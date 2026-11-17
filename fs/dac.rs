@@ -35,7 +35,7 @@ pub const MAY_OPEN: u32 = 32;
 pub const MAY_CHDIR: u32 = 64;
 /// Permission mask: an RCU path walk asks, with no reference to the
 /// inode (Linux MAY_NOT_BLOCK): the check may read only fields an RCU
-/// reader may (atomics, `i_op`; `inode::IFree`) and must not block;
+/// reader may (atomics, `i_op`; `inode::Inode`) and must not block;
 /// anything else is ECHILD, and the walk asks again in ref mode
 pub const MAY_NOT_BLOCK: u32 = 128;
 

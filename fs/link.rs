@@ -3,8 +3,6 @@
 //! This module contains syscalls for creating, reading, and removing
 //! filesystem links, as well as renaming files.
 
-use alloc::sync::Arc;
-
 use crate::fs::dentry::{Dentry, LookupBits, d_exchange, d_move};
 use crate::fs::namei::{
     Last, Parent, create_entry, delete_entry, filename_create, filename_lookup, filename_parentat,
@@ -454,7 +452,7 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
             if exchange { d.mode().is_dir() } else { is_dir },
         )?,
     }
-    if !Arc::ptr_eq(odir, ndir) {
+    if !InodeRef::ptr_eq(odir, ndir) {
         if is_dir {
             dac::permission_as(&c, &sinode, MAY_WRITE)?;
         }

@@ -499,10 +499,12 @@ fn find_bsd(inode: &crate::fs::Inode) -> Option<Arc<UnixSock>> {
         .find(|e| {
             e.is_live()
                 && e.get().addr.read().as_ref().is_some_and(|a| {
-                    a.path
-                        .as_ref()
-                        .and_then(|d| d.get_inode())
-                        .is_some_and(|i| core::ptr::eq(Arc::as_ptr(&i), inode))
+                    // Its inode compared, no reference taken under the
+                    // bucket's spin lock (Linux d_backing_inode == i)
+                    a.path.as_ref().is_some_and(|d| {
+                        d.d_inode_rcu(&crate::sync::rcu::read_lock())
+                            .is_some_and(|i| core::ptr::eq(i, inode))
+                    })
                 })
         })
         .and_then(|e| e.upgrade());

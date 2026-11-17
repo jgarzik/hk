@@ -52,7 +52,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | dentry reference `DentryRef` (`fs/dentry.rs`, Linux dget/dput on d_lockref), mount reference `MountRef` (`fs/mntput.rs`, Linux mntget/mntput on mnt_pcp) | counted pointer, last put deferred (RCU free, queued teardown) |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
 | RCU-readable dentry name `DNameSlot` over `ExternalName` (`fs/name.rs`, Linux d_name over d_shortname / external_name) | atomics a reader may see torn, never out of bounds; a replaced long block released after a grace period (`put_rcu`) |
-| RCU-borrowed inode `Dentry::d_inode_rcu`, reference from it `Inode::igrab` (`fs/dentry.rs`, `fs/inode.rs`, Linux READ_ONCE(d_inode), igrab) | borrow for a guard's life; memory freed a grace period after the teardown (`IFree`) |
+| inode reference `InodeRef` (`fs/inode.rs`, Linux ihold/iput on i_count); RCU-borrowed inode `Dentry::d_inode_rcu`, reference from it `Inode::igrab` (`fs/dentry.rs`, `fs/inode.rs`, Linux READ_ONCE(d_inode), igrab) | counted pointer, last put tears down at once (iput_final -> evict); borrow for a guard's life, memory freed a grace period after the teardown (`i_callback`) |
 | inode list `InodeList` (`fs/inode.rs`, Linux s_inodes, i_hash chains, b_dirty/b_io; `new` unsafe: eviction unlinks under the list's lock; `remove` and `iter_after` unsafe: membership) | intrusive list owning nothing, a linked entry live under the lock, a reference only by `Inode::igrab` |
 | RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
 | hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h; `remove` and `iter_locked` unsafe: membership, and every remover excluded) | owning intrusive containers, membership checked |
@@ -181,33 +181,31 @@ named. A type kept in such a container says so where it is defined
 (Linux SOCK_RCU_FREE sockets: `__sk_destruct` runs from the RCU
 callback).
 
-An inode (`fs/inode.rs` `IFree`, Linux destroy_inode / i_callback) is
-the other shape: RCU readers reach it with no reference (a dentry's
-`d_inode`), its teardown runs synchronously at the last `Arc`, and only
-the memory is deferred (the inode's own `Weak`, dropped by the
-callback). `Inode` has no `Drop`; each field with drop glue is
-`ManuallyDrop` and dropped by `IFree`'s drop through a raw-pointer
-place before the free is queued. Compile-time checks name every field
+An inode (`fs/inode.rs` `InodeRef`, Linux iput / destroy_inode /
+i_callback) is the other shape: RCU readers reach it with no reference
+(a dentry's `d_inode`), its teardown runs synchronously at the last
+put, and only the memory is deferred. Its references are counted in
+`i_count` through `InodeRef` (a raw pointer, as `DentryRef` counts
+`d_count`): a clone is ihold, `Inode::igrab` takes one from a borrowed
+inode unless the count is zero and I_FREEING / I_WILL_FREE is set
+(both only at zero, under `i_lock`), and the drop is iput, whose last
+put evicts and tears down through the raw pointer (`iput_final` ->
+`evict` -> `destroy_inode`), then queues `i_callback`, which frees the
+`Box` block `Inode::alloc` made. No `&mut Inode` is ever formed.
+`Inode` has no `Drop` and no drop glue; each field with drop glue is
+`ManuallyDrop`, dropped through its raw-pointer place by
+`destroy_inode` (or by `i_callback`, for what an RCU reader may read:
+`i_link`, `i_private_rcu`), so a reader, which reads only atomics,
+`ino`, `i_op` and other fields with no drop glue, never sees a byte it
+reads written before the free. Compile-time checks name every field
 (an exhaustive pattern, no `..`): `no_glue` asserts `needs_drop` false
-on each other field's own type, and `Inode::init_at`, which builds the
-inode in place before `assume_init`, writes each field exactly once,
-so a field added fails the build until both are updated. `SignalStruct::alloc` (signal/mod.rs) builds the signal
-struct in place the same way (`try_arc_uninit`, an `init_at` writing
-each field once under an exhaustive pattern, then `assume_init`), so
-its large cells are never copied through the stack. The one remaining `&mut Inode`, the transient
-one std `Arc::drop_slow` makes to run the drop glue, writes no byte an
-RCU reader reads: readers read only atomics, `ino`, `i_op` and other
-fields with no drop glue, and the glue's only step is `IFree`'s drop,
-whose own `&mut self` covers just its `me` and its `RcuHead`. No other
-pointer touches those bytes while that `&mut self` lives (it is
-protected for the whole call): they are private to `IFree`, readers
-use a copy of the pointer (`Inode::i_weak`, for `igrab`), the shared
-`&Inode` the eviction borrows through `me` neither reads nor freezes
-them (all interior mutable) and ends before `self` is used again, the
-`ManuallyDrop` places dropped through `me` lie outside them, and the
-free is queued on `self.i_rcu`, borrowed from `self`. Linux's
-form, a counted `i_count` with an explicit `iput` (as `DentryRef` does
-with `d_count`), removes that transient `&mut` too (BUGS.md).
+on each field's own type and on `Inode`, and `Inode::init_at`, which
+builds the inode in place in its uninitialized block, writes each field
+exactly once, so a field added fails the build until both are updated.
+`SignalStruct::alloc` (signal/mod.rs) builds the signal struct in place
+the same way (`try_arc_uninit`, an `init_at` writing each field once
+under an exhaustive pattern, then `assume_init`), so its large cells
+are never copied through the stack.
 
 A file (`fs/file.rs`, Linux's SLAB_TYPESAFE_BY_RCU `struct file`) is
 reached by descriptor-table readers (`util/rcuslots.rs`) and epoll

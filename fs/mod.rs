@@ -213,7 +213,7 @@ impl Drop for RenameLock {
 /// one inode (bind mounts) - its i_rwsem must be taken once
 fn same_dir(p1: &DentryRef, p2: &DentryRef) -> bool {
     DentryRef::ptr_eq(p1, p2)
-        || matches!((p1.get_inode(), p2.get_inode()), (Some(a), Some(b)) if Arc::ptr_eq(&a, &b))
+        || matches!((p1.get_inode(), p2.get_inode()), (Some(a), Some(b)) if InodeRef::ptr_eq(&a, &b))
 }
 
 /// The non-directories of `a` and `b`, each once, lowest address first
@@ -222,8 +222,8 @@ fn nondirs<'a>(a: Option<&'a InodeRef>, b: Option<&'a InodeRef>) -> [Option<&'a 
     let nd = |i: Option<&'a InodeRef>| i.filter(|i| !i.mode().is_dir());
     let (a, b) = (nd(a), nd(b));
     match (a, b) {
-        (Some(x), Some(y)) if Arc::ptr_eq(x, y) => [Some(x), None],
-        (Some(x), Some(y)) if Arc::as_ptr(y) < Arc::as_ptr(x) => [Some(y), Some(x)],
+        (Some(x), Some(y)) if InodeRef::ptr_eq(x, y) => [Some(x), None],
+        (Some(x), Some(y)) if InodeRef::as_ptr(y) < InodeRef::as_ptr(x) => [Some(y), Some(x)],
         _ => [a, b],
     }
 }

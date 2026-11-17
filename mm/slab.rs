@@ -722,7 +722,7 @@ pub static VMA_CACHE: KmemCache = named_cache!("vm_area_struct", box_of::<crate:
 pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", arc_of::<crate::fs::dentry::Dentry>());
 /// Inodes (`InodeRef`; Linux inode_cache)
 pub static INODE_CACHE: KmemCache =
-    named_cache!("inode_cache", arc_of::<crate::fs::inode::Inode>());
+    named_cache!("inode_cache", box_of::<crate::fs::inode::Inode>());
 
 /// Pages for the caches made here (host tests: their own)
 #[cfg(not(test))]

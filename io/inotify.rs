@@ -282,7 +282,7 @@ impl InotifyInner {
         let (wd, watch) = self
             .watches
             .iter_mut()
-            .find(|(_, w)| Arc::ptr_eq(&w.inode, inode))?;
+            .find(|(_, w)| InodeRef::ptr_eq(&w.inode, inode))?;
         if mask & IN_MASK_CREATE != 0 {
             return Some(Err(KernelError::AlreadyExists));
         }
@@ -590,7 +590,7 @@ impl Inotify {
         let Ok(i) = inner.find(wd) else {
             return;
         };
-        if !core::ptr::eq(Arc::as_ptr(&inner.watches[i].1.inode), inode) {
+        if !core::ptr::eq(InodeRef::as_ptr(&inner.watches[i].1.inode), inode) {
             return;
         }
         let (_, gone) = inner.watches.remove(i);

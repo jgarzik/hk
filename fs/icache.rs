@@ -14,7 +14,7 @@
 //! dentry, an open file, a mapping. The hash holds none (an
 //! `InodeList` per bucket, linked through the inode's own
 //! `i_hash_node`: hashing allocates nothing). When the last reference
-//! goes, its teardown (`inode::IFree`) runs [`evict`]: it
+//! goes, its teardown (`inode::iput` -> `evict`) runs [`evict`]: it
 //! unhashes the inode and calls the filesystem's `evict_inode`, which frees what an
 //! unlinked object still owns (Linux iput_final -> evict ->
 //! ->evict_inode). Deviation from Linux: no LRU of unused inodes (Linux
@@ -36,7 +36,8 @@
 //!
 //! Locking: one `INODE_HASH_LOCK` (Linux inode_hash_lock), a spin leaf
 //! apart from `test` (which may take `Inode.private` and the
-//! filesystem's inode data lock), thread context only: an inode's last
+//! filesystem's inode data lock) and `Inode::igrab` (a candidate's
+//! `i_lock`, Linux find_inode), thread context only: an inode's last
 //! reference never goes in an interrupt handler (pinned pages and files
 //! are released in thread context: `PinnedPages`, `fput`), and lockdep
 //! reports a tracked spin lock taken in one. The table is sized from RAM
@@ -107,7 +108,8 @@ enum Found {
 }
 
 /// The inode of (sb, hashval) passing `test`, if hashed (Linux
-/// find_inode): `test` runs before any reference is taken, so nothing
+/// find_inode): `test` runs before any reference is taken, which
+/// `Inode::igrab` takes unless the last one went, so nothing
 /// is dropped under the lock (the last reference's eviction takes it).
 /// `b` is the bucket of (sb, hashval), found before the lock (the table
 /// is allocated at first use).
@@ -274,7 +276,7 @@ pub fn rehash(inode: &InodeRef, hashval: u64) {
 /// its filesystem releases what it still owns while it is still hashed
 /// (lookups of its object wait), then it is unhashed and the waiters
 /// woken (Linux evict: ->evict_inode, remove_inode_hash, wake_up_bit).
-/// Runs from the inode's teardown (`IFree`) in a context that may sleep (Linux iput:
+/// Runs from the inode's teardown (`iput`) in a context that may sleep (Linux iput:
 /// might_sleep): the filesystem may do I/O (vfat frees an unlinked
 /// file's clusters).
 pub fn evict(inode: &Inode) {
@@ -283,5 +285,86 @@ pub fn evict(inode: &Inode) {
         // Its waiters queued under the hash lock this unhash took (Linux
         // evict: wake_up_bit(__I_NEW) on the inode's hashed queue)
         crate::sync::waitqueue::var_waitqueue(core::ptr::from_ref(inode) as usize).wake_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::inode::{InodeMode, InodeOps, Timespec, istate};
+    use crate::fs::superblock::{
+        FileSystemType, FsContext, FsNext, FsSupers, NULL_SUPER_OPS, SbLocked, get_tree_nodev,
+        kill_anon_super, vfs_get_tree,
+    };
+    use core::sync::atomic::AtomicUsize;
+
+    /// Evictions `DyingOps` checked
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Looks itself up in the cache from its own eviction: the last
+    /// reference went and it is still hashed (Linux evict before
+    /// remove_inode_hash), so a lookup must find it dying, to wait for,
+    /// and never take a new reference to it
+    struct DyingOps;
+
+    impl InodeOps for DyingOps {
+        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
+            Err(KernelError::NotFound)
+        }
+
+        fn evict_inode(&self, inode: &Inode) {
+            assert!(inode.state() & istate::I_FREEING != 0);
+            let sb = inode.sb.as_ptr();
+            let h = inode.i_hash.load(Ordering::Relaxed);
+            let l = INODE_HASH_LOCK.lock();
+            let me = core::ptr::from_ref(inode) as usize;
+            let found = find(&l, bucket(sb, h), sb, h, &|i| core::ptr::eq(i, inode));
+            assert!(matches!(found, Found::Dying(a) if a == me));
+            SEEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static DYING_OPS: DyingOps = DyingOps;
+
+    fn mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        get_tree_nodev(fc, &NULL_SUPER_OPS, |_| Ok(()))
+    }
+
+    static T: FileSystemType = FileSystemType {
+        name: "icachetest",
+        fs_flags: 0,
+        mount,
+        kill_sb: kill_anon_super,
+        file_ops: &crate::fs::RAMFS_FILE_OPS,
+        next: FsNext::new(None),
+        fs_supers: FsSupers::new(crate::util::list::WeakList::new()),
+    };
+
+    /// A hashed inode is found with a new reference while held; once
+    /// its last reference went, a lookup during its eviction finds it
+    /// dying (Linux find_inode: I_FREEING, __wait_on_freeing_inode),
+    /// and after its eviction finds nothing
+    #[test]
+    fn lookup_during_final_iput_waits() {
+        let sb = vfs_get_tree(&FsContext::new(&T, b"")).unwrap().unlock();
+        let i = Inode::alloc(Inode::new(
+            7,
+            InodeMode::regular(0o644),
+            0,
+            0,
+            0,
+            Timespec::ZERO,
+            Arc::downgrade(&sb),
+            &DYING_OPS,
+        ))
+        .unwrap();
+        insert_inode_hash(&i, 7);
+        let same = |x: &Inode| x.ino == 7;
+        let got = ilookup5(&sb, 7, &same).unwrap();
+        assert!(InodeRef::ptr_eq(&got, &i) && InodeRef::count(&i) == 2);
+        drop(got);
+        drop(i);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 1);
+        assert!(ilookup5(&sb, 7, &same).is_none());
     }
 }

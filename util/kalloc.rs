@@ -141,6 +141,26 @@ pub fn try_box<T>(v: T) -> Result<Box<T>, KernelError> {
     }
 }
 
+/// `Box::new_uninit()`, or ENOMEM: for a large `T` built in place
+pub fn try_box_uninit<T>() -> Result<Box<core::mem::MaybeUninit<T>>, KernelError> {
+    if crate::mm::fault_inject::should_fail() {
+        return Err(KernelError::OutOfMemory);
+    }
+    let layout = Layout::new::<T>();
+    if layout.size() == 0 {
+        // No allocation to fail
+        return Ok(Box::new_uninit());
+    }
+    // SAFETY: a nonzero size
+    let p = unsafe { alloc::alloc::alloc(layout) }.cast::<core::mem::MaybeUninit<T>>();
+    if p.is_null() {
+        return Err(KernelError::OutOfMemory);
+    }
+    // SAFETY: a fresh global-allocator block of `T`'s layout, which an
+    // uninitialized `T` may occupy
+    Ok(unsafe { Box::from_raw(p) })
+}
+
 /// `Arc::new(v)`, or ENOMEM
 pub fn try_arc<T>(v: T) -> Result<Arc<T>, KernelError> {
     #[expect(clippy::disallowed_methods)]

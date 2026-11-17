@@ -616,9 +616,11 @@ VFS locks (detailed order):
                    MOUNT_LOCK's locking read, d_path under an RCU
                    read guard)
         ↓
-    Inode.i_dentry (spin Mutex: the inode's dentries, Linux i_dentry
-                   under i_lock; taken before the d_locks of the
-                   dentry it links or unlinks and its parent)
+    Inode.i_lock (spin Mutex, Linux i_lock: the inode's dentries
+                   (i_dentry) and its i_state writes; taken before the
+                   d_locks of the dentry it links or unlinks and its
+                   parent; under INODE_HASH_LOCK, INODE_SB_LIST_LOCK
+                   and BdiWriteback.list_lock by igrab)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
@@ -2784,14 +2786,15 @@ number, so a device is found by its number (3.10), and a tmpfs inode
 by number plus generation once a file handle of it is made
 (`insert_inode_hash_once`, checked and hashed under the lock; Linux
 shmem_encode_fh's own spin lock), so open_by_handle_at finds it
-(`ilookup5`, then its dentry under `Inode.i_dentry`). A RAM-sized table of buckets, each an `InodeList` through the
+(`ilookup5`, then its dentry under `Inode.i_lock`). A RAM-sized table of buckets, each an `InodeList` through the
 inode's embedded `i_hash_node` (no reference per entry, nothing
 allocated: an inode is unhashed under the lock by its eviction at the
 latest, so a linked one is live memory), all under one `INODE_HASH_LOCK` (spin Mutex, Linux
 inode_hash_lock, thread context): under it only the bucket links and
 the filesystem's `test` (which may take `Inode.private`, a spin
 RwLock, then vfat's `VfatInode.d`, a spin Mutex leaf held only to copy
-the data in or out). Not IRQ-safe: an inode's last reference never goes
+the data in or out), and a candidate's `i_lock` (igrab's slow path,
+Linux find_inode's spin_lock(&inode->i_lock)). Not IRQ-safe: an inode's last reference never goes
 in an interrupt handler (pinned pages and files are released in thread
 context: `PinnedPages`, `fput`), which lockdep checks (a tracked lock
 taken in an interrupt handler is reported). A lookup (Linux
@@ -2807,13 +2810,15 @@ sleeps once (Linux __wait_on_freeing_inode; `INODE_HASH_LOCK` -> that
 queue's lock), woken by the eviction after its unhash under the lock
 (Linux wake_up_bit(__I_NEW)), then searches again: a lookup may sleep, so
 its callers hold no spin lock (vfat's hold its directory's `i_rwsem`,
-which no writeback or eviction takes). Eviction (`IFree`'s drop ->
-`icache::evict`, Linux iput_final -> evict) runs where the last `Arc`
-goes, which must be a context that may sleep (Linux iput's
-might_sleep, checked first): never under a spin lock or with
-interrupts off. A linked, hashed, dirty inode is written back first
-(Linux write_inode_now for an inode not kept cached; hk keeps none);
-then it leaves its superblock's and writeback lists,
+which no writeback or eviction takes). Eviction (`iput` ->
+`iput_final` -> `evict` -> `icache::evict`, Linux the same) runs where
+the last reference goes, which must be a context that may sleep (Linux
+iput's might_sleep, checked first): never under a spin lock or with
+interrupts off. A linked, hashed inode (Linux inode_generic_drop
+false) is marked I_WILL_FREE and, if dirty, written back first with
+`i_lock` released (Linux write_inode_now for an inode not kept cached;
+hk keeps none), then marked I_FREEING; then it leaves its writeback
+and superblock lists,
 `->evict_inode` runs while it is still hashed (may sleep and do I/O:
 vfat frees an unlinked file's clusters at once, Linux
 fat_evict_inode), and `INODE_HASH_LOCK` is taken to unhash it, the
@@ -2832,18 +2837,46 @@ reports one that does not. Deviation from Linux: no
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
 
-**Inode free** (`fs/inode.rs` `IFree`; Linux evict -> destroy_inode
--> call_rcu(&inode->i_rcu, i_callback)): the whole teardown runs
-synchronously where the last `Arc` goes, as above: the eviction, then
-every field with drop glue (`destroy_inode`: the page cache, Linux
-truncate_inode_pages_final; inotify marks, file locks, the writeback
-state, the filesystem data, a FIFO's pipe, and the superblock's
-passive reference last), each a `ManuallyDrop` dropped through a raw
-pointer. Only the memory waits: the inode's `Arc` keeps a `Weak` of
-its own (`Inode::alloc`), and `i_callback`, queued after the teardown
-(no field is touched after it), drops that `Weak` in `rcuc/N` a grace
-period later: an atomic decrement and the block's free, which never
-sleeps and takes no lock. So an RCU reader that reached an inode with
+**Inode references** (`fs/inode.rs` `InodeRef`, `Inode.i_count`,
+`Inode.i_state`, `Inode.i_lock`; Linux i_count, i_state, i_lock, iput,
+igrab, ihold): a holder's reference is one count of the atomic
+`i_count`. ihold (a clone) adds one; iput (a drop) takes one lock-free
+unless it is the last (atomic_add_unless(-1, 1)), and otherwise takes
+`i_lock`, drops the count to zero under it and, still under it, marks
+the inode I_FREEING (or I_WILL_FREE first, for a writeback before the
+eviction: `iput_final`), then releases it before the eviction, which
+sleeps. `Inode::igrab`, for an inode borrowed with no reference (an RCU
+walk's `d_inode`, an entry of an `InodeList` under its lock), adds one
+lock-free while the count is above zero, else takes `i_lock` and adds
+one only if neither I_FREEING nor I_WILL_FREE is set (Linux igrab,
+__iget): since those bits are set under `i_lock` in the same hold that
+dropped the count to zero, no reference is taken to an inode in its
+teardown, and the teardown runs once. `i_state` is written only under
+`i_lock` and read lock-free (Linux inode_state_read_once). `i_lock` is
+a spin leaf above the d_locks (it guards the inode's dentries too,
+Linux i_dentry): taken by igrab under `INODE_HASH_LOCK`,
+`INODE_SB_LIST_LOCK` or a `BdiWriteback.list_lock` (Linux:
+inode_hash_lock, s_inode_list_lock and wb->list_lock before i_lock),
+and never held while any of those is taken (iput_final drops it before
+the eviction takes them). Every put may sleep (Linux iput's
+might_sleep, checked on each put, not only the last): no reference is
+put under a spin lock or in an interrupt handler, so a lookup under a
+spin lock compares a dentry's inode without taking one (unix
+`find_bsd`, Linux d_backing_inode), and an asynchronous direct I/O,
+which may end in an interrupt handler, borrows the inode of the file
+its request holds (vfat `VfatAio`, Linux struct dio's inode).
+
+**Inode free** (`fs/inode.rs` `destroy_inode`, `i_callback`; Linux
+evict -> destroy_inode -> call_rcu(&inode->i_rcu, i_callback)): the
+whole teardown runs synchronously where the last reference goes, as
+above: the eviction, then every field with drop glue
+(`destroy_inode`: the page cache, Linux truncate_inode_pages_final;
+inotify marks, file locks, the writeback state, the filesystem data, a
+FIFO's pipe, and the superblock's passive reference last), each a
+`ManuallyDrop` dropped through a raw pointer. Only the memory waits:
+`i_callback`, queued on `i_rcu` after the teardown (no field is
+touched after it), frees the block in `rcuc/N` a grace period later,
+which never sleeps and takes no lock. So an RCU reader that reached an inode with
 no reference (a dentry's `d_inode`) may read it until its guard ends,
 a torn-down one included, but only its fields with no drop glue
 (atomics, `ino`, `i_op`; Linux's RCU walk reads i_mode, i_uid, i_op
@@ -2858,7 +2891,7 @@ it too. No lock is added.
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
 superblock's `s_inodes` (an `InodeList` through `Inode.i_sb_list`,
 holding no reference) until
-its eviction (`IFree`'s drop, first step) unlinks it. One global
+its eviction (`evict`, after the writeback lists) unlinks it. One global
 `INODE_SB_LIST_LOCK` (spin Mutex leaf, thread context; Linux
 inode_sb_list_lock as it was before s_inode_list_lock went per
 superblock) guards every list: an inode holds only a `Weak` to its
@@ -2866,11 +2899,12 @@ superblock and may be evicted after that superblock's shutdown, which
 drains the list under this lock, before the last passive put frees any
 field, so an inode still linked under the lock has a superblock with
 intact fields (a per-superblock lock would live in memory the last put
-may already have freed). Taken wherever an inode's last reference goes
-(under d_locks and other spin locks; nothing is taken under it). The
-reclaim and drop_caches walks (`for_each_sb_inode`, Linux
-drop_pagecache_sb) take each inode's reference under it and work with
-it released, dropping the previous reference unlocked.
+may already have freed). Taken by an inode's eviction, with nothing
+held; under it only an inode's `i_lock` (igrab's slow path). The
+reclaim and drop_caches walks and the inotify shutdown
+(`for_each_sb_inode`, Linux drop_pagecache_sb, fsnotify_unmount_inodes)
+take each inode's reference under it (`Inode::igrab`) and work with it
+released, dropping the previous reference unlocked.
 
 **vfat FAT lock** (`fs/vfat/mod.rs`, Linux fs/fat/fatent.c):
 `VfatSbData.fat` (sleeping `sync::Mutex`, Linux sbi->fat_lock /
@@ -3103,10 +3137,9 @@ the guard; a pass that raced starts the buffer over. `Dentry::alloc`
 inserts a child under the parent's `d_lock` unless one with that name
 is cached (Linux d_alloc + d_add): one dentry per name.
 
-An inode's dentries (`Inode.i_dentry`, Linux i_dentry and
-d_u.d_alias) are an intrusive list through `Dentry.d_alias` under a
-spin Mutex of their own (Linux keeps them under i_lock), thread
-context only. A dentry is on its inode's list exactly while its d_lock
+An inode's dentries (`ILocked.i_dentry`, Linux i_dentry and
+d_u.d_alias) are an intrusive list through `Dentry.d_alias` under the
+inode's `i_lock` (Linux the same), thread context only. A dentry is on its inode's list exactly while its d_lock
 holds that inode: `DentryRef::new` links a positive one, `add` links
 one it makes positive, `d_delete` (making it negative in place) and
 `dentry_kill` unlink it, each with the inode's list lock taken first
@@ -3799,7 +3832,7 @@ address) -> dentry `d_lock` -> fs-internal locks.
 pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> RenameLock;
 
 /// The non-directory source/target of a rename, by address; a guard
-pub fn lock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) -> NondirsLock;
+pub fn lock_two_nondirs(a: Option<&InodeRef>, b: Option<&InodeRef>) -> NondirsLock;
 
 /// Check if child is a subdirectory of ancestor
 pub fn is_subdir(child: &Arc<Dentry>, ancestor: &Arc<Dentry>) -> bool;
@@ -5652,7 +5685,7 @@ else is taken under it) unless an order is given. "spin" is the
 list taken whole under its lock) takes the marks out under `Marks.list`, releases it, then per group takes `Inotify.inner` and checks the wd still names that inode before queueing IN_DELETE_SELF/IN_UNMOUNT and IN_IGNORED; only the remover that finds the watch uncharges it. The group's watch table (wd -> watch, Linux's idr under idr_lock) stays under `Inotify.inner`, a sorted vector: an add makes room for one more under `mark_mutex` before taking `Inotify.inner` (`kmem::grow_locked`, Linux idr_preload; only adds insert, so the room stays), and removals free nothing under it. Nothing there sleeps: each event is allocated before `Inotify.inner` is taken (Linux allocates in inotify_handle_inode_event, then fsnotify_insert_event takes notification_lock; no memory: IN_Q_OVERFLOW takes its place, a queue position that allocates nothing, Linux's preallocated overflow_event), an unqueued or read event is freed after the lock, the wakeup is allowed under any lock and SIGIO is sent with `kill_fasync` once `Inotify.inner` is dropped (Linux fsnotify_insert_event). A watch never counts toward a mount being busy |
 | `USER_WATCHES` | io/inotify.rs | spin leaf | each user's inotify watches against fs.inotify.max_user_watches (Linux UCOUNT_INOTIFY_WATCHES ucounts), a vector of (uid, count) that grows with the lock released (`push_if`; Linux alloc_ucounts allocates before ucounts_lock): a new watch is charged before `Inotify.inner` is taken and a removed one returned after it is released (never nested in it; returning frees nothing); the limit itself (`MAX_USER_WATCHES`) is a sysctl atomic read lock-free |
 | `Fanotify.mark_mutex` → `Fanotify.inner` | io/fanotify.rs | sleeping `sync::Mutex`; IrqSpinlock leaf | a fanotify group's marks (Linux group->mark_mutex): fanotify_mark adds, removes and flushes them under it (allocating there); never nested with `Fanotify.inner`, the event queue (Linux notification_lock): an event is allocated before it is taken (Linux fanotify_alloc_event, then fsnotify_insert_event; no memory or a full queue: FAN_Q_OVERFLOW, a queue position that allocates nothing) and freed after it is released |
-| `Eventfd.inner`, `Inotify.inner`, `Fanotify.inner`, `Signalfd.inner`, `Timerfd.inner` | io/eventfd.rs, io/inotify.rs, io/fanotify.rs, io/signalfd.rs, time/timerfd.rs | IrqSpinlock | per-object state of the anon-inode files (inotify: watch table and event queue; fanotify: event queue; both queues are `io/fsnotify.rs` `NotifQueue`, Linux fs/notify/notification.c: insert, remove_first, the overflow event as a queue position, max_events); their wait queues are woken after unlocking. An inotify watch holds its inode (`Arc<Inode>`, matched by identity, Linux's mark pinning the inode); a removed watch's inode is released after `Inotify.inner` is dropped. eventfd, inotify and fanotify readers wait with it held (`wait_event_interruptible_locked`: inner -> wait queue head while queueing, released while asleep) |
+| `Eventfd.inner`, `Inotify.inner`, `Fanotify.inner`, `Signalfd.inner`, `Timerfd.inner` | io/eventfd.rs, io/inotify.rs, io/fanotify.rs, io/signalfd.rs, time/timerfd.rs | IrqSpinlock | per-object state of the anon-inode files (inotify: watch table and event queue; fanotify: event queue; both queues are `io/fsnotify.rs` `NotifQueue`, Linux fs/notify/notification.c: insert, remove_first, the overflow event as a queue position, max_events); their wait queues are woken after unlocking. An inotify watch holds its inode (`InodeRef`, matched by identity, Linux's mark pinning the inode); a removed watch's inode is released after `Inotify.inner` is dropped. eventfd, inotify and fanotify readers wait with it held (`wait_event_interruptible_locked`: inner -> wait queue head while queueing, released while asleep) |
 | `IoRing.submit` → `Files`, `IoRing.cq` | io/io_uring/ | `submit` sleeping `sync::Mutex` (Linux uring_lock); `cq` spin Mutex (Linux completion_lock), thread context | `submit`: the kernel's SQ head (Linux cached_sq_head), the registered files and buffers, the pending poll/timeout list; held across a whole io_uring_enter submission, so the operations run (and may sleep, fault on user memory, take any lock a syscall takes) under it, and across io_uring_register; an io-wq worker takes it to install an open's file in the registered table (`IoRing::fixed_install`, Linux io_ring_submit_lock), after the open and with no other lock held, while a chain run in io_uring_enter, which holds it, installs through the held `Submit` (never taking it again) (which reads the fd table under it: -> `Files`; replaced files are released after both). `cq`: the kernel's CQ tail (Linux cached_cq_tail) and the overflow list (Linux cq_overflow_list), a leaf but for growing that list, GFP_NOWAIT named (Linux io_cqe_overflow_locked allocates the overflow CQE under completion_lock, GFP_NOWAIT); posting writes the CQE into the shared ring and publishes the tail (Release) under it, wakeups follow the unlock (`IoRing.cq_wait`, GETEVENTS sleepers, which check the tail after queueing themselves, and the poll queue). `IoRing.poll_files` (sleeping `sync::Mutex`, Linux polls under uring_lock; IOPOLL rings: the files with polled requests issued; thread context) is held while GETEVENTS and the exit/exec polls poll them (-> the disk's poll queues and the bio ends they run: `Tctx.reqs`, `TaskWorks.q`, wakeups); emptied once nothing is in flight, the files released after it. `IoRing.overflowed` (atomic) is set and cleared under `cq` and read lock-free by poll and GETEVENTS; `IoRing.dropped` (atomic, a CQE was lost) is set under `cq` and cleared by the io_uring_enter that returns EBADR. The overflow list holds at most `cq_entries` CQEs (Linux charges them to the memory cgroup). The ring memory (`mm::shared::SharedRegion`) is written by user space at any time: the kernel only uses atomics and volatile copies on it |
 | `Mm.ioctx` (`IoctxTable.slots`); `AIO_NR` | io/aio/mod.rs | spin Mutex leaves, thread context | `Mm.ioctx`: an address space's AIO contexts by id (Linux mm->ioctx_table under ioctx_lock): io_setup adds (the table grows by a buffer allocated before the lock, `kmem::spare`/`adopt`), io_destroy and exit_aio remove, every AIO syscall looks a context up under it, cloning its `Arc`; mremap of a ring, under the mmap_lock for writing, finds its context in it and moves the context id (atomics); nothing is taken under it. `AIO_NR` (Linux aio_nr_lock): the events every context asked for, against aio-max-nr (an atomic, read lock-free) |
 | `Kioctx.ring_lock` (sleeping) → mmap_lock; `Kioctx.comp`, `Kioctx.reap`; `PollIocb.reg` (sleeping) → `Kioctx.active` → file wait queue head → `PollIocb.st` → `Workqueue.inner` | io/aio/ctx.rs, io/aio/poll.rs | `ring_lock`, `reg` sleeping `sync::Mutex`; `comp`, `reap`, `active`, `st` IrqSpinlock | An AIO context (Linux struct kioctx). `ring_lock` (Linux ring_lock): one io_getevents copies events to user space (it may fault: -> mmap_lock) and moves the ring's head. `comp` (Linux completion_lock): the kernel's tail and the count of posted events whose slots are not free yet; a request's end writes its event into the shared ring and publishes the tail (Release) under it, in any context (a bio's end_io in hardirq), then signals its eventfd (`Eventfd.inner`) and wakes io_getevents sleepers (`Kioctx.wait`, keyed by the events in the ring) after the unlock; a leaf. `Kioctx.avail` (atomic, Linux reqs_available) counts free event slots, refilled under `comp` from the head user space stored. `reap`: requests whose event is posted, waiting for release in thread context (their pins are dirtied under page locks, their file dropped: Linux bio_dirty_work, delayed_fput), pushed in any context with a delayed work item on `SYSTEM_WQ` (queued from the interrupt handler: `Workqueue.inner`), drained by that work, io_submit, io_getevents and the context's end; a leaf. `active` (Linux ctx_lock): the cancellable requests (IOCB_CMD_POLL), taken by io_cancel, the end's cancel, and a poll's submission and work, which take their wait entry off the file's queue under it (-> the queue head). `PollIocb.reg` (a poll request's wait entry and the owners of its queue) is held by the submission across the file's poll (which may sleep) and its decision under `active`, and by the poll work around its own, so the work waits for a submission still registering. A poll's wakeup runs under the file's wait queue head and takes only `PollIocb.st` (its work's queued/again/cancelled flags), then queues its work (`Workqueue.inner`, the worker's wait queue head): head -> head nesting, as epoll's callback. `Kioctx.users` and `reqs` (atomics, Linux percpu_ref users and reqs) count the syscalls using a context and its requests alive; io_destroy and exit_aio set `dead` (SeqCst against a lookup's increment, and against the last put's read of `dead` after its decrement: store buffering, all four accesses SeqCst), wait for `users` to drain, cancel, then wait for `reqs` (`Kioctx.idle`), releasing reaped requests meanwhile |
@@ -5697,7 +5730,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
 | `BdiWriteback.pass` | mm/writeback.rs, fs/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, a superblock's shutdown (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
-| `BdiWriteback.list_lock` | mm/writeback.rs, fs/fs_writeback.rs | spin Mutex leaf | Linux wb->list_lock: the disk's dirty inodes, `b_dirty` (oldest first) and `b_io` (the running pass's), `InodeList`s through `Inode.i_io_list` holding no reference (Linux), `Inode.i_io_on` (which list it is on) and `Inode.i_dirty`'s clearing. `mark_inode_dirty` (called by every page dirtying, `filemap::dirty_page`, through the mapping's `host`: Linux __folio_mark_dirty) sets `i_dirty` first and, the first time, queues the inode at the tail under a page lock at most, then arms the periodic work after unlocking if the lists were empty (a block device's own inode is on its disk's lists too). A pass moves the expired inodes (of one superblock for a sync) to `b_io` in one hold (`InodeList::move_if`, grabbing none, Linux queue_io), then per inode: under the lock take a reference unless its last one went (`Inode::igrab`, Linux __iget; one being freed is skipped, its teardown writes it back), take it off `b_io` and clear `i_dirty`, unlock, write it, drop it with no lock held (its last reference may evict it). An inode's eviction takes it off its list under the lock (`inode_io_list_del`, Linux evict), before any field goes, so a linked entry is a live value. The mapping's `host` is the inode whose `i_data` it is (Linux mapping->host, a plain pointer): page dirtying grabs it (`Inode::igrab`, failing once its last reference went, as Linux skips an I_FREEING inode). `AddressSpace.dirtied_when` is stored (release, under the `i_pages` lock) when the mapping's first dirty page since it was clean comes, and read (acquire) under `list_lock` by the expiry test |
+| `BdiWriteback.list_lock` | mm/writeback.rs, fs/fs_writeback.rs | spin Mutex, a leaf but for an inode's `i_lock` (`Inode::igrab`'s slow path, Linux wb->list_lock -> i_lock) | Linux wb->list_lock: the disk's dirty inodes, `b_dirty` (oldest first) and `b_io` (the running pass's), `InodeList`s through `Inode.i_io_list` holding no reference (Linux), `Inode.i_io_on` (which list it is on) and `Inode.i_dirty`'s clearing. `mark_inode_dirty` (called by every page dirtying, `filemap::dirty_page`, through the mapping's `host`: Linux __folio_mark_dirty) sets `i_dirty` first and, the first time, queues the inode at the tail under a page lock at most, then arms the periodic work after unlocking if the lists were empty (a block device's own inode is on its disk's lists too). A pass moves the expired inodes (of one superblock for a sync) to `b_io` in one hold (`InodeList::move_if`, grabbing none, Linux queue_io), then per inode: under the lock take a reference unless its last one went (`Inode::igrab`, Linux __iget; one being freed is skipped, its teardown writes it back), take it off `b_io` and clear `i_dirty`, unlock, write it, drop it with no lock held (its last reference may evict it). An inode's eviction takes it off its list under the lock (`inode_io_list_del`, Linux evict), before any field goes, so a linked entry is a live value. The mapping's `host` is the inode whose `i_data` it is (Linux mapping->host, a plain pointer): page dirtying grabs it (`Inode::igrab`, failing once its last reference went, as Linux skips an I_FREEING inode). `AddressSpace.dirtied_when` is stored (release, under the `i_pages` lock) when the mapping's first dirty page since it was clean comes, and read (acquire) under `list_lock` by the expiry test |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
 | `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu, the mempolicy syscalls (mbind copies the node spans before taking mmap_lock; get_mempolicy's page node with no lock held) and futex_waitv (FUTEX2_NUMA node checks, after `futex_mpol` drops mmap_lock) |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents; nothing allocates under them: hash elements are preallocated at create on a free list (Linux htab prealloc), lookups and get_next_key copy into a buffer the caller allocated before the lock (Linux bpf_map_copy_value) |

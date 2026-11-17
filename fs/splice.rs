@@ -960,7 +960,7 @@ fn copy_len(
     }
     // Overlapping ranges of one file
     let (i, o, c) = (i128::from(pos_in), i128::from(pos_out), i128::from(count));
-    if Arc::ptr_eq(&iin, &iout) && o + c > i && o < i + c {
+    if crate::fs::InodeRef::ptr_eq(&iin, &iout) && o + c > i && o < i + c {
         return Err(KernelError::InvalidArgument);
     }
     verify_pos(pos_in, count)?;

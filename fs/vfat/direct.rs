@@ -261,9 +261,17 @@ fn fallback(
 /// in dio_complete), a read's result cut at the size it saw; a write
 /// ends in thread context when the file has pages cached at its end
 /// (`PostWrite`)
+///
+/// # Invariants
+/// `inode` is the inode of the file `inner` holds (`FileOps::dio_submit`)
+/// through its dentry, so it stays live while `inner` does.
 struct VfatAio {
     inner: Arc<dyn AsyncIo>,
-    inode: InodeRef,
+    /// The file's inode, borrowed with no reference of its own (Linux
+    /// struct dio's inode, kept by iocb->ki_filp): its end may come in
+    /// an interrupt handler, where no inode reference may be put (Linux
+    /// iput's might_sleep)
+    inode: core::ptr::NonNull<Inode>,
     /// Most bytes the result counts
     cut: usize,
     /// A write's end over a cached range
@@ -302,6 +310,12 @@ impl PostWrite {
     }
 }
 
+// SAFETY: `inode` is a shared borrow of a Sync inode (type invariant);
+// the rest is Send and Sync
+unsafe impl Send for VfatAio {}
+// SAFETY: as above
+unsafe impl Sync for VfatAio {}
+
 impl VfatAio {
     /// `write`: the position of a write
     fn new(
@@ -312,9 +326,11 @@ impl VfatAio {
     ) -> Result<Arc<Self>, KernelError> {
         let post = write.map(PostWrite::new).transpose()?;
         inode.inode_dio_begin();
+        // INVARIANT: `inode` is the file's (the caller's, from the file
+        // `inner` holds)
         let r = try_arc(Self {
             inner,
-            inode: inode.clone(),
+            inode: core::ptr::NonNull::from(&**inode),
             cut,
             post,
         });
@@ -324,13 +340,19 @@ impl VfatAio {
         r
     }
 
+    /// The file's inode
+    fn inode(&self) -> &Inode {
+        // SAFETY: live while `inner` holds the file (type invariant)
+        unsafe { self.inode.as_ref() }
+    }
+
     /// Drop what was cached over the written range meanwhile (thread
     /// context)
     fn invalidate(&self, res: &Result<usize, KernelError>) {
         if let (Some(p), Ok(n)) = (&self.post, res)
             && *n > 0
         {
-            invalidate_post(&self.inode, p.pos, *n);
+            invalidate_post(self.inode(), p.pos, *n);
         }
     }
 
@@ -344,7 +366,7 @@ impl VfatAio {
 
 impl Drop for VfatAio {
     fn drop(&mut self) {
-        self.inode.inode_dio_end();
+        self.inode().inode_dio_end();
     }
 }
 
@@ -352,8 +374,9 @@ impl Drop for VfatAio {
 // this holds it; `complete` cuts the result and either hands this to
 // its write's work (a lock and a queueing, both any context: the work
 // was made at submission) or ends the count (atomics and a wakeup) and
-// drops this before passing the result on: its inode reference is not
-// the last, as the inner request holds the file (`FileOps::dio_submit`)
+// drops this before passing the result on: it holds no inode reference
+// (its inode is the file's, which the inner request holds:
+// `FileOps::dio_submit`)
 unsafe impl AsyncIo for VfatAio {
     fn segs(&self) -> &[PageSeg] {
         self.inner.segs()
@@ -361,7 +384,7 @@ unsafe impl AsyncIo for VfatAio {
 
     fn complete(self: Arc<Self>, res: Result<usize, KernelError>) {
         let res = res.map(|n| n.min(self.cut));
-        let cached = matches!(res, Ok(n) if n > 0) && self.inode.i_data.nrpages() != 0;
+        let cached = matches!(res, Ok(n) if n > 0) && self.inode().i_data.nrpages() != 0;
         if let Some(p) = self.post.as_ref().filter(|_| cached) {
             let (job, work) = (p.job.clone(), p.work.clone());
             *job.lock() = Some((self, res));
