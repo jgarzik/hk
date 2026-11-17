@@ -1136,7 +1136,7 @@ Tag = roadmap phase (doc/ROADMAP.md).
 
 - Large frames left: `do_clone` (TaskInner and the clone state live by
   value; Linux dup_task_struct builds in the allocated task), x86-64
-  `setup_rt_frame`, `gen_status` and `munmap_locked`.
+  `setup_rt_frame` and `munmap_locked`.
 
 ## DRM dumb buffers are the boot framebuffer only
 

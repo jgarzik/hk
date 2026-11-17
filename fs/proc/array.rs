@@ -13,6 +13,7 @@
 //! remote reads of cmdline/environ), the sighand action lock, the shared
 //! pending set, `FsStruct.inner` (umask) and the descriptor table lock.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -20,7 +21,6 @@ use core::fmt::Write;
 use crate::fs::KernelError;
 use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
 use crate::ns::PidNamespace;
-use crate::ns::pid::MAX_PID_NS_LEVEL;
 use crate::task::percpu::{TASKLIST, TaskRef};
 use crate::task::{Cred, Pid, Task, TaskKind, TaskState};
 
@@ -31,9 +31,6 @@ const PF_KTHREAD: u64 = 0x0020_0000;
 /// but exec caps the strings at 128 KiB)
 const ARGS_MAX: u64 = 128 * 1024;
 
-/// Levels a task can have numbers at
-const LEVELS: usize = MAX_PID_NS_LEVEL as usize + 1;
-
 /// What /proc reads of a task, copied under TASKLIST; the pids as the
 /// reading procfs's namespace numbers them (0 if not visible there)
 struct Snap {
@@ -42,10 +39,11 @@ struct Snap {
     ppid: Pid,
     pgid: Pid,
     sid: Pid,
-    /// (tgid, pid, pgid, sid) in each namespace from the procfs's down
-    /// to the task's own (Linux NStgid, NSpid, NSpgid, NSsid)
-    ns_ids: [[u32; 4]; LEVELS],
-    levels: usize,
+    /// The leader's, its own, its group's and its session's struct pid,
+    /// numbered in each namespace from the procfs's down to the task's
+    /// own at print time (Linux task_state: NStgid, NSpid, NSpgid, NSsid
+    /// from pid->numbers)
+    pids: [Option<Arc<crate::task::pid::Pid>>; 4],
     comm: [u8; 16],
     state: TaskState,
     /// In a ptrace stop (Linux __TASK_TRACED; JOBCTL_TRACED under its
@@ -87,9 +85,12 @@ struct Snap {
     files: Option<Arc<crate::task::fdtable::Files>>,
 }
 
-/// Copy task `pid` out of TASKLIST, its pids numbered in `ns` (Linux
-/// task_state, do_task_stat with proc_pid_ns)
-fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
+/// Copy task `pid` out of TASKLIST into the heap, its pids numbered
+/// in `ns` (Linux task_state, do_task_stat with proc_pid_ns, which
+/// print from the task itself: no copy on the stack)
+fn snap(task: &Task, ns: &PidNamespace) -> Option<Box<Snap>> {
+    // Allocated before the lock
+    let b = crate::util::kalloc::try_box_uninit::<Snap>().ok()?;
     let table = TASKLIST.read();
     // Still listed: then its tid names it for this read hold
     let t = table.view(task)?;
@@ -114,14 +115,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         .task
         .tracer(&g)
         .map_or(0, |x| Pid::from(x.pid_nr_ns(ns, &g)));
-    let mut ns_ids = [[0u32; 4]; LEVELS];
-    let mut levels = 0;
-    if let Some(p) = me {
-        for u in p.numbers().iter().skip(ns.level as usize) {
-            ns_ids[levels] = [nr(leader, &u.ns), u.nr, nr(pg, &u.ns), nr(se, &u.ns)];
-            levels += 1;
-        }
-    }
+    let pids = [leader, me, pg, se].map(|p| p.map(crate::task::pid::get_pid));
     // comm and the resources together, under task_lock
     let (comm, fs, files) = {
         let a = t.task.task_lock();
@@ -133,14 +127,13 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let (utime, stime) = crate::task::cputime::thread_group_cputime_adjusted(&table, pid);
     // One setting of the scheduling parameters (one load)
     let params = t.task.se.params();
-    Some(Snap {
+    let s = Snap {
         pid: u64::from(nr(me, ns)),
         tgid: u64::from(nr(leader, ns)),
         ppid: u64::from(ppid),
         pgid: u64::from(nr(pg, ns)),
         sid: u64::from(nr(se, ns)),
-        ns_ids,
-        levels,
+        pids,
         comm,
         state: match t.state() {
             // The run state as of its last switch (Linux task_state)
@@ -185,7 +178,8 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         signal: t.signal().cloned(),
         fs,
         files,
-    })
+    };
+    Some(Box::write(b, s))
 }
 
 /// Linux task_state_array letter and name
@@ -335,8 +329,17 @@ pub fn gen_status(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
         .enumerate()
     {
         let _ = write!(o, "{key}");
-        for ids in &s.ns_ids[..s.levels] {
-            let _ = write!(o, "\t{}", ids[i]);
+        let [leader, me, pg, se] = s.pids.each_ref().map(Option::as_deref);
+        let nr = |p: Option<&crate::task::pid::Pid>, u: &crate::task::pid::UPid| {
+            p.map_or(0, |p| p.nr_ns(&u.ns))
+        };
+        for u in me
+            .map_or(&[][..], |p| p.numbers())
+            .iter()
+            .skip(ns.level as usize)
+        {
+            let id = [nr(leader, u), u.nr, nr(pg, u), nr(se, u)][i];
+            let _ = write!(o, "\t{id}");
         }
         let _ = writeln!(o);
     }
@@ -345,16 +348,11 @@ pub fn gen_status(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
         status_mem(&mut o, &v);
     }
     status_sig(&mut o, &s);
-    let caps = [
-        ("CapInh", c.cap_inheritable.0),
-        ("CapPrm", c.cap_permitted.0),
-        ("CapEff", c.cap_effective.0),
-        ("CapBnd", c.cap_bset.0),
-        ("CapAmb", c.cap_ambient.0),
-    ];
-    for (k, v) in caps {
-        let _ = writeln!(o, "{k}:\t{v:016x}");
-    }
+    hex_line(&mut o, "CapInh", c.cap_inheritable.0);
+    hex_line(&mut o, "CapPrm", c.cap_permitted.0);
+    hex_line(&mut o, "CapEff", c.cap_effective.0);
+    hex_line(&mut o, "CapBnd", c.cap_bset.0);
+    hex_line(&mut o, "CapAmb", c.cap_ambient.0);
     let _ = writeln!(o, "NoNewPrivs:\t{}", u8::from(s.no_new_privs));
     let _ = writeln!(o, "Seccomp:\t{}\nSeccomp_filters:\t0", s.seccomp);
     let _ = writeln!(o, "Speculation_Store_Bypass:\tunknown");
@@ -372,28 +370,23 @@ pub fn gen_status(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
 /// The Vm* lines (Linux task_mem; hk keeps no high-water marks, so
 /// VmPeak/VmHWM are the current sizes)
 fn status_mem(o: &mut Out, v: &VmStat) {
-    let kb = |pages: u64| pages * 4;
-    let lines = [
-        ("VmPeak", kb(v.total)),
-        ("VmSize", kb(v.total)),
-        ("VmLck", kb(v.locked)),
-        ("VmPin", 0),
-        ("VmHWM", kb(v.rss)),
-        ("VmRSS", kb(v.rss)),
-        ("RssAnon", kb(v.rss)),
-        ("RssFile", 0),
-        ("RssShmem", 0),
-        ("VmData", kb(v.data)),
-        ("VmStk", kb(v.stack)),
-        ("VmExe", kb(v.text)),
-        ("VmLib", kb(v.lib)),
-        ("VmPTE", 0),
-        ("VmSwap", kb(v.swap)),
-    ];
-    for (k, val) in lines {
-        let _ = writeln!(o, "{k}:\t{val:>8} kB");
-    }
-    let _ = writeln!(o, "HugetlbPages:\t{:>8} kB", 0);
+    // Printed one by one, as Linux task_mem: no table on the stack
+    kb_line(o, "VmPeak", v.total);
+    kb_line(o, "VmSize", v.total);
+    kb_line(o, "VmLck", v.locked);
+    kb_line(o, "VmPin", 0);
+    kb_line(o, "VmHWM", v.rss);
+    kb_line(o, "VmRSS", v.rss);
+    kb_line(o, "RssAnon", v.rss);
+    kb_line(o, "RssFile", 0);
+    kb_line(o, "RssShmem", 0);
+    kb_line(o, "VmData", v.data);
+    kb_line(o, "VmStk", v.stack);
+    kb_line(o, "VmExe", v.text);
+    kb_line(o, "VmLib", v.lib);
+    kb_line(o, "VmPTE", 0);
+    kb_line(o, "VmSwap", v.swap);
+    kb_line(o, "HugetlbPages", 0);
     let _ = writeln!(o, "CoreDumping:\t0\nTHP_enabled:\t1");
 }
 
@@ -408,16 +401,22 @@ fn status_sig(o: &mut Out, s: &Snap) {
     let queued = s.cred.ucounts.get(crate::task::Ucount::Sigpending);
     let (ign, cgt) = ign_cgt(s);
     let _ = writeln!(o, "Threads:\t{}\nSigQ:\t{}/{}", s.threads, queued, qlim);
-    let sets = [
-        ("SigPnd", s.pending),
-        ("ShdPnd", shd_pnd(s)),
-        ("SigBlk", s.blocked),
-        ("SigIgn", ign),
-        ("SigCgt", cgt),
-    ];
-    for (k, v) in sets {
-        let _ = writeln!(o, "{k}:\t{v:016x}");
-    }
+    hex_line(o, "SigPnd", s.pending);
+    hex_line(o, "ShdPnd", shd_pnd(s));
+    hex_line(o, "SigBlk", s.blocked);
+    hex_line(o, "SigIgn", ign);
+    hex_line(o, "SigCgt", cgt);
+}
+
+/// A `key:\t` line of `pages` in kB (Linux task_mem's SEQ_PUT_DEC)
+fn kb_line(o: &mut Out, key: &str, pages: u64) {
+    let _ = writeln!(o, "{key}:\t{:>8} kB", pages * 4);
+}
+
+/// A `key:\t` line of a 64-bit set in hex (Linux render_sigset_t,
+/// render_cap_t)
+fn hex_line(o: &mut Out, key: &str, v: u64) {
+    let _ = writeln!(o, "{key}:\t{v:016x}");
 }
 
 /// /proc/<pid>/stat (Linux do_task_stat, whole thread group): all 52
@@ -579,8 +578,7 @@ mod tests {
             ppid: 1,
             pgid: 40,
             sid: 30,
-            ns_ids: [[0; 4]; LEVELS],
-            levels: 0,
+            pids: [None, None, None, None],
             comm: c,
             state: TaskState::Sleeping,
             traced: false,
