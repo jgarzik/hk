@@ -33,14 +33,13 @@ use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, MAY_NOT_BLOCK, may_follow_link, permission_as};
 use crate::fs::dentry::{__d_lookup_rcu, Dentry, DentryRef, LookupBits};
 use crate::fs::fsstruct::PathRcu;
-use crate::fs::inode::{Inode, Link};
+use crate::fs::inode::{Inode, InodeRef, Link};
 use crate::fs::mount::{
     __lookup_mnt, MNT_NOSYMFOLLOW, MOUNT_LOCK, Mount, MountRef, choose_mountpoint_rcu,
     path_connected,
 };
 use crate::fs::path_ref::Path;
 use crate::sync::rcu::RcuReadGuard;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// Where an RCU walk stands (Linux nameidata's path, inode and seq
@@ -206,7 +205,7 @@ pub(super) struct Lazy<'p> {
 pub(super) struct HeldFrame {
     pub(super) link: Path,
     pub(super) body: Option<Vec<u8>>,
-    pub(super) inode: Option<Arc<Inode>>,
+    pub(super) inode: Option<InodeRef>,
     pub(super) pos: usize,
     pub(super) tail_empty: bool,
 }
@@ -1244,7 +1243,7 @@ mod tests {
     use crate::fs::inode::{InodeMode, NULL_INODE_OPS, Timespec};
     use alloc::sync::{Arc, Weak};
 
-    fn inode() -> Arc<Inode> {
+    fn inode() -> InodeRef {
         Inode::alloc(Inode::new(
             1,
             InodeMode::directory(0o755),

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use super::{ProcPid, ProcfsInodeData, create_file_inode, pid_ino, task_nsproxy};
 use crate::fs::KernelError;
 use crate::fs::file::{DirContext, DirEntry};
-use crate::fs::inode::{FileType, Inode, InodeMode};
+use crate::fs::inode::{FileType, Inode, InodeMode, InodeRef};
 use crate::net::NetNamespace;
 use crate::task::percpu::TaskRef;
 
@@ -50,7 +50,7 @@ fn task_net(t: &TaskRef) -> Option<Arc<NetNamespace>> {
 
 /// Look `name` up in the /proc/<pid>/net directory `dir` of `p`
 /// (Linux proc_tgid_net_lookup)
-pub(super) fn lookup(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, KernelError> {
+pub(super) fn lookup(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, KernelError> {
     let t = p.task().ok_or(KernelError::NotFound)?;
     let net = task_net(&t).ok_or(KernelError::NotFound)?;
     let (i, &(_, generator)) = NET_FILES

@@ -25,7 +25,9 @@ use alloc::vec::Vec;
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
-use crate::fs::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use crate::fs::inode::{
+    AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, Timespec,
+};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
@@ -179,7 +181,7 @@ impl InodeOps for CgroupfsInodeOps {
         }
     }
 
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let data = private
             .as_ref()
@@ -223,7 +225,7 @@ impl InodeOps for CgroupfsInodeOps {
         }
     }
 
-    fn mkdir(&self, dir: &Inode, name: &[u8], _mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], _mode: InodeMode) -> Result<InodeRef, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let data = private
             .as_ref()
@@ -269,10 +271,7 @@ pub static CGROUPFS_INODE_OPS: CgroupfsInodeOps = CgroupfsInodeOps;
 // ============================================================================
 
 /// Create a cgroup directory inode
-fn create_cgroup_dir_inode(
-    parent: &Inode,
-    cgroup: &Arc<Cgroup>,
-) -> Result<Arc<Inode>, KernelError> {
+fn create_cgroup_dir_inode(parent: &Inode, cgroup: &Arc<Cgroup>) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let inode = Inode::alloc(Inode::new(
         cgroup.ino,
@@ -295,7 +294,7 @@ fn create_control_file_inode(
     parent: &Inode,
     cgroup: &Arc<Cgroup>,
     file_type: CgroupControlFileType,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let mode = if file_type.is_writable() {
         0o644
@@ -325,7 +324,7 @@ fn create_subsys_file_inode(
     cgroup: &Arc<Cgroup>,
     controller: ControllerType,
     file_name: &'static str,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
 
     // Determine mode from controller's control file definition
@@ -761,7 +760,7 @@ impl SuperOps for CgroupfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         let inode = Inode::alloc(Inode::new(
             sb.alloc_ino(),
             mode,

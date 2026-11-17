@@ -177,7 +177,7 @@ pub enum Link {
 /// of the dentry it was given, with its d_time / d_fsdata set first)
 pub struct Found {
     /// The inode; None: no such name, kept as a negative dentry
-    pub inode: Option<Arc<Inode>>,
+    pub inode: Option<InodeRef>,
     /// The new dentry's `d_time`, what the filesystem's d_revalidate
     /// checks (vfat's directory version, kernfs's revision)
     pub d_time: u64,
@@ -186,7 +186,7 @@ pub struct Found {
 /// Inode operations trait - filesystem-specific behavior
 pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError>;
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError>;
 
     /// [`InodeOps::lookup`] as the dcache asks it (Linux ->lookup): a
     /// filesystem that keeps negative dentries (one its d_revalidate
@@ -232,7 +232,7 @@ pub trait InodeOps: Send + Sync {
     }
 
     /// Create a new file in a directory
-    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let _ = (dir, name, mode);
         Err(KernelError::OperationNotSupported)
     }
@@ -253,13 +253,13 @@ pub trait InodeOps: Send + Sync {
 
     /// A new regular file of `dir`'s file system with no name (nlink 0)
     /// for O_TMPFILE (Linux ->tmpfile); default EOPNOTSUPP
-    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<InodeRef, KernelError> {
         let _ = (dir, mode);
         Err(KernelError::OperationNotSupported)
     }
 
     /// Create a new directory
-    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let _ = (dir, name, mode);
         Err(KernelError::OperationNotSupported)
     }
@@ -271,7 +271,7 @@ pub trait InodeOps: Send + Sync {
         name: &[u8],
         mode: InodeMode,
         rdev: DevId,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         let _ = (dir, name, mode, rdev);
         Err(KernelError::OperationNotSupported)
     }
@@ -312,13 +312,13 @@ pub trait InodeOps: Send + Sync {
     }
 
     /// Create a symbolic link
-    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<InodeRef, KernelError> {
         let _ = (dir, name, target);
         Err(KernelError::OperationNotSupported)
     }
 
     /// Create a hard link (new directory entry pointing to existing inode)
-    fn link(&self, dir: &Inode, name: &[u8], inode: &Arc<Inode>) -> Result<(), KernelError> {
+    fn link(&self, dir: &Inode, name: &[u8], inode: &InodeRef) -> Result<(), KernelError> {
         let _ = (dir, name, inode);
         Err(KernelError::OperationNotSupported)
     }
@@ -338,7 +338,7 @@ pub trait InodeOps: Send + Sync {
         &self,
         old_dir: &Inode,
         old_name: &[u8],
-        new_dir: &Arc<Inode>,
+        new_dir: &InodeRef,
         new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
@@ -352,7 +352,7 @@ pub trait InodeOps: Send + Sync {
     /// without the op.
     fn fallocate(
         &self,
-        inode: &Arc<Inode>,
+        inode: &InodeRef,
         mode: i32,
         offset: u64,
         len: u64,
@@ -365,7 +365,7 @@ pub trait InodeOps: Send + Sync {
     ///
     /// If the file was larger than length, the extra data is discarded.
     /// If the file was shorter, it is extended with null bytes.
-    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
+    fn truncate(&self, inode: &InodeRef, length: u64) -> Result<(), KernelError> {
         let _ = (inode, length);
         Err(KernelError::OperationNotSupported)
     }
@@ -554,6 +554,10 @@ pub mod iflags {
     pub const I_LINKABLE: u32 = 1 << 16;
 }
 
+/// A counted reference to an inode (Linux an igrab'd or ihold'd
+/// `struct inode *`)
+pub type InodeRef = Arc<Inode>;
+
 /// A FIFO inode's pipe and its open count (`Inode.i_pipe`)
 pub type PipeSlot = Option<(Arc<crate::io::pipe::Pipe>, usize)>;
 
@@ -737,7 +741,7 @@ pub type SbInodes = LockedBy<WeakList<SbInodeA>, InodeSbLists>;
 static INODE_SB_LIST_LOCK: Mutex<InodeSbLists> = Mutex::new(InodeSbLists(()));
 
 /// List a new inode on its superblock (Linux inode_sb_list_add)
-fn sb_list_add(sb: &SuperBlock, inode: &Arc<Inode>) {
+fn sb_list_add(sb: &SuperBlock, inode: &InodeRef) {
     let mut l = INODE_SB_LIST_LOCK.lock();
     sb.s_inodes.access_mut(&mut l).push_front(inode);
 }
@@ -775,8 +779,8 @@ pub(super) fn sb_list_drain(list: &SbInodes) {
 /// drop_pagecache_sb's walk): each taken under `INODE_SB_LIST_LOCK`
 /// and held while `f` runs with no lock, released after the next one is
 /// taken; allocates nothing. False if `f` stopped the walk.
-pub fn for_each_sb_inode(sb: &Arc<SuperBlock>, f: &mut dyn FnMut(&Arc<Inode>) -> bool) -> bool {
-    let mut cur: Option<Arc<Inode>> = None;
+pub fn for_each_sb_inode(sb: &Arc<SuperBlock>, f: &mut dyn FnMut(&InodeRef) -> bool) -> bool {
+    let mut cur: Option<InodeRef> = None;
     loop {
         let next = {
             let l = INODE_SB_LIST_LOCK.lock();
@@ -1393,7 +1397,7 @@ impl Drop for DioGuard<'_> {
 
 /// [`InodeLock`] owning its inode reference ([`Inode::lock_arc`])
 #[must_use]
-pub struct InodeLockArc(Arc<Inode>);
+pub struct InodeLockArc(InodeRef);
 
 impl Drop for InodeLockArc {
     fn drop(&mut self) {
@@ -1418,7 +1422,7 @@ impl Drop for InodeLockShared<'_> {
 pub struct NullInodeOps;
 
 impl InodeOps for NullInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 }
@@ -1428,7 +1432,7 @@ pub static NULL_INODE_OPS: NullInodeOps = NullInodeOps;
 
 /// Write access to an inode, held by a file open for writing and by a
 /// truncate (Linux get_write_access / put_write_access)
-pub struct InodeWrite(Arc<Inode>);
+pub struct InodeWrite(InodeRef);
 
 impl Inode {
     /// Take write access (Linux get_write_access): ETXTBSY while the
@@ -1719,7 +1723,7 @@ mod tests {
     struct TestOps;
 
     impl InodeOps for TestOps {
-        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
             Err(KernelError::NotFound)
         }
     }

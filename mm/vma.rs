@@ -375,7 +375,7 @@ impl Vma {
     }
 
     /// The inode of the mapped file (its i_mmap lists this VMA)
-    pub fn inode(&self) -> Option<Arc<crate::fs::Inode>> {
+    pub fn inode(&self) -> Option<crate::fs::InodeRef> {
         self.file.as_ref().and_then(|f| f.mapping_inode())
     }
 

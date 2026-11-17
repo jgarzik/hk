@@ -35,7 +35,7 @@ use crate::sync::spin::{Mutex, RwLock};
 
 use super::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
-use crate::fs::{Inode, LookupFlags, lookup_path};
+use crate::fs::{Inode, InodeRef, LookupFlags, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
 use crate::mm::xarray::XArray;
@@ -133,7 +133,7 @@ struct SwapMap {
 /// One swap area (Linux swap_info_struct)
 pub struct SwapInfo {
     /// Backing file (a swap file)
-    pub inode: Option<Arc<Inode>>,
+    pub inode: Option<InodeRef>,
     /// Backing block device (a swap partition)
     pub bdev: Option<crate::block::blkdev::BdevHandle>,
     /// Path given to swapon
@@ -210,7 +210,7 @@ impl SwapInfo {
     }
 
     fn new(
-        backing: (Option<Arc<Inode>>, Option<crate::block::blkdev::BdevHandle>),
+        backing: (Option<InodeRef>, Option<crate::block::blkdev::BdevHandle>),
         path: Vec<u8>,
         swap_type: u8,
         max: u64,

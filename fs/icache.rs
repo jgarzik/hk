@@ -48,7 +48,7 @@ use core::sync::atomic::Ordering;
 
 use spin::Once;
 
-use super::inode::Inode;
+use super::inode::{Inode, InodeRef};
 use super::superblock::SuperBlock;
 use crate::sync::spin::Mutex;
 use crate::sync::{LockedBy, UniqueOwner};
@@ -96,7 +96,7 @@ fn bucket(sb: *const SuperBlock, hashval: u64) -> &'static Bucket {
 
 /// What a search found
 enum Found {
-    Live(Arc<Inode>),
+    Live(InodeRef),
     /// Its inode, its last reference gone, is still hashed (Linux
     /// I_WILL_FREE / I_FREEING): its address, the key of its wait queue
     /// (never dereferenced once the lock is dropped)
@@ -157,7 +157,7 @@ pub fn ilookup5(
     sb: &Arc<SuperBlock>,
     hashval: u64,
     test: &dyn Fn(&Inode) -> bool,
-) -> Option<Arc<Inode>> {
+) -> Option<InodeRef> {
     let b = bucket(Arc::as_ptr(sb), hashval);
     loop {
         crate::sync::might_sleep();
@@ -179,8 +179,8 @@ pub fn iget5(
     sb: &Arc<SuperBlock>,
     hashval: u64,
     test: &dyn Fn(&Inode) -> bool,
-    make: impl FnOnce() -> Result<Arc<Inode>, KernelError>,
-) -> Result<Arc<Inode>, KernelError> {
+    make: impl FnOnce() -> Result<InodeRef, KernelError>,
+) -> Result<InodeRef, KernelError> {
     if let Some(i) = ilookup5(sb, hashval, test) {
         return Ok(i);
     }
@@ -207,14 +207,14 @@ pub fn iget5(
 
 /// Hash `i` under `hashval` on its bucket `b` (Linux
 /// __insert_inode_hash: hlist_add_head)
-fn hash_locked(l: &mut InodeHash, b: &Bucket, i: &Arc<Inode>, hashval: u64) {
+fn hash_locked(l: &mut InodeHash, b: &Bucket, i: &InodeRef, hashval: u64) {
     i.i_hash.store(hashval, Ordering::Relaxed);
     b.access_mut(l).push_front(i);
 }
 
 /// Hash a new inode under `hashval` (Linux insert_inode_hash): for an
 /// object a create just made, which no lookup can have found yet
-pub fn insert_inode_hash(inode: &Arc<Inode>, hashval: u64) {
+pub fn insert_inode_hash(inode: &InodeRef, hashval: u64) {
     if inode.superblock().is_none() {
         return;
     }
@@ -226,7 +226,7 @@ pub fn insert_inode_hash(inode: &Arc<Inode>, hashval: u64) {
 /// shmem_encode_fh: inode_unhashed, then __insert_inode_hash under a
 /// lock of its own, here this lock): for a filesystem that hashes its
 /// inodes only once some lookup may need them
-pub fn insert_inode_hash_once(inode: &Arc<Inode>, hashval: u64) {
+pub fn insert_inode_hash_once(inode: &InodeRef, hashval: u64) {
     if inode.superblock().is_none() || inode.i_hash_node.is_linked() {
         return;
     }
@@ -268,7 +268,7 @@ fn unhash(inode: &Inode) -> bool {
 }
 
 /// Move `inode` to `hashval` (Linux fat_detach + fat_attach on rename)
-pub fn rehash(inode: &Arc<Inode>, hashval: u64) {
+pub fn rehash(inode: &InodeRef, hashval: u64) {
     remove_inode_hash(inode);
     insert_inode_hash(inode, hashval);
 }

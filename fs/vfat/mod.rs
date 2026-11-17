@@ -27,7 +27,7 @@ use crate::util::pod::{FromBytes, IntoBytes};
 use super::dentry::Dentry;
 use super::file::{DirContext, DirEntry as VfsDirEntry, File, FileOps, RwFlags};
 use super::icache;
-use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, Timespec};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
@@ -213,11 +213,7 @@ fn update_size(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
 /// generic_perform_write): clusters first, a gap past the old end
 /// zeroed, the data through the page cache (written back later), then
 /// the new size in the directory entry. The VFS holds i_rwsem.
-fn vfat_write(
-    inode: &Arc<Inode>,
-    from: &mut IovSource<'_>,
-    pos: u64,
-) -> Result<usize, KernelError> {
+fn vfat_write(inode: &InodeRef, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
     if from.is_empty() {
         return Ok(0);
     }
@@ -1880,7 +1876,7 @@ impl InodeOps for VfatInodeOps {
         }
     }
 
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         let name = &user_name(dir, name, KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -1942,7 +1938,7 @@ impl InodeOps for VfatInodeOps {
         }
     }
 
-    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let name = &new_name(dir, name)?;
         let _ = mode; // FAT doesn't support Unix permissions
         let sb = dir.superblock().ok_or(KernelError::Io)?;
@@ -2007,7 +2003,7 @@ impl InodeOps for VfatInodeOps {
         Ok(inode)
     }
 
-    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let name = &new_name(dir, name)?;
         let _ = mode; // FAT doesn't support Unix permissions
         let sb = dir.superblock().ok_or(KernelError::Io)?;
@@ -2181,7 +2177,7 @@ impl InodeOps for VfatInodeOps {
     /// the end (truncate_setsize, mappings included) before the clusters
     /// go; growing zeroes the rest of the last cluster through the page
     /// cache and gives the file zeroed clusters. The VFS holds i_rwsem.
-    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
+    fn truncate(&self, inode: &InodeRef, length: u64) -> Result<(), KernelError> {
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let d = get_inode_data(inode)?;
@@ -2231,7 +2227,7 @@ impl InodeOps for VfatInodeOps {
     /// (fat_cont_expand); nothing else
     fn fallocate(
         &self,
-        inode: &Arc<Inode>,
+        inode: &InodeRef,
         mode: i32,
         offset: u64,
         len: u64,
@@ -2259,7 +2255,7 @@ impl InodeOps for VfatInodeOps {
         &self,
         old_dir: &Inode,
         old_name: &[u8],
-        new_dir: &Arc<Inode>,
+        new_dir: &InodeRef,
         new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
@@ -2380,7 +2376,7 @@ fn is_obj(inode: &Inode, parent: u32, short: &[u8; 11]) -> bool {
 }
 
 /// The cached inode of the entry `short` in the directory at `parent`
-fn cached(sb: &Arc<SuperBlock>, parent: u32, short: &[u8; 11]) -> Option<Arc<Inode>> {
+fn cached(sb: &Arc<SuperBlock>, parent: u32, short: &[u8; 11]) -> Option<InodeRef> {
     icache::ilookup5(sb, ikey(parent, short), &|i| is_obj(i, parent, short))
 }
 
@@ -2390,7 +2386,7 @@ fn vfat_iget(
     sb: &Arc<SuperBlock>,
     entry: &ParsedDirEntry,
     parent: u32,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let short = entry.short_name;
     icache::iget5(
         sb,
@@ -2429,7 +2425,7 @@ fn create_inode_for_entry(
     sb: &Arc<SuperBlock>,
     entry: &ParsedDirEntry,
     parent_cluster: u32,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb_data = get_sb_data(sb)?;
     // A directory points at a cluster of its own (Linux
     // fat_validate_dir); a file's first cluster is checked when its
@@ -2674,7 +2670,7 @@ impl SuperOps for VfatSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         Inode::alloc(Inode::new(
             sb.alloc_ino(),
             mode,

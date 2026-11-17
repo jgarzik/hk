@@ -493,7 +493,7 @@ impl SuperOps for TmpfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: crate::fs::inode::InodeMode,
         i_op: &'static dyn crate::fs::inode::InodeOps,
-    ) -> Result<Arc<crate::fs::inode::Inode>, KernelError> {
+    ) -> Result<crate::fs::inode::InodeRef, KernelError> {
         super::RAMFS_SUPER_OPS.alloc_inode(sb, mode, i_op)
     }
 
@@ -553,7 +553,7 @@ fn fh_hash(ino: u64, generation: u32) -> u64 {
 
 impl ExportOps for ShmemExportOps {
     /// Linux shmem_encode_fh
-    fn encode_fh(&self, inode: &Arc<crate::fs::inode::Inode>, fh: &mut [u32]) -> Encoded {
+    fn encode_fh(&self, inode: &crate::fs::inode::InodeRef, fh: &mut [u32]) -> Encoded {
         let Some(w) = fh.get_mut(..SHMEM_FH_LEN) else {
             return Err(SHMEM_FH_LEN);
         };

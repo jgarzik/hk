@@ -6,8 +6,6 @@
 //! - truncate, ftruncate (file size modification)
 //! - pipe, pipe2 (pipe creation)
 
-use alloc::sync::Arc;
-
 use crate::fs::{KernelError, LookupFlags};
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
@@ -26,7 +24,7 @@ use crate::task::fdtable::UnusedFd;
 /// `times` (ftruncate: Linux ATTR_MTIME | ATTR_CTIME): mtime and ctime
 /// are set even when the size stays; without it only a size change
 /// sets them (the file system's setattr, as ext4, tmpfs and vfat).
-fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelResult<()> {
+fn do_truncate(inode: &super::InodeRef, length: u64, times: bool) -> KernelResult<()> {
     // Check RLIMIT_FSIZE when extending the file
     let current_size = inode.get_size();
     // RLIMIT_FSIZE (SIGXFSZ), then the filesystem's largest file (Linux

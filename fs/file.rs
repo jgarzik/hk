@@ -16,7 +16,7 @@ use crate::sync;
 
 use super::KernelError;
 use super::dentry::DentryRef;
-use super::inode::{FileType, Inode, InodeId};
+use super::inode::{FileType, Inode, InodeId, InodeRef};
 use super::iov_iter::{IovDest, IovSource};
 use super::mount::MountRef;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
@@ -727,7 +727,7 @@ impl File {
     /// The inode whose page cache holds the file's data (Linux
     /// f_mapping->host): a block device node's is the device's bdev
     /// inode, every other file's its own
-    pub fn mapping_inode(&self) -> Option<Arc<Inode>> {
+    pub fn mapping_inode(&self) -> Option<InodeRef> {
         if let Some(b) = self.private_ref::<crate::block::BlockDevice>() {
             return Some(b.bd_inode.clone());
         }
@@ -735,7 +735,7 @@ impl File {
     }
 
     /// Get the inode for this file
-    pub fn get_inode(&self) -> Option<Arc<Inode>> {
+    pub fn get_inode(&self) -> Option<InodeRef> {
         self.dentry.get_inode()
     }
 
@@ -1325,7 +1325,7 @@ impl Drop for FileRef {
 /// mm->exe_file) is one.
 pub struct DenyWrite {
     /// Let go first, as Linux allows writes before the fput
-    inode: Option<Arc<Inode>>,
+    inode: Option<InodeRef>,
     file: FileRef,
 }
 

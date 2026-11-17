@@ -39,7 +39,7 @@ const ON_NONE: u8 = 0;
 const ON_DIRTY: u8 = 1;
 const ON_IO: u8 = 2;
 
-use super::inode::Inode;
+use super::inode::{Inode, InodeRef};
 use super::superblock::{SuperBlock, iterate_supers};
 use crate::mm::writeback::BdiWriteback;
 use crate::util::error::KernelError;
@@ -64,7 +64,7 @@ fn inode_to_wb(inode: &Inode) -> Option<Arc<BdiWriteback>> {
 /// periodic writeback if nothing was queued (its mapping notes when it
 /// became dirty). An inode with no device to write to stays marked and
 /// unqueued (Linux noop_backing_dev_info).
-pub fn mark_inode_dirty(inode: &Arc<Inode>) {
+pub fn mark_inode_dirty(inode: &InodeRef) {
     if !inode.i_data.aops().can_dirty() || inode.i_dirty.swap(true, Ordering::AcqRel) {
         return;
     }

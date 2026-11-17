@@ -2,7 +2,6 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::{File, FileRef};
@@ -85,7 +84,7 @@ fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
 /// A shared writable mapping counted on its file's mapping while it is
 /// made (Linux mapping_map_writable .. mapping_unmap_writable around
 /// vma_link, which counts it for good)
-struct WritableHold(Option<Arc<crate::fs::Inode>>);
+struct WritableHold(Option<crate::fs::InodeRef>);
 
 impl WritableHold {
     fn new(v: &Vma) -> Result<Self, KernelError> {

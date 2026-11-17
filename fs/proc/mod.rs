@@ -42,7 +42,7 @@ use crate::sync::spin::RwLock;
 use super::KernelError;
 use super::dentry::Dentry;
 use super::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
-use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, Timespec};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::io::poll::{DEFAULT_POLLMASK, POLLIN, POLLRDNORM, PollTable};
@@ -216,7 +216,7 @@ pub enum ProcfsInodeData {
     /// Directory with static children (built at mount; shared, so a
     /// readdir walks them with no lock held)
     Directory {
-        children: Arc<BTreeMap<String, Arc<Inode>>>,
+        children: Arc<BTreeMap<String, InodeRef>>,
     },
     /// File with content generator
     File { generator: ContentGenerator },
@@ -340,7 +340,7 @@ impl ProcfsInodeData {
     }
 
     /// Get children map (for static directories)
-    pub fn children(&self) -> Option<&BTreeMap<String, Arc<Inode>>> {
+    pub fn children(&self) -> Option<&BTreeMap<String, InodeRef>> {
         match self {
             Self::Directory { children } => Some(children),
             _ => None,
@@ -554,7 +554,7 @@ impl InodeOps for ProcfsInodeOps {
     /// A new per-process inode takes the task's owner (Linux
     /// proc_pid_make_inode -> pid_update_inode), so its first permission
     /// check sees it
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         let inode = proc_lookup(dir, name)?;
         pid_update_inode(&inode);
         Ok(inode)
@@ -663,7 +663,7 @@ impl ProcRcu {
 
 /// A new procfs inode's data, and what an RCU walk reads of it, before
 /// the inode is visible
-fn set_data(inode: &Arc<Inode>, data: ProcfsInodeData) -> Result<(), KernelError> {
+fn set_data(inode: &InodeRef, data: ProcfsInodeData) -> Result<(), KernelError> {
     let opts = inode.superblock().and_then(|sb| sb.get_private());
     inode.set_private_rcu(try_arc(ProcRcu::of(&data, opts))?);
     inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
@@ -832,14 +832,14 @@ fn pid_update_inode(inode: &Inode) {
 }
 
 /// Look up `name` in the /proc directory `dir`
-fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
     // Every /proc name is text: anything else names nothing
     let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
 
     // What the directory is, copied out: lookups allocate inodes and
     // take TASKLIST, so none runs under the inode data's spin lock
     enum Dir {
-        Static(Option<Arc<Inode>>, bool),
+        Static(Option<InodeRef>, bool),
         Pid(ProcPid),
         Ns(ProcPid),
         Fd(ProcPid),
@@ -959,7 +959,7 @@ fn create_dir_inode(
     parent: &Inode,
     ino: u64,
     data: ProcfsInodeData,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let inode = Inode::alloc(Inode::new(
         ino,
@@ -981,7 +981,7 @@ fn create_file_inode(
     ino: u64,
     mode: InodeMode,
     data: ProcfsInodeData,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().ok_or(KernelError::Io)?;
     let inode = Inode::alloc(Inode::new(
         ino,
@@ -997,7 +997,7 @@ fn create_file_inode(
     Ok(inode)
 }
 
-fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<Arc<Inode>, KernelError> {
+fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let inode = Inode::alloc(Inode::new(
         pid_ino(pid.ino(), 0),
@@ -1014,7 +1014,7 @@ fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<Arc<Inode>, Kern
 }
 
 /// Look up entries in /proc/<pid>/
-fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, KernelError> {
+fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, KernelError> {
     // The task, while its pid names one; its tid only numbers inodes
     let t = p.task().ok_or(KernelError::NotFound)?;
     let pid = t.tid();
@@ -1142,7 +1142,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
 }
 
 /// Look up entries in /proc/<pid>/ns/
-fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, KernelError> {
+fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, KernelError> {
     // The task, while its pid names one; its tid only numbers inodes
     let t = p.task().ok_or(KernelError::NotFound)?;
     let pid = t.tid();
@@ -1209,7 +1209,7 @@ fn self_link_rcu(r: &ProcRcu) -> Result<Vec<u8>, KernelError> {
 }
 
 /// /proc/self (resolved at readlink time to the reader's pid)
-fn create_self_link(parent: &Inode) -> Result<Arc<Inode>, KernelError> {
+fn create_self_link(parent: &Inode) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let inode = Inode::alloc(Inode::new(
         pid_ino(0, 999),
@@ -1264,7 +1264,7 @@ fn fd_jump(pid: &ProcPid, fd: i32) -> Result<crate::fs::Path, KernelError> {
 }
 
 /// Look up entries in /proc/<pid>/fd/
-fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, KernelError> {
+fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, KernelError> {
     // The task, while its pid names one; its tid only numbers inodes
     let t = p.task().ok_or(KernelError::NotFound)?;
     let pid = t.tid();
@@ -1315,11 +1315,7 @@ fn fd_update_inode(inode: &Inode, file: &File) {
 }
 
 /// Look up entries in /proc/<pid>/fdinfo/
-fn lookup_pid_fdinfo_entry(
-    dir: &Inode,
-    p: &ProcPid,
-    name: &str,
-) -> Result<Arc<Inode>, KernelError> {
+fn lookup_pid_fdinfo_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, KernelError> {
     // The task, while its pid names one; its tid only numbers inodes
     let t = p.task().ok_or(KernelError::NotFound)?;
     let pid = t.tid();
@@ -2079,7 +2075,7 @@ impl FileOps for ProcfsFileOps {
         // shared reference): entries are emitted, and TASKLIST taken,
         // with the inode data's spin lock released
         enum Dir {
-            Static(Arc<BTreeMap<String, Arc<Inode>>>),
+            Static(Arc<BTreeMap<String, InodeRef>>),
             Pid(ProcPid),
             Ns(ProcPid),
             Fd(ProcPid),
@@ -2465,7 +2461,7 @@ impl SuperOps for ProcfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         let inode = Inode::alloc(Inode::new(
             sb.alloc_ino(),
             mode,
@@ -2603,7 +2599,7 @@ fn mk_inode(
     sb: &Arc<SuperBlock>,
     mode: InodeMode,
     data: ProcfsInodeData,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
         mode,
@@ -2629,8 +2625,8 @@ fn mk_inode(
 /// proc_dir_entry before proc_register links it under
 /// proc_subdir_lock), so nothing is added under the data's lock
 struct DirBuild {
-    inode: Arc<Inode>,
-    files: BTreeMap<String, Arc<Inode>>,
+    inode: InodeRef,
+    files: BTreeMap<String, InodeRef>,
     dirs: BTreeMap<String, DirBuild>,
 }
 
@@ -2678,7 +2674,7 @@ impl DirBuild {
 
     /// The directory's inode, its entries (subdirectories finished
     /// first) now its data
-    fn finish(self) -> Result<Arc<Inode>, KernelError> {
+    fn finish(self) -> Result<InodeRef, KernelError> {
         let mut map = self.files;
         for (name, d) in self.dirs {
             map.insert(name, d.finish()?);

@@ -18,7 +18,6 @@
 
 mod rcu;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, OnceCell};
 
@@ -30,7 +29,7 @@ use crate::fs::dac::{MAY_EXEC, permission_as};
 use crate::fs::dentry::{Dentry, DentryRef, LookupBits, d_invalidate};
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use crate::fs::fsstruct::FsStruct;
-use crate::fs::inode::{Inode, Link};
+use crate::fs::inode::{Inode, InodeRef, Link};
 use crate::fs::mount::{
     MOUNT_LOCK, MountRef, choose_mountpoint, follow_mount, is_path_reachable, path_connected,
 };
@@ -1041,7 +1040,7 @@ fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelErr
 /// with the caller's credentials; the new dentry is cached
 pub fn create_entry(
     p: &Parent,
-    make: impl FnOnce(&Arc<Inode>, &Cred) -> Result<Arc<Inode>, KernelError>,
+    make: impl FnOnce(&InodeRef, &Cred) -> Result<InodeRef, KernelError>,
 ) -> Result<DentryRef, KernelError> {
     let (parent, name) = (&p.dir, p.name.as_slice());
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
@@ -1326,7 +1325,7 @@ mod tests {
         ..DentryOps::NONE
     };
 
-    fn inode(ino: u64) -> Arc<Inode> {
+    fn inode(ino: u64) -> InodeRef {
         let m = InodeMode::directory(0o755);
         let t = Timespec::from_secs(0);
         Inode::alloc(Inode::new(ino, m, 0, 0, 0, t, Weak::new(), &NULL_INODE_OPS)).unwrap()

@@ -892,7 +892,7 @@ fn store_pos(ptr: UserPtr<i64>, f: &File, end: u64) -> KernelResult<()> {
 fn copy_files_ok(
     fin: &File,
     fout: &File,
-) -> Result<(Arc<crate::fs::Inode>, Arc<crate::fs::Inode>), KernelError> {
+) -> Result<(crate::fs::InodeRef, crate::fs::InodeRef), KernelError> {
     let (Some(iin), Some(iout)) = (fin.get_inode(), fout.get_inode()) else {
         return Err(KernelError::InvalidArgument);
     };

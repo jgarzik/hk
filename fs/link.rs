@@ -11,7 +11,7 @@ use crate::fs::namei::{
     getname,
 };
 use crate::fs::{
-    Inode, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
+    InodeRef, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
     lock_two_nondirs, lookup_one,
 };
 use crate::uaccess::{UserPtr, UserSlice};
@@ -167,7 +167,7 @@ pub fn sys_link(oldpath_ptr: UserPtr<u8>, newpath_ptr: UserPtr<u8>) -> KernelRes
 /// unless it is a linkable O_TMPFILE file,
 /// and no unlink can drop its last link between that check and the link
 /// (Linux vfs_link: inode_lock(inode), i_nlink == 0 -> ENOENT)
-fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), KernelError> {
+fn link_locked(dir: &InodeRef, name: &[u8], inode: &InodeRef) -> Result<(), KernelError> {
     let _lock = inode.lock();
     // An O_TMPFILE file (I_LINKABLE) gets its first name once
     if inode.get_nlink() == 0 && !inode.is_linkable() {
@@ -384,7 +384,7 @@ fn do_renameat2(
 }
 
 /// One side of a rename: the split path and its parent's inode
-type Side<'a> = (&'a Parent, &'a Arc<Inode>);
+type Side<'a> = (&'a Parent, &'a InodeRef);
 
 /// The rename itself with both parents locked (Linux do_renameat2 trap
 /// check + vfs_rename): may_delete of the source, may_create or

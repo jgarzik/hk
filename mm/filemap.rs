@@ -33,7 +33,7 @@ use super::page::{
 };
 use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, XArray};
 use crate::FRAME_ALLOCATOR;
-use crate::fs::inode::Inode;
+use crate::fs::inode::{Inode, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
@@ -183,7 +183,7 @@ impl AddressSpace {
     /// Set the filesystem's operations and, for a mapping whose pages
     /// get dirty, the inode it belongs to (once, before any page is
     /// cached; Linux inode->i_mapping->a_ops, mapping->host)
-    pub fn set_aops(&self, a: &'static dyn Aops, host: Option<&alloc::sync::Arc<Inode>>) {
+    pub fn set_aops(&self, a: &'static dyn Aops, host: Option<&InodeRef>) {
         self.a_ops.call_once(|| a);
         if let Some(h) = host {
             self.host.call_once(|| alloc::sync::Arc::downgrade(h));

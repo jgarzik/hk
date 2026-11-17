@@ -26,7 +26,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::{ATTR_MAX, AttrNode, BinAttr, KNode, Kind, SysBuf};
 use crate::fs::KernelError;
 use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, generic_llseek};
-use crate::fs::inode::{AsAny, FileType, Found, Inode, InodeAttr, InodeData, InodeMode, InodeOps};
+use crate::fs::inode::{
+    AsAny, FileType, Found, Inode, InodeAttr, InodeData, InodeMode, InodeOps, InodeRef,
+};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::SuperBlock;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLPRI, PollTable};
@@ -83,7 +85,7 @@ pub fn knode_rcu(inode: &Inode) -> Option<&KfInode> {
 }
 
 /// A new inode for `kn` on `sb` (Linux kernfs_init_inode)
-pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, KernelError> {
+pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<InodeRef, KernelError> {
     let (mode, size) = match &kn.kind {
         Kind::Dir(_) => (InodeMode::directory(kn.mode), 0),
         Kind::Attr(_) => (InodeMode::regular(kn.mode), ATTR_MAX as u64),
@@ -122,7 +124,7 @@ impl InodeOps for KernfsIops {
         knode(inode).is_some_and(|k| k.empty)
     }
 
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         self.lookup_neg(dir, name)?
             .inode
             .ok_or(KernelError::NotFound)

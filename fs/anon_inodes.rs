@@ -26,7 +26,7 @@ use spin::Once;
 
 use crate::fs::FileRef;
 use crate::fs::file::{File, FileOps};
-use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
+use crate::fs::inode::{Inode, InodeMode, InodeOps, InodeRef, Timespec};
 use crate::sync::IrqSpinlock;
 use crate::util::error::KernelError;
 
@@ -61,7 +61,7 @@ pub fn get_next_ino() -> u64 {
 struct AnonInodeOps;
 
 impl InodeOps for AnonInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 
@@ -73,7 +73,7 @@ impl InodeOps for AnonInodeOps {
 static ANON_INODE_OPS: AnonInodeOps = AnonInodeOps;
 
 /// The inode every anonymous file shares
-static ANON_INODE: Once<Arc<Inode>> = Once::new();
+static ANON_INODE: Once<InodeRef> = Once::new();
 
 /// anon_inodefs and its shared inode (Linux anon_inode_init, an fs
 /// initcall: kern_mount, then alloc_anon_inode)

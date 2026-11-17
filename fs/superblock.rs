@@ -15,7 +15,7 @@ use crate::sync;
 
 use super::KernelError;
 use super::dentry::DentryRef;
-use super::inode::{Inode, InodeId, InodeMode, InodeOps};
+use super::inode::{Inode, InodeId, InodeMode, InodeOps, InodeRef};
 use crate::util::kalloc::try_arc;
 
 /// Superblock operations trait - filesystem-specific behavior
@@ -26,7 +26,7 @@ pub trait SuperOps: Send + Sync {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError>;
+    ) -> Result<InodeRef, KernelError>;
 
     /// Called when inode is no longer referenced
     fn drop_inode(&self, _inode: &Inode) {}
@@ -1332,7 +1332,7 @@ impl SuperOps for NullSuperOps {
         _sb: &Arc<SuperBlock>,
         _mode: InodeMode,
         _i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 }
@@ -1413,7 +1413,7 @@ mod tests {
     struct EvictOps;
 
     impl InodeOps for EvictOps {
-        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
             Err(KernelError::NotFound)
         }
 
@@ -1493,7 +1493,7 @@ mod tests {
 
     /// An inode a failing fill made and kept, and a passive reference
     /// to its superblock (`T3`)
-    static T3_KEPT: std::sync::Mutex<Option<(Arc<Inode>, Arc<SuperBlock>)>> =
+    static T3_KEPT: std::sync::Mutex<Option<(InodeRef, Arc<SuperBlock>)>> =
         std::sync::Mutex::new(None);
 
     /// A fill that makes an inode, keeps it, and fails before setting

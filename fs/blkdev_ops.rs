@@ -20,7 +20,7 @@ use crate::block::blkdev::{
     get_blkdev, sync_blockdev,
 };
 use crate::block::genhd;
-use crate::fs::inode::{Inode, InodeMode, Timespec};
+use crate::fs::inode::{Inode, InodeMode, InodeRef, Timespec};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::uaccess::{copy_to_user, get_user, put_user};
 use crate::util::error::KernelError;
@@ -482,7 +482,7 @@ static BDEV_AOPS: BdevAops = BdevAops;
 /// bytes (Linux bdev_alloc: new_inode on blockdev_superblock, numbered
 /// by the device), on the superblock's `s_inodes`, unhashed until the
 /// device is added; ENOMEM
-pub fn bdev_inode(dev: DevId, size: u64) -> Result<Arc<Inode>, KernelError> {
+pub fn bdev_inode(dev: DevId, size: u64) -> Result<InodeRef, KernelError> {
     let sb = crate::fs::pseudo::BDEV.sb()?;
     let inode = Inode::alloc(Inode::new_device(
         u64::from(dev.encode()),
@@ -503,7 +503,7 @@ pub fn bdev_inode(dev: DevId, size: u64) -> Result<Arc<Inode>, KernelError> {
 struct BdevInodeOps;
 
 impl crate::fs::inode::InodeOps for BdevInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
         Err(KernelError::NotDirectory)
     }
 

@@ -40,7 +40,9 @@ use crate::mm::filemap::{self, Aops};
 use super::KernelError;
 use super::dentry::{Dentry, DentryRef};
 use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
-use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::inode::{
+    AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, Timespec,
+};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::util::kalloc::try_arc;
@@ -270,7 +272,7 @@ fn xattr_space(name: &[u8], size: usize) -> u64 {
 /// other entries come and go (an `rm -r` that unlinks as it reads sees
 /// every entry once). Positions 0 and 1 are "." and "..".
 pub struct Children {
-    by_name: BTreeMap<FileName, (u64, Arc<Inode>)>,
+    by_name: BTreeMap<FileName, (u64, InodeRef)>,
     by_pos: BTreeMap<u64, FileName>,
     next: u64,
 }
@@ -286,7 +288,7 @@ impl Children {
     }
 
     /// Inode of entry `name`
-    pub fn get(&self, name: &[u8]) -> Option<&Arc<Inode>> {
+    pub fn get(&self, name: &[u8]) -> Option<&InodeRef> {
         self.by_name.get(name).map(|(_, i)| i)
     }
 
@@ -301,7 +303,7 @@ impl Children {
     }
 
     /// Add (or replace) entry `name` at the next position
-    pub fn insert(&mut self, name: FileName, inode: Arc<Inode>) -> Option<Arc<Inode>> {
+    pub fn insert(&mut self, name: FileName, inode: InodeRef) -> Option<InodeRef> {
         let old = self.remove(&name);
         let pos = self.next;
         self.next += 1;
@@ -311,14 +313,14 @@ impl Children {
     }
 
     /// Remove entry `name`
-    pub fn remove(&mut self, name: &[u8]) -> Option<Arc<Inode>> {
+    pub fn remove(&mut self, name: &[u8]) -> Option<InodeRef> {
         let (pos, inode) = self.by_name.remove(name)?;
         self.by_pos.remove(&pos);
         Some(inode)
     }
 
     /// Entries at position `pos` or later, in position order
-    pub fn from_pos(&self, pos: u64) -> impl Iterator<Item = (u64, &[u8], &Arc<Inode>)> {
+    pub fn from_pos(&self, pos: u64) -> impl Iterator<Item = (u64, &[u8], &InodeRef)> {
         self.by_pos.range(pos..).filter_map(|(&p, name)| {
             self.by_name
                 .get(name)
@@ -501,7 +503,7 @@ impl RamfsInodeOps {
 }
 
 impl InodeOps for RamfsInodeOps {
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
@@ -517,7 +519,7 @@ impl InodeOps for RamfsInodeOps {
             .ok_or(KernelError::NotFound)
     }
 
-    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         // Owner from the caller's fs ids (inode_init_owner)
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
         add_new(dir, name, Kind::File, mode, uid, gid, current_time())
@@ -529,14 +531,14 @@ impl InodeOps for RamfsInodeOps {
         name: &[u8],
         mode: InodeMode,
         rdev: DevId,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
         add_new(dir, name, Kind::Dev(rdev), mode, uid, gid, current_time())
     }
 
     /// Linux ramfs_tmpfile, shmem_tmpfile (d_tmpfile drops the link);
     /// on tmpfs it takes an inode like any file
-    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<InodeRef, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
         let inode = new_inode(&sb, Kind::File, mode, uid, gid, current_time())?;
@@ -544,7 +546,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(inode)
     }
 
-    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
         add_new(dir, name, Kind::Dir, mode, uid, gid, current_time())
     }
@@ -579,7 +581,7 @@ impl InodeOps for RamfsInodeOps {
             .ok_or(KernelError::InvalidArgument)
     }
 
-    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<InodeRef, KernelError> {
         // S_IFLNK | 0777, the target in the inode (Linux tmpfs keeps a
         // short one there, i_link, a long one in a page; here all, as
         // nothing in hk pages a symlink out)
@@ -588,7 +590,7 @@ impl InodeOps for RamfsInodeOps {
         add_new(dir, name, kind, mode, uid, gid, current_time())
     }
 
-    fn link(&self, dir: &Inode, name: &[u8], target_inode: &Arc<Inode>) -> Result<(), KernelError> {
+    fn link(&self, dir: &Inode, name: &[u8], target_inode: &InodeRef) -> Result<(), KernelError> {
         // Cannot hard link directories
         if target_inode.mode().is_dir() {
             return Err(KernelError::PermissionDenied); // EPERM
@@ -625,7 +627,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
+    fn truncate(&self, inode: &InodeRef, length: u64) -> Result<(), KernelError> {
         if inode.mode().is_dir() {
             return Err(KernelError::IsDirectory);
         }
@@ -646,7 +648,7 @@ impl InodeOps for RamfsInodeOps {
     /// modified (Linux file_modified). ramfs: EOPNOTSUPP.
     fn fallocate(
         &self,
-        inode: &Arc<Inode>,
+        inode: &InodeRef,
         mode: i32,
         offset: u64,
         len: u64,
@@ -712,7 +714,7 @@ impl InodeOps for RamfsInodeOps {
         &self,
         old_dir: &Inode,
         old_name: &[u8],
-        new_dir: &Arc<Inode>,
+        new_dir: &InodeRef,
         new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
@@ -1172,7 +1174,7 @@ impl SuperOps for RamfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         _i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         new_inode(sb, Kind::of(mode), mode, 0, 0, current_time())
     }
 }
@@ -1283,7 +1285,7 @@ fn new_inode(
     uid: Uid,
     gid: Gid,
     time: Timespec,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     reserve_inode(sb)?;
     let (ino, w) = (sb.alloc_ino(), Arc::downgrade(sb));
     let ops = &RAMFS_INODE_OPS;
@@ -1317,7 +1319,7 @@ fn new_inode(
 /// A new regular file of `sb` with permissions `perm`, in no directory,
 /// owned by the caller's fsuid and fsgid (Linux shmem_get_inode for
 /// shmem_file_setup: inode_init_owner with no directory)
-pub fn new_file(sb: &Arc<SuperBlock>, perm: u16) -> Result<Arc<Inode>, KernelError> {
+pub fn new_file(sb: &Arc<SuperBlock>, perm: u16) -> Result<InodeRef, KernelError> {
     let c = crate::task::current_cred();
     let mode = InodeMode::regular(perm);
     new_inode(sb, Kind::File, mode, c.fsuid, c.fsgid, current_time())
@@ -1334,7 +1336,7 @@ fn add_new(
     uid: Uid,
     gid: Gid,
     time: Timespec,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = dir.superblock().ok_or(KernelError::Io)?;
     let private = dir.get_private().ok_or(KernelError::Io)?;
     let dir_data = private

@@ -18,7 +18,7 @@
 use alloc::sync::Arc;
 
 use super::dentry::{DentryRef, d_find_alias_by};
-use super::inode::Inode;
+use super::inode::{Inode, InodeRef};
 use super::mount::MountRef;
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
@@ -80,7 +80,7 @@ pub type Encoded = Result<(u8, usize), usize>;
 pub trait ExportOps: Sync {
     /// Encode `inode` into `fh` (its length is the room: Linux
     /// ->encode_fh's *max_len, in 32-bit words)
-    fn encode_fh(&self, inode: &Arc<Inode>, fh: &mut [u32]) -> Encoded;
+    fn encode_fh(&self, inode: &InodeRef, fh: &mut [u32]) -> Encoded;
 
     /// A dentry of the object `fh` (of type `ty`) names on `sb`; None if
     /// it is gone (Linux ->fh_to_dentry: NULL, ESTALE to the caller)
@@ -222,7 +222,7 @@ mod tests {
     fn can_encode() {
         struct Ops;
         impl ExportOps for Ops {
-            fn encode_fh(&self, _: &Arc<Inode>, _: &mut [u32]) -> Encoded {
+            fn encode_fh(&self, _: &InodeRef, _: &mut [u32]) -> Encoded {
                 Err(0)
             }
             fn fh_to_dentry(

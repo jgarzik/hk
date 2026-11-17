@@ -62,7 +62,9 @@ pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, DentryRef, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, FileRef, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, exit_task_fs, get_task_fs, init_task_fs};
-pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
+pub use inode::{
+    DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, InodeRef, Uid,
+};
 pub use mount::{Mount, do_umount, follow_mount, umount_flags};
 pub use namei::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;
@@ -216,11 +218,8 @@ fn same_dir(p1: &DentryRef, p2: &DentryRef) -> bool {
 
 /// The non-directories of `a` and `b`, each once, lowest address first
 /// (Linux lock_two_nondirectories order)
-fn nondirs<'a>(
-    a: Option<&'a Arc<Inode>>,
-    b: Option<&'a Arc<Inode>>,
-) -> [Option<&'a Arc<Inode>>; 2] {
-    let nd = |i: Option<&'a Arc<Inode>>| i.filter(|i| !i.mode().is_dir());
+fn nondirs<'a>(a: Option<&'a InodeRef>, b: Option<&'a InodeRef>) -> [Option<&'a InodeRef>; 2] {
+    let nd = |i: Option<&'a InodeRef>| i.filter(|i| !i.mode().is_dir());
     let (a, b) = (nd(a), nd(b));
     match (a, b) {
         (Some(x), Some(y)) if Arc::ptr_eq(x, y) => [Some(x), None],
@@ -233,10 +232,7 @@ fn nondirs<'a>(
 /// locks (Linux vfs_rename -> lock_two_nondirectories): the non-directory
 /// source and target, by address. Directories are skipped: they have no
 /// hard links to race with.
-pub fn lock_two_nondirs<'a>(
-    a: Option<&'a Arc<Inode>>,
-    b: Option<&'a Arc<Inode>>,
-) -> NondirsLock<'a> {
+pub fn lock_two_nondirs<'a>(a: Option<&'a InodeRef>, b: Option<&'a InodeRef>) -> NondirsLock<'a> {
     let [x, y] = nondirs(a, b);
     let first = x.map(|i| i.lock());
     NondirsLock([first, y.map(|i| i.lock())])

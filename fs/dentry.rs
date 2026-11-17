@@ -28,7 +28,7 @@ use crate::sync::spin::RwLock;
 use crate::util::hlist_bl::BlHead;
 use crate::util::list::{Link, OwnedList, Owner};
 
-use super::inode::Inode;
+use super::inode::{Inode, InodeRef};
 use super::mount::{MOUNT_LOCK, Mount, MountRef};
 use super::name::{DName, DNameSlot};
 use super::path_ref::Path;
@@ -528,7 +528,7 @@ impl Drop for Dentry {
 }
 
 impl Dentry {
-    fn with(name: DName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
+    fn with(name: DName, inode: Option<InodeRef>, sb: Weak<SuperBlock>) -> Self {
         let d_op = sb.upgrade().and_then(|s| s.d_op());
         Self::with_op(name, inode, sb, d_op)
     }
@@ -536,7 +536,7 @@ impl Dentry {
     /// With `d_op` (its superblock's s_d_op: a child's is its parent's)
     fn with_op(
         name: DName,
-        inode: Option<Arc<Inode>>,
+        inode: Option<InodeRef>,
         sb: Weak<SuperBlock>,
         d_op: Option<&'static DentryOps>,
     ) -> Self {
@@ -565,13 +565,13 @@ impl Dentry {
     }
 
     /// Create root dentry for a filesystem
-    pub fn new_root(inode: Arc<Inode>, sb: Weak<SuperBlock>) -> Self {
+    pub fn new_root(inode: InodeRef, sb: Weak<SuperBlock>) -> Self {
         Self::with(DName::default(), Some(inode), sb)
     }
 
     /// A root with dentry operations `op` and no superblock, for tests
     #[cfg(test)]
-    pub(crate) fn new_root_op(inode: Arc<Inode>, op: &'static DentryOps) -> Self {
+    pub(crate) fn new_root_op(inode: InodeRef, op: &'static DentryOps) -> Self {
         Self::with_op(DName::default(), Some(inode), Weak::new(), Some(op))
     }
 
@@ -579,7 +579,7 @@ impl Dentry {
     ///
     /// Anonymous dentries have no superblock and are not part of any filesystem.
     /// They exist solely to provide a File's required dentry reference.
-    pub fn new_anonymous(name: &[u8], inode: Option<Arc<Inode>>) -> Result<Self, KernelError> {
+    pub fn new_anonymous(name: &[u8], inode: Option<InodeRef>) -> Result<Self, KernelError> {
         Ok(Self::with(DName::new(name)?, inode, Weak::new()))
     }
 
@@ -588,7 +588,7 @@ impl Dentry {
     /// inode's or namespace file's
     pub fn new_pseudo(
         name: &[u8],
-        inode: Arc<Inode>,
+        inode: InodeRef,
         sb: &Arc<SuperBlock>,
     ) -> Result<Self, KernelError> {
         Ok(Self::with(
@@ -604,7 +604,7 @@ impl Dentry {
     pub fn alloc(
         parent: &DentryRef,
         name: &[u8],
-        inode: Option<Arc<Inode>>,
+        inode: Option<InodeRef>,
     ) -> Result<DentryRef, KernelError> {
         let d = Self::prealloc(parent, name)?;
         Ok(Self::add(parent, d, inode))
@@ -613,7 +613,7 @@ impl Dentry {
     /// The dentry of an O_TMPFILE file in `parent` (Linux d_tmpfile):
     /// named "#<ino>", never in the tree (unhashed: lookups miss it, its
     /// path reads " (deleted)")
-    pub fn tmpfile(parent: &DentryRef, inode: Arc<Inode>) -> Result<DentryRef, KernelError> {
+    pub fn tmpfile(parent: &DentryRef, inode: InodeRef) -> Result<DentryRef, KernelError> {
         let name = alloc::format!("#{}", inode.ino);
         Self::tmpfile_named(parent, name.as_bytes(), inode)
     }
@@ -623,7 +623,7 @@ impl Dentry {
     pub fn tmpfile_named(
         parent: &DentryRef,
         name: &[u8],
-        inode: Arc<Inode>,
+        inode: InodeRef,
     ) -> Result<DentryRef, KernelError> {
         let d = DentryRef::new(Self::with_op(
             DName::new(name)?,
@@ -679,7 +679,7 @@ impl Dentry {
     /// (Linux d_add / d_instantiate): the cached child of that name if
     /// there is one (a negative one gets `inode`), so a name never has
     /// two dentries
-    pub fn add(parent: &DentryRef, d: DentryRef, inode: Option<Arc<Inode>>) -> DentryRef {
+    pub fn add(parent: &DentryRef, d: DentryRef, inode: Option<InodeRef>) -> DentryRef {
         let name = d.name();
         // The inode's alias lock first (Linux d_add: i_lock, then d_lock)
         let i = inode.clone();
@@ -752,7 +752,7 @@ impl Dentry {
     /// lock (`d_inode_rcu`), the reference taken unless that inode's
     /// last one went (Linux igrab), which happens only after a writer
     /// took it off this dentry: then it is negative
-    pub fn get_inode(&self) -> Option<Arc<Inode>> {
+    pub fn get_inode(&self) -> Option<InodeRef> {
         let g = crate::sync::rcu::read_lock();
         self.d_inode_rcu(&g).and_then(Inode::igrab)
     }
@@ -776,7 +776,7 @@ impl Dentry {
     /// Point `d_inode` at `inode` (Linux __d_set_inode_and_type), under
     /// this dentry's d_lock held for writing and a `d_seq` write section;
     /// the pointer owns the reference
-    fn set_inode(&self, _dl: &mut DentryInner, inode: Option<Arc<Inode>>) {
+    fn set_inode(&self, _dl: &mut DentryInner, inode: Option<InodeRef>) {
         let new = inode.map_or(core::ptr::null_mut(), |i| Arc::into_raw(i).cast_mut());
         let old = self.d_inode.swap(new, Ordering::Release);
         debug_assert!(old.is_null(), "dcache: inode set twice");
@@ -785,7 +785,7 @@ impl Dentry {
     /// Clear `d_inode` (Linux __d_clear_type_and_inode), under this
     /// dentry's d_lock held for writing and a `d_seq` write section: the
     /// reference it held, for the caller to drop after the locks
-    fn take_inode(&self, _dl: &mut DentryInner) -> Option<Arc<Inode>> {
+    fn take_inode(&self, _dl: &mut DentryInner) -> Option<InodeRef> {
         let p = self.d_inode.swap(core::ptr::null_mut(), Ordering::Release);
         // SAFETY: a non-null `d_inode` is an `Arc::into_raw` the dentry
         // owns (`set_inode`, `with`), taken out once by this swap
@@ -1871,7 +1871,7 @@ mod tests {
     use super::*;
     use crate::fs::inode::{InodeMode, NULL_INODE_OPS, Timespec};
 
-    fn inode() -> Arc<Inode> {
+    fn inode() -> InodeRef {
         Inode::alloc(Inode::new(
             1,
             InodeMode::directory(0o755),

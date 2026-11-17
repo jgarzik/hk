@@ -720,7 +720,7 @@ macro_rules! named_cache {
 pub static VMA_CACHE: KmemCache = named_cache!("vm_area_struct", box_of::<crate::mm::Vma>());
 /// Dentries (`DentryRef`; Linux dentry_cache)
 pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", arc_of::<crate::fs::dentry::Dentry>());
-/// Inodes (`Arc<Inode>`; Linux inode_cache)
+/// Inodes (`InodeRef`; Linux inode_cache)
 pub static INODE_CACHE: KmemCache =
     named_cache!("inode_cache", arc_of::<crate::fs::inode::Inode>());
 

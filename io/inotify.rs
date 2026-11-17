@@ -38,11 +38,11 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
-use crate::fs::Inode;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::fs::path_ref::Path;
+use crate::fs::{Inode, InodeRef};
 use crate::io::fasync::{FasyncList, POLL_IN, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::IrqSpinlock;
@@ -173,7 +173,7 @@ struct InotifyWatch {
     /// The watched inode, held while the watch lives (Linux: the mark
     /// sits on the inode's fsnotify connector and pins it). Matched by
     /// identity: inode numbers repeat across filesystems.
-    inode: Arc<Inode>,
+    inode: InodeRef,
 }
 
 // =============================================================================
@@ -278,7 +278,7 @@ impl InotifyInner {
 
     /// Change the existing watch on `inode`, if any: its result (EEXIST
     /// for IN_MASK_CREATE; IN_MASK_ADD adds to the mask, else replaces)
-    fn update_watch(&mut self, mask: u32, inode: &Arc<Inode>) -> Option<KernelResult<i32>> {
+    fn update_watch(&mut self, mask: u32, inode: &InodeRef) -> Option<KernelResult<i32>> {
         let (wd, watch) = self
             .watches
             .iter_mut()
@@ -385,7 +385,7 @@ impl SbMarks {
     /// pushes the inode, after the push: an adder that sees it set
     /// knows the inode is listed, and a failed growth leaves it unset
     /// for the next adder to try.
-    fn add(&self, inode: &Arc<Inode>) -> Result<(), KernelError> {
+    fn add(&self, inode: &InodeRef) -> Result<(), KernelError> {
         let on_sb = &inode.fsnotify.on_sb;
         if on_sb.load(Ordering::Acquire) {
             return Ok(());

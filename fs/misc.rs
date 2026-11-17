@@ -6,10 +6,9 @@
 //! - xattr syscalls (extended attributes)
 //! - readahead (file readahead)
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::fs::{Inode, KernelError, LookupFlags, lookup_path_flags};
+use crate::fs::{InodeRef, KernelError, LookupFlags, lookup_path_flags};
 use crate::uaccess::{
     UaccessError, UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str,
 };
@@ -603,7 +602,7 @@ fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult
 
 /// Linux vfs_setxattr, write access already held: the permission
 /// check, then the file system's op
-fn setxattr_inode(inode: &Arc<Inode>, name: &[u8], value: &[u8], flags: i32) -> KernelResult<()> {
+fn setxattr_inode(inode: &InodeRef, name: &[u8], value: &[u8], flags: i32) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode
         .i_op
@@ -691,7 +690,7 @@ pub fn sys_fsetxattr(
 /// `size`-byte user buffer (size 0: only its length); ERANGE from the
 /// file system when the buffer is too small
 fn getxattr_inode(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     name: &[u8],
     value_ptr: UserPtr<u8>,
     size: u64,
@@ -789,7 +788,7 @@ pub fn sys_fgetxattr(
 
 /// Linux listxattr: the NUL-separated names into the `size`-byte user
 /// buffer (size 0: only their length)
-fn listxattr_inode(inode: &Arc<Inode>, list_ptr: UserPtr<u8>, size: u64) -> KernelResult<usize> {
+fn listxattr_inode(inode: &InodeRef, list_ptr: UserPtr<u8>, size: u64) -> KernelResult<usize> {
     if size == 0 {
         return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
     }
@@ -850,7 +849,7 @@ pub fn sys_flistxattr(fd: i32, list_ptr: UserPtr<u8>, size: u64) -> KernelResult
 }
 
 /// Linux vfs_removexattr, write access already held
-fn removexattr_inode(inode: &Arc<Inode>, name: &[u8]) -> KernelResult<()> {
+fn removexattr_inode(inode: &InodeRef, name: &[u8]) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode.i_op.removexattr(inode, name).map_err(xattr_err)
 }

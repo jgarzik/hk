@@ -43,7 +43,7 @@ use alloc::sync::Arc;
 
 use crate::block::dio::{self, AsyncIo, Extent};
 use crate::fs::file::{File, RwFlags};
-use crate::fs::inode::Inode;
+use crate::fs::inode::{Inode, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::mm::gup::PageSeg;
@@ -99,7 +99,7 @@ fn sb_of(inode: &Inode) -> Result<VfatSbData, KernelError> {
 /// IOCB_DIRECT): the cache over the range written back, the direct
 /// part, then the rest through the cache if it stopped short before
 /// the end of the file
-pub fn read(inode: &Arc<Inode>, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
+pub fn read(inode: &InodeRef, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
     let count = to.len();
     if count == 0 {
         return Ok(0);
@@ -165,7 +165,7 @@ fn invalidate_post(inode: &Inode, pos: u64, count: usize) {
 
 /// O_DIRECT write of `from` at `pos` (Linux __generic_file_write_iter
 /// with IOCB_DIRECT); the VFS holds i_rwsem and gave at least one byte
-pub fn write(inode: &Arc<Inode>, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
+pub fn write(inode: &InodeRef, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
     let count = from.len();
     let n = match invalidate_pages(inode, pos, count) {
         // A page that cannot be dropped: all through the cache
@@ -183,7 +183,7 @@ pub fn write(inode: &Arc<Inode>, from: &mut IovSource<'_>, pos: u64) -> Result<u
 /// fat_direct_IO): 0 for one past the initialized bytes; the bios, the
 /// range dropped from the cache again and the size raised
 fn direct_write(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     from: &mut IovSource<'_>,
     pos: u64,
 ) -> Result<usize, KernelError> {
@@ -231,7 +231,7 @@ fn direct_write(
 /// generic_perform_write): all the bytes, or the direct ones if this
 /// part failed (its error if there were none)
 fn fallback(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     from: &mut IovSource<'_>,
     pos: u64,
     direct: usize,
@@ -263,7 +263,7 @@ fn fallback(
 /// (`PostWrite`)
 struct VfatAio {
     inner: Arc<dyn AsyncIo>,
-    inode: Arc<Inode>,
+    inode: InodeRef,
     /// Most bytes the result counts
     cut: usize,
     /// A write's end over a cached range
@@ -306,7 +306,7 @@ impl VfatAio {
     /// `write`: the position of a write
     fn new(
         inner: Arc<dyn AsyncIo>,
-        inode: &Arc<Inode>,
+        inode: &InodeRef,
         cut: usize,
         write: Option<u64>,
     ) -> Result<Arc<Self>, KernelError> {
@@ -401,7 +401,7 @@ fn io_len(io: &dyn AsyncIo) -> usize {
 /// An asynchronous direct read (`direct_read`'s steps, the wait left to
 /// the bios' end)
 fn read_async(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     io: Arc<dyn AsyncIo>,
     pos: u64,
 ) -> Result<Option<usize>, KernelError> {
@@ -432,7 +432,7 @@ fn read_async(
 /// the whole write at once through the VFS
 fn write_async(
     file: &File,
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     io: Arc<dyn AsyncIo>,
     pos: u64,
     flags: RwFlags,

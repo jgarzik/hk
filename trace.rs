@@ -38,7 +38,7 @@ use spin::Once;
 
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
-use crate::fs::inode::{Inode, InodeMode, InodeOps};
+use crate::fs::inode::{InodeMode, InodeOps, InodeRef};
 use crate::fs::kernfs::{self, Attr, BinAttr, KNode, SysBuf, sysfs};
 use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
 use crate::sync::{IrqSpinlock, Mutex};
@@ -527,7 +527,7 @@ impl SuperOps for TracefsSops {
         _sb: &Arc<SuperBlock>,
         _mode: InodeMode,
         _i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 

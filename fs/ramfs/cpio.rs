@@ -12,7 +12,6 @@
 //!   skipped and another archive may follow (the link table resets)
 //! - both newc magics, 070701 and 070702 (with checksum, not checked)
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::{
@@ -21,7 +20,7 @@ use super::{
 };
 use crate::fs::chardev::DevId;
 use crate::fs::dentry::DentryRef;
-use crate::fs::inode::{Gid, Inode, InodeMode, Timespec, Uid};
+use crate::fs::inode::{Gid, Inode, InodeMode, InodeRef, Timespec, Uid};
 
 /// The initramfs image (Linux __initramfs_start or initrd_start)
 pub struct Initrd(Image);
@@ -152,7 +151,7 @@ fn parse(data: &[u8], off: usize) -> Result<Entry<'_>, CpioError> {
 }
 
 /// Hard-link table of one archive: (dev, ino) -> the first name's inode
-type Links = Vec<((u32, u32, u32), Arc<Inode>)>;
+type Links = Vec<((u32, u32, u32), InodeRef)>;
 
 /// Unpack an initramfs (one or more concatenated cpio newc archives)
 /// into a ramfs directory. Returns the number of non-directory entries
@@ -280,7 +279,7 @@ fn do_entry(root: &DentryRef, e: &Entry<'_>, links: &mut Links) -> Result<bool, 
 
 /// Linux clean_path: an existing entry of another type is removed
 /// (rmdir for a directory); one of the same type is returned
-fn clean_path(parent: &DentryRef, dir: &Inode, name: &[u8], ty: u32) -> Option<Arc<Inode>> {
+fn clean_path(parent: &DentryRef, dir: &Inode, name: &[u8], ty: u32) -> Option<InodeRef> {
     let old = dir.i_op.lookup(dir, name).ok()?;
     if u32::from(old.mode().0) & S_IFMT == ty {
         return Some(old);
