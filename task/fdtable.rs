@@ -30,11 +30,11 @@
 //! task uses is read with no reference at all ([`fdget_raw`], Linux
 //! __fget_light): only its own task changes it.
 
-use crate::sync::rcu::{self, RcuArc};
+use crate::sync::rcu;
 use crate::sync::spin::{Mutex, MutexGuard};
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::kalloc::{arc_nofail, try_arc};
-use crate::util::rcuslots::{Lookup, Slots};
+use crate::util::rcuslots::{Lookup, RcuSlots};
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 
@@ -49,7 +49,7 @@ pub struct Files {
     table: Mutex<FdTable<FileRef>>,
     /// The table's slots, for lookups under RCU (Linux files->fdt),
     /// replaced under `table`'s lock when it grows
-    slots: RcuArc<Slots<FileRef>>,
+    slots: RcuSlots<FileRef>,
     /// Its identity as a POSIX lock owner (Linux fl_owner): unique, never
     /// reused, kept across an exec that did not have to copy the table
     id: u64,
@@ -76,8 +76,12 @@ fn filp_close(f: FileRef, owner: u64) {
 
 impl Files {
     fn new(t: FdTable<FileRef>) -> Self {
+        // SAFETY: a new table's slots, published only here; the table
+        // grows only in `expand_fdtable`, which publishes the new slots
+        // in the same lock hold
+        let slots = unsafe { RcuSlots::new(t.slots()) };
         Self {
-            slots: RcuArc::new(t.slots()),
+            slots,
             table: Mutex::new(t),
             id: NEXT_FILES_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             users: core::sync::atomic::AtomicUsize::new(0),
@@ -154,7 +158,12 @@ impl Files {
         // Published before the lock is released: a later change is made
         // in the new slots, which a reader still on the old ones sees
         // through its recheck of the table (Linux rcu_assign_pointer)
-        let retired = spare.is_ok().then(|| self.slots.replace(t.slots()));
+        // SAFETY: the slots `expand` just retired were published here;
+        // the new ones, published nowhere else, are unchanged since (the
+        // same lock hold)
+        let retired = spare
+            .is_ok()
+            .then(|| unsafe { self.slots.replace(t.slots()) });
         drop(t);
         if let Some(r) = retired {
             r.defer();

@@ -2717,7 +2717,7 @@ array of file pointers that readers load under an RCU read guard with
 no lock. They are written only under the table's lock, through their
 one `SlotsOwner` (install, close, dup2: Linux rcu_assign_pointer).
 A table that grows copies its pointers into the bigger slots, which
-`Files.slots` (an `RcuArc`, Linux files->fdt) publishes before the
+`Files.slots` (`RcuSlots`, Linux files->fdt; a reader borrows it for its guard only) publishes before the
 lock is released; the old slots keep their pointers as stale copies
 and are freed a grace period later (`RcuRetired::defer`, Linux
 free_fdtable_rcu). `Files::fget` takes a reference from a slot unless

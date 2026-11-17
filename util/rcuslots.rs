@@ -11,13 +11,16 @@
 //! copy_fdtable): the old one keeps its pointers as stale copies the new
 //! one owns, so a reader still on it finds the same references, and it
 //! is freed a grace period after the new one is published (Linux
-//! free_fdtable_rcu).
+//! free_fdtable_rcu). Readers reach an array only through its owner or
+//! through [`RcuSlots`], borrowed for their guard: no handle outlives a
+//! grace period with access to a retired array's stale pointers
+//! ([`SlotsRef`] can only be published or dropped).
 
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::sync::rcu::{HasRcuHead, RcuHead, RcuReadGuard};
+use crate::sync::rcu::{HasRcuHead, RcuArc, RcuHead, RcuReadGuard, RcuRetired};
 use crate::util::error::KernelResult;
 
 /// A counted reference that a reader may take again from its target's
@@ -77,7 +80,11 @@ pub enum Lookup<R> {
 /// through the array's one [`SlotsOwner`]; once set (by `grow`, which
 /// moved them into the next array), slots are never written and own
 /// nothing. A pointer a slot holds named a target with a reference at
-/// some time after every reader that can reach the array began.
+/// some time after every reader that can reach the array began: a
+/// shared borrow comes only from its owner (not retired while borrowed)
+/// or from [`RcuSlots::read`], for a guard begun while the array was
+/// published, and a retired one is freed a grace period after it was
+/// replaced.
 pub struct Slots<R: RcuRef> {
     s: alloc::boxed::Box<[AtomicPtr<R::Target>]>,
     retired: AtomicBool,
@@ -174,9 +181,9 @@ impl<R: RcuRef> SlotsOwner<R> {
         Ok(Self(crate::util::kalloc::try_arc(a)?))
     }
 
-    /// The array, for readers
-    pub fn shared(&self) -> Arc<Slots<R>> {
-        self.0.clone()
+    /// The array, to publish for readers ([`RcuSlots`])
+    pub fn shared(&self) -> SlotsRef<R> {
+        SlotsRef(self.0.clone())
     }
 
     /// The array, borrowed
@@ -226,7 +233,7 @@ impl<R: RcuRef> SlotsOwner<R> {
     /// which becomes the owned array (Linux copy_fdtable); the old one
     /// is handed back, its pointers left as stale copies for readers
     /// still on it, to be freed a grace period after `new` is published
-    pub fn grow(&mut self, new: SlotsOwner<R>) -> Arc<Slots<R>> {
+    pub fn grow(&mut self, new: SlotsOwner<R>) -> SlotsRef<R> {
         assert!(new.len() >= self.len());
         for (d, s) in new.0.s.iter().zip(self.0.s.iter()) {
             let p = s.load(Ordering::Relaxed);
@@ -237,7 +244,51 @@ impl<R: RcuRef> SlotsOwner<R> {
         // INVARIANT: the old array owns nothing from here on, and its
         // owner is gone: it is never written again
         self.0.retired.store(true, Ordering::Relaxed);
-        core::mem::replace(&mut self.0, new.0)
+        SlotsRef(core::mem::replace(&mut self.0, new.0))
+    }
+}
+
+/// A counted reference to an array that gives no access to it: it can
+/// only be published ([`RcuSlots`]) or dropped, so a retired array is
+/// never read but by readers that reached it while it was published
+#[must_use]
+pub struct SlotsRef<R: RcuRef>(Arc<Slots<R>>);
+
+/// The published array (Linux files->fdt under rcu_assign_pointer):
+/// readers borrow it for their guard only (Linux rcu_dereference)
+pub struct RcuSlots<R: RcuRef>(RcuArc<Slots<R>>);
+
+impl<R: RcuRef> RcuSlots<R> {
+    /// Publishing `a`
+    ///
+    /// # Safety
+    /// `a` is published nowhere else, and is replaced here
+    /// ([`replace`](Self::replace)) when its owner retires it
+    /// ([`SlotsOwner::grow`]), with no slot of the new array written in
+    /// between (both under the writer's one lock hold).
+    pub unsafe fn new(a: SlotsRef<R>) -> Self {
+        Self(RcuArc::new(a.0))
+    }
+
+    /// The published array, for the guard's life
+    pub fn read<'a>(&'a self, g: &'a RcuReadGuard) -> &'a Slots<R> {
+        self.0.read(g)
+    }
+
+    /// The published array's address, to compare only
+    pub fn as_ptr(&self) -> *const Slots<R> {
+        self.0.as_ptr()
+    }
+
+    /// Publish `a` in place of the array its owner just retired (Linux
+    /// rcu_assign_pointer(files->fdt, new_fdt)); the old one is freed a
+    /// grace period later, when the result is dropped or deferred
+    ///
+    /// # Safety
+    /// As [`new`](Self::new)'s, for `a`; and the array published until
+    /// now was just retired, with no slot of `a` written since.
+    pub unsafe fn replace(&self, a: SlotsRef<R>) -> RcuRetired<Slots<R>> {
+        self.0.replace(a.0)
     }
 }
 
@@ -280,7 +331,7 @@ pub mod tests {
         assert!(o.replace(1, Some(TRef(f.clone()))).is_none());
         let old = o.grow(SlotsOwner::alloc(4).unwrap());
         assert_eq!(o.len(), 4);
-        assert_eq!(old.as_ptr(1), Arc::as_ptr(&f));
+        assert_eq!(old.0.as_ptr(1), Arc::as_ptr(&f));
         drop(old);
         assert_eq!(Arc::strong_count(&f), 2);
         assert!(o.get(1).is_some());

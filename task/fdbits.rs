@@ -17,9 +17,8 @@
 
 use super::{FD_CLOEXEC, Fd};
 use crate::util::error::{KernelError, KernelResult};
-use crate::util::rcuslots::{RcuRef, Slots, SlotsOwner};
+use crate::util::rcuslots::{RcuRef, SlotsOwner, SlotsRef};
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 const BITS: usize = u64::BITS as usize;
@@ -267,7 +266,7 @@ impl<F: RcuRef> Fdt<F> {
 #[must_use]
 pub struct Spare<F: RcuRef> {
     _bits: Box<[u64]>,
-    _slots: Arc<Slots<F>>,
+    _slots: SlotsRef<F>,
 }
 
 /// What [`FdTable::alloc_fd`] found
@@ -309,7 +308,7 @@ impl<F: RcuRef> FdTable<F> {
     }
 
     /// The slots, for readers (Linux files->fdt->fd)
-    pub fn slots(&self) -> Arc<Slots<F>> {
+    pub fn slots(&self) -> SlotsRef<F> {
         self.fdt.fd.shared()
     }
 
@@ -534,6 +533,7 @@ impl<F: RcuRef> FdTable<F> {
 mod tests {
     use super::*;
     use crate::util::rcuslots::tests::TRef;
+    use alloc::sync::Arc;
 
     type T = FdTable<TRef>;
 
