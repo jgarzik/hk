@@ -93,7 +93,12 @@ pub fn device_del(name: &str) {
     let Some(r) = root() else { return };
     let Some(dir) = r.get_inode() else { return };
     let _lock = dir.lock();
-    if dir.i_op.unlink(&dir, name.as_bytes()).is_ok() {
+    // Its dentry, as Linux handle_remove's lookup gives it to vfs_unlink
+    let none = crate::fs::dentry::LookupBits::empty();
+    let Ok(d) = crate::fs::lookup_one(&r, name.as_bytes(), none) else {
+        return;
+    };
+    if dir.i_op.unlink(&dir, name.as_bytes(), &d).is_ok() {
         r.remove_child(name.as_bytes());
     }
 }

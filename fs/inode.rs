@@ -277,15 +277,28 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
-    /// Remove a file
-    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
-        let _ = (dir, name);
+    /// Remove file `name`, whose dentry is `d` (Linux ->unlink(dir,
+    /// dentry): a file system may stamp the dentry, which the VFS then
+    /// makes negative or drops)
+    fn unlink(
+        &self,
+        dir: &Inode,
+        name: &[u8],
+        d: &super::dentry::Dentry,
+    ) -> Result<(), KernelError> {
+        let _ = (dir, name, d);
         Err(KernelError::OperationNotSupported)
     }
 
-    /// Remove a directory
-    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
-        let _ = (dir, name);
+    /// Remove directory `name`, whose dentry is `d` (Linux ->rmdir, as
+    /// [`InodeOps::unlink`])
+    fn rmdir(
+        &self,
+        dir: &Inode,
+        name: &[u8],
+        d: &super::dentry::Dentry,
+    ) -> Result<(), KernelError> {
+        let _ = (dir, name, d);
         Err(KernelError::OperationNotSupported)
     }
 

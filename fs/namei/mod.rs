@@ -1223,12 +1223,12 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         } else if isdir {
             // What is cached below goes first (Linux vfs_rmdir:
             // shrink_dcache_parent, then S_DEAD)
-            dir.i_op.rmdir(&dir, name).inspect(|()| {
+            dir.i_op.rmdir(&dir, name, &victim).inspect(|()| {
                 super::dentry::d_drop_tree(&victim);
                 inode.set_dead();
             })
         } else {
-            dir.i_op.unlink(&dir, name)
+            dir.i_op.unlink(&dir, name, &victim)
         };
         // The parent's mtime and ctime, the victim's ctime
         // (simple_unlink)

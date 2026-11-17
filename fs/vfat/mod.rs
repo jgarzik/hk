@@ -2096,7 +2096,7 @@ impl InodeOps for VfatInodeOps {
         Ok(inode)
     }
 
-    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+    fn unlink(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
         let name = &user_name(dir, name, KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -2129,10 +2129,14 @@ impl InodeOps for VfatInodeOps {
             entry,
             start_cluster,
         )?;
+        // The dentry the VFS makes negative next is valid at this
+        // version (Linux vfat_d_version_set(dentry,
+        // inode_query_iversion(dir)))
+        d.set_d_time(dir.iversion());
         dir_sync(&sb, &sb_data)
     }
 
-    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
         let name = &user_name(dir, name, KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -2172,6 +2176,10 @@ impl InodeOps for VfatInodeOps {
             entry,
             start_cluster,
         )?;
+        // The dentry the VFS makes negative next is valid at this
+        // version (Linux vfat_d_version_set(dentry,
+        // inode_query_iversion(dir)))
+        d.set_d_time(dir.iversion());
         dir_sync(&sb, &sb_data)
     }
 

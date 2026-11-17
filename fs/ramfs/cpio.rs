@@ -280,14 +280,17 @@ fn do_entry(root: &DentryRef, e: &Entry<'_>, links: &mut Links) -> Result<bool, 
 /// Linux clean_path: an existing entry of another type is removed
 /// (rmdir for a directory); one of the same type is returned
 fn clean_path(parent: &DentryRef, dir: &Inode, name: &[u8], ty: u32) -> Option<InodeRef> {
-    let old = dir.i_op.lookup(dir, name).ok()?;
+    // Its dentry, as Linux's path lookup gives init_unlink / init_rmdir
+    let none = crate::fs::dentry::LookupBits::empty();
+    let d = crate::fs::lookup_one(parent, name, none).ok()?;
+    let old = d.get_inode()?;
     if u32::from(old.mode().0) & S_IFMT == ty {
         return Some(old);
     }
     let gone = if old.mode().is_dir() {
-        dir.i_op.rmdir(dir, name)
+        dir.i_op.rmdir(dir, name, &d)
     } else {
-        dir.i_op.unlink(dir, name)
+        dir.i_op.unlink(dir, name, &d)
     };
     if gone.is_ok() {
         parent.remove_child(name);

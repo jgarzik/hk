@@ -690,7 +690,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+    fn unlink(&self, dir: &Inode, name: &[u8], _d: &Dentry) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
@@ -824,7 +824,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8], _d: &Dentry) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
