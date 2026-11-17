@@ -2483,9 +2483,11 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), KernelErro
 }
 
 /// A released task's /proc entries leave every procfs dcache (Linux
-/// proc_flush_pid): /proc/<tid>, and the process directory with it
-/// when the task was its leader, /proc/<pid>/task/<tid> otherwise, each
-/// named as that procfs's pid namespace numbers it. TASKLIST not held.
+/// proc_flush_pid, d_invalidate): /proc/<tid>, and the process
+/// directory with it when the task was its leader,
+/// /proc/<pid>/task/<tid> otherwise, each named as that procfs's pid
+/// namespace numbers it, with what is mounted on or below them.
+/// TASKLIST not held; sleeps (d_invalidate's NAMESPACE_SEM).
 pub fn proc_flush_pid(
     t: &crate::task::Task,
     thread: Option<alloc::sync::Arc<crate::task::pid::Pid>>,
@@ -2513,13 +2515,19 @@ pub fn proc_flush_pid(
         let (Some(root), Some(tid)) = (sb.get_root(), thread.nr_in(&ns)) else {
             return;
         };
-        root.remove_child(&name(tid));
+        // Linux d_invalidate: what is mounted there goes too
+        let flush = |dir: &super::dentry::DentryRef, n: u32| {
+            if let Some(d) = dir.lookup_child(&name(n)) {
+                super::dentry::d_invalidate(&d);
+            }
+        };
+        flush(&root, tid);
         if let Some(pid) = leader.as_ref().and_then(|l| l.nr_in(&ns))
             && let Some(task) = root
                 .lookup_child(&name(pid))
                 .and_then(|d| d.lookup_child(b"task"))
         {
-            task.remove_child(&name(tid));
+            flush(&task, tid);
         }
     });
 }

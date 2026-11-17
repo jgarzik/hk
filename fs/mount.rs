@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use crate::sync::LockedBy;
 use crate::sync::rcu::{RcuPuts, RcuReadGuard};
 use crate::sync::{LockedByEither, RwSem, RwSemReadGuard, RwSemWriteGuard, SeqLock, UniqueOwner};
-use crate::util::list::{BoxList, Link, OwnedList, Owner};
+use crate::util::list::{BoxList, Link, List, OwnedList, Owner};
 use crate::util::rcuhlist::{HNode, RcuHList};
 use ::core::ptr::NonNull;
 use ::core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering, fence};
@@ -379,6 +379,9 @@ pub struct Mount {
     /// Its [`Mountpoint`] (Linux mnt_mp), which counts it: set and
     /// cleared with `mnt_mountpoint`; null for none
     mnt_mp: AtomicPtr<Mountpoint>,
+    /// On its mountpoint's `m_list` (Linux mnt_mp_list) while `mnt_mp`
+    /// is set, under MOUNT_LOCK
+    mnt_mp_list: Link,
     /// The mount hung on its root (Linux overmount), no reference: set
     /// when one is made visible there, cleared when it leaves; written
     /// under NAMESPACE_SEM write and MOUNT_LOCK write, read under either
@@ -530,6 +533,7 @@ impl Mount {
             mnt_parent: AtomicPtr::new(core::ptr::null_mut()),
             mnt_mountpoint: AtomicPtr::new(core::ptr::null_mut()),
             mnt_mp: AtomicPtr::new(core::ptr::null_mut()),
+            mnt_mp_list: Link::new(),
             overmount: AtomicPtr::new(core::ptr::null_mut()),
             mnt_mounts: LockedByEither::new(OwnedList::new()),
             mnt_child: Link::new(),
@@ -761,11 +765,15 @@ impl Mount {
     /// Hang it on `parent` at `mp` (Linux mnt_set_mountpoint), under
     /// MOUNT_LOCK write (and NAMESPACE_SEM write): the mountpoint counts
     /// this mount, which names its dentry
-    pub(super) fn set_mountpoint(&self, _ml: &mut MntHash, parent: &MountRef, mp: MpPtr) {
+    pub(super) fn set_mountpoint(&self, ml: &mut MntHash, parent: &MountRef, mp: MpPtr) {
         // SAFETY: the caller holds `mp` (a pin or a mount on it), and
         // MOUNT_LOCK, under which alone it is freed
         let m = unsafe { mp.get() };
         m.m_count.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: on no mountpoint's list (`mnt_mp` is null: hung once),
+        // and it leaves this one in `take_mountpoint`, before it is
+        // freed (a mount is off its mountpoint before its teardown)
+        unsafe { m.m_list.access_mut(ml).push_back(self) };
         let w = Weak::into_raw(MountRef::downgrade(parent)).cast_mut();
         let old = self.mnt_parent.swap(w, Ordering::Release);
         debug_assert!(old.is_null(), "mount: hung twice");
@@ -799,11 +807,14 @@ impl Mount {
     /// Clear the mountpoint links, under MOUNT_LOCK: the mountpoint they
     /// named, which still counts this mount until the caller's
     /// `put_mp`
-    fn take_mountpoint(&self, _ml: &MntHash) -> Option<MpPtr> {
+    fn take_mountpoint(&self, ml: &mut MntHash) -> Option<MpPtr> {
         self.mnt_mountpoint
             .store(core::ptr::null_mut(), Ordering::Relaxed);
-        let mp = self.mnt_mp.swap(core::ptr::null_mut(), Ordering::Relaxed);
-        NonNull::new(mp).map(MpPtr)
+        let mp = NonNull::new(self.mnt_mp.swap(core::ptr::null_mut(), Ordering::Relaxed))?;
+        // SAFETY: this mount still counts it, under MOUNT_LOCK; the
+        // mount is on its list (`set_mountpoint`)
+        unsafe { MpPtr(mp).get().m_list.access_mut(ml).remove(self) };
+        Some(MpPtr(mp))
     }
 
     /// Its mountpoint (Linux mnt_mp), under a lock that holds the tree's
@@ -1159,9 +1170,14 @@ pub struct Mountpoint {
     m_dentry: DentryRef,
     /// Mounts attached on it (Linux m_count)
     m_count: AtomicU32,
+    /// The mounts hung on it (Linux m_list, through `Mount.mnt_mp_list`;
+    /// no reference: each counts the mountpoint while it is on it).
+    /// Covers counted in `m_count` are not on it.
+    m_list: LockedBy<List<MntMpA>, MntHash>,
 }
 
 crate::adapter!(MpHashA, Mountpoint, m_hash);
+crate::adapter!(MntMpA, Mount, mnt_mp_list);
 crate::hadapter!(MntHashA, Mount, mnt_hash);
 
 /// A mountpoint hash bucket (Linux mountpoint_hashtable's hlist_head)
@@ -1325,6 +1341,7 @@ pub(super) fn get_mountpoint(d: &DentryRef) -> MpPin {
             m_hash: Link::new(),
             m_dentry: d.clone(),
             m_count: AtomicU32::new(0),
+            m_list: LockedBy::new(List::new()),
         }));
     }
 }
@@ -2077,7 +2094,9 @@ fn detach_mnt(ns: &mut NsTree, m: &MountRef) -> Option<MountRef> {
         .map(|c| unsafe { MountRef::from_entry(c) });
     let w = m.take_parent(&mut ml);
     // The put hands back a last one to drop after the unlock
-    let gone = m.take_mountpoint(&ml).and_then(|mp| put_mp(&mut ml, mp));
+    let gone = m
+        .take_mountpoint(&mut ml)
+        .and_then(|mp| put_mp(&mut ml, mp));
     drop(ml);
     drop(gone);
     drop(w);
@@ -2554,7 +2573,8 @@ impl Mount {
     fn put_mountpoint(&self) {
         let gone = {
             let mut ml = MOUNT_LOCK.read_excl();
-            self.take_mountpoint(&ml).and_then(|mp| put_mp(&mut ml, mp))
+            self.take_mountpoint(&mut ml)
+                .and_then(|mp| put_mp(&mut ml, mp))
         };
         drop(gone);
     }
@@ -2672,6 +2692,57 @@ impl Drop for Mount {
             unsafe { self.cleanup() };
         }
     }
+}
+
+/// Unmount everything mounted on `d`, in every namespace (Linux
+/// detach_mounts / __detach_mounts: a dentry that left the tree, an
+/// invalidated one's subtree): under NAMESPACE_SEM write and
+/// MOUNT_LOCK write, each mount on its mountpoint goes with its tree
+/// (umount_tree with no propagation; the unmounted ones' references
+/// are put by [`namespace_unlock`]), the mountpoint pinned meanwhile.
+/// Linux keeps the detached trees' submounts connected
+/// (UMOUNT_CONNECTED); here only locked ones keep a cover, as for a
+/// lazy umount.
+///
+/// Whether a mount was detached: a mountpoint held only by covers (an
+/// unmounted parent's locked children) has none to detach.
+pub fn detach_mounts(d: &Dentry) -> bool {
+    if !d.is_mountpoint() {
+        return false;
+    }
+    let mut ns = namespace_lock();
+    let gone = {
+        let mut ml = MOUNT_LOCK.write();
+        let Some(mp) = lookup_mountpoint(&ml, d) else {
+            return false;
+        };
+        let pin = pin_mp(&mut ml, mp);
+        let mut any = false;
+        loop {
+            // SAFETY: pinned, under MOUNT_LOCK
+            let m = unsafe { mp.get() }.m_list.access(&ml).front();
+            // SAFETY: a mount on the list hangs on its parent, whose
+            // mnt_mounts holds a reference to it, under MOUNT_LOCK
+            let Some(m) = m.map(|m| unsafe { &*m }) else {
+                break;
+            };
+            // Every umount takes a mount off its mountpoint (a cover
+            // stands in for a connected one): none lingers here
+            debug_assert_eq!(
+                m.flags() & MNT_UMOUNT,
+                0,
+                "mount: unmounted on its mountpoint"
+            );
+            umount_tree(&mut ns, &mut ml, m, 0);
+            any = true;
+        }
+        (unpin_mountpoint(&mut ml, pin), any)
+    };
+    // The mountpoint (its dentry reference) after the semaphore, as
+    // namespace_unlock frees ex_mountpoints
+    drop(ns);
+    drop(gone.0);
+    gone.1
 }
 
 /// Something is mounted on `d` in the caller's mount namespace (Linux

@@ -3075,14 +3075,23 @@ ECHILD; procfs and kernfs, whose answers need the inode data, always
 are. A stale answer invalidates that dentry (`dentry::d_invalidate`,
 Linux d_invalidate: the parent's d_lock, then its own, as every
 unhook, the parent read again if a rename moved it meanwhile; then
-`d_drop_tree` below it), never whatever holds the name by then; an
+each mountpoint at or below it, found by a walk of child lists under
+d_lock (`find_submount`, restarted if RENAME_LOCK's sequence moved),
+has its mounts detached (`mount::detach_mounts`, Linux
+__detach_mounts: NAMESPACE_SEM write, then MOUNT_LOCK write, the
+mountpoint pinned while each mount on its `m_list` goes with
+`umount_tree`), so it sleeps, inside the walk's i_rwsem as Linux's
+lookup under i_rwsem does; then `d_drop_tree` below it), never
+whatever holds the name by then; an
 error is the lookup's and invalidates nothing (Linux lookup_fast,
 lookup_dcache, __lookup_slow). `sb_permission` reads `Inode.sb` for a write only. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
 clones the task's and its leader's `Pid` under TASKLIST's read lock
 (dropped after it), then walks the procfs superblocks
-(`iterate_supers_type`: each taken under `SB_LOCK`, then s_umount
-read with it released) and drops dentries (d_lock), each named as that
-superblock's pid namespace numbers the task.
+(`iterate_supers_type_active`: an active reference each, no
+s_umount) and invalidates dentries (`d_invalidate`: d_lock, then
+NAMESPACE_SEM and MOUNT_LOCK for what is mounted there, Linux
+proc_invalidate_siblings_dcache), each named as that superblock's pid
+namespace numbers the task; it sleeps.
 
 A procfs superblock's pid namespace (`ProcOpts.pid_ns`, Linux
 proc_fs_info.pid_ns: the mounter's) is fixed at mount and read with no
@@ -3302,6 +3311,7 @@ of its namespace under MOUNT_LOCK.
 | `Mount.mnt_parent` | `AtomicPtr<Mount>` (a `Weak::into_raw`) | Parent mount (Linux mnt_parent; no reference: `get_parent` takes one with `try_get_mnt`): no lock of its own, written under NAMESPACE_SEM write and `MOUNT_LOCK` write (`attach_mnt`'s mnt_set_mountpoint, `detach_mnt`, `put_mnt_ns`, a teardown's `unhang_children`), read under either (`parent_in`, `get_parent`, `up`), or under an RCU read guard checked by MOUNT_LOCK's sequence (`up_rcu`, `__lookup_mnt`) |
 | `Mount.mnt_mountpoint` | `AtomicPtr<Dentry>` | Where it is mounted (Linux mnt_mountpoint): no reference, the dentry pinned by its `Mountpoint` (m_dentry) while set; set and cleared with `mnt_parent`, or for a mount already unhung cleared under MOUNT_LOCK's locking read just before its mountpoint is put (`put_unhung`); `get_mountpoint` takes a reference under an RCU read guard (`DentryRef::try_get`) |
 | `Mount.mnt_mp` | `AtomicPtr<Mountpoint>` | Its mountpoint (Linux mnt_mp), which counts it: set and cleared with `mnt_mountpoint` (`set_mountpoint`, `take_mountpoint`), read under NAMESPACE_SEM or MOUNT_LOCK while the mount has a parent (`mp_in`: copy_tree attaches a copy on its source's, pivot_root pins the old root's) |
+| `Mount.mnt_mp_list` | `list::Link` | On its mountpoint's `m_list` (Linux mnt_mp_list) while `mnt_mp` is set: linked and unlinked with it under MOUNT_LOCK; `detach_mounts` walks the list under MOUNT_LOCK write |
 | `Mount.overmount` | `AtomicPtr<Mount>` | The mount hung on its root (Linux overmount), no reference: set by `make_visible`, cleared when that mount leaves (`take_parent`, `mnt_change_mountpoint`), all under NAMESPACE_SEM write and `MOUNT_LOCK` write; read under either (`topmost_overmount`: graft's tucking, `where_to_mount` under MOUNT_LOCK's locking read) |
 | `Mount.mnt_mounts` | `LockedByEither<OwnedList>` (no lock of its own) | Submounts, each entry a reference to the submount (`MountRef::into_entry`; Linux mnt_mounts, linked through `Mount.mnt_child`): changed only under NAMESPACE_SEM write and `MOUNT_LOCK` both (`attach_mnt`, `detach_mnt`: `&mut NsTree` and `&mut MntHash`), read under either (`Stable`: `&NsTree` from a NAMESPACE_SEM guard, `&MntHash` from `MOUNT_LOCK.read_excl`). Walks step with `next_mnt` (Linux next_mnt: first submount, else the next sibling of the nearest mount up to the walk's root that has one), so no list is copied and no stack is kept |
 | `Mount.mnt_pcp` | `util::percpu_alloc::PcpSlot` (a word per CPU, in that CPU's chunks) | `MountRef` count (Linux mnt_pcp's mnt_count), summed under `MOUNT_LOCK` write once out of its namespace |
@@ -3389,9 +3399,11 @@ writers pass MOUNT_LOCK's `MntHash`: `attach_mnt` adds it, and
 out, all under MOUNT_LOCK write, before its `parent` or `mountpoint`
 changes; the chain's `Arc` is released a grace period later through
 `Mount.mnt_puts`). A dentry with mounts on it has one `Mountpoint`
-(Linux struct mountpoint: a reference to the dentry and `m_count`,
-the mounts attached there and the pins on it: Linux m_list) in a
-bucket under MOUNT_LOCK (`LockedBy` its `MntHash`, a locking read or
+(Linux struct mountpoint: a reference to the dentry, `m_count`, the
+mounts attached there, its covers and the pins on it, and `m_list`,
+the mounts alone, linked through `Mount.mnt_mp_list` by
+`set_mountpoint` and unlinked by `take_mountpoint`, both under
+MOUNT_LOCK) in a bucket under MOUNT_LOCK (`LockedBy` its `MntHash`, a locking read or
 the write side); each mount on it points at it (`Mount.mnt_mp`), a
 pin (`MpPin`, Linux pinned_mountpoint) keeps it across an attach;
 while it exists the dentry is marked mounted (`DentryFlags.mounted`,

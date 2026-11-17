@@ -1363,11 +1363,16 @@ pub fn d_drop_tree(d: &DentryRef) {
 }
 
 /// Take `d` itself out of the tree, unless it left already, then
-/// everything cached below it (Linux d_invalidate: a dentry its
-/// d_revalidate found stale; that dentry, not whatever holds its name
-/// by now). The parent's d_lock, then `d`'s, as for every unhook; a
-/// rename between reading the parent and locking it is seen under the
-/// locks and the parent read again.
+/// what is mounted on it or below it, then everything cached below it
+/// (Linux d_invalidate: a dentry its d_revalidate found stale; that
+/// dentry, not whatever holds its name by now; find_submount and
+/// detach_mounts for each mountpoint of the subtree). The parent's
+/// d_lock, then `d`'s, as for every unhook; a rename between reading
+/// the parent and locking it is seen under the locks and the parent
+/// read again. The mounts go before the subtree is dropped (Linux
+/// shrinks it first, which leaves a mountpoint, held by its
+/// mountpoint, in the tree; `d_drop_tree` takes held ones out too).
+/// May sleep (NAMESPACE_SEM).
 pub fn d_invalidate(d: &DentryRef) {
     loop {
         let Some(parent) = d.get_parent() else {
@@ -1386,8 +1391,50 @@ pub fn d_invalidate(d: &DentryRef) {
         }
         break;
     }
-    if !d.is_negative() {
-        d_drop_tree(d);
+    if d.is_negative() {
+        return;
+    }
+    // A mountpoint held only by covers detaches nothing: stop there
+    while let Some(v) = find_submount(d) {
+        if !super::mount::detach_mounts(&v) {
+            break;
+        }
+    }
+    d_drop_tree(d);
+}
+
+/// The first dentry at or below `top` that something is mounted on
+/// (Linux d_walk with find_submount), depth first; walked again from
+/// `top` if a rename raced the climb back up (Linux d_walk's
+/// rename_lock retry), so the walk never leaves the subtree
+fn find_submount(top: &DentryRef) -> Option<DentryRef> {
+    'again: loop {
+        let seq = rename_seq_begin();
+        let mut cur = top.clone();
+        loop {
+            if cur.is_mountpoint() {
+                return Some(cur);
+            }
+            if let Some(c) = first_child(&cur) {
+                cur = c;
+                continue;
+            }
+            // The next sibling of `cur` or of an ancestor below `top`
+            loop {
+                if DentryRef::ptr_eq(&cur, top) {
+                    return None;
+                }
+                let parent = cur.get_parent()?;
+                if rename_seq_retry(seq) {
+                    continue 'again;
+                }
+                if let Some(n) = next_sibling(&parent, &cur) {
+                    cur = n;
+                    break;
+                }
+                cur = parent;
+            }
+        }
     }
 }
 

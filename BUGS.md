@@ -556,6 +556,18 @@ NS_MNT_GET_INFO's nr_mounts is a walk of its tree under NAMESPACE_SEM
 (Linux reads mnt_ns->nr_mounts), and there is no fs.mount-max limit
 (sysctl_mount_max, count_mounts: ENOSPC).
 
+## detach_mounts gaps
+
+**Location**: `fs/mount.rs` (`detach_mounts`), `fs/namei/mod.rs`
+(`delete_entry`), `fs/link.rs` (rename)
+
+- The detached trees' submounts are disconnected as for a lazy umount
+  (locked ones leave covers); Linux __detach_mounts keeps them all
+  connected (umount_tree with UMOUNT_CONNECTED).
+- rmdir, unlink and a rename over a victim leave mounts other
+  namespaces have on the removed dentry; Linux vfs_rmdir, vfs_unlink
+  and vfs_rename detach them (dont_mount, detach_mounts).
+
 ## nullfs gaps
 
 **Location**: `fs/nullfs.rs`, `fs/mount.rs` init_mount_tree,
@@ -696,10 +708,6 @@ waiting).
   reference (set_root, path_init), legitimizes the root at unlazy
   (legitimize_root, nd->root_seq), and uses fdget and current_cred
   without one.
-- `dentry::d_invalidate` (a stale dentry's drop, `namei::d_revalidate`)
-  leaves mounts on the dropped subtree in place; Linux d_invalidate
-  detaches them (detach_mounts on each mountpoint below), e.g. a mount
-  under a /proc/<pid> directory whose task exited.
 
 ## renameat2 flag gaps
 

@@ -26,6 +26,77 @@ pub fn run_tests() {
     report_r(b"PROC_INO_UNIQUE", ino_unique());
     report_r(b"DROP_CACHES_DENTRIES", drop_dentries());
     report_r(b"DCACHE_UMOUNT_FREED", umount_freed());
+    report_r(b"PROC_FLUSH_DETACH", flush_detach());
+}
+
+/// A mount on /proc/<pid> goes when the process is reaped (Linux
+/// proc_flush_pid -> d_invalidate -> detach_mounts): run in a child
+/// with a private mount namespace, its exit status the failed step
+fn flush_detach() -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(flush_detach_child());
+    }
+    check(b"fork", pid > 0, pid)?;
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"child step", ws == 0, i64::from(ws >> 8))
+}
+
+/// Whether /proc/self/mountinfo shows a mount from source `src`
+fn mounted(src: &[u8]) -> bool {
+    let fd = sys_open(b"/proc/self/mountinfo\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 16384];
+    let mut n = 0;
+    while n < buf.len() {
+        let r = sys_read(fd as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    sys_close(fd as u64);
+    buf[..n].windows(src.len()).any(|w| w == src)
+}
+
+fn flush_detach_child() -> u64 {
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const MS_REC: u64 = 16384;
+    const MS_PRIVATE: u64 = 1 << 18;
+    let none = core::ptr::null();
+    if hk_syscall::sys_unshare(CLONE_NEWNS) != 0
+        || hk_syscall::sys_mount(none, b"/\0".as_ptr(), none, MS_REC | MS_PRIVATE, 0) != 0
+    {
+        return 1;
+    }
+    let (pid, w) = waiting_child();
+    let mut b = [0u8; 64];
+    let dir = proc_path(&mut b, pid, b"");
+    let r = hk_syscall::sys_mount(
+        b"hkflushsrc\0".as_ptr(),
+        dir.as_ptr(),
+        b"tmpfs\0".as_ptr(),
+        0,
+        0,
+    );
+    let on = r == 0 && mounted(b" hkflushsrc ");
+    sys_kill(pid, SIGKILL);
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    sys_close(w as u64);
+    if !on {
+        return 2;
+    }
+    if mounted(b" hkflushsrc ") {
+        return 3;
+    }
+    if stat(dir).err() != Some(ENOENT) {
+        return 4;
+    }
+    0
 }
 
 fn stat(p: &[u8]) -> Result<Stat, i64> {
