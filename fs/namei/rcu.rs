@@ -238,43 +238,22 @@ impl HeldFrame {
 }
 
 /// The legitimized link stack (Linux nd->stack after legitimize_links):
-/// two levels in place, the rest in room reserved while the RCU walk
-/// pushed them, bottom first
+/// its levels past the embedded ones in room reserved while the RCU
+/// walk pushed them, bottom first
 #[derive(Default)]
-pub(super) struct Held {
-    emb: [Option<HeldFrame>; EMBEDDED],
-    more: Vec<HeldFrame>,
-}
+pub(super) struct Held(EmbStack<HeldFrame>);
 
 impl Held {
-    fn len(&self) -> usize {
-        self.emb.iter().filter(|f| f.is_some()).count() + self.more.len()
-    }
-
-    /// Add a level, room reserved (`Stack::reserve`)
-    fn push(&mut self, f: HeldFrame) {
-        match self.emb.iter_mut().find(|s| s.is_none()) {
-            Some(s) => *s = Some(f),
-            None => self.more.push(f),
-        }
-    }
-
-    fn get(&self, i: usize) -> &HeldFrame {
-        match self.emb.get(i) {
-            Some(f) => f.as_ref().expect("namei: a hole in the held stack"),
-            None => &self.more[i - EMBEDDED],
-        }
-    }
-
     /// The rest of the name in ref mode: the top body's rest from
     /// `from`, the bodies below it, then `user`, in one text (the ref
     /// walk's form: a body with what follows it), allocated with no
     /// guard held; the links are put as it drops
     pub(super) fn text(&self, from: usize, user: &[u8]) -> Result<Vec<u8>, KernelError> {
         let mut v = Vec::new();
-        let n = self.len();
+        let n = self.0.len();
         for i in (0..n).rev() {
-            self.get(i)
+            self.0
+                .get(i)
                 .rest_to(if i == n - 1 { from } else { 0 }, &mut v)?;
         }
         v.try_reserve(user.len())
@@ -358,62 +337,59 @@ impl Frame<'_> {
 /// Linux EMBEDDED_LEVELS: links nested this deep need no allocation
 const EMBEDDED: usize = 2;
 
-/// The RCU walk's symlink stack (Linux nd->stack, nd->internal): two
-/// levels in place, the rest allocated GFP_ATOMIC on first need
-/// (nd_alloc_stack under LOOKUP_RCU), MAX_SYMLINK_DEPTH levels at most
-struct Stack<'g> {
-    emb: [Option<Frame<'g>>; EMBEDDED],
-    more: Vec<Frame<'g>>,
-    /// Room for the levels past the embedded ones once legitimized,
-    /// reserved with `more`
-    held_more: Vec<HeldFrame>,
+/// A stack of up to MAX_SYMLINK_DEPTH levels (Linux nd->stack over
+/// nd->internal): EMBEDDED in place, the rest in `more`, whose room is
+/// reserved before a push needs it, bottom first
+struct EmbStack<T> {
+    emb: [Option<T>; EMBEDDED],
+    more: Vec<T>,
 }
 
-impl<'g> Stack<'g> {
-    fn new() -> Self {
+impl<T> Default for EmbStack<T> {
+    fn default() -> Self {
         Self {
             emb: [None, None],
             more: Vec::new(),
-            held_more: Vec::new(),
         }
     }
+}
 
-    fn depth(&self) -> usize {
+impl<T> EmbStack<T> {
+    fn len(&self) -> usize {
         self.emb.iter().filter(|f| f.is_some()).count() + self.more.len()
     }
 
-    fn get(&self, i: usize) -> &Frame<'g> {
+    fn get(&self, i: usize) -> &T {
         match self.emb.get(i) {
             Some(f) => f.as_ref().expect("namei: a hole in the link stack"),
             None => &self.more[i - EMBEDDED],
         }
     }
 
-    fn top(&self) -> Option<&Frame<'g>> {
-        self.depth().checked_sub(1).map(|i| self.get(i))
+    fn top(&self) -> Option<&T> {
+        self.len().checked_sub(1).map(|i| self.get(i))
     }
 
-    fn top_mut(&mut self) -> Option<&mut Frame<'g>> {
+    fn top_mut(&mut self) -> Option<&mut T> {
         if let Some(f) = self.more.last_mut() {
             return Some(f);
         }
         self.emb.iter_mut().rev().find_map(Option::as_mut)
     }
 
-    /// Room for one more level: false if the allocation an RCU walk may
-    /// make failed (Linux reserve_stack: then try_to_unlazy)
-    fn reserve(&mut self) -> bool {
-        if self.depth() < EMBEDDED || self.more.capacity() > self.more.len() {
-            return true;
-        }
+    /// Room for one more level without an allocation
+    fn has_room(&self) -> bool {
+        self.len() < EMBEDDED || self.more.capacity() > self.more.len()
+    }
+
+    /// Room for every level past the embedded ones; false on ENOMEM
+    fn reserve_more(&mut self) -> bool {
         let n = super::MAX_SYMLINK_DEPTH - EMBEDDED;
-        crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
-            self.more.try_reserve_exact(n).is_ok() && self.held_more.try_reserve_exact(n).is_ok()
-        })
+        self.more.try_reserve_exact(n).is_ok()
     }
 
     /// Push a level, room reserved
-    fn push(&mut self, f: Frame<'g>) {
+    fn push(&mut self, f: T) {
         match self.emb.iter_mut().find(|s| s.is_none()) {
             Some(s) if self.more.is_empty() => *s = Some(f),
             _ => self.more.push(f),
@@ -425,6 +401,62 @@ impl<'g> Stack<'g> {
             return true;
         }
         self.emb.iter_mut().rev().find_map(Option::take).is_some()
+    }
+
+    /// Its levels, bottom first
+    fn into_levels(self) -> impl Iterator<Item = T> {
+        self.emb.into_iter().flatten().chain(self.more)
+    }
+}
+
+/// The RCU walk's symlink stack (Linux nd->stack, nd->internal): two
+/// levels in place, the rest allocated GFP_ATOMIC on first need
+/// (nd_alloc_stack under LOOKUP_RCU), MAX_SYMLINK_DEPTH levels at most;
+/// with it, empty, the stack its levels become once legitimized, its
+/// room reserved alongside (no allocation in legitimize_links)
+struct Stack<'g> {
+    frames: EmbStack<Frame<'g>>,
+    held: Held,
+}
+
+impl<'g> Stack<'g> {
+    fn new() -> Self {
+        Self {
+            frames: EmbStack::default(),
+            held: Held::default(),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn top(&self) -> Option<&Frame<'g>> {
+        self.frames.top()
+    }
+
+    fn top_mut(&mut self) -> Option<&mut Frame<'g>> {
+        self.frames.top_mut()
+    }
+
+    /// Room for one more level: false if the allocation an RCU walk may
+    /// make failed (Linux reserve_stack: then try_to_unlazy)
+    fn reserve(&mut self) -> bool {
+        if self.frames.has_room() {
+            return true;
+        }
+        crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
+            self.frames.reserve_more() && self.held.0.reserve_more()
+        })
+    }
+
+    /// Push a level, room reserved
+    fn push(&mut self, f: Frame<'g>) {
+        self.frames.push(f);
+    }
+
+    fn pop(&mut self) -> bool {
+        self.frames.pop()
     }
 }
 
@@ -465,16 +497,8 @@ fn legitimize_path(
 /// drop_links, terminate_walk). No allocation: the levels past the
 /// embedded ones go in room reserved with them.
 fn legitimize_links(stack: Stack<'_>, m_seq: u32, puts: &mut Puts) -> Option<Held> {
-    let Stack {
-        emb,
-        more,
-        held_more,
-    } = stack;
-    let mut held = Held {
-        emb: [None, None],
-        more: held_more,
-    };
-    for fr in emb.into_iter().flatten().chain(more) {
+    let Stack { frames, mut held } = stack;
+    for fr in frames.into_levels() {
         let mnt = match MountRef::legitimize(fr.mnt, m_seq) {
             Ok(m) => m,
             Err(m) => {
@@ -489,7 +513,7 @@ fn legitimize_links(stack: Stack<'_>, m_seq: u32, puts: &mut Puts) -> Option<Hel
             return None;
         };
         let moved = fr.link.d_seq_retry(fr.seq);
-        held.push(HeldFrame {
+        held.0.push(HeldFrame {
             link: Path::new(mnt, d),
             body: match fr.body {
                 Body::Ref(_) => None,
