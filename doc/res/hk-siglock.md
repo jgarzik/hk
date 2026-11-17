@@ -205,8 +205,9 @@ made under siglock as Linux's.
      synchronize_group_exit).
    - [x] `SigHand.action`: the siglock's own data (`InstanceLock::Data`);
      exec's unshare copies it under the old siglock.
-   - [ ] `SigHand.update` gone; ignored POSIX timers on a siglock-owned
-     list (Linux ignored_posix_timers).
+   - [x] `SigHand.update` gone (`do_sigaction` under siglock alone);
+     ignored POSIX timers on a siglock-owned list (Linux
+     ignored_posix_timers).
 
 Also in this series:
 

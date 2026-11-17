@@ -133,9 +133,6 @@ struct PosixTimerInner {
     sigqueue_seq: u64,
     /// The signal was sent as an interval timer's (Linux it_sig_periodic)
     sig_periodic: bool,
-    /// Its signal was ignored on expiry: queued once the action stops
-    /// ignoring it (Linux ignored_posix_timers)
-    ignored: bool,
     /// A CPU timer on a firing list (`elist`) waiting to fire (Linux
     /// it.cpu.firing): settime and delete clear it, and the firer then
     /// drops the event
@@ -159,7 +156,6 @@ impl PosixTimerInner {
             signal_seq: 0,
             sigqueue_seq: 0,
             sig_periodic: false,
-            ignored: false,
             firing: false,
             collected: false,
         }
@@ -203,6 +199,11 @@ pub struct PosixTimer {
     /// it.cpu.elist): linked under the group's `posix_timers`, unlinked
     /// by that run alone after it drops the lock (`inner.collected`)
     elist: crate::util::list::Link,
+    /// Its link on its process's `SignalStruct.ignored_timers` while its
+    /// interval signal waits to be unignored (Linux ignored_list), under
+    /// that process's siglock
+    ignored_link: crate::util::list::Link,
+    ignored_owner: crate::util::list::Owner,
     /// The references its signal entry's flush puts, dropped a grace
     /// period later (Linux posixtimer_putref -> posixtimer_free_timer:
     /// kfree_rcu)
@@ -210,6 +211,7 @@ pub struct PosixTimer {
 }
 
 crate::adapter!(pub ElistAdapter, PosixTimer, elist);
+crate::owned_adapter!(pub IgnoredAdapter, PosixTimer, ignored_link, ignored_owner);
 crate::rcu_puts!(PosixTimer, rcu);
 
 impl PosixTimer {
@@ -236,6 +238,8 @@ impl PosixTimer {
             sleeper: false,
             wq: crate::sync::waitqueue::WaitQueue::new(),
             elist: crate::util::list::Link::new(),
+            ignored_link: crate::util::list::Link::new(),
+            ignored_owner: crate::util::list::Owner::new(),
             rcu: crate::sync::rcu::RcuPuts::new(),
         }
     }
@@ -287,6 +291,8 @@ impl PosixTimer {
             sleeper,
             wq: crate::sync::waitqueue::WaitQueue::new(),
             elist: crate::util::list::Link::new(),
+            ignored_link: crate::util::list::Link::new(),
+            ignored_owner: crate::util::list::Owner::new(),
             rcu: crate::sync::rcu::RcuPuts::new(),
         }
     }
@@ -531,22 +537,17 @@ impl PosixTimer {
     }
 
     /// Send its entry `q` as stamped when it was first queued (Linux
-    /// posixtimer_queue_sigqueue): ignored, an interval timer's waits
-    /// to be unignored
+    /// posixtimer_send_sigqueue): ignored, it goes back to the timer
+    /// under the receiver's siglock, an interval timer's listed to be
+    /// unignored ([`sig_ignore`])
     fn send_sigq(&self, q: Box<SigQueue>) {
-        let periodic = self.inner.lock().sig_periodic;
         let Some(target) = &self.target else {
             *self.sigq.lock() = Some(q);
             return;
         };
-        let ignored = match crate::signal::send_timer_sigqueue(target, self.pid_type, q) {
-            Ok(()) => false,
-            Err((q, ignored)) => {
-                *self.sigq.lock() = Some(q);
-                ignored && periodic
-            }
-        };
-        self.inner.lock().ignored = ignored;
+        if let Err(q) = crate::signal::send_timer_sigqueue(target, self.pid_type, q) {
+            *self.sigq.lock() = Some(q);
+        }
     }
 
     /// Its signal was dequeued, the info in `info` (Linux
@@ -655,6 +656,10 @@ impl PosixTimer {
             i.firing = false;
             i.signal_seq += 1;
         }
+        // Off its process's ignored list (Linux
+        // posix_timer_cleanup_ignored under siglock): the deleter is a
+        // thread of that process
+        crate::signal::cleanup_ignored(self);
         self.timer.cancel_sync();
         self.wq.wake_all();
     }
@@ -724,39 +729,81 @@ pub fn reclaim(q: Box<SigQueue>) {
     let Some(t) = q.timer().and_then(alloc::sync::Weak::upgrade) else {
         return;
     };
-    {
-        let mut i = t.inner.lock();
-        if i.sig_periodic && i.signal_seq == i.sigqueue_seq {
-            i.ignored = true;
-        }
-    }
     *t.sigq.lock() = Some(q);
     crate::sync::rcu::put_rcu(t);
 }
 
-/// `sig`'s action no longer ignores it: the current process's interval
-/// timers whose signal it ignored queue it now (Linux
-/// posixtimer_sig_unignore)
-pub fn sig_unignore(sig: Signal) {
-    let me = current();
-    let ignored = |t: &&Arc<PosixTimer>| t.sigevent.signal() == Some(sig) && t.inner.lock().ignored;
-    // Sized under one hold, filled under another: nothing allocates
-    // under posix_timers
-    let n = with_timers(&me, |reg| reg.iter().filter(ignored).count()).unwrap_or(0);
-    let mut waiting = alloc::vec::Vec::with_capacity(n);
-    with_timers(&me, |reg| {
-        for t in reg.iter().filter(ignored).take(n) {
-            waiting.push(t.clone());
+/// Timer entry `q` was not queued, its signal ignored, or was flushed,
+/// under the siglock `g` of process `group`'s table (Linux
+/// posixtimer_sig_ignore, from posixtimer_send_sigqueue and
+/// sigqueue_free_ignored): back to its timer; a live interval timer's
+/// is listed on `group.ignored_timers` to be queued again when the
+/// action stops ignoring it, any other timer comes off that list (an
+/// interval timer set to one shot since). The timer's own lock is a
+/// leaf under the siglock (no path takes the siglock under it: its
+/// signal is sent after it is dropped); a timer reference dropped here
+/// goes a grace period late (`put_rcu`): a deleted timer is never torn
+/// down under the siglock.
+pub fn sig_ignore(
+    g: &crate::signal::SigGuard<'_>,
+    group: &crate::signal::SignalStruct,
+    q: Box<SigQueue>,
+) {
+    let Some(t) = q.timer().and_then(alloc::sync::Weak::upgrade) else {
+        return;
+    };
+    let wait = {
+        let i = t.inner.lock();
+        i.sig_periodic && i.signal_seq == i.sigqueue_seq
+    };
+    *t.sigq.lock() = Some(q);
+    let mut l = group.ignored_timers(g);
+    if wait {
+        if !l.contains(&t) {
+            l.push_back(t);
+            return;
         }
-    });
-    // Queued as first stamped: a settime or delete since then drops it
-    // at dequeue (Linux posixtimer_sig_unignore leaves it_sigqueue_seq)
-    for t in waiting {
-        t.inner.lock().ignored = false;
+    } else if let Some(r) = l.remove(&t) {
+        crate::sync::rcu::put_rcu(r);
+    }
+    drop(l);
+    crate::sync::rcu::put_rcu(t);
+}
+
+/// The timer entries among `gone`, just flushed under siglock `g` from
+/// `group`'s sets, go back to their timers ([`sig_ignore`]; Linux
+/// flush_sigqueue_mask: sigqueue_free_ignored)
+pub fn flush_ignored(
+    g: &crate::signal::SigGuard<'_>,
+    group: &crate::signal::SignalStruct,
+    gone: &mut crate::signal::SigPending,
+) {
+    gone.drain_timers(|q| sig_ignore(g, group, q));
+}
+
+/// `sig`'s action no longer ignores it: `group`'s interval timers whose
+/// signal it ignored queue it now, under its siglock `g` (Linux
+/// posixtimer_sig_unignore: the rearm is left to the dequeue). A timer
+/// whose target cannot take it keeps its entry.
+pub fn sig_unignore(
+    g: &crate::signal::SigGuard<'_>,
+    group: &crate::signal::SignalStruct,
+    sig: Signal,
+) {
+    loop {
+        let found = group
+            .ignored_timers(g)
+            .remove_first(|t| t.sigevent.signal() == Some(sig));
+        let Some(t) = found else {
+            return;
+        };
         let q = t.sigq.lock().take();
-        if let Some(q) = q {
-            t.send_sigq(q);
+        if let (Some(q), Some(pid)) = (q, t.target.as_ref())
+            && let Err(q) = crate::signal::queue_timer_locked(g, pid, t.pid_type, q)
+        {
+            *t.sigq.lock() = Some(q);
         }
+        crate::sync::rcu::put_rcu(t);
     }
 }
 

@@ -261,6 +261,12 @@ impl SigPending {
         gone
     }
 
+    /// Hand each queued timer entry to `f`, off the list (a flushed
+    /// set's: its mask is left as it is)
+    pub fn drain_timers(&mut self, f: impl FnMut(Box<SigQueue>)) {
+        self.list.drain_if(|q| q.timer.is_some(), f);
+    }
+
     /// The info of its `n`th queued entry (PTRACE_PEEKSIGINFO)
     pub fn nth(&self, n: u64) -> Option<SigInfo> {
         self.iter().nth(usize::try_from(n).ok()?).map(|q| q.info)

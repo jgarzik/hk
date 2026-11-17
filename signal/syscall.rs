@@ -103,24 +103,9 @@ pub fn sys_rt_sigaction(
         let old = sighand.get_action(sig);
         return write_oact(oact, &old);
     };
-    // The install and its flush as one step for other sigactions on
-    // this table (Linux do_sigaction holds siglock across both): none
-    // can install a handler, and let a signal be queued for it, before
-    // this flush has run. A send meanwhile sees the new action.
-    let old = {
-        let _update = sighand.lock_update();
-        let ignores = new.ignores(sig);
-        // The old action and the swap in one hold of the action lock
-        let old = sighand.set_action(sig, new)?;
-        // Ignored now: discarded pending; no longer ignored: interval
-        // timers whose signal it ignored queue it (Linux do_sigaction)
-        if ignores {
-            crate::signal::flush_group_signal(sig);
-        } else if old.is_ignore() {
-            crate::time::posix_timer::sig_unignore(sig);
-        }
-        old
-    };
+    // The install and its flush or timer requeue in one siglock hold
+    // (Linux do_sigaction); the old action written after it
+    let old = crate::signal::do_sigaction(sig, new)?;
     write_oact(oact, &old)
 }
 

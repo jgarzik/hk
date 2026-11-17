@@ -801,6 +801,15 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         Some(unsafe { self.list.remove(item) })
     }
 
+    /// Take the first entry `f` picks off and hand back the list's
+    /// reference
+    pub fn remove_first(&mut self, f: impl Fn(&A::Item) -> bool) -> Option<P> {
+        let item = self.list.remove_first(f)?;
+        // INVARIANT: off the list
+        A::owner(&item).0.store(0, Relaxed);
+        Some(item)
+    }
+
     /// Take the first entry off and hand back the list's reference
     pub fn pop_front(&mut self) -> Option<P> {
         let item = self.list.pop_front()?;

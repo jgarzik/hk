@@ -355,12 +355,6 @@ impl Default for SigAction {
 /// Contains the signal action table for a task or group of tasks sharing
 /// handlers, under its siglock (Linux sighand->action).
 pub struct SigHand {
-    /// Serializes sigaction's change of an action with the flush of
-    /// pending signals that change makes (Linux holds siglock across
-    /// both in do_sigaction): a thread's install waits until another's
-    /// flush is done. Sleeping (the flush allocates and frees queue
-    /// entries); taken before TASKLIST and every signal spin lock
-    update: crate::sync::Mutex<()>,
     /// Readers and pollers of a signalfd among the tasks sharing this
     /// table (Linux sighand->signalfd_wqh): woken by every signal sent
     /// to one of them
@@ -418,7 +412,6 @@ impl SigHand {
     /// A table with `actions`
     fn with_actions(actions: Box<[SigAction]>) -> Self {
         Self {
-            update: crate::sync::Mutex::new(()),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
             users: crate::task::TableCell::new(0),
             siglock: new_siglock(actions),
@@ -476,12 +469,6 @@ impl SigHand {
             }
         }
         (ign, cgt)
-    }
-
-    /// Hold off other sigaction changes of this table while the caller
-    /// changes an action and flushes what it now ignores
-    pub fn lock_update(&self) -> crate::sync::MutexGuard<'_, ()> {
-        self.update.lock()
     }
 
     /// Set `sig`'s action under its siglock; the old one, or EINVAL for
@@ -1431,23 +1418,45 @@ pub fn exec_signals() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// The current thread group's pending `sig` is discarded, every queued
-/// instance with it (Linux do_sigaction once the action ignores it:
-/// POSIX, whether or not it is blocked)
-pub fn flush_group_signal(sig: Signal) {
+/// Group `s`'s pending `sig` is discarded, every queued instance with
+/// it, from its set and each thread's, under its siglock `g` (Linux
+/// do_sigaction once the action ignores it: flush_sigqueue_mask on
+/// shared_pending and for_each_thread; POSIX, whether or not it is
+/// blocked); a timer's entry goes back to it, the rest to `gone`
+fn flush_group_signal(g: &SigGuard<'_>, s: &SignalStruct, sig: Signal, gone: &mut SigPending) {
     let mask = SigSet::of(sig);
+    s.shared(g).flush_mask_into(&mask, gone);
+    for t in s.threads(g) {
+        with_sig_send(g, t, |_, st| st.pending.flush_mask_into(&mask, gone));
+    }
+    crate::time::posix_timer::flush_ignored(g, s, gone);
+}
+
+/// Install `new` as the current process's action for `sig` (not
+/// SIGKILL or SIGSTOP), the old one returned (Linux do_sigaction), in
+/// one hold of its siglock: the install, the flush of what it now
+/// ignores, or the requeue of interval timers whose signal it no
+/// longer ignores (Linux posixtimer_sig_unignore). Flushed entries are
+/// freed after it. ESRCH if the caller has no table.
+pub fn do_sigaction(sig: Signal, new: SigAction) -> KernelResult<SigAction> {
+    if sig.kernel_only() {
+        return Err(KernelError::InvalidArgument);
+    }
     let me = crate::task::percpu::current();
-    // Under the caller's siglock, its group's set and each thread's
-    // (Linux do_sigaction: flush_sigqueue_mask, for_each_thread); the
-    // entries are freed after it
     let mut gone = SigPending::new();
     let rcu = crate::sync::rcu::read_lock();
-    if let (Some(g), Some(s)) = (lock_task_sighand(&me, &rcu), me.cpu_group()) {
-        s.shared(&g).flush_mask_into(&mask, &mut gone);
-        for t in s.threads(&g) {
-            with_sig_send(&g, t, |_, st| st.pending.flush_mask_into(&mask, &mut gone));
+    let mut g = lock_task_sighand(&me, &rcu).ok_or(KernelError::NoProcess)?;
+    let ignores = new.ignores(sig);
+    let old = core::mem::replace(&mut g[sig.idx()], new);
+    if let Some(s) = me.cpu_group() {
+        if ignores {
+            flush_group_signal(&g, s, sig, &mut gone);
+        } else if old.is_ignore() {
+            crate::time::posix_timer::sig_unignore(&g, s, sig);
         }
     }
+    drop(g);
+    Ok(old)
 }
 
 /// SIGKILL is pending for the current task (Linux
@@ -1782,6 +1791,9 @@ fn send_task_in(
     let Ok(_j) = prepare_signal(&g, tg.signal.as_ref(), sig, gone) else {
         return Ok(());
     };
+    if let Some(s) = tg.signal.as_ref() {
+        crate::time::posix_timer::flush_ignored(&g, s, gone);
+    }
     let sent = with_sig_send(&g, t, |t, state| send_locked(&g, t, state, &to));
 
     let wants = match sent {
@@ -2501,13 +2513,16 @@ pub fn dequeue_signal(wanted: &SigSet) -> Option<(Signal, SigInfo)> {
 /// Queue POSIX timer entry `q` for task `tid` or its group (Linux
 /// posixtimer_send_sigqueue): no legacy check (the entry is the
 /// timer's one instance), `ty` Pid not on an exiting thread; then the
-/// thread choice of any group signal. The entry comes back if it was
-/// not queued, with whether the signal was ignored.
+/// thread choice of any group signal. An ignored signal's entry goes
+/// back to its timer under the siglock ([`posix_timer::sig_ignore`]);
+/// one that could not be queued otherwise comes back.
+///
+/// [`posix_timer::sig_ignore`]: crate::time::posix_timer::sig_ignore
 pub fn send_timer_sigqueue(
     pid: &crate::task::pid::Pid,
     ty: PidType,
     q: Box<SigQueue>,
-) -> Result<(), (Box<SigQueue>, bool)> {
+) -> Result<(), Box<SigQueue>> {
     let sig = q.sig();
     let me = crate::task::percpu::current();
     // The task its struct pid names now, if any (Linux pid_task under
@@ -2515,7 +2530,7 @@ pub fn send_timer_sigqueue(
     // the group (posixtimer_get_target)
     let rcu = crate::sync::rcu::read_lock();
     let Some(found) = pid.task(&rcu) else {
-        return Err((q, false));
+        return Err(q);
     };
     let t: &Task =
         if ty != PidType::Pid && me.pid == found.tid() && !me.has_flag(crate::task::pf::EXITING) {
@@ -2528,20 +2543,28 @@ pub fn send_timer_sigqueue(
     // after it
     let mut gone = SigPending::new();
     let Some(g) = lock_task_sighand(t, &rcu) else {
-        return Err((q, false));
+        return Err(q);
     };
     let tg = target(t, &rcu);
-    let exiting = tg
-        .signal
-        .as_ref()
-        .is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_)));
-    if t.has_flag(crate::task::pf::KTHREAD) || exiting {
-        return Err((q, true));
+    let Some(group) = tg.signal.as_ref() else {
+        return Err(q);
+    };
+    if t.has_flag(crate::task::pf::KTHREAD) {
+        return Err(q);
+    }
+    let ignore = |q| {
+        crate::time::posix_timer::sig_ignore(&g, group, q);
+        Ok(())
+    };
+    // A dying group ignores it (Linux prepare_signal)
+    if matches!(group.group_exit(), GroupExit::Exit(_)) {
+        return ignore(q);
     }
     let sighand = tg.sighand.as_ref();
-    let Ok(_j) = prepare_signal(&g, tg.signal.as_ref(), sig, &mut gone) else {
-        return Err((q, true));
+    let Ok(_j) = prepare_signal(&g, Some(group), sig, &mut gone) else {
+        return ignore(q);
     };
+    crate::time::posix_timer::flush_ignored(&g, group, &mut gone);
     let mut q = Some(q);
     let r = with_sig_send(&g, t, |task, state| {
         let exiting = task.has_flag(crate::task::pf::EXITING);
@@ -2579,7 +2602,70 @@ pub fn send_timer_sigqueue(
             complete_signal(&g, t, sig, ty, wants, init);
             Ok(())
         }
-        Err(ignored) => Err((q.expect("an unqueued entry comes back"), ignored)),
+        Err(true) => ignore(q.expect("an unqueued entry comes back")),
+        Err(false) => Err(q.expect("an unqueued entry comes back")),
+    }
+}
+
+/// Queue timer entry `q` for the task `pid` names, of the process whose
+/// table's siglock `g` is held, or its group (`ty`; Linux
+/// posixtimer_get_unignore_target, posixtimer_queue_sigqueue: no
+/// ignore or legacy check), then its thread choice; the entry comes
+/// back if that task cannot take it (gone, another table's, or an
+/// exiting thread for its own signal)
+pub fn queue_timer_locked(
+    g: &SigGuard<'_>,
+    pid: &crate::task::pid::Pid,
+    ty: PidType,
+    q: Box<SigQueue>,
+) -> Result<(), Box<SigQueue>> {
+    let me = crate::task::percpu::current();
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(found) = pid.task(&rcu) else {
+        return Err(q);
+    };
+    let t: &Task =
+        if ty != PidType::Pid && me.pid == found.tid() && !me.has_flag(crate::task::pf::EXITING) {
+            &me
+        } else {
+            found
+        };
+    let exiting = t.has_flag(crate::task::pf::EXITING);
+    let ours = core::ptr::eq(t.sighand.as_ptr(), g.owner());
+    let Some(group) = t
+        .cpu_group()
+        .filter(|_| ours && !(exiting && ty == PidType::Pid))
+    else {
+        return Err(q);
+    };
+    let sig = q.sig();
+    let wants = with_sig_send(g, t, |task, state| {
+        let wants = !state.blocked.contains(sig)
+            && !exiting
+            && !state.stopped_or_traced()
+            && (task.se.on_cpu() || !task.sigpending());
+        match ty {
+            PidType::Pid => state.pending.queue(q),
+            PidType::Tgid | PidType::Pgid => group.shared(g).queue(q),
+        }
+        wants
+    });
+    g.owner().signalfd_wq.wake_all();
+    let init = target(t, &rcu).protects(sig, false);
+    complete_signal(g, t, sig, ty, wants, init);
+    Ok(())
+}
+
+/// Timer `t` leaves the current process's ignored list, under its
+/// siglock (Linux posix_timer_cleanup_ignored): it is being deleted by
+/// one of that process's threads
+pub fn cleanup_ignored(t: &crate::time::posix_timer::PosixTimer) {
+    let me = crate::task::percpu::current();
+    let rcu = crate::sync::rcu::read_lock();
+    if let (Some(g), Some(s)) = (lock_task_sighand(&me, &rcu), me.cpu_group())
+        && let Some(r) = s.ignored_timers(&g).remove(t)
+    {
+        crate::sync::rcu::put_rcu(r);
     }
 }
 
@@ -2674,6 +2760,13 @@ pub struct SignalStruct {
     /// group_stop_count, group_exit_code): under the siglock of the
     /// table its threads name, as `shared`
     pub jobctl: crate::sync::InstanceCell<stop::GroupStop, SigHand>,
+    /// Interval timers whose signal was ignored, waiting for the action
+    /// to stop ignoring it (Linux signal->ignored_posix_timers), one
+    /// reference each: under siglock, as `shared`
+    ignored_timers: crate::sync::InstanceCell<
+        crate::util::list::OwnedList<crate::time::posix_timer::IgnoredAdapter>,
+        SigHand,
+    >,
     /// PR_SET_CHILD_SUBREAPER (Linux signal->is_child_subreaper): the
     /// process adopts its descendants' orphans; set by any thread,
     /// under TASKLIST's write lock, read under its read lock by the
@@ -2826,6 +2919,7 @@ impl SignalStruct {
             shared: crate::sync::InstanceCell::new(GroupPending::new()),
             threads: crate::sync::LockedByBoth::new(crate::util::list::OwnedList::new()),
             jobctl: crate::sync::InstanceCell::new(stop::GroupStop::new()),
+            ignored_timers: crate::sync::InstanceCell::new(crate::util::list::OwnedList::new()),
             subreaper: crate::task::TableCell::new(false),
             unkillable: AtomicBool::new(false),
             ctty: Mutex::new(crate::tty::jobctrl::Ctty::new()),
@@ -2848,6 +2942,17 @@ impl SignalStruct {
         self.shared.borrow_mut(g)
     }
 
+    /// Its ignored interval timers, under its table's siglock `g`
+    pub fn ignored_timers<'a>(
+        &'a self,
+        g: &'a SigGuard<'_>,
+    ) -> crate::sync::InstanceRefMut<
+        'a,
+        crate::util::list::OwnedList<crate::time::posix_timer::IgnoredAdapter>,
+    > {
+        self.ignored_timers.borrow_mut(g)
+    }
+
     /// Its job-control state, under its table's siglock `g`
     pub fn jobctl<'a>(
         &'a self,
@@ -2868,6 +2973,7 @@ impl SignalStruct {
         self.threads.set_owner(table, g, new);
         self.shared.set_owner(g, new);
         self.jobctl.set_owner(g, new);
+        self.ignored_timers.set_owner(g, new);
     }
 
     /// The group is a pid namespace's init, protected from SIG_DFL
