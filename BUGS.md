@@ -686,20 +686,15 @@ F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
 
-## RCU path walk gaps
+## Path walk gaps
 
-**Location**: `fs/namei/`, `fs/open.rs`, `fs/proc/`
+**Location**: `fs/namei/`
 
 - The ref-mode walk follows a symlink by copying its body and the
   rest of the name into one buffer and walking that (`get_link`, and
   `Held::text` for the stack an RCU walk hands over); Linux's one
   link_path_walk loop keeps the link stack (nd->stack) in ref mode
   too, the links held until each body is walked.
-- /proc/<pid> permission for a task that is gone falls back to the
-  generic check instead of ESRCH (Linux proc_pid_permission).
-- /proc/<pid>/fd and fdinfo directory permission is a ptrace-read
-  check; Linux proc_fd_permission is the generic check or the same
-  thread group.
 
 ## renameat2 flag gaps
 

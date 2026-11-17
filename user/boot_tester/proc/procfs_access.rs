@@ -6,11 +6,12 @@
 use crate::harness::verdict;
 use hk_syscall::{
     O_DIRECTORY, O_NOFOLLOW, O_PATH, O_RDONLY, Timespec, sys_close, sys_execve, sys_exit, sys_fork,
-    sys_kill, sys_nanosleep, sys_open, sys_pipe2, sys_prctl, sys_pread64, sys_read, sys_readlink,
-    sys_readlinkat, sys_setresuid, sys_setuid, sys_wait4, sys_write,
+    sys_kill, sys_nanosleep, sys_open, sys_openat, sys_pipe2, sys_prctl, sys_pread64, sys_read,
+    sys_readlink, sys_readlinkat, sys_setresuid, sys_setuid, sys_wait4, sys_write,
 };
 
 const EACCES: i64 = -13;
+const ESRCH: i64 = -3;
 const NOBODY: u64 = 65534;
 const PR_SET_DUMPABLE: i32 = 4;
 const SIGKILL: u32 = 9;
@@ -23,6 +24,8 @@ pub fn run_tests() {
     test_suid_differs();
     test_maps_after_exec();
     in_child(b"PROC_FD_LINK_ACCESS", fd_link_access);
+    test_fd_dir_generic();
+    test_gone_esrch();
 }
 
 /// Run `f` in a child; its exit code 0 is a pass, else the failed step
@@ -279,6 +282,88 @@ fn test_suid_differs() {
     sys_close(p[0] as u64);
     sys_close(p[1] as u64);
     verdict(b"PROC_ACCESS_SUID_DIFFERS", st == 0, (st >> 8) as i64);
+}
+
+/// fd/ is the generic check (Linux proc_fd_permission): a dumpable
+/// target whose saved uid differs from the reader's, so ptrace-read
+/// access is denied, still lets its uid open fd/ (owned by its euid);
+/// fdinfo/ needs ptrace-read access (Linux proc_fdinfo_permission:
+/// EACCES)
+fn test_fd_dir_generic() {
+    const UID: u32 = 1000;
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    let a = sys_fork();
+    if a == 0 {
+        sys_setresuid(UID, UID, 0);
+        sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+        sys_write(p[1] as u64, b"r".as_ptr(), 1);
+        let ts = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        sys_nanosleep(&ts, core::ptr::null_mut());
+        sys_exit(0);
+    }
+    let mut c = [0u8; 1];
+    sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+    let b = sys_fork();
+    if b == 0 {
+        sys_setuid(UID);
+        let mut buf = [0u8; 64];
+        let fd = open_ret(path(&mut buf, a, b"fd"), O_RDONLY | O_DIRECTORY);
+        let info = open_ret(path(&mut buf, a, b"fdinfo"), O_RDONLY | O_DIRECTORY);
+        let code = if fd < 0 {
+            1
+        } else if info != EACCES {
+            2
+        } else {
+            0
+        };
+        sys_exit(code);
+    }
+    let mut st = 0i32;
+    sys_wait4(b, &mut st, 0, 0);
+    sys_kill(a, SIGKILL);
+    sys_wait4(a, core::ptr::null_mut(), 0, 0);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    verdict(b"PROC_FD_DIR_GENERIC", st == 0, (st >> 8) as i64);
+}
+
+/// A walk in the /proc/<pid> directory of a process that is gone is
+/// ESRCH (Linux proc_pid_permission); its fdinfo/ too
+/// (proc_fdinfo_permission)
+fn test_gone_esrch() {
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    let a = sys_fork();
+    if a == 0 {
+        sys_close(p[1] as u64);
+        let mut c = [0u8; 1];
+        sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    sys_close(p[0] as u64);
+    let mut buf = [0u8; 64];
+    let dir = sys_open(path(&mut buf, a, b"").as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    let info = sys_open(
+        path(&mut buf, a, b"fdinfo").as_ptr(),
+        O_RDONLY | O_DIRECTORY,
+        0,
+    );
+    sys_close(p[1] as u64);
+    sys_wait4(a, core::ptr::null_mut(), 0, 0);
+    let r1 = sys_openat(dir as i32, b"stat\0".as_ptr(), O_RDONLY, 0);
+    let r2 = sys_openat(info as i32, b"0\0".as_ptr(), O_RDONLY, 0);
+    for fd in [dir, info, r1, r2] {
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+    }
+    let ok = dir >= 0 && info >= 0 && r1 == ESRCH && r2 == ESRCH;
+    let got = if r1 != ESRCH { r1 } else { r2 };
+    verdict(b"PROC_GONE_ESRCH", ok, got);
 }
 
 /// An open maps file keeps reading the address space it was opened on:

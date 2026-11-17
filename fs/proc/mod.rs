@@ -488,9 +488,6 @@ impl InodeOps for ProcfsInodeOps {
         }))
     }
 
-    /// /proc/sys files: Linux proc_sys_permission (never executable,
-    /// then sysctl_perm: no capability override of the mode); fd/ and
-    /// fdinfo/ need ptrace-read access
     /// Linux proc_pid_getattr: a process hidepid=invisible hides is
     /// ENOENT to stat too (a dentry looked up by someone else stays
     /// cached), consistent with readdir
@@ -503,21 +500,38 @@ impl InodeOps for ProcfsInodeOps {
         }
     }
 
+    /// /proc/<pid> (Linux proc_pid_permission: ESRCH for a task that is
+    /// gone, hidepid=), fd/ (proc_fd_permission: the generic check or
+    /// the same thread group), fdinfo/ and its files
+    /// (proc_fdinfo_permission: ESRCH, ptrace-read access), /proc/sys
+    /// files (proc_sys_permission: never executable, then sysctl_perm:
+    /// no capability override of the mode)
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         // An RCU walk reads what the inode keeps for it (`private`
         // goes with the teardown)
         if mask & crate::fs::dac::MAY_NOT_BLOCK != 0 {
             return permission_rcu(inode, cred, mask);
         }
-        // A process directory hidepid= hides (Linux proc_pid_permission)
-        if let Some(t) = pid_dir_pid(inode) {
-            opts::with(inode, |o| o.pid_permission(&t)).unwrap_or(Ok(()))?;
-        }
-        // fd/ and fdinfo/: ptrace-read access (Linux proc_fd_permission)
-        if let Some(OpenCheck::Fds(t)) = open_check(inode)
-            && !crate::task::ptrace::may_access_task(&t, true)
-        {
-            return Err(KernelError::PermissionDenied);
+        match pid_perm(inode) {
+            // Linux proc_pid_permission: ESRCH for a task that is gone,
+            // then what hidepid= hides
+            Some((Perm::PidDir, p)) => {
+                let t = p.task().ok_or(KernelError::NoProcess)?;
+                opts::with(inode, |o| o.pid_permission(&t)).unwrap_or(Ok(()))?;
+            }
+            Some((Perm::FdDir, p)) => {
+                let same = p.task().is_some_and(|t| same_thread_group(&t));
+                return proc_fd_permission(inode, cred, mask, same);
+            }
+            // Linux proc_fdinfo_permission: ESRCH for a task that is
+            // gone, EACCES without ptrace-read access
+            Some((Perm::Fdinfo, p)) => {
+                let t = p.task().ok_or(KernelError::NoProcess)?;
+                if !crate::task::ptrace::may_access_task(&t, true) {
+                    return Err(KernelError::PermissionDenied);
+                }
+            }
+            None => {}
         }
         // The owner follows the task's identity and dumpability (Linux
         // pid_revalidate -> pid_update_inode)
@@ -591,12 +605,16 @@ enum RcuKind {
     Pid,
     /// /proc/<pid> and task/<tid> (proc_pid_permission)
     PidDir,
-    /// fd/ and fdinfo/ (ptrace-read access)
-    Fds,
+    /// fd/ (proc_fd_permission)
+    FdDir,
+    /// fdinfo/ (proc_fdinfo_permission)
+    FdinfoDir,
     /// A per-process file, whose owner follows the task
     PidFile,
-    /// fd/<n>, fdinfo/<n> (tid_fd_revalidate: ECHILD)
+    /// fd/<n> (tid_fd_revalidate: ECHILD)
     Fd,
+    /// fdinfo/<n> (tid_fd_revalidate: ECHILD; proc_fdinfo_permission)
+    FdinfoFile,
     /// /proc/sys (proc_sys_revalidate: ECHILD; proc_sys_permission)
     Sysctl,
     /// /proc/<pid>/net/* (proc_net_d_revalidate: always stale)
@@ -613,9 +631,11 @@ impl ProcRcu {
             D::Directory { .. } | D::File { .. } | D::FixedLink(_) => RcuKind::Static,
             D::SelfLink => RcuKind::SelfLink,
             D::PidDirectory { .. } => RcuKind::PidDir,
-            D::PidFdDirectory { .. } | D::PidFdinfoDirectory { .. } => RcuKind::Fds,
+            D::PidFdDirectory { .. } => RcuKind::FdDir,
+            D::PidFdinfoDirectory { .. } => RcuKind::FdinfoDir,
             D::PidFile { .. } => RcuKind::PidFile,
-            D::FdSymlink { .. } | D::FdinfoFile { .. } => RcuKind::Fd,
+            D::FdSymlink { .. } => RcuKind::Fd,
+            D::FdinfoFile { .. } => RcuKind::FdinfoFile,
             D::Sysctl { .. } => RcuKind::Sysctl,
             D::NetFile { .. } => RcuKind::Net,
             D::PidNsDirectory { .. }
@@ -672,10 +692,12 @@ fn proc_rcu(inode: &Inode) -> Option<&ProcRcu> {
 fn revalidate_rcu(inode: &Inode) -> Result<bool, KernelError> {
     let r = proc_rcu(inode).ok_or(KernelError::NoChild)?;
     match r.kind {
-        RcuKind::Static | RcuKind::Fd | RcuKind::Sysctl => Err(KernelError::NoChild),
+        RcuKind::Static | RcuKind::Fd | RcuKind::FdinfoFile | RcuKind::Sysctl => {
+            Err(KernelError::NoChild)
+        }
         RcuKind::SelfLink => Ok(true),
         RcuKind::Net => Ok(false),
-        RcuKind::Pid | RcuKind::PidDir | RcuKind::Fds | RcuKind::PidFile => {
+        RcuKind::Pid | RcuKind::PidDir | RcuKind::FdDir | RcuKind::FdinfoDir | RcuKind::PidFile => {
             let g = crate::sync::rcu::read_lock();
             let Some(t) = r.task(&g) else {
                 return Ok(false);
@@ -696,11 +718,21 @@ fn permission_rcu(inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelErr
     let g = crate::sync::rcu::read_lock();
     let t = r.task(&g);
     match (r.kind, t) {
+        (RcuKind::PidDir | RcuKind::FdinfoDir | RcuKind::FdinfoFile, None) => {
+            return Err(KernelError::NoProcess);
+        }
         (RcuKind::PidDir, Some(t)) => {
             let o = r.opts().ok_or(KernelError::NoChild)?;
             o.pid_permission(t)?;
         }
-        (RcuKind::Fds, Some(t)) if !crate::task::ptrace::may_access_task(t, true) => {
+        (RcuKind::FdDir, t) => {
+            let same = t.is_some_and(same_thread_group);
+            drop(g);
+            return proc_fd_permission(inode, cred, mask, same);
+        }
+        (RcuKind::FdinfoDir | RcuKind::FdinfoFile, Some(t))
+            if !crate::task::ptrace::may_access_task(t, true) =>
+        {
             return Err(KernelError::PermissionDenied);
         }
         (RcuKind::PidFile, Some(t)) => {
@@ -719,6 +751,53 @@ fn permission_rcu(inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelErr
     }
     drop(g);
     crate::fs::dac::generic_permission(cred, inode, mask)
+}
+
+/// The permission checks of a process's directories and fdinfo files
+/// (Linux proc_pid_permission, proc_fd_permission,
+/// proc_fdinfo_permission)
+#[derive(Clone, Copy)]
+enum Perm {
+    PidDir,
+    FdDir,
+    Fdinfo,
+}
+
+/// Which of [`Perm`] `inode` has, and its process
+fn pid_perm(inode: &Inode) -> Option<(Perm, ProcPid)> {
+    with_data(inode, |d| match d {
+        ProcfsInodeData::PidDirectory { pid } => Some((Perm::PidDir, pid.clone())),
+        ProcfsInodeData::PidFdDirectory { pid } => Some((Perm::FdDir, pid.clone())),
+        ProcfsInodeData::PidFdinfoDirectory { pid } | ProcfsInodeData::FdinfoFile { pid, .. } => {
+            Some((Perm::Fdinfo, pid.clone()))
+        }
+        _ => None,
+    })?
+}
+
+/// fd/ (Linux proc_fd_permission): the generic check, else a thread of
+/// the process itself (`same`) may still search it, its owner being
+/// root when the process is not dumpable
+fn proc_fd_permission(
+    inode: &Inode,
+    cred: &Cred,
+    mask: u32,
+    same: bool,
+) -> Result<(), KernelError> {
+    match crate::fs::dac::generic_permission(cred, inode, mask) {
+        Err(_) if same => Ok(()),
+        r => r,
+    }
+}
+
+/// `t` is a thread of the caller's process (Linux same_thread_group:
+/// the same signal_struct, kept until the task is freed)
+fn same_thread_group(t: &crate::task::Task) -> bool {
+    let me = crate::task::percpu::current();
+    match (t.cpu_group(), me.cpu_group()) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => me.is(t),
+    }
 }
 
 /// [`InodeOps::revalidate`] of a procfs inode in ref mode
@@ -1374,29 +1453,19 @@ fn gen_cgroup_content(t: &TaskRef) -> Vec<u8> {
 enum OpenCheck {
     /// Address-space file of the task: pin its mm
     Mm(TaskRef),
-    /// fd/ or fdinfo/ of the task
-    Fds(TaskRef),
 }
 
 /// The open-time check of `inode`, if any
 fn open_check(inode: &Inode) -> Option<OpenCheck> {
     // Copied out, the task looked up after the inode data's lock
-    let (p, mm) = with_data(inode, |d| match d {
+    let p = with_data(inode, |d| match d {
         ProcfsInodeData::PidFile {
             pid,
             generator: PidGen::Mm(_),
-        } => Some((pid.clone(), true)),
-        ProcfsInodeData::PidFdDirectory { pid } | ProcfsInodeData::PidFdinfoDirectory { pid } => {
-            Some((pid.clone(), false))
-        }
+        } => Some(pid.clone()),
         _ => None,
     })??;
-    let t = p.task()?;
-    Some(if mm {
-        OpenCheck::Mm(t)
-    } else {
-        OpenCheck::Fds(t)
-    })
+    Some(OpenCheck::Mm(p.task()?))
 }
 
 /// Content generator of a per-process file
@@ -1918,17 +1987,14 @@ impl FileOps for ProcfsFileOps {
         proc_poll(file) != ProcPoll::None
     }
 
-    /// Private per-process files check ptrace-read access at open
-    /// (Linux proc_mem_open, proc_fd_permission); maps keeps the address
+    /// Address-space files check ptrace-read access at open (Linux
+    /// proc_mem_open); maps keeps the address
     /// space it was opened on, so a later setuid exec cannot leak
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let mm = match open_check(&inode) {
             Some(OpenCheck::Mm(t)) => mm_access(&t)?,
-            Some(OpenCheck::Fds(t)) if !crate::task::ptrace::may_access_task(&t, true) => {
-                return Err(KernelError::PermissionDenied);
-            }
-            _ => None,
+            None => None,
         };
         // A /proc/<pid>/net file pins its namespace while it lives
         // (Linux seq_open_net: get_proc_net, else ENXIO)
