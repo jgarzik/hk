@@ -72,6 +72,58 @@ tasklist_lock stays only where a group or parent link is walked:
 __kill_pgrp_info, kill(-1), send_sigio to a group, do_notify_parent*,
 setpgid, wait, ptrace attach/detach, release_task, de_thread.
 
+### Step 5's two open points
+
+(a) Per-task state across a table swap. `task->blocked`,
+`real_blocked`, `saved_sigmask`, `pending`, `jobctl`, `exit_code`,
+`last_siginfo` live in task_struct and have no lock of their own: they
+are under the siglock of whatever table `task->sighand` names at the
+time (`signal->shared_pending`, `flags`, `group_stop_count`,
+`curr_target`, `ignored_posix_timers` likewise, through the group's
+threads, which share one table: CLONE_THREAD needs CLONE_SIGHAND). The
+table changes in two places only, both under tasklist write and the old
+table's siglock: unshare_sighand (exec, after de_thread left the task
+alone in its group: copies `action[]` under the old siglock,
+rcu_assign_pointer(me->sighand, new), unlock) and __exit_signal
+(release: smp_store_release(&tsk->sighand, NULL) under the old siglock,
+after posix_cpu_timers_exit and __unhash_process). copy_process sets a
+child's table before the child is listed (fork's attach under tasklist
+write + the parent's siglock; the child's own state initialised before,
+unseen). Readers reach another task's state only through
+lock_task_sighand's retry (lock the table read under RCU, recheck it is
+still `tsk->sighand`): a hand-off under the old siglock is seen by the
+retry, so a holder of either table never touches state the other
+table's holder owns. de_thread changes no table (the exec'ing thread and
+the leader share it); exchange_tids/transfer_pid move pids, not signal
+state. hk: the per-task and per-group cells name their owner table and
+move with `Task.sighand` in the same section (TASKLIST write + old
+siglock), as `SignalStruct.threads` already does (`set_owner`); after
+release (no table) the state is unreachable, as Linux's
+(lock_task_sighand fails).
+
+(b) sigaction's lock. do_sigaction takes spin_lock_irq(&siglock) only:
+SA_IMMUTABLE check, old action copied, new installed, then, still under
+siglock, an action that now ignores the signal flushes it from
+`shared_pending` and every thread's `pending` (flush_sigqueue_mask,
+for_each_thread; entries freed in place) and one that stopped ignoring
+it requeues ignored periodic POSIX timers (posixtimer_sig_unignore).
+There is no sleeping lock. The requeue does not take a timer's it_lock
+(order it_lock -> siglock, posixtimer_send_sigqueue): the timers whose
+signal was ignored are on `signal->ignored_posix_timers`, an hlist
+under siglock, put there by posixtimer_sig_ignore (from
+posixtimer_send_sigqueue on an ignored periodic signal, and from
+sigqueue_free_ignored when a flush drops a timer's queued entry), taken
+off by unignore (sigq requeued under siglock, the rearm left to the
+dequeue: it_sigqueue_seq/it_sig_periodic are siglock-written) and by
+timer deletion (posix_timer_cleanup_ignored under siglock). hk: rt_sigaction
+runs under `lock_task_sighand(current)` alone; the flush walks the thread
+list under it; the timer requeue walks a siglock-owned ignored list in
+`SignalStruct` (Linux's), not the registry under `posix_timers`;
+`SigHand.update` goes. hk frees flushed entries after the siglock (rule
+5: freed outside, a timer entry back to its timer), the one difference
+from Linux's in-place free; the decision to list a timer as ignored is
+made under siglock as Linux's.
+
 ## 2. hk state -> Linux owner -> change
 
 | hk state | today | Linux owner | change |
