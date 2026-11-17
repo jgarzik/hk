@@ -33,7 +33,8 @@
 //!   a file that is no cgroup: EBADF; CLONE_NEWNS with CLONE_FS: EINVAL)
 //!   leaves no child behind to wait for (Linux copy_process checks
 //!   these before the child exists); the second is EINVAL even for an
-//!   unprivileged caller.
+//!   unprivileged caller, as is CLONE_NEWUSER with CLONE_FS (which needs
+//!   no privilege otherwise).
 //! - KEY_REVOKE_UPDATE: an update after a revoke is EKEYREVOKED, and a
 //!   thread updating in a loop while the key is revoked never revives
 //!   it (Linux: key_update and key_revoke under key->sem).
@@ -874,6 +875,7 @@ fn keys_no_root_bypass() -> u64 {
 fn clone3_error_no_leak() -> u64 {
     const CLONE_FS: u64 = 0x200;
     const CLONE_NEWNS: u64 = 0x2_0000;
+    const CLONE_NEWUSER: u64 = 0x1000_0000;
     const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
     const SIGCHLD: u64 = 17;
     let fd = hk_syscall::sys_open(b"/proc/self/status\0".as_ptr(), hk_syscall::O_RDONLY, 0);
@@ -917,6 +919,14 @@ fn clone3_error_no_leak() -> u64 {
     }
     if r != -22 {
         return 6;
+    }
+    args.flags = CLONE_NEWUSER | CLONE_FS;
+    let r = hk_syscall::sys_clone3(&args, size);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r != -22 {
+        return 7;
     }
     0
 }
