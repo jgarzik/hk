@@ -8,9 +8,9 @@
 
 use crate::harness::{R, report_r};
 use hk_syscall::{
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_execve,
-    sys_fstatat, sys_link, sys_lstat, sys_mkdir, sys_mount, sys_open, sys_openat, sys_rename,
-    sys_renameat2, sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_execve, sys_fstatat,
+    sys_link, sys_lstat, sys_mkdir, sys_mount, sys_open, sys_openat, sys_rename, sys_renameat2,
+    sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink,
 };
 
 const ENOENT: i64 = -2;
@@ -295,12 +295,24 @@ fn negative() -> R {
 /// root (Linux follow_dotdot: path_connected)
 fn disconnected() -> R {
     const MS_BIND: u64 = 4096;
-    for d in [&b"/tmp/pc\0"[..], b"/tmp/pc/a\0", b"/tmp/pc/a/b\0", b"/tmp/pc/a/b/c\0", b"/tmp/pc/m\0"] {
+    for d in [
+        &b"/tmp/pc\0"[..],
+        b"/tmp/pc/a\0",
+        b"/tmp/pc/a/b\0",
+        b"/tmp/pc/a/b/c\0",
+        b"/tmp/pc/m\0",
+    ] {
         sys_mkdir(d.as_ptr(), 0o755);
     }
     let null = core::ptr::null();
     let r = (|| {
-        let m = sys_mount(b"/tmp/pc/a/b\0".as_ptr(), b"/tmp/pc/m\0".as_ptr(), null, MS_BIND, 0);
+        let m = sys_mount(
+            b"/tmp/pc/a/b\0".as_ptr(),
+            b"/tmp/pc/m\0".as_ptr(),
+            null,
+            MS_BIND,
+            0,
+        );
         want(b"bind", m, 0)?;
         let fd = sys_open(b"/tmp/pc/m/c\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
         if fd < 0 {
@@ -309,7 +321,11 @@ fn disconnected() -> R {
         let up = sys_openat(fd as i32, b"..\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
         let r = (|| {
             want(b"dotdot inside", up.min(0), 0)?;
-            want(b"rename out", sys_rename(b"/tmp/pc/a/b/c\0".as_ptr(), b"/tmp/pc/a/c\0".as_ptr()), 0)?;
+            want(
+                b"rename out",
+                sys_rename(b"/tmp/pc/a/b/c\0".as_ptr(), b"/tmp/pc/a/c\0".as_ptr()),
+                0,
+            )?;
             let out = sys_openat(fd as i32, b"..\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
             if out >= 0 {
                 sys_close(out as u64);
@@ -323,7 +339,14 @@ fn disconnected() -> R {
         r
     })();
     sys_umount2(b"/tmp/pc/m\0".as_ptr(), 0);
-    for d in [&b"/tmp/pc/a/c\0"[..], b"/tmp/pc/a/b/c\0", b"/tmp/pc/a/b\0", b"/tmp/pc/a\0", b"/tmp/pc/m\0", b"/tmp/pc\0"] {
+    for d in [
+        &b"/tmp/pc/a/c\0"[..],
+        b"/tmp/pc/a/b/c\0",
+        b"/tmp/pc/a/b\0",
+        b"/tmp/pc/a\0",
+        b"/tmp/pc/m\0",
+        b"/tmp/pc\0",
+    ] {
         sys_rmdir(d.as_ptr());
     }
     r
