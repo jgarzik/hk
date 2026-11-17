@@ -1146,14 +1146,7 @@ Tag = roadmap phase (doc/ROADMAP.md).
     pressure: a forced charge for an empty queue, or the window or
     retransmit timer after a drop, may not restart it.
 
-14. **MM_LIFE_FORK_EXEC_OBJS bound inside its noise**: Slab over 300
-    fork+exec moves from about -270 to +50 kB run to run (x86, 15
-    instrumented runs); the test's 64 kB bound sits inside that spread,
-    so it fails now and then (+72 kB seen twice, +152 kB once on an x86
-    debug-assertions boot) with no leak. Measure a quieter quantity or a
-    bound above the noise.
-
-15. **arm64 release stack low dropped**: `check-arm`'s low (deepest
+14. **arm64 release stack low dropped**: `check-arm`'s low (deepest
     thread the isolated BLK test child) fell after the path-walk work and
     moves between builds of near-identical code as frames such as
     `syscall_enter_from_user_mode` and `msdos_partition` split out or

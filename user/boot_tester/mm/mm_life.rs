@@ -590,18 +590,115 @@ fn live_dentries() -> i64 {
         .fold(0i64, |v, c| v * 10 + i64::from(c - b'0'))
 }
 
-/// MM_LIFE_FORK_EXEC_OBJS: fork+exec keeps no kernel object behind:
-/// once the processes are gone and the caches dropped, the dentries come
-/// back to where they were, and on hk the slab too (300 rounds: a leak
-/// of even 300 bytes each would show as 90 kB)
+/// Most caches a /proc/slabinfo snapshot keeps (Linux lists a few
+/// hundred)
+const MAX_CACHES: usize = 400;
+
+/// Active objects per slab cache, from /proc/slabinfo
+struct Slabs {
+    n: usize,
+    name: [[u8; 32]; MAX_CACHES],
+    active: [i64; MAX_CACHES],
+}
+
+impl Slabs {
+    /// A snapshot (empty if /proc/slabinfo is unreadable)
+    fn read() -> Self {
+        let mut s = Slabs {
+            n: 0,
+            name: [[0; 32]; MAX_CACHES],
+            active: [0; MAX_CACHES],
+        };
+        let fd = sys_open(b"/proc/slabinfo\0".as_ptr(), O_RDONLY, 0);
+        if fd < 0 {
+            return s;
+        }
+        let mut buf = [0u8; 4096];
+        let mut have = 0;
+        loop {
+            let n = sys_read(
+                fd as u64,
+                buf[have..].as_mut_ptr(),
+                (buf.len() - have) as u64,
+            );
+            if n <= 0 {
+                break;
+            }
+            have += n as usize;
+            let end = buf[..have]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            for l in buf[..end].split(|&b| b == b'\n') {
+                s.add(l);
+            }
+            buf.copy_within(end..have, 0);
+            have -= end;
+        }
+        sys_close(fd as u64);
+        s
+    }
+
+    /// Record a cache line, `name active_objs ...` (headers skipped)
+    fn add(&mut self, l: &[u8]) {
+        let mut f = l.split(|&b| b == b' ').filter(|w| !w.is_empty());
+        let (Some(name), Some(num)) = (f.next(), f.next()) else {
+            return;
+        };
+        if !num.iter().all(u8::is_ascii_digit) || self.n == MAX_CACHES {
+            return;
+        }
+        let k = name.len().min(32);
+        self.name[self.n][..k].copy_from_slice(&name[..k]);
+        self.active[self.n] = num.iter().fold(0, |v, c| v * 10 + i64::from(c - b'0'));
+        self.n += 1;
+    }
+
+    /// Active objects of the cache `name` (0 if there is none)
+    fn of(&self, name: &[u8; 32]) -> i64 {
+        (0..self.n)
+            .find(|&j| &self.name[j] == name)
+            .map_or(0, |j| self.active[j])
+    }
+
+    /// The cache that gained most objects since `before`: its index and
+    /// gain. Linux's vmap_area is left out: it frees the areas of exited
+    /// tasks' vmalloc'd stacks lazily, thousands at a time
+    /// (purge_vmap_area_lazy past lazy_max_pages), so it grows with the
+    /// rounds until a purge.
+    fn grown(&self, before: &Slabs) -> (usize, i64) {
+        let lazy = |i: usize| self.name[i].starts_with(b"vmap_area\0");
+        (0..self.n)
+            .filter(|&i| !lazy(i))
+            .map(|i| (i, self.active[i] - before.of(&self.name[i])))
+            .max_by_key(|&(_, d)| d)
+            .unwrap_or((0, 0))
+    }
+
+    /// Print `name` of entry `i`
+    fn print_name(&self, i: usize) {
+        let k = self.name[i].iter().position(|&b| b == 0).unwrap_or(32);
+        print(&self.name[i][..k]);
+    }
+}
+
+/// MM_LIFE_FORK_EXEC_OBJS: fork+exec keeps no kernel object behind.
+/// Once the processes are gone and the caches dropped, the dentries come
+/// back to where they were, and no slab cache keeps an object per round.
+/// A leak grows its cache's active objects (/proc/slabinfo) by N or
+/// more, however small the object; objects parked in per-CPU caches (hk's
+/// arrays, Linux's CPU slabs) and freed late (RCU) move a count by a few
+/// hundred at most, whatever N is. So a cache may gain under N/2. (meminfo
+/// Slab moves by whole slabs, hundreds of kB, and misses small leaks.)
 fn fork_exec_objects() {
     const NAME: &[u8] = b"MM_LIFE_FORK_EXEC_OBJS";
-    const N: i64 = 300;
+    const N: i64 = 1000;
     for _ in 0..20 {
         fork_exec();
     }
     settle();
-    let (d0, s0) = (live_dentries(), meminfo(b"Slab:"));
+    let d0 = live_dentries();
+    let s0 = Slabs::read();
     for _ in 0..N {
         if !fork_exec() {
             verdict_detail(NAME, false, -2);
@@ -609,15 +706,16 @@ fn fork_exec_objects() {
         }
     }
     let mut ok = false;
-    let (mut d1, mut s1) = (0, 0);
+    let mut d1 = 0;
+    let mut s1 = Slabs::read();
+    let mut g = (0, 0);
     // Deferred frees (exited tasks' stacks, Linux RCU) may lag a little
     for _ in 0..20 {
         settle();
-        (d1, s1) = (live_dentries(), meminfo(b"Slab:"));
-        // Linux keeps freed slab objects cached (per-CPU and per-cache
-        // free lists), so its Slab need not come back: that bound is hk's
-        let slab_ok = host_mode() || s1 - s0 <= 64;
-        ok = d0 > 0 && s0 > 0 && d1 - d0 <= 5 && slab_ok;
+        d1 = live_dentries();
+        s1 = Slabs::read();
+        g = s1.grown(&s0);
+        ok = d0 > 0 && s0.n > 0 && d1 - d0 <= 5 && g.1 < N / 2;
         if ok {
             break;
         }
@@ -628,15 +726,17 @@ fn fork_exec_objects() {
         print_num(d0);
         print(b" -> ");
         print_num(d1);
-        print(b", Slab kB ");
-        print_num(s0);
-        print(b" -> ");
-        print_num(s1);
-        print(b" over ");
+        print(b", ");
+        print_num(s0.n as i64);
+        print(b" caches, ");
+        s1.print_name(g.0);
+        print(b" +");
+        print_num(g.1);
+        print(b" objects over ");
         print_num(N);
         println(b" fork+exec");
     }
-    verdict_detail(NAME, ok, s1 - s0);
+    verdict_detail(NAME, ok, g.1);
 }
 
 /// Two 2MB-aligned MADV_HUGEPAGE pages are touched (2MB pages where
