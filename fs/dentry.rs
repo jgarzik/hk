@@ -1028,12 +1028,6 @@ unsafe impl RefPtr for DentryRef {
     }
 }
 
-/// This CPU can queue RCU callbacks (not in host unit tests, nor at
-/// the start of boot, when no other CPU runs a reader)
-fn have_cpu() -> bool {
-    !cfg!(test) && crate::cpu::try_this_id().is_some()
-}
-
 /// Kill a dentry whose last reference went (Linux __dentry_kill): its
 /// inode, if the last name of it is gone, takes its watches with it
 /// (dentry_unlink_inode at the final dput); its memory is freed after
@@ -1066,7 +1060,7 @@ unsafe fn dentry_kill(d: NonNull<Dentry>) -> Option<NonNull<Dentry>> {
     // The parent's reference is ours now; the pointer stays
     let parent = NonNull::new(r.parent_ptr().cast_mut());
     let p = d.as_ptr().cast_const().cast::<()>();
-    if have_cpu() {
+    if crate::sync::rcu::can_queue() {
         // SAFETY: `d_rcu` is in the dentry, which nothing frees before
         // `d_free` runs; `d_free` only drops the box it is given, which
         // may happen in any context

@@ -417,7 +417,14 @@ grace period. No lock; the count's RMWs (AcqRel) order a put against a
 callback's decrement. Same rules as `kfree_rcu` for the drop (runs in
 `rcuc/N`, preemption off). `rcu_barrier` (Linux; one caller at a time under
 `BARRIER_MUTEX`, sleeping) queues a callback behind each CPU's last one
-and waits for them all.
+and waits for them all. `RcuFree<T, O>` (Linux destroy_inode's
+call_rcu(i_callback)) is the value of an `Arc`'d owner torn down
+where its last strong reference goes but freed later: the owner's
+`Drop` runs first (eviction, which may sleep), then the `RcuFree`
+field's drop queues its embedded head, and the callback drops `T` and
+the owner's own `Weak` (set by `Arc::new_cyclic`), which kept the
+memory; `upgrade` is Linux igrab (refused once the last strong
+reference went). Same rules as `kfree_rcu` for `T`'s drop.
 
 Assumptions: a CPU joins grace periods (`rcu::cpu_online`) when its
 scheduler starts, before it runs anything, and never leaves (no CPU
@@ -2699,6 +2706,18 @@ reference after MOUNT_LOCK and NAMESPACE_SEM): `might_sleep` there
 reports one that does not. Deviation from Linux: no
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
+
+**Inode free** (`fs/inode.rs`, `sync::rcu::RcuFree`; Linux
+destroy_inode -> call_rcu(&inode->i_rcu, i_callback)): after the
+eviction above, still in `Drop for Inode`, the page cache is emptied
+(truncate_inode_pages_final) and the filesystem's data and a FIFO's
+pipe are taken out under their own locks (`private`, `i_pipe`: Linux
+->destroy_inode); every other field (`InodeInner`) and the memory go
+a grace period later, in `rcuc/N` (drops that never sleep). So an RCU
+reader that reached an inode with no reference (a dentry's
+`d_inode`, 3.3 Dentry) may read it until its guard ends, an evicted
+one included (its `private` then reads None). `Inode::alloc` (the
+only maker of an `Arc<Inode>`) gives each its own `Weak` for this.
 
 **Superblock inode lists** (`fs/inode.rs`; Linux s_inodes,
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
