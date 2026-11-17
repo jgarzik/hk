@@ -1,14 +1,15 @@
 //! Sleeping mutex (Linux `struct mutex`, kernel/locking/mutex.c)
 //!
-//! The owner word holds the owner's tid shifted past three flag bits
-//! (Linux keeps them in the low bits of the task pointer):
+//! The owner word holds the owner task's address with three flag bits
+//! in its low bits (Linux mutex->owner: the task pointer, never a tid,
+//! which a non-leader's exec changes while it holds locks):
 //! - `WAITERS`: the wait list is not empty, so an unlock must wake its
 //!   first waiter;
 //! - `HANDOFF`: the first waiter was woken and still lost the lock to
 //!   a barging locker; the next unlock hands the lock to it instead of
 //!   releasing it, so a task that unlocks and relocks at once cannot
 //!   starve the sleepers;
-//! - `PICKUP`: the lock was handed to the tid in the word, which takes
+//! - `PICKUP`: the lock was handed to the task in the word, which takes
 //!   it on its next try; nobody else can.
 //!
 //! Waiters queue FIFO on `wait`, a list guarded by a spin lock (Linux
@@ -24,7 +25,7 @@
 //! (any, or SIGKILL) is pending while they would sleep; they first try
 //! the lock, so a waiter woken by an unlock either takes it or leaves
 //! it held by someone whose unlock wakes the next waiter. `try_lock`
-//! (Linux mutex_trylock) never sleeps. The owner's tid also catches
+//! (Linux mutex_trylock) never sleeps. The owner word also catches
 //! recursive locking and foreign unlocks in debug builds.
 
 use core::cell::UnsafeCell;
@@ -34,7 +35,7 @@ use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::sched::{
-    WakeQ, can_sleep, current_tid, schedule, set_current_state, signal_pending_state, waiter_ref,
+    WakeQ, can_sleep, current_owner, schedule, set_current_state, signal_pending_state, waiter_ref,
     waiter_task,
 };
 use super::{might_sleep, spin};
@@ -47,17 +48,17 @@ use crate::util::list::{Link, List};
 const WAITERS: u64 = 1;
 /// Unlock hands the lock to the first waiter (Linux MUTEX_FLAG_HANDOFF)
 const HANDOFF: u64 = 2;
-/// Handed to the tid in the word, which picks it up (Linux
+/// Handed to the task in the word, which picks it up (Linux
 /// MUTEX_FLAG_PICKUP)
 const PICKUP: u64 = 4;
 const FLAGS: u64 = WAITERS | HANDOFF | PICKUP;
-const SHIFT: u32 = 3;
-/// Owner id when locked before tasks exist (early boot)
-const NO_TASK: u64 = u64::MAX >> SHIFT;
+/// Owner id when locked before tasks exist (early boot): no task's
+/// address
+const NO_TASK: u64 = !FLAGS;
 
-/// The owner id in an owner word (0: unlocked)
+/// The owner id in an owner word (0: unlocked; Linux __owner_task)
 fn owner_of(word: u64) -> u64 {
-    word >> SHIFT
+    word & !FLAGS
 }
 
 /// A task sleeping for the lock (Linux `struct mutex_waiter`)
@@ -117,7 +118,11 @@ unsafe impl<T: Send> Sync for Mutex<T> {}
 
 /// Owner id of the caller
 fn me() -> u64 {
-    if can_sleep() { current_tid() } else { NO_TASK }
+    if can_sleep() {
+        current_owner()
+    } else {
+        NO_TASK
+    }
 }
 
 impl<T> Mutex<T> {
@@ -158,7 +163,7 @@ impl<T> Mutex<T> {
             } else {
                 return false;
             }
-            let new = (owner << SHIFT) | flags;
+            let new = owner | flags;
             match self
                 .owner
                 .compare_exchange(word, new, Ordering::Acquire, Ordering::Relaxed)
@@ -201,7 +206,7 @@ impl<T> Mutex<T> {
         let mut word = self.owner.load(Ordering::Relaxed);
         loop {
             debug_assert!(word & PICKUP == 0);
-            let mut new = (word & WAITERS) | (next << SHIFT);
+            let mut new = (word & WAITERS) | next;
             if next != 0 {
                 new |= PICKUP;
             }
@@ -300,7 +305,7 @@ impl<T> Mutex<T> {
         );
         if self
             .owner
-            .compare_exchange(me << SHIFT, 0, Ordering::Release, Ordering::Relaxed)
+            .compare_exchange(me, 0, Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
             self.unlock_slow();
@@ -440,9 +445,9 @@ mod tests {
     extern crate std;
     use super::*;
 
-    const A: u64 = 10;
-    const B: u64 = 11;
-    const C: u64 = 12;
+    const A: u64 = 10 << 3;
+    const B: u64 = 11 << 3;
+    const C: u64 = 12 << 3;
 
     fn word(m: &Mutex<()>) -> (u64, u64) {
         let w = m.owner.load(Ordering::Relaxed);

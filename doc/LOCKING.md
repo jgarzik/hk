@@ -239,15 +239,16 @@ owner is running).
   another `WakeQ` already is not queued twice: that wakeup comes after
   the caller's store (full barriers on both sides, Linux
   __wake_q_add), and every sleeping-lock wait rechecks its condition.
-- `Mutex<T>` (Linux kernel/locking/mutex.c): an owner word (the owner's
-  tid shifted past three flags) and a FIFO wait list under the wait
+- `Mutex<T>` (Linux kernel/locking/mutex.c): an owner word (the owner task's
+  address with three flags in its low bits, Linux mutex->owner: never
+  a tid, which a non-leader's exec changes while it holds locks) and a FIFO wait list under the wait
   lock. Flags: `WAITERS` (list not empty: unlock takes
   the slow path and wakes the first waiter), `HANDOFF` (set by the
   first waiter when a retry after its wakeup fails: the next unlock
   hands the lock to it instead of releasing it), `PICKUP` (handed to
-  the tid in the word; no one else may take it). So a task that
+  the task in the word; no one else may take it). So a task that
   unlocks and relocks at once cannot starve a sleeper. Debug builds
-  catch recursive locking and foreign unlocks by the tid.
+  catch recursive locking and foreign unlocks by the owner word.
   `lock_interruptible`/`lock_killable` (Linux mutex_lock_interruptible/
   _killable) give up with EINTR on a signal (any, or SIGKILL) pending
   while they wait, after one more try under the wait lock (so a waiter

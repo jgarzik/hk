@@ -39,7 +39,7 @@ pub use sole::{Sole, SoleCell, Word};
 mod sched {
     pub use crate::sync::waitqueue::signal_pending_state;
     use crate::task::Task;
-    pub use crate::task::percpu::{TaskRef, current_tid, get_ticks, schedule, set_current_state};
+    pub use crate::task::percpu::{TaskRef, get_ticks, schedule, set_current_state};
     pub use crate::task::wake_q::WakeQ;
 
     /// The caller is a task that may sleep (not tid 0: an idle task or
@@ -51,6 +51,15 @@ mod sched {
     /// The current task, queued as a sleeping lock's waiter
     pub fn waiter_task() -> *const Task {
         &raw const *crate::task::percpu::current()
+    }
+
+    /// The current task's identity as a sleeping lock's owner (Linux
+    /// `current` in mutex->owner): its address, fixed for its life (a
+    /// tid is not: a non-leader's exec takes its leader's), its low
+    /// three bits clear (a `Task` is 8-aligned)
+    pub fn current_owner() -> u64 {
+        const _: () = assert!(core::mem::align_of::<Task>() >= 8);
+        waiter_task().addr() as u64
     }
 
     /// The current task has an RT policy (rwsem handoff at once)
@@ -106,6 +115,11 @@ mod sched {
 
     pub fn signal_pending_state(_: SleepState) -> bool {
         false
+    }
+
+    /// A per-thread owner identity, its low three bits clear
+    pub fn current_owner() -> u64 {
+        current_tid() << 3
     }
 
     pub fn waiter_task() -> *const Task {
