@@ -257,47 +257,64 @@ fn start_path(start: Start<'_>) -> Result<Path, KernelError> {
     }
 }
 
-/// Child `name` of directory `parent` (Linux lookup_one_qstr_excl,
-/// lookup_slow's d_alloc + ->lookup), for a lookup with `flags`: the
-/// dcache, else the file system (the new dentry is cached). A cached
-/// negative dentry is ENOENT; a miss caches one where the file system
-/// keeps it (`InodeOps::lookup_neg`: vfat, kernfs, cgroupfs; one
-/// killed at its last put, as ramfs's always_delete_dentry, is gone at
-/// once), else none (procfs). Permission is the caller's business.
+/// Child `name` of directory `parent`, whose lock the caller holds for
+/// writing (Linux lookup_one_qstr_excl), for a lookup with `flags`: the
+/// dcache, else, unless the directory is dead (ENOENT), the file system
+/// ([`d_alloc_lookup`]). A negative dentry is ENOENT. Permission is the
+/// caller's business.
 pub fn lookup_one(
     parent: &DentryRef,
     name: &[u8],
     flags: LookupBits,
 ) -> Result<DentryRef, KernelError> {
-    // No file system here has longer names (Linux simple_lookup and the
-    // disk file systems' lookups: ENAMETOOLONG)
+    name_ok(name)?;
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let d = match lookup_dcache(parent, &dir, name, flags)? {
+        Some(d) => d,
+        None if dir.is_dead() => return Err(KernelError::NotFound),
+        None => d_alloc_lookup(parent, &dir, name)?,
+    };
+    positive(d)
+}
+
+/// No file system here has longer names (Linux simple_lookup and the
+/// disk file systems' lookups: ENAMETOOLONG)
+fn name_ok(name: &[u8]) -> Result<(), KernelError> {
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    if let Some(child) = cached(parent, &dir, name, flags)? {
-        return if child.is_negative() {
-            Err(KernelError::NotFound)
-        } else {
-            Ok(child)
-        };
-    }
-    let found = dir.i_op.lookup_neg(&dir, name)?;
-    // Stamped before it is hashed (Linux vfat_d_version_set,
-    // kernfs_set_rev before d_splice_alias)
-    let d = Dentry::prealloc(parent, name)?;
-    d.set_d_time(found.d_time);
-    let d = Dentry::add(parent, d, found.inode);
+    Ok(())
+}
+
+/// A lookup's answer as a walk takes it: a negative dentry is ENOENT
+/// (Linux step_into, lookup_one_qstr_excl without LOOKUP_CREATE)
+fn positive(d: DentryRef) -> Result<DentryRef, KernelError> {
     if d.is_negative() {
         return Err(KernelError::NotFound);
     }
     Ok(d)
 }
 
+/// Ask the file system for `name` in `dir`, `parent`'s inode, whose
+/// lock the caller holds (Linux d_alloc + ->lookup + d_splice_alias):
+/// the new dentry is cached, negative where the file system keeps one
+/// (`InodeOps::lookup_neg`: vfat, kernfs, cgroupfs; one killed at its
+/// last put, as ramfs's always_delete_dentry, is gone at once), else
+/// none (procfs: ENOENT)
+fn d_alloc_lookup(parent: &DentryRef, dir: &Inode, name: &[u8]) -> Result<DentryRef, KernelError> {
+    let found = dir.i_op.lookup_neg(dir, name)?;
+    // Stamped before it is hashed (Linux vfat_d_version_set,
+    // kernfs_set_rev before d_splice_alias)
+    let d = Dentry::prealloc(parent, name)?;
+    d.set_d_time(found.d_time);
+    Ok(Dentry::add(parent, d, found.inode))
+}
+
 /// The dcache's child `name` of `parent` (whose inode is `dir`) if it
-/// is still valid for a lookup with `flags` (Linux lookup_dcache): a
-/// stale one is invalidated and None, a revalidation error returned
-fn cached(
+/// is still valid for a lookup with `flags` (Linux lookup_dcache, and
+/// lookup_fast without LOOKUP_RCU): a stale one is invalidated and
+/// None, a revalidation error returned
+fn lookup_dcache(
     parent: &DentryRef,
     dir: &Inode,
     name: &[u8],
@@ -336,23 +353,52 @@ fn d_revalidate(
 /// Longest name of one path component (Linux NAME_MAX)
 pub const NAME_MAX: usize = 255;
 
-/// Path-walk lookup (Linux lookup_fast + lookup_slow): a dcache hit
-/// needs no lock; a miss asks the file system under the directory's
-/// shared inode lock, so it cannot race a create/unlink/rename there
-fn lookup_slow(parent: &DentryRef, name: &[u8], f: LookupFlags) -> Result<DentryRef, KernelError> {
-    if name.len() > NAME_MAX {
-        return Err(KernelError::NameTooLong);
+/// walk_component's lookup in ref mode: `name` in `parent`, whose inode
+/// is `dir` (Linux lookup_fast without LOOKUP_RCU: the dcache with no
+/// lock; on a miss, or a stale entry, lookup_slow); a negative answer
+/// is ENOENT (step_into)
+fn walk_lookup(
+    parent: &DentryRef,
+    dir: &Inode,
+    name: &[u8],
+    f: LookupFlags,
+) -> Result<DentryRef, KernelError> {
+    name_ok(name)?;
+    match lookup_dcache(parent, dir, name, f.bits())? {
+        Some(d) => positive(d),
+        None => positive(lookup_slow(parent, dir, name, f.bits())?),
     }
-    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    if let Some(child) = cached(parent, &dir, name, f.bits())? {
-        return if child.is_negative() {
-            Err(KernelError::NotFound)
-        } else {
-            Ok(child)
-        };
-    }
+}
+
+/// Linux lookup_slow: [`__lookup_slow`] under the directory's shared
+/// inode lock, so it cannot race a create, unlink or rename there
+fn lookup_slow(
+    parent: &DentryRef,
+    dir: &Inode,
+    name: &[u8],
+    flags: LookupBits,
+) -> Result<DentryRef, KernelError> {
     let _lock = dir.lock_shared();
-    lookup_one(parent, name, f.bits())
+    __lookup_slow(parent, dir, name, flags)
+}
+
+/// Linux __lookup_slow: ENOENT in a dead directory (IS_DEADDIR); else
+/// the dcache once more, now under the lock (d_alloc_parallel's find:
+/// a stale entry is invalidated and the file system asked), else the
+/// file system ([`d_alloc_lookup`]); the answer may be negative
+fn __lookup_slow(
+    parent: &DentryRef,
+    dir: &Inode,
+    name: &[u8],
+    flags: LookupBits,
+) -> Result<DentryRef, KernelError> {
+    if dir.is_dead() {
+        return Err(KernelError::NotFound);
+    }
+    match lookup_dcache(parent, dir, name, flags)? {
+        Some(d) => Ok(d),
+        None => d_alloc_lookup(parent, dir, name),
+    }
 }
 
 /// The ref-mode half of lookup_fast after try_to_unlazy_next: `child`,
@@ -369,10 +415,8 @@ fn lookup_fast_ref(
 ) -> Result<DentryRef, KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     match d_revalidate(&dir, child, Some(rcu), f.bits())? {
-        // A valid negative entry: Linux step_into's ENOENT
-        Some(c) if c.is_negative() => Err(KernelError::NotFound),
-        Some(c) => Ok(c),
-        None => lookup_slow(parent, name, f),
+        Some(c) => positive(c),
+        None => positive(lookup_slow(parent, &dir, name, f.bits())?),
     }
 }
 
@@ -484,13 +528,15 @@ impl<'p> RefWalk<'p> {
     }
 }
 
-/// may_lookup: `dir` must be a searchable directory
-fn may_lookup(c: &Cred, dir: &Dentry) -> Result<(), KernelError> {
+/// may_lookup: `dir` must be a searchable directory; its inode, which
+/// the walk looks the next component up in (Linux nd->inode)
+fn may_lookup(c: &Cred, dir: &Dentry) -> Result<InodeRef, KernelError> {
     let inode = dir.get_inode().ok_or(KernelError::NotFound)?;
     if !inode.mode().is_dir() {
         return Err(KernelError::NotDirectory);
     }
-    permission_as(c, &inode, MAY_EXEC)
+    permission_as(c, &inode, MAY_EXEC)?;
+    Ok(inode)
 }
 
 /// What is mounted on `p` (Linux handle_mounts): crossed, or EXDEV for
@@ -693,7 +739,7 @@ impl<'a> Nd<'a> {
     /// from the link stack, the link held meanwhile
     fn walk_ref(&self, mut cur: Path, w: &mut RefWalk<'_>) -> Result<Path, KernelError> {
         while let Some(c) = w.next()? {
-            may_lookup(self.cred(), &cur.dentry)?;
+            let dir = may_lookup(self.cred(), &cur.dentry)?;
             let d = match w.name(&c)? {
                 b"." => None,
                 b".." => {
@@ -701,7 +747,7 @@ impl<'a> Nd<'a> {
                     self.recheck()?;
                     None
                 }
-                name => Some(lookup_slow(&cur.dentry, name, w.f)?),
+                name => Some(walk_lookup(&cur.dentry, &dir, name, w.f)?),
             };
             w.advance(&c);
             if let Some(d) = d {
@@ -754,9 +800,13 @@ impl<'a> Nd<'a> {
             To::Done(p) => return self.finish(p, w.f),
             To::Comp(cur) => cur,
             To::Link { cur, link, last } => self.get_link(cur, link, last, &mut w)?,
+            // lookup_fast missed in RCU mode: lookup_slow
             To::Lookup(cur) => {
                 let c = w.next()?.ok_or(ECHILD)?;
-                let d = lookup_slow(&cur.dentry, w.name(&c)?, w.f)?;
+                let name = w.name(&c)?;
+                name_ok(name)?;
+                let dir = cur.dentry.get_inode().ok_or(KernelError::NotFound)?;
+                let d = positive(lookup_slow(&cur.dentry, &dir, name, w.f.bits())?)?;
                 w.advance(&c);
                 self.step(cur, d, c.last, &mut w)?
             }
@@ -1365,7 +1415,7 @@ mod tests {
         let n = Dentry::alloc(&r, b"n", None).unwrap();
         let dir = r.get_inode().unwrap();
         assert!(
-            cached(&r, &dir, b"n", LookupBits::empty())
+            lookup_dcache(&r, &dir, b"n", LookupBits::empty())
                 .unwrap()
                 .is_none()
         );
@@ -1391,7 +1441,7 @@ mod tests {
         let a = Dentry::alloc(&r, b"x", Some(inode(STALE))).unwrap();
         let dir = r.get_inode().unwrap();
         assert!(
-            cached(&r, &dir, b"x", LookupBits::empty())
+            lookup_dcache(&r, &dir, b"x", LookupBits::empty())
                 .unwrap()
                 .is_none()
         );
@@ -1409,7 +1459,7 @@ mod tests {
         let e = lookup_fast_ref(&r, a.clone(), b"x", Err(ECHILD), f);
         assert_eq!(e.err(), Some(KernelError::Io));
         let dir = r.get_inode().unwrap();
-        let c = cached(&r, &dir, b"x", LookupBits::empty());
+        let c = lookup_dcache(&r, &dir, b"x", LookupBits::empty());
         assert_eq!(c.err(), Some(KernelError::Io));
         assert!(!a.d_unhashed());
         let _ = lookup_fast_ref(&r, a.clone(), b"x", Ok(false), f);
