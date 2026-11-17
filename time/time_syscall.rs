@@ -169,25 +169,29 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
         } else {
             pid as crate::task::Tid
         };
-        let table = percpu::TASKLIST.read();
-        let t = table.get(tid).ok_or(KernelError::InvalidArgument)?;
-        if t.task.pid != percpu::current_pid() {
+        // Found and sampled under RCU (Linux posix_cpu_clock_get:
+        // pid_task, cpu_clock_sample under rcu_read_lock)
+        let g = crate::sync::rcu::read_lock();
+        let t = percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+            .ok_or(KernelError::InvalidArgument)?;
+        if t.pid != percpu::current_pid() {
             return Err(KernelError::InvalidArgument);
         }
-        // Linux cpu_clock_sample
-        return Ok(cpu_clock_sample(t.task, sample));
+        return Ok(cpu_clock_sample(t, sample));
     }
     // Linux pid_for_clock (gettime): pid 0, or the caller's own tid from
     // any thread, is its process
     let (tgid, sig) = if pid == 0 || (gettime && pid == me) {
         (percpu::current_pid(), crate::signal::current_signal())
     } else {
-        let table = percpu::TASKLIST.read();
-        let t = table.get(pid as crate::task::Tid);
-        if !t.as_ref().is_some_and(|t| t.task.pid == pid) {
-            return Err(KernelError::InvalidArgument);
-        }
-        (pid, t.and_then(|t| t.signal().cloned()))
+        // A group leader's, found under RCU (Linux pid_for_clock:
+        // find_task_by_vpid, has_group_leader_pid)
+        let g = crate::sync::rcu::read_lock();
+        let t = percpu::pid_ns_task(pid, &crate::ns::INIT_PID_NS, &g);
+        let t = t
+            .filter(|t| t.pid == pid)
+            .ok_or(KernelError::InvalidArgument)?;
+        (pid, t.cpu_group().cloned())
     };
     // Linux cpu_clock_sample_group(start=false); a kernel thread (no
     // SignalStruct here; Linux gives it one) is its threads' sum

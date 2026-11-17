@@ -113,9 +113,12 @@ pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<FileRef, KernelError> {
     let p = crate::task::pid::find_vpid(nr).ok_or(KernelError::NoProcess)?;
     let thread = file_flags & pidfd_flags::PIDFD_THREAD != 0;
     {
-        let table = crate::task::percpu::TASKLIST.read();
-        let tid = table.pid_tid(&p).ok_or(KernelError::NoProcess)?;
-        if !thread && !table.get(tid).is_some_and(|t| t.leader) {
+        // Under RCU, no TASKLIST (Linux pidfd_prepare: pid_has_task
+        // PIDTYPE_PID, then PIDTYPE_TGID: the task it names leads its
+        // group, which a leader's pid names by its tid)
+        let g = crate::sync::rcu::read_lock();
+        let t = p.task(&g).ok_or(KernelError::NoProcess)?;
+        if !thread && t.tid() != t.pid {
             return Err(KernelError::NotFound);
         }
     }
@@ -167,7 +170,7 @@ pub fn show_fdinfo(
         return false;
     };
     let pid = &pidfd.pid;
-    let nr = if pid.task().is_null() {
+    let nr = if !pid.has_task() {
         -1
     } else {
         i64::from(pid.nr_ns(ns))
@@ -182,15 +185,12 @@ pub fn show_fdinfo(
     true
 }
 
-/// The tid of a pidfd's process (Linux pidfd_get_task): from its struct
-/// pid under TASKLIST, never by number, so a reused number never
+/// A pidfd's task (Linux pidfd_get_task: get_pid_task, under RCU):
+/// from its struct pid, never by number, so a reused number never
 /// reaches another process; EBADF for another file, ESRCH once gone
 pub fn pidfd_task(file: &File) -> Result<crate::task::percpu::TaskRef, KernelError> {
     let pidfd = get_pidfd(file).ok_or(KernelError::BadFd)?;
-    crate::task::percpu::TASKLIST
-        .read()
-        .pid_task_ref(&pidfd.pid)
-        .ok_or(KernelError::NoProcess)
+    crate::task::percpu::get_pid_task(&pidfd.pid).ok_or(KernelError::NoProcess)
 }
 
 /// Check if a file is a pidfd

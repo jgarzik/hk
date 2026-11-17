@@ -15,8 +15,7 @@ use super::Pid;
 ///
 /// # Arguments
 /// * `pid` - Process ID to query (0 = calling process)
-/// * `caller_pid` - PID of calling process
-pub fn sys_getpgid(pid: i32, caller_pid: Pid) -> KernelResult<i64> {
+pub fn sys_getpgid(pid: i32) -> KernelResult<i64> {
     if pid < 0 {
         return Err(KernelError::NoProcess);
     }
@@ -24,11 +23,10 @@ pub fn sys_getpgid(pid: i32, caller_pid: Pid) -> KernelResult<i64> {
     if pid == 0 {
         return Ok(i64::from(super::percpu::current_pgid_vnr()));
     }
-    // The caller's number (Linux find_task_by_vpid); reported in the
-    // caller's namespace, 0 for a group outside it (Linux
-    // pid_vnr(task_pgrp(p)))
-    let pid = super::pid::from_vnr_or(pid as Pid, caller_pid).ok_or(KernelError::NoProcess)?;
-    let pgid = super::percpu::lookup_task_pgid(pid).ok_or(KernelError::NoProcess)?;
+    // The caller's number (Linux find_task_by_vpid, under RCU);
+    // reported in the caller's namespace, 0 for a group outside it
+    // (Linux pid_vnr(task_pgrp(p)))
+    let pgid = super::percpu::vpid_pgrp_vnr(pid as u64, false).ok_or(KernelError::NoProcess)?;
     Ok(i64::from(pgid))
 }
 
@@ -41,8 +39,7 @@ pub fn sys_getpgid(pid: i32, caller_pid: Pid) -> KernelResult<i64> {
 ///
 /// # Arguments
 /// * `pid` - Process ID to query (0 = calling process)
-/// * `caller_pid` - PID of calling process
-pub fn sys_getsid(pid: i32, caller_pid: Pid) -> KernelResult<i64> {
+pub fn sys_getsid(pid: i32) -> KernelResult<i64> {
     if pid < 0 {
         return Err(KernelError::NoProcess);
     }
@@ -50,8 +47,7 @@ pub fn sys_getsid(pid: i32, caller_pid: Pid) -> KernelResult<i64> {
     if pid == 0 {
         return Ok(i64::from(super::percpu::current_sid_vnr()));
     }
-    let pid = super::pid::from_vnr_or(pid as Pid, caller_pid).ok_or(KernelError::NoProcess)?;
-    let sid = super::percpu::lookup_task_sid(pid).ok_or(KernelError::NoProcess)?;
+    let sid = super::percpu::vpid_pgrp_vnr(pid as u64, true).ok_or(KernelError::NoProcess)?;
     Ok(i64::from(sid))
 }
 

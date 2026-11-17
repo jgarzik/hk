@@ -207,10 +207,11 @@ pub fn thread_sample(tid: Tid, s: Sample) -> Option<u64> {
     if me.tid() == tid {
         return Some(cpu_clock_sample(&me, s));
     }
-    crate::task::percpu::TASKLIST
-        .read()
-        .get(tid)
-        .map(|t| cpu_clock_sample(t.task, s))
+    // Found and sampled under RCU (Linux cpu_timer_task_rcu,
+    // cpu_clock_sample under rcu_read_lock)
+    let g = crate::sync::rcu::read_lock();
+    crate::task::percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+        .map(|t| cpu_clock_sample(t, s))
 }
 
 /// The value of `clock` now (process: group `pid`'s totals)
@@ -242,10 +243,7 @@ pub fn arm(clock: CpuClock, at: u64) {
             let task = if me.tid() == tid {
                 Some(crate::task::percpu::task_ref(&me))
             } else {
-                crate::task::percpu::TASKLIST
-                    .read()
-                    .get(tid)
-                    .map(|t| crate::task::percpu::task_ref(t.task))
+                crate::task::percpu::find_task(tid)
             };
             let (Some(t), Some(g)) = (task, crate::signal::current_signal()) else {
                 return;

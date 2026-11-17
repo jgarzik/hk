@@ -1158,12 +1158,18 @@ ntp_update_frequency).
 
 ## Deviations from Linux's lockless reads (fixing next)
 
-- **Task lookup by pid takes TASKLIST**: `task/percpu.rs`
-  `GlobalTaskTable::get` and its callers (getpgid/getsid with a pid,
-  kill and the other pid-addressed syscalls, /proc/<pid>) find the task
-  under TASKLIST's read lock. Linux finds it under RCU
-  (find_task_by_vpid / pid_task over the pid hash, tasks RCU-freed by
-  delayed_put_task_struct) and reads what it needs there.
+- **Another task's credentials and signal state are read under
+  TASKLIST**: `task/mod.rs` `Task::cred` of another task, `TaskInner`
+  `sighand`/`signal`, and `task/pid.rs` `Pid` `pgrp` lists; so kill,
+  tkill, tgkill and rt_sigqueueinfo (`signal/mod.rs`
+  `kill_pid_info_type`, `signal/syscall.rs` `user_thread_send`), the
+  sched_* / setpriority / ioprio / prlimit permission checks, a POSIX
+  timer's signal (`send_timer_sigqueue`) and F_GETOWN of a group
+  (`io/fasync.rs` `owner_nr`) take TASKLIST's read lock after (or
+  for) the pid lookup. Linux reads `__task_cred` under RCU (creds
+  freed by put_cred_rcu), reaches the handlers through
+  lock_task_sighand (RCU, then siglock) and reads
+  pid->tasks[PIDTYPE_PGID] under RCU (pid_task).
 - **The ptracer link is a `Weak` under TASKLIST**: `task/mod.rs`
   `TaskInner` `ptracer`, read by /proc status TracerPid among others;
   Linux reads `ptrace_parent()` (`rcu_dereference(task->parent)`)

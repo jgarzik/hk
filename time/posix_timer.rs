@@ -500,14 +500,13 @@ impl PosixTimer {
     }
 
     /// Its target is a thread of the caller's process (Linux
-    /// good_sigevent: same_thread_group)
+    /// good_sigevent: pid_task, same_thread_group, under RCU)
     fn target_in_group(&self) -> bool {
-        let table = crate::task::percpu::TASKLIST.read();
+        let g = crate::sync::rcu::read_lock();
         self.target
             .as_ref()
-            .and_then(|p| table.pid_tid(p))
-            .and_then(|t| table.get(t))
-            .is_some_and(|v| v.task.pid == crate::task::percpu::current_pid())
+            .and_then(|p| p.task(&g))
+            .is_some_and(|t| t.pid == crate::task::percpu::current_pid())
     }
 
     /// Its expiry sends a signal
@@ -1084,10 +1083,11 @@ fn own_cpu_clock(clockid: i32) -> Option<crate::time::cpu_timer::CpuClock> {
     let sample = crate::time::cpu_timer::Sample::of(which);
     if thread {
         let tid = if pid == 0 { current_tid() } else { pid };
-        let same = crate::task::percpu::TASKLIST
-            .read()
-            .get(tid)
-            .is_some_and(|t| t.task.pid == current_pid());
+        // Under RCU (Linux pid_for_clock: find_task_by_vpid,
+        // same_thread_group)
+        let g = crate::sync::rcu::read_lock();
+        let same = crate::task::percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+            .is_some_and(|t| t.pid == current_pid());
         return same.then_some(crate::time::cpu_timer::CpuClock {
             thread: Some(tid),
             sample,
@@ -1225,11 +1225,16 @@ pub fn sys_timer_settime(
     }
 
     // A thread CPU clock whose thread is gone: ESRCH (Linux
-    // posix_cpu_timer_set finds no task)
+    // posix_cpu_timer_set finds no task, under RCU)
     if let Some(crate::time::cpu_timer::CpuClock {
         thread: Some(t), ..
     }) = timer.cpu
-        && crate::task::percpu::TASKLIST.read().get(t).is_none()
+        && crate::task::percpu::pid_ns_task(
+            t,
+            &crate::ns::INIT_PID_NS,
+            &crate::sync::rcu::read_lock(),
+        )
+        .is_none()
     {
         return Err(KernelError::NoProcess);
     }

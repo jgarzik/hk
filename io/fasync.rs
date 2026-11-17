@@ -138,18 +138,6 @@ impl File {
     }
 }
 
-/// The `Pid` the caller numbers `nr` while a task uses it as its pid
-/// or process group (Linux find_vpid with pid_task / the group's list
-/// checked, as f_setown's callers do)
-fn find_owner(nr: u32) -> Option<Arc<Pid>> {
-    let pid = crate::task::pid::find_vpid(nr)?;
-    let used = {
-        let table = TASKLIST.read();
-        table.pid_tid(&pid).is_some() || table.pgrp(&pid).next().is_some()
-    };
-    used.then_some(pid)
-}
-
 /// `who` > 0 a process, < 0 a process group, 0 none (Linux f_setown):
 /// ESRCH if none exists, EINVAL for INT_MIN; `force` = false keeps an
 /// owner already set (__f_setown)
@@ -165,7 +153,9 @@ pub fn f_setown(file: &File, who: i32, force: bool) -> Result<(), KernelError> {
     let own = file.f_owner_alloc()?;
     let pid = match who.unsigned_abs() {
         0 => None,
-        nr => Some(find_owner(nr).ok_or(KernelError::NoProcess)?),
+        // Hashed while a task uses it in any role (Linux f_setown:
+        // find_vpid under RCU, no other check)
+        nr => Some(crate::task::pid::find_vpid(nr).ok_or(KernelError::NoProcess)?),
     };
     own.set(pid, kind, force);
     Ok(())
@@ -189,14 +179,15 @@ fn owner_nr(o: &Owner) -> i32 {
     let Some(pid) = &o.pid else {
         return 0;
     };
-    let table = TASKLIST.read();
     let live = match o.kind {
-        PidType::Tid => table.pid_tid(pid).is_some(),
-        PidType::Tgid => table
-            .pid_tid(pid)
-            .and_then(|t| table.get(t))
-            .is_some_and(|t| t.task.tid() == t.task.pid),
-        PidType::Pgrp => table.pgrp(pid).next().is_some(),
+        PidType::Tid => pid.has_task(),
+        // Under RCU: the task it names leads its group (Linux
+        // pid_task(pid, PIDTYPE_TGID))
+        PidType::Tgid => {
+            let g = crate::sync::rcu::read_lock();
+            pid.task(&g).is_some_and(|t| t.tid() == t.pid)
+        }
+        PidType::Pgrp => TASKLIST.read().pgrp(pid).next().is_some(),
     };
     if live { pid.vnr() as i32 } else { 0 }
 }
@@ -235,7 +226,7 @@ pub fn f_setown_ex(file: &File, arg: u64) -> Result<(), KernelError> {
         nr => Some(
             u32::try_from(nr)
                 .ok()
-                .and_then(find_owner)
+                .and_then(crate::task::pid::find_vpid)
                 .ok_or(KernelError::NoProcess)?,
         ),
     };

@@ -147,10 +147,8 @@ impl NsSet {
     /// name, in Linux's order (validate_nsset): ESRCH once it is gone,
     /// EPERM without ptrace-read access to it (real ids)
     fn install_from(&mut self, pid: &crate::task::pid::Pid) -> KernelResult<()> {
-        let t = crate::task::percpu::TASKLIST
-            .read()
-            .pid_task_ref(pid)
-            .ok_or(KernelError::NoProcess)?;
+        // Linux pidfd_get_task -> get_pid_task, under RCU
+        let t = crate::task::percpu::get_pid_task(pid).ok_or(KernelError::NoProcess)?;
         if !crate::task::ptrace::may_access_task(&t, false) {
             return Err(KernelError::NotPermitted);
         }

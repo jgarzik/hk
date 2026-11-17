@@ -1298,7 +1298,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: an intrusive `ArcList` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, found by tid through the pid hash (`Pid.task`, set and cleared under the write lock) |
+| `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: an intrusive `ArcList` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, found by tid through the pid hash (`Pid.task`, an `RcuPtr` set and cleared under the write lock, read under it or an RCU read guard) |
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
 | `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
@@ -1309,25 +1309,44 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 number per pid-namespace level. Numbers come from a lock-free bitmap
 per namespace (pages allocated outside any lock, installed by
 compare-and-swap; bits set and cleared atomically). `PIDMAP_LOCK`
-(spin leaf, thread context only, nothing allocates under it) protects
-the global hash chains of every live `Pid`'s numbers: `alloc_pid`
-links them, `find_pid` walks them (taking a strong reference only
-while the `Pid` lives: the hash holds weak ones), and they are
-unlinked and given back when the last task leaves the `Pid`
-(`release_numbers` from `GlobalTaskTable::remove`, `change_pids` and
-`take_leadership`, under TASKLIST's write lock: Linux free_pid from
-detach_pid), or at its last drop if no task ever left it; from
+(spin leaf, thread context only, nothing allocates under it)
+serializes changes to the global hash chains of every live `Pid`'s
+numbers (Linux pidmap_lock): `alloc_pid` links them (each `UPid`
+published whole, Release), and they are unlinked and given back when
+the last task leaves the `Pid` (`release_numbers` from
+`GlobalTaskTable::remove`, `change_pids` and `take_leadership`, under
+TASKLIST's write lock: Linux free_pid from detach_pid), or, for one
+whose task never joined the list, by the fork or kernel-thread
+creation that fails (`pid::NewPid`, Linux bad_fork_free_pid); from
 `alloc_pid` until then the `Pid` holds an active reference to the
 namespace it was made in (3.4, atomics, put after PIDMAP_LOCK is
-released). It is taken
-under nothing but may be taken under TASKLIST and, being a leaf, under
-any thread-context lock where a last `Arc<Pid>` reference may go (an
-AF_UNIX queue's SCM credentials and SO_PEERCRED, a tty's group, an
-F_SETOWN owner, a procfs inode).
+released). Readers walk the chains under an RCU read guard with no
+lock (`pid::find_pid_ns`, Linux find_pid_ns under rcu_read_lock): the
+hash holds one reference to a hashed `Pid` (`Pid.hash_ref`, Linux
+alloc_pid's count), dropped through `put_rcu` by `release_numbers`
+(Linux delayed_put_pid), and an unlinked `UPid` keeps its `next`
+(hlist_del_rcu), so a `Pid` found there, and every `UPid` of it, stays
+allocated until the guard drops; `find_pid` (Linux find_get_pid) and
+`get_pid` take a reference. PIDMAP_LOCK is taken under nothing but
+may be taken under TASKLIST and, being a leaf, under any
+thread-context lock where a `release_numbers` may run; the last
+`Arc<Pid>` reference (an AF_UNIX queue's SCM credentials and
+SO_PEERCRED, a tty's group, an F_SETOWN owner, a procfs inode, the
+hash's in `rcuc/N`) only frees memory and puts its namespace.
+A `Pid`'s task link (`Pid.task`, Linux pid->tasks[PIDTYPE_PID]) is an
+`RcuPtr<Task>` holding no reference: set under TASKLIST's write lock
+only to a task that is listed or joins the list in that section
+(`insert`), cleared in the section that unlists it, before the list's
+reference goes through `kfree_rcu` (`unhash`), so a task read through
+it under an RCU read guard (`Pid::task`, Linux pid_task) stays
+allocated until the guard drops (task lifetime, below), and one read
+under TASKLIST (`Pid::task_locked`) is listed for the hold.
 A process's pid is its leader's tid; an exec from a non-leader takes
 the leader's tid and `Pid` (`take_leadership`, Linux exchange_tids)
 under TASKLIST (the run queue knows tasks by reference, not by
-number). The idle tasks
+number), the two tasks' links exchanged while both are listed and
+before the old leader is unlisted, so the leader's `Pid` names one of
+them at every moment (Linux hlist_replace_rcu). The idle tasks
 are tid 0 and, like the boot task, not in TASKLIST.
 
 **Pid namespaces** (Linux task_active_pid_ns, pid_nr_ns, pid_vnr,
@@ -1339,16 +1358,43 @@ EINVAL), so the current task reads its own lock-free
 sessions are named by root numbers or `Arc<Pid>`; numbers are
 translated only at the user boundary: out, a root number to a
 namespace's (`pid::nr_ns`, `vnr`: 0 if not visible) through the hash
-(PIDMAP_LOCK), its owner kept listed by the caller meanwhile (the
+(under RCU), its owner kept listed by the caller meanwhile (the
 caller's own ids, or TASKLIST held for reading), or a `Pid` read
 under RCU numbered in place (`Pid::nr_ns`: a parent's group, a group,
 a session); in, a
 caller's number to its `Pid` or root number (`pid::find_vpid`,
 `from_vnr`, `find_pgrp(ns, nr)`: ESRCH if not visible) through the
-hash before TASKLIST is taken, or to its task
-(`percpu::find_task_by_vpid`, `find_task_by_pid_ns`: the hash, then
-TASKLIST's read lock only to take a reference from `Pid.task`, the
-`Arc<Pid>` dropped after it). Every pid argument is looked up so.
+hash before TASKLIST is taken, or to its task with no TASKLIST, under
+one RCU read guard (Linux rcu_read_lock; find_task_by_vpid /
+pid_task): `percpu::vpid_task`, `pid_ns_task` borrow it for the
+guard, `find_task_by_vpid`, `find_task_by_pid_ns`, `find_task` and,
+from a held `Pid`, `get_pid_task` take a reference (get_task_struct,
+`task_ref`: the list's reference keeps its count). Every pid argument
+is looked up so.
+
+**Task lookup by pid** (Linux find_task_by_vpid, get_pid_task under
+rcu_read_lock, no tasklist_lock): getpgid and getsid with a pid read
+the task's group or session in the same guard (`vpid_pgrp_vnr`);
+kcmp, ptrace's tracee, prlimit, the sched_* / setpriority /
+ioprio targets, process_vm_*, migrate_pages, a cgroup.procs write,
+nsfs's pid lookups, pidfd_open's checks (Linux pidfd_prepare:
+pid_has_task PIDTYPE_PID, then the task leading its group),
+`pidfd_task`, setns by pidfd, every /proc/<pid> access (`ProcPid::task`,
+Linux get_pid_task; `alive`, Linux pid_alive), the CPU clocks
+(clock_gettime and timer_create on a thread or process clock, a
+thread timer's settime and sample, Linux posix_cpu_clock_get,
+cpu_timer_task_rcu) and a timer's SIGEV_THREAD_ID check
+(good_sigevent) find the task so, F_SETOWN takes any hashed pid
+(f_setown: find_vpid) and F_GETOWN tests a thread or process owner's
+task the same way. What they then read of another task's
+`TaskInner` (credentials for a permission check, its signal handlers,
+its group's threads) is still under TASKLIST's read lock, so kill,
+tkill, tgkill, rt_sigqueueinfo, F_GETOWN of a group and a timer's
+signal find the task in that hold (BUGS.md); Linux takes
+tasklist_lock for these too only where it walks a group or a parent
+link (__kill_pgrp_info, send_sigio to a group, setpgid, ptrace
+attach and checks, wait, the PRIO_PGRP / IOPRIO_WHO_PGRP walks), as
+hk does.
 
 **A pid namespace's init** (`task/pidns.rs`; Linux child_reaper,
 pid_allocated, find_child_reaper, zap_pid_ns_processes): no new lock.
@@ -1456,7 +1502,7 @@ write lock that inserts the child. The old group and session `Pid`
 are handed back too and dropped after TASKLIST (Linux ksys_setsid's
 pids[] and free_pids; each thread's own old reference goes through
 `put_rcu` in the section); a group's `Pid` is looked up by number
-(`find_pgrp`, PIDMAP_LOCK) before TASKLIST is taken. Group 0, where
+(`find_pgrp`, under RCU) before TASKLIST is taken. Group 0, where
 init starts, is `INIT_STRUCT_PID` (Linux init_struct_pid, never
 hashed). kill(-pgrp), kill(0), tty ISIG, F_SETOWN and PRIO_PGRP /
 IOPRIO_WHO_PGRP walk a group's list, never the whole task list; the
@@ -1498,7 +1544,8 @@ listed task) is dropped through `kfree_rcu` in the write section that
 unlists the task (`remove`; the embedded `Task.rcu` head, queued once:
 a task is unlisted once), so a task leaves memory no sooner than a
 grace period after it leaves the list, and an RCU reader that reached
-it with no reference (a parent link) may read it meanwhile. That
+it with no reference (a `Pid`'s task link, a parent link) may read it
+meanwhile or take a reference (`task_ref`, Linux get_task_struct). That
 reference is usually the last, so the task's drop (its `TaskInner`:
 signal and sighand references, `Pid`s; its credentials, cgroup and
 keyring references, its namespace) runs in `rcuc/N` with preemption
@@ -1687,7 +1734,7 @@ from `Task.se`.
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
 | `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.jobctl` (group stop state), `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
-| RCU (`real_parent`, `signal->pids[]`, task and pid lifetime) | Lockless parent, group and session reads | `Task.real_parent` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the list's task reference through `kfree_rcu`, a dropped `Pid` link through `put_rcu` |
+| RCU (`real_parent`, `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, task and pid lifetime) | Lockless parent, group and session reads; task lookup by pid | `Task.real_parent` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
 | RCU (`cred`) | Credentials | lock-free for the task, TASKLIST for others |
 
 Remaining differences: the `task_struct` fields Linux leaves to the
@@ -2990,14 +3037,14 @@ proc_fs_info.pid_ns: the mounter's) is fixed at mount and read with no
 lock; inode data holds the task's `Pid` (`ProcPid`, an `Arc`, Linux
 proc_inode->pid; its last reference may go wherever the inode does,
 PIDMAP_LOCK being a leaf), copied out of the inode data and, once per
-access, turned into a reference to the task (`Pid.task` under
-TASKLIST's read lock, never under the inode data's lock: Linux
-get_pid_task) that every helper then works on, never its number (a
+access, turned into a reference to the task (`Pid.task` under RCU,
+never under the inode data's lock: Linux get_pid_task) that every
+helper then works on, never its number (a
 helper needing the task's locked fields finds it again under TASKLIST
 only if it is still that task, `GlobalTaskTable::view`; its resources under its
 alloc_lock); lookup, readdir and the per-task files
-translate through the pid helpers (3.1.1 Pid namespaces): the hash,
-then TASKLIST's read lock to reach the task
+translate through the pid helpers (3.1.1 Pid namespaces): the hash
+and the task link under RCU
 (readdir and /proc/<pid>/task gather under it with no allocation,
 `collect_tasks`/`collect_threads`); status and stat number every pid
 under that read lock from the `Pid`s it keeps listed (lock-free).
@@ -4706,7 +4753,7 @@ get_pid), read from the caller's task under TASKLIST. Order (Linux
 tty_lock → tasklist_lock → ctrl.lock): `CTTY_LOCK` → TASKLIST (read) →
 `Tty.ctrl`. TIOCSPGRP checks that the group is in the caller's session
 and stores it with TASKLIST read-held across both, so the group cannot
-change in between; the pid lookup (PIDMAP_LOCK) comes before TASKLIST.
+change in between; the pid lookup (under RCU) comes before TASKLIST.
 
 #### Graphics Console Lock
 

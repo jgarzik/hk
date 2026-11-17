@@ -6,9 +6,10 @@
 //! - F_SETSIG/F_GETSIG: Set/get signal number for async I/O
 
 use crate::harness::{fail_num, pass};
-use crate::helpers::{print, print_num, println};
+use crate::helpers::{print, print_num, println, reap};
 use hk_syscall::{
-    O_CREAT, O_RDWR, sys_close, sys_fcntl, sys_getpgid, sys_getpid, sys_mkdir, sys_open,
+    O_CREAT, O_RDWR, sys_close, sys_exit, sys_fcntl, sys_fork, sys_getpgid, sys_getpid, sys_mkdir,
+    sys_open, sys_pause, sys_pipe2, sys_read, sys_setpgid, sys_setsid, sys_wait4, sys_write,
 };
 
 // fcntl commands
@@ -31,6 +32,7 @@ pub fn run_tests() {
     test_setsig_getsig();
     test_getown_unset();
     test_setown_ebadf();
+    test_setown_session_pid();
 }
 
 /// Test F_SETOWN and F_GETOWN with positive PID
@@ -177,6 +179,64 @@ fn test_getown_unset() {
 
     sys_close(fd as u64);
     pass(b"FCNTL_OWNER_UNSET");
+}
+
+/// F_SETOWN takes any pid a task still uses, here only as its session
+/// (Linux f_setown: find_vpid, no other check): session leader P reaped,
+/// its child C in a group of its own; F_GETOWN then reads 0 (no task
+/// is P's process or in group P: pid_task NULL)
+fn test_setown_session_pid() {
+    const NAME: &[u8] = b"FCNTL_OWNER_SESSION_PID";
+    let mut ready = [0i32; 2];
+    if sys_pipe2(ready.as_mut_ptr(), 0) != 0 {
+        fail_num(b"FCNTL_OWNER_SESSION_PID:FAIL: pipe2 ", -1);
+        return;
+    }
+    let p = sys_fork();
+    if p == 0 {
+        sys_setsid();
+        if sys_fork() == 0 {
+            // C: a group of its own in P's session, then its pid out
+            sys_setpgid(0, 0);
+            let me = sys_getpid() as i32;
+            sys_write(ready[1] as u64, (&me as *const i32).cast(), 4);
+            loop {
+                sys_pause();
+            }
+        }
+        sys_exit(0);
+    }
+    let mut c = 0i32;
+    let got = sys_read(ready[0] as u64, (&mut c as *mut i32).cast(), 4);
+    let mut st = 0;
+    sys_wait4(p, &mut st, 0, 0);
+    sys_close(ready[0] as u64);
+    sys_close(ready[1] as u64);
+    if got != 4 {
+        fail_num(b"FCNTL_OWNER_SESSION_PID:FAIL: child pid read ", got);
+        return;
+    }
+    let fd = sys_open(b"/tmp/fcntl_owner_sess\0".as_ptr(), O_RDWR | O_CREAT, 0o644);
+    let r = if fd < 0 {
+        Err(fd)
+    } else {
+        let r = [
+            sys_fcntl(fd as i32, F_SETOWN, p as u64),
+            sys_fcntl(fd as i32, F_GETOWN, 0),
+            sys_fcntl(fd as i32, F_SETOWN, (-(p as i32)) as u64),
+            sys_fcntl(fd as i32, F_GETOWN, 0),
+        ];
+        sys_close(fd as u64);
+        match r.iter().position(|&x| x != 0) {
+            None => Ok(()),
+            Some(i) => Err(i as i64 * 1000 + r[i]),
+        }
+    };
+    reap(c as i64);
+    match r {
+        Ok(()) => pass(NAME),
+        Err(v) => fail_num(b"FCNTL_OWNER_SESSION_PID:FAIL: step*1000+ret ", v),
+    }
 }
 
 /// Test F_SETOWN returns EBADF for invalid fd

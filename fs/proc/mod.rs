@@ -59,9 +59,10 @@ fn current_time() -> Timespec {
     TIMEKEEPER.current_time()
 }
 
-/// `t` is still in the task list (not reaped)
+/// `t` is still in the task list, not reaped (Linux pid_alive, no
+/// lock)
 fn alive(t: &crate::task::Task) -> bool {
-    crate::task::percpu::TASKLIST.read().view(t).is_some()
+    t.pid_alive()
 }
 
 /// Task `t`'s descriptor table, fs struct, namespaces and address space
@@ -85,11 +86,11 @@ pub(super) fn task_mm(t: &crate::task::Task) -> Option<Arc<crate::mm::Mm>> {
 pub struct ProcPid(Arc<crate::task::pid::Pid>);
 
 impl ProcPid {
-    /// The task, pinned, while the pid names one (Linux get_pid_task),
-    /// None once it is reaped; TASKLIST read only to take the reference.
-    /// Every per-process path works on this task, never on its number.
+    /// The task, pinned, while the pid names one (Linux get_pid_task,
+    /// under RCU), None once it is reaped. Every per-process path works
+    /// on this task, never on its number.
     pub fn task(&self) -> Option<TaskRef> {
-        crate::task::percpu::TASKLIST.read().pid_task_ref(&self.0)
+        crate::task::percpu::get_pid_task(&self.0)
     }
 
     /// Its root number, for inode numbers (fixed)

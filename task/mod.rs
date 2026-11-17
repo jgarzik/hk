@@ -1716,6 +1716,13 @@ impl Task {
         self.pid_ns.as_deref().unwrap_or(&crate::ns::INIT_PID_NS)
     }
 
+    /// Still in the task list, not yet reaped (Linux pid_alive): read
+    /// with no lock, so only a hint once it returns unless TASKLIST is
+    /// held
+    pub fn pid_alive(&self) -> bool {
+        self.tasks_link.is_linked()
+    }
+
     /// Its real parent, none once it has left the task list (Linux
     /// pid_alive(p) ? rcu_dereference(p->real_parent)); no reference
     /// taken: the parent stays allocated while `g` is held

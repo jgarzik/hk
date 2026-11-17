@@ -24,6 +24,7 @@ pub fn run_tests() {
     test_kcmp_self_file();
     test_kcmp_invalid_pid();
     test_kcmp_invalid_type();
+    test_kcmp_pid_before_type();
     test_kcmp_invalid_fd();
     test_kcmp_epoll_tfd_unsupported();
 }
@@ -126,6 +127,23 @@ fn test_kcmp_invalid_type() {
     } else {
         print(b"FAIL (expected EINVAL=");
         print_num(EINVAL);
+        print(b", got ");
+        print_num(ret);
+        println(b")");
+    }
+}
+
+/// Test: the tasks are found before the type is checked (Linux kcmp:
+/// find_task_by_vpid first), so a missing task with a bad type is ESRCH
+fn test_kcmp_pid_before_type() {
+    print(b"  kcmp missing PID before bad type: ");
+    let pid = sys_getpid() as u64;
+    let ret = sys_kcmp(pid, 99999999, 999, 0, 0);
+    if ret == ESRCH {
+        println(b"PASS");
+    } else {
+        print(b"FAIL (expected ESRCH=");
+        print_num(ESRCH);
         print(b", got ");
         print_num(ret);
         println(b")");

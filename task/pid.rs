@@ -10,17 +10,20 @@
 //! cleared atomically, so allocation takes no lock.
 //!
 //! Every number of every live `Pid` is in one global hash keyed by
-//! (namespace, number) for lookups (`find_pid`). Its chains are
-//! intrusive (each `UPid` links to the next), protected by
-//! `PIDMAP_LOCK` (spin leaf, thread context only; nothing allocates under
-//! it). The hash holds a weak reference per number: a lookup takes a
-//! strong one only while the `Pid` is alive, and the last drop unhashes
-//! it and frees its numbers.
+//! (namespace, number) for lookups (Linux pid_hash / the pid idr). Its
+//! chains are intrusive (each `UPid` links to the next), changed under
+//! `PIDMAP_LOCK` (spin leaf, thread context only; nothing allocates
+//! under it) and walked under RCU with no lock ([`find_pid_ns`], Linux
+//! find_pid_ns under rcu_read_lock). The hash holds one reference to a
+//! hashed `Pid` (Linux alloc_pid's count), dropped a grace period after
+//! the `Pid` is unhashed ([`Pid::release_numbers`], Linux free_pid ->
+//! delayed_put_pid), so a reader that found it may use it until its
+//! guard drops, or take a reference ([`find_pid`], Linux find_get_pid).
 
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, box_nofail, try_arc, try_box};
 use alloc::boxed::Box;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::ns::{Namespace, PidNamespace};
@@ -43,10 +46,12 @@ const RESERVED_PIDS: u32 = 300;
 pub struct UPid {
     pub nr: u32,
     pub ns: Arc<PidNamespace>,
-    /// Next number in this hash chain (under PIDMAP_LOCK)
+    /// Next number in this hash chain: written under PIDMAP_LOCK, read
+    /// under RCU (left as it was once unhashed, Linux hlist_del_rcu)
     next: AtomicPtr<UPid>,
-    /// The `Pid` this number belongs to, as a `Weak::into_raw` pointer
-    /// (set once the `Pid` is in its `Arc`)
+    /// The `Pid` this number belongs to (no reference: the number is
+    /// part of it); set before it is hashed, once the `Pid` is in its
+    /// `Arc`
     pid: AtomicPtr<Pid>,
 }
 
@@ -56,10 +61,14 @@ pub struct Pid {
     pub level: u32,
     /// Its number at each level, root first
     numbers: Box<[UPid]>,
-    /// The task it names (Linux pid->tasks[PIDTYPE_PID]): a
-    /// `*const Task` set and cleared under TASKLIST's write lock
-    /// while the task is in the task list
-    task: AtomicPtr<()>,
+    /// The task it names (Linux pid->tasks[PIDTYPE_PID]), no reference:
+    /// set and cleared under TASKLIST's write lock, only while the task
+    /// is in the task list (set as it joins, cleared before it leaves,
+    /// moved straight from one task to the other by exec's
+    /// exchange_tids), so a task it names is listed or was within a
+    /// grace period: read under TASKLIST or an RCU read guard
+    /// ([`Pid::task`], Linux pid_task)
+    task: crate::sync::rcu::RcuPtr<crate::task::Task>,
     /// The process group whose id this is: its member processes'
     /// group leaders (Linux pid->tasks[PIDTYPE_PGID]; links
     /// `Task.pgrp_link`), changed under TASKLIST's write lock and
@@ -83,11 +92,16 @@ pub struct Pid {
     /// (`release_numbers`, Linux free_pid) or it is dropped; changed
     /// under PIDMAP_LOCK, which orders it
     hashed: AtomicBool,
-    /// References a task's group or session link dropped (Linux
-    /// delayed_put_pid): RCU readers of `Task.pgrp`/`session` may still
-    /// see it, so the drop waits a grace period (`put_rcu`); several
-    /// threads' references may go in one. Its drop may so run in
-    /// `rcuc/N`, preemption off (`release_numbers`: spin leaves only).
+    /// The hash holds a reference to it (one, taken as it is hashed:
+    /// Linux alloc_pid's count), dropped through `put_rcu` once it is
+    /// unhashed (`release_numbers`); under PIDMAP_LOCK
+    hash_ref: AtomicBool,
+    /// References dropped a grace period late (Linux delayed_put_pid):
+    /// a task's group or session link, read by RCU readers of
+    /// `Task.pgrp`/`session`, and the hash's own once it is unhashed,
+    /// read by RCU walkers of the hash (`put_rcu`); several may go in
+    /// one. Its drop may so run in `rcuc/N`, preemption off
+    /// (`release_numbers`: spin leaves only).
     puts: crate::sync::rcu::RcuPuts,
 }
 
@@ -127,15 +141,54 @@ impl Pid {
         self.exec_gen.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// The task it names (null if none: not yet attached, or released)
-    pub fn task(&self) -> *const () {
-        self.task.load(Ordering::Acquire)
+    /// It names a task now (Linux pid_has_task(pid, PIDTYPE_PID)): not
+    /// yet attached, or released, is false
+    pub fn has_task(&self) -> bool {
+        !self.task.as_ptr().is_null()
     }
 
-    /// Attach (non-null) or detach (null) its task; TASKLIST held for
-    /// writing
-    pub fn set_task(&self, t: *const ()) {
-        self.task.store(t.cast_mut(), Ordering::Release);
+    /// The task it names, no reference taken (Linux pid_task(pid,
+    /// PIDTYPE_PID) under rcu_read_lock): it stays allocated while `g`
+    /// is held; `percpu::task_ref` takes a reference (get_task_struct)
+    pub fn task<'a>(
+        &'a self,
+        g: &'a crate::sync::rcu::RcuReadGuard,
+    ) -> Option<&'a crate::task::Task> {
+        let _ = g;
+        // SAFETY: the target was listed when it was loaded (the field's
+        // rule: set only to a listed task, cleared before it leaves the
+        // list), and a task leaves memory no sooner than a grace period
+        // after it leaves the list (task lifetime: kfree_rcu), which `g`
+        // keeps from ending for 'a
+        unsafe { self.task.get() }
+    }
+
+    /// The task it names, TASKLIST held (Linux pid_task under
+    /// tasklist_lock): listed for the borrow of the table
+    pub fn task_locked<'t>(
+        &self,
+        table: &'t crate::task::percpu::GlobalTaskTable,
+    ) -> Option<&'t crate::task::Task> {
+        let _ = table;
+        // SAFETY: a target is listed (the field's rule) and stays so
+        // while the borrowed table keeps the write lock out, held by the
+        // list's reference
+        unsafe { self.task.get() }
+    }
+
+    /// Attach (`Some`) or detach (`None`) its task (Linux attach_pid,
+    /// detach_pid PIDTYPE_PID: rcu_assign_pointer under tasklist_lock);
+    /// `t` is listed, or joins the list in this write section
+    pub fn set_task(
+        &self,
+        t: Option<&crate::task::Task>,
+        table: &mut crate::task::percpu::GlobalTaskTable,
+    ) {
+        let _ = table;
+        // INVARIANT: the caller's: a listed (or joining) task, under the
+        // write lock
+        self.task
+            .set(t.map_or(core::ptr::null(), core::ptr::from_ref));
     }
 
     /// Its numbers, one per level from the root (Linux pid->numbers)
@@ -356,23 +409,53 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
     let pid = try_arc(Pid {
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
-        task: AtomicPtr::new(core::ptr::null_mut()),
+        task: crate::sync::rcu::RcuPtr::null(),
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(true),
+        hash_ref: AtomicBool::new(false),
         puts: crate::sync::rcu::RcuPuts::new(),
     })?;
     let _g = PIDMAP_LOCK.lock();
+    // The hash's reference, given back by `release_numbers`
+    let _ = Arc::into_raw(pid.clone());
+    pid.hash_ref.store(true, Ordering::Relaxed);
     for u in pid.numbers.iter() {
-        let weak = Weak::into_raw(Arc::downgrade(&pid)).cast_mut();
-        u.pid.store(weak, Ordering::Relaxed);
+        u.pid.store(Arc::as_ptr(&pid).cast_mut(), Ordering::Relaxed);
         let b = bucket(&u.ns, u.nr);
         u.next.store(b.load(Ordering::Relaxed), Ordering::Relaxed);
+        // Published whole to RCU walkers (Linux hlist_add_head_rcu)
         b.store(core::ptr::from_ref::<UPid>(u).cast_mut(), Ordering::Release);
     }
     Ok(pid)
+}
+
+/// A `Pid` not yet attached to its task (fork, kernel thread creation):
+/// its numbers go back if it is dropped unattached (Linux copy_process
+/// bad_fork_free_pid: free_pid), the hash holding a reference until
+/// then; [`attached`](Self::attached) once its task joins the list
+pub struct NewPid(Option<Arc<Pid>>);
+
+impl NewPid {
+    pub fn new(p: &Arc<Pid>) -> Self {
+        Self(Some(p.clone()))
+    }
+
+    /// Its task joined the task list: from now on its numbers go back
+    /// when no task uses it (`GlobalTaskTable::release_unused`)
+    pub fn attached(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for NewPid {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            p.release_numbers();
+        }
+    }
 }
 
 /// `ns` holds no pid and has had no init: an earlier attempt to make
@@ -470,12 +553,13 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
             next: AtomicPtr::new(core::ptr::null_mut()),
             pid: AtomicPtr::new(core::ptr::null_mut()),
         }]),
-        task: AtomicPtr::new(core::ptr::null_mut()),
+        task: crate::sync::rcu::RcuPtr::null(),
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(false),
+        hash_ref: AtomicBool::new(false),
         puts: crate::sync::rcu::RcuPuts::new(),
     })
 });
@@ -534,7 +618,8 @@ pub fn nr_ns(nr: u64, ns: &PidNamespace) -> u32 {
     if ns.level == 0 {
         return n;
     }
-    find_pid(&crate::ns::INIT_PID_NS, n).map_or(0, |p| p.nr_ns(ns))
+    let g = crate::sync::rcu::read_lock();
+    find_pid_ns(&crate::ns::INIT_PID_NS, n, &g).map_or(0, |p| p.nr_ns(ns))
 }
 
 /// Root number `nr` in the caller's namespace (Linux pid_vnr)
@@ -552,7 +637,8 @@ pub fn from_vnr(nr: u64) -> Option<u64> {
     if ns.level == 0 {
         return Some(nr);
     }
-    find_pid(ns, u32::try_from(nr).ok()?).map(|p| u64::from(p.nr()))
+    let g = crate::sync::rcu::read_lock();
+    find_pid_ns(ns, u32::try_from(nr).ok()?, &g).map(|p| u64::from(p.nr()))
 }
 
 /// [`from_vnr`] with 0 naming the caller (`me`), as most pid
@@ -561,22 +647,50 @@ pub fn from_vnr_or(nr: u64, me: u64) -> Option<u64> {
     if nr == 0 { Some(me) } else { from_vnr(nr) }
 }
 
-/// The live `Pid` numbered `nr` in `ns` (Linux find_pid_ns)
-pub fn find_pid(ns: &PidNamespace, nr: u32) -> Option<Arc<Pid>> {
-    let _g = PIDMAP_LOCK.lock();
+/// The `Pid` numbered `nr` in `ns`, no reference taken (Linux
+/// find_pid_ns under rcu_read_lock): it stays allocated while `g` is
+/// held. No lock: the chain is walked as PIDMAP_LOCK's holders publish
+/// and unlink it.
+pub fn find_pid_ns<'a>(
+    ns: &PidNamespace,
+    nr: u32,
+    g: &'a crate::sync::rcu::RcuReadGuard,
+) -> Option<&'a Pid> {
+    let _ = g;
     let mut u = bucket(ns, nr).load(Ordering::Acquire);
-    // SAFETY: hashed UPids live until unhashed under PIDMAP_LOCK
+    // SAFETY: a UPid is part of its Pid, which the hash keeps (its
+    // reference) until a grace period after it is unhashed; one reached
+    // through the chain was hashed within `g`'s section, and its `next`
+    // stays what it was (another such UPid, or null)
     while let Some(up) = unsafe { u.as_ref() } {
         if up.nr == nr && core::ptr::eq(Arc::as_ptr(&up.ns), ns) {
-            let p = up.pid.load(Ordering::Relaxed);
-            // SAFETY: the hash's weak reference keeps the allocation;
-            // upgrade fails once the last strong one is gone
-            let weak = core::mem::ManuallyDrop::new(unsafe { Weak::from_raw(p) });
-            return weak.upgrade();
+            // SAFETY: set before the UPid was published (Release, read
+            // Acquire above): its own Pid, allocated as above
+            return unsafe { up.pid.load(Ordering::Relaxed).as_ref() };
         }
-        u = up.next.load(Ordering::Relaxed);
+        u = up.next.load(Ordering::Acquire);
     }
     None
+}
+
+/// A reference to the `Pid` numbered `nr` in `ns` (Linux find_get_pid,
+/// in a namespace)
+pub fn find_pid(ns: &PidNamespace, nr: u32) -> Option<Arc<Pid>> {
+    let g = crate::sync::rcu::read_lock();
+    find_pid_ns(ns, nr, &g).map(get_pid)
+}
+
+/// A new reference to `p`, a `Pid` reached through the hash under RCU
+/// (Linux get_pid)
+pub fn get_pid(p: &Pid) -> Arc<Pid> {
+    let p = core::ptr::from_ref(p);
+    // SAFETY: every hashed Pid is in an `Arc` (`alloc_pid_nr`), and one
+    // found under RCU has a count (the hash's, dropped a grace period
+    // after unhashing) for as long as the guard the borrow comes from
+    unsafe {
+        Arc::increment_strong_count(p);
+        Arc::from_raw(p)
+    }
 }
 
 impl Pid {
@@ -584,16 +698,19 @@ impl Pid {
     /// detach_pid): its numbers leave the hash and are given back, so
     /// find_pid no longer finds it and they can name a new task, while
     /// the struct lives on for its holders (a pidfd, a timer, an F_SETOWN
-    /// owner, a tty's session), naming no task. Once.
+    /// owner, a tty's session), naming no task. Once. The hash's
+    /// reference is dropped a grace period later (Linux delayed_put_pid):
+    /// an RCU walker may still be on it.
     pub fn release_numbers(&self) {
-        let mut weaks = [core::ptr::null_mut::<Pid>(); 33];
         let mut zapping = false;
+        let hash_ref;
         {
             let _g = PIDMAP_LOCK.lock();
             if !self.hashed.swap(false, Ordering::Relaxed) {
                 return;
             }
-            for (i, u) in self.numbers.iter().enumerate() {
+            hash_ref = self.hash_ref.swap(false, Ordering::Relaxed);
+            for u in self.numbers.iter() {
                 zapping |= uncount(&u.ns);
                 let b = bucket(&u.ns, u.nr);
                 let me = core::ptr::from_ref::<UPid>(u).cast_mut();
@@ -610,9 +727,6 @@ impl Pid {
                     // SAFETY: hashed, under PIDMAP_LOCK
                     link = unsafe { &(*cur).next };
                 }
-                if let Some(w) = weaks.get_mut(i) {
-                    *w = u.pid.swap(core::ptr::null_mut(), Ordering::Relaxed);
-                }
             }
         }
         for u in self.numbers.iter() {
@@ -625,17 +739,19 @@ impl Pid {
         if zapping {
             crate::task::proc::CHILD_EXIT_WQ.wake_all();
         }
-        for w in weaks.into_iter().filter(|w| !w.is_null()) {
-            // SAFETY: the hash's weak references, released once here
-            // (the Pid itself is alive: the caller holds it)
-            drop(unsafe { Weak::from_raw(w) });
+        if hash_ref {
+            // SAFETY: the hash's reference (`alloc_pid_nr`: the
+            // `Arc::into_raw` of this Pid), taken back once here
+            crate::sync::rcu::put_rcu(unsafe { Arc::from_raw(core::ptr::from_ref(self)) });
         }
     }
 }
 
 impl Drop for Pid {
-    /// Unhash every number and free it (Linux free_pid), unless the last
-    /// task's detach did
+    /// Give its numbers back if it never got into the hash
+    /// (`alloc_pid_nr` failing to make its `Arc`); a hashed one is
+    /// dropped only after `release_numbers`, the hash holding a
+    /// reference until then
     fn drop(&mut self) {
         self.release_numbers();
     }

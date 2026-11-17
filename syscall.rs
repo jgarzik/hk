@@ -550,10 +550,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             UserPtr::new(a[2]),
         )
         .ret() as u64,
-        Sys::Getpgid => {
-            crate::task::syscall::sys_getpgid(a[0] as i32, crate::task::percpu::current_pid()).ret()
-                as u64
-        }
+        Sys::Getpgid => crate::task::syscall::sys_getpgid(a[0] as i32).ret() as u64,
         Sys::Getpid => crate::task::syscall::sys_getpid().ret() as u64,
         Sys::Getppid => crate::task::syscall::sys_getppid().ret() as u64,
         Sys::Getpriority => {
@@ -583,10 +580,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Getrusage => {
             crate::task::syscall::sys_getrusage(a[0] as i32, UserPtr::new(a[1])).ret() as u64
         }
-        Sys::Getsid => {
-            crate::task::syscall::sys_getsid(a[0] as i32, crate::task::percpu::current_pid()).ret()
-                as u64
-        }
+        Sys::Getsid => crate::task::syscall::sys_getsid(a[0] as i32).ret() as u64,
         Sys::Getsockname => crate::net::syscall::sys_getsockname(
             a[0] as i32,
             UserPtr::new(a[1]),
