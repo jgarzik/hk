@@ -12,16 +12,28 @@
 //! fully free ones on the empty list (a few kept, the rest returned to
 //! the page allocator), full ones on no list.
 //!
+//! A SLAB_TYPESAFE_BY_RCU cache (`KmemCache::typesafe_by_rcu`) returns
+//! its empty slabs to the page allocator only a grace period after they
+//! emptied (Linux free_slab's call_rcu): a freed object is reused at
+//! once, but its memory stays an object of the cache while an RCU
+//! reader may still hold its address. Its constructor (Linux ctor) sets
+//! the type-stable part of each object when its slab is made; the cache
+//! writes nothing in an object but its free-list link, at an offset the
+//! cache's user leaves out of that part (Linux freeptr_offset).
+//!
 //! Locking: per-CPU array (interrupts off) → `list_lock` (`IrqSpinlock`)
 //! → page allocator (per-CPU list, `Zone.lock`); empty slabs are given
-//! back after `list_lock` is dropped. Everything is IRQ-safe. A CPU
-//! without per-CPU data yet allocates and frees under `list_lock`.
+//! back after `list_lock` is dropped, through `rcu` (`IrqSpinlock`
+//! leaf, never held across anything) for a type-stable cache. Everything
+//! is IRQ-safe. A CPU without per-CPU data yet allocates and frees under
+//! `list_lock`.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mm::page::{PG_SLAB, Page};
 use crate::mm::page_alloc::{Gfp, this_cpu};
+use crate::sync::rcu::RcuHead;
 use crate::sync::{IrqSpinlock, local_irq_restore, local_irq_save};
 
 /// Largest per-CPU array
@@ -73,11 +85,36 @@ struct Lists {
     active: usize,
 }
 
+/// Empty slabs of a type-stable cache waiting for a grace period (Linux
+/// free_slab's call_rcu(&slab->rcu_head)), each list linked through its
+/// head pages' `next`. Linux queues each slab on the rcu_head in its
+/// struct slab; a struct page here has no room for one, so the cache
+/// queues one head (`KmemCache.rcu_head`) at a time: its callback frees
+/// `waiting`, and slabs emptied after it was queued (`next`) wait for
+/// the grace period it then queues.
+struct RcuSlabs {
+    waiting: usize,
+    next: usize,
+    /// The head is queued, or its callback runs and queues it again
+    /// when `next` has slabs
+    queued: bool,
+}
+
+/// Cache flag: memory stays type-stable for a grace period (Linux
+/// SLAB_TYPESAFE_BY_RCU)
+const SLAB_TYPESAFE_BY_RCU: u32 = 1;
+
 /// A cache of equally sized objects (Linux struct kmem_cache)
 pub struct KmemCache {
     pub name: &'static str,
     /// Object stride (size rounded up to the alignment)
     size: usize,
+    /// SLAB_TYPESAFE_BY_RCU or 0
+    flags: u32,
+    /// Where a free object links the next (Linux kmem_cache->offset)
+    freeptr: usize,
+    /// Sets a fresh object up (Linux kmem_cache->ctor)
+    ctor: Option<unsafe fn(*mut u8)>,
     /// The layout it was made for (named caches match it exactly)
     obj: (usize, usize),
     /// Slab order and objects per slab
@@ -90,7 +127,10 @@ pub struct KmemCache {
     /// Each CPU's object cache, in its per-CPU area
     cpu: &'static crate::cpu::PerCpu<CpuCell>,
     list_lock: IrqSpinlock<Lists>,
-    /// Slabs allocated (meminfo Slab)
+    /// Empty slabs on their way back (type-stable caches)
+    rcu: IrqSpinlock<RcuSlabs>,
+    rcu_head: RcuHead,
+    /// Slabs allocated, until given back (meminfo Slab)
     nr_slabs: AtomicUsize,
 }
 
@@ -135,6 +175,9 @@ impl KmemCache {
         Self {
             name,
             size,
+            flags: 0,
+            freeptr: 0,
+            ctor: None,
             obj,
             order,
             objs: (4096 << order) / size,
@@ -148,8 +191,43 @@ impl KmemCache {
                 nr_empty: 0,
                 active: 0,
             }),
+            rcu: IrqSpinlock::new(RcuSlabs {
+                waiting: 0,
+                next: 0,
+                queued: false,
+            }),
+            rcu_head: RcuHead::new(),
             nr_slabs: AtomicUsize::new(0),
         }
+    }
+
+    /// A SLAB_TYPESAFE_BY_RCU cache (Linux kmem_cache_create with that
+    /// flag, `freeptr_offset` and `ctor`): an object freed may be handed
+    /// out again at once, but its memory stays an object of this cache
+    /// until a grace period after it was freed, its slab given back to
+    /// the page allocator only then. `ctor` sets up each object of a new
+    /// slab; the cache writes nothing in an object afterwards but its
+    /// free-list link, at `freeptr` (8-aligned, inside the object), which
+    /// its user keeps out of the part readers rely on.
+    ///
+    /// # Safety
+    /// The cache is never dropped (a `static`): its grace-period callback
+    /// reaches it. `ctor` may be called on any fresh object of it.
+    pub const unsafe fn typesafe_by_rcu(
+        name: &'static str,
+        size: usize,
+        align: usize,
+        freeptr: usize,
+        ctor: unsafe fn(*mut u8),
+        src: &'static dyn SlabPages,
+        cpu: &'static crate::cpu::PerCpu<CpuCell>,
+    ) -> Self {
+        assert!(freeptr.is_multiple_of(8) && freeptr + 8 <= size);
+        let mut c = Self::new(name, size, align, src, cpu);
+        c.flags = SLAB_TYPESAFE_BY_RCU;
+        c.freeptr = freeptr;
+        c.ctor = Some(ctor);
+        c
     }
 
     /// Object stride
@@ -173,6 +251,11 @@ impl KmemCache {
 
     fn head(&self, base: usize) -> &Page {
         self.src.page(base)
+    }
+
+    /// The free-list link of `obj`
+    fn link(&self, obj: usize) -> *mut usize {
+        (obj + self.freeptr) as *mut usize
     }
 
     // ------------------------------------------------------------------
@@ -210,9 +293,9 @@ impl KmemCache {
     fn take_obj(&self, l: &mut Lists, base: usize) -> usize {
         let pg = self.head(base);
         let obj = pg.private.load(Ordering::Relaxed) as usize;
-        // SAFETY: a free object of a slab we own; its first word links
-        // the next free object
-        let next = unsafe { *(obj as *const usize) };
+        // SAFETY: a free object of a slab we own, whose link word (no
+        // reader's) names the next free object
+        let next = unsafe { *self.link(obj) };
         pg.private.store(next as u64, Ordering::Relaxed);
         l.active += 1;
         // Under list_lock (`l`): Linux slab->inuse++
@@ -234,8 +317,9 @@ impl KmemCache {
     fn put_obj(&self, l: &mut Lists, obj: usize) {
         let base = self.base_of(obj);
         let pg = self.head(base);
-        // SAFETY: the object is free again; its first word links the list
-        unsafe { *(obj as *mut usize) = pg.private.load(Ordering::Relaxed) as usize };
+        // SAFETY: the object is free again; its link word (no reader's)
+        // links the list
+        unsafe { *self.link(obj) = pg.private.load(Ordering::Relaxed) as usize };
         pg.private.store(obj as u64, Ordering::Relaxed);
         l.active -= 1;
         // Under list_lock (`l`): Linux slab->inuse--
@@ -285,8 +369,13 @@ impl KmemCache {
         let mut free = 0;
         for i in (0..self.objs).rev() {
             let obj = base + i * self.size;
+            if let Some(ctor) = self.ctor {
+                // SAFETY: a fresh object of this cache (the constructor's
+                // contract), which no one else reaches yet
+                unsafe { ctor(obj as *mut u8) };
+            }
             // SAFETY: the fresh slab's objects are ours
-            unsafe { *(obj as *mut usize) = free };
+            unsafe { *self.link(obj) = free };
             free = obj;
         }
         pg.private.store(free as u64, Ordering::Relaxed);
@@ -301,7 +390,76 @@ impl KmemCache {
         true
     }
 
-    /// Give an empty slab back to the page allocator (no list_lock held)
+    /// Give an empty slab back (Linux discard_slab): to the page
+    /// allocator, a grace period later for a type-stable cache (no
+    /// list_lock held)
+    fn discard(&self, base: usize) {
+        if self.flags & SLAB_TYPESAFE_BY_RCU == 0 {
+            self.release(base);
+            return;
+        }
+        let mut r = self.rcu.lock();
+        self.head(base).next.store(r.next as u64, Ordering::Relaxed);
+        r.next = base;
+        if r.queued {
+            return;
+        }
+        r.queued = true;
+        r.waiting = core::mem::take(&mut r.next);
+        drop(r);
+        self.queue_gp();
+    }
+
+    /// Run `rcu_free` a grace period from now (Linux call_rcu)
+    #[cfg(not(test))]
+    fn queue_gp(&self) {
+        /// The callback
+        ///
+        /// # Safety
+        /// `p` is the cache queued with it, never dropped.
+        unsafe fn free(p: *const ()) {
+            // SAFETY: the caller's contract
+            unsafe { &*p.cast::<KmemCache>() }.rcu_free();
+        }
+        if !crate::sync::rcu::can_queue() {
+            // Early boot: no other CPU runs a reader yet
+            self.rcu_free();
+            return;
+        }
+        // SAFETY: the cache, and with it its head, is never dropped
+        // (`typesafe_by_rcu`'s contract); the head is queued by one
+        // caller at a time (`RcuSlabs.queued`), and `free` neither sleeps
+        // nor cares which CPU runs it
+        unsafe {
+            crate::sync::rcu::call_rcu(&self.rcu_head, free, core::ptr::from_ref(self).cast());
+        }
+    }
+
+    /// Host tests end the grace period themselves (`rcu_free`)
+    #[cfg(test)]
+    fn queue_gp(&self) {}
+
+    /// A grace period is over (Linux rcu_free_slab): the slabs it covers
+    /// go back, and the ones emptied since wait for another
+    fn rcu_free(&self) {
+        let (mut base, again) = {
+            let mut r = self.rcu.lock();
+            let w = core::mem::take(&mut r.waiting);
+            r.waiting = core::mem::take(&mut r.next);
+            r.queued = r.waiting != 0;
+            (w, r.queued)
+        };
+        if again {
+            self.queue_gp();
+        }
+        while base != 0 {
+            let next = self.head(base).next.load(Ordering::Relaxed) as usize;
+            self.release(base);
+            base = next;
+        }
+    }
+
+    /// Give an empty slab to the page allocator (Linux __free_slab)
     fn release(&self, base: usize) {
         let pg = self.head(base);
         pg.clear_flag(PG_SLAB);
@@ -363,7 +521,7 @@ impl KmemCache {
         ac.entry.copy_within(n..ac.avail, 0);
         ac.avail -= n;
         for &base in &gone[..ng] {
-            self.release(base);
+            self.discard(base);
         }
     }
 
@@ -421,7 +579,7 @@ impl KmemCache {
             self.shrink_one(&mut l)
         };
         if let Some(base) = gone {
-            self.release(base);
+            self.discard(base);
         }
     }
 }
@@ -566,6 +724,39 @@ pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", arc_of::<crate::fs::
 pub static INODE_CACHE: KmemCache =
     named_cache!("inode_cache", arc_of::<crate::fs::inode::Inode>());
 
+/// Pages for the caches made here (host tests: their own)
+#[cfg(not(test))]
+use KERNEL_PAGES as CACHE_PAGES;
+#[cfg(test)]
+use tests::HOST_PAGES as CACHE_PAGES;
+
+/// Open files (`fs::file::FileObj`; Linux filp_cache, files_init):
+/// SLAB_TYPESAFE_BY_RCU, so a descriptor table's RCU reader that loaded
+/// a file's address may try for a count on it however soon it is freed
+/// and reused. Used only by `File::alloc` and a file's release, never
+/// through the global allocator.
+pub static FILP_CACHE: KmemCache = {
+    use crate::fs::file::FileObj;
+    crate::percpu! {
+        static CPU: CpuCell = CpuCell::new();
+    }
+    // SAFETY: a static; `FileObj::ctor` takes any fresh object
+    unsafe {
+        KmemCache::typesafe_by_rcu(
+            "filp",
+            core::mem::size_of::<FileObj>(),
+            core::mem::align_of::<FileObj>(),
+            FileObj::FREEPTR,
+            FileObj::ctor,
+            &CACHE_PAGES,
+            &CPU,
+        )
+    }
+};
+
+/// Caches used by name only (Linux kmem_cache_create's callers)
+static OWN: [&KmemCache; 1] = [&FILP_CACHE];
+
 /// Object types with a cache of their own. Rust allocates through the
 /// global allocator with only a layout, so these caches serve every
 /// allocation of exactly their type's layout (another type of the same
@@ -626,10 +817,15 @@ pub fn slabinfo() -> alloc::vec::Vec<u8> {
          : slabdata <active_slabs> <num_slabs> <sharedavail>\n";
     // Each cache line below is about 110 bytes
     const LINE: usize = 112;
-    let mut out =
-        alloc::string::String::with_capacity(HEAD.len() + (NAMED.len() + KMALLOC.len()) * LINE);
+    let n = OWN.len() + NAMED.len() + KMALLOC.len();
+    let mut out = alloc::string::String::with_capacity(HEAD.len() + n * LINE);
     out.push_str(HEAD);
-    for c in NAMED.iter().copied().chain(KMALLOC.iter()) {
+    for c in OWN
+        .iter()
+        .chain(NAMED.iter())
+        .copied()
+        .chain(KMALLOC.iter())
+    {
         let active = c.list_lock.lock().active;
         let slabs = c.nr_slabs.load(Ordering::Relaxed);
         let _ = writeln!(
@@ -654,7 +850,11 @@ pub fn slabinfo() -> alloc::vec::Vec<u8> {
 
 pub fn slab_bytes() -> usize {
     KMALLOC.iter().map(KmemCache::bytes).sum::<usize>()
-        + NAMED.iter().map(|c| c.bytes()).sum::<usize>()
+        + OWN
+            .iter()
+            .chain(NAMED.iter())
+            .map(|c| c.bytes())
+            .sum::<usize>()
 }
 
 const _: () = assert!(SIZES[SIZES.len() - 1] == KMALLOC_MAX);
@@ -663,23 +863,30 @@ const _: () = assert!(SIZES[SIZES.len() - 1] == KMALLOC_MAX);
 pub mod tests {
     use super::*;
     use std::alloc::Layout;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     /// Slabs from the host allocator, struct pages in a side table
     pub struct HostPages {
-        pages: Mutex<HashMap<usize, &'static Page>>,
+        pages: Mutex<BTreeMap<usize, &'static Page>>,
         pub live: AtomicUsize,
     }
 
     impl HostPages {
-        pub fn new() -> &'static Self {
-            Box::leak(Box::new(Self {
-                pages: Mutex::new(HashMap::new()),
+        pub const fn empty() -> Self {
+            Self {
+                pages: Mutex::new(BTreeMap::new()),
                 live: AtomicUsize::new(0),
-            }))
+            }
+        }
+
+        pub fn new() -> &'static Self {
+            Box::leak(Box::new(Self::empty()))
         }
     }
+
+    /// The host tests' pages for `FILP_CACHE` and the like
+    pub static HOST_PAGES: HostPages = HostPages::empty();
 
     impl SlabPages for HostPages {
         fn alloc(&self, order: u32) -> Option<usize> {
@@ -701,13 +908,113 @@ pub mod tests {
         }
     }
 
+    fn cpus() -> &'static crate::cpu::PerCpu<CpuCell> {
+        Box::leak(Box::new(crate::cpu::PerCpu::new(
+            [const { CpuCell::new() }; crate::util::cpumask::NR_CPUS],
+        )))
+    }
+
     fn cache(size: usize, align: usize) -> (&'static KmemCache, &'static HostPages) {
         let src = HostPages::new();
-        let cpu = Box::leak(Box::new(crate::cpu::PerCpu::new(
-            [const { CpuCell::new() }; crate::util::cpumask::NR_CPUS],
-        )));
-        let c = Box::leak(Box::new(KmemCache::new("test", size, align, src, cpu)));
+        let c = Box::leak(Box::new(KmemCache::new("test", size, align, src, cpus())));
         (c, src)
+    }
+
+    /// A type-stable object: `state` is its constructed part, the rest
+    /// (where the cache links it when free) its user's
+    #[repr(C)]
+    struct Stable {
+        body: [u64; 7],
+        state: core::sync::atomic::AtomicU64,
+    }
+
+    const CTOR: u64 = 0xc0;
+
+    /// # Safety
+    /// `p` is a fresh object of a `Stable` cache.
+    unsafe fn stable_ctor(p: *mut u8) {
+        let s = p.cast::<Stable>();
+        // SAFETY: the caller's contract
+        unsafe { (&raw mut (*s).state).write(core::sync::atomic::AtomicU64::new(CTOR)) };
+    }
+
+    fn typesafe() -> (&'static KmemCache, &'static HostPages) {
+        let src = HostPages::new();
+        let (s, a) = box_of::<Stable>();
+        // SAFETY: leaked, never dropped; `stable_ctor` takes a fresh one
+        let c = unsafe { KmemCache::typesafe_by_rcu("ts", s, a, 0, stable_ctor, src, cpus()) };
+        (Box::leak(Box::new(c)), src)
+    }
+
+    fn state(o: usize) -> &'static core::sync::atomic::AtomicU64 {
+        // SAFETY: an object of a `Stable` cache whose slab is still the
+        // cache's: its state stays constructed
+        unsafe { &(*(o as *const Stable)).state }
+    }
+
+    /// An object freed and handed out again keeps its constructed part:
+    /// the cache writes only its link word, which is not in it
+    #[test]
+    fn typesafe_keeps_layout() {
+        let (c, _) = typesafe();
+        let v: Vec<usize> = (0..100).map(|_| c.alloc() as usize).collect();
+        for &o in &v {
+            assert_eq!(state(o).load(Ordering::Relaxed), CTOR);
+            state(o).store(o as u64, Ordering::Relaxed);
+            // SAFETY: allocated, ours: its body is its user's
+            unsafe { (*(o as *mut Stable)).body = [!0; 7] };
+        }
+        for &o in &v {
+            c.free(o as *mut u8);
+            // Freed: still what its user left
+            assert_eq!(state(o).load(Ordering::Relaxed), o as u64);
+        }
+        let w: Vec<usize> = (0..100).map(|_| c.alloc() as usize).collect();
+        let again = w.iter().filter(|o| v.contains(o)).count();
+        assert!(again >= 64, "freed objects are handed out at once");
+        for &o in &w {
+            let want = if v.contains(&o) { o as u64 } else { CTOR };
+            assert_eq!(state(o).load(Ordering::Relaxed), want);
+        }
+    }
+
+    /// Slabs on a type-stable cache's list from `b`
+    fn listed(c: &KmemCache, mut b: usize) -> usize {
+        let mut n = 0;
+        while b != 0 {
+            n += 1;
+            b = c.head(b).next.load(Ordering::Relaxed) as usize;
+        }
+        n
+    }
+
+    /// Empty slabs go back to the pages only once a grace period ends,
+    /// and one emptied after it was queued waits for the next
+    #[test]
+    fn typesafe_slabs_wait_for_gp() {
+        let (c, src) = typesafe();
+        let v: Vec<usize> = (0..400).map(|_| c.alloc() as usize).collect();
+        let slabs = src.live.load(Ordering::Relaxed);
+        let bytes = c.bytes();
+        for o in v {
+            c.free(o as *mut u8);
+        }
+        assert_eq!(src.live.load(Ordering::Relaxed), slabs, "none back yet");
+        assert_eq!(c.bytes(), bytes, "counted until given back");
+        let (w, n, q) = {
+            let r = c.rcu.lock();
+            (listed(c, r.waiting), listed(c, r.next), r.queued)
+        };
+        assert!(q && w == 1 && n > 0, "{w} {n}");
+        c.rcu_free();
+        assert_eq!(src.live.load(Ordering::Relaxed), slabs - 1);
+        assert!(c.rcu.lock().queued, "the next grace period is queued");
+        c.rcu_free();
+        let left = src.live.load(Ordering::Relaxed);
+        assert_eq!(left, slabs - 1 - n);
+        assert!(left <= KEEP_EMPTY + 2, "{left} of {slabs}");
+        let r = c.rcu.lock();
+        assert!(!r.queued && r.waiting == 0 && r.next == 0);
     }
 
     #[test]

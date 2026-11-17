@@ -208,22 +208,10 @@ impl Files {
         }
     }
 
-    /// A file taken out of the table: if other tasks use it, their RCU
-    /// lookups may hold its address, so its memory outlives its release
-    /// by a grace period (`File::rcu_free`); a task counted here is
-    /// still a user while it looks one up
-    fn detached(&self, f: FileRef) -> FileRef {
-        if self.shared() {
-            f.rcu_free();
-        }
-        f
-    }
-
     /// Detach descriptor `fd` for the caller to close after the unlock
     /// (Linux file_close_fd); None (EBADF) if no file is installed there
     pub fn close_fd(&self, fd: Fd) -> Option<FileRef> {
-        let f = self.lock().close_fd(fd);
-        f.map(|f| self.detached(f))
+        self.lock().close_fd(fd)
     }
 
     /// Make `newfd` a copy of `oldfd` with FD_CLOEXEC from `flags`
@@ -241,7 +229,7 @@ impl Files {
         let tofree = t.dup2(newfd, file, flags)?;
         drop(t);
         if let Some(f) = tofree {
-            filp_close(self.detached(f), self.id);
+            filp_close(f, self.id);
         }
         Ok(())
     }
@@ -255,7 +243,7 @@ impl Files {
             let Some((n, f)) = next else {
                 return;
             };
-            filp_close(self.detached(f), self.id);
+            filp_close(f, self.id);
             fd = n + 1;
         }
     }
@@ -275,7 +263,7 @@ impl Files {
                 return;
             };
             if let Some(f) = f {
-                filp_close(self.detached(f), self.id);
+                filp_close(f, self.id);
             }
             fd = n + 1;
         }

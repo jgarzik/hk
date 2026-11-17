@@ -26,11 +26,15 @@ use crate::util::error::KernelResult;
 ///
 /// # Safety
 /// - `into_raw` leaks one reference, which `from_raw` takes back.
-/// - A target's memory stays allocated until a grace period after its
-///   last reference went.
-/// - `get_rcu` touches only interior-mutable bytes of the target, which
-///   the last reference's release and drop never write through a
-///   unique borrow.
+/// - A target's memory is type-stable (Linux SLAB_TYPESAFE_BY_RCU): it
+///   may be freed and reused for a new target at once, but stays an
+///   object of the targets' cache, its count readable, until a grace
+///   period after it was freed.
+/// - `get_rcu` touches only that count, which nothing writes but
+///   atomically, and takes a reference only from a nonzero one: a
+///   target's, set after the rest of the target (Release), so a reader
+///   may get a newer target than the one it looked for, never a dead
+///   or half-made one.
 pub unsafe trait RcuRef: Sized {
     type Target;
 
@@ -44,10 +48,14 @@ pub unsafe trait RcuRef: Sized {
     unsafe fn from_raw(p: *const Self::Target) -> Self;
 
     /// A new reference to the target at `p`, unless its last one went
-    /// (Linux file_ref_get)
+    /// (Linux file_ref_get): to whatever target is there now, which the
+    /// caller checks is the one it meant (Linux __get_file_rcu's
+    /// reload)
     ///
     /// # Safety
-    /// `p` came from `into_raw` and is still allocated.
+    /// `p` came from `into_raw`, and its memory is still of the cache: a
+    /// target with a reference, or one the caller's RCU read section
+    /// began to reach while it was.
     unsafe fn get_rcu(p: *const Self::Target) -> Option<Self>;
 }
 
@@ -109,12 +117,14 @@ impl<R: RcuRef> Slots<R> {
             return Lookup::Empty;
         }
         // SAFETY: `p` named a target with a reference after this reader
-        // began (type invariant); its memory stays until a grace period
-        // after its last reference went (RcuRef), which `_g` keeps from
+        // began (type invariant); its memory stays type-stable until a
+        // grace period after it is freed (RcuRef), which `_g` keeps from
         // ending
         let Some(r) = (unsafe { R::get_rcu(p) }) else {
             return Lookup::Raced;
         };
+        // The memory may hold a newer target: the slot still holding it
+        // means that one is this slot's (Linux __get_file_rcu)
         if slot.load(Ordering::Acquire) != p {
             return Lookup::Raced;
         }

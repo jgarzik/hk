@@ -674,7 +674,8 @@ Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
     slab per-CPU array (IRQs off) → KmemCache.list_lock (IrqSpinlock)
     → per-CPU page list lock (IrqSpinlock, one at a time) → Zone.lock
-    (IrqSpinlock leaf);
+    (IrqSpinlock leaf); KmemCache.rcu (IrqSpinlock leaf, after
+    list_lock is dropped; its call_rcu after it is dropped);
     3.2 Heap Allocator, Frame Allocator
 
 Kernel mappings (3.2 Kernel Page Tables): vmalloc FLUSH (sleeping;
@@ -2510,6 +2511,20 @@ layout in `doc/MEMORY.md`
   given back to the page allocator after `list_lock` is dropped, and a
   new slab is allocated with no `list_lock` held. A CPU without per-CPU
   data yet uses `list_lock` directly.
+- A SLAB_TYPESAFE_BY_RCU cache (`KmemCache::typesafe_by_rcu`; the file
+  cache `FILP_CACHE`, Linux filp_cache) gives its empty slabs back only
+  a grace period after they emptied (Linux free_slab's call_rcu): they
+  go on `KmemCache.rcu` (`IrqSpinlock` leaf, taken after `list_lock` is
+  dropped, any context), whose one `RcuHead` is queued after the unlock
+  (`RcuSlabs.queued`: one queuer at a time); its callback (`rcuc/N`,
+  preemption off) frees the slabs it covers to the page allocator and
+  queues the head again for slabs emptied meanwhile (Linux queues an
+  rcu_head per slab, in struct slab; a struct page here has no room).
+  Objects are reused at once: an RCU reader that loaded an object's
+  address touches only its constructed, type-stable part (for a file,
+  its count), which the cache never writes (the free-list link is at
+  `freeptr`, outside it, Linux freeptr_offset), and checks after taking
+  a reference that it got the object it meant.
 - All IRQ-safe (an allocation in interrupt context cannot deadlock),
   but the policy is still **no allocation in IRQ context**; IRQ paths
   reserve capacity up front (e.g. `netif_napi_add`)
@@ -2706,24 +2721,26 @@ A table that grows copies its pointers into the bigger slots, which
 lock is released; the old slots keep their pointers as stale copies
 and are freed a grace period later (`RcuRetired::defer`, Linux
 free_fdtable_rcu). `Files::fget` takes a reference from a slot unless
-the file's count is zero or DEAD, then checks that the slot and the
-published slots are unchanged, else drops it (a put, never sleeping)
+the file's count is zero, then checks that the slot and the
+published slots are unchanged (Linux __get_file_rcu: the memory may
+hold a newer file by then), else drops it (a put, never sleeping)
 and looks again. `fdget_raw` (the path walk's dirfd, Linux
 path_init's fdget_raw) does that for a table other tasks use
 (`Files.users` > 1) and, for one only the caller uses, borrows the
 file with no reference: only its own task changes such a table, and
 the caller promises not to close the descriptor or share or change
 the table while it holds the result (its `# Safety`). What makes the
-RCU read safe is that the memory of a file taken out of a shared
-table outlives its last count by a grace period (`file_free`, below).
+RCU read safe is the file cache: SLAB_TYPESAFE_BY_RCU, so a file's
+memory stays a file object, its count readable, until a grace period
+after it is freed, while it may be reused at once (below).
 
 **File references and release** (`fs/file.rs`; Linux
 fs/file_table.c): a `FileRef` counts one reference in `File.f_count`
 (Linux f_ref, an atomic: taken and dropped lock-free from any
-context; `FileRef::try_get` takes one from a `Weak<File>` unless the
-count is zero, Linux file_ref_get; its only caller, epoll, calls it
-under `Eventpoll.mtx`, which the file's release needs before it lets
-go of its `Arc`, so a failed one never drops the last). The last reference's drop (`fput`)
+context; `FileRef::try_get` takes one from a file's address unless the
+count is zero, Linux file_ref_get, for a caller that keeps the memory a
+file object: epoll under `Eventpoll.mtx`, which the file's release
+needs before it frees the file, or an RCU reader). The last reference's drop (`fput`)
 never releases the file itself: it queues the release (`__fput`,
 which may sleep and takes the file's own locks, epoll's
 `Eventpoll.mtx`, socket locks...) on the current task's task_work
@@ -2736,15 +2753,14 @@ lock is released: `Workqueue.inner`), under `DELAYED_FPUT_RUN`
 (sleeping, outermost: 2). So a `FileRef` may be dropped under any
 lock, spin or sleeping, in any context. Only close(2) releases inline
 (`fput_close_sync`, Linux the same), with no lock held. The release
-drops the file's fields at once (dentry, mount: Linux __fput's dput
-and mntput); a file a table took out while other tasks used it
-(`Files::detached` sets `File::rcu_free`; a task stays counted in
-`Files.users` while it looks a descriptor up) keeps its memory a grace
-period longer (`file_free`: a `Weak` dropped by an RCU callback through
-`File.f_rcu`), so a reader of that table that loaded the file's
-address before its last count went finds the count DEAD, never freed
-memory. Linux's SLAB_TYPESAFE_BY_RCU file cache reuses the memory at
-once instead (BUGS.md). Exit runs the
+drops the file's fields (dentry, mount: Linux __fput's dput and
+mntput) and gives its memory back to the file cache at once
+(`file_free`, Linux kmem_cache_free(filp_cache)): every file is a
+`FileObj` of `FILP_CACHE` (`File::alloc`, the one way to a `FileRef`),
+whose count stays 0 there and is set last, Release, by the next file
+put in that memory (Linux init_file), so a reader that loaded the old
+address finds no count to take, or a newer file's, which its recheck
+of the slot tells apart. Exit runs the
 task's queued releases (`exit_task_work`) after it dropped its
 descriptors, fs context, namespaces and address space, before a parent
 can see it exited; boot runs pid 1's and the delayed list's after
@@ -5588,7 +5604,7 @@ else is taken under it) unless an order is given. "spin" is the
 | timerfd `CANCEL_LIST` | time/timerfd.rs | `RcuList` (its `ends` spin leaf), thread only | the timerfds that armed TFD_TIMER_CANCEL_ON_SET (Linux cancel_list), linked through `Timerfd.clist`: `clock_was_set` walks it under `rcu::read_lock` and takes each one's `inner` (IrqSpinlock) in turn, skipping one whose `might_cancel` is off; `setup_cancel` decides under `inner` (`might_cancel`, `listed`), drops it, and the first arming links the timerfd; it stays linked until its release, which clears `listed` under `inner` and unlinks it with no lock held; the list's reference goes with `RcuUnlinked::defer` (Linux kfree_rcu: `Timerfd.rcu`), dropped by `rcuc/N` after a grace period, its timer already cancelled (a HARD hrtimer's drop only spins on a running callback, and none runs). Never nested with `inner` |
 | `TimerBase.wheel` (per CPU, HARD and SOFT) | time/timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
 | `HrBase.q` (per CPU, HARD and SOFT) | time/hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context. `SOFT_ACTIVATED` (per-CPU atomic, Linux softirq_activated): set by the clock interrupt when it hands due SOFT timers to `ktimers/N`, cleared by it after its pass (interrupts off, then reprogram); while set the clock event counts only HARD timers |
-| `EPNESTED` (sleeping) → `Eventpoll.mtx` (sleeping) → `EpItem.regs` (spin) → file wait queue heads → `Eventpoll.lock` (IrqSpinlock); `File.f_ep` (spin leaf) | io/epoll.rs | see column 1 | epoll (Linux epnested_mutex, ep->mtx, ep->lock, file->f_lock): `EPNESTED` serializes an epoll target's loop check and insert. `Eventpoll.mtx` (Linux ep->mtx) holds the item map (Linux ep->rbr) and, as Linux, is held across each epoll_ctl operation (an add polls the target with it held, registering), each scan of the ready list (epoll_wait's `send_events`, Linux ep_send_events, with its items' polls and copies to user; the epoll file's own poll, Linux __ep_eventpoll_poll) and each item's removal (EPOLL_CTL_DEL, and a watched file's release: `eventpoll_release` takes each watching epoll's `mtx` in turn), so one scan at a time looks at the ready list. An epoll watched by another is polled with the outer one's `mtx` held and takes its own inside (Linux mutex_lock_nested by depth; hk lockdep does not check nesting within a class): the loop check under `EPNESTED` keeps the nesting acyclic and at most EP_MAX_NESTS deep. A file's last `FileRef` dropped under it only queues the release (`fput`), whose `eventpoll_release` takes it later. To poll an item's file, epoll takes a reference with `FileRef::try_get` (Linux epi_fget), always under `mtx`: an item a holder sees is still in the map, so its file's release has not passed this epoll's `eventpoll_release` and keeps its `Arc` until then: a failed `try_get` never drops the file's last one. `EpItem.regs` holds an item's callback entries: an add polls the file (a poll method may sleep) into a local list and swaps it into `regs` after; unregistering takes the watched file's queue locks under it, before the item leaves the map and ready list, so no callback can queue it again. `Eventpoll.lock` (Linux ep->lock) holds the ready list (`EpItem.rdlink`): `ep_poll_callback` runs under a woken queue's lock (possibly in an interrupt), queues the item under it, then wakes the epoll's own queues after releasing it (a nested epoll's callback in turn: bounded by EP_MAX_NESTS, no cycles). A scan takes the items queued when it starts off the front one at a time (Linux ep_start_scan) and polls each with the lock released; an event meanwhile queues one again at the end (Linux's ovflist), a level-triggered one reported goes back at the end, one whose copy-out failed back in front, and waiters are woken after if any is ready (ep_done_scan). Nothing sleeps, allocates, polls, copies to user or drops a last `Arc<EpItem>` under `Eventpoll.lock`. `File.f_ep` (Linux file->f_ep under file->f_lock) lists the items watching the file through `EpItem.fllink`, holding a reference each (no allocation): an add links the item, EPOLL_CTL_DEL and an epoll's drop unlink it if still linked (an item's link is only ever on its own file's list), the file's release takes them off one at a time under it; the loop check counts an epoll file's watchers under it, sizes its vector with it released and fills it under it (no add meanwhile: `EPNESTED`). |
+| `EPNESTED` (sleeping) → `Eventpoll.mtx` (sleeping) → `EpItem.regs` (spin) → file wait queue heads → `Eventpoll.lock` (IrqSpinlock); `File.f_ep` (spin leaf) | io/epoll.rs | see column 1 | epoll (Linux epnested_mutex, ep->mtx, ep->lock, file->f_lock): `EPNESTED` serializes an epoll target's loop check and insert. `Eventpoll.mtx` (Linux ep->mtx) holds the item map (Linux ep->rbr) and, as Linux, is held across each epoll_ctl operation (an add polls the target with it held, registering), each scan of the ready list (epoll_wait's `send_events`, Linux ep_send_events, with its items' polls and copies to user; the epoll file's own poll, Linux __ep_eventpoll_poll) and each item's removal (EPOLL_CTL_DEL, and a watched file's release: `eventpoll_release` takes each watching epoll's `mtx` in turn), so one scan at a time looks at the ready list. An epoll watched by another is polled with the outer one's `mtx` held and takes its own inside (Linux mutex_lock_nested by depth; hk lockdep does not check nesting within a class): the loop check under `EPNESTED` keeps the nesting acyclic and at most EP_MAX_NESTS deep. A file's last `FileRef` dropped under it only queues the release (`fput`), whose `eventpoll_release` takes it later. An item keeps its file's address only (Linux epi->ffd.file). To poll an item's file, epoll takes a reference with `FileRef::try_get` (`EpItem::fget`, Linux epi_fget), always under `mtx`: an item a holder sees is still in the map, so its file's release has not passed this epoll's `eventpoll_release` and the file is not freed. An epoll's drop (no `mtx` is needed: nothing else reaches it) takes each item off its file's `f_ep` under an RCU read guard (`f_ep_off`): a linked item's file has not finished its release, so its memory stays a file object for the guard (type-stable file cache), and a count taken there (or none: the release unlinks the item) lets it lock `f_ep`. `Eventpoll.file` (Linux ep->file) is set before the epoll is reachable and cleared by the epoll file's release under `EPNESTED`, which the loop check holds while it reads it. `EpItem.regs` holds an item's callback entries: an add polls the file (a poll method may sleep) into a local list and swaps it into `regs` after; unregistering takes the watched file's queue locks under it, before the item leaves the map and ready list, so no callback can queue it again. `Eventpoll.lock` (Linux ep->lock) holds the ready list (`EpItem.rdlink`): `ep_poll_callback` runs under a woken queue's lock (possibly in an interrupt), queues the item under it, then wakes the epoll's own queues after releasing it (a nested epoll's callback in turn: bounded by EP_MAX_NESTS, no cycles). A scan takes the items queued when it starts off the front one at a time (Linux ep_start_scan) and polls each with the lock released; an event meanwhile queues one again at the end (Linux's ovflist), a level-triggered one reported goes back at the end, one whose copy-out failed back in front, and waiters are woken after if any is ready (ep_done_scan). Nothing sleeps, allocates, polls, copies to user or drops a last `Arc<EpItem>` under `Eventpoll.lock`. `File.f_ep` (Linux file->f_ep under file->f_lock) lists the items watching the file through `EpItem.fllink`, holding a reference each (no allocation): an add links the item, EPOLL_CTL_DEL and an epoll's drop unlink it if still linked (an item's link is only ever on its own file's list), the file's release takes them off one at a time under it; the loop check counts an epoll file's watchers under it, sizes its vector with it released and fills it under it (no add meanwhile: `EPNESTED`). |
 | `Inotify.fasync` | io/inotify.rs | `FasyncList` (RCU, see `Fasync.fa`) | the group's O_ASYNC files (Linux fsnotify group fsn_fa); queueing an event sends their SIGIO after `Inotify.inner` is dropped |
 | `Inotify.mark_mutex`; `Inode.fsnotify` (`Marks.list`), `SuperBlock.s_fsnotify` (`SbMarks`) | io/inotify.rs | sleeping `sync::Mutex`; spin leaves | `mark_mutex` (Linux group->mark_mutex) serializes a group's adds and is taken before every other inotify lock. `Marks.list` holds the watches on an inode (Linux i_fsnotify_marks: group and wd), `SbMarks` the inodes of a superblock that have had watches (Linux s_fsnotify_info; each listed once: `Marks.on_sb` is set under `SbMarks`'s lock by the adder that pushed the inode, after the push, and read lock-free (Acquire) to skip the lock, so a watch is placed only on a listed inode; dead ones dropped before the list grows). Both grow with the lock released (`push_if`, `kmem::grow_locked`: nothing allocates under them). An add holds the watched path (mount and dentry) throughout, so neither the superblock's shutdown nor the dentry's release of the inode can run meanwhile: it lists the inode on its superblock, puts the mark on the inode, then under `Inotify.inner` (order `Inotify.inner` -> `Marks.list`, the only nesting) inserts the watch only if the mark is still there; a failure undoes the charge before anything is published. rm_watch and a group's drop remove the watch under `Inotify.inner`, then the mark. Removal of an inode's watches (Linux fsnotify_inoderemove: a dentry letting go of an inode with no name left, in `d_delete` after its locks or in a dentry's final drop, never under a d_lock (Linux dentry_unlink_inode); fsnotify_sb_delete: the superblock's shutdown under s_umount, the
 list taken whole under its lock) takes the marks out under `Marks.list`, releases it, then per group takes `Inotify.inner` and checks the wd still names that inode before queueing IN_DELETE_SELF/IN_UNMOUNT and IN_IGNORED; only the remover that finds the watch uncharges it. The group's watch table (wd -> watch, Linux's idr under idr_lock) stays under `Inotify.inner`, a sorted vector: an add makes room for one more under `mark_mutex` before taking `Inotify.inner` (`kmem::grow_locked`, Linux idr_preload; only adds insert, so the room stays), and removals free nothing under it. Nothing there sleeps: each event is allocated before `Inotify.inner` is taken (Linux allocates in inotify_handle_inode_event, then fsnotify_insert_event takes notification_lock; no memory: IN_Q_OVERFLOW takes its place, a queue position that allocates nothing, Linux's preallocated overflow_event), an unqueued or read event is freed after the lock, the wakeup is allowed under any lock and SIGIO is sent with `kill_fasync` once `Inotify.inner` is dropped (Linux fsnotify_insert_event). A watch never counts toward a mount being busy |

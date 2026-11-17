@@ -57,7 +57,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h; `remove` and `iter_locked` unsafe: membership, and every remover excluded) | owning intrusive containers, membership checked |
 | RCU hash chain `RcuHList` / `HNode` / `RcuHRef` (`util/rcuhlist.rs`, Linux hlist_*_rcu), writers proven by a `UniqueOwner` | owning intrusive chain, membership checked, release after a grace period |
 | non-owning RCU hash chain `RcuHListBare` (`util/rcuhlist.rs`, Linux pid->tasks[type] bare hlist nodes), writers proven by a `UniqueOwner`; `add_head` unsafe: the entry stays allocated while linked and a grace period after (a task: unlinked at release, freed a grace period after leaving the task list, as `RcuPtr`'s targets) | intrusive chain owning nothing, readers safe under RCU |
-| RCU slot array `Slots` / `SlotsOwner` over an `RcuRef` (`util/rcuslots.rs`, Linux fdtable->fd and file_ref_get), file reference `FileRef` (`fs/file.rs`, Linux f_ref) | owning array, one writer handle, reference taken unless the last went; grown arrays keep stale copies and own nothing |
+| RCU slot array `Slots` / `SlotsOwner` over an `RcuRef` (`util/rcuslots.rs`, Linux fdtable->fd and file_ref_get), file reference `FileRef` (`fs/file.rs`, Linux f_ref) | owning array, one writer handle, reference taken unless the last went, on type-stable memory (SLAB_TYPESAFE_BY_RCU) and rechecked; grown arrays keep stale copies and own nothing |
 | data under a unique lock and one instance of a lock of many, `LockedByBoth` with `InstanceLock` / `InstanceGuard` (`sync/locked_by.rs`, Linux signal->thread_head under tasklist_lock and siglock; RfL `LockedBy` owner check) | cell checked against its owner instance at run time |
 | data under one instance of a lock of many, `InstanceCell` / `InstanceRef` / `InstanceRefMut` (`sync/locked_by.rs`, Linux task->blocked/pending under the siglock of the task's table; RfL `LockedBy` owner check) | cell checked against its owner instance, borrows counted (`RefCell` rule) at run time |
 
@@ -209,18 +209,23 @@ form, a counted `i_count` with an explicit `iput` (as `DentryRef` does
 with `d_count`), removes that transient `&mut` too (BUGS.md).
 
 A file (`fs/file.rs`, Linux's SLAB_TYPESAFE_BY_RCU `struct file`) is
-reached by descriptor-table readers through its address alone
-(`util/rcuslots.rs`), who only try for a count on `f_count`
-(`RcuRef::get_rcu`): its release drops the fields at once and, for a
-file a shared table took out (the only tables read so), the memory a
-grace period later (`file_free` queues a `Weak` on `f_rcu`,
-an `RcuHead` with no drop glue, so whole after the fields' drop). The
-`&mut File` that the last `Arc`'s drop makes (`Arc::drop_slow`, then
-`File`'s own drop, which reads `f_count` and writes nothing on a
-released file) may overlap such a reader's failed compare-exchange on
-`f_count`, an atomic, and, when an epoll `try_get` holds the last
-`Arc` instead, the RCU list's link write on `f_rcu`, also interior
-mutable: neither unique borrow writes those bytes.
+reached by descriptor-table readers (`util/rcuslots.rs`) and epoll
+through its address alone, who only try for a count. Every file lives
+in a `FileObj` of `FILP_CACHE` (`mm/slab.rs`, a type-stable cache): the
+file, then `f_count`, an atomic the cache's constructor makes when the
+slab is made, which nothing writes afterwards but atomically (the
+cache's free-list link is in the file part, `FileObj::FREEPTR`) and
+which stays a count until the slab goes back to the page allocator, a
+grace period after it emptied. A count is taken only from a nonzero
+one (`inc_not_zero`), which `File::alloc` sets last, Release, after
+writing the file; the release (`release`: `drop_in_place` of the file,
+then `file_free` to the cache) borrows the file part alone, and leaves
+the count 0. So a reader's compare-exchange never races a non-atomic
+write, a count it wins names a whole live file, maybe a newer one in the
+same memory, which `Slots::get` rejects by reloading the slot (Linux
+__get_file_rcu), and a reader that loaded the address under an RCU guard
+(or under a lock that keeps the file from being freed: epoll's `mtx`)
+cannot reach memory given back to the page allocator.
 
 ## Review checklist (for each new `unsafe`)
 

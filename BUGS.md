@@ -702,10 +702,7 @@ waiting).
 The heap is the slab allocator over the page allocator, so it grows
 with RAM; what is missing: no shrinker (caches give back empty slabs
 beyond two each, but nothing asks them under pressure), no slab
-merging, poisoning or red zones. No cache is SLAB_TYPESAFE_BY_RCU: a
-file taken out of a shared descriptor table keeps its memory a grace
-period past its release (`fs/file.rs` `file_free`), where Linux's file
-cache reuses it at once.
+merging, poisoning or red zones.
 
 Objects are built fallibly (`util/kalloc.rs` try_box/try_arc, ENOMEM) and
 buffers sized from outside through `kmem`; the `*_nofail` calls (boot
