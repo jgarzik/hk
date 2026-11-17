@@ -51,7 +51,6 @@ use spin::Once;
 use super::inode::Inode;
 use super::superblock::SuperBlock;
 use crate::sync::spin::Mutex;
-use crate::sync::waitqueue::WaitQueue;
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::error::KernelError;
 use crate::util::list::WeakList;
@@ -95,19 +94,13 @@ fn bucket(sb: *const SuperBlock, hashval: u64) -> &'static Bucket {
     &t[(h >> 32) as usize & (t.len() - 1)]
 }
 
-/// Evictions of hashed inodes so far, and their waiters (Linux wakes
-/// __I_NEW's bit queue at the end of evict): a lookup that found the
-/// object's inode dying samples this under `INODE_HASH_LOCK` and sleeps
-/// until it moves, never touching the dying inode again
-static FREED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static FREED_WQ: WaitQueue = WaitQueue::new();
-
 /// What a search found
 enum Found {
     Live(Arc<Inode>),
     /// Its inode, its last reference gone, is still hashed (Linux
-    /// I_WILL_FREE / I_FREEING): `FREED` as it was then
-    Dying(u64),
+    /// I_WILL_FREE / I_FREEING): its address, the key of its wait queue
+    /// (never dereferenced once the lock is dropped)
+    Dying(usize),
     None,
 }
 
@@ -123,7 +116,7 @@ fn find(
     hashval: u64,
     test: &dyn Fn(&Inode) -> bool,
 ) -> Found {
-    let mut dying = false;
+    let mut dying = None;
     for e in b.access(l).iter() {
         let i = e.get();
         if core::ptr::eq(i.sb.as_ptr(), sb)
@@ -132,22 +125,30 @@ fn find(
         {
             match e.upgrade() {
                 Some(a) => return Found::Live(a),
-                None => dying = true,
+                None => dying = Some(core::ptr::from_ref(i) as usize),
             }
         }
     }
-    if dying {
-        Found::Dying(FREED.load(Ordering::Acquire))
-    } else {
-        Found::None
+    match dying {
+        Some(a) => Found::Dying(a),
+        None => Found::None,
     }
 }
 
-/// Sleep until an eviction after `seen` finished (Linux
-/// __wait_on_freeing_inode), the dying inode gone from the hash
-fn wait_freed(seen: u64) {
+/// Sleep until the dying inode at `addr` is unhashed (Linux
+/// __wait_on_freeing_inode): queued on its address's hashed queue under
+/// `INODE_HASH_LOCK` (`l`, dropped here), so the eviction's wakeup after
+/// its unhash under that lock is never missed; one sleep, then the
+/// caller searches again (a shared queue's other wakeups included)
+fn wait_freed(l: crate::sync::spin::MutexGuard<'_, InodeHash>, addr: usize) {
+    use crate::sync::waitqueue::{WaitEntry, var_waitqueue};
     crate::sync::might_sleep();
-    FREED_WQ.wait_event(|| FREED.load(Ordering::Acquire) != seen);
+    let q = var_waitqueue(addr);
+    let w = core::pin::pin!(WaitEntry::new());
+    q.prepare_to_wait(w.as_ref(), crate::task::percpu::SleepState::Uninterruptible);
+    drop(l);
+    crate::task::percpu::schedule();
+    q.finish_wait(w.as_ref());
 }
 
 /// The cached inode of (sb, hashval) for which `test` holds (Linux
@@ -160,11 +161,11 @@ pub fn ilookup5(
 ) -> Option<Arc<Inode>> {
     let b = bucket(Arc::as_ptr(sb), hashval);
     loop {
-        let found = find(&INODE_HASH_LOCK.lock(), b, Arc::as_ptr(sb), hashval, test);
-        match found {
+        let l = INODE_HASH_LOCK.lock();
+        match find(&l, b, Arc::as_ptr(sb), hashval, test) {
             Found::Live(i) => return Some(i),
             Found::None => return None,
-            Found::Dying(seen) => wait_freed(seen),
+            Found::Dying(addr) => wait_freed(l, addr),
         }
     }
 }
@@ -193,10 +194,7 @@ pub fn iget5(
                 // `new` is dropped unhashed, after the unlock
                 return Ok(i);
             }
-            Found::Dying(seen) => {
-                drop(l);
-                wait_freed(seen);
-            }
+            Found::Dying(addr) => wait_freed(l, addr),
             Found::None => {
                 hash_locked(&mut l, b, &new, hashval);
                 drop(l);
@@ -284,7 +282,8 @@ pub fn rehash(inode: &Arc<Inode>, hashval: u64) {
 pub fn evict(inode: &Inode) {
     inode.i_op.evict_inode(inode);
     if unhash(inode) {
-        FREED.fetch_add(1, Ordering::AcqRel);
-        FREED_WQ.wake_all();
+        // Its waiters queued under the hash lock this unhash took (Linux
+        // evict: wake_up_bit(__I_NEW) on the inode's hashed queue)
+        crate::sync::waitqueue::var_waitqueue(core::ptr::from_ref(inode) as usize).wake_all();
     }
 }

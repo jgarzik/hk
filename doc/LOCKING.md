@@ -2566,9 +2566,11 @@ then upgrades the match, so no reference is dropped under the lock (a
 last reference's eviction takes it); an entry in its teardown (Linux
 I_WILL_FREE / I_FREEING: its last `Arc` gone, its `Drop` writing it
 back or evicting it while still hashed) fails the upgrade, and the
-lookup sleeps with no lock held until an eviction finishes (`FREED`,
-a sequence sampled under the lock, and `FREED_WQ`, Linux
-__wait_on_freeing_inode), then searches again: a lookup may sleep, so
+lookup queues on the dying inode's address's hashed wait queue
+(`var_waitqueue`, Linux bit_waitqueue) under the lock, drops it and
+sleeps once (Linux __wait_on_freeing_inode; `INODE_HASH_LOCK` -> that
+queue's lock), woken by the eviction after its unhash under the lock
+(Linux wake_up_bit(__I_NEW)), then searches again: a lookup may sleep, so
 its callers hold no spin lock (vfat's hold its directory's `i_rwsem`,
 which no writeback or eviction takes). Eviction (`Drop for Inode` ->
 `icache::evict`, Linux iput_final -> evict) runs where the last `Arc`

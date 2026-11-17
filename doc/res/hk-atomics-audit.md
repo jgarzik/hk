@@ -54,18 +54,6 @@ argued / published copy of locked state.
 - Fix: set-once (`Once` or the constructor) where boot order allows.
 
 
-### 8. Inode eviction bumps a global counter and global wait queue — (c)
-- Where: `fs/icache.rs` `FREED`, `FREED_WQ`, `evict` (`fetch_add(AcqRel)` +
-  `wake_all` on every hashed inode's eviction), `find`/`wait_freed`.
-- Wrong: every eviction on every CPU takes the single `FREED_WQ` IrqSpinlock
-  and RMWs one line, even with no waiter; waiters wake on any eviction.
-- Linux: `inode_wake_up_bit` on a hashed bit wait queue (`bit_waitqueue`,
-  many buckets) after `smp_mb`, skipped when `waitqueue_active` is false;
-  waiters key on the inode.
-- Fix: hashed wait-queue table keyed by inode address, waiter keyed wake,
-  `waitqueue_active` fast path; drop the global counter (re-check the hash
-  instead). LOCKING.md VFS section.
-
 ### 12. Timer wheel fields as atomics; `running` read outside the base lock — (a)(e)
 - Where: `time/timer.rs` `TimerList.expires`, `not_before`, `slot` (all
   "under the base lock"), `TimerBase.running`/`runner`,
