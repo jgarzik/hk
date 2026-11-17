@@ -2640,12 +2640,26 @@ fn create_inode_for_entry(
     parent_cluster: u32,
 ) -> Result<InodeRef, KernelError> {
     let sb_data = get_sb_data(sb)?;
-    // A directory points at a cluster of its own (Linux
-    // fat_validate_dir); a file's first cluster is checked when its
-    // chain is walked (`cache`, Linux fat_get_cluster)
-    if entry.is_dir() && (entry.start_cluster == 0 || entry.start_cluster == sb_data.root_cluster) {
-        return Err(KernelError::Io);
-    }
+    // A directory's link count is fat_subdirs (Linux fat_fill_inode),
+    // then fat_validate_dir: its "." and ".." at least, and a cluster of
+    // its own; both checked before any inode exists, so a refused one
+    // is never evicted with no link (its clusters are not its to free).
+    // A file's first cluster is checked when its chain is walked
+    // (`cache`, Linux fat_get_cluster).
+    let nlink = if entry.is_dir() {
+        let n = fat_subdirs(&sb_data, entry.start_cluster)?;
+        if n < 2 {
+            crate::printkln!("FAT-fs: corrupted directory (invalid entries)");
+            return Err(KernelError::Io);
+        }
+        if entry.start_cluster == 0 || entry.start_cluster == sb_data.root_cluster {
+            crate::printkln!("FAT-fs: corrupted directory (invalid i_start)");
+            return Err(KernelError::Io);
+        }
+        n
+    } else {
+        1
+    };
     let o = sb_data.opts;
     let mode = if entry.is_dir() {
         o.dir_mode()
@@ -2666,11 +2680,9 @@ fn create_inode_for_entry(
     ))?;
     inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
     inode.inc_iversion();
-    // Linux fat_fill_inode: a directory's link count is fat_subdirs
-    if entry.is_dir() {
-        let n = fat_subdirs(&sb_data, entry.start_cluster)?;
-        inode.nlink.store(n, core::sync::atomic::Ordering::Relaxed);
-    }
+    inode
+        .nlink
+        .store(nlink, core::sync::atomic::Ordering::Relaxed);
 
     inode.set_private(new_private(VfatInodeData {
         start_cluster: entry.start_cluster,

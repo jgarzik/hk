@@ -8,13 +8,19 @@
 //!   (Linux fat_subdirs, counting "." and ".."; the root's + 2), kept by
 //!   mkdir, rmdir and a rename across directories, and the same when
 //!   read again after a remount.
+//! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
+//!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
+//!   and on hk its cluster stays allocated. Linux frees it: the refused
+//!   inode is iput with i_nlink 0 and fat_evict_inode truncates it, so
+//!   a crafted image loses a live directory's data there; hk checks
+//!   before any inode exists.
 
 use crate::harness::T;
-use crate::helpers::find_blkdev;
+use crate::helpers::{find_blkdev, host_mode};
 use crate::proc::sysfs::each_entry;
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount, sys_open, sys_pread64,
-    sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink,
+    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount, sys_open,
+    sys_pread64, sys_pwrite64, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink,
 };
 
 const MNT: &[u8] = b"/tmp/vdk\0";
@@ -148,6 +154,7 @@ pub fn run_tests() {
     }
     dotdot(&mut t, dev);
     nlink(dev);
+    bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
     t.done();
@@ -237,5 +244,79 @@ fn nlink(dev: &[u8]) {
     sys_rmdir(a.as_ptr());
     sys_rmdir(n.as_ptr());
     sys_rmdir(moved.as_ptr());
+    t.done();
+}
+
+/// Write `buf` at `off` of the device `dev`
+fn poke(dev: &[u8], off: u64, buf: &[u8]) -> bool {
+    let fd = sys_open(dev.as_ptr(), O_RDWR, 0);
+    if fd < 0 {
+        return false;
+    }
+    let n = sys_pwrite64(fd as i32, buf.as_ptr(), buf.len() as u64, off as i64);
+    sys_close(fd as u64);
+    n == buf.len() as i64
+}
+
+/// The FAT entry of cluster `c`, or u32::MAX
+fn fat_of(f: &Fat, c: u32) -> u32 {
+    let mut b = [0u8; 4];
+    if !f.read(f.fat * f.bps + u64::from(c) * 4, &mut b) {
+        return u32::MAX;
+    }
+    u32::from_le_bytes(b) & 0x0fff_ffff
+}
+
+/// VFAT_BAD_DIR: BAD's "." and ".." marked deleted on disk
+fn bad_dir(dev: &[u8]) {
+    const EIO: i64 = -5;
+    let mut t = T::new(b"VFAT_BAD_DIR");
+    let bad = b"/tmp/vdk/BAD\0";
+    t.eq(b"mkdir", sys_mkdir(bad.as_ptr(), 0o755), 0);
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    let mut saved = [0u8; 64];
+    let mut at = None;
+    if let Some(f) = Fat::open(dev)
+        && let Some(e) = f.find(f.root, b"BAD        ")
+    {
+        let c = start(&e);
+        let off = f.cl_off(c);
+        if f.read(off, &mut saved) {
+            at = Some((c, off, fat_of(&f, c)));
+        }
+    }
+    let Some((c, off, before)) = at else {
+        t.ok(b"BAD on disk", false, 0);
+        mount(dev);
+        sys_rmdir(bad.as_ptr());
+        t.done();
+        return;
+    };
+    let mut gone = saved;
+    gone[0] = 0xe5;
+    gone[32] = 0xe5;
+    t.ok(b"poke", poke(dev, off, &gone), 0);
+    t.eq(b"remount", mount(dev), 0);
+    t.eq(
+        b"stat BAD",
+        sys_stat(bad.as_ptr(), &mut Stat::default()),
+        EIO,
+    );
+    t.eq(b"umount again", sys_umount2(MNT.as_ptr(), 0), 0);
+    let fat = Fat::open(dev);
+    let after = fat.as_ref().map_or(u32::MAX, |f| fat_of(f, c));
+    let kept = before != 0 && after == before;
+    if !host_mode() {
+        t.ok(b"cluster kept", kept, i64::from(after));
+    } else if !kept && let Some(f) = &fat {
+        // A Linux bug: fat_build_inode iputs the refused inode (i_nlink 0)
+        // and fat_evict_inode frees a live directory's cluster; put back
+        // in the first FAT for the cleanup
+        poke(dev, f.fat * f.bps + u64::from(c) * 4, &before.to_le_bytes());
+    }
+    drop(fat);
+    t.ok(b"restore", poke(dev, off, &saved), 0);
+    t.eq(b"mount restored", mount(dev), 0);
+    t.eq(b"rmdir", sys_rmdir(bad.as_ptr()), 0);
     t.done();
 }

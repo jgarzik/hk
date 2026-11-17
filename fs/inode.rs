@@ -1610,9 +1610,16 @@ impl Inode {
         self.nlink.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement link count, returns new value
+    /// Decrement link count (Linux drop_nlink), returns new value; one
+    /// already 0 is a bug (Linux WARN_ON) and stays 0
     pub fn dec_nlink(&self) -> u32 {
-        self.nlink.fetch_sub(1, Ordering::Relaxed) - 1
+        match (self.nlink).try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)) {
+            Ok(n) => n - 1,
+            Err(_) => {
+                crate::printkln!("WARNING: drop_nlink: inode {} has no link", self.ino);
+                0
+            }
+        }
     }
 
     // ========================================================================
