@@ -20,21 +20,36 @@
 //! close_range, exec's close-on-exec and the last reference's close
 //! take one descriptor per lock hold. A task's last reference to its
 //! table is dropped after its alloc_lock is released, never under it.
+//!
+//! Lookups take no lock (Linux fdget, __fget_files_rcu): the slots are
+//! published for RCU readers (`util::rcuslots`), written under the lock,
+//! a grown table's old slots freed a grace period after the new ones
+//! are published (Linux expand_fdtable's rcu_assign_pointer and
+//! free_fdtable_rcu); a reader takes a reference unless the file is
+//! going and checks the slot and the table again. A table no other
+//! task uses is read with no reference at all ([`fdget_raw`], Linux
+//! __fget_light): only its own task changes it.
 
+use crate::sync::rcu::{self, RcuArc};
 use crate::sync::spin::{Mutex, MutexGuard};
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::rcuslots::{Lookup, Slots};
 use alloc::sync::Arc;
+use core::ptr::NonNull;
 
 use super::fdbits::{Fdt, NR_OPEN_DEFAULT, Slot};
 use super::percpu::current;
 use super::{Fd, FdTable, Task};
-use crate::fs::FileRef;
+use crate::fs::{File, FileRef};
 use crate::util::error::{KernelError, KernelResult};
 
 /// A descriptor table (Linux files_struct)
 pub struct Files {
     table: Mutex<FdTable<FileRef>>,
+    /// The table's slots, for lookups under RCU (Linux files->fdt),
+    /// replaced under `table`'s lock when it grows
+    slots: RcuArc<Slots<FileRef>>,
     /// Its identity as a POSIX lock owner (Linux fl_owner): unique, never
     /// reused, kept across an exec that did not have to copy the table
     id: u64,
@@ -62,6 +77,7 @@ fn filp_close(f: FileRef, owner: u64) {
 impl Files {
     fn new(t: FdTable<FileRef>) -> Self {
         Self {
+            slots: RcuArc::new(t.slots()),
             table: Mutex::new(t),
             id: NEXT_FILES_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             users: core::sync::atomic::AtomicUsize::new(0),
@@ -134,10 +150,44 @@ impl Files {
         let new = Fdt::alloc(nr + 1);
         let mut t = self.lock();
         t.resize_in_progress = false;
-        let old = t.expand(new?);
+        let spare = t.expand(new?);
+        // Published before the lock is released: a later change is made
+        // in the new slots, which a reader still on the old ones sees
+        // through its recheck of the table (Linux rcu_assign_pointer)
+        let retired = spare.is_some().then(|| self.slots.replace(t.slots()));
         drop(t);
-        drop(old);
+        if let Some(r) = retired {
+            r.defer();
+        }
+        drop(spare);
         Ok(())
+    }
+
+    /// A reference to the file at `fd`, looked up with no lock (Linux
+    /// __fget_files_rcu): taken unless the file is going, kept if the
+    /// slot and the table are still the same, else looked up again
+    pub fn fget(&self, fd: Fd) -> Option<FileRef> {
+        let i = usize::try_from(fd).ok()?;
+        let g = rcu::read_lock();
+        loop {
+            let s = self.slots.read(&g);
+            match s.get(i, &g) {
+                Lookup::Empty => return None,
+                Lookup::Raced => continue,
+                Lookup::Got(f) if core::ptr::eq(self.slots.as_ptr(), s) => return Some(f),
+                // Grown meanwhile: the reference goes (a put, never
+                // sleeping), the new slots are looked at
+                Lookup::Got(f) => drop(f),
+            }
+        }
+    }
+
+    /// The file at `fd` with no reference, for a table only the caller
+    /// uses (Linux files_lookup_fd_raw)
+    fn lookup_raw(&self, fd: Fd) -> Option<NonNull<File>> {
+        let i = usize::try_from(fd).ok()?;
+        let g = rcu::read_lock();
+        NonNull::new(self.slots.read(&g).as_ptr(i).cast_mut())
     }
 
     /// Reserve the lowest free descriptor at or above `start` and below
@@ -157,10 +207,22 @@ impl Files {
         }
     }
 
+    /// A file taken out of the table: if other tasks use it, their RCU
+    /// lookups may hold its address, so its memory outlives its release
+    /// by a grace period (`File::rcu_free`); a task counted here is
+    /// still a user while it looks one up
+    fn detached(&self, f: FileRef) -> FileRef {
+        if self.shared() {
+            f.rcu_free();
+        }
+        f
+    }
+
     /// Detach descriptor `fd` for the caller to close after the unlock
     /// (Linux file_close_fd); None (EBADF) if no file is installed there
     pub fn close_fd(&self, fd: Fd) -> Option<FileRef> {
-        self.lock().close_fd(fd)
+        let f = self.lock().close_fd(fd);
+        f.map(|f| self.detached(f))
     }
 
     /// Make `newfd` a copy of `oldfd` with FD_CLOEXEC from `flags`
@@ -178,7 +240,7 @@ impl Files {
         let tofree = t.dup2(newfd, file, flags)?;
         drop(t);
         if let Some(f) = tofree {
-            filp_close(f, self.id);
+            filp_close(self.detached(f), self.id);
         }
         Ok(())
     }
@@ -192,7 +254,7 @@ impl Files {
             let Some((n, f)) = next else {
                 return;
             };
-            filp_close(f, self.id);
+            filp_close(self.detached(f), self.id);
             fd = n + 1;
         }
     }
@@ -212,7 +274,7 @@ impl Files {
                 return;
             };
             if let Some(f) = f {
-                filp_close(f, self.id);
+                filp_close(self.detached(f), self.id);
             }
             fd = n + 1;
         }
@@ -252,6 +314,50 @@ impl Drop for Files {
             fd = n + 1;
         }
     }
+}
+
+/// What [`fdget_raw`] found (Linux struct fd): a reference, or, from a
+/// table no other task uses, the file borrowed with none (Linux
+/// FDPUT_FPUT clear)
+pub enum FdRef {
+    Ref(FileRef),
+    /// Stays in the task that looked it up (`fdget_raw`'s contract)
+    Borrowed(NonNull<File>, core::marker::PhantomData<*const ()>),
+}
+
+impl core::ops::Deref for FdRef {
+    type Target = File;
+    fn deref(&self) -> &File {
+        match self {
+            Self::Ref(f) => f,
+            // SAFETY: installed in the looking-up task's unshared table,
+            // which keeps its reference while the result lives
+            // (`fdget_raw`'s contract)
+            Self::Borrowed(p, _) => unsafe { p.as_ref() },
+        }
+    }
+}
+
+/// The calling task's file at `fd` (Linux fdget_raw, __fget_light):
+/// from a table no other task uses, borrowed with no reference, as
+/// nobody else can close it; from a shared one, a reference looked up
+/// under RCU ([`Files::fget`]). No lock either way.
+///
+/// # Safety
+/// While the result lives, the calling task keeps it, does not close or
+/// replace `fd` (close, dup2, close_range, exec's close-on-exec), and
+/// does not share or change its descriptor table (clone with
+/// CLONE_FILES, unshare, exec).
+pub unsafe fn fdget_raw(fd: Fd) -> Option<FdRef> {
+    let me = current();
+    // SAFETY: the calling task's own table, which only it replaces
+    let files = unsafe { Task::files(&me) }.as_ref()?;
+    if files.shared() {
+        return files.fget(fd).map(FdRef::Ref);
+    }
+    files
+        .lookup_raw(fd)
+        .map(|p| FdRef::Borrowed(p, core::marker::PhantomData))
 }
 
 /// A descriptor reserved in a table (Linux get_unused_fd_flags):

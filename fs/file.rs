@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
 use ::core::mem::ManuallyDrop;
-use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync;
 
@@ -596,6 +596,12 @@ pub struct File {
     /// Queues the release on a task or the delayed list (Linux
     /// f_task_work / f_llist): on one list at a time, once
     f_task_work: CallbackHead,
+    /// Frees the memory a grace period after the release (Linux
+    /// f_rcuhead): `file_free`
+    f_rcu: sync::rcu::RcuHead,
+    /// It left a descriptor table other tasks use, whose RCU readers may
+    /// still hold its address (`rcu_free`)
+    f_rcu_free: AtomicBool,
 }
 
 impl File {
@@ -662,6 +668,8 @@ impl File {
             f_sb_err: AtomicU32::new(0),
             f_count: AtomicUsize::new(0),
             f_task_work: CallbackHead::new(____fput),
+            f_rcu: sync::rcu::RcuHead::new(),
+            f_rcu_free: AtomicBool::new(false),
         }
         .sampled()
     }
@@ -1081,7 +1089,12 @@ impl File {
     /// f_ref of one): the one way to a [`FileRef`]; ENOMEM
     pub fn alloc(mut self) -> Result<FileRef, KernelError> {
         *self.f_count.get_mut() = 1;
-        crate::util::kalloc::try_arc(self).map(|f| FileRef(ManuallyDrop::new(f)))
+        let f = crate::util::kalloc::try_arc(self)?;
+        // INVARIANT: the one count; its `Arc` leaked for the references
+        // SAFETY: `into_raw` never returns null
+        Ok(FileRef(unsafe {
+            core::ptr::NonNull::new_unchecked(Arc::into_raw(f).cast_mut())
+        }))
     }
 }
 
@@ -1105,93 +1118,161 @@ const FILE_REF_DEAD: usize = usize::MAX;
 /// clone takes one (get_file); the last one's drop releases the file
 /// (`fput`). A holder that must not keep the file open (an epoll item)
 /// keeps a `Weak` (`FileRef::downgrade`) and takes a reference with
-/// `FileRef::try_get` (Linux epi_fget).
+/// `FileRef::try_get` (Linux epi_fget); a descriptor table's reader
+/// takes one from the file's address under RCU (`RcuRef::get_rcu`,
+/// Linux file_ref_get in __fget_files_rcu).
 ///
 /// # Invariants
-/// Holds one strong count of its `Arc` and one of the file's `f_count`.
-pub struct FileRef(ManuallyDrop<Arc<File>>);
+/// Holds one count of the file's `f_count`. The references together own
+/// one strong count of the file's `Arc` (leaked by `File::alloc`), taken
+/// back by the last one's put for the release: while `f_count` is
+/// neither 0 nor `FILE_REF_DEAD`, it is live.
+pub struct FileRef(core::ptr::NonNull<File>);
+
+// SAFETY: it stands for an `Arc<File>` (File is Send + Sync); the count
+// is atomic
+unsafe impl Send for FileRef {}
+// SAFETY: as above
+unsafe impl Sync for FileRef {}
 
 impl FileRef {
     /// A reference to the file `w` names, unless its last one is gone
     /// (Linux file_ref_get). A failure briefly holds an `Arc` that would
-    /// drop the file's memory (dentry, private data) if the release had
+    /// drop the file's fields (dentry, private data) if the release had
     /// finished and dropped its own meanwhile (Linux frees a file
     /// through RCU instead): the caller keeps the release from finishing
     /// (epoll calls it under `Eventpoll.mtx`, which the file's
     /// `eventpoll_release` takes for the item)
     pub fn try_get(w: &alloc::sync::Weak<File>) -> Option<FileRef> {
         let f = w.upgrade()?;
-        let mut n = f.f_count.load(Ordering::Relaxed);
+        // A success leaves the leaked `Arc` live, so `f` is not the last
+        f.get_ref()
+    }
+
+    /// One more count on `f`, unless it is 0 (the last reference went)
+    /// or `FILE_REF_DEAD` (Linux file_ref_get)
+    fn inc_not_zero(f: &AtomicUsize) -> bool {
+        let mut n = f.load(Ordering::Relaxed);
         loop {
-            // Released or being released: dropping this `Arc` never
-            // releases it (the releaser holds one until it is DEAD)
             if n == 0 || n == FILE_REF_DEAD {
-                return None;
+                return false;
             }
-            match f
-                .f_count
-                .compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => return Some(FileRef(ManuallyDrop::new(f))),
+            match f.compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return true,
                 Err(v) => n = v,
             }
         }
     }
 
+    /// The file's leaked `Arc`, borrowed (no count taken)
+    fn arc(&self) -> ManuallyDrop<Arc<File>> {
+        // SAFETY: this reference keeps the leaked strong count live
+        // (type invariant); `ManuallyDrop` never drops it
+        ManuallyDrop::new(unsafe { Arc::from_raw(self.0.as_ptr()) })
+    }
+
     /// A non-owning handle to the file (no reference)
     pub fn downgrade(this: &Self) -> alloc::sync::Weak<File> {
-        Arc::downgrade(&this.0)
+        Arc::downgrade(&this.arc())
     }
 
     /// The file's address (its identity)
     pub fn as_ptr(this: &Self) -> *const File {
-        Arc::as_ptr(&this.0)
+        this.0.as_ptr()
     }
 
     /// Both are the same open file
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        Arc::ptr_eq(&a.0, &b.0)
+        a.0 == b.0
     }
 
-    /// Drop the reference (Linux file_ref_put): its `Arc` back for the
-    /// release if it was the last
+    /// Drop the reference (Linux file_ref_put): the leaked `Arc` back
+    /// for the release if it was the last
     fn put(self) -> Option<Arc<File>> {
-        let mut me = ManuallyDrop::new(self);
-        // SAFETY: taken once; `me` is never dropped
-        let f = unsafe { ManuallyDrop::take(&mut me.0) };
-        if f.f_count.fetch_sub(1, Ordering::Release) != 1 {
-            // Another reference holds an `Arc`: this is not the last
+        let me = ManuallyDrop::new(self);
+        if me.f_count.fetch_sub(1, Ordering::Release) != 1 {
             return None;
         }
         // Every other holder's use comes before the release
         fence(Ordering::Acquire);
-        Some(f)
+        // SAFETY: the last count: the leaked strong count is now this
+        // one's to take back, once (type invariant)
+        Some(unsafe { Arc::from_raw(me.0.as_ptr()) })
+    }
+}
+
+impl File {
+    /// Its memory outlives its release by a grace period (`file_free`):
+    /// it was taken out of a descriptor table that other tasks use, so
+    /// an RCU reader of theirs may have its address (`Files::fget`)
+    pub fn rcu_free(&self) {
+        self.f_rcu_free.store(true, Ordering::Relaxed);
+    }
+
+    /// A reference, unless the last one went (Linux file_ref_get)
+    fn get_ref(&self) -> Option<FileRef> {
+        // INVARIANT: a count taken from a nonzero one: the leaked `Arc`
+        // is live
+        FileRef::inc_not_zero(&self.f_count).then(|| FileRef(core::ptr::NonNull::from(self)))
+    }
+}
+
+// SAFETY: a `FileRef` leaks its count as the file's address and is
+// rebuilt from it once; a file's memory is freed a grace period after
+// its release (`file_free`: the deferred `Weak`), which follows the
+// last count's put; `get_rcu` touches only `f_count`, an atomic the
+// release and the drop never write through `&mut` (`File`'s drop reads
+// it)
+unsafe impl crate::util::rcuslots::RcuRef for FileRef {
+    type Target = File;
+
+    fn into_raw(self) -> *const File {
+        ManuallyDrop::new(self).0.as_ptr()
+    }
+
+    unsafe fn from_raw(p: *const File) -> Self {
+        // SAFETY: from `into_raw` (the caller), so not null; its count is
+        // taken back once
+        FileRef(unsafe { core::ptr::NonNull::new_unchecked(p.cast_mut()) })
+    }
+
+    unsafe fn get_rcu(p: *const File) -> Option<Self> {
+        // SAFETY: allocated (the caller); only the atomic count is
+        // borrowed, no other byte of a file that may be going
+        let c = unsafe { &(*p).f_count };
+        // INVARIANT: a count taken from a nonzero one: the leaked `Arc`
+        // is live
+        FileRef::inc_not_zero(c).then(|| {
+            // SAFETY: from `into_raw`, not null
+            FileRef(unsafe { core::ptr::NonNull::new_unchecked(p.cast_mut()) })
+        })
     }
 }
 
 impl Clone for FileRef {
     /// Another reference (Linux get_file)
     fn clone(&self) -> Self {
-        self.0.f_count.fetch_add(1, Ordering::Relaxed);
-        FileRef(self.0.clone())
+        self.f_count.fetch_add(1, Ordering::Relaxed);
+        // INVARIANT: one more count of a live file
+        FileRef(self.0)
     }
 }
 
 impl core::ops::Deref for FileRef {
     type Target = File;
     fn deref(&self) -> &File {
-        &self.0
+        // SAFETY: the leaked `Arc` is live while this reference holds its
+        // count (type invariant)
+        unsafe { self.0.as_ref() }
     }
 }
 
 impl Drop for FileRef {
     /// fput: the last reference queues the release
     fn drop(&mut self) {
-        // SAFETY: taken once, here; `put` owns it from now on
-        let f = FileRef(ManuallyDrop::new(unsafe {
-            ManuallyDrop::take(&mut self.0)
-        }));
-        if let Some(f) = f.put() {
+        // INVARIANT: the count moves to the copy, which `put` consumes;
+        // `self` is not used again
+        if let Some(f) = FileRef(self.0).put() {
             fput_deferred(f);
         }
     }
@@ -1276,6 +1357,44 @@ fn release(f: Arc<File>) {
     crate::sync::might_sleep();
     f.__fput();
     f.f_count.store(FILE_REF_DEAD, Ordering::Release);
+    file_free(f);
+}
+
+/// Drop the released file's `Arc`: its fields now, in the releaser's
+/// context (dentry, mount: Linux __fput's dput and mntput), and for a
+/// file taken out of a table other tasks use (`File::rcu_free`) its
+/// memory a grace period later: an RCU reader of that table that loaded
+/// its address before the last count went may still try for one
+/// (`RcuRef::get_rcu`), which finds it DEAD. Linux's file cache is
+/// SLAB_TYPESAFE_BY_RCU, its memory reused at once (BUGS.md); others
+/// are freed at once, as no reader can have them: only a table's own
+/// tasks read it under RCU, and only when it is shared
+fn file_free(f: Arc<File>) {
+    /// The deferred `Weak`, dropped: the memory goes
+    ///
+    /// # Safety
+    /// `p` is the `Weak::into_raw` queued with it.
+    unsafe fn free(p: *const ()) {
+        // SAFETY: the caller's contract, taken back once
+        drop(unsafe { alloc::sync::Weak::from_raw(p.cast::<File>()) });
+    }
+    if !f.f_rcu_free.load(Ordering::Relaxed) {
+        drop(f);
+        return;
+    }
+    let w = alloc::sync::Weak::into_raw(Arc::downgrade(&f));
+    drop(f);
+    if !sync::rcu::can_queue() {
+        // SAFETY: as `free`'s; no other CPU runs a reader yet (early
+        // boot, host tests)
+        unsafe { free(w.cast()) };
+        return;
+    }
+    // SAFETY: `w` keeps the allocation, and with it `f_rcu` (no drop
+    // glue, so whole after the fields' drop), queued once (a file is
+    // released once), until `free` drops it; `Weak<File>` is Send +
+    // Sync
+    unsafe { sync::rcu::call_rcu(&(*w).f_rcu, free, w.cast()) };
 }
 
 /// Queue the release of `f` (Linux __fput_deferred)

@@ -324,6 +324,12 @@ impl<T> RcuArc<T> {
         a
     }
 
+    /// The current version's address, to compare only (Linux
+    /// rcu_access_pointer)
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.load(Ordering::Acquire)
+    }
+
     /// Publish `new` (Linux rcu_assign_pointer); the old version is
     /// released after a grace period, when the result drops
     pub fn replace(&self, new: Arc<T>) -> RcuRetired<T> {

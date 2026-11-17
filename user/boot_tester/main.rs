@@ -242,6 +242,7 @@ pub fn run_all_tests() {
     fs::namei::run_tests();
     io::cloexec::run_tests();
     io::close_range::run_tests();
+    io::fdget::run_tests();
     fs::append::run_tests();
     mount::mountflags::run_tests();
     fs::fs_times::run_tests();

@@ -10,6 +10,7 @@ pub mod fault_inject;
 pub mod fcntl_owner;
 pub mod fd_leak;
 pub mod fd_scale;
+pub mod fdget;
 pub mod gencalls;
 pub mod last_close;
 pub mod nonblock;

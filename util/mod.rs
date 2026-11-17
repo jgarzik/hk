@@ -23,6 +23,7 @@ pub mod pod;
 pub mod rbtree;
 pub mod rcuhlist;
 pub mod rculist;
+pub mod rcuslots;
 pub mod scope;
 pub mod seg;
 pub mod siphash;

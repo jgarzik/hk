@@ -24,6 +24,7 @@ use core::cell::{Cell, OnceCell};
 
 use self::rcu::{Lazy, To};
 
+use crate::fs::File;
 use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, permission_as};
 use crate::fs::dentry::{Dentry, DentryRef, d_invalidate};
@@ -35,9 +36,9 @@ use crate::fs::mount::{
 };
 use crate::fs::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
-use crate::fs::{File, FileRef};
 use crate::ns::current_mnt_ns;
 use crate::task::Cred;
+use crate::task::fdtable::FdRef;
 use crate::task::percpu::Cur;
 use crate::uaccess::UserPtr;
 
@@ -187,13 +188,14 @@ impl<'a> Start<'a> {
 }
 
 /// What a user path's walk starts from, held for the lookup (Linux
-/// path_init's fdget: the dirfd's file, whose f_path the walk borrows
-/// with no path reference)
+/// path_init's fdget_raw: the dirfd's file, whose f_path the walk
+/// borrows with no path reference)
 pub enum Dfd {
     Root,
     Cwd,
-    /// A dirfd's file, which has a mount
-    File(FileRef),
+    /// A dirfd's file, which has a mount: with no reference from a
+    /// table no other task uses (`fdget_raw`)
+    File(FdRef),
     /// A path (an internal file's, or one the caller gave)
     Path(Path),
 }
@@ -1072,10 +1074,10 @@ pub fn path_start(dirfd: i32, path: &[u8], f: LookupFlags) -> Result<Dfd, Kernel
     if dirfd == AT_FDCWD {
         return Ok(Dfd::Cwd);
     }
-    let file = crate::fs::syscall::current_fd_table()
-        .lock()
-        .get(dirfd)
-        .ok_or(KernelError::BadFd)?;
+    // SAFETY: a walk closes no descriptor and neither shares nor
+    // changes the table; the `Dfd` is the calling syscall's, dropped
+    // when its lookup is done
+    let file = unsafe { crate::task::fdtable::fdget_raw(dirfd) }.ok_or(KernelError::BadFd)?;
     if f.linkat_empty && !may_linkat_empty(&file) {
         return Err(KernelError::NotFound);
     }

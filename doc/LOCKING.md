@@ -2695,6 +2695,27 @@ Files looked up with `get` are clones taken while the table holds its
 own reference, so dropping them under the lock is never the last
 reference.
 
+**Lookups under RCU** (Linux fdget, __fget_light, __fget_files_rcu):
+the slots (`util/rcuslots.rs` `Slots`, Linux fdtable->fd) are an
+array of file pointers that readers load under an RCU read guard with
+no lock. They are written only under the table's lock, through their
+one `SlotsOwner` (install, close, dup2: Linux rcu_assign_pointer).
+A table that grows copies its pointers into the bigger slots, which
+`Files.slots` (an `RcuArc`, Linux files->fdt) publishes before the
+lock is released; the old slots keep their pointers as stale copies
+and are freed a grace period later (`RcuRetired::defer`, Linux
+free_fdtable_rcu). `Files::fget` takes a reference from a slot unless
+the file's count is zero or DEAD, then checks that the slot and the
+published slots are unchanged, else drops it (a put, never sleeping)
+and looks again. `fdget_raw` (the path walk's dirfd, Linux
+path_init's fdget_raw) does that for a table other tasks use
+(`Files.users` > 1) and, for one only the caller uses, borrows the
+file with no reference: only its own task changes such a table, and
+the caller promises not to close the descriptor or share or change
+the table while it holds the result (its `# Safety`). What makes the
+RCU read safe is that the memory of a file taken out of a shared
+table outlives its last count by a grace period (`file_free`, below).
+
 **File references and release** (`fs/file.rs`; Linux
 fs/file_table.c): a `FileRef` counts one reference in `File.f_count`
 (Linux f_ref, an atomic: taken and dropped lock-free from any
@@ -2713,7 +2734,16 @@ delayed work item on `SYSTEM_WQ` one tick later (queued after the
 lock is released: `Workqueue.inner`), under `DELAYED_FPUT_RUN`
 (sleeping, outermost: 2). So a `FileRef` may be dropped under any
 lock, spin or sleeping, in any context. Only close(2) releases inline
-(`fput_close_sync`, Linux the same), with no lock held. Exit runs the
+(`fput_close_sync`, Linux the same), with no lock held. The release
+drops the file's fields at once (dentry, mount: Linux __fput's dput
+and mntput); a file a table took out while other tasks used it
+(`Files::detached` sets `File::rcu_free`; a task stays counted in
+`Files.users` while it looks a descriptor up) keeps its memory a grace
+period longer (`file_free`: a `Weak` dropped by an RCU callback through
+`File.f_rcu`), so a reader of that table that loaded the file's
+address before its last count went finds the count DEAD, never freed
+memory. Linux's SLAB_TYPESAFE_BY_RCU file cache reuses the memory at
+once instead (BUGS.md). Exit runs the
 task's queued releases (`exit_task_work`) after it dropped its
 descriptors, fs context, namespaces and address space, before a parent
 can see it exited; boot runs pid 1's and the delayed list's after
