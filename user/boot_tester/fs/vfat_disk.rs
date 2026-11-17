@@ -14,6 +14,9 @@
 //!   mtime); a rename keeps the moved file's times; all of it reads the
 //!   same after a remount, and a time_offset=60 mount shows the stored
 //!   local times an hour earlier
+//! - VFAT_ATIME_RO: after a read-only remount a read updates no atime
+//!   (Linux touch_atime: mnt_get_write_access refused) and still reads;
+//!   the atime on disk is the one before
 //! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
 //!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
 //!   and on hk its cluster stays allocated. Linux frees it: the refused
@@ -25,9 +28,9 @@ use crate::harness::T;
 use crate::helpers::{find_blkdev, host_mode};
 use crate::proc::sysfs::each_entry;
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, Timespec, sys_clock_gettime, sys_close, sys_mkdir,
-    sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_rename, sys_rmdir, sys_stat, sys_umount2,
-    sys_unlink, sys_utimensat, sys_write,
+    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, Timespec, UTIME_OMIT, sys_clock_gettime, sys_close,
+    sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_rename, sys_rmdir,
+    sys_stat, sys_umount2, sys_unlink, sys_utimensat, sys_write,
 };
 
 const MNT: &[u8] = b"/tmp/vdk\0";
@@ -162,6 +165,7 @@ pub fn run_tests() {
     dotdot(&mut t, dev);
     nlink(dev);
     times(dev);
+    atime_ro(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -425,5 +429,61 @@ fn times(dev: &[u8]) {
     t.eq(b"mount again", mount(dev), 0);
     sys_unlink(g.as_ptr());
     sys_rmdir(d.as_ptr());
+    t.done();
+}
+
+/// VFAT_ATIME_RO on R, its atime set to OLD's day before
+fn atime_ro(dev: &[u8]) {
+    const MS_RDONLY: u64 = 1;
+    const MS_REMOUNT: u64 = 32;
+    /// 2017-07-14, a day boundary (FAT keeps the atime's date only)
+    const OLD: i64 = 1_499_990_400;
+    let mut t = T::new(b"VFAT_ATIME_RO");
+    let r = b"/tmp/vdk/R\0";
+    let fd = sys_open(r.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    if fd >= 0 {
+        sys_write(fd as u64, b"data".as_ptr(), 4);
+        sys_close(fd as u64);
+    }
+    let ts = [
+        Timespec {
+            tv_sec: OLD,
+            tv_nsec: 0,
+        },
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+    ];
+    t.eq(
+        b"utimensat",
+        sys_utimensat(-100, r.as_ptr(), ts.as_ptr(), 0),
+        0,
+    );
+    let remount = |f: u64| {
+        sys_mount(
+            dev.as_ptr(),
+            MNT.as_ptr(),
+            core::ptr::null(),
+            MS_REMOUNT | f,
+            b"iocharset=cp437\0".as_ptr() as u64,
+        )
+    };
+    t.eq(b"remount ro", remount(MS_RDONLY), 0);
+    let fd = sys_open(r.as_ptr(), O_RDONLY, 0);
+    t.ok(b"open ro", fd >= 0, fd);
+    if fd >= 0 {
+        let mut b = [0u8; 8];
+        let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64);
+        t.eq(b"read", n, 4);
+        sys_close(fd as u64);
+    }
+    t.eq(b"atime kept", stimes(r)[0].0, OLD);
+    t.eq(b"remount rw", remount(0), 0);
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
+    t.eq(b"atime on disk", stimes(r)[0].0, OLD);
+    sys_unlink(r.as_ptr());
     t.done();
 }

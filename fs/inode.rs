@@ -1531,12 +1531,21 @@ impl Inode {
     /// An access through `mnt` (Linux touch_atime): atime becomes the
     /// current time unless the mount is read-only, noatime (nodiratime
     /// for a directory), or relatime and the atime is newer than mtime
-    /// and ctime and under a day old. Unlocked, as Linux.
+    /// and ctime and under a day old. The update (which a filesystem
+    /// may write to its device) holds write access to the mount, and is
+    /// skipped if refused (a read-only remount since the check). Linux
+    /// takes sb_start_write_trylock first; hk has no freezing. Unlocked,
+    /// as Linux.
     pub fn touch_atime(&self, mnt: &super::mount::Mount) {
-        if let Some(now) = self.atime_update(mnt) {
-            // Linux touch_atime -> inode_update_time(S_ATIME)
-            self.i_op.update_time(self, TimeUpdate::Atime, now);
+        let Some(now) = self.atime_update(mnt) else {
+            return;
+        };
+        // Linux mnt_get_write_access, then inode_update_time(S_ATIME)
+        if mnt.get_write().is_err() {
+            return;
         }
+        self.i_op.update_time(self, TimeUpdate::Atime, now);
+        mnt.put_write();
     }
 
     /// An access through `mnt` would change the atime (Linux

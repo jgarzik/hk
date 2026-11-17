@@ -714,7 +714,7 @@ impl Mount {
     /// Take write access (Linux mnt_get_write_access): count first,
     /// then (smp_mb) wait out a hold, spinning (a holder holds MOUNT_LOCK
     /// and never waits for writers), then (smp_rmb) EROFS if read-only
-    fn get_write(&self) -> Result<(), KernelError> {
+    pub(super) fn get_write(&self) -> Result<(), KernelError> {
         self.mnt_writers.add(1);
         fence(Ordering::SeqCst);
         while self.mnt_flags.load(Ordering::Relaxed) & MNT_WRITE_HOLD != 0 {
