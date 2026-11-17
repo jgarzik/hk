@@ -59,10 +59,13 @@ const STACK_PAGES: usize = THREAD_SIZE / PAGE_SIZE as usize;
 const VMSTACK_END: u64 = VMSTACK_START + NR_SLOTS as u64 * SLOT_SIZE;
 
 /// Slot bookkeeping: `used` slots hold a stack; `dirty` ones were freed
-/// since the last flush and may still be cached in some TLB
+/// since the last flush and may still be cached in some TLB;
+/// `flushing` the dirty ones a flush in progress covers (written by
+/// `FLUSH`'s holder only; kept here, not copied onto its stack)
 struct Slots {
     used: [u64; WORDS],
     dirty: [u64; WORDS],
+    flushing: [u64; WORDS],
     nr_dirty: usize,
 }
 
@@ -80,6 +83,7 @@ impl Slots {
         Self {
             used,
             dirty: [0; WORDS],
+            flushing: [0; WORDS],
             nr_dirty: 0,
         }
     }
@@ -99,9 +103,15 @@ impl Slots {
         self.nr_dirty += 1;
     }
 
-    /// The slots in `flushed` are clean again
-    fn clean(&mut self, flushed: &[u64; WORDS]) {
-        for (w, f) in self.dirty.iter_mut().zip(flushed) {
+    /// A flush starts: it covers what is dirty now (what is freed
+    /// during it stays dirty until the next one)
+    fn start_flush(&mut self) {
+        self.flushing.copy_from_slice(&self.dirty);
+    }
+
+    /// The slots the flush covered are clean again
+    fn clean(&mut self) {
+        for (w, f) in self.dirty.iter_mut().zip(&self.flushing) {
             self.nr_dirty -= (*w & f).count_ones() as usize;
             *w &= !f;
         }
@@ -119,7 +129,7 @@ fn take_slot() -> Option<usize> {
         return Some(i);
     }
     let _flusher = FLUSH.lock();
-    let dirty = {
+    {
         let mut s = SLOTS.lock();
         if s.nr_dirty < DIRTY_MAX
             && let Some(i) = s.take()
@@ -129,13 +139,11 @@ fn take_slot() -> Option<usize> {
         if s.nr_dirty == 0 {
             return s.take();
         }
-        // What is dirty now: what is freed during the flush stays
-        // dirty until the next one
-        s.dirty
-    };
+        s.start_flush();
+    }
     crate::mm::tlb::flush_tlb_kernel_range(VMSTACK_START, VMSTACK_END);
     let mut s = SLOTS.lock();
-    s.clean(&dirty);
+    s.clean();
     s.take()
 }
 
@@ -334,8 +342,8 @@ mod tests {
         s.put(1);
         assert_eq!(s.take(), Some(3));
         assert_eq!(s.nr_dirty, 1);
-        let flushed = s.dirty;
-        s.clean(&flushed);
+        s.start_flush();
+        s.clean();
         assert_eq!(s.nr_dirty, 0);
         assert_eq!(s.take(), Some(1));
         // Every word full: the next word

@@ -4,9 +4,10 @@
 //! hybrid) MBR is required, and the primary header at LBA 1 must be
 //! valid (CRCs, bounds); the backup is not used as a fallback.
 
+use alloc::boxed::Box;
 use alloc::vec;
 
-use super::{Parsed, ReadSector, le32, le64};
+use super::{Parsed, ReadSector, le32, le64, sector_buf};
 
 const SIG: &[u8; 8] = b"EFI PART";
 const PMBR_GPT: u8 = 0xee;
@@ -47,24 +48,28 @@ fn pmbr_valid(s: &[u8; 512], nr_sects: u64) -> bool {
 }
 
 /// The primary header, checked (Linux is_gpt_valid at LBA 1)
-fn header(read: &mut ReadSector<'_>, last: u64) -> Option<[u8; 512]> {
-    let mut h = [0u8; 512];
+fn header(read: &mut ReadSector<'_>, last: u64) -> Option<Box<[u8; 512]>> {
+    let mut h = sector_buf()?;
     read(1, &mut h).ok()?;
-    let hsize = le32(&h, 12) as usize;
+    let hsize = le32(&h[..], 12) as usize;
     if &h[..8] != SIG || !(HDR_MIN..=512).contains(&hsize) {
         return None;
     }
-    let mut c = h;
-    c[16..20].fill(0);
-    if crc32(&c[..hsize]) != le32(&h, 16) || le64(&h, 24) != 1 {
+    // The CRC with its own field zeroed, then restored (Linux
+    // is_gpt_valid)
+    let crc = le32(&h[..], 16);
+    h[16..20].fill(0);
+    let ok = crc32(&h[..hsize]) == crc;
+    h[16..20].copy_from_slice(&crc.to_le_bytes());
+    if !ok || le64(&h[..], 24) != 1 {
         return None;
     }
-    let (first, lastu) = (le64(&h, 40), le64(&h, 48));
+    let (first, lastu) = (le64(&h[..], 40), le64(&h[..], 48));
     if first > last || lastu > last || lastu < first {
         return None;
     }
-    let n = le32(&h, 80) as usize;
-    if le32(&h, 84) as usize != ENTRY || n > MAX_ENTRIES {
+    let n = le32(&h[..], 80) as usize;
+    if le32(&h[..], 84) as usize != ENTRY || n > MAX_ENTRIES {
         return None;
     }
     Some(h)
@@ -81,10 +86,8 @@ fn entries(read: &mut ReadSector<'_>, h: &[u8; 512], last: u64) -> Option<alloc:
         return None;
     }
     let mut buf = vec![0u8; len.next_multiple_of(512)];
-    for (i, s) in buf.chunks_mut(512).enumerate() {
-        let mut sec = [0u8; 512];
-        read(lba + i as u64, &mut sec).ok()?;
-        s.copy_from_slice(&sec);
+    for (i, s) in buf.as_chunks_mut::<512>().0.iter_mut().enumerate() {
+        read(lba + i as u64, s).ok()?;
     }
     buf.truncate(len);
     (crc32(&buf) == le32(h, 88)).then_some(buf)
@@ -96,10 +99,13 @@ pub fn efi_partition(st: &mut Parsed, read: &mut ReadSector<'_>, nr_sects: u64) 
         return false;
     }
     let last = nr_sects - 1;
-    let mut mbr = [0u8; 512];
+    let Some(mut mbr) = sector_buf() else {
+        return false;
+    };
     if read(0, &mut mbr).is_err() || !pmbr_valid(&mbr, nr_sects) {
         return false;
     }
+    drop(mbr);
     let Some(h) = header(read, last) else {
         return false;
     };

@@ -51,6 +51,14 @@ impl Parsed {
 /// Reads one 512-byte sector
 pub type ReadSector<'a> = dyn FnMut(u64, &mut [u8; 512]) -> Result<(), KernelError> + 'a;
 
+/// A sector buffer off the stack, which the device probe paths that scan
+/// partitions run deep on (Linux read_part_sector reads into the page
+/// cache); None on ENOMEM, which reads as no table
+fn sector_buf() -> Option<alloc::boxed::Box<[u8; 512]>> {
+    let v = crate::util::kmem::try_vec(512, 0u8).ok()?;
+    v.into_boxed_slice().try_into().ok()
+}
+
 /// Find the partitions of a disk of `nr_sects` sectors with at most
 /// `limit - 1` partitions. Returns (number, partition), clipped to the
 /// disk like Linux blk_add_partitions.

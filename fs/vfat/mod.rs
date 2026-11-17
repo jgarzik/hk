@@ -142,12 +142,13 @@ pub static VFAT_FILE_AOPS: VfatAops = VfatAops;
 /// clusters it already has (Linux cont_write_begin / fat_cont_expand):
 /// bytes past the old end in its last cluster may be stale on disk
 fn cont_expand(inode: &Inode, cs: u64, from: u64, to: u64) -> Result<(), KernelError> {
+    /// The bytes written (Linux zeroes the page cache pages in place)
+    static ZEROS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
     let to = to.min(from.next_multiple_of(cs));
-    let zeros = [0u8; PAGE_SIZE];
     let mut at = from;
     while at < to {
         let n = ((to - at) as usize).min(PAGE_SIZE - (at % PAGE_SIZE as u64) as usize);
-        if filemap::perform_write(inode, &zeros[..n], at)? != n {
+        if filemap::perform_write(inode, &ZEROS[..n], at)? != n {
             return Err(KernelError::NoSpace);
         }
         at += n as u64;
@@ -1075,7 +1076,9 @@ fn fat_scan(
 ) -> Result<Option<u32>, KernelError> {
     const PER: u32 = 1024; // 4-byte entries in 4 KiB
     let base = sb_data.fat_start_sector * u64::from(sb_data.bytes_per_sector);
-    let mut buf = [0u8; 4096];
+    // Off the stack: the allocation path below it goes deep (Linux reads
+    // the FAT through buffer heads, no copy on the stack)
+    let mut buf = crate::util::kmem::try_vec(4096, 0u8)?;
     let mut c = from;
     while c < to {
         let n = (PER - c % PER).min(to - c);

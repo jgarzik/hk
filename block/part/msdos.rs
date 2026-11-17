@@ -3,7 +3,7 @@
 //! Primary partitions 1-4; logical partitions 5+ from the chain of
 //! extended boot records. No BSD/Solaris/UnixWare subpartitions, no AIX.
 
-use super::{Parsed, ReadSector, le32};
+use super::{Parsed, ReadSector, le32, sector_buf};
 
 const TABLE: usize = 0x1be;
 /// Protective MBR of a GPT disk: GPT's job
@@ -42,7 +42,9 @@ fn fat_boot(s: &[u8; 512]) -> bool {
 /// Parse an MBR; true if one was found (possibly a bare FAT boot
 /// sector: a table with no partitions, as in Linux)
 pub fn msdos_partition(st: &mut Parsed, read: &mut ReadSector<'_>) -> bool {
-    let mut s = [0u8; 512];
+    let Some(mut s) = sector_buf() else {
+        return false;
+    };
     if read(0, &mut s).is_err() || !magic(&s) {
         return false;
     }
@@ -75,7 +77,9 @@ pub fn msdos_partition(st: &mut Parsed, read: &mut ReadSector<'_>) -> bool {
 fn parse_extended(st: &mut Parsed, read: &mut ReadSector<'_>, first: u64, first_size: u64) {
     let (mut this, mut this_size) = (first, first_size);
     let mut loops = 0;
-    let mut s = [0u8; 512];
+    let Some(mut s) = sector_buf() else {
+        return;
+    };
     loop {
         loops += 1;
         if loops > 100 || st.next >= st.limit() {

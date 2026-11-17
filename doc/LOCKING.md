@@ -2475,8 +2475,10 @@ layout in `doc/MEMORY.md`
   context) flushes the whole area on every CPU once 64 slots are dirty,
   with `SLOTS` not held, before any of them is reused (Linux lazy
   vmap purge). Flushers are serialized by `FLUSH` (sleeping
-  `sync::Mutex`), so one cleaning a slot set from its snapshot cannot
-  clean a slot freed again after another's flush. `SLOTS` is never
+  `sync::Mutex`), so one cleaning a slot set from its snapshot (the
+  dirty set taken under `SLOTS` into `Slots.flushing`, which only
+  `FLUSH`'s holder writes) cannot clean a slot freed again after
+  another's flush. `SLOTS` is never
   taken in an interrupt handler.
 - Large heap blocks (`mm::vmalloc`, Linux vmalloc/kvmalloc): page
   ranges of the 16 GiB vmalloc allocation area, each followed by an

@@ -588,7 +588,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         crate::mm::filemap::write_and_wait(&inode)?;
         crate::mm::filemap::invalidate(&inode);
     }
-    let mut hdr = [0u8; PAGE_SIZE];
+    // The header page off the stack (Linux reads it into a page cache
+    // folio, read_mapping_folio)
+    let mut hdr = crate::util::kmem::try_vec(PAGE_SIZE, 0u8)?;
     let read = match &bdev {
         Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|()| PAGE_SIZE),
         None => inode
@@ -607,7 +609,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         .map_or(inode.get_size() / PAGE_SIZE as u64, |b| {
             b.nr_sects() / SECTORS_PER_PAGE
         });
-    let max = parse_header(&hdr, size)?;
+    let hdr =
+        <&[u8; PAGE_SIZE]>::try_from(hdr.as_slice()).map_err(|_| KernelError::InvalidArgument)?;
+    let max = parse_header(hdr, size)?;
     let priority = if swap_flags & SWAP_FLAG_PREFER != 0 {
         (swap_flags & SWAP_FLAG_PRIO_MASK) as i16
     } else {
