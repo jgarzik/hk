@@ -681,6 +681,16 @@ waiting).
 - No instances/ directory (tracefs_create_instance_dir: mkdir/rmdir of
   trace instances), so nothing removes a tracefs entry at run time.
 
+## fsync and freeze gaps
+
+**Location**: `fs/file.rs` (`FileOps::fsync`), `fs/inode.rs` (`touch_atime`)
+
+- `FileOps::fsync` takes no datasync flag, so fdatasync writes a
+  times-only dirty inode too (Linux vfs_fsync_range(datasync) skips
+  I_DIRTY_SYNC unless I_DIRTY_DATASYNC).
+- No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
+  such as touch_atime take mount write access only.
+
 ## No buffer heads
 
 **Location**: `fs/vfat/mod.rs` (`write_inode_sb`, `VfatSbData.ipos`), `fs/blkdev_ops.rs`
