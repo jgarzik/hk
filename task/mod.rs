@@ -852,6 +852,9 @@ pub struct Task {
     pub nivcsw: AtomicU64,
     /// Minor page faults (demand paging, COW - no I/O required)
     pub min_flt: AtomicU64,
+    /// Pages it dirtied since its last dirty throttle check (Linux
+    /// current->nr_dirtied): written by the task alone (`Sole`)
+    pub nr_dirtied: AtomicU64,
     /// Major page faults (swap-in required - I/O needed)
     pub maj_flt: AtomicU64,
 
@@ -1627,6 +1630,7 @@ impl Task {
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
+            nr_dirtied: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),
@@ -1691,6 +1695,7 @@ impl Task {
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
+            nr_dirtied: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),

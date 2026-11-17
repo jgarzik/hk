@@ -142,7 +142,6 @@ fn find(
 /// caller searches again (a shared queue's other wakeups included)
 fn wait_freed(l: crate::sync::spin::MutexGuard<'_, InodeHash>, addr: usize) {
     use crate::sync::waitqueue::{WaitEntry, var_waitqueue};
-    crate::sync::might_sleep();
     let q = var_waitqueue(addr);
     let w = core::pin::pin!(WaitEntry::new());
     q.prepare_to_wait(w.as_ref(), crate::task::percpu::SleepState::Uninterruptible);
@@ -161,6 +160,7 @@ pub fn ilookup5(
 ) -> Option<Arc<Inode>> {
     let b = bucket(Arc::as_ptr(sb), hashval);
     loop {
+        crate::sync::might_sleep();
         let l = INODE_HASH_LOCK.lock();
         match find(&l, b, Arc::as_ptr(sb), hashval, test) {
             Found::Live(i) => return Some(i),
@@ -187,6 +187,7 @@ pub fn iget5(
     let new = make()?;
     let b = bucket(Arc::as_ptr(sb), hashval);
     loop {
+        crate::sync::might_sleep();
         let mut l = INODE_HASH_LOCK.lock();
         match find(&l, b, Arc::as_ptr(sb), hashval, test) {
             Found::Live(i) => {

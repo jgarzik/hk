@@ -163,8 +163,14 @@ crate::percpu! {
 /// least 16); 0 until first computed
 static RATELIMIT_PAGES: AtomicU64 = AtomicU64::new(0);
 
-/// `n` pages were dirtied on this CPU (Linux account_page_dirtied)
+/// Pages a task dirties between its checks (Linux nr_dirtied_pause's
+/// start, 128 KiB; hk does not adapt it)
+const DIRTIED_PAUSE: u64 = 32;
+
+/// `n` pages were dirtied by the current task on this CPU (Linux
+/// account_page_dirtied: current->nr_dirtied, bdp_ratelimits)
 pub fn dirtied(n: i64) {
+    crate::sync::Sole::sole_add(&crate::task::percpu::current().nr_dirtied, n as u64);
     let irq = crate::sync::local_irq_save();
     let w = BDP_RATELIMITS.this();
     w.store(w.load(Ordering::Relaxed) + n, Ordering::Relaxed);
@@ -179,21 +185,28 @@ fn set_ratelimit() -> u64 {
     r
 }
 
-/// This CPU dirtied enough pages since its last check to check again
-/// (Linux balance_dirty_pages_ratelimited_flags' bdp_ratelimits test);
-/// its count restarts then
+/// The current task, or this CPU, dirtied enough pages since its last
+/// check to check again (Linux balance_dirty_pages_ratelimited_flags:
+/// current->nr_dirtied against nr_dirtied_pause, else this CPU's
+/// bdp_ratelimits against ratelimit_pages); the counts restart then
 fn ratelimit_due() -> bool {
     let r = match RATELIMIT_PAGES.load(Ordering::Relaxed) {
         0 => set_ratelimit(),
         r => r,
     };
+    let me = crate::task::percpu::current();
+    let task_due = me.nr_dirtied.load(Ordering::Relaxed) >= DIRTIED_PAUSE;
     let irq = crate::sync::local_irq_save();
     let w = BDP_RATELIMITS.this();
-    let due = w.load(Ordering::Relaxed) >= r as i64;
+    let due = task_due || w.load(Ordering::Relaxed) >= r as i64;
     if due {
         w.store(0, Ordering::Relaxed);
     }
     crate::sync::local_irq_restore(irq);
+    if due {
+        // Linux balance_dirty_pages: current->nr_dirtied = 0
+        me.nr_dirtied.store(0, Ordering::Relaxed);
+    }
     due
 }
 

@@ -11,7 +11,7 @@
 //! write(pipe_w)               read(pipe_r)
 //!     |                            |
 //!     v                            v
-//! PipeWriteEnd             PipeReadEnd
+//! write file               read file
 //!     |                            |
 //!     +-----> Arc<Pipe> <----------+
 //!              |
@@ -783,40 +783,6 @@ impl Pipe {
         self.writers.load(Ordering::Relaxed) > 0
     }
 
-    /// One more read end (a duplicated one)
-    pub fn add_reader(&self) {
-        let g = self.lock();
-        g.count(&self.readers, 1);
-    }
-
-    /// One read end less (Linux pipe_release): the last wakes writers
-    /// (EPIPE, POLLERR)
-    pub fn remove_reader(&self) {
-        let g = self.lock();
-        g.count(&self.readers, -1);
-        drop(g);
-        if !self.has_readers() {
-            self.wait_queue.wake_all();
-        }
-    }
-
-    /// One more write end (a duplicated one)
-    pub fn add_writer(&self) {
-        let g = self.lock();
-        g.count(&self.writers, 1);
-    }
-
-    /// One write end less (Linux pipe_release): the last wakes readers
-    /// (EOF, POLLHUP)
-    pub fn remove_writer(&self) {
-        let g = self.lock();
-        g.count(&self.writers, -1);
-        drop(g);
-        if !self.has_writers() {
-            self.wait_queue.wake_all();
-        }
-    }
-
     /// Wake readers' waits and polls (rd_wait with EPOLLIN | EPOLLRDNORM)
     fn wake_rd(&self) {
         self.wait_queue.wake_poll(u32::from(POLLIN | POLLRDNORM));
@@ -1036,37 +1002,6 @@ fn pipe_write_wait(
     }
 }
 
-// =============================================================================
-// Pipe Read End
-// =============================================================================
-
-/// Read end of a pipe
-pub struct PipeReadEnd {
-    pipe: Arc<Pipe>,
-}
-
-impl PipeReadEnd {
-    /// Create a new read end for a pipe
-    pub fn new(pipe: Arc<Pipe>) -> Self {
-        Self { pipe }
-    }
-}
-
-impl Clone for PipeReadEnd {
-    fn clone(&self) -> Self {
-        self.pipe.add_reader();
-        Self {
-            pipe: Arc::clone(&self.pipe),
-        }
-    }
-}
-
-impl Drop for PipeReadEnd {
-    fn drop(&mut self) {
-        self.pipe.remove_reader();
-    }
-}
-
 /// File operations for pipe read end (the pipe is the file's private
 /// data, like Linux file->private_data = pipe)
 pub struct PipeReadFileOps;
@@ -1128,37 +1063,6 @@ impl FileOps for PipeReadFileOps {
 
     fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
         Some(pipe_of(file).and_then(|p| pipe_fasync(p, file, fd, on)))
-    }
-}
-
-// =============================================================================
-// Pipe Write End
-// =============================================================================
-
-/// Write end of a pipe
-pub struct PipeWriteEnd {
-    pipe: Arc<Pipe>,
-}
-
-impl PipeWriteEnd {
-    /// Create a new write end for a pipe
-    pub fn new(pipe: Arc<Pipe>) -> Self {
-        Self { pipe }
-    }
-}
-
-impl Clone for PipeWriteEnd {
-    fn clone(&self) -> Self {
-        self.pipe.add_writer();
-        Self {
-            pipe: Arc::clone(&self.pipe),
-        }
-    }
-}
-
-impl Drop for PipeWriteEnd {
-    fn drop(&mut self) {
-        self.pipe.remove_writer();
     }
 }
 

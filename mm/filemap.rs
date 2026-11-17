@@ -279,59 +279,36 @@ impl Drop for AddressSpace {
     }
 }
 
-crate::percpu! {
-    static DIRTY_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-}
-crate::percpu! {
-    static FILE_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-}
-crate::percpu! {
-    static UNEVICT_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-}
-crate::percpu! {
-    static SHMEM_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-}
-
-use super::vmstat::VmStat;
-
-/// Dirty page-cache pages (Linux NR_FILE_DIRTY): balance_dirty_pages
-/// and /proc/meminfo
-static NR_DIRTY: VmStat = VmStat::new(&DIRTY_DIFF);
-/// Page-cache pages, and those of unevictable mappings (Linux
-/// NR_FILE_PAGES, NR_UNEVICTABLE): /proc/meminfo
-static NR_FILE: VmStat = VmStat::new(&FILE_DIFF);
-static NR_UNEVICT: VmStat = VmStat::new(&UNEVICT_DIFF);
-/// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
-static NR_SHMEM: VmStat = VmStat::new(&SHMEM_DIFF);
+use super::vmstat::{Item, add as vm_add, read as vm_read};
 
 /// `d` pages entered (or left) the cache of `m`
 fn count_file(m: &AddressSpace, d: i64) {
-    NR_FILE.add(d);
+    vm_add(Item::FilePages, d);
     if m.has_flag(AS_UNEVICTABLE) {
-        NR_UNEVICT.add(d);
+        vm_add(Item::Unevictable, d);
     }
     if m.acct.get().is_some() {
-        NR_SHMEM.add(d);
+        vm_add(Item::Shmem, d);
     }
 }
 
 /// tmpfs and shared memory pages (Linux NR_SHMEM): /proc/meminfo Shmem
 pub fn nr_shmem() -> u64 {
-    NR_SHMEM.read()
+    vm_read(Item::Shmem)
 }
 
 /// Page-cache pages (Linux NR_FILE_PAGES)
 pub fn nr_file_pages() -> u64 {
-    NR_FILE.read()
+    vm_read(Item::FilePages)
 }
 
 /// Page-cache pages that never leave memory (ramfs; Linux Unevictable)
 pub fn nr_unevictable() -> u64 {
-    NR_UNEVICT.read()
+    vm_read(Item::Unevictable)
 }
 
 fn count_dirty(d: i64) {
-    NR_DIRTY.add(d);
+    vm_add(Item::FileDirty, d);
     if d > 0 {
         // Linux account_page_dirtied: this_cpu_inc(bdp_ratelimits)
         super::writeback::dirtied(d);
@@ -340,7 +317,7 @@ fn count_dirty(d: i64) {
 
 /// Dirty page-cache pages (Linux global_node_page_state(NR_FILE_DIRTY))
 pub fn nr_dirty() -> u64 {
-    NR_DIRTY.read()
+    vm_read(Item::FileDirty)
 }
 
 /// Clear the page's dirty bit; true (and uncounted) if it was set

@@ -163,15 +163,6 @@ impl TimerList {
         self.arm(expires, deadline_ns.max(1))
     }
 
-    /// The CLOCK_MONOTONIC bound it was armed with (0: armed in
-    /// jiffies or never armed); /proc/net/tcp shows the time left
-    pub fn deadline_ns(&self) -> u64 {
-        match base_ref(self.base.load(Ordering::Acquire)) {
-            Some(base) => base.wheel.lock().pos(self).not_before,
-            None => 0,
-        }
-    }
-
     /// Expiry and lower bound change together under the base lock, so
     /// a `run` racing a re-arm sees one arm's pair, never a mix (a
     /// jiffy-armed timer firing early on a stale bound, or the reverse)
@@ -587,12 +578,6 @@ impl<T: Send + Sync> ArcTimer<T> {
     /// Armed and not yet fired (Linux timer_pending)
     pub fn pending(&self) -> bool {
         self.timer.pending()
-    }
-
-    /// The CLOCK_MONOTONIC ns it was last armed for (Linux
-    /// icsk_timeout / timer->expires)
-    pub fn deadline_ns(&self) -> u64 {
-        self.timer.deadline_ns()
     }
 }
 

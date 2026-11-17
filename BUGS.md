@@ -1155,3 +1155,18 @@ the ACPI PM timer, which hk lacks.
 adjtimex keeps and reports the NTP frequency (ADJ_FREQUENCY) and the
 tick, but neither changes how fast the clock runs (Linux
 ntp_update_frequency).
+
+## Deviations from Linux's lockless reads (fixing next)
+
+- **Parent and group reads take TASKLIST**: `task/mod.rs`
+  `TaskInner::ppid` / `pgid` / `sid` and their callers (getppid,
+  getpgid, getsid, kill's `Sender::current`, the wait scans) read under
+  TASKLIST's read lock. Linux reads `rcu_dereference(real_parent)` and
+  `signal->pids[]` under RCU, valid because a task and a `struct pid`
+  are freed a grace period after they are unlisted
+  (delayed_put_task_struct, delayed_put_pid).
+- **TCP /proc view snapshot**: `net/tcp/mod.rs` `TcpSock::lock_sock`
+  stores `Snap.proc` on every ownership. Linux has no copy: the fields
+  /proc/net/tcp reads are read live (READ_ONCE); hk's equivalent is
+  those control-block fields as Relaxed atomics written where they
+  change.

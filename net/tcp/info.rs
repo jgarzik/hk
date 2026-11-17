@@ -364,64 +364,31 @@ fn tw_line(i: usize, tw: &super::timewait::TimeWait, now: u64) -> Line {
     l
 }
 
-/// One /proc/net/tcp entry, gathered under RCU: a socket (its line made
-/// after, `sock_line`) or a TIME_WAIT line
-enum Entry {
-    Sock(usize, alloc::sync::Arc<super::TcpSock>),
-    Tw(Line),
-}
-
 /// `/proc/net/tcp` of `net`: listeners, then connections and TIME_WAIT
-/// entries (Linux tcp4_seq_show over the hash walk). The walk is under
-/// RCU, which cannot sleep: it takes references (counted first, room
-/// made with RCU dropped, entries past the room left out as raced),
-/// then makes each socket's line (`sock_line`).
+/// entries, generated under RCU into a `SeqBuf` (Linux tcp4_seq_show over
+/// the hash walk); a socket's line takes only its `slock` (`sock_line`)
 pub fn proc_net_tcp(net: &crate::net::NetNamespace) -> Vec<u8> {
-    let c = core::cell::Cell::new(0usize);
-    {
-        let inc = || c.set(c.get() + 1);
-        let g = crate::sync::rcu::read_lock();
-        net.tcp.walk_rcu(&g, |_| inc(), |_| inc(), |_| inc());
-    }
-    let mut n = c.get();
-    let mut v: Vec<Entry> = Vec::new();
-    if v.try_reserve_exact(n).is_err() {
-        n = 0;
-    }
-    let now = now_ms();
-    {
-        let i = core::cell::Cell::new(0);
-        let v = core::cell::RefCell::new(&mut v);
-        let sk = |s: &super::TcpSock| {
-            let mut v = v.borrow_mut();
-            if v.len() < n
-                && let Some(a) = s.me.upgrade()
-            {
-                v.push(Entry::Sock(i.get(), a));
-                i.set(i.get() + 1);
-            }
-        };
-        let g = crate::sync::rcu::read_lock();
-        net.tcp.walk_rcu(&g, sk, sk, |t| {
-            let mut v = v.borrow_mut();
-            if v.len() < n {
-                v.push(Entry::Tw(tw_line(i.get(), t, now)));
-                i.set(i.get() + 1);
-            }
-        });
-    }
     seq::generate(|m| {
         let mut l = Line::new();
         let _ = l.write_str(
             "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
         );
         l.put(m);
-        for e in &v {
-            match e {
-                Entry::Sock(i, s) => sock_line(m, *i, s, now),
-                Entry::Tw(l) => l.put(m),
-            }
-        }
+        let now = now_ms();
+        let i = core::cell::Cell::new(0);
+        let next = || {
+            let n = i.get();
+            i.set(n + 1);
+            n
+        };
+        let g = crate::sync::rcu::read_lock();
+        let m = core::cell::RefCell::new(m);
+        net.tcp.walk_rcu(
+            &g,
+            |s| sock_line(&mut m.borrow_mut(), next(), s, now),
+            |s| sock_line(&mut m.borrow_mut(), next(), s, now),
+            |t| tw_line(next(), t, now).put(&mut m.borrow_mut()),
+        );
     })
 }
 

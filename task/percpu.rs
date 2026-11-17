@@ -4344,6 +4344,7 @@ pub fn scheduler_tick() {
         crate::task::loadavg::tick(t);
     }
     crate::time::timer::run_local();
+    crate::mm::vmstat::tick();
     crate::time::watchdog::tick();
     crate::kmsg::tick();
     crate::console::tick();

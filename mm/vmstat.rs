@@ -1,49 +1,85 @@
-//! Page-state counters (Linux mm/vmstat.c): a global count plus a
-//! difference per CPU, folded into the global once it passes a
-//! threshold. An update touches only its CPU's word (interrupts off, a
-//! load and a store) and the shared line once per threshold changes;
-//! a read is one load of the global, off by at most the threshold per
-//! CPU (Linux global_node_page_state).
+//! Page-state counters (Linux mm/vmstat.c, node_stat_item): a global
+//! count per item plus a difference per CPU, folded into the global once
+//! it passes a threshold, and every second by its CPU's tick (Linux
+//! vmstat_update every sysctl_stat_interval). An update touches only its
+//! CPU's word (interrupts off, a load and a store) and the shared line
+//! once per threshold changes; a read is one load of the global, off by
+//! at most the threshold per CPU for at most a second (Linux
+//! global_node_page_state).
 
-use core::sync::atomic::{AtomicI64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
-use crate::cpu::PerCpu;
-
-/// A counter (Linux one item of vm_node_stat with its vm_node_stat_diff)
-pub struct VmStat {
-    /// The folded count (Linux vm_node_stat[item])
-    global: AtomicI64,
-    /// Each CPU's unfolded part (Linux pcp->vm_node_stat_diff[item]):
-    /// written by its CPU alone, interrupts off
-    diff: &'static PerCpu<AtomicI64>,
+/// A counter (Linux enum node_stat_item)
+#[derive(Clone, Copy)]
+pub enum Item {
+    /// Page-cache pages (NR_FILE_PAGES)
+    FilePages,
+    /// Dirty page-cache pages (NR_FILE_DIRTY)
+    FileDirty,
+    /// Pages of unevictable mappings (NR_UNEVICTABLE)
+    Unevictable,
+    /// tmpfs and shared memory pages (NR_SHMEM)
+    Shmem,
 }
 
-impl VmStat {
-    pub const fn new(diff: &'static PerCpu<AtomicI64>) -> Self {
-        Self {
-            global: AtomicI64::new(0),
-            diff,
-        }
-    }
+const N: usize = 4;
 
-    /// Add `d` (Linux mod_node_page_state)
-    pub fn add(&self, d: i64) {
-        let irq = crate::sync::local_irq_save();
-        let w = self.diff.this();
-        let v = w.load(Ordering::Relaxed) + d;
-        if v.abs() > threshold() {
-            self.global.fetch_add(v, Ordering::Relaxed);
+/// The folded counts (Linux vm_node_stat)
+static GLOBAL: [AtomicI64; N] = [const { AtomicI64::new(0) }; N];
+
+/// A CPU's unfolded parts and tick count: written by its CPU alone,
+/// interrupts off (Linux per_cpu_nodestat.vm_node_stat_diff)
+struct Diff {
+    d: [AtomicI64; N],
+    ticks: AtomicU32,
+}
+
+crate::percpu! {
+    static DIFF: Diff = Diff {
+        d: [const { AtomicI64::new(0) }; N],
+        ticks: AtomicU32::new(0),
+    };
+}
+
+/// Add `v` to `item` (Linux mod_node_page_state)
+pub fn add(item: Item, v: i64) {
+    let irq = crate::sync::local_irq_save();
+    let w = &DIFF.this().d[item as usize];
+    let x = w.load(Ordering::Relaxed) + v;
+    if x.abs() > threshold() {
+        GLOBAL[item as usize].fetch_add(x, Ordering::Relaxed);
+        w.store(0, Ordering::Relaxed);
+    } else {
+        w.store(x, Ordering::Relaxed);
+    }
+    crate::sync::local_irq_restore(irq);
+}
+
+/// `item`, unfolded parts left out, never below 0 (Linux
+/// global_node_page_state)
+pub fn read(item: Item) -> u64 {
+    GLOBAL[item as usize].load(Ordering::Relaxed).max(0) as u64
+}
+
+/// Ticks between folds: a second (Linux sysctl_stat_interval = HZ)
+const FOLD_TICKS: u32 = 100;
+
+/// This CPU's tick (interrupts off): every second, fold its parts into
+/// the globals (Linux vmstat_update -> refresh_cpu_vm_stats)
+pub fn tick() {
+    let me = DIFF.this();
+    let t = me.ticks.load(Ordering::Relaxed) + 1;
+    if t < FOLD_TICKS {
+        me.ticks.store(t, Ordering::Relaxed);
+        return;
+    }
+    me.ticks.store(0, Ordering::Relaxed);
+    for (w, g) in me.d.iter().zip(&GLOBAL) {
+        let x = w.load(Ordering::Relaxed);
+        if x != 0 {
+            g.fetch_add(x, Ordering::Relaxed);
             w.store(0, Ordering::Relaxed);
-        } else {
-            w.store(v, Ordering::Relaxed);
         }
-        crate::sync::local_irq_restore(irq);
-    }
-
-    /// The count, unfolded parts left out, never below 0 (Linux
-    /// global_node_page_state)
-    pub fn read(&self) -> u64 {
-        self.global.load(Ordering::Relaxed).max(0) as u64
     }
 }
 
