@@ -50,10 +50,9 @@
 //! a CPU's callbacks; nothing is taken under it and callbacks run after
 //! it is released.
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync::waitqueue::WaitQueue;
@@ -792,131 +791,6 @@ pub fn kfree_rcu<T: HasRcuHead + Send + Sync>(a: Arc<T>) {
     unsafe { call_rcu(&*h, put::<T>, p) };
 }
 
-/// Callbacks can be queued here: false in host unit tests and at the
-/// start of boot (no CPU id yet), when no other CPU runs a reader, so a
-/// release may happen at once
-pub fn can_queue() -> bool {
-    !cfg!(test) && crate::cpu::try_this_id().is_some()
-}
-
-/// The value of an object in an `Arc` (`O`, which embeds this as its
-/// field holding everything with drop glue) whose destruction and
-/// memory wait a grace period past the last strong reference, while
-/// the owner's own teardown (its `Drop`, which runs first) happens
-/// where that reference goes (Linux iput_final -> evict, then
-/// destroy_inode's call_rcu(&inode->i_rcu, i_callback)): an RCU reader
-/// that reached the owner with no reference (`&O` under a guard) keeps
-/// a whole value until its guard ends. `T`'s drop runs in `rcuc/N`
-/// with preemption off: it must not sleep, and allocates only with a
-/// GFP named.
-///
-/// # Invariants
-/// `me` is a weak reference to the `Arc` holding the owner (dangling
-/// for an owner not made so); `val` and `me` are dropped once, by this
-/// type's drop (at once, when no reader can reach the owner) or by its
-/// callback a grace period after the owner's last strong reference
-/// went; nothing else writes them.
-pub struct RcuFree<T: Send + Sync, O: Send + Sync> {
-    head: RcuHead,
-    me: UnsafeCell<ManuallyDrop<Weak<O>>>,
-    val: UnsafeCell<ManuallyDrop<T>>,
-}
-
-// SAFETY: `val` and `me` are shared as `&T` / `&Weak<O>` and dropped
-// only with no other user left (type invariant)
-unsafe impl<T: Send + Sync, O: Send + Sync> Sync for RcuFree<T, O> {}
-// SAFETY: as above; the drop may run on another CPU
-unsafe impl<T: Send + Sync, O: Send + Sync> Send for RcuFree<T, O> {}
-
-impl<T: Send + Sync, O: Send + Sync> RcuFree<T, O> {
-    /// `val`, its owner not yet in an `Arc` (`set_me` once it is)
-    pub fn new(val: T) -> Self {
-        Self {
-            head: RcuHead::new(),
-            me: UnsafeCell::new(ManuallyDrop::new(Weak::new())),
-            val: UnsafeCell::new(ManuallyDrop::new(val)),
-        }
-    }
-
-    /// The owner's own `Arc` is `me` (`Arc::new_cyclic`'s weak)
-    pub fn set_me(&mut self, me: Weak<O>) {
-        // INVARIANT: the owner is in the `Arc` `me` names; the old one
-        // is dropped here, before anyone could read it
-        **self.me.get_mut() = me;
-    }
-
-    /// A strong reference to the owner unless its last one went (Linux
-    /// igrab: refused once the object is being freed)
-    pub fn upgrade(&self) -> Option<Arc<O>> {
-        // SAFETY: `me` is dropped only with no user left (type invariant)
-        unsafe { &*self.me.get() }.upgrade()
-    }
-
-    /// The callback: the value, then the weak reference that kept the
-    /// memory
-    ///
-    /// # Safety
-    /// `p` is an `RcuFree` whose drop queued it, a grace period after
-    /// its owner's last strong reference went.
-    unsafe fn free(p: *const ()) {
-        // SAFETY: its memory is kept by `me`, not dropped yet; its drop
-        // changed none of its bytes
-        let f = unsafe { &*p.cast::<Self>() };
-        // SAFETY: a grace period after the last strong reference: no
-        // user is left, and this is the one drop (type invariant)
-        unsafe { ManuallyDrop::drop(&mut *f.val.get()) };
-        // SAFETY: as above; `f` is not touched after this
-        let me = unsafe { ManuallyDrop::take(&mut *f.me.get()) };
-        drop(me);
-    }
-}
-
-impl<T: Send + Sync, O: Send + Sync> core::ops::Deref for RcuFree<T, O> {
-    type Target = T;
-    #[inline]
-    fn deref(&self) -> &T {
-        // SAFETY: `val` is dropped only once no strong reference and no
-        // RCU reader can reach the owner, so not while `&self` lives
-        // (type invariant)
-        unsafe { &*self.val.get() }
-    }
-}
-
-impl<T: Send + Sync, O: Send + Sync> core::ops::DerefMut for RcuFree<T, O> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        self.val.get_mut()
-    }
-}
-
-impl<T: Send + Sync, O: Send + Sync> Drop for RcuFree<T, O> {
-    /// Part of the owner's drop, after its own `Drop`: in the `Arc` `me`
-    /// names (this field lies inside the owner `me` points at), the last
-    /// strong reference just went, so the value and the memory go a
-    /// grace period from now (Linux call_rcu(&inode->i_rcu, i_callback));
-    /// an owner made bare or moved out of its `Arc`, or one with no RCU
-    /// callbacks yet ([`can_queue`]), is freed at once: no reader can
-    /// reach it.
-    fn drop(&mut self) {
-        let me = self.me.get_mut().as_ptr().addr();
-        let at = core::ptr::from_ref(self).addr();
-        let in_arc = at >= me && at < me.wrapping_add(core::mem::size_of::<O>());
-        if in_arc && can_queue() {
-            let p = core::ptr::from_ref(self).cast::<()>();
-            // SAFETY: the head is in this memory, which `me` keeps until
-            // `free` drops it; `free` drops only `T` (Send + Sync, its
-            // drop atomic-safe by this type's contract) and the `Weak`
-            unsafe { call_rcu(&self.head, Self::free, p) };
-            return;
-        }
-        // SAFETY: `&mut self`, and no reader can reach the owner: the
-        // one drop (type invariant)
-        unsafe { ManuallyDrop::drop(self.val.get_mut()) };
-        // SAFETY: as above
-        drop(unsafe { ManuallyDrop::take(self.me.get_mut()) });
-    }
-}
-
 /// Deferred reference drops that may be queued again before earlier
 /// ones ran ([`put_rcu`]), embedded in the object ([`HasRcuPuts`]):
 /// an entry of a `util::hlist_nulls` table can be unhashed, hashed again
@@ -1270,39 +1144,6 @@ mod tests {
             cur = h.next.load(Ordering::Relaxed);
         }
         v
-    }
-
-    /// Counts its drops
-    struct Probe<'a>(&'a AtomicUsize);
-
-    impl Drop for Probe<'_> {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    struct Own(RcuFree<Probe<'static>, Own>);
-
-    /// An `RcuFree` value: `upgrade` works while a strong reference
-    /// lives and fails after; the value is dropped once, a bare owner's
-    /// at its drop (with no callbacks, an `Arc`'s at its last drop too),
-    /// and the weak reference kept for the memory is released
-    #[test]
-    fn rcu_free_drops_once() {
-        static DROPS: AtomicUsize = AtomicUsize::new(0);
-        let a = Arc::new_cyclic(|me| {
-            let mut o = Own(RcuFree::new(Probe(&DROPS)));
-            o.0.set_me(me.clone());
-            o
-        });
-        let w = Arc::downgrade(&a);
-        assert!(a.0.upgrade().is_some_and(|b| Arc::ptr_eq(&a, &b)));
-        assert_eq!(Weak::weak_count(&w), 2);
-        drop(a);
-        assert_eq!(DROPS.load(Ordering::Relaxed), 1);
-        assert!(w.upgrade().is_none() && Weak::weak_count(&w) == 0);
-        drop(Own(RcuFree::new(Probe(&DROPS))));
-        assert_eq!(DROPS.load(Ordering::Relaxed), 2);
     }
 
     /// put_rcu's count: only the first of a run of puts queues the head;

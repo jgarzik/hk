@@ -51,7 +51,6 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | RCU pointers `RcuArc`, `RcuLockedArc` (nullable, writers proven by a `UniqueOwner`), `RcuPtr` (no ownership, unsafe read) (`sync/rcu.rs`, Linux `__rcu`) | published pointer, old version released after a grace period |
 | dentry reference `DentryRef` (`fs/dentry.rs`, Linux dget/dput on d_lockref), mount reference `MountRef` (`fs/mntput.rs`, Linux mntget/mntput on mnt_pcp) | counted pointer, last put deferred (RCU free, queued teardown) |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
-| value freed a grace period past its owner's teardown `RcuFree` (`sync/rcu.rs`, Linux destroy_inode's call_rcu(i_callback)) | embedded value + head + own `Weak` |
 | RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
 | hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h) | owning intrusive containers, membership checked |
 | RCU hash chain `RcuHList` / `HNode` / `RcuHRef` (`util/rcuhlist.rs`, Linux hlist_*_rcu), writers proven by a `UniqueOwner` | owning intrusive chain, membership checked, release after a grace period |

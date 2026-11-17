@@ -275,7 +275,7 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        truncate_inode_pages_final(self);
+        truncate_final(self);
     }
 }
 
@@ -536,7 +536,7 @@ fn truncate_pages(m: &AddressSpace, from: u64, last: u64) {
 
 /// Drop every page of a mapping nobody else can reach any more (Linux
 /// truncate_inode_pages_final, from eviction): no page lock, no sleep
-pub fn truncate_inode_pages_final(m: &AddressSpace) {
+fn truncate_final(m: &AddressSpace) {
     count_file(m, -(m.nrpages() as i64));
     m.uncharge(m.nrpages());
     let mut pages = m.i_pages.lock();
