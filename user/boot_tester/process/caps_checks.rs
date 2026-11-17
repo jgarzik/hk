@@ -732,14 +732,24 @@ fn key_gc() -> u64 {
                 KEY_SPEC_PROCESS_KEYRING,
             )
         };
+        // The add that fails must fail for quota. Its error is the one
+        // checked: keys of an earlier test of this uid may still be
+        // collected meanwhile (the GC is asynchronous), so a second add
+        // could succeed
         let mut i = 0;
-        while add(i) > 0 {
+        let r = loop {
+            let r = add(i);
+            if r <= 0 {
+                break r;
+            }
             i += 1;
-            if i > 260 {
+            // Up to the 200-key cap, plus as many again freed by the
+            // GC meanwhile
+            if i > 600 {
                 sys_exit(3);
             }
-        }
-        if add(i) != EDQUOT {
+        };
+        if r != EDQUOT {
             sys_exit(4);
         }
         if keyctl(KEYCTL_CLEAR, KEY_SPEC_PROCESS_KEYRING as u64, 0, 0) != 0 {
