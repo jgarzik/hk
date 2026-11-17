@@ -3041,7 +3041,12 @@ take it again), and nothing else is taken under it.
 A cached child is revalidated (`InodeOps::revalidate`, Linux
 d_revalidate) after its d_lock is released, inside whatever i_rwsem the
 walk holds: procfs's takes TASKLIST (read) and the task's fd table
-lock. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
+lock. Asked by an RCU walk (`rcu`, Linux LOOKUP_RCU; and a permission
+check's MAY_NOT_BLOCK) the inode is borrowed under the guard with no
+reference and may be torn down already: the answer may read only
+fields with no drop glue and take nothing that sleeps, else it is
+ECHILD; procfs and kernfs, whose answers need the inode data, always
+are. `sb_permission` reads `Inode.sb` for a write only. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
 clones the task's and its leader's `Pid` under TASKLIST's read lock
 (dropped after it), then walks the procfs superblocks
 (`iterate_supers_type`: each taken under `SB_LOCK`, then s_umount

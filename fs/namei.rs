@@ -177,7 +177,7 @@ pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelEr
 fn cached(parent: &DentryRef, name: &[u8]) -> Option<DentryRef> {
     let child = parent.lookup_child(name)?;
     match child.get_inode() {
-        Some(i) if !i.i_op.revalidate(&i) => {
+        Some(i) if i.i_op.revalidate(&i, false) != Ok(true) => {
             parent.remove_child(name);
             None
         }
@@ -215,7 +215,7 @@ fn lookup_slow(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError
 fn lookup_cached(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
     let child = parent.lookup_child(name).ok_or(KernelError::WouldBlock)?;
     match child.get_inode() {
-        Some(i) if !i.i_op.revalidate_blocks(&i) && i.i_op.revalidate(&i) => Ok(child),
+        Some(i) if i.i_op.revalidate(&i, true) == Ok(true) => Ok(child),
         _ => Err(KernelError::WouldBlock),
     }
 }

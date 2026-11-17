@@ -449,25 +449,6 @@ impl InodeOps for ProcfsInodeOps {
         }
     }
 
-    /// Linux tid_fd_revalidate, proc_sys_revalidate and
-    /// proc_misc_d_revalidate are -ECHILD in an RCU walk; pid_revalidate
-    /// is not
-    fn revalidate_blocks(&self, inode: &Inode) -> bool {
-        with_data(inode, |d| {
-            matches!(
-                d,
-                ProcfsInodeData::FdSymlink { .. }
-                    | ProcfsInodeData::FdinfoFile { .. }
-                    | ProcfsInodeData::Sysctl { .. }
-                    | ProcfsInodeData::File { .. }
-                    | ProcfsInodeData::Directory { .. }
-                    | ProcfsInodeData::FixedLink(_)
-                    | ProcfsInodeData::NetFile { .. }
-            )
-        })
-        .unwrap_or(false)
-    }
-
     /// The magic links jump (Linux proc_pid_get_link, after
     /// proc_fd_access_allowed: proc_fd_link, proc_cwd_link,
     /// proc_root_link, proc_exe_link; proc_ns_get_link: ns_get_path);
@@ -514,6 +495,11 @@ impl InodeOps for ProcfsInodeOps {
     }
 
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+        // Every answer needs the inode data, which an RCU walk may not
+        // read (`private` goes with the teardown): ref mode
+        if mask & crate::fs::dac::MAY_NOT_BLOCK != 0 {
+            return Err(KernelError::NoChild);
+        }
         // A process directory hidepid= hides (Linux proc_pid_permission)
         if let Some(t) = pid_dir_pid(inode) {
             opts::with(inode, |o| o.pid_permission(&t)).unwrap_or(Ok(()))?;
@@ -542,35 +528,16 @@ impl InodeOps for ProcfsInodeOps {
 
     /// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that
     /// is gone, or of an fd no longer open, is invalid; a live one takes
-    /// the task's current owner (pid_update_inode)
-    fn revalidate(&self, inode: &Inode) -> bool {
-        // A /proc/<pid>/net file is looked up afresh by every walk, so
-        // it follows the task's namespace (Linux proc_net_d_revalidate)
-        if with_data(inode, |d| matches!(d, ProcfsInodeData::NetFile { .. })).unwrap_or(false) {
-            return false;
+    /// the task's current owner (pid_update_inode). ECHILD in an RCU
+    /// walk: Linux's tid_fd_revalidate, proc_sys_revalidate and
+    /// proc_misc_d_revalidate are; its pid_revalidate is not, but here
+    /// every answer needs the inode data, which an RCU walk may not read
+    /// (`private` goes with the teardown).
+    fn revalidate(&self, inode: &Inode, rcu: bool) -> Result<bool, KernelError> {
+        if rcu {
+            return Err(KernelError::NoChild);
         }
-        let fd_of = |d: &ProcfsInodeData| match d {
-            ProcfsInodeData::FdSymlink { fd, .. } | ProcfsInodeData::FdinfoFile { fd, .. } => {
-                Some(*fd)
-            }
-            _ => None,
-        };
-        let Some((Some(p), fd)) = with_data(inode, |d| (d.pid(), fd_of(d))) else {
-            return true;
-        };
-        let Some(t) = p.task() else {
-            return false;
-        };
-        if let Some(fd) = fd {
-            let Some(file) = task_files(&t).and_then(|f| f.lock().get(fd)) else {
-                return false;
-            };
-            fd_update_inode(inode, &file);
-        }
-        let (uid, gid) = dump_owner(&t);
-        inode.set_uid(uid);
-        inode.set_gid(gid);
-        true
+        Ok(revalidate_ref(inode))
     }
 
     /// A new per-process inode takes the task's owner (Linux
@@ -581,6 +548,35 @@ impl InodeOps for ProcfsInodeOps {
         pid_update_inode(&inode);
         Ok(inode)
     }
+}
+
+/// [`InodeOps::revalidate`] of a procfs inode in ref mode
+fn revalidate_ref(inode: &Inode) -> bool {
+    // A /proc/<pid>/net file is looked up afresh by every walk, so
+    // it follows the task's namespace (Linux proc_net_d_revalidate)
+    if with_data(inode, |d| matches!(d, ProcfsInodeData::NetFile { .. })).unwrap_or(false) {
+        return false;
+    }
+    let fd_of = |d: &ProcfsInodeData| match d {
+        ProcfsInodeData::FdSymlink { fd, .. } | ProcfsInodeData::FdinfoFile { fd, .. } => Some(*fd),
+        _ => None,
+    };
+    let Some((Some(p), fd)) = with_data(inode, |d| (d.pid(), fd_of(d))) else {
+        return true;
+    };
+    let Some(t) = p.task() else {
+        return false;
+    };
+    if let Some(fd) = fd {
+        let Some(file) = task_files(&t).and_then(|f| f.lock().get(fd)) else {
+            return false;
+        };
+        fd_update_inode(inode, &file);
+    }
+    let (uid, gid) = dump_owner(&t);
+    inode.set_uid(uid);
+    inode.set_gid(gid);
+    true
 }
 
 /// `f` on the inode's procfs data under its read lock (copy out what

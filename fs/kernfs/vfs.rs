@@ -140,14 +140,13 @@ impl InodeOps for KernfsIops {
         });
     }
 
-    /// Linux kernfs_dop_revalidate: a removed node's dentry is stale
-    fn revalidate(&self, inode: &Inode) -> bool {
-        knode(inode).is_some_and(|kn| !kn.removed())
-    }
-
-    /// kernfs_dop_revalidate is -ECHILD in an RCU walk
-    fn revalidate_blocks(&self, _inode: &Inode) -> bool {
-        true
+    /// Linux kernfs_dop_revalidate: a removed node's dentry is stale;
+    /// ECHILD in an RCU walk, as there (the node is the inode data)
+    fn revalidate(&self, inode: &Inode, rcu: bool) -> Result<bool, KernelError> {
+        if rcu {
+            return Err(KernelError::NoChild);
+        }
+        Ok(knode(inode).is_some_and(|kn| !kn.removed()))
     }
 
     fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {

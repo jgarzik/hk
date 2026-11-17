@@ -186,22 +186,19 @@ pub trait InodeOps: Send + Sync {
     }
 
     /// A cached dentry of this inode is still good for the walk (Linux
-    /// d_revalidate): false drops it and the walk looks the name up
-    /// again. Default yes; procfs says no once its task or fd is gone.
-    fn revalidate(&self, _inode: &Inode) -> bool {
-        true
-    }
-
-    /// `revalidate` needs the ref-walk (Linux d_revalidate's -ECHILD
-    /// under LOOKUP_RCU), so a RESOLVE_CACHED walk stops there (EAGAIN).
-    /// Default no; kernfs, and procfs outside its process directories,
-    /// say yes.
-    fn revalidate_blocks(&self, _inode: &Inode) -> bool {
-        false
+    /// d_revalidate): Ok(false) drops it and the walk looks the name up
+    /// again. With `rcu` (LOOKUP_RCU) an RCU walk asks: `inode` is
+    /// borrowed with no reference and may be torn down already, so only
+    /// its fields with no drop glue may be read (`IFree`); ECHILD where
+    /// that is not enough, and the walk asks again in ref mode. Default
+    /// yes; procfs says no once its task or fd is gone.
+    fn revalidate(&self, _inode: &Inode, _rcu: bool) -> Result<bool, KernelError> {
+        Ok(true)
     }
 
     /// Access check for `mask` (MAY_* bits) by `cred` (Linux
-    /// ->permission). Default: generic_permission (mode bits plus
+    /// ->permission). With MAY_NOT_BLOCK an RCU walk asks, as for
+    /// `revalidate`'s `rcu`. Default: generic_permission (mode bits plus
     /// capability overrides); /proc/sys overrides it with sysctl_perm.
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         super::dac::generic_permission(cred, inode, mask)

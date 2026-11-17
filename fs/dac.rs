@@ -33,6 +33,11 @@ pub const MAY_ACCESS: u32 = 16;
 pub const MAY_OPEN: u32 = 32;
 /// Permission mask: check comes from chdir()
 pub const MAY_CHDIR: u32 = 64;
+/// Permission mask: an RCU path walk asks, with no reference to the
+/// inode (Linux MAY_NOT_BLOCK): the check may read only fields an RCU
+/// reader may (atomics, `i_op`; `inode::IFree`) and must not block;
+/// anything else is ECHILD, and the walk asks again in ref mode
+pub const MAY_NOT_BLOCK: u32 = 128;
 
 pub use super::file::flags::O_NOATIME;
 
@@ -91,7 +96,8 @@ fn mode_ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, mask: u32) -> bool {
 /// generic_permission: mode bits, then capability overrides.
 /// CAP_DAC_READ_SEARCH reads files and reads/searches directories;
 /// CAP_DAC_OVERRIDE grants everything except exec of a file with no
-/// x bit at all.
+/// x bit at all. Reads only the mode, owner and group (atomics), so
+/// it answers MAY_NOT_BLOCK too (Linux: rcu-walk aware).
 pub fn generic_permission(c: &Cred, inode: &Inode, mask: u32) -> Result<(), KernelError> {
     let mode = inode.mode();
     permission_ids(
@@ -147,18 +153,24 @@ pub fn want_write(inode: &Inode) -> Result<WriteAccess, KernelError> {
 }
 
 /// sb_permission: writing a regular file, directory or symlink of a
-/// read-only file system is EROFS (devices, FIFOs, sockets are fine)
+/// read-only file system is EROFS (devices, FIFOs, sockets are fine).
+/// The superblock is read for a write only, as Linux: an RCU walk's
+/// MAY_EXEC must not touch `Inode.sb`, which a teardown releases.
 fn sb_permission(inode: &Inode, mask: u32) -> Result<(), KernelError> {
+    if mask & MAY_WRITE == 0 {
+        return Ok(());
+    }
     let m = inode.mode();
     let ro = inode.superblock().is_some_and(|sb| sb.rdonly());
-    if mask & MAY_WRITE != 0 && ro && (m.is_file() || m.is_dir() || m.is_symlink()) {
+    if ro && (m.is_file() || m.is_dir() || m.is_symlink()) {
         return Err(KernelError::ReadOnlyFs);
     }
     Ok(())
 }
 
 /// inode_permission with explicit credentials: sb_permission, then the
-/// inode's InodeOps::permission (generic_permission unless overridden)
+/// inode's InodeOps::permission (generic_permission unless overridden);
+/// with MAY_NOT_BLOCK, `inode` may be one an RCU walk borrowed
 pub fn permission_as(c: &Cred, inode: &Inode, mask: u32) -> Result<(), KernelError> {
     sb_permission(inode, mask)?;
     inode.i_op.permission(inode, c, mask)
