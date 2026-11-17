@@ -398,7 +398,10 @@ pub fn action(g: &SigGuard<'_>, sig: Signal) -> SigAction {
     g[sig.idx()].clone()
 }
 
-/// A handler table with every action at its default
+/// A handler table with every action at its default. Out of line: the
+/// fill, unrolled, takes a stack slot per action, ~2 KB of frame in
+/// every caller fork inlines it into (debug-assertion builds)
+#[inline(never)]
 fn default_actions() -> Box<[SigAction]> {
     alloc::vec![SigAction::new(); NSIG as usize].into_boxed_slice()
 }

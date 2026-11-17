@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 
 use crate::arch::ArchPageTable;
 use crate::arch::CurrentArch;
-use crate::arch::{ContextOps, CpuOps, FrameAlloc, PerCpuOps, SchedArch, UserModeOps, UserRegs};
+use crate::arch::{ContextOps, CpuOps, FrameAlloc, PerCpuOps, SchedArch, UserModeOps};
 use crate::ns::Namespace;
 use crate::printkln;
 use crate::signal::notify::{Told, Zombie, notify};
@@ -2839,17 +2839,20 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Every user register of the parent's syscall (Linux copy_thread:
     // *childregs = *current_pt_regs()), returning 0, on its own stack
-    // unless it shares the parent's (fork: child_stack 0)
-    let mut child_trapframe = current_pt_regs().get();
-    child_trapframe.set_ret(0);
+    // unless it shares the parent's (fork: child_stack 0). Copied
+    // straight onto the child's kernel stack: through this frame it
+    // would cost the whole frame, FP/SIMD state included, of stack here
+    let tf_ptr = trapframe_ptr as *mut <CurrentArch as Arch>::TrapFrame;
+    // SAFETY: the parent's frame (ours, running) into the TrapFrame slot
+    // at the top of the child's new kernel stack, which nothing else
+    // reaches before the child runs; plain registers, no drop
+    unsafe { core::ptr::copy_nonoverlapping(current_pt_regs().as_ptr(), tf_ptr, 1) };
+    // SAFETY: the child's frame, written just above, reached only here
+    // until the child runs
+    let child_regs = unsafe { crate::arch::UserFrame::from_ptr(tf_ptr) };
+    child_regs.set_ret(0);
     if config.child_stack != 0 {
-        child_trapframe.set_sp(config.child_stack);
-    }
-
-    // Copy TrapFrame to child's kernel stack
-    unsafe {
-        let tf_ptr = trapframe_ptr as *mut <CurrentArch as Arch>::TrapFrame;
-        core::ptr::write(tf_ptr, child_trapframe);
+        child_regs.set_sp(config.child_stack);
     }
 
     // Create TaskContext pointing to clone_child_entry, its frame below
@@ -2908,28 +2911,30 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // section that lists it (below)
         ..crate::task::TaskInner::new(TaskState::Ready, child_pgd)
     };
-    let child_task = Task::new(
-        child_tid,
-        crate::task::TaskIds {
-            pid: child_pid,
-            seccomp_mode: parent_seccomp_mode,
-            thread_pid: Some(child_thread_pid.clone()),
-        },
-        TaskKind::UserProcess,
-        kstack_top,
-        cpu_id,
-        &parent_cpus_allowed,
-        child_cred,
-        child_mm,
-        // The name and memory policy are inherited
-        parent_alloc,
-        child_sig,
-        child_task_inner,
-    );
+    // Built in its block (Linux dup_task_struct fills the slab object):
+    // a task copied through fork's frames costs kilobytes of stack. On
+    // failure the stack, pid and mm go with the unbuilt task's parts
+    let child_task = crate::util::kalloc::try_arc_with(|| {
+        Task::new(
+            child_tid,
+            crate::task::TaskIds {
+                pid: child_pid,
+                seccomp_mode: parent_seccomp_mode,
+                thread_pid: Some(child_thread_pid.clone()),
+            },
+            TaskKind::UserProcess,
+            kstack_top,
+            cpu_id,
+            &parent_cpus_allowed,
+            child_cred,
+            child_mm,
+            // The name and memory policy are inherited
+            parent_alloc,
+            child_sig,
+            child_task_inner,
+        )
+    })?;
     child_task.se.stack.set(stack);
-    // On failure the stack goes with the unbuilt task, like its pid
-    // and mm
-    let child_task = try_arc(child_task)?;
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }

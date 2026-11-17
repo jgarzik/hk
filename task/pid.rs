@@ -21,7 +21,7 @@
 //! guard drops, or take a reference ([`find_pid`], Linux find_get_pid).
 
 use crate::util::error::KernelError;
-use crate::util::kalloc::{arc_nofail, box_nofail, try_arc, try_box};
+use crate::util::kalloc::{arc_nofail, box_nofail, try_box_array};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -256,7 +256,7 @@ impl PidMap {
         };
         let mut p = slot.load(Ordering::Acquire);
         if p.is_null() {
-            let new = Box::into_raw(try_box([const { AtomicU64::new(0) }; 512])?);
+            let new = Box::into_raw(try_box_array(|| AtomicU64::new(0))?);
             match slot.compare_exchange(
                 core::ptr::null_mut(),
                 new,
@@ -418,7 +418,7 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
     // Counted now: on failure the unbuilt Pid's Drop uncounts it, puts
     // that active reference and gives its numbers back (it was never
     // hashed)
-    let pid = try_arc(Pid {
+    let pid = crate::util::kalloc::try_arc_with(|| Pid {
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
         task: crate::sync::rcu::RcuPtr::null(),

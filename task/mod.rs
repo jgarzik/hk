@@ -1607,8 +1607,11 @@ impl TaskLock<'_> {
 }
 
 impl Task {
-    /// A task with its locked fields (not yet in the table)
+    /// A task with its locked fields (not yet in the table). Out of
+    /// line: returned in place into the caller's block
+    /// (`kalloc::try_arc_with`), not built in the caller's frame
     #[expect(clippy::too_many_arguments)]
+    #[inline(never)]
     pub fn new(
         tid: Tid,
         ids: TaskIds,

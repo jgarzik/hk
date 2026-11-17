@@ -32,7 +32,10 @@ pub struct Mib<const N: usize> {
 }
 
 impl<const N: usize> Mib<N> {
-    /// All zero, a part per possible CPU (Linux alloc_percpu); ENOMEM
+    /// All zero, a part per possible CPU (Linux alloc_percpu); ENOMEM.
+    /// Out of line: each part is made on its frame before it is pushed,
+    /// and a namespace makes six MIBs
+    #[inline(never)]
     fn new() -> Result<Self, KernelError> {
         let n = crate::cpu::nr_possible() as usize;
         let mut v = crate::util::kmem::KVec::try_with_capacity(n)?;
@@ -140,7 +143,7 @@ impl NetMib {
         let m = crate::util::kalloc::try_arc(Self {
             ip: Mib::new()?,
             icmp: Mib::new()?,
-            icmpmsg: crate::util::kalloc::try_box([const { AtomicU64::new(0) }; ICMPMSG_MIB_MAX])?,
+            icmpmsg: crate::util::kalloc::try_box_array(|| AtomicU64::new(0))?,
             tcp: Mib::new()?,
             udp: Mib::new()?,
             net: Mib::new()?,

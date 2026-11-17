@@ -1122,14 +1122,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
     host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
     the socket is an active connect (no listener-side code involved).
 
-11. **arm64 stack margin with debug assertions**: a `check-arm` boot
-    of a kernel built with debug assertions
-    (`KERNEL_FEATURES='--config profile.release.debug-assertions=true'`)
-    reports `STACK:FAIL` at about 3860 of 16384 bytes left (need 4096);
-    release kernels stay near 7000-7500 (`task/percpu.rs`
-    `check_stack_usage` names the task of each new low). Find the
-    path the assertions deepen (objdump frame sizes) and shrink it.
-
 12. **FORK_PGRP_SIGNAL flake** (hk x86, once in three local `check`
     runs): `FORK_PGRP_SIGNAL:FAIL got 11`: in round 1 a child forked
     before the group's SIGUSR1 showed pending in its parent did not
@@ -1145,12 +1137,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
     every tcp_mem limit at 4 pages. A connection stalled under memory
     pressure: a forced charge for an empty queue, or the window or
     retransmit timer after a drop, may not restart it.
-
-14. **arm64 release stack low dropped**: `check-arm`'s low (deepest
-    thread the isolated BLK test child) fell after the path-walk work and
-    moves between builds of near-identical code as frames such as
-    `syscall_enter_from_user_mode` and `msdos_partition` split out or
-    merge. Find the deepest call chain and shrink its largest frames.
 
 ## DRM dumb buffers are the boot framebuffer only
 

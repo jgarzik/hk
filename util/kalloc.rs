@@ -172,6 +172,31 @@ pub fn try_arc_uninit<T>() -> Result<Arc<core::mem::MaybeUninit<T>>, KernelError
     reserved(arc_layout::<T>(), Arc::new_uninit)
 }
 
+/// `Box::new([f(); N])` made item by item in the heap block, or ENOMEM:
+/// for a large array (Linux kzalloc), which `try_box([..; N])` builds
+/// on the stack first in builds that do not optimize the copy away
+pub fn try_box_array<T, const N: usize>(f: impl FnMut() -> T) -> Result<Box<[T; N]>, KernelError> {
+    let v = crate::util::kmem::try_vec_with(N, f)?;
+    match v.into_boxed_slice().try_into() {
+        Ok(b) => Ok(b),
+        Err(_) => unreachable!("try_box_array: N items made"),
+    }
+}
+
+/// `Arc::new(f())` with the block allocated first and `f`'s value made
+/// in it, or ENOMEM before `f` runs: for a large `T`, which
+/// `try_arc(v)` copies through the caller's frame and its own (Linux
+/// fills a slab object in place, dup_task_struct)
+#[inline(always)]
+pub fn try_arc_with<T>(f: impl FnOnce() -> T) -> Result<Arc<T>, KernelError> {
+    let mut a = try_arc_uninit::<T>()?;
+    Arc::get_mut(&mut a)
+        .expect("try_arc_with: a new Arc is unshared")
+        .write(f());
+    // SAFETY: the value was written just above
+    Ok(unsafe { a.assume_init() })
+}
+
 /// `Arc::<[T]>::from(s)`, or ENOMEM (a refcounted copy of a slice:
 /// Linux's external_name)
 pub fn try_arc_slice<T: Copy>(s: &[T]) -> Result<Arc<[T]>, KernelError> {

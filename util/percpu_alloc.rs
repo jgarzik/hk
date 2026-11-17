@@ -101,7 +101,7 @@ impl PcpSlot {
                 let chunk: Box<Chunk> = if nofail {
                     crate::util::kalloc::box_nofail([const { AtomicIsize::new(0) }; SLOTS])
                 } else {
-                    crate::util::kalloc::try_box([const { AtomicIsize::new(0) }; SLOTS])?
+                    crate::util::kalloc::try_box_array(|| AtomicIsize::new(0))?
                 };
                 // Published once, under GROW, never freed
                 a.chunks[c].store(Box::into_raw(chunk), Ordering::Release);
