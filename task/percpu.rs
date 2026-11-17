@@ -2555,6 +2555,16 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(KernelError::InvalidArgument);
     }
 
+    // A thread group shares its handlers, and handlers are shared only
+    // with the memory (Linux copy_process): every thread of a group
+    // names its group's table, whose siglock its thread list is under
+    if config.flags & CLONE_THREAD != 0 && config.flags & CLONE_SIGHAND == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if config.flags & CLONE_SIGHAND != 0 && config.flags & CLONE_VM == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+
     // Validate: CLONE_SIGHAND and CLONE_CLEAR_SIGHAND are mutually exclusive
     // (can't share handlers AND reset them at the same time)
     if config.flags & CLONE_SIGHAND != 0 && config.flags & CLONE_CLEAR_SIGHAND != 0 {
