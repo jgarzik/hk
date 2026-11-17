@@ -1150,6 +1150,11 @@ Tag = roadmap phase (doc/ROADMAP.md).
     taken minutes apart in time and absorbs host contention; interleave
     the low and high batches, or compare more tries.
 
+15. **AIO_VFAT_DIO_CACHE flake on Linux** (`check-linux`, once):
+    `AIO_VFAT_DIO_CACHE:FAIL io_getevents got -4`: io_getevents returned
+    EINTR on the reference Linux; a rerun passed. Find what signal
+    interrupts the wait, or retry the wait on EINTR as Linux allows.
+
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
