@@ -1,5 +1,6 @@
 //! File open/close syscalls
 
+use super::dentry::LookupBits;
 use super::file::EMPTY_FOPS;
 use crate::fs::DentryRef;
 use crate::fs::FileRef;
@@ -27,12 +28,14 @@ use crate::util::error::KernelResult;
 /// lookup_open + may_o_create) under the parent's lock: an entry that
 /// appeared meanwhile is returned as is (created = false); otherwise
 /// write+search on the parent, the mode gets the umask and SGID
-/// stripping, the owner comes from init_owner
+/// stripping, the owner comes from init_owner. `flags`: the last name's
+/// nd->flags, the open's intent in them
 fn create_in(
     mnt: &super::mount::MountRef,
     parent: &DentryRef,
     name: &[u8],
     mode: u32,
+    flags: LookupBits,
 ) -> Result<(DentryRef, bool), KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     if !dir.mode().is_dir() {
@@ -43,9 +46,9 @@ fn create_in(
     let w = mnt.want_write();
     let _dir_lock = dir.lock();
     (|| {
-        // Linux lookup_open: d_revalidate with the open's intent
-        let intent = super::dentry::LookupBits::OPEN | super::dentry::LookupBits::CREATE;
-        if let Ok(d) = lookup_one(parent, name, intent) {
+        // Linux lookup_open: d_revalidate with nd->flags, the open's
+        // intent in them
+        if let Ok(d) = lookup_one(parent, name, flags) {
             return Ok((d, false));
         }
         let _w = w?;
@@ -215,6 +218,12 @@ pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
 fn open_lookup(flags: u32, res: u64) -> LookupFlags {
     use resolve::*;
     let excl = flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL;
+    // op->intent: LOOKUP_OPEN but for O_PATH, LOOKUP_CREATE with O_CREAT,
+    // LOOKUP_EXCL with O_EXCL too
+    let mut intent = LookupBits::empty();
+    intent.set(LookupBits::OPEN, flags & O_PATH == 0);
+    intent.set(LookupBits::CREATE, flags & O_CREAT != 0);
+    intent.set(LookupBits::EXCL, excl);
     LookupFlags {
         directory: flags & O_DIRECTORY != 0,
         follow: flags & O_NOFOLLOW == 0 && !excl,
@@ -224,6 +233,7 @@ fn open_lookup(flags: u32, res: u64) -> LookupFlags {
         beneath: res & RESOLVE_BENEATH != 0,
         in_root: res & RESOLVE_IN_ROOT != 0,
         cached: res & RESOLVE_CACHED != 0,
+        intent,
         ..LookupFlags::default()
     }
 }
@@ -330,7 +340,7 @@ fn open_target_nd(
     let (d, created) = match nd.lookup(Start::path(&dir), &p.name, lf) {
         Ok(d) => (d, false),
         Err(KernelError::NotFound) => {
-            let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode)?;
+            let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode, lf.bits(true))?;
             (Path::new(p.mnt.clone(), d), c)
         }
         Err(e) => return Err(e),
@@ -465,8 +475,11 @@ pub fn file_open_root(root: &Path, flags: u32) -> Result<FileRef, KernelError> {
 /// write and search on the directory (EACCES), EOPNOTSUPP from a file
 /// system without tmpfile. Linkable unless O_EXCL.
 fn tmpfile_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
+    // Linux do_tmpfile: path_lookupat with the lookup flags alone, no
+    // intent
     let lf = LookupFlags {
         directory: true,
+        intent: LookupBits::empty(),
         ..op.lookup
     };
     let dir = at.lookup(path, lf)?;

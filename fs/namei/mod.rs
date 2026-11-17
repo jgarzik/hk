@@ -72,6 +72,15 @@ pub struct LookupFlags {
     pub in_root: bool,
     /// The dcache alone, else EAGAIN (Linux LOOKUP_CACHED)
     pub cached: bool,
+    /// An open's intent (Linux op->intent: LOOKUP_OPEN, LOOKUP_CREATE,
+    /// LOOKUP_EXCL), which the last component's lookup carries (Linux
+    /// open_last_lookups: nd->flags |= op->intent, cleared again when
+    /// it is a symlink to follow)
+    pub intent: LookupBits,
+    /// The walk is of a parent's name only, every component one on the
+    /// way (Linux path_parentat: link_path_walk's LOOKUP_PARENT
+    /// throughout, the last name not walked)
+    pub parent: bool,
 }
 
 impl LookupFlags {
@@ -101,12 +110,33 @@ impl LookupFlags {
         }
     }
 
-    /// What a d_revalidate sees of them (Linux nd->flags)
-    pub fn bits(&self) -> LookupBits {
+    /// What a d_revalidate sees of them when it is asked for a component
+    /// (Linux nd->flags then): the RESOLVE_* restrictions and
+    /// LOOKUP_LINKAT_EMPTY always; on the way (LOOKUP_PARENT: any
+    /// component but the walk's `last`, every one of a parent's walk),
+    /// the caller's FOLLOW and DIRECTORY; on the last, those and an
+    /// open's intent (LOOKUP_PARENT cleared, op->intent added)
+    pub fn bits(&self, last: bool) -> LookupBits {
         let mut b = LookupBits::empty();
+        b.set(LookupBits::LINKAT_EMPTY, self.linkat_empty);
+        b.set(LookupBits::CACHED, self.cached);
+        b.set(LookupBits::NO_SYMLINKS, self.no_symlinks);
+        b.set(LookupBits::NO_MAGICLINKS, self.no_magiclinks);
+        b.set(LookupBits::NO_XDEV, self.no_xdev);
+        b.set(LookupBits::BENEATH, self.beneath);
+        b.set(LookupBits::IN_ROOT, self.in_root);
+        // A parent's walk follows and wants directories by itself; its
+        // caller asked for neither (Linux path_parentat's flags)
+        if self.parent {
+            return b | LookupBits::PARENT;
+        }
         b.set(LookupBits::FOLLOW, self.follow);
         b.set(LookupBits::DIRECTORY, self.directory);
-        b
+        if last {
+            b | self.intent
+        } else {
+            b | LookupBits::PARENT
+        }
     }
 
     /// Scoped to the start (Linux LOOKUP_IS_SCOPED)
@@ -356,17 +386,18 @@ pub const NAME_MAX: usize = 255;
 /// walk_component's lookup in ref mode: `name` in `parent`, whose inode
 /// is `dir` (Linux lookup_fast without LOOKUP_RCU: the dcache with no
 /// lock; on a miss, or a stale entry, lookup_slow); a negative answer
-/// is ENOENT (step_into)
+/// is ENOENT (step_into). `flags`: nd->flags for this component
+/// ([`LookupFlags::bits`]).
 fn walk_lookup(
     parent: &DentryRef,
     dir: &Inode,
     name: &[u8],
-    f: LookupFlags,
+    flags: LookupBits,
 ) -> Result<DentryRef, KernelError> {
     name_ok(name)?;
-    match lookup_dcache(parent, dir, name, f.bits())? {
+    match lookup_dcache(parent, dir, name, flags)? {
         Some(d) => positive(d),
-        None => positive(lookup_slow(parent, dir, name, f.bits())?),
+        None => positive(lookup_slow(parent, dir, name, flags)?),
     }
 }
 
@@ -411,12 +442,12 @@ fn lookup_fast_ref(
     child: DentryRef,
     name: &[u8],
     rcu: Result<bool, KernelError>,
-    f: LookupFlags,
+    flags: LookupBits,
 ) -> Result<DentryRef, KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    match d_revalidate(&dir, child, Some(rcu), f.bits())? {
+    match d_revalidate(&dir, child, Some(rcu), flags)? {
         Some(c) => positive(c),
-        None => positive(lookup_slow(parent, &dir, name, f.bits())?),
+        None => positive(lookup_slow(parent, &dir, name, flags)?),
     }
 }
 
@@ -763,7 +794,7 @@ impl<'a> Nd<'a> {
                     self.recheck()?;
                     None
                 }
-                name => Some(walk_lookup(&cur.dentry, &dir, name, w.f)?),
+                name => Some(walk_lookup(&cur.dentry, &dir, name, w.f.bits(c.last))?),
             };
             w.advance(&c);
             if let Some(d) = d {
@@ -822,13 +853,14 @@ impl<'a> Nd<'a> {
                 let name = w.name(&c)?;
                 name_ok(name)?;
                 let dir = cur.dentry.get_inode().ok_or(KernelError::NotFound)?;
-                let d = positive(lookup_slow(&cur.dentry, &dir, name, w.f.bits())?)?;
+                let d = positive(lookup_slow(&cur.dentry, &dir, name, w.f.bits(c.last))?)?;
                 w.advance(&c);
                 self.step(cur, d, c.last, &mut w)?
             }
             To::Child { cur, child, reval } => {
                 let c = w.next()?.ok_or(ECHILD)?;
-                let d = lookup_fast_ref(&cur.dentry, child, w.name(&c)?, reval, w.f)?;
+                let f = w.f.bits(c.last);
+                let d = lookup_fast_ref(&cur.dentry, child, w.name(&c)?, reval, f)?;
                 w.advance(&c);
                 self.step(cur, d, c.last, &mut w)?
             }
@@ -969,6 +1001,7 @@ impl<'a> Nd<'a> {
         let dirf = LookupFlags {
             follow: true,
             directory: true,
+            parent: true,
             ..f.resolve()
         };
         let (mnt, dir) = match (dir_path.is_empty(), start) {
@@ -1004,8 +1037,10 @@ impl<'a> Nd<'a> {
         const MAX_SYMLINKS: usize = 40;
         for _ in 0..MAX_SYMLINKS {
             let dir = Path::new(p.mnt.clone(), p.dir.clone());
+            // The last name with the open's intent (Linux lookup_open)
             let nofollow = LookupFlags {
                 follow: false,
+                intent: f.intent,
                 ..f.resolve()
             };
             let found = match self.walk(Start::path(&dir), &p.name, nofollow) {
@@ -1136,7 +1171,11 @@ pub fn create_entry(
     let w = p.mnt.want_write();
     let _dir_lock = dir.lock();
     (|| {
-        if lookup_one(parent, name, LookupBits::CREATE | LookupBits::EXCL).is_ok() {
+        // LOOKUP_CREATE | LOOKUP_EXCL, but no create through a trailing
+        // slash that does not make a directory
+        let mut cf = LookupBits::CREATE | LookupBits::EXCL;
+        cf.set(LookupBits::CREATE, !p.slash);
+        if lookup_one(parent, name, cf).is_ok() {
             return Err(KernelError::AlreadyExists);
         }
         if p.slash {
@@ -1443,7 +1482,7 @@ mod tests {
         let a = Dentry::alloc(&r, b"x", Some(inode(STALE))).unwrap();
         drop(r.remove_child(b"x"));
         let b = Dentry::alloc(&r, b"x", Some(inode(VALID))).unwrap();
-        let d = lookup_fast_ref(&r, a, b"x", Err(ECHILD), LookupFlags::default()).unwrap();
+        let d = lookup_fast_ref(&r, a, b"x", Err(ECHILD), LookupBits::empty()).unwrap();
         assert!(DentryRef::ptr_eq(&d, &b) && !b.d_unhashed());
     }
 
@@ -1468,7 +1507,7 @@ mod tests {
     fn reval_error_returned() {
         let r = root();
         let a = Dentry::alloc(&r, b"x", Some(inode(BROKEN))).unwrap();
-        let f = LookupFlags::default();
+        let f = LookupBits::empty();
         let e = lookup_fast_ref(&r, a.clone(), b"x", Err(ECHILD), f);
         assert_eq!(e.err(), Some(KernelError::Io));
         let dir = r.get_inode().unwrap();
@@ -1543,6 +1582,33 @@ mod tests {
         let x = w.next().unwrap().unwrap();
         assert_eq!(w.name(&x).unwrap(), b"x");
         assert!(x.last);
+    }
+
+    /// What d_revalidate sees of a walk (Linux nd->flags): LOOKUP_PARENT
+    /// on the way, an open's intent on the last component only, a
+    /// parent's walk LOOKUP_PARENT throughout with none of its own
+    /// FOLLOW/DIRECTORY; RESOLVE_* always
+    #[test]
+    fn revalidate_sees_nd_flags() {
+        let open = LookupFlags {
+            follow: true,
+            beneath: true,
+            intent: LookupBits::OPEN | LookupBits::CREATE,
+            ..LookupFlags::default()
+        };
+        let on_way = LookupBits::FOLLOW | LookupBits::BENEATH | LookupBits::PARENT;
+        assert_eq!(open.bits(false), on_way);
+        let at_last = LookupBits::FOLLOW | LookupBits::BENEATH | open.intent;
+        assert_eq!(open.bits(true), at_last);
+        let parent = LookupFlags {
+            follow: true,
+            directory: true,
+            parent: true,
+            ..open.resolve()
+        };
+        let p = LookupBits::PARENT | LookupBits::BENEATH;
+        assert_eq!(parent.bits(false), p);
+        assert_eq!(parent.bits(true), p);
     }
 
     #[test]

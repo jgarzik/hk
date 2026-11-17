@@ -392,10 +392,14 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
     let ((op, oname), odir) = ((&old.0.dir, old.0.name.as_slice()), old.1);
     let ((np, nname), ndir) = ((&new.0.dir, new.0.name.as_slice()), new.1);
     // Linux __start_renaming: the target looked up with
-    // LOOKUP_RENAME_TARGET (and LOOKUP_EXCL for RENAME_NOREPLACE)
+    // LOOKUP_RENAME_TARGET | LOOKUP_CREATE (none for RENAME_EXCHANGE),
+    // and LOOKUP_EXCL for RENAME_NOREPLACE
     let src = lookup_one(op, oname, LookupBits::empty())?;
     let sinode = src.get_inode().ok_or(KernelError::NotFound)?;
-    let mut tflags = LookupBits::RENAME_TARGET;
+    let mut tflags = LookupBits::RENAME_TARGET | LookupBits::CREATE;
+    if flags & RENAME_EXCHANGE != 0 {
+        tflags = LookupBits::empty();
+    }
     tflags.set(LookupBits::EXCL, flags & RENAME_NOREPLACE != 0);
     let dst = lookup_one(np, nname, tflags)
         .ok()

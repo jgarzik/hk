@@ -198,8 +198,14 @@ bitflags::bitflags! {
         const FOLLOW = 1 << 0;
         /// The result must be a directory
         const DIRECTORY = 1 << 1;
+        /// linkat AT_EMPTY_PATH
+        const LINKAT_EMPTY = 1 << 4;
         /// An RCU walk asks (no reference held)
         const RCU = 1 << 8;
+        /// The dcache alone (RESOLVE_CACHED)
+        const CACHED = 1 << 9;
+        /// Not the walk's last component (a parent on the way)
+        const PARENT = 1 << 10;
         /// An open's last component
         const OPEN = 1 << 16;
         /// An object is to be created there
@@ -208,6 +214,16 @@ bitflags::bitflags! {
         const EXCL = 1 << 18;
         /// A rename's target
         const RENAME_TARGET = 1 << 19;
+        /// RESOLVE_NO_SYMLINKS
+        const NO_SYMLINKS = 1 << 24;
+        /// RESOLVE_NO_MAGICLINKS
+        const NO_MAGICLINKS = 1 << 25;
+        /// RESOLVE_NO_XDEV
+        const NO_XDEV = 1 << 26;
+        /// RESOLVE_BENEATH
+        const BENEATH = 1 << 27;
+        /// RESOLVE_IN_ROOT
+        const IN_ROOT = 1 << 28;
     }
 }
 

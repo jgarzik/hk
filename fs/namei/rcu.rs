@@ -731,7 +731,7 @@ impl Nd<'_> {
             let dot = name == b".";
             let got = match name {
                 b"." | b".." => None,
-                _ => match self.lookup_fast_rcu(rc, &cur, name, f, puts)? {
+                _ => match self.lookup_fast_rcu(rc, &cur, name, f, last, puts)? {
                     Ok(c) => Some(c),
                     Err(to) => return self.lazy(to, stack, user, at, f, total, puts),
                 },
@@ -863,7 +863,8 @@ impl Nd<'_> {
     }
 
     /// lookup_fast under LOOKUP_RCU: `name` in `cur` from the dcache,
-    /// revalidated: the child, its inode and its `d_seq` sample; else
+    /// revalidated with nd->flags for it (`last`: the walk's last
+    /// component): the child, its inode and its `d_seq` sample; else
     /// where ref mode takes over (a miss, an answer other than valid)
     fn lookup_fast_rcu<'g>(
         &self,
@@ -871,6 +872,7 @@ impl Nd<'_> {
         cur: &RcuPath<'g>,
         name: &[u8],
         f: LookupFlags,
+        last: bool,
         puts: &mut Puts,
     ) -> Result<Result<Hit<'g>, To>, KernelError> {
         // A miss, maybe a rename's (no RENAME_LOCK check: lookup_slow
@@ -890,7 +892,7 @@ impl Nd<'_> {
         // one, ref-mode d_revalidate if ECHILD)
         // `cur` is a directory may_lookup let through
         let dir = cur.inode.ok_or(ECHILD)?;
-        let status = child.revalidate(dir, inode, LookupBits::RCU | f.bits());
+        let status = child.revalidate(dir, inode, LookupBits::RCU | f.bits(last));
         if status != Ok(true) {
             let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
             return Ok(Err(To::Child {
