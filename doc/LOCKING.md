@@ -3360,7 +3360,8 @@ and hold count; Linux pin_fs_lock) is a spin leaf, thread context only
 install and the count are one hold; the mount is made and put with it
 released.
 tracefs's mount options (`FsInfo`, Linux tracefs_fs_info) are a spin
-leaf, replaced by a mount or remount and read by show_options; the
+leaf, thread context only (never taken in IRQ context, so no IRQ
+class), replaced by a mount or remount and read by show_options; the
 owner an inode takes from the root (Linux set_tracefs_inode_owner) is
 written with no lock, by permission (an RCU walk's too) and getattr,
 from the root's ids and the inode's PERM_SET flags (atomics, as Linux
