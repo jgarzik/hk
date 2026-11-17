@@ -1330,9 +1330,9 @@ fn write_inode_sb(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError
     let off = d.i_pos;
     let mut b = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut b)?;
-    let size = if d.is_dir { 0 } else { inode.get_size() as u32 };
-    entry_set_extent(&mut b, d.start_cluster, size);
-    EntryTimes::of_inode(sb_data.opts.tz(), inode, d.crtime).put(&mut b);
+    let ((start, size), times) = inode_entry(inode, sb_data)?;
+    entry_set_extent(&mut b, start, size);
+    times.put(&mut b);
     write_bytes(&sb_data.bdev, off, &b)
 }
 
@@ -2530,16 +2530,18 @@ impl InodeOps for VfatInodeOps {
             target: existing.map(|t| (&new_inode, t)),
             new_ipos,
         };
+        // A cached inode's own extent and times (Linux __fat_write_inode
+        // after fat_attach), else the old entry's
         let sync_ipos = || {
-            let (start, size) = match &old_inode {
+            let e = &old_entry;
+            let (ext, times) = match &old_inode {
                 Some(i) => {
                     attach(i, &sb_data, np, new_short, new_ipos)?;
-                    (get_inode_data(i)?.start_cluster, i.get_size() as u32)
+                    inode_entry(i, &sb_data)?
                 }
-                None => (old_entry.start_cluster, old_entry.file_size),
+                None => ((e.start_cluster, e.file_size), e.times),
             };
-            let e = &old_entry;
-            write_entry(&sb_data, new_ipos, e.attr, (start, size), &e.times)
+            write_entry(&sb_data, new_ipos, e.attr, ext, &times)
         };
         if let Err(e) = sync_ipos() {
             unwind.inode(None);
@@ -2676,6 +2678,18 @@ fn write_entry(
     write_bytes(&sb_data.bdev, off, &b)
 }
 
+/// What `inode`'s entry holds of it (Linux __fat_write_inode): its
+/// first cluster and size (0 for a directory), and its times
+fn inode_entry(
+    inode: &Inode,
+    sb_data: &VfatSbData,
+) -> Result<((u32, u32), EntryTimes), KernelError> {
+    let d = get_inode_data(inode)?;
+    let size = if d.is_dir { 0 } else { inode.get_size() as u32 };
+    let times = EntryTimes::of_inode(sb_data.opts.tz(), inode, d.crtime);
+    Ok(((d.start_cluster, size), times))
+}
+
 /// What a failed rename puts back (Linux vfat_rename's error_dotdot and
 /// error_inode)
 struct Unwind<'a> {
@@ -2716,16 +2730,15 @@ impl Unwind<'_> {
         let mut failed = corrupt.unwrap_or(false);
         match self.target {
             Some((ni, t)) => {
-                let (mut start, mut size) = (t.start_cluster, t.file_size);
+                let mut ent = ((t.start_cluster, t.file_size), t.times);
                 if let Some(i) = ni {
                     let _ = attach(i, self.sb_data, self.new_dir, t.short_name, self.new_ipos);
-                    if let Ok(d) = get_inode_data(i) {
-                        (start, size) = (d.start_cluster, i.get_size() as u32);
+                    if let Ok(e) = inode_entry(i, self.sb_data) {
+                        ent = e;
                     }
                 }
                 if corrupt.is_some() {
-                    let ext = (start, size);
-                    let r = write_entry(self.sb_data, self.new_ipos, t.attr, ext, &t.times);
+                    let r = write_entry(self.sb_data, self.new_ipos, t.attr, ent.0, &ent.1);
                     failed |= r.is_err();
                 }
             }
