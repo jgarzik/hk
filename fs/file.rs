@@ -609,6 +609,11 @@ impl File {
             .is_some_and(|m| m.flags() & super::mount::MNT_NOEXEC != 0)
     }
 
+    /// Its mount, borrowed (none for an internal file)
+    pub fn mnt(&self) -> Option<&super::mount::MountRef> {
+        self.mnt.as_ref()
+    }
+
     /// The file's path (Linux f_path); a file with no mount (an internal
     /// object) is placed in the namespace's root mount
     pub fn f_path(&self) -> Option<super::Path> {

@@ -4,7 +4,8 @@ use super::file::EMPTY_FOPS;
 use crate::fs::DentryRef;
 use crate::fs::FileRef;
 use crate::fs::namei::{
-    CreateAt, Last, Nd, filename_lookup, filename_lookup_from, getname, path_start,
+    CreateAt, Dfd, Last, Nd, Start, filename_lookup, filename_lookup_from, filename_lookup_start,
+    getname, path_start,
 };
 use crate::fs::{
     Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
@@ -234,11 +235,11 @@ enum OpenAt<'a> {
 }
 
 impl OpenAt<'_> {
-    /// The walk's start (Linux path_init)
-    fn start(self, path: &[u8], lf: LookupFlags) -> Result<Option<Path>, KernelError> {
+    /// The walk's start (Linux path_init), held for the lookup
+    fn start(self, path: &[u8], lf: LookupFlags) -> Result<Dfd, KernelError> {
         match self {
             Self::Fd(fd) => path_start(fd, path, lf),
-            Self::Root(r) => Ok(Some(r.clone())),
+            Self::Root(r) => Ok(Dfd::Path(r.clone())),
         }
     }
 
@@ -256,10 +257,10 @@ impl OpenAt<'_> {
     /// without LOOKUP_RCU); the caller retries on ECHILD (`open_target`)
     fn lookup_try(self, path: &[u8], lf: LookupFlags, rcu: bool) -> Result<Path, KernelError> {
         let start = self.start(path, lf)?;
+        let s = start.start();
         if path.is_empty() {
-            return filename_lookup_from(start, path, lf);
+            return filename_lookup_start(s, path, lf);
         }
-        let s = start.as_ref();
         Nd::new(s, lf, rcu)?.lookup(s, path, lf)
     }
 }
@@ -299,8 +300,8 @@ fn open_target_nd(
     // slash is EISDIR, existing or not; one lookup (Nd) throughout, so
     // RESOLVE_* holds for the parent, the symlinks and the last name
     let start = at.start(path, lf)?;
-    let nd = Nd::new(start.as_ref(), lf, rcu)?;
-    let p = nd.parentat(start.as_ref(), path, lf)?;
+    let nd = Nd::new(start.start(), lf, rcu)?;
+    let p = nd.parentat(start.start(), path, lf)?;
     if p.last != Last::Norm || p.slash {
         return Err(KernelError::IsDirectory);
     }
@@ -317,7 +318,7 @@ fn open_target_nd(
         CreateAt::Object(d) => return creat_existing(d, flags),
     };
     let dir = Path::new(p.mnt.clone(), p.dir.clone());
-    let (d, created) = match nd.lookup(Some(&dir), &p.name, lf) {
+    let (d, created) = match nd.lookup(Start::path(&dir), &p.name, lf) {
         Ok(d) => (d, false),
         Err(KernelError::NotFound) => {
             let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode)?;

@@ -87,11 +87,7 @@ use alloc::sync::Arc;
 ///
 /// Returns a read-only file, or ENOENT, EACCES, ...
 pub fn kernel_open_exec(path: &[u8]) -> KernelResult<FileRef> {
-    let p = namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        path,
-        LookupFlags::open(),
-    )?;
+    let p = namei::path_lookup(crate::fs::namei::Start::Cwd, path, LookupFlags::open())?;
     open_exec(p)
 }
 

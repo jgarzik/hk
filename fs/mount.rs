@@ -2313,7 +2313,7 @@ pub fn choose_mountpoint(m: &Mount, root: &Path) -> Option<Path> {
     loop {
         let g = crate::sync::rcu::read_lock();
         let seq = MOUNT_LOCK.read_begin();
-        let Some((pm, pd)) = choose_mountpoint_rcu(m, root, &g) else {
+        let Some((pm, pd)) = choose_mountpoint_rcu(m, (&root.mnt, &root.dentry), &g) else {
             if !MOUNT_LOCK.read_retry(seq) {
                 return None;
             }
@@ -2334,17 +2334,16 @@ pub fn choose_mountpoint(m: &Mount, root: &Path) -> Option<Path> {
     }
 }
 
-/// One climb of [`choose_mountpoint`] (Linux choose_mountpoint_rcu)
+/// One climb of [`choose_mountpoint`] (Linux choose_mountpoint_rcu),
+/// stopping at the root (`root`: its mount and dentry)
 pub(super) fn choose_mountpoint_rcu<'g>(
     m: &'g Mount,
-    root: &Path,
+    root: (&Mount, &Dentry),
     g: &'g crate::sync::rcu::RcuReadGuard,
 ) -> Option<(&'g Mount, &'g Dentry)> {
     let mut m = m;
     while let Some((p, mp)) = m.up_rcu(g) {
-        if core::ptr::eq(mp, DentryRef::as_ptr(&root.dentry))
-            && core::ptr::eq(p, MountRef::as_ptr(&root.mnt))
-        {
+        if core::ptr::eq(mp, root.1) && core::ptr::eq(p, root.0) {
             return None;
         }
         if !core::ptr::eq(mp, p.root_addr()) {
@@ -2555,12 +2554,7 @@ fn chroot_fs_refs(old: &Path, new: &Path) {
         let Some(fs) = super::get_task_fs(&t) else {
             continue;
         };
-        if fs.get_root().same(old) {
-            fs.set_root(new.clone());
-        }
-        if fs.get_pwd().same(old) {
-            fs.set_pwd(new.clone());
-        }
+        fs.replace_refs(old, new);
     }
 }
 

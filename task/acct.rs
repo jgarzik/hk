@@ -266,12 +266,9 @@ fn open_acct_file(path: &[u8]) -> KernelResult<FileRef> {
     use crate::fs::{LookupFlags, dac};
 
     // Any lookup error as is (Linux filp_open)
-    let (mnt, dentry) = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        path,
-        LookupFlags::open(),
-    )?
-    .into_parts();
+    let (mnt, dentry) =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, path, LookupFlags::open())?
+            .into_parts();
 
     // file_open_name(O_WRONLY | O_APPEND): may_open, then a regular file
     if let Some(inode) = dentry.get_inode() {

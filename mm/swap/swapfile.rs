@@ -35,7 +35,6 @@ use crate::sync::spin::{Mutex, RwLock};
 
 use super::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
-use crate::fs::namei::path_lookupat;
 use crate::fs::{Inode, LookupFlags, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
@@ -561,9 +560,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         return Err(KernelError::NotPermitted);
     }
     let path = user_path(path)?;
-    let cwd = crate::task::percpu::current_cwd();
     let swap_file =
-        path_lookupat(cwd, &path, LookupFlags::open()).map_err(|_| KernelError::NotFound)?;
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, LookupFlags::open())
+            .map_err(|_| KernelError::NotFound)?;
     let inode = swap_file.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _g = SWAPON.lock();
     if find_swap_by_path(&path).is_some() {

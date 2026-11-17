@@ -109,11 +109,8 @@ pub fn sys_truncate(path_ptr: UserPtr<u8>, length: i64) -> KernelResult<()> {
     let path = crate::fs::namei::getname(path_ptr, false)?;
 
     // Look up the file (follow symlinks for truncate)
-    let fpath = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &path,
-        LookupFlags::open(),
-    )?;
+    let fpath =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, LookupFlags::open())?;
     let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // vfs_truncate: EISDIR / EINVAL, write access (EROFS), write

@@ -638,7 +638,7 @@ Filesystem-internal locks (ramfs children: sleeping RwSem inside the
     ↓
 Leaves taken with no task lock held (their Arc is cloned out of the
 Task first, under its alloc_lock or lock-free by the task itself):
-UtsNamespace.name (RwLock), FsStruct.inner (Mutex),
+UtsNamespace.name (RwLock), FsStruct.seq (SeqLock),
 FutexHashBucket.waiters (spin Mutex; wakeups through a WakeQ after
 unlocking)
     ↓
@@ -3382,7 +3382,8 @@ Every mount, bind, MS_MOVE and pivot_root locks its target with
 the root of the topmost mount stacked on the path, under MOUNT_LOCK's
 locking read), then that dentry's i_rwsem, then NAMESPACE_SEM, then
 `where_to_mount` again, all released and repeated if it changed; pivot_root's chroot_fs_refs runs after both are
-released (TASKLIST read to collect the tasks, then each FsStruct.inner).
+released (TASKLIST read to collect the tasks, then each FsStruct.seq's
+write side, `replace_refs`).
 umount writes the filesystem back after releasing NAMESPACE_SEM
 (writeback takes inode locks; Linux syncs in deactivate_super after
 namespace_unlock). Mount ids come from `MNT_IDS` (`util::ida::Ida`,
@@ -3498,15 +3499,31 @@ takes references to where it stands (`try_to_unlazy`,
 `try_to_unlazy_next` for a child too, `legitimize_path`:
 `MountRef::legitimize` against MOUNT_LOCK's sequence sampled at the
 lookup's start, `DentryRef::try_get`, then the `d_seq` check again)
-and goes on in ref mode from there; the root is held by the lookup
-(`Nd.root`, Linux ND_ROOT_PRESET). If a legitimize fails, or a
+and goes on in ref mode from there. The walk starts with no reference
+either (Linux path_init under LOOKUP_RCU): the root and the cwd are
+read from the caller's fs_struct (borrowed lock-free, the task's own)
+under `FsStruct.seq`'s sequence (`root_rcu`, `pwd_rcu`: the paths'
+addresses, kept in atomics stored in the write section beside the
+owned paths, and their `d_seq` sampled in the same read; the old
+paths are put after the write section and freed a grace period
+later), a dirfd's path borrowed from its file (the fd table lock and
+a file reference, held for the lookup: hk has no RCU fd lookup), a
+held start (a parent, file_open_root's root) borrowed. The root is
+legitimized at the first unlazy that needs it (`legitimize_root`,
+Linux nd->root_seq: against its `d_seq` and MOUNT_LOCK's sequence,
+the reference kept in `Nd.root` for the ref walks, a scoped lookup's
+held start cloned); complete_walk leaves it untaken unless scoped,
+and a later ref walk of the lookup takes it then (set_root:
+`FsStruct.seq`'s locking read). The credentials are the current
+task's, borrowed (`Task::subj_cred_ref`, Linux current_cred), not
+copied. If a legitimize fails, or a
 sequence moved, the walk is ECHILD and the lookup is done again in
 ref mode from its start (a new `Nd`: path_init's sequences sampled
 again). What a failed legitimize took is put after the guard
 (`Puts`, Linux terminate_walk): a put may be the last. Its slots are
 fixed by role, as terminate_walk's set (the walk's place, the symlink
-being picked, a mount taken without its dentry, try_to_unlazy_next's
-child), each filled at most once since every fill ends the walk; a
+being picked, the root, a mount taken without its dentry,
+try_to_unlazy_next's child), each filled at most once since every fill ends the walk; a
 second fill panics in every build rather than drop under the guard. A
 RESOLVE_CACHED walk (Linux LOOKUP_CACHED) may not leave RCU mode but
 at its end (complete_walk), so it is EAGAIN where Linux's is: the
@@ -3593,10 +3610,10 @@ take the parent's `Inode::lock()` first and, while holding it, look the name
 up (`lookup_one`: dentry `d_lock`, then the file system's `lookup`), decide
 EEXIST / "created by this call", run the DAC checks (`dac::may_create`,
 `dac::may_delete`; these read the inode's atomic mode/uid/gid and, for the
-new mode, the task's umask under `FsStruct.inner`) and perform the
+new mode, the task's umask under `FsStruct.seq`'s locking read) and perform the
 operation. So the existence check, the permission decision and the change
 are atomic with respect to other directory operations on that parent.
-Order: parent `i_rwsem` -> `FsStruct.inner` (umask read, leaf) and parent
+Order: parent `i_rwsem` -> `FsStruct.seq` (umask read, leaf) and parent
 `i_rwsem` -> dentry `d_lock` -> fs-internal locks. Rename does the same
 lookups and checks (`link.rs::rename_locked`) inside `lock_rename()`.
 
@@ -5929,7 +5946,7 @@ this is the interrupt-safety invariant:
 | `SignalStruct.jobctl` | signal/mod.rs, signal/stop.rs | `Mutex` | Job-control (group stop) state (after SigHand.siglock, before Task.sig; 3.7) |
 | `SignalStruct.shared` | signal/mod.rs | `Mutex` | Thread-group pending signals and curr_target (under Task.sig) |
 | `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
-| `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
+| `FsStruct.seq` | fs/fsstruct.rs | `SeqLock` | Root, cwd, umask (leaf; Linux fs->seq): writers and reference-taking readers lock, RCU walks read root/pwd under its sequence |
 | `MEMBLOCK` | mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `PidNamespace.bacct` | task/acct.rs | `Mutex` | A pid namespace's process accounting file (Linux pid_namespace->bacct; leaf, thread context: cloned out, the record written and an old file released with no lock held; an exit walks its namespace and each parent, one lock at a time; taken out at the namespace's zap, after its other tasks are gone) |
 | All VFS locks | fs/*.rs | `RwLock` | Inodes, dentries, mounts |

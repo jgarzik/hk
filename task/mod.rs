@@ -1394,6 +1394,17 @@ impl CredOverride {
         self.0.swap(p, Ordering::Relaxed)
     }
 
+    /// The override in force, borrowed
+    ///
+    /// # Safety
+    /// The caller is the task itself, and drops the borrow before it
+    /// reverts or replaces the override.
+    unsafe fn get(&self) -> Option<&Cred> {
+        // SAFETY: from Arc::into_raw, holding the cell's count, which
+        // only this task (the caller) gives up (see above)
+        unsafe { self.0.load(Ordering::Relaxed).as_ref() }
+    }
+
     /// # Safety
     /// The caller is the task itself.
     unsafe fn arc(&self) -> Option<Arc<Cred>> {
@@ -1961,6 +1972,19 @@ impl Task {
             Some(c) => c,
             None => self.cred.arc(),
         }
+    }
+
+    /// As [`Task::subj_cred_arc`], borrowed (Linux current_cred: no
+    /// reference taken)
+    ///
+    /// # Safety
+    /// The caller is the task itself, and drops the borrow before it
+    /// changes its credentials or their override (commit_creds,
+    /// override_creds, revert_creds).
+    pub unsafe fn subj_cred_ref(&self) -> &Cred {
+        // SAFETY: the task itself, which keeps both as they are while
+        // borrowed (the caller's contract)
+        unsafe { self.cred_override.get().unwrap_or_else(|| self.cred.own()) }
     }
 
     /// As [`Task::subj_cred_arc`], copied

@@ -24,10 +24,11 @@
 //! its place over to the ref-mode loop where Linux's try_to_unlazy
 //! returns to it.
 
-use super::{ECHILD, LookupFlags, Nd, next_comp};
+use super::{ECHILD, LookupFlags, Nd, Start, next_comp};
 use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, MAY_NOT_BLOCK, may_follow_link, permission_as};
 use crate::fs::dentry::{__d_lookup_rcu, Dentry, DentryRef};
+use crate::fs::fsstruct::PathRcu;
 use crate::fs::inode::Inode;
 use crate::fs::mount::{
     __lookup_mnt, MNT_NOSYMFOLLOW, MOUNT_LOCK, Mount, MountRef, choose_mountpoint_rcu,
@@ -51,16 +52,44 @@ struct RcuPath<'g> {
 impl<'g> RcuPath<'g> {
     /// A path the caller holds, as where the walk starts (Linux
     /// path_init: nd->seq = read_seqcount_begin(&dentry->d_seq))
-    fn held(p: &'g Path, g: &'g RcuReadGuard) -> Self {
-        let dentry: &Dentry = &p.dentry;
+    fn at(mnt: &'g Mount, dentry: &'g Dentry, g: &'g RcuReadGuard) -> Self {
         let seq = dentry.d_seq_begin();
         Self {
-            mnt: &p.mnt,
+            mnt,
             dentry,
             inode: dentry.d_inode_rcu(g),
             seq,
         }
     }
+
+    /// The fs_struct's root or cwd, read under its sequence with its
+    /// `d_seq` sample (Linux set_root, path_init's AT_FDCWD)
+    fn fs(p: PathRcu<'g>, g: &'g RcuReadGuard) -> Self {
+        let (mnt, dentry, seq) = p;
+        Self {
+            mnt,
+            dentry,
+            inode: dentry.d_inode_rcu(g),
+            seq,
+        }
+    }
+
+    /// Its mount and dentry
+    fn pair(&self) -> (&'g Mount, &'g Dentry) {
+        (self.mnt, self.dentry)
+    }
+}
+
+/// What an RCU walk keeps for its whole length (Linux nameidata under
+/// LOOKUP_RCU): the guard, and the root read at its start (nd->root,
+/// nd->root_seq), with no reference: legitimized at the first unlazy
+/// that needs it (legitimize_root)
+struct Rcu<'g> {
+    g: &'g RcuReadGuard,
+    root: RcuPath<'g>,
+    /// The root's path when the walk holds it already (boot code's
+    /// namespace root, or one an earlier walk of the lookup took)
+    held: Option<&'g Path>,
 }
 
 /// What a failed legitimize took, put by the caller after the RCU
@@ -70,18 +99,22 @@ impl<'g> RcuPath<'g> {
 /// One slot per role, as Linux's terminate_walk puts a fixed set: the
 /// walk's own place (nd->path), the symlink being picked (the link
 /// stack; the RCU walk never stacks one, since `pick_link_rcu` leaves
-/// RCU mode with it), a mount whose dentry could not be taken
-/// (legitimize_mnt's put), and try_to_unlazy_next's child. Each is
+/// RCU mode with it), the root (ND_ROOT_GRABBED), a mount whose dentry
+/// could not be taken (legitimize_mnt's put), and try_to_unlazy_next's
+/// child. Each is
 /// filled at most once: every fill is on a path that ends the RCU walk
-/// with an error (`?` up to `walk_rcu`), and of the two legitimizes
-/// one walk step may run (`pick_link_rcu`: the link's, then the
-/// place's), the first fills a slot only if it fails and so ends the
-/// step before the second. A second fill would drop a value under the
-/// guard; it panics instead (`put`), in every build.
+/// with an error (`?` up to `walk_rcu`), and of the legitimizes one
+/// walk step may run (`pick_link_rcu`: the link's, then the place's,
+/// then the root's), each fills a slot only if it fails, and so ends
+/// the step before the next, or its own slot (the root's leftover;
+/// a mount alone only from the first that fails). A second fill would
+/// drop a value under the guard; it panics instead (`put`), in every
+/// build.
 #[derive(Default)]
 pub(super) struct Puts {
     path: Option<Path>,
     link: Option<Path>,
+    root: Option<Path>,
     mnt: Option<MountRef>,
     dentry: Option<DentryRef>,
 }
@@ -93,6 +126,8 @@ enum Role {
     Path,
     /// The link stack's top: the symlink being picked
     Link,
+    /// nd->root
+    Root,
 }
 
 /// Fill a `Puts` slot, empty by construction (`Puts`)
@@ -106,6 +141,7 @@ impl Puts {
         match r {
             Role::Path => put(&mut self.path, p),
             Role::Link => put(&mut self.link, p),
+            Role::Root => put(&mut self.root, p),
         }
     }
 
@@ -189,23 +225,57 @@ const WALK_TRAILING: u8 = 1;
 const WALK_MORE: u8 = 2;
 const WALK_NOFOLLOW: u8 = 4;
 
-impl Nd {
-    /// link_path_walk and complete_walk from `start` in RCU mode,
-    /// going on in ref mode where it must; ECHILD if it could not
-    /// leave RCU mode (the caller walks again in ref mode)
+impl Nd<'_> {
+    /// path_init, link_path_walk and complete_walk from `start` (the
+    /// root if `abs`) in RCU mode, going on in ref mode where it must;
+    /// ECHILD if it could not leave RCU mode (the caller walks again in
+    /// ref mode). The root and the cwd are read under the fs_struct's
+    /// sequence with no reference, a held start borrowed (Linux
+    /// path_init under LOOKUP_RCU).
     pub(super) fn walk_rcu(
         &self,
-        start: &Path,
+        start: Start<'_>,
+        abs: bool,
         path: &[u8],
         f: LookupFlags,
     ) -> Result<Path, KernelError> {
+        let fs = self.fs();
+        // Boot code with no fs_struct: the namespace's root, held
+        let boot = match (fs, self.root.get()) {
+            (None, None) => Some(super::nd_root()?),
+            _ => None,
+        };
         let mut puts = Puts::default();
         let g = crate::sync::rcu::read_lock();
-        let r = self.link_path_walk_rcu(&g, RcuPath::held(start, &g), path, f, &mut puts);
+        let held = self.root.get().or(boot.as_ref());
+        let root = match (held, fs) {
+            (Some(p), _) => RcuPath::at(&p.mnt, &p.dentry, &g),
+            (None, Some(fs)) => match self.top {
+                // A scoped lookup's root is its start (Linux path_init:
+                // nd->root = nd->path, root_seq = seq)
+                Start::At(m, d) if self.scoped => RcuPath::at(m, d, &g),
+                Start::Cwd if self.scoped => RcuPath::fs(fs.pwd_rcu(&g), &g),
+                _ => RcuPath::fs(fs.root_rcu(&g), &g),
+            },
+            (None, None) => unreachable!("namei: no root"),
+        };
+        let at = match start {
+            _ if abs => root,
+            Start::Root => root,
+            Start::Cwd => match fs {
+                Some(_) if self.scoped => root,
+                Some(fs) => RcuPath::fs(fs.pwd_rcu(&g), &g),
+                None => root,
+            },
+            Start::At(m, d) => RcuPath::at(m, d, &g),
+        };
+        let rc = Rcu { g: &g, root, held };
+        let r = self.link_path_walk_rcu(&rc, at, path, f, &mut puts);
         drop(g);
         // leave_rcu, whatever the outcome; then terminate_walk's puts
         self.rcu.set(false);
         drop(puts);
+        drop(boot);
         self.unlazied(r?, f)
     }
 
@@ -214,7 +284,7 @@ impl Nd {
     #[inline(never)]
     fn link_path_walk_rcu<'g, 'p>(
         &self,
-        g: &'g RcuReadGuard,
+        rc: &Rcu<'g>,
         mut cur: RcuPath<'g>,
         path: &'p [u8],
         f: LookupFlags,
@@ -226,7 +296,7 @@ impl Nd {
             if let Err(e) = self.may_lookup_rcu(&cur) {
                 // Out of RCU mode to see it was not transient (Linux
                 // may_lookup): a hard error stands, ECHILD asks again
-                let at = self.try_to_unlazy(&cur, f.cached, puts)?;
+                let at = self.try_to_unlazy(rc, &cur, f.cached, puts)?;
                 if e != ECHILD {
                     puts.path(Role::Path, at);
                     return Err(e);
@@ -238,10 +308,10 @@ impl Nd {
                 b".." => {
                     // handle_dots: follow_dotdot_rcu, step_into with
                     // WALK_NOFOLLOW, then a scoped walk's check
-                    let (d, seq) = self.follow_dotdot_rcu(g, &mut cur, f)?;
-                    let inode = d.d_inode_rcu(g);
+                    let (d, seq) = self.follow_dotdot_rcu(rc, &mut cur, f)?;
+                    let inode = d.d_inode_rcu(rc.g);
                     let step = self.step_into_rcu(
-                        g,
+                        rc,
                         &mut cur,
                         d,
                         inode,
@@ -259,7 +329,7 @@ impl Nd {
                 }
                 _ => {
                     let flags = if last { WALK_TRAILING } else { WALK_MORE };
-                    let step = self.walk_component_rcu(g, &mut cur, name, rest, flags, f, puts)?;
+                    let step = self.walk_component_rcu(rc, &mut cur, name, rest, flags, f, puts)?;
                     if let Some(l) = step {
                         return Ok(l);
                     }
@@ -267,8 +337,16 @@ impl Nd {
             }
             p = rest;
         }
-        // complete_walk: LOOKUP_CACHED is cleared for this last unlazy
-        Ok(Lazy::Done(self.try_to_unlazy(&cur, false, puts)?))
+        // complete_walk: LOOKUP_CACHED is cleared for this last unlazy,
+        // and only a scoped lookup keeps its root (Linux: nd->root.mnt =
+        // NULL, so legitimize_root has nothing to do)
+        Ok(Lazy::Done(self.unlazy(
+            rc,
+            &cur,
+            false,
+            self.scoped,
+            puts,
+        )?))
     }
 
     /// may_lookup under LOOKUP_RCU: `cur` is a directory (link_path_walk's
@@ -280,7 +358,7 @@ impl Nd {
         if !inode.mode().is_dir() {
             return Err(KernelError::NotDirectory);
         }
-        permission_as(&self.c, inode, MAY_EXEC | MAY_NOT_BLOCK)
+        permission_as(self.cred(), inode, MAY_EXEC | MAY_NOT_BLOCK)
     }
 
     /// walk_component under LOOKUP_RCU: lookup_fast, then step_into.
@@ -289,7 +367,7 @@ impl Nd {
     #[allow(clippy::too_many_arguments)]
     fn walk_component_rcu<'g, 'p>(
         &self,
-        g: &'g RcuReadGuard,
+        rc: &Rcu<'g>,
         cur: &mut RcuPath<'g>,
         name: &'p [u8],
         rest: &'p [u8],
@@ -299,22 +377,22 @@ impl Nd {
     ) -> Result<Option<Lazy<'p>>, KernelError> {
         // A miss, maybe a rename's (no RENAME_LOCK check: lookup_slow
         // decides under the directory's lock)
-        let Some((child, seq)) = __d_lookup_rcu(cur.dentry, name, g) else {
-            let at = self.try_to_unlazy(cur, f.cached, puts)?;
+        let Some((child, seq)) = __d_lookup_rcu(cur.dentry, name, rc.g) else {
+            let at = self.try_to_unlazy(rc, cur, f.cached, puts)?;
             return Ok(Some(Lazy::Lookup(at, name, rest)));
         };
         // The parent did not change during the lookup
         if cur.dentry.d_seq_retry(cur.seq) {
             return Err(ECHILD);
         }
-        let inode = child.d_inode_rcu(g);
+        let inode = child.d_inode_rcu(rc.g);
         // d_revalidate under LOOKUP_RCU (only a positive entry has one,
         // as in ref mode); anything but "valid" is handled in ref mode
         // (Linux lookup_fast: try_to_unlazy_next, then d_invalidate if
         // stale, the error if one, ref-mode d_revalidate if ECHILD)
         let status = inode.map_or(Ok(true), |i| i.i_op.revalidate(i, true));
         if status != Ok(true) {
-            let (at, c) = self.try_to_unlazy_next(cur, child, seq, f.cached, puts)?;
+            let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
             return Ok(Some(Lazy::Child {
                 cur: at,
                 child: c,
@@ -324,7 +402,7 @@ impl Nd {
                 dots: false,
             }));
         }
-        self.step_into_rcu(g, cur, child, inode, seq, name, rest, flags, f, puts)
+        self.step_into_rcu(rc, cur, child, inode, seq, name, rest, flags, f, puts)
     }
 
     /// step_into under LOOKUP_RCU: onto `child` (its `d_seq` was
@@ -333,7 +411,7 @@ impl Nd {
     #[allow(clippy::too_many_arguments)]
     fn step_into_rcu<'g, 'p>(
         &self,
-        g: &'g RcuReadGuard,
+        rc: &Rcu<'g>,
         cur: &mut RcuPath<'g>,
         child: &'g Dentry,
         inode: Option<&'g Inode>,
@@ -348,8 +426,8 @@ impl Nd {
         // try_to_unlazy_next and traverse_mounts in ref mode
         let (mut mnt, mut d, mut seq, mut inode) = (cur.mnt, child, seq, inode);
         if child.is_mountpoint() {
-            let Some((m, r, s)) = self.follow_mount_rcu(g, mnt, child, seq, f) else {
-                let (at, c) = self.try_to_unlazy_next(cur, child, seq, f.cached, puts)?;
+            let Some((m, r, s)) = self.follow_mount_rcu(rc.g, mnt, child, seq, f) else {
+                let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
                 return Ok(Some(Lazy::Child {
                     cur: at,
                     child: c,
@@ -359,12 +437,12 @@ impl Nd {
                     dots: flags & WALK_NOFOLLOW != 0,
                 }));
             };
-            (mnt, d, seq, inode) = (m, r, s, r.d_inode_rcu(g));
+            (mnt, d, seq, inode) = (m, r, s, r.d_inode_rcu(rc.g));
         }
         let last = flags & WALK_TRAILING != 0;
         let follow = flags & WALK_NOFOLLOW == 0 && (!last || f.follow);
         if follow && inode.is_some_and(|i| i.mode().is_symlink()) {
-            let l = self.pick_link_rcu(cur, mnt, d, inode, seq, rest, last, f, puts)?;
+            let l = self.pick_link_rcu(rc, cur, mnt, d, inode, seq, rest, last, f, puts)?;
             return Ok(Some(l));
         }
         if d.d_seq_retry(seq) {
@@ -398,15 +476,15 @@ impl Nd {
     /// bind mount's root is ECHILD (path_connected, ENOENT in ref mode).
     fn follow_dotdot_rcu<'g>(
         &self,
-        g: &'g RcuReadGuard,
+        rc: &Rcu<'g>,
         cur: &mut RcuPath<'g>,
         f: LookupFlags,
     ) -> Result<(&'g Dentry, u32), KernelError> {
-        let root = &self.root;
-        let at_root = core::ptr::eq(cur.mnt, MountRef::as_ptr(&root.mnt))
-            && core::ptr::eq(cur.dentry, DentryRef::as_ptr(&root.dentry));
+        let g = rc.g;
+        let at_root =
+            core::ptr::eq(cur.mnt, rc.root.mnt) && core::ptr::eq(cur.dentry, rc.root.dentry);
         if !at_root && core::ptr::eq(cur.dentry, cur.mnt.root_addr()) {
-            match choose_mountpoint_rcu(cur.mnt, root, g) {
+            match choose_mountpoint_rcu(cur.mnt, rc.root.pair(), g) {
                 Some((m, mp)) => {
                     if f.no_xdev {
                         return Err(ECHILD);
@@ -491,6 +569,7 @@ impl Nd {
     #[allow(clippy::too_many_arguments)]
     fn pick_link_rcu<'g, 'p>(
         &self,
+        rc: &Rcu<'g>,
         cur: &RcuPath<'g>,
         mnt: &'g Mount,
         link: &'g Dentry,
@@ -507,7 +586,7 @@ impl Nd {
         }
         if last
             && let (Some(d), Some(i)) = (cur.inode, inode)
-            && may_follow_link(&self.c, d, i).is_err()
+            && may_follow_link(self.cred(), d, i).is_err()
         {
             return Err(ECHILD);
         }
@@ -519,7 +598,7 @@ impl Nd {
             return Err(ECHILD);
         }
         let link = legitimize_path(mnt, link, seq, self.m_seq, puts, Role::Link).ok_or(ECHILD)?;
-        match self.try_to_unlazy(cur, false, puts) {
+        match self.try_to_unlazy(rc, cur, false, puts) {
             Ok(at) => Ok(Lazy::Link {
                 cur: at,
                 link,
@@ -532,20 +611,61 @@ impl Nd {
         }
     }
 
-    /// try_to_unlazy: references to where the walk stands, unless
-    /// LOOKUP_CACHED forbids leaving RCU mode (`cached`) or something
-    /// moved: ECHILD then. The root needs none (the walk holds it:
-    /// legitimize_root of ND_ROOT_PRESET).
+    /// try_to_unlazy: references to where the walk stands and to the
+    /// root (legitimize_root), unless LOOKUP_CACHED forbids leaving RCU
+    /// mode (`cached`) or something moved: ECHILD then
     fn try_to_unlazy(
         &self,
+        rc: &Rcu<'_>,
         cur: &RcuPath<'_>,
         cached: bool,
+        puts: &mut Puts,
+    ) -> Result<Path, KernelError> {
+        self.unlazy(rc, cur, cached, true, puts)
+    }
+
+    /// [`Nd::try_to_unlazy`], the root legitimized only if `root`
+    fn unlazy(
+        &self,
+        rc: &Rcu<'_>,
+        cur: &RcuPath<'_>,
+        cached: bool,
+        root: bool,
         puts: &mut Puts,
     ) -> Result<Path, KernelError> {
         if cached {
             return Err(ECHILD);
         }
-        legitimize_path(cur.mnt, cur.dentry, cur.seq, self.m_seq, puts, Role::Path).ok_or(ECHILD)
+        let at = legitimize_path(cur.mnt, cur.dentry, cur.seq, self.m_seq, puts, Role::Path)
+            .ok_or(ECHILD)?;
+        if root && !self.legitimize_root(rc, puts) {
+            puts.path(Role::Path, at);
+            return Err(ECHILD);
+        }
+        Ok(at)
+    }
+
+    /// legitimize_root: a reference to the root the walk read with
+    /// none, for the rest of the lookup in ref mode, unless it has one
+    /// (an earlier walk's, or a path the walk holds: a scoped lookup's
+    /// start, boot code's namespace root); false if it moved
+    fn legitimize_root(&self, rc: &Rcu<'_>, puts: &mut Puts) -> bool {
+        if self.root.get().is_some() {
+            return true;
+        }
+        let p = match (rc.held, self.top) {
+            (Some(p), _) => p.clone(),
+            (None, Start::At(m, d)) if self.scoped => Path::new(m.clone(), d.clone()),
+            _ => {
+                let r = &rc.root;
+                match legitimize_path(r.mnt, r.dentry, r.seq, self.m_seq, puts, Role::Root) {
+                    Some(p) => p,
+                    None => return false,
+                }
+            }
+        };
+        let _ = self.root.set(p);
+        true
     }
 
     /// try_to_unlazy_next: [`Nd::try_to_unlazy`] and a reference to
@@ -553,6 +673,7 @@ impl Nd {
     /// (it was read after the parent's was checked)
     fn try_to_unlazy_next(
         &self,
+        rc: &Rcu<'_>,
         cur: &RcuPath<'_>,
         child: &Dentry,
         seq: u32,
@@ -578,7 +699,7 @@ impl Nd {
             puts.path(Role::Path, at);
             return Err(ECHILD);
         };
-        if child.d_seq_retry(seq) {
+        if child.d_seq_retry(seq) || !self.legitimize_root(rc, puts) {
             puts.path(Role::Path, at);
             puts.dentry(c);
             return Err(ECHILD);

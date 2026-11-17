@@ -20,22 +20,25 @@ mod rcu;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, OnceCell};
 
 use self::rcu::Lazy;
 
 use crate::fs::KernelError;
-use crate::fs::dac::{MAY_EXEC, cred, permission_as};
+use crate::fs::dac::{MAY_EXEC, permission_as};
 use crate::fs::dentry::{Dentry, DentryRef, d_invalidate};
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use crate::fs::fsstruct::FsStruct;
 use crate::fs::inode::{Inode, Link};
 use crate::fs::mount::{
     MOUNT_LOCK, MountRef, choose_mountpoint, follow_mount, is_path_reachable, path_connected,
 };
 use crate::fs::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
+use crate::fs::{File, FileRef};
 use crate::ns::current_mnt_ns;
 use crate::task::Cred;
+use crate::task::percpu::Cur;
 use crate::uaccess::UserPtr;
 
 /// Maximum number of symlinks to follow (prevent infinite loops)
@@ -125,7 +128,7 @@ pub fn lookup_path(path: &[u8]) -> Result<DentryRef, KernelError> {
 
 /// Look up a path relative to the current directory with specific flags
 pub fn lookup_path_flags(path: &[u8], flags: LookupFlags) -> Result<DentryRef, KernelError> {
-    lookup_path_at(crate::task::percpu::current_cwd(), path, flags)
+    path_lookup(Start::Cwd, path, flags).map(|p| p.dentry.clone())
 }
 
 /// Look up a path relative to a starting path
@@ -147,10 +150,93 @@ pub fn path_lookupat(
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Path, KernelError> {
-    let s = start.as_ref();
-    match Nd::new(s, flags, true)?.lookup(s, path, flags) {
-        Err(ECHILD) => Nd::new(s, flags, false)?.lookup(s, path, flags),
+    match &start {
+        Some(p) => path_lookup(Start::path(p), path, flags),
+        None => path_lookup(Start::Root, path, flags),
+    }
+}
+
+/// [`path_lookupat`] from `start` (Linux filename_lookup's
+/// path_lookupat: in RCU mode, again in ref mode if that is ECHILD)
+pub fn path_lookup(start: Start<'_>, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
+    match Nd::new(start, flags, true)?.lookup(start, path, flags) {
+        Err(ECHILD) => Nd::new(start, flags, false)?.lookup(start, path, flags),
         r => r,
+    }
+}
+
+/// Where a walk starts (Linux path_init: nd->dfd, or a path the caller
+/// holds): the cwd is read by the walk itself, under the fs_struct's
+/// sequence with no reference in RCU mode
+#[derive(Clone, Copy)]
+pub enum Start<'a> {
+    /// The root
+    Root,
+    /// The cwd (AT_FDCWD); the root for boot code, which has none
+    Cwd,
+    /// A path the caller holds for the lookup (a dirfd's file,
+    /// file_open_root's root, a parent already walked)
+    At(&'a MountRef, &'a DentryRef),
+}
+
+impl<'a> Start<'a> {
+    /// A held path
+    pub fn path(p: &'a Path) -> Self {
+        Self::At(&p.mnt, &p.dentry)
+    }
+}
+
+/// What a user path's walk starts from, held for the lookup (Linux
+/// path_init's fdget: the dirfd's file, whose f_path the walk borrows
+/// with no path reference)
+pub enum Dfd {
+    Root,
+    Cwd,
+    /// A dirfd's file, which has a mount
+    File(FileRef),
+    /// A path (an internal file's, or one the caller gave)
+    Path(Path),
+}
+
+impl Dfd {
+    /// The walk's start, borrowed from this
+    pub fn start(&self) -> Start<'_> {
+        match self {
+            Self::Root => Start::Root,
+            Self::Cwd => Start::Cwd,
+            Self::File(f) => match f.mnt() {
+                Some(m) => Start::At(m, &f.dentry),
+                None => Start::Root,
+            },
+            Self::Path(p) => Start::path(p),
+        }
+    }
+}
+
+/// The current task's fs_struct, borrowed (Linux current->fs): None for
+/// boot code before pid 1 has one; a kernel thread's is the shared one
+fn fs_of(me: &Cur) -> Option<&FsStruct> {
+    if me.tid() == 0 {
+        return None;
+    }
+    // SAFETY: the current task, which replaces its fs_struct only
+    // itself (unshare, setns, exit), never while it walks a path
+    match unsafe { crate::task::Task::fs(me) } {
+        Some(fs) => Some(fs),
+        None => crate::fs::fsstruct::kthread_fs_ref(me),
+    }
+}
+
+/// `start` as a path, a reference (Linux get_fs_pwd, path_get): an
+/// empty name's result, a ref-mode walk's start
+fn start_path(start: Start<'_>) -> Result<Path, KernelError> {
+    match start {
+        Start::Root => nd_root(),
+        Start::Cwd => match fs_of(&crate::task::percpu::current()) {
+            Some(fs) => Ok(fs.get_pwd()),
+            None => nd_root(),
+        },
+        Start::At(m, d) => Ok(Path::new(m.clone(), d.clone())),
     }
 }
 
@@ -301,10 +387,19 @@ fn step_mounts(p: Path, f: LookupFlags) -> Result<Path, KernelError> {
 /// nameidata's root, m_seq and r_seq, and LOOKUP_RCU): the root
 /// absolute paths and ".." stop at (a scoped lookup's own start), the
 /// mount and rename sequences sampled at its start (path_init), and
-/// whether its walks still start in RCU mode
-pub struct Nd {
-    c: Cred,
-    root: Path,
+/// whether its walks still start in RCU mode. The caller's credentials
+/// are borrowed from it (Linux current_cred), not copied.
+pub struct Nd<'a> {
+    /// The current task, whose credentials and fs_struct the lookup
+    /// borrows
+    me: Cur,
+    /// The lookup's start (a scoped lookup's root)
+    top: Start<'a>,
+    /// The root, a reference, for the ref-mode walks: taken when one
+    /// first needs it (Linux set_root, get_fs_root), or from an RCU
+    /// walk that left RCU mode (legitimize_root); an RCU walk reads it
+    /// with none
+    root: OnceCell<Path>,
     /// LOOKUP_RCU: a walk tries RCU mode first (`rcu::walk_rcu`);
     /// cleared once one left it (leave_rcu), so the rest of the lookup
     /// runs in ref mode
@@ -319,24 +414,22 @@ pub struct Nd {
     scoped: bool,
 }
 
-impl Nd {
-    /// Linux path_init's root and sequences: a scoped lookup's root is
-    /// its start (dirfd or the cwd), any other the task's root. `rcu`:
-    /// LOOKUP_RCU, which LOOKUP_CACHED needs (EAGAIN without: the
-    /// retry of a walk that had to leave RCU mode).
-    pub fn new(start: Option<&Path>, f: LookupFlags, rcu: bool) -> Result<Self, KernelError> {
+impl<'a> Nd<'a> {
+    /// Linux path_init's sequences: a scoped lookup's root is its start
+    /// (dirfd or the cwd), any other the task's root, taken (ref mode)
+    /// or read (RCU mode) when a walk needs it. `rcu`: LOOKUP_RCU,
+    /// which LOOKUP_CACHED needs (EAGAIN without: the retry of a walk
+    /// that had to leave RCU mode).
+    pub fn new(start: Start<'a>, f: LookupFlags, rcu: bool) -> Result<Self, KernelError> {
         if f.cached && !rcu {
             return Err(KernelError::WouldBlock);
         }
         let m_seq = MOUNT_LOCK.read_begin();
         let r_seq = super::dentry::rename_seq_begin();
-        let root = match start {
-            Some(p) if f.scoped() => p.clone(),
-            _ => nd_root()?,
-        };
         Ok(Self {
-            c: cred(),
-            root,
+            me: crate::task::percpu::current(),
+            top: start,
+            root: OnceCell::new(),
             rcu: Cell::new(rcu),
             m_seq,
             r_seq,
@@ -344,10 +437,46 @@ impl Nd {
         })
     }
 
+    /// The caller's credentials (Linux current_cred), borrowed
+    fn cred(&self) -> &Cred {
+        // SAFETY: the current task, which changes its credentials only
+        // itself, never while it walks a path
+        unsafe { self.me.subj_cred_ref() }
+    }
+
+    /// The current task's fs_struct, borrowed
+    fn fs(&self) -> Option<&FsStruct> {
+        fs_of(&self.me)
+    }
+
+    /// The root for a ref-mode walk (Linux nd->root, set_root when it
+    /// is not set yet): a scoped lookup's start, else the task's root
+    fn root(&self) -> Result<&Path, KernelError> {
+        if let Some(r) = self.root.get() {
+            return Ok(r);
+        }
+        let r = match (self.scoped, self.top) {
+            (true, Start::Cwd) => start_path(Start::Cwd)?,
+            (true, Start::At(m, d)) => Path::new(m.clone(), d.clone()),
+            _ => nd_root()?,
+        };
+        Ok(self.root.get_or_init(|| r))
+    }
+
+    /// Where a ref-mode walk from `start` begins: a scoped lookup's
+    /// cwd is its root, read once
+    fn start_ref(&self, start: Start<'_>) -> Result<Path, KernelError> {
+        match start {
+            Start::Root => self.root().cloned(),
+            Start::Cwd if self.scoped => self.root().cloned(),
+            s => start_path(s),
+        }
+    }
+
     /// Walk `path` from `start` (Linux path_lookupat + complete_walk)
     pub fn lookup(
         &self,
-        start: Option<&Path>,
+        start: Start<'_>,
         path: &[u8],
         f: LookupFlags,
     ) -> Result<Path, KernelError> {
@@ -358,7 +487,7 @@ impl Nd {
     /// A scoped lookup's result must still be under its root, whatever
     /// raced it (Linux complete_walk: path_is_under, EXDEV)
     fn complete(&self, p: Path) -> Result<Path, KernelError> {
-        if self.scoped && !is_path_reachable(&p, &self.root) {
+        if self.scoped && !is_path_reachable(&p, self.root()?) {
             return Err(KernelError::CrossDevice);
         }
         Ok(p)
@@ -380,7 +509,7 @@ impl Nd {
     /// nd_jump_root): EXDEV beneath, and for a no-xdev walk off the
     /// root's mount
     fn jump_root(&self, at: &Path, f: LookupFlags) -> Result<(), KernelError> {
-        if f.beneath || (f.no_xdev && !MountRef::ptr_eq(&at.mnt, &self.root.mnt)) {
+        if f.beneath || (f.no_xdev && !MountRef::ptr_eq(&at.mnt, &self.root()?.mnt)) {
             return Err(KernelError::CrossDevice);
         }
         Ok(())
@@ -406,7 +535,7 @@ impl Nd {
     /// ref mode
     fn walk(
         &self,
-        start: Option<&Path>,
+        start: Start<'_>,
         path: &[u8],
         mut f: LookupFlags,
         depth: usize,
@@ -426,14 +555,15 @@ impl Nd {
         if abs && f.beneath {
             return Err(KernelError::CrossDevice);
         }
-        let start = match start {
-            Some(p) if !abs => p,
-            _ => &self.root,
-        };
         if self.rcu.get() {
-            return self.walk_rcu(start, path, f);
+            return self.walk_rcu(start, abs, path, f);
         }
-        self.walk_ref(start.clone(), path, f, depth)
+        let start = if abs {
+            self.root()?.clone()
+        } else {
+            self.start_ref(start)?
+        };
+        self.walk_ref(start, path, f, depth)
     }
 
     /// The walk's loop in ref mode, from `cur` (Linux link_path_walk
@@ -448,11 +578,11 @@ impl Nd {
         let mut next = next_comp(path);
         while let Some((name, rest)) = next {
             next = next_comp(rest);
-            may_lookup(&self.c, &cur.dentry)?;
+            may_lookup(self.cred(), &cur.dentry)?;
             cur = match name {
                 b"." => cur,
                 b".." => {
-                    let p = follow_dotdot(cur, &self.root, f)?;
+                    let p = follow_dotdot(cur, self.root()?, f)?;
                     self.recheck()?;
                     p
                 }
@@ -555,7 +685,7 @@ impl Nd {
     ) -> Result<(), KernelError> {
         let inode = link.get_inode().ok_or(KernelError::NotFound)?;
         if last && let Some(d) = dir.dentry.get_inode() {
-            super::dac::may_follow_link(&self.c, &d, &inode)?;
+            super::dac::may_follow_link(self.cred(), &d, &inode)?;
         }
         if f.no_symlinks || link.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
             return Err(KernelError::TooManySymlinks);
@@ -590,7 +720,7 @@ impl Nd {
         }
         // `rest` is empty or starts at a slash: the walk goes on through it
         path.extend_from_slice(rest);
-        self.walk(Some(dir), &path, f, depth + 1)
+        self.walk(Start::path(dir), &path, f, depth + 1)
     }
 
     /// Go on from a magic link's object `p` with what followed the link:
@@ -607,7 +737,7 @@ impl Nd {
         if from == rest.len() && !rest.is_empty() {
             f.directory = true;
         }
-        self.walk(Some(&p), &rest[from..], f, depth + 1)
+        self.walk(Start::path(&p), &rest[from..], f, depth + 1)
     }
 
     /// Walk all but the last component of `path` from `start` (Linux
@@ -615,7 +745,7 @@ impl Nd {
     /// last name is not looked up, only classified
     pub fn parentat(
         &self,
-        start: Option<&Path>,
+        start: Start<'_>,
         path: &[u8],
         f: LookupFlags,
     ) -> Result<Parent, KernelError> {
@@ -624,7 +754,7 @@ impl Nd {
         let trimmed = &path[..end];
         if trimmed.is_empty() {
             // Only slashes: the root, no last component
-            let (mnt, dir) = self.root.clone().into_parts();
+            let (mnt, dir) = self.root()?.clone().into_parts();
             return Ok(Parent {
                 dir,
                 mnt,
@@ -643,12 +773,12 @@ impl Nd {
             ..f.resolve()
         };
         let (mnt, dir) = match (dir_path.is_empty(), start) {
-            (true, Some(p)) => p.clone(),
-            (_, start) => self.lookup(start, dir_path, dirf)?,
+            (true, s) => self.start_ref(s)?,
+            (false, s) => self.lookup(s, dir_path, dirf)?,
         }
         .into_parts();
         // link_path_walk: search permission before the last component too
-        may_lookup(&self.c, &dir)?;
+        may_lookup(self.cred(), &dir)?;
         let last = match name {
             b"." => Last::Dot,
             b".." => Last::DotDot,
@@ -679,7 +809,7 @@ impl Nd {
                 follow: false,
                 ..f.resolve()
             };
-            let found = match self.walk(Some(&dir), &p.name, nofollow, 0) {
+            let found = match self.walk(Start::path(&dir), &p.name, nofollow, 0) {
                 Ok(f) => f,
                 Err(KernelError::NotFound) => return Ok(CreateAt::Name(p)),
                 Err(e) => return Err(e),
@@ -688,7 +818,7 @@ impl Nd {
                 return Ok(CreateAt::Name(p));
             };
             if let Some(d) = p.dir.get_inode() {
-                super::dac::may_follow_link(&self.c, &d, &inode)?;
+                super::dac::may_follow_link(self.cred(), &d, &inode)?;
             }
             if f.no_symlinks || found.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
                 return Err(KernelError::TooManySymlinks);
@@ -704,11 +834,11 @@ impl Nd {
             };
             let start = if target.starts_with(b"/") {
                 self.jump_root(&dir, f)?;
-                None
+                Start::Root
             } else {
-                Some(dir)
+                Start::path(&dir)
             };
-            p = self.parentat(start.as_ref(), &target, f)?;
+            p = self.parentat(start, &target, f)?;
             if p.last != Last::Norm || p.slash {
                 return Err(KernelError::IsDirectory);
             }
@@ -797,7 +927,7 @@ pub fn create_entry(
     if !dir.mode().is_dir() {
         return Err(KernelError::NotDirectory);
     }
-    let c = cred();
+    let c = crate::fs::dac::cred();
     // filename_create: write access first, its EROFS reported after EEXIST
     let w = p.mnt.want_write();
     let _dir_lock = dir.lock();
@@ -827,7 +957,7 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
     let (parent, name) = (&p.dir, p.name.as_slice());
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let _w = p.mnt.want_write()?;
-    let c = cred();
+    let c = crate::fs::dac::cred();
     let _dir_lock = dir.lock();
     (|| {
         let victim = lookup_one(parent, name)?;
@@ -907,15 +1037,15 @@ pub fn getname_maybe_null(ptr: UserPtr<u8>, at: i32) -> Result<Vec<u8>, KernelEr
 /// lookup always, the cwd or `dirfd`, which must be open (EBADF), pass
 /// the `linkat_empty` check (ENOENT) and, unless the path is empty, be a
 /// directory (ENOTDIR)
-pub fn path_start(dirfd: i32, path: &[u8], f: LookupFlags) -> Result<Option<Path>, KernelError> {
+pub fn path_start(dirfd: i32, path: &[u8], f: LookupFlags) -> Result<Dfd, KernelError> {
     if path.starts_with(b"/") && !f.in_root {
         if f.beneath {
             return Err(KernelError::CrossDevice);
         }
-        return Ok(None);
+        return Ok(Dfd::Root);
     }
     if dirfd == AT_FDCWD {
-        return Ok(crate::task::percpu::current_cwd());
+        return Ok(Dfd::Cwd);
     }
     let file = crate::fs::syscall::current_fd_table()
         .lock()
@@ -927,7 +1057,10 @@ pub fn path_start(dirfd: i32, path: &[u8], f: LookupFlags) -> Result<Option<Path
     if !path.is_empty() && !file.is_dir() {
         return Err(KernelError::NotDirectory);
     }
-    Ok(file.f_path())
+    if file.mnt().is_some() {
+        return Ok(Dfd::File(file));
+    }
+    Ok(file.f_path().map_or(Dfd::Root, Dfd::Path))
 }
 
 /// Whether linkat may link `file` (Linux path_init LOOKUP_LINKAT_EMPTY):
@@ -937,7 +1070,7 @@ pub fn path_start(dirfd: i32, path: &[u8], f: LookupFlags) -> Result<Option<Path
 /// lookup the walk starts from. Linux compares cred pointers and uses
 /// ns_capable(f_cred->user_ns); hk compares values (BUGS.md) and has
 /// one user namespace.
-fn may_linkat_empty(file: &crate::fs::File) -> bool {
+fn may_linkat_empty(file: &File) -> bool {
     file.f_cred == crate::task::current_cred()
         || crate::task::capable(crate::task::CAP_DAC_READ_SEARCH)
 }
@@ -946,7 +1079,7 @@ fn may_linkat_empty(file: &crate::fs::File) -> bool {
 /// path (getname let it through: AT_EMPTY_PATH, O_EMPTYPATH) names
 /// dirfd itself
 pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
-    filename_lookup_from(path_start(dirfd, path, flags)?, path, flags)
+    filename_lookup_start(path_start(dirfd, path, flags)?.start(), path, flags)
 }
 
 /// Resolve `path` from `start` (None: the root), an empty path naming
@@ -957,18 +1090,27 @@ pub fn filename_lookup_from(
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Path, KernelError> {
+    match &start {
+        Some(p) => filename_lookup_start(Start::path(p), path, flags),
+        None => filename_lookup_start(Start::Root, path, flags),
+    }
+}
+
+/// [`filename_lookup`]'s walk from `start`
+pub fn filename_lookup_start(
+    start: Start<'_>,
+    path: &[u8],
+    flags: LookupFlags,
+) -> Result<Path, KernelError> {
     if path.is_empty() {
-        let p = match start {
-            Some(p) => p,
-            None => nd_root()?,
-        };
+        let p = start_path(start)?;
         // Linux path_lookupat's LOOKUP_DIRECTORY check, walk or not
         if flags.directory && p.get_inode().is_some_and(|n| !n.mode().is_dir()) {
             return Err(KernelError::NotDirectory);
         }
         return Ok(p);
     }
-    path_lookupat(start, path, flags)
+    path_lookup(start, path, flags)
 }
 
 /// Copy in and resolve a path argument (Linux user_path_at)
@@ -1009,7 +1151,7 @@ pub struct Parent {
 pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError> {
     let f = LookupFlags::default();
     let start = path_start(dirfd, path, f)?;
-    let s = start.as_ref();
+    let s = start.start();
     match Nd::new(s, f, true)?.parentat(s, path, f) {
         Err(ECHILD) => Nd::new(s, f, false)?.parentat(s, path, f),
         r => r,

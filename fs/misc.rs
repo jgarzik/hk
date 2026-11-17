@@ -288,11 +288,8 @@ pub fn sys_mount(
     };
     let target = crate::fs::namei::getname(target_ptr, false)?;
     // A mount may cover a file (bind): the target is only followed
-    let mp = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &target,
-        LookupFlags::open(),
-    )?;
+    let mp =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &target, LookupFlags::open())?;
 
     if flags & ms::MGC_MSK == ms::MGC_VAL {
         flags &= !ms::MGC_MSK;
@@ -314,8 +311,8 @@ pub fn sys_mount(
         return remount(&own_mount_at(&mp)?, flags, &data);
     }
     if flags & ms::BIND != 0 {
-        let old = crate::fs::namei::path_lookupat(
-            crate::task::percpu::current_cwd(),
+        let old = crate::fs::namei::path_lookup(
+            crate::fs::namei::Start::Cwd,
             &source,
             LookupFlags::open(),
         );
@@ -328,8 +325,8 @@ pub fn sys_mount(
         return change_type(&mount_at(&mp)?, flags);
     }
     if flags & ms::MOVE != 0 {
-        let old = crate::fs::namei::path_lookupat(
-            crate::task::percpu::current_cwd(),
+        let old = crate::fs::namei::path_lookup(
+            crate::fs::namei::Start::Cwd,
             &source,
             LookupFlags::open(),
         );
@@ -423,7 +420,7 @@ pub fn sys_umount2(target_ptr: UserPtr<u8>, flags: i32) -> KernelResult<()> {
         follow: flags & UMOUNT_NOFOLLOW == 0,
         ..LookupFlags::open()
     };
-    let target = crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), &target, lf)?;
+    let target = crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &target, lf)?;
     if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
@@ -442,11 +439,7 @@ pub fn sys_pivot_root(new_root_ptr: UserPtr<u8>, put_old_ptr: UserPtr<u8>) -> Ke
     }
     let dir = |p: UserPtr<u8>| {
         let name = crate::fs::namei::getname(p, false)?;
-        crate::fs::namei::path_lookupat(
-            crate::task::percpu::current_cwd(),
-            &name,
-            LookupFlags::opendir(),
-        )
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &name, LookupFlags::opendir())
     };
     let new = dir(new_root_ptr)?;
     let old = dir(put_old_ptr)?;
@@ -668,11 +661,8 @@ fn do_setxattr(
     let path = crate::fs::namei::getname(path_ptr, false)?;
     let name = xattr_name(name_ptr)?;
     let value = copy_xattr_value_from_user(value_ptr, size)?;
-    let fpath = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &path,
-        xattr_lookup(follow),
-    )?;
+    let fpath =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, xattr_lookup(follow))?;
     let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
     // setxattr/removexattr: write access first (EROFS), held across
     let _w = fpath.mnt.want_write()?;
@@ -883,11 +873,8 @@ pub fn sys_lremovexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>) -> KernelR
 fn do_removexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>, follow: bool) -> KernelResult<()> {
     let path = crate::fs::namei::getname(path_ptr, false)?;
     let name = xattr_name(name_ptr)?;
-    let fpath = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &path,
-        xattr_lookup(follow),
-    )?;
+    let fpath =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, xattr_lookup(follow))?;
     let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
     // setxattr/removexattr: write access first (EROFS), held across
     let _w = fpath.mnt.want_write()?;

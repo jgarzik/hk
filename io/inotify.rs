@@ -922,11 +922,7 @@ fn resolve_path(pathname: &[u8], mask: u32) -> KernelResult<Path> {
     }
 
     // Any lookup error as is (Linux user_path_at)
-    let path = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        pathname,
-        lookup_flags,
-    )?;
+    let path = crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, pathname, lookup_flags)?;
     let inode = path.dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // inotify_find_inode: the watched inode must be readable
