@@ -2958,8 +2958,9 @@ checked against the sample before a filesystem's `d_compare` runs
 which the caller checks (`Dentry::d_seq_retry`) before trusting what
 it read and again after taking a reference (`DentryRef::try_get`;
 Linux legitimize_path). A walk
-that misses during a rename (`lookup_cached`/`cached` without the
-directory lock) is fine: lookup_slow rechecks under i_rwsem.
+that misses during a rename (`__d_lookup_rcu` in an RCU walk, `cached`
+without the directory lock) is fine: lookup_slow rechecks under
+i_rwsem.
 
 A name (`fs::name::DName`, Linux qstr over d_shortname or an
 external_name) is inline below `DNAME_INLINE_LEN` (40) bytes, else a
@@ -3420,10 +3421,41 @@ path_connected: a bind mount's root only, `is_subdir` under
 RENAME_LOCK's sequence or locking read, nothing else held), else
 ENOENT: a rename may have taken the directory out of the subtree.
 
+**RCU path walk** (`fs/namei/rcu.rs`; Linux LOOKUP_RCU,
+link_path_walk, lookup_fast, step_into, try_to_unlazy): every lookup
+(`path_lookupat`, `filename_parentat`, an open's `open_target`) first
+walks under one RCU read guard, which disables preemption: nothing in
+it sleeps, takes a sleeping lock, allocates or drops a reference, and
+it stores to no shared dentry, inode or lock word. Its place
+(`RcuPath`: mount, dentry, inode, `d_seq` value, no references) moves
+by `__d_lookup_rcu` (each hit's `d_seq` sampled), the parent's `d_seq`
+checked after the lookup, the child's inode read with `d_inode_rcu`
+and checked against the child's sample before the walk stands on it
+(Linux nd->seq / nd->next_seq). The search permission is asked with
+MAY_NOT_BLOCK on the borrowed inode, a revalidation with LOOKUP_RCU
+(above: ECHILD where the answer needs more than RCU-readable fields).
+Where it must leave RCU mode (a miss, a symlink's body, ".." or a
+mountpoint, a revalidation or permission check that said ECHILD) it
+takes references to where it stands (`try_to_unlazy`,
+`try_to_unlazy_next` for a child too, `legitimize_path`:
+`MountRef::legitimize` against MOUNT_LOCK's sequence sampled at the
+lookup's start, `DentryRef::try_get`, then the `d_seq` check again)
+and goes on in ref mode from there; the root is held by the lookup
+(`Nd.root`, Linux ND_ROOT_PRESET). If a legitimize fails, or a
+sequence moved, the walk is ECHILD and the lookup is done again in
+ref mode from its start (a new `Nd`: path_init's sequences sampled
+again). What a failed legitimize took is put after the guard
+(`Puts`, Linux terminate_walk): a put may be the last. A
+RESOLVE_CACHED walk (Linux LOOKUP_CACHED) may not leave RCU mode but
+at its end (complete_walk), so it is EAGAIN where Linux's is: the
+retry's `Nd::new` refuses LOOKUP_CACHED without LOOKUP_RCU. No lock
+is taken or added; the sequences are read (`read_begin` spins out a
+writer, which holds spin locks only).
+
 A scoped walk (openat2 RESOLVE_BENEATH / RESOLVE_IN_ROOT, `namei::Nd`;
-Linux nd->m_seq, nd->r_seq) samples `MOUNT_LOCK`'s and `RENAME_LOCK`'s
-sequences at its start, holding no lock (`read_begin` spins out a
-writer, which holds only spin locks), and after each ".." gives up
+Linux nd->m_seq, nd->r_seq) uses `MOUNT_LOCK`'s and `RENAME_LOCK`'s
+sequences sampled at its start (every lookup samples them), holding no
+lock, and after each ".." gives up
 with EAGAIN if either moved: a rename or a mount change may have taken
 it above its root. Its result must then still be under the root
 (`mount::is_path_reachable`, Linux complete_walk's path_is_under:
@@ -3444,10 +3476,6 @@ same lock), so a mount and a removal of its mountpoint serialize:
 i_rwsem -> NAMESPACE_SEM -> MntNamespace.root.
 
 #### VFS Locking Notes
-
-**No RCU (future optimization):** The current implementation uses `RwLock` for all
-VFS read paths. Linux uses RCU for lockless path lookup. This is acceptable for MVP
-but may be a scalability bottleneck under heavy path lookup load.
 
 **Single Dentry Lock:** Following Linux's `d_lock` pattern, each dentry uses a
 single RwLock (`d_lock`) protecting all mutable state. This matches the proven

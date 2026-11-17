@@ -253,8 +253,24 @@ impl OpenAt<'_> {
 }
 
 /// Resolve the open target: an existing file, or (O_CREAT) a newly
-/// created one; the bool says it was created by this call
+/// created one; the bool says it was created by this call. Walked in
+/// RCU mode first, again in ref mode if that is ECHILD (Linux
+/// do_filp_open's retry of path_openat), which comes before anything
+/// is created.
 fn open_target(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), KernelError> {
+    match open_target_nd(at, path, op, true) {
+        Err(KernelError::NoChild) => open_target_nd(at, path, op, false),
+        r => r,
+    }
+}
+
+/// [`open_target`], its lookup's walks starting in RCU mode if `rcu`
+fn open_target_nd(
+    at: OpenAt<'_>,
+    path: &[u8],
+    op: &OpenFlags,
+    rcu: bool,
+) -> Result<(Path, bool), KernelError> {
     let (flags, lf) = (op.flags, op.lookup);
     if flags & O_CREAT == 0 {
         return Ok((at.lookup(path, lf)?, false));
@@ -269,8 +285,8 @@ fn open_target(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<(Path, boo
     // slash is EISDIR, existing or not; one lookup (Nd) throughout, so
     // RESOLVE_* holds for the parent, the symlinks and the last name
     let start = at.start(path, lf)?;
-    let nd = Nd::new(&start, lf)?;
-    let p = nd.parentat(start, path, lf)?;
+    let nd = Nd::new(start.as_ref(), lf, rcu)?;
+    let p = nd.parentat(start.as_ref(), path, lf)?;
     if p.last != Last::Norm || p.slash {
         return Err(KernelError::IsDirectory);
     }
@@ -287,7 +303,7 @@ fn open_target(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<(Path, boo
         CreateAt::Object(d) => return creat_existing(d, flags),
     };
     let dir = Path::new(p.mnt.clone(), p.dir.clone());
-    let (d, created) = match nd.lookup(Some(dir), &p.name, lf) {
+    let (d, created) = match nd.lookup(Some(&dir), &p.name, lf) {
         Ok(d) => (d, false),
         Err(KernelError::NotFound) => {
             let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode)?;

@@ -32,7 +32,7 @@ argued / published copy of locked state.
 ### 3. Dentry reads store to shared lock words — (c)
 - Where: `fs/dentry.rs` `d_lookup` (`__d_lookup` takes each candidate's
   `Dentry.d_lock` for reading, as Linux's non-RCU lookup does) and the
-  path walk built on it (`fs/namei.rs` `cached`, `lookup_cached`): every
+  path walk built on it (`fs/namei/` `cached`): every
   path component's read lock and reference count write shared words,
   so popular directories become contended lines.
 - Linux: path walk is RCU-walk with the `d_seq` seqcount, no stores to
@@ -43,9 +43,11 @@ argued / published copy of locked state.
   (`d_inode_rcu`, `Inode::igrab`, `DNameSlot`); `get_inode`,
   `is_negative`, `d_unhashed`, `is_mountpoint`, `name` take no lock;
   `__d_lookup_rcu`, `d_seq_begin`/`d_seq_retry`, `DentryRef::try_get`.
-- Left (stage 2): the LOOKUP_RCU walk itself (Linux path_init /
-  lookup_fast / step_into in RCU mode, try_to_unlazy, legitimize_links,
-  permission checks with MAY_NOT_BLOCK).
+- Done (stage 2): the LOOKUP_RCU walk (`fs/namei/rcu.rs`: lookup_fast,
+  step_into, may_lookup with MAY_NOT_BLOCK, try_to_unlazy(_next),
+  ECHILD retry in ref mode, RESOLVE_CACHED through it).
+- Left (stage 2): mounts and ".." in RCU mode (they unlazy), path_init
+  without references to the root and cwd.
 
 
 ## Checked and judged legitimate (f)

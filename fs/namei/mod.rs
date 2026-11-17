@@ -10,19 +10,29 @@
 //! What stays fixed along one lookup, symlinks included, is its [`Nd`]
 //! (Linux struct nameidata): the root and, for openat2's RESOLVE_*
 //! restrictions, the scoped lookup's sequences.
+//!
+//! A lookup walks in RCU mode first ([`rcu`]: no reference, no lock, no
+//! store to a shared dentry), going on in ref mode where it must; if it
+//! cannot, it is ECHILD and done again in ref mode from the start
+//! (Linux filename_lookup's retry without LOOKUP_RCU).
+
+mod rcu;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
-use super::KernelError;
-use super::dac::{MAY_EXEC, cred, permission_as};
-use super::dentry::{Dentry, DentryRef};
-use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
-use super::inode::{Inode, Link};
-use super::mount::{
+use self::rcu::Lazy;
+
+use crate::fs::KernelError;
+use crate::fs::dac::{MAY_EXEC, cred, permission_as};
+use crate::fs::dentry::{Dentry, DentryRef};
+use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use crate::fs::inode::{Inode, Link};
+use crate::fs::mount::{
     MOUNT_LOCK, MountRef, choose_mountpoint, follow_mount, is_path_reachable, path_connected,
 };
-use super::path_ref::Path;
+use crate::fs::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
 use crate::ns::current_mnt_ns;
 use crate::task::Cred;
@@ -30,6 +40,10 @@ use crate::uaccess::UserPtr;
 
 /// Maximum number of symlinks to follow (prevent infinite loops)
 const MAX_SYMLINK_DEPTH: usize = 40;
+
+/// An RCU walk cannot go on (Linux -ECHILD): its lookup is done again
+/// in ref mode; never reaches user space
+const ECHILD: KernelError = KernelError::NoChild;
 
 /// Path lookup flags
 #[derive(Debug, Clone, Copy, Default)]
@@ -126,13 +140,18 @@ pub fn lookup_path_at(
     path_lookupat(start, path, flags).map(|p| p.dentry.clone())
 }
 
-/// As [`lookup_path_at`], the mount too (Linux path_lookupat)
+/// As [`lookup_path_at`], the mount too (Linux filename_lookup's
+/// path_lookupat: in RCU mode, again in ref mode if that is ECHILD)
 pub fn path_lookupat(
     start: Option<Path>,
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Path, KernelError> {
-    Nd::new(&start, flags)?.lookup(start, path, flags)
+    let s = start.as_ref();
+    match Nd::new(s, flags, true)?.lookup(s, path, flags) {
+        Err(ECHILD) => Nd::new(s, flags, false)?.lookup(s, path, flags),
+        r => r,
+    }
 }
 
 /// Child `name` of directory `parent`: the dcache, else the file system
@@ -207,17 +226,31 @@ fn lookup_slow(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError
     lookup_one(parent, name)
 }
 
-/// Child `name` from the dcache alone (Linux lookup_fast in an RCU walk
-/// with LOOKUP_CACHED): a miss, or an entry whose revalidation needs
-/// the ref-walk, is EAGAIN. hk caches a miss (a negative entry) only on
-/// in-memory filesystems, where Linux drops one at once
-/// (always_delete_dentry), so it is a miss here too.
-fn lookup_cached(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
-    let child = parent.lookup_child(name).ok_or(KernelError::WouldBlock)?;
+/// The ref-mode half of lookup_fast after try_to_unlazy_next: `child`,
+/// found for `name` in `parent` by an RCU walk, revalidated (Linux
+/// d_revalidate without LOOKUP_RCU); an invalid one is dropped and the
+/// name looked up again (d_invalidate, then lookup_slow)
+fn lookup_fast_ref(
+    parent: &DentryRef,
+    child: DentryRef,
+    name: &[u8],
+) -> Result<DentryRef, KernelError> {
     match child.get_inode() {
-        Some(i) if i.i_op.revalidate(&i, true) == Ok(true) => Ok(child),
-        _ => Err(KernelError::WouldBlock),
+        Some(i) if i.i_op.revalidate(&i, false) == Ok(true) => Ok(child),
+        None => Err(KernelError::NotFound),
+        Some(_) => {
+            drop(child);
+            parent.remove_child(name);
+            lookup_slow(parent, name)
+        }
     }
+}
+
+/// What a ref-mode step gives: the walk goes on from it, or it was a
+/// symlink whose walk ended the lookup
+enum Walked {
+    On(Path),
+    Done(Path),
 }
 
 /// may_lookup: `dir` must be a searchable directory
@@ -244,22 +277,38 @@ fn step_mounts(p: Path, f: LookupFlags) -> Result<Path, KernelError> {
 }
 
 /// What stays fixed along one lookup, symlinks included (Linux struct
-/// nameidata's root, m_seq and r_seq): the root absolute paths and ".."
-/// stop at (a scoped lookup's own start), and for a scoped lookup the
-/// mount and rename sequences sampled at its start
+/// nameidata's root, m_seq and r_seq, and LOOKUP_RCU): the root
+/// absolute paths and ".." stop at (a scoped lookup's own start), the
+/// mount and rename sequences sampled at its start (path_init), and
+/// whether its walks still start in RCU mode
 pub struct Nd {
     c: Cred,
     root: Path,
-    seq: Option<(u32, u32)>,
+    /// LOOKUP_RCU: a walk tries RCU mode first (`rcu::walk_rcu`);
+    /// cleared once one left it (leave_rcu), so the rest of the lookup
+    /// runs in ref mode
+    rcu: Cell<bool>,
+    /// MOUNT_LOCK's sequence at the start (nd->m_seq): an RCU walk's
+    /// legitimize checks it; a scoped lookup's ".." too
+    m_seq: u32,
+    /// RENAME_LOCK's sequence at the start (nd->r_seq), for a scoped
+    /// lookup's ".."
+    r_seq: u32,
+    /// LOOKUP_IS_SCOPED
+    scoped: bool,
 }
 
 impl Nd {
     /// Linux path_init's root and sequences: a scoped lookup's root is
-    /// its start (dirfd or the cwd), any other the task's root
-    pub fn new(start: &Option<Path>, f: LookupFlags) -> Result<Self, KernelError> {
-        let seq = f
-            .scoped()
-            .then(|| (MOUNT_LOCK.read_begin(), super::dentry::rename_seq_begin()));
+    /// its start (dirfd or the cwd), any other the task's root. `rcu`:
+    /// LOOKUP_RCU, which LOOKUP_CACHED needs (EAGAIN without: the
+    /// retry of a walk that had to leave RCU mode).
+    pub fn new(start: Option<&Path>, f: LookupFlags, rcu: bool) -> Result<Self, KernelError> {
+        if f.cached && !rcu {
+            return Err(KernelError::WouldBlock);
+        }
+        let m_seq = MOUNT_LOCK.read_begin();
+        let r_seq = super::dentry::rename_seq_begin();
         let root = match start {
             Some(p) if f.scoped() => p.clone(),
             _ => nd_root()?,
@@ -267,14 +316,17 @@ impl Nd {
         Ok(Self {
             c: cred(),
             root,
-            seq,
+            rcu: Cell::new(rcu),
+            m_seq,
+            r_seq,
+            scoped: f.scoped(),
         })
     }
 
     /// Walk `path` from `start` (Linux path_lookupat + complete_walk)
     pub fn lookup(
         &self,
-        start: Option<Path>,
+        start: Option<&Path>,
         path: &[u8],
         f: LookupFlags,
     ) -> Result<Path, KernelError> {
@@ -285,7 +337,7 @@ impl Nd {
     /// A scoped lookup's result must still be under its root, whatever
     /// raced it (Linux complete_walk: path_is_under, EXDEV)
     fn complete(&self, p: Path) -> Result<Path, KernelError> {
-        if self.seq.is_some() && !is_path_reachable(&p, &self.root) {
+        if self.scoped && !is_path_reachable(&p, &self.root) {
             return Err(KernelError::CrossDevice);
         }
         Ok(p)
@@ -295,8 +347,8 @@ impl Nd {
     /// may have left the root (Linux handle_dots: EAGAIN, for user space
     /// to retry)
     fn recheck(&self) -> Result<(), KernelError> {
-        if let Some((m, r)) = self.seq
-            && (MOUNT_LOCK.read_retry(m) || super::dentry::rename_seq_retry(r))
+        if self.scoped
+            && (MOUNT_LOCK.read_retry(self.m_seq) || super::dentry::rename_seq_retry(self.r_seq))
         {
             return Err(KernelError::WouldBlock);
         }
@@ -327,9 +379,13 @@ impl Nd {
         Ok(())
     }
 
+    /// link_path_walk + lookup_last from `start` (the root for an
+    /// absolute path): in RCU mode while the lookup is still in it
+    /// (depth 0: RCU mode is left before any symlink's body), else in
+    /// ref mode
     fn walk(
         &self,
-        start: Option<Path>,
+        start: Option<&Path>,
         path: &[u8],
         mut f: LookupFlags,
         depth: usize,
@@ -349,76 +405,145 @@ impl Nd {
         if abs && f.beneath {
             return Err(KernelError::CrossDevice);
         }
-        let mut cur = match start {
+        let start = match start {
             Some(p) if !abs => p,
-            _ => self.root.clone(),
+            _ => &self.root,
         };
+        if self.rcu.get() {
+            return self.walk_rcu(start, path, f);
+        }
+        self.walk_ref(start.clone(), path, f, depth)
+    }
+
+    /// The walk's loop in ref mode, from `cur` (Linux link_path_walk
+    /// without LOOKUP_RCU)
+    fn walk_ref(
+        &self,
+        mut cur: Path,
+        path: &[u8],
+        f: LookupFlags,
+        depth: usize,
+    ) -> Result<Path, KernelError> {
         let mut next = next_comp(path);
         while let Some((name, rest)) = next {
             next = next_comp(rest);
             may_lookup(&self.c, &cur.dentry)?;
-            match name {
-                b"." => continue,
+            cur = match name {
+                b"." => cur,
                 b".." => {
-                    cur = follow_dotdot(cur, &self.root, f)?;
+                    let p = follow_dotdot(cur, &self.root, f)?;
                     self.recheck()?;
-                    continue;
+                    p
                 }
-                _ => {}
-            }
-            let d = if f.cached {
-                lookup_cached(&cur.dentry, name)?
-            } else {
-                lookup_slow(&cur.dentry, name)?
+                _ => {
+                    let d = lookup_slow(&cur.dentry, name)?;
+                    match self.step(cur, d, rest, f, depth)? {
+                        Walked::On(p) => p,
+                        Walked::Done(p) => return Ok(p),
+                    }
+                }
             };
-            let child = step_mounts(Path::new(cur.mnt.clone(), d), f)?;
-            let last = next.is_none();
-            if (!last || f.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
-                return self.follow_link(&cur, &child, rest, last, f, depth);
-            }
-            cur = child;
         }
-        if f.directory && cur.get_inode().is_some_and(|n| !n.mode().is_dir()) {
-            return Err(KernelError::NotDirectory);
-        }
-        Ok(cur)
+        self.finish(cur, f)
     }
 
-    /// Continue a walk through symlink `link` found in `dir`, with the
-    /// components `rest` still to resolve after it (Linux pick_link);
-    /// `last`: no component follows it (WALK_TRAILING)
-    fn follow_link(
+    /// The end of a walk: LOOKUP_DIRECTORY's check (Linux
+    /// path_lookupat: ENOTDIR)
+    fn finish(&self, p: Path, f: LookupFlags) -> Result<Path, KernelError> {
+        if f.directory && p.get_inode().is_some_and(|n| !n.mode().is_dir()) {
+            return Err(KernelError::NotDirectory);
+        }
+        Ok(p)
+    }
+
+    /// step_into in ref mode: onto `d`, found in `cur`, with `rest` to
+    /// walk after it: what is mounted on it crossed, a symlink to follow
+    /// followed (its walk is the rest of this one)
+    fn step(
+        &self,
+        cur: Path,
+        d: DentryRef,
+        rest: &[u8],
+        f: LookupFlags,
+        depth: usize,
+    ) -> Result<Walked, KernelError> {
+        let last = next_comp(rest).is_none();
+        let child = step_mounts(Path::new(cur.mnt.clone(), d), f)?;
+        if (!last || f.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
+            self.pick_link(&cur, &child, last, f)?;
+            return self
+                .get_link(&cur, &child, rest, f, depth)
+                .map(Walked::Done);
+        }
+        Ok(Walked::On(child))
+    }
+
+    /// Go on in ref mode from where an RCU walk left RCU mode (Linux:
+    /// the same loop after try_to_unlazy)
+    fn unlazied(&self, l: Lazy<'_>, f: LookupFlags) -> Result<Path, KernelError> {
+        let (cur, d, rest) = match l {
+            Lazy::Done(p) => return self.finish(p, f),
+            Lazy::Comp(cur, path) => return self.walk_ref(cur, path, f, 0),
+            Lazy::Link { cur, link, rest } => return self.get_link(&cur, &link, rest, f, 0),
+            Lazy::Lookup(cur, name, rest) => {
+                let d = lookup_slow(&cur.dentry, name)?;
+                (cur, d, rest)
+            }
+            Lazy::Child {
+                cur,
+                child,
+                name,
+                rest,
+                reval,
+            } => {
+                let d = if reval {
+                    lookup_fast_ref(&cur.dentry, child, name)?
+                } else {
+                    child
+                };
+                (cur, d, rest)
+            }
+        };
+        match self.step(cur, d, rest, f, 0)? {
+            Walked::On(p) => self.walk_ref(p, rest, f, 0),
+            Walked::Done(p) => Ok(p),
+        }
+    }
+
+    /// pick_link's checks of symlink `link` found in `dir`:
+    /// fs.protected_symlinks for the trailing link only (`last`:
+    /// WALK_TRAILING), then RESOLVE_NO_SYMLINKS or a nosymfollow mount
+    /// (LOOKUP_NO_SYMLINKS / MNT_NOSYMFOLLOW on the link's mount)
+    fn pick_link(
         &self,
         dir: &Path,
         link: &Path,
-        rest: &[u8],
         last: bool,
         f: LookupFlags,
-        depth: usize,
-    ) -> Result<Path, KernelError> {
+    ) -> Result<(), KernelError> {
         let inode = link.get_inode().ok_or(KernelError::NotFound)?;
-        // fs.protected_symlinks for the trailing link only, then
-        // RESOLVE_NO_SYMLINKS or a nosymfollow mount (Linux pick_link:
-        // may_follow_link under WALK_TRAILING, then LOOKUP_NO_SYMLINKS /
-        // MNT_NOSYMFOLLOW on the link's mount)
         if last && let Some(d) = dir.dentry.get_inode() {
             super::dac::may_follow_link(&self.c, &d, &inode)?;
         }
         if f.no_symlinks || link.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
             return Err(KernelError::TooManySymlinks);
         }
-        // An atime update leaves the RCU walk, which LOOKUP_CACHED
-        // forbids (try_to_unlazy fails: EAGAIN)
-        if f.cached && inode.atime_needs_update(&link.mnt) {
-            return Err(KernelError::WouldBlock);
-        }
-        // A magic link's get_link needs the ref-walk too (procfs's is
-        // -ECHILD without a dentry): EAGAIN under LOOKUP_CACHED
-        let got = inode.i_op.get_link(&inode);
-        if f.cached && !matches!(got, Ok(Link::Text(_))) {
-            return Err(KernelError::WouldBlock);
-        }
-        let got = got?;
+        Ok(())
+    }
+
+    /// The rest of pick_link, in ref mode: continue the walk through
+    /// symlink `link` found in `dir`, with the components `rest` still
+    /// to resolve after it (its atime touched, its ->get_link)
+    fn get_link(
+        &self,
+        dir: &Path,
+        link: &Path,
+        rest: &[u8],
+        f: LookupFlags,
+        depth: usize,
+    ) -> Result<Path, KernelError> {
+        let inode = link.get_inode().ok_or(KernelError::NotFound)?;
+        let got = inode.i_op.get_link(&inode)?;
         inode.touch_atime(&link.mnt);
         let mut path = match got {
             // A magic link: the walk goes on from its object
@@ -433,7 +558,7 @@ impl Nd {
         }
         // `rest` is empty or starts at a slash: the walk goes on through it
         path.extend_from_slice(rest);
-        self.walk(Some(dir.clone()), &path, f, depth + 1)
+        self.walk(Some(dir), &path, f, depth + 1)
     }
 
     /// Go on from a magic link's object `p` with what followed the link:
@@ -450,7 +575,7 @@ impl Nd {
         if from == rest.len() && !rest.is_empty() {
             f.directory = true;
         }
-        self.walk(Some(p), &rest[from..], f, depth + 1)
+        self.walk(Some(&p), &rest[from..], f, depth + 1)
     }
 
     /// Walk all but the last component of `path` from `start` (Linux
@@ -458,7 +583,7 @@ impl Nd {
     /// last name is not looked up, only classified
     pub fn parentat(
         &self,
-        start: Option<Path>,
+        start: Option<&Path>,
         path: &[u8],
         f: LookupFlags,
     ) -> Result<Parent, KernelError> {
@@ -486,7 +611,7 @@ impl Nd {
             ..f.resolve()
         };
         let (mnt, dir) = match (dir_path.is_empty(), start) {
-            (true, Some(p)) => p,
+            (true, Some(p)) => p.clone(),
             (_, start) => self.lookup(start, dir_path, dirf)?,
         }
         .into_parts();
@@ -522,7 +647,7 @@ impl Nd {
                 follow: false,
                 ..f.resolve()
             };
-            let found = match self.walk(Some(dir.clone()), &p.name, nofollow, 0) {
+            let found = match self.walk(Some(&dir), &p.name, nofollow, 0) {
                 Ok(f) => f,
                 Err(KernelError::NotFound) => return Ok(CreateAt::Name(p)),
                 Err(e) => return Err(e),
@@ -551,7 +676,7 @@ impl Nd {
             } else {
                 Some(dir)
             };
-            p = self.parentat(start, &target, f)?;
+            p = self.parentat(start.as_ref(), &target, f)?;
             if p.last != Last::Norm || p.slash {
                 return Err(KernelError::IsDirectory);
             }
@@ -847,11 +972,16 @@ pub struct Parent {
 }
 
 /// Walk all but the last component of `path` (Linux filename_parentat):
-/// see [`Nd::parentat`]
+/// see [`Nd::parentat`]; in RCU mode, again in ref mode if that is
+/// ECHILD
 pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError> {
     let f = LookupFlags::default();
     let start = path_start(dirfd, path, f)?;
-    Nd::new(&start, f)?.parentat(start, path, f)
+    let s = start.as_ref();
+    match Nd::new(s, f, true)?.parentat(s, path, f) {
+        Err(ECHILD) => Nd::new(s, f, false)?.parentat(s, path, f),
+        r => r,
+    }
 }
 
 /// The parent and new name for mkdir/mknod/symlink/link/bind (Linux

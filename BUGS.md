@@ -413,7 +413,7 @@ operations, as Linux has them:
 
 ## Credentials have no identity
 
-**Location**: `task/mod.rs` (`Cred`), `fs/namei.rs` (`may_linkat_empty`)
+**Location**: `task/mod.rs` (`Cred`), `fs/namei/mod.rs` (`may_linkat_empty`)
 
 `Cred` is a value, not Linux's shared, refcounted `struct cred`. linkat
 AT_EMPTY_PATH compares `f_cred` with the caller's creds by value, where
@@ -673,6 +673,20 @@ but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
 F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
+
+## RCU path walk gaps
+
+**Location**: `fs/namei/rcu.rs`, `fs/inode.rs` (`InodeOps::get_link`),
+`fs/proc/mod.rs`
+
+- No RCU ->get_link (Linux inode->i_link, get_link(NULL dentry)): the
+  RCU walk leaves RCU mode at every symlink it follows, and a
+  RESOLVE_CACHED walk through a symlink is EAGAIN where Linux tmpfs's
+  fast symlinks resolve.
+- procfs's revalidate and permission are ECHILD in an RCU walk (its
+  inode data is not RCU-readable); Linux's pid_revalidate and
+  proc_pid_permission run there, so /proc/<pid> walks leave RCU mode
+  at /proc and RESOLVE_CACHED is EAGAIN under it.
 
 ## renameat2 flag gaps
 
