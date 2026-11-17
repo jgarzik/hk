@@ -24,6 +24,7 @@
 use super::jobctl::*;
 use super::{
     SIGCONT, SIGSTOP, SIGTRAP, SigGuard, SigPending, SigSet, Signal, SignalStruct, TaskSignalState,
+    sig_of,
 };
 use crate::sync::spin::MutexGuard;
 use crate::task::Task;
@@ -204,6 +205,12 @@ fn trap_notify(t: &Task, s: &mut TaskSignalState) {
     ptrace_signal_wake_up(t, s, listening);
 }
 
+/// `t`'s jobctl bits, read under its siglock (0 once released)
+fn jobctl_of(t: &Task) -> u32 {
+    let rcu = crate::sync::rcu::read_lock();
+    super::lock_task_sighand(t, &rcu).map_or(0, |g| sig_of(t, &g).jobctl)
+}
+
 /// `t` is traced with PTRACE_SEIZE (a racy read, Linux t->ptrace &
 /// PT_SEIZED under siglock)
 fn seized(t: &Task) -> bool {
@@ -232,7 +239,7 @@ pub fn prepare(
         super::STOP_SIGNALS
     };
     for t in sig_struct.threads(g) {
-        let mut s = t.sig.lock();
+        let mut s = sig_of(t, g);
         s.pending.flush_mask_into(&flush, gone);
         if !stop {
             clear_pending(&mut s, STOP_PENDING);
@@ -295,7 +302,7 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
     };
     let sg = SigGuard::lock(h);
     let mut g = sig_struct.jobctl.lock();
-    let mut s = me.sig.lock();
+    let mut s = sig_of(&me, &sg);
     if s.jobctl & STOP_PENDING == 0 {
         let Some(signr) = signr else {
             return false;
@@ -318,7 +325,7 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
             if me.is(t) {
                 continue;
             }
-            let mut ts = t.sig.lock();
+            let mut ts = sig_of(t, &sg);
             if ts.jobctl & STOPPED == 0 && set_pending(t, &mut ts, signr.nr() | gstop) {
                 g.count += 1;
                 if !seized(t) {
@@ -328,7 +335,7 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
                 }
             }
         }
-        s = me.sig.lock();
+        s = sig_of(&me, &sg);
     }
     if traced {
         // Traced: the stop is reported in a ptrace trap
@@ -351,7 +358,7 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
     // Until SIGCONT, SIGKILL or a tracer's attach clears STOPPED
     loop {
         set_current_state(SleepState::Killable);
-        if me.sig.lock().jobctl & STOPPED == 0 {
+        if jobctl_of(&me) & STOPPED == 0 {
             break;
         }
         crate::task::percpu::schedule();
@@ -373,7 +380,7 @@ pub fn do_jobctl_trap() {
         let table = crate::task::percpu::TASKLIST.read();
         table.view(&me).is_some_and(|v| v.ptrace() & PT_SEIZED != 0)
     };
-    let mut signr = me.sig.lock().jobctl & STOP_SIGMASK;
+    let mut signr = jobctl_of(&me) & STOP_SIGMASK;
     if seized {
         let g = sig_struct.jobctl.lock();
         if g.count == 0 && g.flags & flags::STOP_STOPPED == 0 {
@@ -449,20 +456,22 @@ pub fn notify_cld() {
 /// the parent
 pub fn exit_participate() {
     let me = crate::task::percpu::current();
-    let Some(sig_struct) = me.cpu_group().cloned() else {
+    let table = crate::task::percpu::TASKLIST.read();
+    let Some(sg) = super::lock_sighand_in(&me, &table) else {
         me.set_flag(crate::task::pf::EXITING);
-        let _gone = core::mem::take(&mut me.sig.lock().pending);
         return;
     };
-    let table = crate::task::percpu::TASKLIST.read();
     let (notify, gone) = {
-        let mut g = sig_struct.jobctl.lock();
-        let mut s = me.sig.lock();
+        let mut g = me.cpu_group().map(|s| s.jobctl.lock());
+        let mut s = sig_of(&me, &sg);
         me.set_flag(crate::task::pf::EXITING);
         let gone = core::mem::take(&mut s.pending);
-        let notify = s.jobctl & STOP_PENDING != 0 && participate(&mut g, &mut s);
+        let notify =
+            s.jobctl & STOP_PENDING != 0 && g.as_mut().is_some_and(|g| participate(g, &mut s));
         (notify, gone)
     };
+    // Dropped before the parent's notice, which takes its siglock
+    drop(sg);
     if notify {
         super::notify::notify_parent_cldstop(&table, &me, false, Why::Stopped);
     }
@@ -510,8 +519,12 @@ pub fn attach_stopped(t: &Task) {
     let Some(sig_struct) = t.cpu_group() else {
         return;
     };
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(sg) = super::lock_task_sighand(t, &rcu) else {
+        return;
+    };
     let _g = sig_struct.jobctl.lock();
-    let mut s = t.sig.lock();
+    let mut s = sig_of(t, &sg);
     if s.jobctl & STOPPED != 0 && set_pending(t, &mut s, TRAP_STOP | TRAPPING) {
         s.jobctl &= !STOPPED;
         t.set_sigpending(true);
@@ -521,7 +534,7 @@ pub fn attach_stopped(t: &Task) {
 
 /// `t` is in the middle of an attach's re-trap (JOBCTL_TRAPPING)
 pub fn trapping(t: &Task) -> bool {
-    t.sig.lock().jobctl & TRAPPING != 0
+    jobctl_of(t) & TRAPPING != 0
 }
 
 /// `t` loses its tracer (Linux __ptrace_unlink), TASKLIST held for
@@ -529,9 +542,13 @@ pub fn trapping(t: &Task) -> bool {
 /// for it unless it is exiting, and it is woken out of a ptrace stop or
 /// to stop for the group, its stop's code left alone
 pub fn unlink(t: &Task) {
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(sg) = super::lock_task_sighand(t, &rcu) else {
+        return;
+    };
     let sig_struct = t.cpu_group().cloned();
     let g = sig_struct.as_ref().map(|s| s.jobctl.lock());
-    let mut s = t.sig.lock();
+    let mut s = sig_of(t, &sg);
     s.jobctl &= !PTRACE_FROZEN;
     clear_pending(&mut s, TRAP_MASK);
     clear_trapping(&mut s);
@@ -551,10 +568,14 @@ pub fn unlink(t: &Task) {
 /// here; true if the signal work is to look again
 pub fn pending_step() -> bool {
     let me = crate::task::percpu::current();
-    let (j, killed) = {
-        let s = me.sig.lock();
+    let rcu = crate::sync::rcu::read_lock();
+    let Some((j, killed)) = super::lock_task_sighand(&me, &rcu).map(|g| {
+        let s = sig_of(&me, &g);
         (s.jobctl, s.pending.signal.contains(super::SIGKILL))
+    }) else {
+        return false;
     };
+    drop(rcu);
     // A fatal signal comes first (its dequeue ends the task)
     if killed {
         return false;
@@ -562,7 +583,7 @@ pub fn pending_step() -> bool {
     if j & STOP_PENDING != 0 && do_signal_stop(None) {
         return true;
     }
-    if me.sig.lock().jobctl & TRAP_MASK != 0 {
+    if jobctl_of(&me) & TRAP_MASK != 0 {
         do_jobctl_trap();
         return true;
     }
@@ -587,15 +608,20 @@ pub fn join_group_stop(parent: &Task, child: &Task) {
     let Some(sig_struct) = parent.cpu_group() else {
         return;
     };
+    // One table: CLONE_THREAD shares it
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(sg) = super::lock_task_sighand(parent, &rcu) else {
+        return;
+    };
     let mut g = sig_struct.jobctl.lock();
-    let mut mask = parent.sig.lock().jobctl & STOP_SIGMASK;
+    let mut mask = sig_of(parent, &sg).jobctl & STOP_SIGMASK;
     if g.count != 0 {
         g.count += 1;
         mask |= STOP_CONSUME;
     } else if g.flags & flags::STOP_STOPPED == 0 {
         return;
     }
-    let mut s = child.sig.lock();
+    let mut s = sig_of(child, &sg);
     set_pending(child, &mut s, mask | STOP_PENDING);
     super::recalc_sigpending_tsk(child, &s);
 }

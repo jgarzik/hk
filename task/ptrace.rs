@@ -211,7 +211,8 @@ fn ptrace_check_attach(task: &TaskRef) -> KernelResult<Frozen> {
 
         // In a ptrace stop its tracer does not listen in, and not
         // killed: the stop then stays until the request ends
-        let mut s = task.sig.lock();
+        let g = signal::lock_sighand_in(task, &table).ok_or(KernelError::NoProcess)?;
+        let mut s = signal::sig_of(task, &g);
         if !s.traced() || s.jobctl & LISTENING != 0 || s.fatal_pending() {
             return Err(KernelError::NoProcess);
         }
@@ -233,7 +234,12 @@ struct Frozen(TaskRef);
 
 impl Drop for Frozen {
     fn drop(&mut self) {
-        let mut s = self.0.sig.lock();
+        // Linux ptrace_unfreeze_traced: nothing once released
+        let rcu = crate::sync::rcu::read_lock();
+        let Some(g) = signal::lock_task_sighand(&self.0, &rcu) else {
+            return;
+        };
+        let mut s = signal::sig_of(&self.0, &g);
         s.jobctl &= !PTRACE_FROZEN;
         if s.fatal_pending() {
             s.end_trace_stop();
@@ -256,7 +262,8 @@ pub type PtRegs = <crate::arch::CurrentArch as crate::arch::Arch>::TrapFrame;
 pub fn with_stopped_regs<R>(t: &Task, f: impl FnOnce(&mut PtRegs) -> R) -> KernelResult<R> {
     let table = TASKLIST.read();
     let v = table.view(t).ok_or(KernelError::NoProcess)?;
-    let s = v.task.sig.lock();
+    let g = signal::lock_sighand_in(v.task, &table).ok_or(KernelError::NoProcess)?;
+    let s = signal::sig_of(v.task, &g);
     if !s.traced() || !s.frozen() {
         return Err(KernelError::NoProcess);
     }
@@ -264,7 +271,7 @@ pub fn with_stopped_regs<R>(t: &Task, f: impl FnOnce(&mut PtRegs) -> R) -> Kerne
     // the tracee writes only on a kernel entry or exit; it is in a ptrace
     // stop its tracer's request holds (PTRACE_FROZEN, set before
     // ptrace_check_attach waited for it to switch out), which ends only
-    // under its Task.sig, held here: no other access races this one
+    // under its siglock, held here: no other access races this one
     let r = f(unsafe { &mut *percpu::task_pt_regs(v.task) });
     drop(s);
     Ok(r)
@@ -371,7 +378,13 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
 fn wait_trapping(t: &Task) {
     use crate::sync::waitqueue::WaitEntry;
     use percpu::SleepState;
-    let wq = signal::stop::trapping_wq(&t.sig.lock());
+    let wq = {
+        let rcu = crate::sync::rcu::read_lock();
+        let Some(g) = signal::lock_task_sighand(t, &rcu) else {
+            return;
+        };
+        signal::stop::trapping_wq(&signal::sig_of(t, &g))
+    };
     let w = core::pin::pin!(WaitEntry::new());
     loop {
         wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
@@ -455,7 +468,12 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> KernelResult<i64> {
     // __ptrace_detach's wakeup, under tasklist_lock)
     let mut table = TASKLIST.write();
     let mut t = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
-    t.task.sig.lock().ptrace_code = sig.map_or(0, Signal::nr);
+    {
+        let rcu = crate::sync::rcu::read_lock();
+        if let Some(g) = signal::lock_task_sighand(t.task, &rcu) {
+            signal::sig_of(t.task, &g).ptrace_code = sig.map_or(0, Signal::nr);
+        }
+    }
     ptrace_unlink(&mut t);
     Ok(0)
 }
@@ -470,7 +488,11 @@ fn resume_sig(data: u64) -> KernelResult<Option<Signal>> {
 /// ptrace_resume, ptrace_signal_wake_up: exit_code, JOBCTL_TRACED and
 /// wake_up_state(__TASK_TRACED) under siglock)
 fn ptrace_wake(task: &Task, sig: Option<Signal>) {
-    let mut s = task.sig.lock();
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(g) = signal::lock_task_sighand(task, &rcu) else {
+        return;
+    };
+    let mut s = signal::sig_of(task, &g);
     if !s.traced() {
         return;
     }
@@ -583,8 +605,9 @@ fn ptrace_interrupt(target_pid: Pid) -> KernelResult<i64> {
     else {
         return Err(KernelError::Io);
     };
+    let sg = signal::lock_sighand_in(&task, &table).ok_or(KernelError::Io)?;
     let _g = sig_struct.jobctl.lock();
-    let mut s = task.sig.lock();
+    let mut s = signal::sig_of(&task, &sg);
     if signal::stop::set_pending(&task, &mut s, TRAP_STOP) {
         let listening = s.jobctl & LISTENING != 0;
         signal::stop::ptrace_signal_wake_up(&task, &mut s, listening);
@@ -606,7 +629,8 @@ fn ptrace_listen(target_pid: Pid) -> KernelResult<i64> {
     if v.task.ptrace() & PT_SEIZED == 0 {
         return Err(KernelError::Io);
     }
-    let mut s = task.sig.lock();
+    let g = signal::lock_sighand_in(&task, &table).ok_or(KernelError::NoProcess)?;
+    let mut s = signal::sig_of(&task, &g);
     let event_stop = s
         .last_siginfo
         .is_some_and(|i| i.code >> 8 == PTRACE_EVENT_STOP as i32);
@@ -723,8 +747,12 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> KernelResult<i64> {
 fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
     let task = tracee(target_pid)?;
     let _frozen = ptrace_check_attach(&task)?;
-    // Under its Task.sig (Linux ptrace_getsiginfo: lock_task_sighand)
-    let info = task.sig.lock().last_siginfo;
+    // Under its siglock (Linux ptrace_getsiginfo: lock_task_sighand)
+    let info = {
+        let rcu = crate::sync::rcu::read_lock();
+        let g = signal::lock_task_sighand(&task, &rcu).ok_or(KernelError::NoProcess)?;
+        signal::sig_of(&task, &g).last_siginfo
+    };
     info.ok_or(KernelError::InvalidArgument)?
         .copy_to_user(data)?;
     Ok(0)
@@ -737,7 +765,9 @@ fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> KernelResult<i64> {
     let task = tracee(target_pid)?;
     let _frozen = ptrace_check_attach(&task)?;
     let info = crate::signal::SigInfo::copy_from_user(data)?;
-    let mut s = task.sig.lock();
+    let rcu = crate::sync::rcu::read_lock();
+    let g = signal::lock_task_sighand(&task, &rcu).ok_or(KernelError::NoProcess)?;
+    let mut s = signal::sig_of(&task, &g);
     match s.last_siginfo.as_mut() {
         Some(i) => {
             *i = info;
@@ -879,9 +909,12 @@ pub fn ptrace_stop_why(
         let Some(t) = table.view(&me) else {
             return (None, info);
         };
+        let Some(sg) = signal::lock_sighand_in(&me, &table) else {
+            return (None, info);
+        };
         let sig_struct = me.cpu_group().cloned();
         let mut g = sig_struct.as_ref().map(|s| s.jobctl.lock());
-        let mut s = me.sig.lock();
+        let mut s = signal::sig_of(&me, &sg);
         // Untraced, or killed: no stop (Linux: !current->ptrace ||
         // __fatal_signal_pending)
         if t.task.ptrace() == 0 || s.pending.signal.contains(crate::signal::SIGKILL) {
@@ -901,6 +934,8 @@ pub fn ptrace_stop_why(
         set_current_state(SleepState::Killable);
         drop(s);
         drop(g);
+        // Dropped before the notices, which take the parents' siglocks
+        drop(sg);
         // The tracer's wait finds the stop; SIGCHLD tells it, in the
         // TASKLIST hold that saw us traced (Linux ptrace_stop:
         // do_notify_parent_cldstop under tasklist_lock); a completed
@@ -934,7 +969,11 @@ pub fn ptrace_stop_why(
         schedule();
     }
     set_current_state(SleepState::Running);
-    let mut s = me.sig.lock();
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(g) = signal::lock_task_sighand(&me, &rcu) else {
+        return (None, None);
+    };
+    let mut s = signal::sig_of(&me, &g);
     // The stop's siginfo, as the tracer left it (Linux: last_siginfo
     // cleared after the stop)
     let info = s.last_siginfo.take();
@@ -967,10 +1006,13 @@ pub fn ptrace_do_notify(signr: u32, exit_code: u32, why: Why) -> Option<Signal> 
 }
 
 /// The current task is in a ptrace stop, and its tracer inside a
-/// request on it (frozen), read under its Task.sig
+/// request on it (frozen), read under its siglock
 fn stop_state(me: &Task) -> (bool, bool) {
-    let s = me.sig.lock();
-    (s.traced(), s.frozen())
+    let rcu = crate::sync::rcu::read_lock();
+    signal::lock_task_sighand(me, &rcu).map_or((false, false), |g| {
+        let s = signal::sig_of(me, &g);
+        (s.traced(), s.frozen())
+    })
 }
 
 /// A PTRACE_SYSCALL stop at syscall entry or exit (Linux

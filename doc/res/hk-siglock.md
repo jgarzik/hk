@@ -133,7 +133,7 @@ made under siglock as Linux's.
 | `TaskInner.signal` | gone (2b) | `task->signal`, fixed | `Task.cpu_group` is it (fixed) |
 | leader `TaskInner.threads` | `SignalStruct.threads` (3) | `signal->thread_head`: tasklist write + siglock | done |
 | `TaskInner.ptrace` | `Task.ptrace` atomic (4) | tasklist write; racy read under siglock | done |
-| `Task.sig` (blocked, pending, altstack, ptrace jobctl, last_siginfo) | per-task spin Mutex | siglock | nested under siglock first; folded into siglock-owned state last |
+| `Task.sig` (blocked, pending, altstack, ptrace jobctl, last_siginfo) | per-task spin Mutex | siglock | `InstanceCell` owned by the task's table (done) |
 | `SignalStruct.jobctl` (group stop) | spin Mutex after TASKLIST | siglock | as above |
 | `SignalStruct.shared` (shared_pending, curr_target, forks) | spin Mutex | siglock | as above |
 | `SigHand.action` | IrqSpinlock leaf | siglock | as above |
@@ -195,8 +195,15 @@ made under siglock as Linux's.
    TASKLIST; TASKLIST callers (pgrp walk, kill(-1), notify parent,
    exit_ptrace, send_sigio) take siglock inside it. exit_group and
    de_thread's zap take only siglock. BUGS.md bullet deleted.
-5. [ ] fold Task.sig, SignalStruct.jobctl/shared, SigHand.action/update
-   into siglock-owned `SigCell`s (Linux: one lock). Delete this file.
+5. fold into siglock-owned state (Linux: one lock); delete this file
+   after the last:
+   - [x] `Task.sig`: `sync::InstanceCell` owned by the task's table,
+     moved with `Task.sighand`; `with_sig`'s retarget walks the thread
+     list under siglock.
+   - [ ] `SignalStruct.jobctl`, `shared`.
+   - [ ] `SigHand.action`.
+   - [ ] `SigHand.update` gone; ignored POSIX timers on a siglock-owned
+     list (Linux ignored_posix_timers).
 
 Also in this series:
 

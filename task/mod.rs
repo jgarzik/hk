@@ -841,11 +841,13 @@ pub struct Task {
     /// task itself; read at every syscall entry
     pub seccomp_mode: AtomicU8,
 
-    /// Its signal state (blocked mask, private pending set, altstack;
-    /// Linux siglock's per-task part): spin Mutex, thread context only
-    /// (no interrupt handler sends signals), under TASKLIST when both
-    /// are taken; the shared pending set's lock nests inside
-    pub sig: crate::sync::spin::Mutex<TaskSignalState>,
+    /// Its signal state (blocked mask, private pending set, altstack,
+    /// ptrace stop; Linux task->blocked, ->pending, ->jobctl..., no lock
+    /// of their own): under the siglock of the table `sighand` names,
+    /// the cell's owner, handed over with that field (exec's unshare,
+    /// under TASKLIST's write lock and the old siglock); reached through
+    /// `signal::lock_task_sighand`
+    pub sig: crate::sync::InstanceCell<TaskSignalState, SigHand>,
     /// Keyring references (Linux cred->thread_keyring etc.): spin lock,
     /// thread context; the key database is taken under it
     pub keyrings: crate::sync::spin::Mutex<crate::keys::keyring::TaskKeyrings>,
@@ -1652,7 +1654,7 @@ impl Task {
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
-            sig: crate::sync::spin::Mutex::new(sig),
+            sig: crate::sync::InstanceCell::new(sig),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
@@ -1726,7 +1728,7 @@ impl Task {
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(0),
-            sig: crate::sync::spin::Mutex::new(TaskSignalState::boot()),
+            sig: crate::sync::InstanceCell::new(TaskSignalState::boot()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),

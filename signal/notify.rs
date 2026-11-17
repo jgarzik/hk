@@ -72,7 +72,8 @@ pub fn notify_parent_cldstop(
             let code = tsk.cpu_group().map_or(0, |s| super::stop::stop_code(s));
             (code & 0x7f) as i32
         }
-        Why::Trapped => (tsk.sig.lock().ptrace_code & 0x7f) as i32,
+        Why::Trapped => super::lock_sighand_in(&tsk, table)
+            .map_or(0, |g| (super::sig_of(&tsk, &g).ptrace_code & 0x7f) as i32),
     };
     let quiet = table
         .view(&parent)

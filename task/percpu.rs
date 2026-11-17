@@ -2357,7 +2357,7 @@ fn group_status(t: &TaskView<'_>, own: i32) -> i32 {
 /// `wnowait` (Linux wait_task_stopped with ptrace: exit_code cleared
 /// under siglock), with its process's CPU time ([`rusage_both`]). The
 /// tracees are walked under the read lock, each stop read and its code
-/// taken under the tracee's Task.sig.
+/// taken under the tracee's siglock.
 pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32, Times)> {
     let table = TASKLIST.read();
     let pgid = current_pgid();
@@ -2365,7 +2365,8 @@ pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(T
         if !(tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid)) {
             return None;
         }
-        let mut s = t.task.sig.lock();
+        let g = crate::signal::lock_sighand_in(t.task, &table)?;
+        let mut s = crate::signal::sig_of(t.task, &g);
         // Not one its tracer listens in (Linux task_stopped_code:
         // JOBCTL_LISTENING)
         if !s.traced() || s.jobctl & crate::signal::jobctl::LISTENING != 0 || s.ptrace_code == 0 {
@@ -3153,7 +3154,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         let mut keep = crate::signal::SigSet::new();
         keep.add(crate::signal::SIGKILL);
         keep.add(crate::signal::SIGSTOP);
-        child_task.sig.lock().blocked = crate::signal::SigSet::from_bits(!keep.bits());
+        crate::signal::with_task_signal_state(&child_task, |s| {
+            s.blocked = crate::signal::SigSet::from_bits(!keep.bits());
+        });
         let mut name = [0u8; 16];
         io_thread_name(&mut name, current_tid);
         child_task.task_lock().set_comm(name);

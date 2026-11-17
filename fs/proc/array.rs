@@ -49,7 +49,7 @@ struct Snap {
     comm: [u8; 16],
     state: TaskState,
     /// In a ptrace stop (Linux __TASK_TRACED; JOBCTL_TRACED under its
-    /// Task.sig)
+    /// siglock)
     traced: bool,
     /// In a group stop (Linux __TASK_STOPPED; JOBCTL_STOPPED)
     stopped: bool,
@@ -125,15 +125,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         let a = t.task.task_lock();
         (a.comm(), a.fs().cloned(), a.files().cloned())
     };
-    let (blocked, pending, traced, stopped) = {
-        let s = t.task.sig.lock();
-        (
-            s.blocked.0,
-            s.pending.signal.0,
-            s.traced(),
-            s.jobctl & crate::signal::jobctl::STOPPED != 0,
-        )
-    };
+    let (blocked, pending, traced, stopped) = crate::signal::proc_sig(&table, t.task);
     // The whole thread group's CPU time (Linux do_task_stat with whole:
     // thread_group_cputime_adjusted)
     let (utime, stime) = crate::task::cputime::thread_group_cputime_adjusted(&table, pid);

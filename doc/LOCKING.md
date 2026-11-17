@@ -726,7 +726,7 @@ SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fa_lock,
     list under RCU, any context but hardirq, spin locks held or not:
     `fa` (read) → FOwner.st (IrqRwLock, read) → TASKLIST (read; a
     pgrp owner's group walked under it, each send in place) →
-    Task.sig → SignalStruct.shared, its entry GFP_ATOMIC (3.7 rule 5)
+    SigHand.siglock → SignalStruct.shared, its entry GFP_ATOMIC (3.7 rule 5)
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem, INODE_HASH_LOCK
@@ -771,8 +771,7 @@ Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
     SigHand.siglock (spin Mutex, per handler table, thread context;
     Linux sighand->siglock, 3.7) →
     SignalStruct.jobctl (spin Mutex, per thread group, thread context;
-    job-control state, 3.7) → Task.sig (spin
-    Mutex, per task) → SignalStruct.shared (spin Mutex) →
+    job-control state, 3.7) → SignalStruct.shared (spin Mutex) →
     SigHand.action (IrqSpinlock leaf); Task.keyrings, Task.cgroup:
     per-task leaves reached through the task (current
     or a held TaskRef), never under TASKLIST; SignalStruct.posix_timers (never under TASKLIST)
@@ -1293,8 +1292,8 @@ for lookups and walks, write for any change) protects the task list and
 the relations, ptrace, exit and other `TaskInner` fields. Per task, as in
 Linux: `Task.alloc_lock` (Linux task_lock) guards the resource pointers
 (mm, files, fs, nsproxy, comm, mempolicy, io_context), `Task.pi_lock`
-serializes wakers (3.1), `Task.sig` holds the per-task signal state
-(3.7).
+serializes wakers (3.1), the siglock of its handler table owns its signal state
+(`Task.sig`, 3.7).
 
 #### Data Structures
 
@@ -1613,7 +1612,7 @@ one alloc_lock section (under `exec_update` and TASKLIST, which it
 holds for the page table), so a reader sees the old name with the old
 mm or the new with the new (Linux exec_mmap, __set_task_comm). Order:
 TASKLIST (and PIDMAP_LOCK) before alloc_lock, alloc_lock before
-`Task.sig`; nothing else is taken under it (no TASKLIST, no `Files`,
+siglock; nothing else is taken under it (no TASKLIST, no `Files`,
 no sleeping lock). `cred` keeps its own scheme (Linux RCU): lock-free
 for the task, an RCU read guard for others.
 
@@ -1774,7 +1773,7 @@ from `Task.se`.
 |------------|---------|---------------|
 | `alloc_lock` (task_lock) | mm, files, fs, nsproxy, comm, mempolicy, io_context | `Task.alloc_lock` (spin Mutex, per task) |
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
-| `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.jobctl` (group stop state), `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
+| `sighand->siglock` | Signal state, handlers | `SigHand.siglock` with the per-task state it owns (`Task.sig`), `SignalStruct.jobctl` (group stop state), `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
 | RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHList`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
 | RCU (`cred`, put_cred_rcu) | Credentials | `Task.cred` (`TaskCred`): lock-free for the task, an RCU read guard for others, the old set through `put_rcu` |
@@ -1791,19 +1790,19 @@ The `TaskState` enum in `TASKLIST` is informational (and records
 **ptrace stops** (`task/ptrace.rs`, Linux ptrace_stop; JOBCTL_TRACED,
 JOBCTL_PTRACE_FROZEN, exit_code and last_siginfo under siglock): a
 stop is `TaskSignalState.jobctl` (`jobctl::TRACED`, `PTRACE_FROZEN`),
-`ptrace_code` and `last_siginfo`, all under the tracee's `Task.sig`.
+`ptrace_code` and `last_siginfo`, all under the tracee's siglock.
 The tracee checks it is traced under TASKLIST's read lock (`ptrace`
 is written under the write lock, so a detach cannot slip between) and
-sets the stop under its `Task.sig` inside it, drops `Task.sig`, wakes
+sets the stop under its siglock inside it, drops the siglock, wakes
 `CHILD_EXIT_WQ` and signals its tracer still inside that read hold
 (Linux ptrace_stop: do_notify_parent_cldstop under tasklist_lock, so
 a tracer that detached first gets no CLD_TRAPPED), drops TASKLIST,
 then sleeps `Killable` until
-the stop has ended (`Task.sig`, rechecked after each wakeup) or
+the stop has ended (under siglock, rechecked after each wakeup) or
 SIGKILL. PTRACE_ATTACH sends its SIGSTOP in the TASKLIST write
 section that links the tracer (Linux ptrace_attach under
 tasklist_lock). The tracer's wait walks its tracees under the read lock and
-takes a stop's code under that tracee's `Task.sig` (Linux
+takes a stop's code under that tracee's siglock (Linux
 wait_task_stopped); resume, detach and the tracer's exit
 (`exit_ptrace`) end the stop and `try_to_wake_up` the tracee under it
 (`ptrace_wake`, `ptrace_unlink`; Linux ptrace_resume and
@@ -1818,43 +1817,43 @@ the detach (`send_sig_info_in`, Linux exit_ptrace under tasklist_lock:
 SIGKILL takes no queue entry, so nothing allocates), its group
 effects and wakeups done there too, so the tracee never runs untraced
 user code. SIGKILL ends the stop
-under the `Task.sig` hold that queues it (`sigkill_task`, Linux
+under the siglock hold that queues it (`sigkill_task`, Linux
 signal_wake_up(fatal) clearing JOBCTL_TRACED under siglock), so a wait
 after the kill never reports the stop, and a kill needs no TASKLIST
 write lock (`zap_threads` walks the group under its siglock). A
 tracer's request holds the stop while it runs (`PTRACE_FROZEN`): set
-by `ptrace_check_attach` under the tracee's `Task.sig` (in the stop, no
+by `ptrace_check_attach` under the tracee's siglock (in the stop, no
 SIGKILL pending) inside TASKLIST's read lock (the tracer link), cleared
-under `Task.sig` when the request's `Frozen` guard drops, and whenever
+under siglock when the request's `Frozen` guard drops, and whenever
 a stop begins or ends (resume, detach, the tracer's exit, the tracee
 leaving `ptrace_stop`), so no stale flag outlives a stop; while it is
 set, SIGKILL leaves the stop alone (`sigkill_task`, and the tracee,
 woken, sleeps `Uninterruptible` once it reads frozen with SIGKILL
 pending), and the guard's drop ends a stop with SIGKILL pending and
-wakes the tracee under its `Task.sig` (Linux ptrace_unfreeze_traced).
+wakes the tracee under its siglock (Linux ptrace_unfreeze_traced).
 The tracee's user
 register frame is touched only through `ptrace::with_stopped_regs`
 (the arch register and single-step helpers): TASKLIST's read lock,
-then the tracee's `Task.sig`, held across the frame access (a stop
+then the tracee's siglock, held across the frame access (a stop
 ends only under it), ESRCH unless the tracee is stopped and frozen
 (Linux: regs of a task ptrace_check_attach froze); callers hold
 neither. A detach clears the single-step flag while the tracee is
 still frozen, before it is untraced (Linux ptrace_detach:
 ptrace_disable first).
 PTRACE_INTERRUPT takes TASKLIST's read lock (the tracer link), the
-tracee's group lock, then its `Task.sig`, sets `jobctl::TRAP_STOP` and
+tracee's group lock, then its siglock, sets `jobctl::TRAP_STOP` and
 wakes the tracee there (Linux ptrace_signal_wake_up under siglock).
-PTRACE_LISTEN sets `jobctl::LISTENING` under the tracee's `Task.sig`
+PTRACE_LISTEN sets `jobctl::LISTENING` under the tracee's siglock
 in a frozen PTRACE_EVENT_STOP trap; the tracee clears it under
-`Task.sig` when it leaves `ptrace_stop`. While it is set, wait and
+siglock when it leaves `ptrace_stop`. While it is set, wait and
 `ptrace_check_attach` skip the stop, and a trap notice (SIGCONT's
 prepare, a group stop's start: `trap_notify`, both locks held) or
-INTERRUPT ends the stop under `Task.sig` (`ptrace_signal_wake_up`,
+INTERRUPT ends the stop under siglock (`ptrace_signal_wake_up`,
 Linux JOBCTL_LISTENING).
 
 **Group stops** (`signal/stop.rs`, Linux do_signal_stop; JOBCTL_STOPPED
 and TASK_STOPPED): a stopped thread has `jobctl::STOPPED` under its
-`Task.sig`, set with its group's `SignalStruct.jobctl` held, then sleeps
+siglock, set with its group's `SignalStruct.jobctl` held, then sleeps
 `Killable` until it is clear (rechecked after each wakeup). It is
 cleared, and the thread woken, under the same locks by SIGCONT's
 prepare (`WakeMode::Any`, only a thread it found STOPPED), by a fatal
@@ -1863,7 +1862,7 @@ signal (`sigkill_task`, `WakeMode::Fatal`) and by a tracer's attach
 on the `VAR_WAIT_TABLE` queue its tracee's jobctl word hashes to
 (`stop::trapping_wq`, Linux wait_on_bit(JOBCTL_TRAPPING)) for
 TRAPPING to clear, which wakes that queue under the tracee's
-`Task.sig`: an IrqSpinlock leaf taking only run-queue locks). The parent is told (CLD_STOPPED, CLD_CONTINUED) under
+siglock: an IrqSpinlock leaf taking only run-queue locks). The parent is told (CLD_STOPPED, CLD_CONTINUED) under
 TASKLIST's read lock after the group lock is dropped.
 
 **Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
@@ -4423,13 +4422,13 @@ state patterns.
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `Task.sighand` | `RcuLockedArc<SigHand, GlobalTaskTable>` | The task's handler table (Linux task->sighand, `__rcu`): set by fork in the TASKLIST write section that lists the child (`install_fork_signal`, Linux copy_process: visible with its sighand); replaced (exec's unshare_sighand) or cleared at release (`unhash`, Linux __exit_signal from release_task: a zombie keeps its handlers) under TASKLIST's write lock and the old table's `siglock`, the old reference dropped a grace period later (`put_rcu` on `SigHand.puts`); read under TASKLIST (the views' `sighand`) or an RCU read guard (`get_task_sighand`) |
-| `SigHand.siglock` | `spin::Mutex<()>`, thread context only (not IRQ-safe), one lockdep class (`new_siglock`); held through a `SigGuard` (`sync::InstanceGuard`), the proof siglock-owned cells check against their owner table | Linux sighand->siglock: held with TASKLIST's write lock while a task stops naming the table (`SigHand::leave`: exec, release) and while a thread list of a group whose threads name it changes (`SignalStruct.threads`); held across a send, from its prepare to its last wakeup (`send_task_in`, `send_timer_sigqueue`; Linux send_signal_locked), across do_signal_stop's thread walk, and around a group kill's (`zap_group`: exit_group, de_thread). Never two at once (one lockdep class): a stop notice to a parent is sent after the stopping thread's is dropped. Not IRQ-safe as in Linux PREEMPT_RT: hk sends no signal from an interrupt handler (rule 1, `check_send_context`); a hardirq sender would make it an IrqSpinlock (Linux irqsave). Order: TASKLIST → `siglock` → `SignalStruct.jobctl` → `Task.sig`. The rest of siglock's state moves under it per doc/res/hk-siglock.md |
+| `SigHand.siglock` | `spin::Mutex<()>`, thread context only (not IRQ-safe), one lockdep class (`new_siglock`); held through a `SigGuard` (`sync::InstanceGuard`), the proof siglock-owned cells check against their owner table | Linux sighand->siglock: held with TASKLIST's write lock while a task stops naming the table (`SigHand::leave`: exec, release) and while a thread list of a group whose threads name it changes (`SignalStruct.threads`); held across a send, from its prepare to its last wakeup (`send_task_in`, `send_timer_sigqueue`; Linux send_signal_locked), across do_signal_stop's thread walk, and around a group kill's (`zap_group`: exit_group, de_thread). Never two at once (one lockdep class): a stop notice to a parent is sent after the stopping thread's is dropped. Not IRQ-safe as in Linux PREEMPT_RT: hk sends no signal from an interrupt handler (rule 1, `check_send_context`); a hardirq sender would make it an IrqSpinlock (Linux irqsave). Owns `Task.sig` (each task's, of the tasks naming the table). Order: TASKLIST → `siglock` → `SignalStruct.jobctl` → `SignalStruct.shared`. The rest of siglock's state moves under it per doc/res/hk-siglock.md |
 | `SignalStruct.threads` | `sync::LockedByBoth<OwnedList<ThreadNode>, GlobalTaskTable, SigHand>` | The group's threads (Linux signal->thread_head): changed under TASKLIST's write lock and the siglock of the table every thread names (the cell's owner, checked at run time: set when the group gets its first task, moved by exec's unshare under the old siglock), walked under either: `GlobalTaskTable::threads` (TASKLIST), `SignalStruct::threads` (a `SigGuard`: complete_signal's thread choice, `zap_threads`, `stop::prepare`, do_signal_stop). A task joins in the section that gives it its group (`install_fork_signal`, `init_task_signal`) and leaves at release (`unhash`, with its sighand clear, under one siglock hold). CLONE_THREAD requires CLONE_SIGHAND (EINVAL), so a group's threads share one table |
 | `SigHand.users` | `TableCell<u32>` (TASKLIST) | Tasks whose `Task.sighand` it is, changed with that field (Linux sighand->count): exec copies a table with more than one (unshare_sighand) |
-| `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack; a ptrace stop: `jobctl` (TRACED, PTRACE_FROZEN, LISTENING), `ptrace_code`, `last_siginfo` (3.1.3) (Linux siglock's per-task part: jobctl, exit_code, last_siginfo) |
-| `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under `Task.sig` | Pending-signal flag |
-| `SignalStruct.jobctl` | `spin::Mutex<stop::GroupStop>`, thread context only (not IRQ-safe), one group's at a time; reached through the group's `SignalStruct` (a task's `cpu_group`, Linux task->signal: set in the TASKLIST section that lists it, fixed for its life) | Job-control state (Linux siglock's group part: signal->flags' SIGNAL_STOP_*/SIGNAL_CLD_*, group_stop_count, group_exit_code as the stop's signal). Taken after TASKLIST (read or write, when held) and before any thread's `Task.sig`; a thread's stop bits (`jobctl` STOP_PENDING, STOP_CONSUME, STOPPED, TRAP_STOP, TRAP_NOTIFY, TRAPPING) change with both held, and are read under either. Holders: a stop signal's or SIGCONT's send, across its prepare (every thread's `Task.sig` in turn, the shared set's flush), queue, thread choice and wakeups (Linux prepare_signal/complete_signal under siglock); do_signal_stop (TASKLIST read for the thread walk, each thread's `Task.sig` in turn); a ptrace trap's entry (`ptrace_stop_why`); PTRACE_INTERRUPT (TASKLIST read); `zap_threads`; `exit_participate` (PF_EXITING set under it, Linux exit_signals); a group exit's start (`SignalStruct::start_exit`, Linux SIGNAL_GROUP_EXIT set under siglock; TASKLIST held or not, no `Task.sig`), so a stop signal's or SIGCONT's send, which checks for one under it before its prepare, is dropped by an exit begun before it (Linux prepare_signal) and seen by one begun after; the tracer's attach and unlink (TASKLIST write); a clone's insert (`join_group_stop`, TASKLIST write); wait (`take_stopped`, `take_continued`, TASKLIST read); a stop notice's code. Dropped before any parent is notified (a SIGCHLD send takes no group lock); wakeups under it are allowed. Entries a stop signal or SIGCONT flushes go to the caller's `SigPending`, dropped with no signal lock held (a timer's entry goes back to its timer) |
-| `SignalStruct.shared` | `spin::Mutex<GroupPending>`, reached through a task's `cpu_group` (`signal::group_pending`, Linux t->signal->shared_pending); a flush on SIG_IGN (`flush_group_signal`) takes it alone | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target), and the forks in progress (`GroupPending.multiprocess`, Linux signal->multiprocess): a fork links its boxed `ForkDelay` node under `Task.sig` -> `shared` at its start (`fork_signals_begin`, with its ERESTARTNOINTR check of the caller's pending signals under the same `Task.sig`), a send of a `PidType::Pgid` signal records it in every node in the hold that queues it, and the child's attach (`install_fork_signal`, TASKLIST write) unlinks the node (`shared` alone under TASKLIST) and ORs its set into the child's group set (the child's `shared`, after the parent's is dropped); a failed fork unlinks it as it returns, no other lock held |
+| `Task.sig` | `sync::InstanceCell<TaskSignalState, SigHand>` (per task), owned by the siglock of the table `Task.sighand` names | Blocked mask, private pending set, altstack; a ptrace stop: `jobctl` (TRACED, PTRACE_FROZEN, LISTENING), `ptrace_code`, `last_siginfo` (3.1.3) (Linux task->blocked, ->pending, ->jobctl, ->exit_code, ->last_siginfo: no lock of their own, under the siglock of the table the task names). Borrowed (`signal::sig_of`) under a `SigGuard` of that table, checked at run time: `lock_task_sighand` (RCU, retry) or, under TASKLIST, `lock_sighand_in`. The owner is set where the task first names a table (`install_fork_signal`, `init_task_signal`: the state was built unseen) and moves with `Task.sighand` (exec's unshare, TASKLIST write + the old siglock: Linux unshare_sighand), so a holder of the old table that found the task through it never shares the state with a holder of the new one; after release (no table) it is unreachable, as Linux's (lock_task_sighand fails). A kernel thread has no table: its state is never reached |
+| `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under siglock | Pending-signal flag |
+| `SignalStruct.jobctl` | `spin::Mutex<stop::GroupStop>`, thread context only (not IRQ-safe), one group's at a time; reached through the group's `SignalStruct` (a task's `cpu_group`, Linux task->signal: set in the TASKLIST section that lists it, fixed for its life) | Job-control state (Linux siglock's group part: signal->flags' SIGNAL_STOP_*/SIGNAL_CLD_*, group_stop_count, group_exit_code as the stop's signal). Taken after TASKLIST (read or write, when held) and before any thread's state (`Task.sig`, under siglock); a thread's stop bits (`jobctl` STOP_PENDING, STOP_CONSUME, STOPPED, TRAP_STOP, TRAP_NOTIFY, TRAPPING) change with both held, and are read under either. Holders: a stop signal's or SIGCONT's send, across its prepare (every thread's state in turn, the shared set's flush), queue, thread choice and wakeups (Linux prepare_signal/complete_signal under siglock); do_signal_stop (TASKLIST read for the thread walk, each thread's state in turn); a ptrace trap's entry (`ptrace_stop_why`); PTRACE_INTERRUPT (TASKLIST read); `zap_threads`; `exit_participate` (PF_EXITING set under it, Linux exit_signals); a group exit's start (`SignalStruct::start_exit`, Linux SIGNAL_GROUP_EXIT set under siglock; TASKLIST held or not, no thread's state), so a stop signal's or SIGCONT's send, which checks for one under it before its prepare, is dropped by an exit begun before it (Linux prepare_signal) and seen by one begun after; the tracer's attach and unlink (TASKLIST write); a clone's insert (`join_group_stop`, TASKLIST write); wait (`take_stopped`, `take_continued`, TASKLIST read); a stop notice's code. Dropped before any parent is notified (a SIGCHLD send takes no group lock); wakeups under it are allowed. Entries a stop signal or SIGCONT flushes go to the caller's `SigPending`, dropped with no signal lock held (a timer's entry goes back to its timer) |
+| `SignalStruct.shared` | `spin::Mutex<GroupPending>`, reached through a task's `cpu_group` (`signal::group_pending`, Linux t->signal->shared_pending); a flush on SIG_IGN (`flush_group_signal`) takes it alone | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target), and the forks in progress (`GroupPending.multiprocess`, Linux signal->multiprocess): a fork links its boxed `ForkDelay` node under siglock -> `shared` at its start (`fork_signals_begin`, with its ERESTARTNOINTR check of the caller's pending signals under the same siglock), a send of a `PidType::Pgid` signal records it in every node in the hold that queues it, and the child's attach (`install_fork_signal`, TASKLIST write) unlinks the node (`shared` alone under TASKLIST) and ORs its set into the child's group set (the child's `shared`, after the parent's is dropped); a failed fork unlinks it as it returns, no other lock held |
 | `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (64 entries, `Signal::idx`) | Signal handler table |
 | `SigHand.update` | sleeping `sync::Mutex<()>`, thread context only (never from IRQ) | rt_sigaction's install of an action and the pending flush or timer requeue it makes, as one step for the table's other sigactions (Linux siglock held across do_sigaction). Outermost of the signal locks: taken with no lock held, before TASKLIST, `Task.sig`, `SignalStruct.shared`, `SignalStruct.posix_timers` and `SigHand.action`; never nested with itself (one lockdep class) |
@@ -4452,13 +4451,15 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 
 #### Locking Rules
 
-1. **Per-task signal state has its own lock** - `get_task_sighand`
-   clones the `Arc<SigHand>` out under RCU; `with_task_signal_state`
-   checks the task is still listed (the current one without TASKLIST,
-   another under TASKLIST's read lock) and runs its closure under `Task.sig` (no
-   sleeping, no user memory, no TASKLIST, nothing released in it).
-   Deviation: Linux siglock is IRQ-safe and per thread group; hk's is
-   per task, thread context only. Audit (T0): no interrupt handler
+1. **Per-task signal state is under its table's siglock** (Linux: the
+   task's fields under sighand->siglock) - `with_task_signal_state`
+   locks the task's table (`lock_task_sighand`: RCU, retry; None once
+   released) and runs its closure on the borrowed state (no sleeping,
+   no user memory, no TASKLIST, nothing released in it), then
+   recomputes TIF_SIGPENDING and hands newly blocked group signals on
+   in the same hold (`with_sig`, `retarget`: the thread list walked
+   under siglock). Deviation: Linux siglock is IRQ-safe; hk's is thread
+   context only. Audit (T0): no interrupt handler
    sends a signal (the tty receive path is not driven from the UART
    IRQ, SIGIO comes from `kill_fasync` in thread context, spin locks
    possibly held, no SIGURG generation, POSIX timer/itimer expiry runs in
@@ -4471,12 +4472,12 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    exception handlers (page faults, etc.) and process context; a leaf.
 
 3. **The group set before action** - `SigHand.action` may be read
-   under `Task.sig` and `SignalStruct.shared` (a send's `sig_ignored`);
+   under siglock and `SignalStruct.shared` (a send's `sig_ignored`);
    dequeueing reads the action after both are dropped.
 
 4. **Never hold IrqSpinlock while acquiring Mutex** - Would violate lock ordering.
 
-5. **Queue entries are made under `Task.sig`, GFP_ATOMIC, and freed
+5. **Queue entries are made under siglock, GFP_ATOMIC, and freed
    outside it** (Linux __send_signal_locked's __sigqueue_alloc): once
    the locked section has decided the signal is queued (not ignored,
    not a non-RT one already pending: Linux prepare_signal,
@@ -4487,12 +4488,12 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    one (EAGAIN). TASKLIST may be held around it (a child's notice,
    Linux do_notify_parent under tasklist_lock). A dequeue unlinks its
    entry under the lock and the caller frees it (`Dequeued::info`)
-   after; an exiting task's private set is taken under `Task.sig` with
+   after; an exiting task's private set is taken under siglock with
    PF_EXITING set (`exit_participate`, Linux exit_signals:
    sigqueue_dequeue_pending) and freed after, and an exiting task
-   (PF_EXITING, read under `Task.sig`) gets no private entries, so none
+   (PF_EXITING, read under siglock) gets no private entries, so none
    outlives that flush. A zombie keeps its blocked mask and the rest of
-   its `Task.sig`; the group's set stays in its `SignalStruct` until the
+   its state (`Task.sig`); the group's set stays in its `SignalStruct` until the
    struct goes with the last task naming it.
    Senders run in thread context, never from hardirq; every step of a
    send takes only spin locks and allocates GFP_ATOMIC, so a sender may
@@ -4511,21 +4512,21 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    reads of the receiver comes from its siglock, RCU (credentials,
    sender numbering: `Task::pid_nr_ns`) or a racy load (`Task.ptrace`,
    as Linux under siglock). After the signal is
-   queued under the receiver's `Task.sig`, the group's thread list is
+   queued under the receiver's siglock, the group's thread list is
    walked under siglock (`signal::choose`), each candidate's
-   `Task.sig` taken alone to test wants_signal, and whether it ends the
+   state borrowed alone to test wants_signal, and whether it ends the
    group decided there, never for an init its protection covers
    (`Target::protects`). Then a decided group kill is done
-   (`group_kill`, `zap_threads`: each thread's `Task.sig` alone,
+   (`group_kill`, `zap_threads`: each thread's state in turn,
    nothing allocated) and the chosen thread's TIF_SIGPENDING is
-   recomputed and it is woken under its `Task.sig` (Linux
+   recomputed and it is woken under its siglock (Linux
    signal_wake_up under siglock), all in the same hold (a wakeup takes
-   only pi_lock and run-queue locks, allowed under `Task.sig`). A send changes
+   only pi_lock and run-queue locks, allowed under siglock). A send changes
    no blocked mask, so it never
    retargets (`with_sig_send`), which would take TASKLIST again. A
    thread that blocks a group signal or starts exiting hands it on
    the same way after dropping its own lock, each receiver marked and
-   woken under its own `Task.sig` (retarget_shared_pending).
+   woken under siglock (retarget_shared_pending).
    A thread that changes its mask between the test and the wakeup
    sees the signal when it recomputes TIF_SIGPENDING.
 
@@ -4541,7 +4542,7 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    ↓
 2. SignalStruct.jobctl (spin Mutex, group stop state; one group's)
    ↓
-3. Task.sig (spin Mutex, per task)
+   (Task.sig: siglock-owned state, no lock of its own)
    ↓
 4. SignalStruct.shared (spin Mutex, thread-group pending)
    ↓
@@ -4581,7 +4582,7 @@ let sighand = get_task_sighand(&current())?;  // cloned out under RCU
 let _update = sighand.lock_update();     // SigHand.update (sleeping)
 let old = sighand.set_action(sig, new);  // SigHand.action (IrqSpinlock),
                                          // one hold: actions[sig.idx()]
-if new.ignores(sig) { flush_group_signal(sig) }  // TASKLIST, Task.sig,
+if new.ignores(sig) { flush_group_signal(sig) }  // siglock, threads,
 else if old.is_ignore() { sig_unignore(sig) }    // SignalStruct.shared
 drop(_update);                           // then oact is written
 ```
@@ -4593,7 +4594,7 @@ already sees the new action (`sig_ignored`) and is dropped, as in Linux.
 
 **rt_sigprocmask(2):** Modify blocked mask:
 ```rust
-with_task_signal_state(&current(), |state| {  // Task.sig, no TASKLIST
+with_task_signal_state(&current(), |state| {  // siglock, no TASKLIST
     state.blocked = new_mask;
 });                                     // TIF_SIGPENDING recomputed
 ```
@@ -4608,7 +4609,7 @@ let rcu = rcu::read_lock();
 let g = lock_task_sighand(t, &rcu)?;      // ESRCH once released
 let tg = target(t, &rcu);                 // handlers, group, limits
 prepare_signal(&g, ..);                   // stop/SIGCONT effects
-let sent = with_sig_send(t, |t, state| {  // Task.sig
+let sent = with_sig_send(&g, t, |t, state| {  // its Task.sig, under g
     if sig_ignored(..) { return Dropped } // SIG_IGN / default-ignore
     state.pending.add(sig);
     Queued(wants)
@@ -4630,9 +4631,9 @@ the result register and takes no lock. `do_signal` delivers the signal
 and restarts or fails the syscall per SA_RESTART. A syscall with a
 temporary mask (rt_sigsuspend, ppoll, pselect6, epoll_pwait;
 `set_temp_sigmask`) saves the old one in `TaskSignalState.saved_sigmask`
-under Task.sig and sets TIF_RESTORE_SIGMASK (current task only, an atomic
+under siglock and sets TIF_RESTORE_SIGMASK (current task only, an atomic
 bit: no lock); a handler frame takes the saved mask and clears the bit,
-otherwise `restore_saved_sigmask` puts it back under Task.sig on the way
+otherwise `restore_saved_sigmask` puts it back under siglock on the way
 out (Linux set_restore_sigmask / restore_saved_sigmask_unless).
 
 #### Thread-Group Exit (Linux do_group_exit, zap_other_threads, de_thread)
@@ -4648,7 +4649,7 @@ de_thread, exit_group does not.
   send's, or exit_group's and de_thread's own, `zap_group`; nothing
   allocated: Linux zap_other_threads under siglock), queuing SIGKILL in
   the private pending set of each thread not yet exiting (PF_EXITING)
-  under its `Task.sig`, setting its
+  under its siglock, setting its
   TIF_SIGPENDING and ending a ptrace stop there (`sigkill_task`), and
   waking it in that hold (`WakeMode::Fatal`: interruptible and
   killable sleeps; Linux signal_wake_up(t, 1) under siglock; a wakeup
@@ -4696,8 +4697,8 @@ de_thread, exit_group does not.
   lock: the receiver and signal, the autoreap decision (the parent
   process's SIGCHLD action, in the `SigHand` of the thread the signal
   goes to) and the whole send (`signal::send_task_in`: TASKLIST →
-  Task.sig → SignalStruct.shared → SigHand.action, the order above;
-  its `SigQueue` entry made under the receiver's `Task.sig`,
+  siglock → SignalStruct.shared → SigHand.action, the order above;
+  its `SigQueue` entry made under the receiver's siglock,
   GFP_ATOMIC, rule 5); an autoreaped zombie leaves the task list there
   too (Linux EXIT_DEAD). The thread that takes the signal is chosen,
   a decided group kill done, and signalfd readers and that thread
@@ -5590,7 +5591,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `KEYRING_LINK` (sleeping) → `Key.keyring_keys`; `USER_KEYRINGS`, `Key.payload` → `KEY_DATABASE` → `KEY_USERS`; `Task.keyrings` | keys/ | `Key.payload`, `Key.keyring_keys`: sleeping `sync::RwSem` (Linux key->sem); `USER_KEYRINGS`: sleeping `sync::Mutex` (Linux key_user_keyring_mutex); `KEY_DATABASE`, `KEY_USERS`: spin RwLock leaves; `Task.keyrings`: spin Mutex leaf | a task's thread/process/session keyrings (`Task.keyrings`, reached through the current task or a fork child: a missing keyring is created with it unlocked and installed if the slot is still empty, Linux keyring_alloc then commit_creds; a replaced or spare key is dropped after it), the per-user keyrings (created under `USER_KEYRINGS`), `KEY_USERS` (Linux key_user_tree: a `util::rbtree` whose node is allocated before the lock and dropped if another made the entry, Linux key_user_lookup), the key registry and keyrings. Links and keyring slots own keys (`Arc<Key>`); `KEY_DATABASE` (Linux key_serial_tree under key_serial_lock) is a `util::rbtree` of weak entries (lookups upgrade after releasing it); a key's node is allocated with the key before the lock (`alloc_key`), so nothing allocates under it, and only that key removes its entry (invalidate, or its `Drop`); invalidation's keyring walk takes it once per key visited. A key's `Drop` (its last reference) takes `KEY_DATABASE`, then `KEY_USERS` (the per-user quota, a leaf), so no `Arc<Key>` is dropped under either; `Key.keyring_keys` is a leaf: unlinked keys are dropped after it is released, and replaced slots after `Task.keyrings`. `KEYRING_LINK` (Linux keyring_serialise_link_lock) is held by a keyring's link from its cycle check to the link, taken with no spin lock held. `Key.payload` also plays key->sem: instantiate (only from uninstantiated), update, revoke and invalidate change `Key.state` under its write lock, so a revoked key is never revived (the state is read lock-free); and KEYCTL_CHOWN / KEYCTL_SETPERM decide (owner, group, CAP_SYS_ADMIN) and store `Key.uid`/`gid`/`perm` in one write hold, as Linux keyctl_chown_key / keyctl_setperm_key under key->sem; those atomics are read lock-free by the permission checks and describe (Linux reads key->uid unlocked) |
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock; a POSIX owner is a descriptor table's id; nothing allocates for a POSIX change under it: room for the two locks one change can add is reserved before it is taken, Linux posix_lock_inode's new_fl/new_fl2, and splits, inserts and merges are done in place; a flock change likewise reserves room for one more shared holder, Linux flock_lock_inode's new_fl),  leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK). A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves; `locks::BLOCKED` (Linux blocked_hash) is an rbtree whose node the waiter allocates before taking it and frees after it |
 | `cmdline::SAVED` | cmdline.rs | `spin::Once` | the saved kernel command line (Linux saved_command_line): set once while parsing, before SMP; read lock-free (init's arguments, /proc/cmdline) |
-| `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (Task.sig -> shared) |
+| `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (siglock -> shared) |
 | `FILE_SYSTEMS`, `SB_LOCK` | fs/superblock.rs | spin RwLock, spin Mutex | the registered filesystem types (Linux file_systems_lock) and the superblock lists (Linux sb_lock); 3.3 Superblock lists |
 | `INODE_SB_LIST_LOCK` | fs/inode.rs | spin Mutex | every superblock's `s_inodes` (Linux inode_sb_list_lock); 3.3 Superblock inode lists |
 | `INODE_HASH_LOCK` | fs/icache.rs | spin Mutex | the inode cache's buckets (Linux inode_hash_lock); 3.3 Inode cache: under it `Inode.private` -> `VfatInode.d` (vfat's `test`) |
@@ -5965,9 +5966,9 @@ this is the interrupt-safety invariant:
 |------|----------|------|--------|
 | `TASKLIST` | task/percpu.rs | `RwLock` | every task (Linux tasklist_lock) |
 | `SigHand.siglock` | signal/mod.rs | `Mutex` | Linux sighand->siglock: `Task.sighand` and thread list changes, a send, thread walks (after TASKLIST, before SignalStruct.jobctl; 3.7) |
-| `SignalStruct.jobctl` | signal/mod.rs, signal/stop.rs | `Mutex` | Job-control (group stop) state (after SigHand.siglock, before Task.sig; 3.7) |
-| `SignalStruct.shared` | signal/mod.rs | `Mutex` | Thread-group pending signals and curr_target (under Task.sig) |
-| `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
+| `SignalStruct.jobctl` | signal/mod.rs, signal/stop.rs | `Mutex` | Job-control (group stop) state (after SigHand.siglock, before SignalStruct.shared; 3.7) |
+| `SignalStruct.shared` | signal/mod.rs | `Mutex` | Thread-group pending signals and curr_target (under SigHand.siglock and SignalStruct.jobctl) |
+| `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over SigHand.siglock) |
 | `FsStruct.seq` | fs/fsstruct.rs | `SeqLock` | Root, cwd, umask (leaf; Linux fs->seq): writers and reference-taking readers lock, RCU walks read root/pwd under its sequence |
 | `MEMBLOCK` | mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `PidNamespace.bacct` | task/acct.rs | `Mutex` | A pid namespace's process accounting file (Linux pid_namespace->bacct; leaf, thread context: cloned out, the record written and an old file released with no lock held; an exit walks its namespace and each parent, one lock at a time; taken out at the namespace's zap, after its other tasks are gone) |
