@@ -20,7 +20,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, Ordering::Relaxed, fence};
+use core::sync::atomic::{
+    AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, Ordering::Relaxed, fence,
+};
 
 use crate::sync::spin::RwLock;
 use crate::util::hlist_bl::BlHead;
@@ -31,21 +33,21 @@ use super::mount::{MOUNT_LOCK, Mount, MountRef};
 use super::name::DName;
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
-use crate::sync::rcu::RcuHead;
+use crate::sync::rcu::{RcuHead, RcuReadGuard};
+use crate::sync::{SeqCount, SeqCountGuard};
 use crate::util::error::KernelError;
 use crate::util::list::{ListPtr, RefPtr};
 
-/// Dentry flags
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DentryFlags {
-    /// A mountpoint exists for it (Linux DCACHE_MOUNTED, set and
-    /// cleared with its struct mountpoint under MOUNT_LOCK): a hint for
-    /// the walk; which mount covers it is the namespace's business
-    pub mounted: bool,
-    /// Dropped from its parent's children: deleted, or replaced by a
-    /// rename (Linux d_unhashed)
-    pub unhashed: bool,
-}
+/// `Dentry.d_flags` bit: a mountpoint exists for it (Linux
+/// DCACHE_MOUNTED, set and cleared with its struct mountpoint under
+/// MOUNT_LOCK): a hint for the walk; which mount covers it is the
+/// namespace's business
+const DCACHE_MOUNTED: u32 = 1 << 16;
+/// `Dentry.d_flags` bit: out of the tree (its parent's children and
+/// its bucket): deleted, replaced by a rename, or never in it (an
+/// O_TMPFILE file's); Linux d_unhashed, its d_hash.pprev == NULL. A
+/// root is not marked.
+const DCACHE_UNHASHED: u32 = 1 << 31;
 
 /// The dcache's tree shape (Linux rename_lock): held for writing by
 /// d_move / d_exchange, which bumps its sequence; for reading by
@@ -198,6 +200,18 @@ fn hash_out(p: &mut DentryInner, d: &Dentry) -> Option<DentryRef> {
     Some(c)
 }
 
+/// Take `d` out of the tree if it is a child of the parent whose
+/// d_lock (`p`) is held for writing, `d`'s own (`dl`) too (Linux
+/// __d_drop): marked unhashed, and its d_seq moved on so an RCU walk
+/// that read it repeats (write_seqcount_invalidate). The children
+/// list's reference, None (and nothing changed) if it was not there.
+fn __d_drop(p: &mut DentryInner, d: &Dentry, dl: &mut DentryInner) -> Option<DentryRef> {
+    let r = hash_out(p, d)?;
+    d.set_flag(dl, DCACHE_UNHASHED, true);
+    d.d_seq.invalidate();
+    Some(r)
+}
+
 /// The bucket's test for the child `name` of `parent`: key and parent
 /// address (atomics, so a dentry being rehashed reads safely)
 fn d_matcher<'a>(parent: &'a Dentry, name: &'a [u8]) -> (u64, impl Fn(&Dentry) -> bool + 'a) {
@@ -234,9 +248,9 @@ fn __d_lookup(parent: &Dentry, name: &[u8]) -> Option<DentryRef> {
         if !is(c) {
             return false;
         }
-        let cl = c.d_lock.read();
+        let _cl = c.d_lock.read();
         if !core::ptr::eq(c.parent_ptr(), parent)
-            || cl.flags.unhashed
+            || c.flag(DCACHE_UNHASHED)
             || !d_same_name(parent, c.d_name.read().as_bytes(), name)
         {
             return false;
@@ -290,8 +304,6 @@ struct DentryInner {
     /// Children in the tree (Linux d_children), each with the list's
     /// reference; each is also in its hash bucket
     children: Children,
-    /// Dentry flags
-    flags: DentryFlags,
 }
 
 /// A directory entry - maps a name to an inode
@@ -342,6 +354,15 @@ pub struct Dentry {
     /// The free a grace period after the last reference (Linux
     /// d_u.d_rcu)
     d_rcu: RcuHead,
+    /// What an RCU walk reads of it changes inside a write section
+    /// under its d_lock held for writing (Linux d_seq): its inode set
+    /// or cleared, its parent and name by a move; leaving the tree
+    /// moves it on (write_seqcount_invalidate)
+    d_seq: SeqCount,
+    /// `DCACHE_*` bits (Linux d_flags): changed under its d_lock held
+    /// for writing (plain stores, Release), read with no lock (Acquire,
+    /// Linux READ_ONCE): an RCU walk confirms what it read by `d_seq`
+    d_flags: AtomicU32,
 
     /// On the parent's children (Linux d_sib)
     d_sib: Link,
@@ -371,6 +392,8 @@ impl Dentry {
             d_count: AtomicUsize::new(1),
             d_parent: AtomicPtr::new(core::ptr::null_mut()),
             d_rcu: RcuHead::new(),
+            d_seq: SeqCount::new(),
+            d_flags: AtomicU32::new(0),
             d_sib: Link::new(),
             d_sib_owner: Owner::new(),
             d_hash: Link::new(),
@@ -381,7 +404,6 @@ impl Dentry {
             d_lock: RwLock::new(DentryInner {
                 inode,
                 children: OwnedList::new(),
-                flags: DentryFlags::default(),
             }),
         }
     }
@@ -449,7 +471,7 @@ impl Dentry {
         {
             let mut dl = d.d_lock.write();
             d.set_parent(&dl, parent.clone());
-            dl.flags.unhashed = true;
+            d.set_flag(&mut dl, DCACHE_UNHASHED, true);
         }
         Ok(d)
     }
@@ -480,6 +502,13 @@ impl Dentry {
         drop(NonNull::new(old).map(|o| unsafe { DentryRef::from_raw(o.as_ptr()) }));
     }
 
+    /// Begin a change an RCU walk must notice (Linux
+    /// write_seqcount_begin(&dentry->d_seq)), under this dentry's d_lock
+    /// held for writing (`_dl`, its writers' lock)
+    fn seq_write(&self, _dl: &mut DentryInner) -> SeqCountGuard<'_> {
+        self.d_seq.write()
+    }
+
     /// The parent's address, lock-free (Linux READ_ONCE(d_parent)):
     /// null for a root. Following it needs RENAME_LOCK, or an RCU read
     /// guard and the rename sequence checked after (`parent_rcu`).
@@ -508,24 +537,29 @@ impl Dentry {
             // a held one is replaced, so a holder never sees an inode
             // it did not look up
             if DentryRef::count(&c) == TREE_REFS + 1 {
+                // Linux __d_instantiate: inside a d_seq write section
+                let s = c.seq_write(&mut ci);
                 ci.inode = inode;
                 if let Some(al) = &mut al {
                     alias_add(al, &ci, &c);
                 }
+                drop(s);
                 drop(ci);
                 return c;
             }
-            ci.flags.unhashed = true;
+            let old = __d_drop(&mut p, &c, &mut ci);
             drop(ci);
-            hash_out(&mut p, &c);
+            drop(old);
         }
         {
             let mut dl = d.d_lock.write();
             debug_assert!(dl.inode.is_none(), "dcache: add of a positive dentry");
+            let s = d.seq_write(&mut dl);
             dl.inode = inode;
             if let Some(al) = &mut al {
                 alias_add(al, &dl, &d);
             }
+            drop(s);
             d.set_parent(&dl, parent.clone());
         }
         hash_in(parent, &mut p, &d, &name);
@@ -569,7 +603,7 @@ impl Dentry {
         let mut cl = c.d_lock.write();
         // Still this child of that name with that inode (the caller
         // holds the directory's i_rwsem: no rename or delete raced)
-        let same = !cl.flags.unhashed
+        let same = !c.flag(DCACHE_UNHASHED)
             && core::ptr::eq(c.parent_ptr(), self)
             && d_same_name(self, c.d_name.read().as_bytes(), name)
             && cl.inode.as_ref().is_some_and(|i| Arc::ptr_eq(i, &inode));
@@ -577,17 +611,19 @@ impl Dentry {
             return;
         }
         if DentryRef::count(&c) <= held + TREE_REFS + 1 {
+            // Linux dentry_unlink_inode: inside a d_seq write section
+            let s = c.seq_write(&mut cl);
             let i = cl.inode.take();
             alias_del(&mut al, &cl, &c);
+            drop(s);
             drop(cl);
             drop(p);
             drop(al);
             crate::io::inotify::d_iput(&inode);
             drop(i);
         } else {
-            cl.flags.unhashed = true;
+            let ours = __d_drop(&mut p, &c, &mut cl);
             drop(cl);
-            let ours = hash_out(&mut p, &c);
             drop(p);
             drop(al);
             drop(ours);
@@ -601,7 +637,22 @@ impl Dentry {
 
     /// Dropped from the tree: deleted or renamed over
     pub fn is_unhashed(&self) -> bool {
-        self.d_lock.read().flags.unhashed
+        self.flag(DCACHE_UNHASHED)
+    }
+
+    /// A `d_flags` bit, read with no lock (Linux READ_ONCE(d_flags)):
+    /// what an RCU walk reads, confirmed by `d_seq`
+    fn flag(&self, f: u32) -> bool {
+        self.d_flags.load(Ordering::Acquire) & f != 0
+    }
+
+    /// Set or clear a `d_flags` bit under this dentry's d_lock held for
+    /// writing (`_dl`, the bits' one writer lock: a plain store, as
+    /// Linux changes d_flags under d_lock)
+    fn set_flag(&self, _dl: &mut DentryInner, f: u32, on: bool) {
+        let v = self.d_flags.load(Relaxed);
+        let v = if on { v | f } else { v & !f };
+        self.d_flags.store(v, Ordering::Release);
     }
 
     /// A reference to the parent (Linux dget_parent): taken under the
@@ -641,8 +692,7 @@ impl Dentry {
     pub fn remove_child(&self, name: &[u8]) -> Option<DentryRef> {
         let mut p = self.d_lock.write();
         let c = d_lookup_locked(self, &p, name)?;
-        c.d_lock.write().flags.unhashed = true;
-        let ours = hash_out(&mut p, &c);
+        let ours = __d_drop(&mut p, &c, &mut c.d_lock.write());
         drop(p);
         drop(ours);
         d_drop_tree(&c);
@@ -651,13 +701,13 @@ impl Dentry {
 
     /// Some mount, in some namespace, sits on this dentry
     pub fn is_mountpoint(&self) -> bool {
-        self.d_lock.read().flags.mounted
+        self.flag(DCACHE_MOUNTED)
     }
 
     /// Mark it a mountpoint or not (Linux d_set_mounted, clearing
     /// DCACHE_MOUNTED); under MOUNT_LOCK, with its mountpoint
     pub fn set_mounted(&self, on: bool) {
-        self.d_lock.write().flags.mounted = on;
+        self.set_flag(&mut self.d_lock.write(), DCACHE_MOUNTED, on);
     }
 
     /// Get the superblock this dentry belongs to
@@ -692,17 +742,16 @@ fn alias_del(al: &mut Aliases, dl: &DentryInner, d: &Dentry) {
     unsafe { al.remove(d) };
 }
 
-/// The first alias of `inode` for which `ok` holds of its d_lock, with
-/// a reference (Linux __d_find_any_alias / __d_find_alias): under the
+/// The first alias of `inode` for which `ok` holds under its d_lock,
+/// with a reference (Linux __d_find_any_alias / __d_find_alias): under the
 /// inode's alias lock, which keeps every entry's memory (unlinked
 /// before it is freed); a dying one is skipped. No reference is
 /// dropped under the lock.
-fn find_alias(inode: &Inode, ok: impl Fn(&DentryInner) -> bool) -> Option<DentryRef> {
+fn find_alias(inode: &Inode, ok: impl Fn(&Dentry) -> bool) -> Option<DentryRef> {
     let al = inode.i_dentry.lock();
     al.iter().find_map(|d| {
-        ok(&d.d_lock.read())
-            .then(|| DentryRef::try_get(d))
-            .flatten()
+        let _dl = d.d_lock.read();
+        ok(d).then(|| DentryRef::try_get(d)).flatten()
     })
 }
 
@@ -717,7 +766,7 @@ pub fn d_find_alias(inode: &Inode) -> Option<DentryRef> {
     if inode.mode().is_dir() {
         return d_find_any_alias(inode);
     }
-    find_alias(inode, |dl| !dl.flags.unhashed)
+    find_alias(inode, |d| !d.flag(DCACHE_UNHASHED))
 }
 
 /// The first alias of `inode` for which `f` holds (Linux
@@ -1050,8 +1099,11 @@ unsafe fn dentry_kill(d: NonNull<Dentry>) -> Option<NonNull<Dentry>> {
     if let Some(i) = inode {
         let mut al = i.i_dentry.lock();
         let mut dl = r.d_lock.write();
+        // Linux dentry_unlink_inode: inside a d_seq write section
+        let s = r.seq_write(&mut dl);
         let taken = dl.inode.take();
         alias_del(&mut al, &dl, r);
+        drop(s);
         drop(dl);
         drop(al);
         drop(taken);
@@ -1102,19 +1154,18 @@ pub fn dentry_state() -> Vec<i64> {
 /// dentry_kill from the LRU)
 fn prune_one(parent: &DentryRef, d: &DentryRef, keep: bool) -> bool {
     let mut p = parent.d_lock.write();
-    let di = d.d_lock.read();
+    let mut di = d.d_lock.write();
     let unused = DentryRef::count(d) == TREE_REFS + 1
         && di.children.is_empty()
-        && !di.flags.mounted
+        && !d.flag(DCACHE_MOUNTED)
         && !(keep && di.inode.is_some());
-    drop(di);
     if !unused {
         return false;
     }
-    let Some(ours) = hash_out(&mut p, d) else {
+    let Some(ours) = __d_drop(&mut p, d, &mut di) else {
         return false;
     };
-    d.d_lock.write().flags.unhashed = true;
+    drop(di);
     drop(p);
     drop(ours);
     true
@@ -1140,8 +1191,7 @@ pub fn d_drop_tree(d: &DentryRef) {
         };
         let mut p = parent.d_lock.write();
         let mut ci = cur.d_lock.write();
-        let ours = hash_out(&mut p, &cur);
-        ci.flags.unhashed = true;
+        let ours = __d_drop(&mut p, &cur, &mut ci);
         drop(ci);
         drop(p);
         // A leaf another remover took out first (the shrinker, a move)
@@ -1212,26 +1262,86 @@ pub fn shrink_dcache(budget: usize) -> usize {
     freed
 }
 
-/// Take `d` out of the tree under `parent`, if it is there
-fn unhook_from(d: &DentryRef, parent: &Dentry) {
-    let mut p = parent.d_lock.write();
-    // A lookup on it meanwhile skips it, and retries for the rename
-    // (Linux __d_move's __d_drop under the dentry's d_lock)
-    d.d_lock.write().flags.unhashed = true;
-    let ours = hash_out(&mut p, d);
-    drop(p);
-    drop(ours);
+/// `p1` is an ancestor of `p2`: the child of `p1` on the way up from
+/// `p2` (`p2` itself if it is a child of `p1`), else None (Linux
+/// d_ancestor). Its caller holds RENAME_LOCK for writing, so no parent
+/// changes during the walk.
+fn d_ancestor<'g>(p1: &Dentry, p2: &'g Dentry, g: &'g RcuReadGuard) -> Option<&'g Dentry> {
+    let mut p = p2;
+    while let Some(up) = p.parent_rcu(g) {
+        if core::ptr::eq(up, p1) {
+            return Some(p);
+        }
+        p = up;
+    }
+    None
 }
 
-/// Re-hang `d` as `name` under `parent` (the name a snapshot of the
-/// target's: Linux copy_name, a copy or a shared reference)
-fn rehook(d: &DentryRef, parent: &DentryRef, name: DName) {
-    let mut di = d.d_lock.write();
-    *d.d_name.write() = name.clone();
-    d.set_parent(&di, parent.clone());
-    di.flags.unhashed = false;
-    drop(di);
-    hash_in(parent, &mut parent.d_lock.write(), d, &name);
+/// Move `d` to where `target` is (Linux __d_move), under RENAME_LOCK
+/// held for writing (the caller's). The d_locks of both parents, an
+/// ancestor first (`d_ancestor`: whoever else takes two of them takes
+/// a parent before its child), then of `d`, then of `target`, all held
+/// for the switch, inside both dentries' `d_seq` write sections, so an
+/// RCU walk that read either one's parent or name repeats: both leave
+/// their buckets, `d` takes `target`'s parent and name (and with
+/// `exchange` `target` takes `d`'s), and the moved ones are hashed
+/// again. Without `exchange` `target` stays out, unhashed. Nothing is
+/// allocated: names move by copy or a shared reference (Linux
+/// copy_name, swap_names), and no reference dropped under the locks is
+/// the last (the caller holds both, and this both parents).
+fn __d_move(d: &DentryRef, target: &DentryRef, exchange: bool) {
+    if DentryRef::ptr_eq(d, target) {
+        return;
+    }
+    let Some(np) = target.get_parent() else {
+        return;
+    };
+    let op = d.get_parent();
+    let ancestor = op.as_ref().map(|o| {
+        let g = crate::sync::rcu::read_lock();
+        d_ancestor(o, target, &g).is_some()
+    });
+    // The new parent's guard, and the old one's when it is another
+    let (mut npl, mut opl) = match (&op, ancestor) {
+        (Some(o), Some(true)) if DentryRef::ptr_eq(o, &np) => (np.d_lock.write(), None),
+        (Some(o), Some(true)) => {
+            let ol = o.d_lock.write();
+            (np.d_lock.write(), Some(ol))
+        }
+        (Some(o), _) => {
+            let nl = np.d_lock.write();
+            (nl, Some(o.d_lock.write()))
+        }
+        (None, _) => (np.d_lock.write(), None),
+    };
+    let mut dl = d.d_lock.write();
+    let mut tl = target.d_lock.write();
+    let sd = d.seq_write(&mut dl);
+    let st = target.seq_write(&mut tl);
+    // Out of both buckets (Linux ___d_drop of each)
+    let d_old = match (&op, &mut opl) {
+        (Some(_), Some(ol)) => hash_out(ol, d),
+        (Some(_), None) => hash_out(&mut npl, d),
+        (None, _) => None,
+    };
+    let t_old = hash_out(&mut npl, target);
+    target.set_flag(&mut tl, DCACHE_UNHASHED, true);
+    let (dn, tn) = (target.name(), d.name());
+    d.set_parent(&dl, np.clone());
+    *d.d_name.write() = dn.clone();
+    d.set_flag(&mut dl, DCACHE_UNHASHED, false);
+    if exchange && let Some(o) = &op {
+        target.set_parent(&tl, o.clone());
+        *target.d_name.write() = tn.clone();
+        target.set_flag(&mut tl, DCACHE_UNHASHED, false);
+        let ol = opl.as_mut().unwrap_or(&mut npl);
+        hash_in(o, ol, target, &tn);
+    }
+    hash_in(&np, &mut npl, d, &dn);
+    drop((st, sd));
+    drop((tl, dl));
+    drop((opl, npl));
+    drop((d_old, t_old));
 }
 
 /// A rename moved `d` to where `target` is (Linux d_move): the target
@@ -1241,16 +1351,7 @@ fn rehook(d: &DentryRef, parent: &DentryRef, name: DName) {
 /// a mountpoint) follows it. Callers hold both parents' i_rwsem.
 pub fn d_move(d: &DentryRef, target: &DentryRef) {
     let w = RENAME_LOCK.write();
-    let Some(parent) = target.get_parent() else {
-        return;
-    };
-    let name = target.name();
-    if let Some(old) = d.get_parent() {
-        unhook_from(d, &old);
-    }
-    unhook_from(target, &parent);
-    target.d_lock.write().flags.unhashed = true;
-    rehook(d, &parent, name);
+    __d_move(d, target, false);
     drop(w);
     d_drop_tree(target);
 }
@@ -1260,14 +1361,10 @@ pub fn d_move(d: &DentryRef, target: &DentryRef) {
 /// IS_ROOT); if one is, nothing changes.
 pub fn d_exchange(a: &DentryRef, b: &DentryRef) {
     let _w = RENAME_LOCK.write();
-    let (Some(pa), Some(pb)) = (a.get_parent(), b.get_parent()) else {
+    if a.parent_ptr().is_null() || b.parent_ptr().is_null() {
         return;
-    };
-    let (na, nb) = (a.name(), b.name());
-    unhook_from(a, &pa);
-    unhook_from(b, &pb);
-    rehook(a, &pb, nb);
-    rehook(b, &pa, na);
+    }
+    __d_move(a, b, true);
 }
 
 /// Global dentry cache
@@ -1558,6 +1655,38 @@ mod tests {
         assert!(b.is_negative() && d_find_any_alias(&i).is_none());
     }
 
+    /// Moves between a directory and one below it, both ways (the old
+    /// parent an ancestor of the target, then the new parent an
+    /// ancestor of the old: Linux __d_move's lock order cases) land the
+    /// dentry under its new parent and name, and each move and drop
+    /// moves the dentries' d_seq on (an RCU walk would repeat)
+    #[test]
+    fn move_nested_parents() {
+        let r = DentryRef::new(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let b = Dentry::alloc(&r, b"b", Some(inode())).unwrap();
+        let x = Dentry::alloc(&r, b"x", Some(inode())).unwrap();
+        let s0 = x.d_seq.read_begin();
+        let t = Dentry::prealloc(&b, b"y").unwrap();
+        d_move(&x, &t);
+        assert!(x.d_seq.read_retry(s0) && t.d_seq.read_retry(0));
+        assert!(
+            b.lookup_child(b"y")
+                .is_some_and(|c| DentryRef::ptr_eq(&c, &x))
+        );
+        assert!(r.lookup_child(b"x").is_none());
+        let t = Dentry::prealloc(&r, b"z").unwrap();
+        d_move(&x, &t);
+        assert!(
+            r.lookup_child(b"z")
+                .is_some_and(|c| DentryRef::ptr_eq(&c, &x))
+        );
+        assert!(b.lookup_child(b"y").is_none() && b.num_children() == 0);
+        assert!(x.get_parent().is_some_and(|p| DentryRef::ptr_eq(&p, &r)));
+        let s1 = x.d_seq.read_begin();
+        assert!(r.remove_child(b"z").is_some());
+        assert!(x.d_seq.read_retry(s1) && x.is_unhashed());
+    }
+
     /// A real exchange swaps names and parents
     #[test]
     fn exchange_swaps() {
@@ -1585,9 +1714,9 @@ mod tests {
         let w = r.d_lock.write();
         let found = r.lookup_child(b"a").unwrap();
         assert!(DentryRef::ptr_eq(&found, &a));
-        a.d_lock.write().flags.unhashed = true;
+        a.set_flag(&mut a.d_lock.write(), DCACHE_UNHASHED, true);
         assert!(r.lookup_child(b"a").is_none());
-        a.d_lock.write().flags.unhashed = false;
+        a.set_flag(&mut a.d_lock.write(), DCACHE_UNHASHED, false);
         drop(w);
         assert_eq!(DentryRef::count(&a), TREE_REFS + 2);
     }
