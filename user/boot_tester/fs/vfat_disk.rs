@@ -372,11 +372,12 @@ fn times(dev: &[u8]) {
     }
     let [a, m, c] = stimes(f);
     t.ok(b"mtime 2 s", m.0 % 2 == 0 && m.1 == 0, m.1);
-    t.ok(
-        b"mtime now",
-        (m.0 - now.tv_sec).abs() <= 3,
-        m.0 - now.tv_sec,
-    );
+    // FAT holds no time before 1980-01-01 (Linux fat_time_unix2fat
+    // clamps to it): a guest whose clock starts at the epoch, as the
+    // reference arm64 VM's does, gets that
+    const FAT_MIN: i64 = 315_532_800;
+    let want = now.tv_sec.max(FAT_MIN);
+    t.ok(b"mtime now", (m.0 - want).abs() <= 3, m.0 - want);
     t.ok(b"ctime is mtime", c == m, c.0);
     t.ok(b"atime the day", a.0 % DAY == 0 && a.1 == 0, a.0 % DAY);
     let [_, dm, dc] = stimes(d);
