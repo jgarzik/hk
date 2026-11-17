@@ -28,6 +28,7 @@ use crate::fs::iov_iter::IovDest;
 use crate::fs::mount::{Mount, MountRef};
 use crate::fs::superblock::{FileSystemType, FsContext, vfs_get_tree};
 use crate::sync::spin::Mutex as SpinMutex;
+use crate::util::kalloc::try_arc;
 
 /// Linux lookup_noperm_common: a kernel-made name is one component,
 /// not "." or ".." (EACCES)
@@ -86,7 +87,7 @@ pub fn simple_recursive_removal(dentry: &DentryRef, callback: Option<&dyn Fn(&De
         if inode.mode().is_dir() {
             inode.set_dead();
         }
-        if let Some(child) = this.nth_positive_child(0) {
+        if let Some(child) = this.first_positive_child() {
             let Some(ci) = child.get_inode() else {
                 continue;
             };
@@ -126,11 +127,68 @@ pub fn simple_recursive_removal(dentry: &DentryRef, callback: Option<&dyn Fn(&De
     }
 }
 
+/// The reader's cursor of an open directory (Linux file->private_data
+/// of dcache_dir_open)
+fn cursor(file: &File) -> Result<alloc::sync::Arc<DentryRef>, KernelError> {
+    file.private_arc::<DentryRef>().ok_or(KernelError::BadFd)
+}
+
+/// Linux dcache_dir_open: the file's cursor, off the list (before the
+/// first entry)
+pub fn dcache_dir_open(file: &File) -> Result<(), KernelError> {
+    let c = try_arc(Dentry::alloc_cursor(&file.dentry)?)?;
+    file.private.call_once(|| c);
+    Ok(())
+}
+
+/// Linux dcache_dir_close: the cursor leaves the children list
+pub fn dcache_dir_close(file: &File) {
+    if let Ok(c) = cursor(file) {
+        file.dentry.cursor_move(&c, None);
+    }
+}
+
+/// Linux dcache_dir_lseek: SEEK_SET or SEEK_CUR to a position at or
+/// past 0 (else EINVAL); a new position puts the cursor after the
+/// positive child before it (none for "." and ".."), under the
+/// directory's shared lock
+pub fn dcache_dir_lseek(file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
+    use crate::fs::file::seek;
+    let off = match whence {
+        seek::SEEK_SET => offset,
+        seek::SEEK_CUR => offset
+            .checked_add(file.get_pos() as i64)
+            .ok_or(KernelError::InvalidArgument)?,
+        _ => return Err(KernelError::InvalidArgument),
+    };
+    let off = u64::try_from(off).map_err(|_| KernelError::InvalidArgument)?;
+    if off != file.get_pos() {
+        let d = &file.dentry;
+        let c = cursor(file)?;
+        let dir = d.get_inode().ok_or(KernelError::BadFd)?;
+        let _l = dir.lock_shared();
+        let n = usize::try_from(off.saturating_sub(2)).unwrap_or(usize::MAX);
+        let to = (off > 2).then(|| d.scan_positives(&c, true, n)).flatten();
+        d.cursor_move(&c, to.as_deref());
+        file.set_pos(off);
+    }
+    Ok(off)
+}
+
 /// Linux dcache_readdir: ".", "..", then the directory's positive
-/// dentries in the order of its children list, the `n`th at position
-/// `n + 2`
+/// dentries in the order of its children list, each one position on;
+/// the file's cursor keeps its place between calls, so entries removed
+/// or added meanwhile shift nothing
 pub fn dcache_readdir(file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
-    let d = &file.dentry;
+    dcache_readdir_at(&file.dentry, &*cursor(file)?, ctx)
+}
+
+/// [`dcache_readdir`] of directory `d` with the reader's cursor `c`
+fn dcache_readdir_at(
+    d: &DentryRef,
+    c: &DentryRef,
+    ctx: &mut DirContext<'_>,
+) -> Result<(), KernelError> {
     let inode = d.get_inode().ok_or(KernelError::BadFd)?;
     let up = d.get_parent().and_then(|p| p.get_inode());
     let parent_ino = up.map_or(inode.ino, |p| p.ino);
@@ -144,23 +202,31 @@ pub fn dcache_readdir(file: &File, ctx: &mut DirContext<'_>) -> Result<(), Kerne
             return Ok(());
         }
     }
-    let mut pos = ctx.pos.max(2);
-    while let Some(c) = d.nth_positive_child(usize::try_from(pos - 2).unwrap_or(usize::MAX)) {
-        // Gone negative since: the next one is at this position now
-        let Some(ci) = c.get_inode() else {
-            continue;
+    // From the first child at position 2, else from the cursor
+    let mut from_head = ctx.pos == 2;
+    loop {
+        // Linux scan_positives(cursor, p, 1, next)
+        let Some(next) = d.scan_positives(c, from_head, 1) else {
+            // The end: the cursor off the list (hlist_del_init)
+            d.cursor_move(c, None);
+            return Ok(());
+        };
+        // Positive under the reader's shared lock (no removal meanwhile)
+        let Some(ni) = next.get_inode() else {
+            return Ok(());
         };
         let e = DirEntry {
-            ino: ci.ino,
-            file_type: ci.mode().file_type().unwrap_or(FileType::Regular),
-            name: c.name().to_vec(),
+            ino: ni.ino,
+            file_type: ni.mode().file_type().unwrap_or(FileType::Regular),
+            name: next.name().to_vec(),
         };
-        if !ctx.emit_at(pos, e) {
-            break;
+        if !ctx.emit_at(ctx.pos, e) {
+            // The cursor stays just before `next`
+            return Ok(());
         }
-        pos += 1;
+        d.cursor_move(c, Some(&next));
+        from_head = false;
     }
-    Ok(())
 }
 
 /// Copy `from` at `*pos` out to `to` (Linux simple_read_from_buffer):
@@ -237,4 +303,72 @@ pub fn simple_release_fs(p: &PinnedFs) {
     let last = if g.1 == 0 { g.0.take() } else { None };
     drop(g);
     drop(last);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::inode::{InodeMode, NULL_INODE_OPS, Timespec};
+    use alloc::sync::Weak;
+    use alloc::vec::Vec;
+
+    fn inode(ino: u64, mode: InodeMode) -> InodeRef {
+        let t = Timespec::from_secs(0);
+        let i = Inode::new(ino, mode, 0, 0, 0, t, Weak::new(), &NULL_INODE_OPS);
+        Inode::alloc(i).unwrap()
+    }
+
+    /// One readdir call with room for `room` entries from `*pos`: the
+    /// names returned, `*pos` moved on
+    fn read(d: &DentryRef, c: &DentryRef, pos: &mut u64, room: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut actor = |e: &DirEntry, _: u64| {
+            if out.len() == room {
+                return false;
+            }
+            out.push(e.name.clone());
+            true
+        };
+        let mut ctx = DirContext::new(*pos, &mut actor);
+        dcache_readdir_at(d, c, &mut ctx).unwrap();
+        *pos = ctx.pos;
+        out
+    }
+
+    /// The reader's cursor keeps its place (Linux dcache_readdir): an
+    /// entry already returned that goes between two calls shifts
+    /// nothing, so the next call starts at the next entry, neither
+    /// repeating nor skipping one; at the end the cursor leaves the
+    /// list and a walk of the children never sees it
+    #[test]
+    fn cursor_keeps_place() {
+        let root = DentryRef::new(Dentry::new_root(
+            inode(1, InodeMode::directory(0o755)),
+            Weak::new(),
+        ))
+        .unwrap();
+        let kids: Vec<DentryRef> = (b'a'..=b'e')
+            .map(|c| {
+                let i = inode(u64::from(c), InodeMode::regular(0o644));
+                Dentry::alloc(&root, &[c], Some(i)).unwrap()
+            })
+            .collect();
+        let cur = Dentry::alloc_cursor(&root).unwrap();
+        let mut pos = 0;
+        let first = read(&root, &cur, &mut pos, 4);
+        assert_eq!(first, [&b"."[..], b"..", b"a", b"b"].map(<[u8]>::to_vec));
+        // The cursor sits among the children, not counted as one
+        assert_eq!(root.num_children(), 5);
+        assert!(root.remove_child(b"a").is_some());
+        let rest = read(&root, &cur, &mut pos, 16);
+        assert_eq!(rest, [&b"c"[..], b"d", b"e"].map(<[u8]>::to_vec));
+        assert_eq!(pos, 7);
+        assert!(read(&root, &cur, &mut pos, 16).is_empty());
+        // A seek back to the start reads from the first again
+        let mut zero = 0;
+        let again = read(&root, &cur, &mut zero, 3);
+        assert_eq!(again, [&b"."[..], b"..", b"b"].map(<[u8]>::to_vec));
+        root.cursor_move(&cur, None);
+        drop(kids);
+    }
 }

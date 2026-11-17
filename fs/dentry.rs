@@ -46,6 +46,11 @@ const DCACHE_MOUNTED: u32 = 1 << 16;
 /// Nothing may be mounted on it any more (Linux DCACHE_CANT_MOUNT): its
 /// name was removed
 const DCACHE_CANT_MOUNT: u32 = 1 << 8;
+/// A directory reader's place among its parent's children (Linux
+/// DCACHE_DENTRY_CURSOR): never hashed and never positive, on the
+/// children list only between readdir calls; every walk of a children
+/// list steps over it
+const DCACHE_DENTRY_CURSOR: u32 = 1 << 25;
 
 /// The dcache's tree shape (Linux rename_lock): held for writing by
 /// d_move / d_exchange, which bumps its sequence; for reading by
@@ -1021,20 +1026,96 @@ impl Dentry {
         self.sb.upgrade()
     }
 
-    /// Get number of children
+    /// Get number of children (cursors not counted)
     pub fn num_children(&self) -> usize {
-        self.d_lock.read().children.len()
+        let dl = self.d_lock.read();
+        dl.children.iter().filter(|c| !c.is_cursor()).count()
     }
 
-    /// Its `n`th positive child, counted from the first (Linux
-    /// scan_positives from the head of d_children): found and taken
-    /// under its d_lock, where lookups take theirs. A removed child is
-    /// off the list, so the first positive one is also the next one
-    /// after the last removed (Linux find_next_child).
-    pub fn nth_positive_child(&self, n: usize) -> Option<DentryRef> {
+    /// Its first positive child (Linux find_next_child; a removed child
+    /// is off the list here, so this is also the next one after the
+    /// last removed), taken under its d_lock where lookups take theirs
+    pub fn first_positive_child(&self) -> Option<DentryRef> {
         let dl = self.d_lock.read();
-        let c = dl.children.iter().filter(|c| !c.is_negative()).nth(n)?;
+        let c = dl
+            .children
+            .iter()
+            .find(|c| !c.is_cursor() && !c.is_negative())?;
         DentryRef::try_get(c)
+    }
+
+    /// A reader's cursor among this directory's children (Linux
+    /// d_alloc_cursor): on no list until moved there, holding the
+    /// directory
+    pub fn alloc_cursor(parent: &DentryRef) -> Result<DentryRef, KernelError> {
+        let d = DentryRef::new(Self::with_op(
+            DName::default(),
+            None,
+            parent.sb.clone(),
+            parent.d_op,
+        ))?;
+        let mut dl = d.d_lock.write();
+        d.set_flag(&mut dl, DCACHE_DENTRY_CURSOR, true);
+        d.set_parent(&dl, parent.clone());
+        drop(dl);
+        Ok(d)
+    }
+
+    /// A cursor (Linux DCACHE_DENTRY_CURSOR)
+    fn is_cursor(&self) -> bool {
+        self.flag(DCACHE_DENTRY_CURSOR)
+    }
+
+    /// Linux scan_positives: the `count`th (from 1) positive child,
+    /// cursors stepped over, counted from the first child (`from_head`)
+    /// or from just after `cursor`, which must then be on the list
+    /// (else None: a cursor off the list stands past the end). Found and
+    /// taken under this directory's d_lock.
+    pub fn scan_positives(
+        &self,
+        cursor: &Dentry,
+        from_head: bool,
+        count: usize,
+    ) -> Option<DentryRef> {
+        let dl = self.d_lock.read();
+        let mut c = if from_head {
+            dl.children.first()
+        } else {
+            dl.children.next_ref(cursor)
+        };
+        let mut n = count.max(1);
+        while let Some(d) = c {
+            if !d.is_cursor() && !d.is_negative() {
+                n -= 1;
+                if n == 0 {
+                    if let Some(r) = DentryRef::try_get(d) {
+                        return Some(r);
+                    }
+                    n = 1;
+                }
+            }
+            c = dl.children.next_ref(d);
+        }
+        None
+    }
+
+    /// Put `cursor`, a cursor of this directory, right after its child
+    /// `after`, or off the list (None, or a child no longer on it):
+    /// Linux hlist_del_init + hlist_add_behind under the d_lock
+    pub fn cursor_move(&self, cursor: &DentryRef, after: Option<&Dentry>) {
+        debug_assert!(cursor.is_cursor(), "dcache: cursor_move of a non-cursor");
+        let mut dl = self.d_lock.write();
+        let ours = dl.children.remove(cursor).unwrap_or_else(|| cursor.clone());
+        let off = match after.filter(|a| dl.children.contains(a)) {
+            Some(a) => {
+                dl.children.insert_after(a, ours);
+                None
+            }
+            None => Some(ours),
+        };
+        drop(dl);
+        // Not the last reference (the caller's): put after the lock
+        drop(off);
     }
 }
 
@@ -1658,13 +1739,22 @@ fn find_submount(top: &DentryRef) -> Option<DentryRef> {
     }
 }
 
-/// The child after `d` in `parent` (none if `d` left it)
+/// The child after `d` in `parent`, cursors stepped over (none if `d`
+/// left it; Linux d_walk skips DCACHE_DENTRY_CURSOR)
 fn next_sibling(parent: &Dentry, d: &Dentry) -> Option<DentryRef> {
-    parent.d_lock.read().children.next(d)
+    let dl = parent.d_lock.read();
+    let mut c = dl.children.next_ref(d);
+    while let Some(n) = c.filter(|n| n.is_cursor()) {
+        c = dl.children.next_ref(n);
+    }
+    c.and_then(DentryRef::try_get)
 }
 
+/// The first child of `d` that is not a cursor
 fn first_child(d: &Dentry) -> Option<DentryRef> {
-    d.d_lock.read().children.front()
+    let dl = d.d_lock.read();
+    let c = dl.children.iter().find(|c| !c.is_cursor())?;
+    DentryRef::try_get(c)
 }
 
 /// Prune up to `budget` unused leaves of the tree under `root`, post

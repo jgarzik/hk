@@ -246,11 +246,31 @@ impl FileOps for TracefsFops {
         self
     }
 
+    /// A file's own open; a directory gets its reader's cursor (Linux
+    /// simple_dir_operations: dcache_dir_open)
     fn open(&self, file: &File) -> Result<(), KernelError> {
         match fops(file) {
             Some(f) => f.open(file.is_writable(), file.get_flags()),
-            None => Ok(()),
+            None => libfs::dcache_dir_open(file),
         }
+    }
+
+    /// Linux dcache_dir_close for a directory
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        if fops(file).is_none() {
+            libfs::dcache_dir_close(file);
+        }
+        Ok(())
+    }
+
+    /// Linux dcache_dir_lseek for a directory, default_llseek's
+    /// generic seek for a file
+    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
+        if fops(file).is_none() {
+            return libfs::dcache_dir_lseek(file, offset, whence);
+        }
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        crate::fs::file::generic_llseek(file, inode.get_size(), offset, whence)
     }
 
     /// No FMODE_NOWAIT: RWF_NOWAIT is EOPNOTSUPP
@@ -529,8 +549,9 @@ mod tests {
 
     /// The positive children's names, in readdir order
     fn names(d: &DentryRef) -> Vec<Vec<u8>> {
-        (0..)
-            .map_while(|n| d.nth_positive_child(n))
+        let c = Dentry::alloc_cursor(d).unwrap();
+        (1..)
+            .map_while(|n| d.scan_positives(&c, true, n))
             .map(|c| c.name().to_vec())
             .collect()
     }

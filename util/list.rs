@@ -583,6 +583,21 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> PtrList<A, P> {
         self.list.pop_front().map(|p| unsafe { P::from_raw(p) })
     }
 
+    /// Insert `item` right after `at` (Linux list_add(item, at)); panics
+    /// if `item` is on a list through this link
+    ///
+    /// # Safety
+    /// `at` is on this list.
+    pub unsafe fn insert_after(&mut self, at: &A::Item, item: P) {
+        assert!(A::link(&item).claim(), "list: item already linked");
+        // SAFETY: `at` on this list (the caller); `item` unlinked and
+        // claimed for this insert, live while the list owns it
+        unsafe {
+            self.list
+                .insert_after(core::ptr::from_ref(at), P::into_raw(item))
+        };
+    }
+
     /// Remove and return the last entry
     pub fn pop_back(&mut self) -> Option<P> {
         // SAFETY: entries were inserted with into_raw
@@ -795,6 +810,19 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         // SAFETY: on this list now, which keeps it live
         let item = unsafe { &*p };
         // INVARIANT: on this list from here (the push claimed its link)
+        A::owner(item).0.store(self.id, Relaxed);
+    }
+
+    /// Insert `item` right after `at` (Linux hlist_add_behind); panics
+    /// if `at` is not on this list or `item` is on a list
+    pub fn insert_after(&mut self, at: &A::Item, item: P) {
+        assert!(self.mine(at), "list: insert after an item not on it");
+        let p = core::ptr::from_ref::<A::Item>(&item);
+        // SAFETY: `at` is marked with this list's id, so on it
+        unsafe { self.list.insert_after(at, item) };
+        // SAFETY: on this list now, which keeps it live
+        let item = unsafe { &*p };
+        // INVARIANT: on this list from here (the insert claimed its link)
         A::owner(item).0.store(self.id, Relaxed);
     }
 

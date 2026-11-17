@@ -3330,9 +3330,16 @@ simple_done_creating), `libfs::simple_recursive_removal` takes a subtree
 away holding one directory's `i_rwsem` at a time going down, and going
 up the victim's parent's, taken after the victim's is released, across
 `d_invalidate` (-> NAMESPACE_SEM for a mountpoint) and its callback
-(Linux __simple_recursive_removal). `libfs::dcache_readdir` reads the
-directory's children list under its d_lock, one entry at a time, under
-the getdents shared `i_rwsem`. `PinnedFs` (a filesystem's kernel mount
+(Linux __simple_recursive_removal). `libfs::dcache_readdir` keeps an
+open directory's place with a cursor dentry (Linux d_alloc_cursor,
+DCACHE_DENTRY_CURSOR) on the directory's children list: found and
+stepped past under the directory's d_lock held for reading
+(`Dentry::scan_positives`, Linux scan_positives), moved under it held
+for writing (`Dentry::cursor_move`, Linux hlist_del_init /
+hlist_add_behind), under the getdents (or lseek) shared `i_rwsem`; a
+cursor is never hashed or positive and every walk of a children list
+steps over it (Linux d_walk); its list reference is put after the
+d_lock is released. `PinnedFs` (a filesystem's kernel mount
 and hold count; Linux pin_fs_lock) is a spin leaf, thread context only
 (never taken in IRQ context, so no IRQ class): the check, the
 install and the count are one hold; the mount is made and put with it

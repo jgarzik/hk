@@ -676,12 +676,8 @@ waiting).
 
 ## tracefs gaps
 
-**Location**: `fs/tracefs.rs`, `fs/libfs.rs`
+**Location**: `fs/tracefs.rs`
 
-- `libfs::dcache_readdir` keeps no cursor dentry between getdents
-  calls (Linux d_alloc_cursor in dcache_dir_open): a position counts
-  positive children from the first, so an entry removed between two
-  calls shifts the later ones back by one.
 - No instances/ directory (tracefs_create_instance_dir: mkdir/rmdir of
   trace instances), so nothing removes a tracefs entry at run time.
 
