@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-use super::cb::{RTO_INIT, RTO_MAX, TcpCb, TcpState, Tmr};
+use super::cb::{Live, RTO_INIT, RTO_MAX, TcpCb, TcpState, Tmr};
 use super::timer::now_ms;
 use crate::fs::proc::seq::{self, SeqBuf};
 
@@ -88,7 +88,7 @@ impl TcpCb {
     fn ca_state(&self) -> u8 {
         if self.cong.in_recovery() {
             CA_RECOVERY
-        } else if self.backoff > 0 && self.snd_una != self.snd_max {
+        } else if self.live.backoff.get() > 0 && self.snd_una != self.snd_max {
             CA_LOSS
         } else {
             CA_OPEN
@@ -99,14 +99,14 @@ impl TcpCb {
 /// `struct tcp_info` of `cb` at `now`
 pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let mut b = Buf(Vec::with_capacity(INFO_LEN));
-    let mss = cb.mss;
+    let mss = cb.live.mss.get();
     let st = &cb.stats;
     let synced = cb.state.synced();
     b.u8(cb.state.linux());
     b.u8(cb.ca_state());
-    b.u8(cb.backoff.min(255) as u8);
-    b.u8(cb.probes.min(255) as u8);
-    b.u8(cb.backoff.min(255) as u8);
+    b.u8(cb.live.backoff.get().min(255) as u8);
+    b.u8(cb.live.probes.get().min(255) as u8);
+    b.u8(cb.live.backoff.get().min(255) as u8);
     let mut opt = 0;
     if cb.ts_ok {
         opt |= OPT_TIMESTAMPS;
@@ -118,7 +118,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u8((cb.snd_wscale & 15) | (cb.rcv_wscale << 4));
     b.u8(0);
     b.u32((cb.rto_cur() * 1000) as u32);
-    b.u32((cb.dack.ato * 1000) as u32);
+    b.u32((cb.live.ato.get() * 1000) as u32);
     b.u32(mss);
     b.u32(cb.dack.rcv_mss);
     b.u32(pkts(cb.snd_max.wrapping_sub(cb.snd_una), mss)); // unacked
@@ -134,13 +134,13 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let (srtt, var) = cb.rtt();
     b.u32((srtt * 1000) as u32);
     b.u32((var * 1000) as u32);
-    let ss = cb.cong.ssthresh;
+    let ss = cb.cong.ssthresh();
     b.u32(if ss >= INFINITE_SSTHRESH {
         INFINITE_SSTHRESH
     } else {
         pkts(ss, mss)
     });
-    b.u32(pkts(cb.cong.cwnd, mss));
+    b.u32(pkts(cb.cong.cwnd(), mss));
     b.u32(cb.adv_mss);
     b.u32(3); // reordering (tcp_reordering)
     b.u32(0); // rcv_rtt
@@ -223,7 +223,7 @@ impl Write for Line {
 }
 
 /// What /proc/net/tcp shows of a connection beyond its addresses (Linux
-/// get_tcp4_sock's reads), computed under the socket lock
+/// get_tcp4_sock's reads), loaded with no lock
 #[derive(Clone, Copy, Default)]
 pub(super) struct ProcView {
     /// Linux timer_active: 1 retransmit, 4 zero-window probe, 2
@@ -242,66 +242,52 @@ pub(super) struct ProcView {
 }
 
 impl ProcView {
-    /// `cb`'s values (under its socket lock)
-    pub fn of(cb: &TcpCb) -> Self {
-        let (tr, when) = match (cb.tmr, cb.keep_at.or(cb.wait_at)) {
+    /// A connection's fields in `l` as they are now, its state `state`
+    /// (each field read once, racily: Linux get_tcp4_sock)
+    pub fn of(l: &Live, state: TcpState) -> Self {
+        let (tr, when) = match (l.tmr.get(), l.keep_at.get().or(l.wait_at.get())) {
             (Some((Tmr::Rtx, t)), _) => (1, t),
             (Some((Tmr::Probe, t)), _) => (4, t),
             (None, Some(t)) => (2, t),
             _ => (0, 0),
         };
-        let ss = cb.cong.ssthresh;
-        let last = if cb.state == TcpState::Listen {
-            i64::from(cb.opts.fastopen)
+        let mss = l.mss.get();
+        let ss = l.ssthresh.get();
+        let last = if state == TcpState::Listen {
+            i64::from(l.fastopen.get())
         } else if ss >= INFINITE_SSTHRESH {
             -1
         } else {
-            i64::from(pkts(ss, cb.mss))
+            i64::from(pkts(ss, mss))
         };
         Self {
             tr,
             when,
-            backoff: cb.backoff,
-            probes: cb.probes,
-            rto: cb.rto_cur(),
-            ato: cb.dack.ato,
-            qp: (cb.dack.quick << 1) | u32::from(cb.dack.pingpong),
-            cwnd: pkts(cb.cong.cwnd, cb.mss),
+            backoff: l.backoff.get(),
+            probes: l.probes.get(),
+            rto: l.rto_cur(),
+            ato: l.ato.get(),
+            qp: (l.quick.get() << 1) | u32::from(l.pingpong.get()),
+            cwnd: pkts(l.cwnd.get(), mss),
             last,
         }
     }
 }
 
-/// A listener or connection line (Linux get_tcp4_sock reads the live
-/// fields racily): an unowned socket's from its block under `slock`, an
-/// owned one's as its owner took it; never waiting for an owner
+/// A listener or connection line, read with no socket lock (Linux
+/// get_tcp4_sock): the state and queue sizes from `Snap`, the rest from
+/// the control block's `Live` fields; never waiting for an owner
 fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
     let a = s.inet.get();
     let ino = s.sk.ino.load(Ordering::Relaxed);
     let uid = s.sk.cred.euid;
-    let live = {
-        let mut b = s.lock.bh_lock();
-        b.get().map(|g| {
-            (
-                g.cb.state,
-                ProcView::of(&g.cb),
-                g.cb.rcvq_len(),
-                g.cb.sndq_len(),
-            )
-        })
-    };
-    let (state, v, rcvq, sndq) = live.unwrap_or_else(|| {
-        (
-            s.state(),
-            s.snap.proc.load(),
-            s.snap.rcvq.load(Ordering::Acquire),
-            s.snap.sndq.load(Ordering::Acquire),
-        )
-    });
+    let state = s.state();
+    let v = ProcView::of(&s.live, state);
+    let sndq = s.snap.sndq.load(Ordering::Acquire);
     let rxq = if state == TcpState::Listen {
         s.queue.lock().as_ref().map_or(0, |q| q.ready.len())
     } else {
-        rcvq
+        s.snap.rcvq.load(Ordering::Acquire)
     };
     let when = if v.tr == 0 {
         0
@@ -365,7 +351,7 @@ fn tw_line(i: usize, tw: &super::timewait::TimeWait, now: u64) -> Line {
 }
 
 /// `/proc/net/tcp` of `net`: listeners, then connections and TIME_WAIT
-/// entries, generated under RCU into a `SeqBuf` (Linux tcp4_seq_show over
+/// the hash walk); a socket's line takes no socket lock (`sock_line`)
 /// the hash walk); a socket's line takes only its `slock` (`sock_line`)
 pub fn proc_net_tcp(net: &crate::net::NetNamespace) -> Vec<u8> {
     seq::generate(|m| {
@@ -408,7 +394,7 @@ mod tests {
 
     #[test]
     fn info_layout() {
-        let cb = TcpCb::new(super::super::cb::Cfg::default());
+        let cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
         let b = tcp_info(&cb, 0);
         assert_eq!(b.len(), INFO_LEN);
         assert_eq!(b[0], TcpState::Closed.linux());

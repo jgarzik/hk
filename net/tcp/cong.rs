@@ -20,7 +20,8 @@
 
 use core::fmt;
 
-use super::cb::before;
+use super::cb::{Live, before};
+use alloc::sync::Arc;
 
 /// Duplicate ACKs that trigger fast retransmit
 pub const DUPTHRESH: u32 = 3;
@@ -78,10 +79,10 @@ pub fn names() -> alloc::string::String {
     v.join(" ")
 }
 
-#[derive(Clone)]
+/// A connection's congestion state; cwnd and ssthresh, which
+/// /proc/net/tcp reads, are in its control block's `cb::Live`
 pub struct Cong {
-    pub cwnd: u32,
-    pub ssthresh: u32,
+    pub(super) live: Arc<Live>,
     mss: u32,
     dupacks: u32,
     /// In fast recovery until this sequence number is acknowledged
@@ -102,17 +103,24 @@ impl fmt::Debug for Cong {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cong")
             .field("algo", &self.name())
-            .field("cwnd", &self.cwnd)
-            .field("ssthresh", &self.ssthresh)
+            .field("cwnd", &self.live.cwnd.get())
+            .field("ssthresh", &self.live.ssthresh.get())
             .finish()
     }
 }
 
+#[cfg(test)]
 impl Default for Cong {
     fn default() -> Self {
-        let mut c = Self {
-            cwnd: 0,
-            ssthresh: u32::MAX,
+        Self::new(Arc::default())
+    }
+}
+
+impl Cong {
+    /// Initial state, its window in `live`
+    pub fn new(live: Arc<Live>) -> Self {
+        let c = Self {
+            live,
             mss: super::cb::MSS_DEFAULT,
             dupacks: 0,
             recover: None,
@@ -122,12 +130,33 @@ impl Default for Cong {
             usage_seq: 0,
             algo: 0,
         };
-        c.cwnd = c.initial();
+        c.live.ssthresh.set(u32::MAX);
+        c.live.cwnd.set(c.initial());
         c
     }
-}
 
-impl Cong {
+    /// Linux tcp_snd_cwnd (bytes here)
+    pub fn cwnd(&self) -> u32 {
+        self.live.cwnd.get()
+    }
+
+    /// Linux snd_ssthresh (bytes here)
+    pub fn ssthresh(&self) -> u32 {
+        self.live.ssthresh.get()
+    }
+
+    /// The same state on its own cells (tests)
+    #[cfg(test)]
+    pub fn dup(&self) -> Self {
+        let c = Self {
+            live: Arc::default(),
+            ..*self
+        };
+        c.live.cwnd.set(self.cwnd());
+        c.live.ssthresh.set(self.ssthresh());
+        c
+    }
+
     fn ops(&self) -> &'static dyn CongOps {
         ALGOS[self.algo]
     }
@@ -153,10 +182,10 @@ impl Cong {
     }
 
     pub fn set_mss(&mut self, mss: u32) {
-        let first = self.cwnd == self.initial();
+        let first = self.live.cwnd.get() == self.initial();
         self.mss = mss;
         if first {
-            self.cwnd = self.initial();
+            self.live.cwnd.set(self.initial());
         }
     }
 
@@ -165,14 +194,19 @@ impl Cong {
     }
 
     pub fn in_slow_start(&self) -> bool {
-        self.cwnd < self.ssthresh
+        self.live.cwnd.get() < self.live.ssthresh.get()
     }
 
     /// Linux tcp_slow_start: grow by `acked` up to ssthresh; returns the
     /// bytes left for congestion avoidance
     pub fn slow_start(&mut self, acked: u32) -> u32 {
-        let cwnd = self.cwnd.saturating_add(acked).min(self.ssthresh);
-        let left = acked.saturating_sub(cwnd.saturating_sub(self.cwnd));
+        let cwnd = self
+            .live
+            .cwnd
+            .get()
+            .saturating_add(acked)
+            .min(self.live.ssthresh.get());
+        let left = acked.saturating_sub(cwnd.saturating_sub(self.live.cwnd.get()));
         self.set_cwnd(cwnd);
         left
     }
@@ -180,18 +214,23 @@ impl Cong {
     /// Linux tcp_cong_avoid_ai: one MSS per cwnd of acknowledged bytes
     pub fn avoid_ai(&mut self, acked: u32) {
         self.cnt = self.cnt.saturating_add(acked);
-        let w = self.cwnd.max(1);
+        let w = self.live.cwnd.get().max(1);
         if self.cnt >= w {
             let steps = self.cnt / w;
             self.cnt -= steps * w;
-            self.set_cwnd(self.cwnd.saturating_add(steps.saturating_mul(self.mss)));
+            self.set_cwnd(
+                self.live
+                    .cwnd
+                    .get()
+                    .saturating_add(steps.saturating_mul(self.mss)),
+            );
         }
     }
 
     /// Linux tcp_snd_cwnd_set with the snd_cwnd_clamp bound its callers
     /// apply: cwnd never passes [`CWND_CLAMP`]
     fn set_cwnd(&mut self, v: u32) {
-        self.cwnd = v.min(CWND_CLAMP);
+        self.live.cwnd.set(v.min(CWND_CLAMP));
     }
 
     /// Linux tcp_is_cwnd_limited
@@ -199,7 +238,7 @@ impl Cong {
         if self.limited {
             return true;
         }
-        self.in_slow_start() && self.cwnd < 2 * self.max_flight
+        self.in_slow_start() && self.live.cwnd.get() < 2 * self.max_flight
     }
 
     /// After a transmit pass: `flight` bytes out, `limited` if cwnd
@@ -222,12 +261,12 @@ impl Cong {
         if let Some(r) = self.recover {
             if before(ack, r) {
                 // Partial ACK: deflate by what it covered, stay
-                let w = self.cwnd.saturating_sub(acked).max(self.mss);
+                let w = self.live.cwnd.get().saturating_sub(acked).max(self.mss);
                 self.set_cwnd(w.saturating_add(self.mss));
                 return true;
             }
             self.recover = None;
-            self.cwnd = self.ssthresh;
+            self.live.cwnd.set(self.live.ssthresh.get());
             return false;
         }
         if self.cwnd_limited() {
@@ -243,15 +282,17 @@ impl Cong {
         if self.recover.is_some() {
             // One MSS per dupack (RFC 6582 inflation): a peer can send
             // any number, so the window stops at the clamp
-            self.set_cwnd(self.cwnd.saturating_add(self.mss));
+            self.set_cwnd(self.live.cwnd.get().saturating_add(self.mss));
             return false;
         }
         if self.dupacks != DUPTHRESH {
             return false;
         }
-        self.ssthresh = self.ops().ssthresh(self, flight);
+        self.live.ssthresh.set(self.ops().ssthresh(self, flight));
         self.set_cwnd(
-            self.ssthresh
+            self.live
+                .ssthresh
+                .get()
                 .saturating_add(DUPTHRESH.saturating_mul(self.mss)),
         );
         self.cnt = 0;
@@ -268,8 +309,8 @@ impl Cong {
     /// Retransmission timeout with `flight` bytes outstanding (loss
     /// window of one segment)
     pub fn on_rto(&mut self, flight: u32) {
-        self.ssthresh = self.ops().ssthresh(self, flight);
-        self.cwnd = self.mss;
+        self.live.ssthresh.set(self.ops().ssthresh(self, flight));
+        self.live.cwnd.set(self.mss);
         self.cnt = 0;
         self.dupacks = 0;
         self.recover = None;
@@ -279,14 +320,14 @@ impl Cong {
     /// tcp_cwnd_restart): halve per RTO idle, not below the initial
     /// window
     pub fn restart(&mut self, idle: u64, rto: u64) {
-        let iw = self.initial().min(self.cwnd);
-        let mut cwnd = self.cwnd;
+        let iw = self.initial().min(self.live.cwnd.get());
+        let mut cwnd = self.live.cwnd.get();
         let mut left = idle as i64 - rto as i64;
         while left > 0 && cwnd > iw {
             cwnd >>= 1;
             left -= rto as i64;
         }
-        self.cwnd = cwnd.max(iw);
+        self.live.cwnd.set(cwnd.max(iw));
         self.max_flight = 0;
     }
 }
@@ -296,45 +337,45 @@ mod tests {
     use super::*;
 
     fn limited(c: &mut Cong) {
-        c.on_sent(c.cwnd, 0, 1, true);
+        c.on_sent(c.cwnd(), 0, 1, true);
     }
 
     #[test]
     fn iw10() {
         let mut c = Cong::default();
         c.set_mss(1460);
-        assert_eq!(c.cwnd, 14600);
+        assert_eq!(c.cwnd(), 14600);
         c.set_mss(1000);
-        assert_eq!(c.cwnd, 10_000);
+        assert_eq!(c.cwnd(), 10_000);
         c.set_mss(536);
-        assert_eq!(c.cwnd, 5360);
+        assert_eq!(c.cwnd(), 5360);
         let mut c = Cong::default();
         c.set_mss(9000);
-        assert_eq!(c.cwnd, 18_000);
+        assert_eq!(c.cwnd(), 18_000);
     }
 
     #[test]
     fn slow_start_then_avoidance() {
         let mut c = Cong::default();
         c.set_mss(1000);
-        assert_eq!(c.cwnd, 10_000);
-        c.ssthresh = 13_000;
+        assert_eq!(c.cwnd(), 10_000);
+        c.live.ssthresh.set(13_000);
         limited(&mut c);
         // Slow start: every acknowledged byte, up to ssthresh
         c.on_ack(2000, 1);
-        assert_eq!(c.cwnd, 12_000);
+        assert_eq!(c.cwnd(), 12_000);
         // Crossing ssthresh: the rest counts towards avoidance
         c.on_ack(2000, 2);
-        assert_eq!(c.cwnd, 13_000);
+        assert_eq!(c.cwnd(), 13_000);
         // Avoidance: one MSS per cwnd acknowledged
         for _ in 0..12 {
             c.on_ack(1000, 3);
         }
-        assert_eq!(c.cwnd, 14_000);
+        assert_eq!(c.cwnd(), 14_000);
         c.on_ack(13_000, 4);
-        assert_eq!(c.cwnd, 14_000);
+        assert_eq!(c.cwnd(), 14_000);
         c.on_ack(1000, 5);
-        assert_eq!(c.cwnd, 15_000);
+        assert_eq!(c.cwnd(), 15_000);
     }
 
     #[test]
@@ -346,33 +387,33 @@ mod tests {
         for i in 0..20 {
             c.on_ack(1000, i);
         }
-        assert_eq!(c.cwnd, 10_000);
+        assert_eq!(c.cwnd(), 10_000);
         c.on_sent(6000, 2000, 8000, false);
         for i in 0..20 {
             c.on_ack(1000, 2000 + i);
         }
-        assert_eq!(c.cwnd, 12_000);
+        assert_eq!(c.cwnd(), 12_000);
     }
 
     #[test]
     fn fast_recovery() {
         let mut c = Cong::default();
         c.set_mss(1000);
-        c.cwnd = 10_000;
+        c.live.cwnd.set(10_000);
         assert!(!c.on_dupack(10_000, 500));
         assert!(!c.on_dupack(10_000, 500));
         assert!(c.on_dupack(10_000, 500));
-        assert_eq!(c.ssthresh, 5000);
-        assert_eq!(c.cwnd, 8000);
+        assert_eq!(c.ssthresh(), 5000);
+        assert_eq!(c.cwnd(), 8000);
         assert!(!c.on_dupack(10_000, 500));
-        assert_eq!(c.cwnd, 9000);
+        assert_eq!(c.cwnd(), 9000);
         // Partial ACK: retransmit the next hole
         assert!(c.on_ack(1000, 100));
         // Full ACK ends recovery at ssthresh
         assert!(!c.on_ack(1000, 500));
-        assert_eq!(c.cwnd, 5000);
+        assert_eq!(c.cwnd(), 5000);
         c.on_rto(4000);
-        assert_eq!((c.cwnd, c.ssthresh), (1000, 2000));
+        assert_eq!((c.cwnd(), c.ssthresh()), (1000, 2000));
     }
 
     #[test]
@@ -384,17 +425,17 @@ mod tests {
         }
         assert!(c.in_recovery());
         // A peer repeating one ACK forever: cwnd stops at the clamp
-        c.cwnd = CWND_CLAMP - 500;
+        c.live.cwnd.set(CWND_CLAMP - 500);
         for _ in 0..4 {
             assert!(!c.on_dupack(10_000, 500));
         }
-        assert_eq!(c.cwnd, CWND_CLAMP);
+        assert_eq!(c.cwnd(), CWND_CLAMP);
         // ...and a partial ACK on top of it neither overflows nor passes it
         assert!(c.on_ack(0, 100));
-        assert_eq!(c.cwnd, CWND_CLAMP);
-        c.cwnd = u32::MAX;
+        assert_eq!(c.cwnd(), CWND_CLAMP);
+        c.live.cwnd.set(u32::MAX);
         assert!(c.on_ack(0, 100));
-        assert_eq!(c.cwnd, CWND_CLAMP);
+        assert_eq!(c.cwnd(), CWND_CLAMP);
         // the dupack count saturates rather than wrapping back to DUPTHRESH
         c.dupacks = u32::MAX;
         assert!(!c.on_dupack(10_000, 500));
@@ -405,13 +446,13 @@ mod tests {
     fn restart_after_idle() {
         let mut c = Cong::default();
         c.set_mss(1000);
-        c.cwnd = 80_000;
+        c.live.cwnd.set(80_000);
         c.restart(150, 200);
-        assert_eq!(c.cwnd, 80_000);
+        assert_eq!(c.cwnd(), 80_000);
         c.restart(450, 200);
-        assert_eq!(c.cwnd, 20_000);
+        assert_eq!(c.cwnd(), 20_000);
         c.restart(100_000, 200);
-        assert_eq!(c.cwnd, 10_000);
+        assert_eq!(c.cwnd(), 10_000);
     }
 
     #[test]

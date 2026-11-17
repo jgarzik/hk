@@ -1165,8 +1165,3 @@ ntp_update_frequency).
   `signal->pids[]` under RCU, valid because a task and a `struct pid`
   are freed a grace period after they are unlisted
   (delayed_put_task_struct, delayed_put_pid).
-- **TCP /proc view snapshot**: `net/tcp/mod.rs` `TcpSock::lock_sock`
-  stores `Snap.proc` on every ownership. Linux has no copy: the fields
-  /proc/net/tcp reads are read live (READ_ONCE); hk's equivalent is
-  those control-block fields as Relaxed atomics written where they
-  change.

@@ -21,19 +21,14 @@ pub const MAX_QUICKACKS: u32 = 16;
 /// Smallest rcv_mss estimate (Linux TCP_MIN_MSS)
 const MIN_MSS: u32 = 88;
 
-/// Delayed ACK state (Linux inet_connection_sock.icsk_ack)
+/// Delayed ACK state (Linux inet_connection_sock.icsk_ack); `quick`,
+/// `pingpong` and `ato`, which /proc/net/tcp reads, are in `cb::Live`
 #[derive(Clone, Debug, Default)]
 pub struct Dack {
     /// An ACK is owed for received data
     pub pending: bool,
     /// A segment shorter than `rcv_mss` arrived since the last ACK
     pub pushed: bool,
-    /// ACKs left to send at once (quickack mode)
-    pub quick: u32,
-    /// Interactive: replies follow data, ACKs ride on them
-    pub pingpong: bool,
-    /// Adaptive delay (ms; 0 until data arrives)
-    pub ato: u64,
     /// When data last arrived
     pub lrcvtime: u64,
     /// Estimated peer MSS
@@ -53,18 +48,18 @@ impl TcpCb {
     /// Linux tcp_incr_quickack
     fn incr_quickack(&mut self, max: u32) {
         let q = (self.rcv_wnd() / (2 * self.dack.rcv_mss.max(1))).max(2);
-        self.dack.quick = self.dack.quick.max(q.min(max));
+        self.live.quick.set(self.live.quick.get().max(q.min(max)));
     }
 
     /// Linux tcp_enter_quickack_mode
     pub(super) fn enter_quickack(&mut self) {
         self.incr_quickack(MAX_QUICKACKS);
-        self.dack.pingpong = false;
-        self.dack.ato = ATO_MIN;
+        self.live.pingpong.set(false);
+        self.live.ato.set(ATO_MIN);
     }
 
     fn in_quickack(&self) -> bool {
-        self.dack.quick > 0 && !self.dack.pingpong
+        self.live.quick.get() > 0 && !self.live.pingpong.get()
     }
 
     /// In-order data of `len` bytes arrived (Linux tcp_event_data_recv +
@@ -76,18 +71,19 @@ impl TcpCb {
         } else {
             self.dack.pushed = true;
         }
-        let d = &mut self.dack;
-        if d.ato == 0 {
+        let ato = self.live.ato.get();
+        let rto = self.live.rto.get();
+        if ato == 0 {
             // The first data: start in quickack mode
-            d.ato = ATO_MIN;
+            self.live.ato.set(ATO_MIN);
             self.incr_quickack(MAX_QUICKACKS);
         } else {
-            let m = now.saturating_sub(d.lrcvtime);
+            let m = now.saturating_sub(self.dack.lrcvtime);
             if m <= ATO_MIN / 2 {
-                d.ato = d.ato / 2 + ATO_MIN / 2;
-            } else if m < d.ato {
-                d.ato = (d.ato / 2 + m).min(self.rto);
-            } else if m > self.rto {
+                self.live.ato.set(ato / 2 + ATO_MIN / 2);
+            } else if m < ato {
+                self.live.ato.set((ato / 2 + m).min(rto));
+            } else if m > rto {
                 // A long gap: the sender restarts, ACK quickly
                 self.incr_quickack(MAX_QUICKACKS);
             }
@@ -98,10 +94,10 @@ impl TcpCb {
 
     /// An ACK went out (Linux tcp_event_ack_sent): nothing owed any more
     pub(super) fn ack_sent(&mut self) {
-        if self.dack.quick > 0 && self.dack.pending {
-            self.dack.quick -= 1;
-            if self.dack.quick == 0 {
-                self.dack.ato = ATO_MIN;
+        if self.live.quick.get() > 0 && self.dack.pending {
+            self.live.quick.set(self.live.quick.get() - 1);
+            if self.live.quick.get() == 0 {
+                self.live.ato.set(ATO_MIN);
             }
         }
         self.dack.pending = false;
@@ -115,8 +111,9 @@ impl TcpCb {
     /// within the ATO of the last data received makes the connection
     /// interactive
     pub(super) fn data_sent(&mut self, now: u64) {
-        if self.dack.ato != 0 && now.saturating_sub(self.dack.lrcvtime) < self.dack.ato {
-            self.dack.pingpong = true;
+        if self.live.ato.get() != 0 && now.saturating_sub(self.dack.lrcvtime) < self.live.ato.get()
+        {
+            self.live.pingpong.set(true);
         }
     }
 
@@ -147,10 +144,10 @@ impl TcpCb {
 
     /// Arm the delayed ACK timer (Linux tcp_send_delayed_ack)
     fn delay_ack(&mut self, now: u64, out: &mut Out) {
-        let mut ato = self.dack.ato.max(ATO_MIN);
+        let mut ato = self.live.ato.get().max(ATO_MIN);
         if ato > ATO_MIN {
             let mut max = 500;
-            if self.dack.pingpong || self.dack.pushed {
+            if self.live.pingpong.get() || self.dack.pushed {
                 max = DELACK_MAX;
             }
             if self.srtt8 != 0 {
@@ -175,12 +172,14 @@ impl TcpCb {
         if !self.dack.pending || !self.state.synced() {
             return;
         }
-        if self.dack.pingpong {
+        if self.live.pingpong.get() {
             // Missed: leave interactive mode
-            self.dack.pingpong = false;
-            self.dack.ato = ATO_MIN;
+            self.live.pingpong.set(false);
+            self.live.ato.set(ATO_MIN);
         } else {
-            self.dack.ato = (self.dack.ato << 1).min(self.rto);
+            self.live
+                .ato
+                .set((self.live.ato.get() << 1).min(self.live.rto.get()));
         }
         self.send_ack(out);
         self.net_stat(crate::net::mib::LINUX_MIB_DELAYEDACKS);
@@ -191,20 +190,20 @@ impl TcpCb {
     /// after the ACK) enters it
     pub fn set_quickack(&mut self, val: i32, out: &mut Out) {
         if val == 0 {
-            self.dack.pingpong = true;
+            self.live.pingpong.set(true);
             return;
         }
-        self.dack.pingpong = false;
+        self.live.pingpong.set(false);
         if matches!(self.state, TcpState::Established | TcpState::CloseWait) && self.dack.pending {
             self.send_ack(out);
             if val & 1 == 0 {
-                self.dack.pingpong = true;
+                self.live.pingpong.set(true);
             }
         }
     }
 
     /// TCP_QUICKACK as read back: not interactive
     pub fn quickack(&self) -> bool {
-        !self.dack.pingpong
+        !self.live.pingpong.get()
     }
 }

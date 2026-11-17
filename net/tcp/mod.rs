@@ -30,9 +30,10 @@
 //! two CPUs never reorder one connection's segments), the error and
 //! shutdown bits and the lockless view (`Snap`: state, queue sizes,
 //! writability, send window edges, Linux's READ_ONCE fields that
-//! tcp_poll, the waits and tcp_v4_err read; /proc/net/tcp reads the
-//! live block under `slock`, an owned socket's view as its owner took
-//! it) are published. Wakeups,
+//! tcp_poll, the waits and tcp_v4_err read) are published. The fields
+//! /proc/net/tcp reads beyond `Snap` (timers, RTO, cwnd, ...) are the
+//! block's own `cb::Live` cells, stored where they change and read with
+//! no lock (`TcpSock.live`; Linux get_tcp4_sock's racy reads). Wakeups,
 //! SIGIO included, run in the step: from the owner, or under `slock`
 //! (unowned input, timers and errors; `release_cb`), as Linux. Transmitting never re-enters a socket lock: `lo`
 //! queues to the receive backlog and `netif_rx_flush_local` runs only
@@ -62,14 +63,12 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use crate::net::sock_lock::{BhGuard, SockGuard, SockHooks, SockLock};
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::Relock;
-use crate::util::kalloc::try_arc_cyclic;
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 
 use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;
@@ -205,54 +204,6 @@ struct Snap {
     /// Linux snd_una / snd_nxt (the ICMP error sequence check)
     snd_una: AtomicU32,
     snd_max: AtomicU32,
-    /// /proc/net/tcp's view of an owned socket: stored as an owner takes
-    /// it (`lock_sock`), read by /proc while owned (an unowned socket's
-    /// line is made from the live block under `slock`); a reader never
-    /// waits for an owner, which may sleep for long (Linux reads the
-    /// live fields racily)
-    proc: ProcSnap,
-}
-
-/// `info::ProcView` as atomics, plus the queue sizes it goes with
-#[derive(Default)]
-struct ProcSnap {
-    tr: AtomicU8,
-    when: AtomicU64,
-    backoff: AtomicU32,
-    probes: AtomicU32,
-    rto: AtomicU64,
-    ato: AtomicU64,
-    qp: AtomicU32,
-    cwnd: AtomicU32,
-    last: AtomicI64,
-}
-
-impl ProcSnap {
-    fn store(&self, v: &info::ProcView) {
-        self.tr.store(v.tr, Ordering::Relaxed);
-        self.when.store(v.when, Ordering::Relaxed);
-        self.backoff.store(v.backoff, Ordering::Relaxed);
-        self.probes.store(v.probes, Ordering::Relaxed);
-        self.rto.store(v.rto, Ordering::Relaxed);
-        self.ato.store(v.ato, Ordering::Relaxed);
-        self.qp.store(v.qp, Ordering::Relaxed);
-        self.cwnd.store(v.cwnd, Ordering::Relaxed);
-        self.last.store(v.last, Ordering::Relaxed);
-    }
-
-    fn load(&self) -> info::ProcView {
-        info::ProcView {
-            tr: self.tr.load(Ordering::Relaxed),
-            when: self.when.load(Ordering::Relaxed),
-            backoff: self.backoff.load(Ordering::Relaxed),
-            probes: self.probes.load(Ordering::Relaxed),
-            rto: self.rto.load(Ordering::Relaxed),
-            ato: self.ato.load(Ordering::Relaxed),
-            qp: self.qp.load(Ordering::Relaxed),
-            cwnd: self.cwnd.load(Ordering::Relaxed),
-            last: self.last.load(Ordering::Relaxed),
-        }
-    }
 }
 
 impl Snap {
@@ -275,6 +226,9 @@ pub struct TcpSock {
     lock: SockLock<Inner>,
     queue: Mutex<Option<Accept>>,
     snap: Snap,
+    /// Its control block's fields /proc/net/tcp reads with no lock
+    /// (`cb::Live`, shared with the block)
+    live: Arc<cb::Live>,
     /// MTU of an ICMP frag needed met while owned (Linux tp->mtu_info)
     mtu_info: AtomicU32,
     /// errno of another ICMP error met while owned (Linux sk_err_soft)
@@ -417,7 +371,8 @@ fn route_mss(net: &NetNamespace, daddr: Ipv4Addr, saddr: Ipv4Addr, oif: u32) -> 
 
 impl TcpSock {
     pub fn new(sk: Sock) -> Result<Arc<Self>, KernelError> {
-        let mut cb = TcpCb::new(cfg(&sk.net));
+        let live = try_arc(cb::Live::default())?;
+        let mut cb = TcpCb::new(cfg(&sk.net), live.clone());
         cb.mib = Some(Arc::clone(&sk.net.mib));
         cb.opts.ca = sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
         let snap = Snap::default();
@@ -436,6 +391,7 @@ impl TcpSock {
             }),
             queue: Mutex::new(None),
             snap,
+            live,
             mtu_info: AtomicU32::new(0),
             err_soft: AtomicI32::new(0),
             timers: [
@@ -465,8 +421,6 @@ impl TcpSock {
     fn lock_sock(&self) -> Guard<'_> {
         let mut g = self.lock.lock(self);
         self.sync_caps(&mut g);
-        // What /proc shows while it is owned
-        self.snap.proc.store(&info::ProcView::of(&g.cb));
         g
     }
 
@@ -981,7 +935,7 @@ impl TcpSock {
         if opts.syncnt != 0 {
             kc.synack_retries = opts.syncnt;
         }
-        let mut cb = TcpCb::new(kc);
+        let mut cb = TcpCb::new(kc, Arc::clone(&c.live));
         cb.mib = Some(Arc::clone(&self.sk.net.mib));
         cb.opts = opts;
         (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = caps;
@@ -1111,7 +1065,7 @@ impl TcpSock {
             self.sk.store_err(0);
             let mut c = cfg(&self.sk.net);
             c.syn_retries = self.syncnt(&g.cb.opts);
-            let mut cb = TcpCb::new(c);
+            let mut cb = TcpCb::new(c, Arc::clone(&self.live));
             cb.mib = Some(Arc::clone(&self.sk.net.mib));
             cb.opts = g.cb.opts;
             (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = (g.cb.rcv_cap, g.cb.snd_cap, g.cb.rcv_locked);
@@ -2276,7 +2230,9 @@ impl TcpSock {
                     if val < 0 || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen) {
                         return bad();
                     }
-                    g.cb.opts.fastopen = (val as u32).min(self.sk.net.sysctl.somaxconn());
+                    g.cb.live
+                        .fastopen
+                        .set((val as u32).min(self.sk.net.sysctl.somaxconn()));
                 }
                 TCP_NOTSENT_LOWAT => {
                     g.cb.opts.notsent_lowat = val as u32;
@@ -2324,7 +2280,7 @@ impl TcpSock {
                 } else if closed {
                     cb::MSS_DEFAULT
                 } else {
-                    g.cb.mss
+                    g.cb.live.mss.get()
                 }
             }
             TCP_NODELAY => u32::from(o.nodelay),
@@ -2336,7 +2292,7 @@ impl TcpSock {
             TCP_SYNCNT => self.syncnt(o),
             TCP_USER_TIMEOUT => o.user_timeout,
             TCP_DEFER_ACCEPT => info::retrans_to_secs(o.defer_accept),
-            TCP_FASTOPEN => o.fastopen,
+            TCP_FASTOPEN => g.cb.live.fastopen.get(),
             TCP_NOTSENT_LOWAT => o.notsent_lowat,
             _ => return Err(KernelError::NoProtocolOption),
         };

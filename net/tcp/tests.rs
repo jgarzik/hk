@@ -135,7 +135,7 @@ fn open(iss: u32, mss: u32) -> Open {
 
 /// A passive open for `syn` with receive buffer `cap`
 fn passive(syn: &Seg, iss: u32, mss: u32, cap: usize, now: u64, out: &mut Out) -> TcpCb {
-    let mut b = TcpCb::new(cfg());
+    let mut b = TcpCb::new(cfg(), Default::default());
     b.rcv_cap = cap;
     b.passive_in(&seg_in(syn), open(iss, mss), now, out);
     b
@@ -198,13 +198,13 @@ impl Pair {
     /// Same, with a's and b's knobs
     fn with_cfgs(mss: u32, cap: usize, ca: Cfg, cb: Cfg) -> Self {
         let mut p = Self::bare();
-        p.a = TcpCb::new(ca);
+        p.a = TcpCb::new(ca, Default::default());
         let mut out = Out::default();
         p.a.connect(open(1000, mss), p.now, &mut out);
         p.take(true, out);
         let (_, syn) = p.wire.pop_front().unwrap();
         let mut out = Out::default();
-        p.b = TcpCb::new(cb);
+        p.b = TcpCb::new(cb, Default::default());
         p.b.rcv_cap = cap;
         p.b.passive_in(&seg_in(&syn), open(5000, mss), p.now, &mut out);
         p.take(false, out);
@@ -216,8 +216,8 @@ impl Pair {
 
     fn bare() -> Self {
         Self {
-            a: TcpCb::new(cfg()),
-            b: TcpCb::new(cfg()),
+            a: TcpCb::new(cfg(), Default::default()),
+            b: TcpCb::new(cfg(), Default::default()),
             now: 0,
             wire: VecDeque::new(),
             held: None,
@@ -378,7 +378,7 @@ fn handshake_options_and_isn() {
     assert!(synack.has(flags::SYN | flags::ACK));
     assert_eq!((synack.seq, synack.ack), (5000, 1001));
     // Timestamps (12 option bytes) come off the MSS
-    assert_eq!((p.a.mss, p.b.mss), (1448, 1448));
+    assert_eq!((p.a.live.mss.get(), p.b.live.mss.get()), (1448, 1448));
     assert!(p.a.ts_ok && p.b.ts_ok && p.a.wscale_ok && p.b.wscale_ok);
     assert_eq!(syn.ws, Some(p.a.rcv_wscale));
     assert_eq!(synack.ws, Some(p.b.rcv_wscale));
@@ -393,7 +393,7 @@ fn handshake_options_and_isn() {
 
 #[test]
 fn mss_default_without_option() {
-    let mut a = TcpCb::new(cfg());
+    let mut a = TcpCb::new(cfg(), Default::default());
     let mut out = Out::default();
     a.connect(open(1, 1460), 0, &mut out);
     let synack = SegIn {
@@ -406,7 +406,7 @@ fn mss_default_without_option() {
     let mut out = Out::default();
     a.feed(&synack, 5, &mut out);
     assert_eq!(a.state, TcpState::Established);
-    assert_eq!(a.mss, MSS_DEFAULT);
+    assert_eq!(a.live.mss.get(), MSS_DEFAULT);
     assert!(out.established);
 }
 
@@ -791,7 +791,7 @@ fn rst_rules_rfc5961() {
 
 #[test]
 fn syn_sent_refused_and_bad_ack() {
-    let mut a = TcpCb::new(cfg());
+    let mut a = TcpCb::new(cfg(), Default::default());
     let mut out = Out::default();
     a.connect(open(500, 1460), 0, &mut out);
     // An ACK for something else: RST from its ACK, still SYN_SENT
@@ -938,7 +938,7 @@ fn orphan_fin_wait2_times_out() {
 
 #[test]
 fn duplicate_syn_resends_synack() {
-    let mut a = TcpCb::new(cfg());
+    let mut a = TcpCb::new(cfg(), Default::default());
     let mut out = Out::default();
     a.connect(open(10, 1460), 0, &mut out);
     let syn = wire(&out)[0].clone();
@@ -968,7 +968,7 @@ fn duplicate_syn_resends_synack() {
 
 #[test]
 fn new_syn_resets_request() {
-    let mut a = TcpCb::new(cfg());
+    let mut a = TcpCb::new(cfg(), Default::default());
     let mut out = Out::default();
     a.connect(open(10, 1460), 0, &mut out);
     let syn = wire(&out)[0].clone();
@@ -994,7 +994,7 @@ fn synack_retries_then_give_up() {
     let mut out = Out::default();
     p.b = passive(&syn, 2, 1460, BUFS.0, 0, &mut out);
     p.filter = drop_all;
-    p.a = TcpCb::new(cfg());
+    p.a = TcpCb::new(cfg(), Default::default());
     p.until(|p| p.b.state == TcpState::Closed, 20);
     let times: Vec<u64> = p.log.iter().filter(|l| !l.1).map(|l| l.0).collect();
     assert_eq!(times, [1000, 3000]);
@@ -1003,7 +1003,7 @@ fn synack_retries_then_give_up() {
 
 #[test]
 fn ack_with_data_completes_handshake() {
-    let mut a = TcpCb::new(cfg());
+    let mut a = TcpCb::new(cfg(), Default::default());
     let mut out = Out::default();
     a.connect(open(10, 1460), 0, &mut out);
     let syn = wire(&out)[0].clone();
@@ -1035,7 +1035,7 @@ fn fast_retransmit_on_dupacks() {
         }
     }
     p.filter = drop_second;
-    p.a.cong.cwnd = 20_000;
+    p.a.live.cwnd.set(20_000);
     p.send_a(&pattern(10_000));
     let t = p.now;
     p.run();
@@ -1052,7 +1052,7 @@ fn pmtu_shrinks_segments() {
     p.send_a(&pattern(3000));
     let mut out = Out::default();
     p.a.pmtu(576, p.now, &mut out);
-    assert_eq!(p.a.mss, 524);
+    assert_eq!(p.a.live.mss.get(), 524);
     assert!(!wire(&out).is_empty());
     assert!(wire(&out).iter().all(|s| s.data.len() <= 524));
 }
@@ -1328,7 +1328,7 @@ fn peer_without_wscale_or_ts() {
     for c in [&p.a, &p.b] {
         assert!(!c.wscale_ok && !c.ts_ok);
         assert_eq!((c.snd_wscale, c.rcv_wscale), (0, 0));
-        assert_eq!(c.mss, 1460);
+        assert_eq!(c.live.mss.get(), 1460);
     }
     // Windows stay below 64 KB, data flows, no options on the wire
     let data = pattern(150_000);
@@ -1358,15 +1358,15 @@ fn wscale_opens_large_window() {
     let ack = p.log.iter().rev().find(|l| !l.1).unwrap().2.clone();
     assert_eq!((ack.wnd as u32) << 7, p.a.snd_wnd);
     // ... and more than 64 KB can be in flight
-    p.a.cong.cwnd = 1 << 20;
+    p.a.live.cwnd.set(1 << 20);
     p.filter = drop_all;
     p.send_a(&data[400_000..]);
     assert!(p.a.snd_max.wrapping_sub(p.a.snd_una) > 65535);
     // The locked buffer picks its own scale (Linux SOCK_RCVBUF_LOCK)
-    let mut b = TcpCb::new(cfg());
+    let mut b = TcpCb::new(cfg(), Default::default());
     b.rcv_cap = 4096;
     b.rcv_locked = true;
-    let mut a = TcpCb::new(cfg());
+    let mut a = TcpCb::new(cfg(), Default::default());
     let mut out = Out::default();
     a.connect(open(1, 1460), 0, &mut out);
     let mut o2 = Out::default();
@@ -1454,8 +1454,8 @@ fn ts_recent_follows_last_ack_sent() {
     // TS.Recent is taken only from segments at or before Last.ACK.sent:
     // with ACKs delayed it echoes the earliest unacknowledged segment
     let mut p = Pair::new(1000);
-    p.b.dack.quick = 0;
-    p.b.dack.ato = 40;
+    p.b.live.quick.set(0);
+    p.b.live.ato.set(40);
     p.send_a(&pattern(500));
     let first = p.log.last().unwrap().2.ts.unwrap().0;
     p.step();
@@ -1478,9 +1478,9 @@ fn delayed_ack_timing() {
     p.send_a(&pattern(100));
     p.run();
     assert_eq!(p.a.snd_una, p.a.snd_max);
-    assert!(p.b.dack.quick > 0);
+    assert!(p.b.live.quick.get() > 0);
     // Leave quickack mode: a lone small segment waits for the ATO
-    p.b.dack.quick = 0;
+    p.b.live.quick.set(0);
     let t = p.now;
     p.send_a(&pattern(100));
     p.run();
@@ -1494,9 +1494,9 @@ fn delayed_ack_timing() {
     // by the reader making room (Linux tcp_cleanup_rbuf), or on arrival
     // if the right edge advances by what arrived
     p.read_b(1 << 20);
-    p.b.dack.quick = 0;
+    p.b.live.quick.set(0);
     p.log.clear();
-    let mss = p.a.mss as usize;
+    let mss = p.a.live.mss.get() as usize;
     p.send_a(&pattern(2 * mss));
     p.step();
     assert!(p.wire.len() == 1, "first segment: ACK delayed");
@@ -1507,7 +1507,7 @@ fn delayed_ack_timing() {
     let acks = p.log.iter().filter(|l| !l.1).count();
     assert_eq!(acks, 1, "one ACK for two segments");
     // A reply carries the ACK (no separate pure ACK)
-    p.b.dack.quick = 0;
+    p.b.live.quick.set(0);
     p.send_a(&pattern(10));
     p.run();
     p.log.clear();
@@ -1540,7 +1540,7 @@ fn quickack_option() {
 #[test]
 fn nagle_coalesces_small_writes() {
     let mut p = Pair::new(1000);
-    p.b.dack.quick = 0;
+    p.b.live.quick.set(0);
     p.b.set_quickack(0, &mut Out::default());
     p.log.clear();
     // The first small write goes out; the next ones wait for its ACK
@@ -1580,7 +1580,7 @@ fn nagle_coalesces_small_writes() {
 #[test]
 fn cork_holds_partial_segments() {
     let mut p = Pair::new(1000);
-    let m = p.a.mss as usize;
+    let m = p.a.live.mss.get() as usize;
     p.a.opts.cork = true;
     p.log.clear();
     let t = p.now;
@@ -1621,8 +1621,8 @@ fn cork_holds_partial_segments() {
 #[test]
 fn iw10_slow_start_growth() {
     let mut p = Pair::new(1000);
-    let mss = p.a.mss as usize;
-    assert_eq!(p.a.cong.cwnd as usize, 10 * mss);
+    let mss = p.a.live.mss.get() as usize;
+    assert_eq!(p.a.cong.cwnd() as usize, 10 * mss);
     p.filter = drop_all;
     p.log.clear();
     p.send_a(&pattern(100_000));
@@ -1641,12 +1641,12 @@ fn iw10_slow_start_growth() {
     }
     assert!(rounds[1] >= 16, "rounds {:?}", rounds);
     // Congestion avoidance: about one segment per window
-    let mut c = p.a.cong.clone();
-    c.ssthresh = c.cwnd;
-    let w = c.cwnd;
+    let mut c = p.a.cong.dup();
+    c.live.ssthresh.set(c.cwnd());
+    let w = c.cwnd();
     c.on_sent(w, 0, 1, true);
     c.on_ack(w, 2);
-    assert_eq!(c.cwnd, w + mss as u32);
+    assert_eq!(c.cwnd(), w + mss as u32);
 }
 
 #[test]
@@ -1691,7 +1691,7 @@ fn keepalive_waits_for_idle() {
     p.log.clear();
     // At 10 s it finds 4 s idle and waits 6 s more
     p.tick();
-    assert_eq!((p.now, p.a.keep_at), (10_000, Some(16_000)));
+    assert_eq!((p.now, p.a.live.keep_at.get()), (10_000, Some(16_000)));
     p.tick();
     assert_eq!(p.now, 16_000);
     let probes = p
@@ -1702,7 +1702,7 @@ fn keepalive_waits_for_idle() {
     assert_eq!(probes, 1);
     // Off: no timer
     p.a.set_keepalive(false, p.now);
-    assert!(p.a.keep_at.is_none());
+    assert!(p.a.live.keep_at.get().is_none());
 }
 
 #[test]
@@ -2028,7 +2028,7 @@ fn mib_retransmit() {
 fn mib_refused() {
     use crate::net::mib::*;
     let m = crate::net::mib::NetMib::new().unwrap();
-    let mut a = TcpCb::new(cfg());
+    let mut a = TcpCb::new(cfg(), Default::default());
     a.mib = Some(m.clone());
     let mut out = Out::default();
     a.connect(open(1000, 1460), 0, &mut out);

@@ -120,9 +120,9 @@ impl TcpCb {
             self.set_rto_fallback();
         }
         self.rtt_seq = None;
-        self.backoff = 0;
+        self.live.backoff.set(0);
         self.rtx_stamp = None;
-        self.tmr = None;
+        self.live.tmr.set(None);
         self.rcv_tstamp = now;
         self.arm_keepalive(now);
         out.established = true;
@@ -153,7 +153,7 @@ impl TcpCb {
             return false;
         }
         // A reordered pure duplicate ACK within the replay window passes
-        let replay = (self.rto * 6 / 5) as i32;
+        let replay = (self.live.rto.get() * 6 / 5) as i32;
         let disordered = s.has(flags::ACK)
             && s.seq_len() == 0
             && s.seq == self.rcv_nxt
@@ -414,7 +414,7 @@ impl TcpCb {
         match self.state {
             TcpState::FinWait1 => {
                 self.set_state(TcpState::FinWait2);
-                self.tmr = None;
+                self.live.tmr.set(None);
                 self.arm_fw2(now);
                 out.wake |= wake::STATE;
                 true
@@ -461,7 +461,7 @@ impl TcpCb {
         // never TCPHPAcks)
         self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
         self.update_ts_recent(s);
-        self.probes = 0;
+        self.live.probes.set(0);
         self.rcv_tstamp = now;
         let old_wnd = self.snd_wnd;
         let wnd = self.seg_wnd(s);
@@ -487,9 +487,12 @@ impl TcpCb {
             self.snd_wl1 = s.seq;
             self.snd_wl2 = ack;
             self.max_wnd = self.max_wnd.max(self.snd_wnd);
-            if old_wnd == 0 && self.snd_wnd > 0 && self.tmr.is_some_and(|t| t.0 == Tmr::Probe) {
-                self.tmr = None;
-                self.backoff = 0;
+            if old_wnd == 0
+                && self.snd_wnd > 0
+                && self.live.tmr.get().is_some_and(|t| t.0 == Tmr::Probe)
+            {
+                self.live.tmr.set(None);
+                self.live.backoff.set(0);
                 self.rtx_stamp = None;
                 out.wake |= wake::SPACE;
             }
@@ -525,7 +528,7 @@ impl TcpCb {
             self.fast_retransmit(out);
         }
         if self.snd_una == self.snd_max {
-            self.tmr = None;
+            self.live.tmr.set(None);
         } else {
             self.arm_rtx(now);
         }
@@ -571,7 +574,7 @@ impl TcpCb {
                 }
                 self.ack_now = true;
                 if fin && self.state == TcpState::TimeWait {
-                    self.wait_at = Some(now + TIMEWAIT_LEN);
+                    self.live.wait_at.set(Some(now + TIMEWAIT_LEN));
                 }
                 return;
             }
