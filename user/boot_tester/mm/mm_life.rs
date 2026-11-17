@@ -6,9 +6,10 @@ use crate::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE,
     O_RDONLY, P_PID, PROT_NONE, PROT_READ, PROT_WRITE, SigInfo, Timespec, WEXITED, Zeroable,
-    sys_clone, sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_madvise, sys_mincore,
-    sys_mmap, sys_mprotect, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read,
-    sys_sched_yield, sys_vfork, sys_wait4, sys_waitid,
+    sys_clone, sys_close, sys_execve, sys_exit, sys_fork, sys_getcpu, sys_kill, sys_madvise,
+    sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_munmap, sys_nanosleep, sys_open,
+    sys_pread64, sys_read, sys_sched_getaffinity, sys_sched_setaffinity, sys_sched_yield,
+    sys_vfork, sys_wait4, sys_waitid,
 };
 
 const CLONE_THREAD: u64 = 0x0001_0000;
@@ -693,15 +694,33 @@ impl Slabs {
 fn fork_exec_objects() {
     const NAME: &[u8] = b"MM_LIFE_FORK_EXEC_OBJS";
     const N: i64 = 1000;
+    // One CPU for the parent and every child (affinity is inherited):
+    // only that CPU's per-CPU caches park objects, so the noise stays
+    // that of one CPU however many there are
+    let mut orig = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&orig), orig.as_mut_ptr());
+    let mut cpu = 0u32;
+    let pinned = len > 0 && sys_getcpu(&mut cpu, core::ptr::null_mut()) >= 0 && {
+        let mut one = [0u64; 16];
+        one[(cpu / 64) as usize % 16] = 1 << (cpu % 64);
+        sys_sched_setaffinity(0, core::mem::size_of_val(&one), one.as_ptr()) == 0
+    };
+    fork_exec_objects_on(NAME, N);
+    if pinned {
+        sys_sched_setaffinity(0, len as usize, orig.as_ptr());
+    }
+}
+
+fn fork_exec_objects_on(name: &[u8], n: i64) {
     for _ in 0..20 {
         fork_exec();
     }
     settle();
     let d0 = live_dentries();
     let s0 = Slabs::read();
-    for _ in 0..N {
+    for _ in 0..n {
         if !fork_exec() {
-            verdict_detail(NAME, false, -2);
+            verdict_detail(name, false, -2);
             return;
         }
     }
@@ -715,13 +734,13 @@ fn fork_exec_objects() {
         d1 = live_dentries();
         s1 = Slabs::read();
         g = s1.grown(&s0);
-        ok = d0 > 0 && s0.n > 0 && d1 - d0 <= 5 && g.1 < N / 2;
+        ok = d0 > 0 && s0.n > 0 && d1 - d0 <= 5 && g.1 < n / 2;
         if ok {
             break;
         }
     }
     if !ok {
-        print(NAME);
+        print(name);
         print(b": dentries ");
         print_num(d0);
         print(b" -> ");
@@ -733,10 +752,10 @@ fn fork_exec_objects() {
         print(b" +");
         print_num(g.1);
         print(b" objects over ");
-        print_num(N);
+        print_num(n);
         println(b" fork+exec");
     }
-    verdict_detail(NAME, ok, g.1);
+    verdict_detail(name, ok, g.1);
 }
 
 /// Two 2MB-aligned MADV_HUGEPAGE pages are touched (2MB pages where
