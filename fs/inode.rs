@@ -252,6 +252,13 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
+    /// chown set the owner (`uid`) and/or the group (`gid`), under
+    /// i_rwsem (Linux ->setattr seeing ATTR_UID / ATTR_GID: tracefs
+    /// pins them). Default nothing.
+    fn setattr_ids(&self, inode: &Inode, uid: bool, gid: bool) {
+        let _ = (inode, uid, gid);
+    }
+
     /// A new regular file of `dir`'s file system with no name (nlink 0)
     /// for O_TMPFILE (Linux ->tmpfile); default EOPNOTSUPP
     fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<InodeRef, KernelError> {

@@ -3335,6 +3335,13 @@ directory's children list under its d_lock, one entry at a time, under
 the getdents shared `i_rwsem`. `PinnedFs` (a filesystem's kernel mount
 and hold count; Linux pin_fs_lock) is a spin leaf: the mount is made
 and put with it released.
+tracefs's mount options (`FsInfo`, Linux tracefs_fs_info) are a spin
+leaf, replaced by a mount or remount and read by show_options; the
+owner an inode takes from the root (Linux set_tracefs_inode_owner) is
+written with no lock, by permission (an RCU walk's too) and getattr,
+from the root's ids and the inode's PERM_SET flags (atomics, as Linux
+writes i_uid there); a uid=/gid= remount walks the superblock's inodes
+(`for_each_sb_inode`, Linux the tracefs_inodes RCU list) setting them.
 
 #### kernfs / sysfs (fs/kernfs/, fs/kernfs/sysfs.rs; Linux fs/kernfs)
 

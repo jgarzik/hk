@@ -21,15 +21,18 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::dentry::{Dentry, DentryOps, DentryRef};
 use crate::fs::file::{DirContext, File, FileOps, RwFlags};
-use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, InodeOps, InodeRef};
+use crate::fs::inode::{AsAny, Inode, InodeAttr, InodeData, InodeMode, InodeOps, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::kernfs::sysfs;
 use crate::fs::libfs::{self, PinnedFs};
 use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
+use crate::sync::spin::Mutex as SpinMutex;
+use crate::task::Cred;
 use crate::util::kalloc::try_arc;
 
 /// Linux TRACEFS_MAGIC
@@ -55,23 +58,54 @@ pub trait TraceFops: Send + Sync {
     fn write(&self, from: &mut IovSource<'_>, pos: &mut u64) -> Result<usize, KernelError>;
 }
 
-/// A file's inode data: its operations (Linux i_fop, i_private)
-struct TracefsFile(Arc<dyn TraceFops>);
+/// chown set the inode's owner, which then no longer follows the
+/// root's (Linux TRACEFS_UID_PERM_SET)
+const UID_PERM_SET: u32 = 1 << 0;
+/// The same for its group (Linux TRACEFS_GID_PERM_SET)
+const GID_PERM_SET: u32 = 1 << 1;
 
-impl AsAny for TracefsFile {
+/// An inode's tracefs data (Linux tracefs_inode): a file's operations
+/// (i_fop, i_private), the root whose owner it takes (ti->private; None
+/// for the root itself), the PERM_SET flags. RCU-readable
+/// (`Inode::private_rcu`), so a permission check in an RCU walk reads
+/// it.
+struct TracefsInode {
+    fops: Option<Arc<dyn TraceFops>>,
+    root: Option<InodeRef>,
+    flags: AtomicU32,
+}
+
+impl AsAny for TracefsInode {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
 }
 
-impl InodeData for TracefsFile {}
+impl InodeData for TracefsInode {}
+
+/// The tracefs data of `inode`
+fn ti(inode: &Inode) -> Option<&TracefsInode> {
+    inode.private_rcu()?.as_any().downcast_ref::<TracefsInode>()
+}
 
 /// The operations of an open file's inode; None for a directory
 fn fops(file: &File) -> Option<Arc<dyn TraceFops>> {
-    let p = file.get_inode()?.get_private()?;
-    p.as_any()
-        .downcast_ref::<TracefsFile>()
-        .map(|f| f.0.clone())
+    ti(&*file.get_inode()?)?.fops.clone()
+}
+
+/// Linux set_tracefs_inode_owner: an inode whose owner or group chown
+/// never set takes the root's (no instances here: the root is the
+/// mount's)
+fn set_owner(inode: &Inode) {
+    let Some(t) = ti(inode) else { return };
+    let Some(root) = &t.root else { return };
+    let flags = t.flags.load(Ordering::Acquire);
+    if flags & UID_PERM_SET == 0 {
+        inode.set_uid(root.uid());
+    }
+    if flags & GID_PERM_SET == 0 {
+        inode.set_gid(root.gid());
+    }
 }
 
 /// Linux tracefs_dir_inode_operations and tracefs_file_inode_operations
@@ -83,6 +117,26 @@ impl InodeOps for TracefsIops {
     fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
         Err(KernelError::NotFound)
     }
+
+    /// Linux tracefs_permission: the owner brought up to date, then
+    /// generic_permission (an RCU walk's too: atomics only)
+    fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+        set_owner(inode);
+        crate::fs::dac::generic_permission(cred, inode, mask)
+    }
+
+    /// Linux tracefs_getattr
+    fn getattr(&self, inode: &Inode) -> InodeAttr {
+        set_owner(inode);
+        crate::fs::inode::generic_fillattr(inode)
+    }
+
+    /// Linux tracefs_setattr: ATTR_UID / ATTR_GID pin the inode's own
+    fn setattr_ids(&self, inode: &Inode, uid: bool, gid: bool) {
+        let Some(t) = ti(inode) else { return };
+        let f = if uid { UID_PERM_SET } else { 0 } | if gid { GID_PERM_SET } else { 0 };
+        t.flags.fetch_or(f, Ordering::AcqRel);
+    }
 }
 
 static TRACEFS_IOPS: TracefsIops = TracefsIops;
@@ -93,11 +147,13 @@ fn new_inode(
     sb: Weak<SuperBlock>,
     ino: u64,
     mode: InodeMode,
-    uid: u32,
-    gid: u32,
+    (uid, gid): (u32, u32),
+    (fops, root): (Option<Arc<dyn TraceFops>>, Option<InodeRef>),
 ) -> Result<InodeRef, KernelError> {
     let now = crate::time::TIMEKEEPER.current_time();
     let i = Inode::alloc(Inode::new(ino, mode, uid, gid, 0, now, sb, &TRACEFS_IOPS))?;
+    let flags = AtomicU32::new(0);
+    i.set_private_rcu(try_arc(TracefsInode { fops, root, flags })?);
     // Directory inodes start with 2 links, for "." (Linux inc_nlink)
     if mode.is_dir() {
         i.inc_nlink();
@@ -107,7 +163,8 @@ fn new_inode(
 
 /// `name` in `parent`, a file with operations `f` or a directory
 /// (Linux tracefs_create_file / __create_dir from
-/// tracefs_start_creating's dentry on): owned like its directory
+/// tracefs_start_creating's dentry on): owned like its directory, its
+/// owner following the root's (instance_inode)
 fn create(
     parent: &DentryRef,
     name: &[u8],
@@ -116,10 +173,13 @@ fn create(
 ) -> Result<DentryRef, KernelError> {
     libfs::simple_create(parent, name, |dir| {
         let ino = crate::fs::anon_inodes::get_next_ino();
-        let i = new_inode((*dir.sb).clone(), ino, mode, dir.uid(), dir.gid())?;
-        if let Some(f) = f {
-            i.set_private(try_arc(TracefsFile(f))?);
-        }
+        // The root: the directory's, or the directory itself
+        let root = match ti(dir).and_then(|t| t.root.clone()) {
+            Some(r) => r,
+            None => Inode::igrab(dir).ok_or(KernelError::NotFound)?,
+        };
+        let ids = (dir.uid(), dir.gid());
+        let i = new_inode((*dir.sb).clone(), ino, mode, ids, (f, Some(root)))?;
         if mode.is_dir() {
             dir.inc_nlink();
         }
@@ -275,41 +335,90 @@ impl SuperOps for TracefsSops {
     /// option is EINVAL (vfs_parse_fs_param: "Unknown parameter")
     fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
         let o = parse_opts(data)?;
-        let root = sb
-            .get_root()
-            .and_then(|r| r.get_inode())
-            .ok_or(KernelError::Io)?;
-        if let Some(m) = o.mode {
-            root.set_mode_perm(m);
-        }
-        if let Some(u) = o.uid {
-            root.set_uid(u);
-        }
-        if let Some(g) = o.gid {
-            root.set_gid(g);
-        }
-        Ok(())
+        // tracefs_reconfigure: the superblock's options are the new ones,
+        // all of them (structure copy), then those given applied
+        let new = (
+            o.uid.unwrap_or(0),
+            o.gid.unwrap_or(0),
+            o.mode.unwrap_or(TRACEFS_DEFAULT_MODE),
+        );
+        with_fsi(sb, |f| *f.0.lock() = new);
+        apply_options(sb, &o)
     }
 
     /// Linux tracefs_show_options: uid, gid when not 0, mode when not
     /// the default
     fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
-        let Some(root) = sb.get_root().and_then(|r| r.get_inode()) else {
+        let Some((uid, gid, mode)) = with_fsi(sb, |f| *f.0.lock()) else {
             return;
         };
         let mut s = alloc::string::String::new();
-        if root.uid() != 0 {
-            let _ = write!(s, ",uid={}", root.uid());
+        if uid != 0 {
+            let _ = write!(s, ",uid={uid}");
         }
-        if root.gid() != 0 {
-            let _ = write!(s, ",gid={}", root.gid());
+        if gid != 0 {
+            let _ = write!(s, ",gid={gid}");
         }
-        let mode = root.mode().perm();
         if mode != TRACEFS_DEFAULT_MODE {
             let _ = write!(s, ",mode={mode:o}");
         }
         out.extend_from_slice(s.as_bytes());
     }
+}
+
+/// The superblock's mount options (Linux tracefs_fs_info in s_fs_info:
+/// uid, gid, mode), a spin leaf: replaced by each mount or remount,
+/// read by show_options
+struct FsInfo(SpinMutex<(u32, u32, u16)>);
+
+impl AsAny for FsInfo {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+impl crate::fs::superblock::SuperBlockData for FsInfo {}
+
+/// `f` on the superblock's options
+fn with_fsi<R>(sb: &SuperBlock, f: impl FnOnce(&FsInfo) -> R) -> Option<R> {
+    let p = sb.get_private()?;
+    p.as_any().downcast_ref::<FsInfo>().map(f)
+}
+
+/// Linux tracefs_apply_options(sb, true): the root's mode, owner and
+/// group as given; a new owner or group goes to every inode, which
+/// follows the root's again (its PERM_SET flag cleared)
+fn apply_options(sb: &SuperBlock, o: &TraceOpts) -> Result<(), KernelError> {
+    let root = sb
+        .get_root()
+        .and_then(|r| r.get_inode())
+        .ok_or(KernelError::Io)?;
+    if let Some(m) = o.mode {
+        root.set_mode_perm(m);
+    }
+    if let Some(u) = o.uid {
+        root.set_uid(u);
+    }
+    if let Some(g) = o.gid {
+        root.set_gid(g);
+    }
+    if o.uid.is_none() && o.gid.is_none() {
+        return Ok(());
+    }
+    crate::fs::inode::for_each_sb_inode(sb, &mut |i| {
+        if let Some(t) = ti(i) {
+            if let Some(u) = o.uid {
+                t.flags.fetch_and(!UID_PERM_SET, Ordering::AcqRel);
+                i.set_uid(u);
+            }
+            if let Some(g) = o.gid {
+                t.flags.fetch_and(!GID_PERM_SET, Ordering::AcqRel);
+                i.set_gid(g);
+            }
+        }
+        true
+    });
+    Ok(())
 }
 
 /// tracefs's mount options (Linux tracefs_fs_info: each set if given)
@@ -368,8 +477,10 @@ fn tracefs_d_delete(_: &Dentry) -> bool {
 /// 1), then tracefs_apply_options(sb, false): the default mode
 fn fill_super(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     sb.set_d_op(&TRACEFS_DOPS);
+    let fsi = FsInfo(SpinMutex::new((0, 0, TRACEFS_DEFAULT_MODE)));
+    sb.set_private(try_arc(fsi)?);
     let mode = InodeMode::directory(TRACEFS_DEFAULT_MODE);
-    let ri = new_inode(Arc::downgrade(sb), 1, mode, 0, 0)?;
+    let ri = new_inode(Arc::downgrade(sb), 1, mode, (0, 0), (None, None))?;
     sb.set_root(DentryRef::new(Dentry::new_root(ri, Arc::downgrade(sb)))?);
     Ok(())
 }
@@ -434,7 +545,14 @@ mod tests {
     // host (EL0) test cannot read
     #[cfg_attr(target_arch = "aarch64", ignore)]
     fn create_and_remove() {
-        let ri = new_inode(Weak::new(), 1, InodeMode::directory(0o700), 0, 0).unwrap();
+        let ri = new_inode(
+            Weak::new(),
+            1,
+            InodeMode::directory(0o700),
+            (0, 0),
+            (None, None),
+        )
+        .unwrap();
         let root = DentryRef::new(Dentry::new_root(ri.clone(), Weak::new())).unwrap();
         let nop: Arc<dyn TraceFops> = Arc::new(Nop);
         let reg = InodeMode::regular(0o640);

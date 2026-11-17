@@ -21,14 +21,18 @@
 //! - TRACEFS_READDIR: getdents lists the root's `trace` (DT_REG) and
 //!   `events` (DT_DIR), and events/'s `enable` (Linux dcache_readdir;
 //!   eventfs's on Linux)
+//! - TRACEFS_OWNER: every tracefs inode takes the root's owner and
+//!   group (Linux set_tracefs_inode_owner): a mount with uid=/gid= shows
+//!   them on `trace` and `events`; one chown made sticks until a later
+//!   uid= (gid=) mount resets it (tracefs_apply_options)
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::{host_mode, linux_at_least, msleep, read_file, skip};
 use crate::proc::sysfs::each_entry;
 use hk_syscall::{
-    LinuxStatFs, O_DIRECT, O_DIRECTORY, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_close,
-    sys_mkdir, sys_mount, sys_open, sys_openat2, sys_pread64, sys_stat, sys_statfs, sys_umount2,
-    sys_write,
+    LinuxStatFs, O_DIRECT, O_DIRECTORY, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_chown,
+    sys_close, sys_mkdir, sys_mount, sys_open, sys_openat2, sys_pread64, sys_stat, sys_statfs,
+    sys_umount2, sys_write,
 };
 
 const MP: &[u8] = b"/sys/kernel/tracing\0";
@@ -53,6 +57,7 @@ pub fn run_tests() {
         skip(b"TRACEFS_OPTS", b"host kernel without tracefs");
         skip(b"TRACEFS_RESOLVE_CACHED", b"host kernel without tracefs");
         skip(b"TRACEFS_READDIR", b"host kernel without tracefs");
+        skip(b"TRACEFS_OWNER", b"host kernel without tracefs");
         return;
     }
     report_r(b"TRACEFS_TRACE", mounted(r));
@@ -64,6 +69,12 @@ pub fn run_tests() {
         report_r(b"TRACEFS_OPTS", opts());
         report_r(b"TRACEFS_RESOLVE_CACHED", cached());
         report_r(b"TRACEFS_READDIR", readdir());
+        let r = owner();
+        // Back to the defaults, for the shared superblock's later users
+        if mount_tr2(b"uid=0,gid=0\0") == 0 {
+            sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+        }
+        report_r(b"TRACEFS_OWNER", r);
         sys_umount2(MP.as_ptr(), 0);
     }
 }
@@ -314,4 +325,50 @@ fn readdir() -> R {
     lists(MP, b"trace", DT_REG)?;
     lists(MP, b"events", DT_DIR)?;
     lists(b"/sys/kernel/tracing/events\0", b"enable", DT_REG)
+}
+
+/// (uid, gid) of `p`
+fn ids(p: &[u8]) -> (u32, u32) {
+    let mut st = Stat::default();
+    sys_stat(p.as_ptr(), &mut st);
+    (st.st_uid, st.st_gid)
+}
+
+/// A second tracefs mount with `data`, unmounted again: its result
+fn remount_with(data: &[u8]) -> i64 {
+    let m = mount_tr2(data);
+    if m == 0 {
+        sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+    }
+    m
+}
+
+fn owner() -> R {
+    const EV_DIR: &[u8] = b"/sys/kernel/tracing/events\0";
+    let m = remount_with(b"uid=1,gid=2\0");
+    check(b"mount uid gid", m == 0, m)?;
+    check(
+        b"trace follows",
+        ids(TRACE) == (1, 2),
+        i64::from(ids(TRACE).0),
+    )?;
+    check(
+        b"events follows",
+        ids(EV_DIR) == (1, 2),
+        i64::from(ids(EV_DIR).0),
+    )?;
+    let c = sys_chown(TRACE.as_ptr(), 3, 4);
+    check(b"chown", c == 0, c)?;
+    check(
+        b"chown sticks",
+        ids(TRACE) == (3, 4),
+        i64::from(ids(TRACE).0),
+    )?;
+    let m = remount_with(b"uid=5\0");
+    check(b"mount uid", m == 0, m)?;
+    check(
+        b"uid reset, gid kept",
+        ids(TRACE) == (5, 4),
+        i64::from(ids(TRACE).1),
+    )
 }

@@ -682,11 +682,6 @@ waiting).
   calls (Linux d_alloc_cursor in dcache_dir_open): a position counts
   positive children from the first, so an entry removed between two
   calls shifts the later ones back by one.
-- No owner propagation: a file's uid and gid are its directory's when
-  made; Linux tracefs_permission / tracefs_getattr give each inode the
-  instance root's (or the mount root's) uid and gid unless chown set
-  its own (set_tracefs_inode_owner, TRACEFS_UID_PERM_SET), and a
-  uid=/gid= remount resets every inode (tracefs_apply_options).
 - No instances/ directory (tracefs_create_instance_dir: mkdir/rmdir of
   trace instances), so nothing removes a tracefs entry at run time.
 

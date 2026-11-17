@@ -411,6 +411,9 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
     if let Some(g) = gid {
         inode.set_gid(g);
     }
+    if uid.is_some() || gid.is_some() {
+        inode.i_op.setattr_ids(inode, uid.is_some(), gid.is_some());
+    }
     if kill != 0 {
         inode.clear_mode_bits(kill);
     }
