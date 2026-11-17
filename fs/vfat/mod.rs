@@ -189,13 +189,6 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
     with_vi(inode, |v| v.d.lock().clusters = need as u32)
 }
 
-/// The file's size changed: its entry follows at write-back (Linux
-/// mark_inode_dirty, __fat_write_inode at writeback)
-fn update_size(inode: &Inode, _sb_data: &VfatSbData) -> Result<(), KernelError> {
-    super::fs_writeback::mark_inode_dirty(inode);
-    Ok(())
-}
-
 /// Write to a vfat file (Linux fat_write_begin/end over
 /// generic_perform_write): clusters first, a gap past the old end
 /// zeroed, the data through the page cache (written back later), then
@@ -232,7 +225,9 @@ fn vfat_write(inode: &InodeRef, from: &mut IovSource<'_>, pos: u64) -> Result<us
     let n = r?;
     crate::mm::writeback::balance_dirty_pages(inode);
     if inode.get_size() != old {
-        update_size(inode, &sb_data)?;
+        // Linux fat_write_end: mark_inode_dirty; the entry follows at
+        // write-back (__fat_write_inode)
+        super::fs_writeback::mark_inode_dirty(inode);
     }
     Ok(n)
 }
@@ -277,7 +272,7 @@ fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> 
                 ..d
             },
         )?;
-        update_size(inode, sb_data)?;
+        super::fs_writeback::mark_inode_dirty(inode);
     }
     Ok(())
 }
@@ -2410,10 +2405,11 @@ impl InodeOps for VfatInodeOps {
                 let _ = write_failed(inode, &sb_data);
                 return Err(e);
             }
-            super::fs_writeback::mark_inode_dirty_pages(inode);
             inode.set_size(length);
         }
-        update_size(inode, &sb_data)
+        // Linux fat_setattr: mark_inode_dirty
+        super::fs_writeback::mark_inode_dirty(inode);
+        Ok(())
     }
 
     /// As Linux fat_fallocate: KEEP_SIZE allocates clusters past the end
