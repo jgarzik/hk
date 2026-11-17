@@ -1148,12 +1148,11 @@ Tag = roadmap phase (doc/ROADMAP.md).
     debug-assertions boot) with no leak. Measure a quieter quantity or a
     bound above the noise.
 
-15. **arm64 release stack low near 6.8 kB**: `check-arm` reports about
-    6840 bytes left (deepest thread the isolated BLK test child), down
-    from about 7400; it moves about 700 bytes between builds of
-    near-identical code (frames such as `syscall_enter_from_user_mode`
-    and `msdos_partition` split out or merge). Find the deepest call
-    chain and shrink its largest frames.
+15. **arm64 release stack low dropped**: `check-arm`'s low (deepest
+    thread the isolated BLK test child) fell after the path-walk work and
+    moves between builds of near-identical code as frames such as
+    `syscall_enter_from_user_mode` and `msdos_partition` split out or
+    merge. Find the deepest call chain and shrink its largest frames.
 
 ## DRM dumb buffers are the boot framebuffer only
 
