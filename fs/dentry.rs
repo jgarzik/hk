@@ -293,8 +293,6 @@ crate::percpu! {
 
 /// Inner mutable state protected by d_lock
 struct DentryInner {
-    /// The inode this dentry points to (None for negative dentry)
-    inode: Option<Arc<Inode>>,
     /// Children in the tree (Linux d_children), each with the list's
     /// reference; each is also in its hash bucket
     children: Children,
@@ -304,8 +302,10 @@ struct DentryInner {
 ///
 /// ## Locking
 ///
-/// `d_lock` protects all mutable state, the parent included (Linux
-/// d_lock); a parent's d_lock is taken before a child's. The name has
+/// `d_lock` serializes every change, the parent included (Linux
+/// d_lock); a parent's d_lock is taken before a child's. `d_inode`
+/// and `d_flags` are atomics written under it (inside `d_seq` write
+/// sections for the inode) and read with no lock. The name has
 /// its own leaf lock, `d_name`, so a bucket walk can compare it (Linux
 /// reads d_name there under d_seq): written by d_move with the dentry's
 /// d_lock held and the dentry out of the tree. `sb` is immutable. `d_sib`/`d_sib_owner` belong to the parent's children
@@ -323,7 +323,7 @@ struct DentryInner {
 ///
 /// # Invariants
 /// A dentry a [`DentryRef`] owns is on its inode's `i_dentry` through
-/// `d_alias` exactly while `d_lock`'s inode is set, from
+/// `d_alias` exactly while `d_inode` is set, from
 /// `DentryRef::new` or the `add` that set it until the `d_delete` or
 /// `dentry_kill` that takes it; both change together under that
 /// inode's `i_dentry` lock and the dentry's d_lock (Linux
@@ -353,6 +353,12 @@ pub struct Dentry {
     /// or cleared, its parent and name by a move; leaving the tree
     /// moves it on (write_seqcount_invalidate)
     d_seq: SeqCount,
+    /// Its inode (Linux d_inode), null for a negative dentry: an
+    /// `Arc::into_raw`, the dentry's reference; written under its
+    /// d_lock (write) inside a `d_seq` write section with Release, read
+    /// with no lock (Acquire): a holder's reference keeps it set, an
+    /// RCU reader borrows it (`d_inode_rcu`)
+    d_inode: AtomicPtr<Inode>,
     /// `DCACHE_*` bits (Linux d_flags): changed under its d_lock held
     /// for writing (a plain store, Release), read with no lock
     /// (Acquire, Linux READ_ONCE): an RCU walk confirms what it read
@@ -380,6 +386,19 @@ pub struct Dentry {
     d_lock: RwLock<DentryInner>,
 }
 
+impl Drop for Dentry {
+    /// A dentry dropped without its kill (one never given to a
+    /// `DentryRef`) lets go of its inode; a killed one has none left.
+    /// A killed dentry is dropped by `d_free`, a grace period after its
+    /// kill, when no RCU reader can borrow it any more.
+    fn drop(&mut self) {
+        let p = *self.d_inode.get_mut();
+        // SAFETY: a non-null `d_inode` is an `Arc::into_raw` the dentry
+        // owns; `&mut self`: no reader is left
+        drop(NonNull::new(p).map(|p| unsafe { Arc::from_raw(p.as_ptr()) }));
+    }
+}
+
 impl Dentry {
     fn with(name: DName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
         Self {
@@ -389,6 +408,9 @@ impl Dentry {
             d_parent: AtomicPtr::new(core::ptr::null_mut()),
             d_rcu: RcuHead::new(),
             d_seq: SeqCount::new(),
+            d_inode: AtomicPtr::new(
+                inode.map_or(core::ptr::null_mut(), |i| Arc::into_raw(i).cast_mut()),
+            ),
             d_flags: AtomicU32::new(0),
             d_sib: Link::new(),
             d_sib_owner: Owner::new(),
@@ -398,7 +420,6 @@ impl Dentry {
             d_alias: Link::new(),
             d_name: RwLock::new(name),
             d_lock: RwLock::new(DentryInner {
-                inode,
                 children: OwnedList::new(),
             }),
         }
@@ -515,7 +536,7 @@ impl Dentry {
         let mut p = parent.d_lock.write();
         if let Some(c) = d_lookup_locked(parent, &p, &name) {
             let mut ci = c.d_lock.write();
-            if ci.inode.is_some() {
+            if !c.is_negative() {
                 drop(ci);
                 return c;
             }
@@ -526,7 +547,7 @@ impl Dentry {
             if DentryRef::count(&c) == TREE_REFS + 1 {
                 // Linux __d_instantiate: inside a d_seq write section
                 let s = c.seq_write(&mut ci);
-                ci.inode = inode;
+                c.set_inode(&mut ci, inode);
                 if let Some(al) = &mut al {
                     alias_add(al, &ci, &c);
                 }
@@ -541,9 +562,9 @@ impl Dentry {
         // Linux __d_add: the inode set inside a d_seq write section,
         // then hashed, under the dentry's d_lock
         let mut dl = d.d_lock.write();
-        debug_assert!(dl.inode.is_none(), "dcache: add of a positive dentry");
+        debug_assert!(d.is_negative(), "dcache: add of a positive dentry");
         let s = d.seq_write(&mut dl);
-        dl.inode = inode;
+        d.set_inode(&mut dl, inode);
         if let Some(al) = &mut al {
             alias_add(al, &dl, &d);
         }
@@ -561,9 +582,48 @@ impl Dentry {
         self.d_name.read().clone()
     }
 
-    /// Get the inode this dentry points to
+    /// A reference to its inode (Linux d_inode + ihold): read with no
+    /// lock (`d_inode_rcu`), the reference taken unless that inode's
+    /// last one went (Linux igrab), which happens only after a writer
+    /// took it off this dentry: then it is negative
     pub fn get_inode(&self) -> Option<Arc<Inode>> {
-        self.d_lock.read().inode.clone()
+        let g = crate::sync::rcu::read_lock();
+        self.d_inode_rcu(&g).and_then(Inode::igrab)
+    }
+
+    /// Its inode, borrowed for an RCU read guard with no reference
+    /// (Linux READ_ONCE(dentry->d_inode) in an RCU walk), None when
+    /// negative: what it was at the read, which a walk confirms with
+    /// `d_seq` (the inode changes inside a write section). Only the
+    /// inode's fields with no drop glue may be read through it (atomics,
+    /// `ino`, `i_op`): it may be torn down already (`inode::IFree`).
+    pub fn d_inode_rcu<'g>(&self, _g: &'g RcuReadGuard) -> Option<&'g Inode> {
+        let p = self.d_inode.load(Ordering::Acquire);
+        // SAFETY: a non-null `d_inode` held a strong reference when it
+        // was read, under the guard; a writer clears the pointer before
+        // it drops that reference, and an inode's memory is freed a
+        // grace period after its teardown (`inode::IFree`, Linux
+        // i_callback), which `_g` holds off
+        unsafe { p.as_ref() }
+    }
+
+    /// Point `d_inode` at `inode` (Linux __d_set_inode_and_type), under
+    /// this dentry's d_lock held for writing and a `d_seq` write section;
+    /// the pointer owns the reference
+    fn set_inode(&self, _dl: &mut DentryInner, inode: Option<Arc<Inode>>) {
+        let new = inode.map_or(core::ptr::null_mut(), |i| Arc::into_raw(i).cast_mut());
+        let old = self.d_inode.swap(new, Ordering::Release);
+        debug_assert!(old.is_null(), "dcache: inode set twice");
+    }
+
+    /// Clear `d_inode` (Linux __d_clear_type_and_inode), under this
+    /// dentry's d_lock held for writing and a `d_seq` write section: the
+    /// reference it held, for the caller to drop after the locks
+    fn take_inode(&self, _dl: &mut DentryInner) -> Option<Arc<Inode>> {
+        let p = self.d_inode.swap(core::ptr::null_mut(), Ordering::Release);
+        // SAFETY: a non-null `d_inode` is an `Arc::into_raw` the dentry
+        // owns (`set_inode`, `with`), taken out once by this swap
+        NonNull::new(p).map(|p| unsafe { Arc::from_raw(p.as_ptr()) })
     }
 
     /// The child `name` was unlinked (Linux d_delete): one no one but
@@ -594,14 +654,14 @@ impl Dentry {
         let same = !c.d_unhashed()
             && core::ptr::eq(c.parent_ptr(), self)
             && d_same_name(self, c.d_name.read().as_bytes(), name)
-            && cl.inode.as_ref().is_some_and(|i| Arc::ptr_eq(i, &inode));
+            && core::ptr::eq(c.d_inode.load(Relaxed), Arc::as_ptr(&inode));
         if !same {
             return;
         }
         if DentryRef::count(&c) <= held + TREE_REFS + 1 {
             // Linux dentry_unlink_inode: inside a d_seq write section
             let s = c.seq_write(&mut cl);
-            let i = cl.inode.take();
+            let i = c.take_inode(&mut cl);
             alias_del(&mut al, &cl, &c);
             drop(s);
             drop(cl);
@@ -620,7 +680,7 @@ impl Dentry {
 
     /// Check if this is a negative (failed lookup) dentry
     pub fn is_negative(&self) -> bool {
-        self.d_lock.read().inode.is_none()
+        self.d_inode.load(Ordering::Acquire).is_null()
     }
 
     /// Out of the tree (Linux d_unhashed, `!d_hash.pprev`): deleted,
@@ -729,8 +789,8 @@ impl Dentry {
 /// Link `d`, just made positive (its d_lock `dl`, written, holds the
 /// inode `al` belongs to), on that inode's aliases (Linux
 /// __d_instantiate's hlist_add_head)
-fn alias_add(al: &mut Aliases, dl: &DentryInner, d: &DentryRef) {
-    debug_assert!(dl.inode.is_some());
+fn alias_add(al: &mut Aliases, _dl: &DentryInner, d: &DentryRef) {
+    debug_assert!(!d.is_negative());
     // SAFETY: `d` is owned by a DentryRef (live, its memory freed only
     // after `dentry_kill` unlinks it) and was negative until now, so on
     // no alias list (type invariant); `al` is its inode's, locked
@@ -740,8 +800,8 @@ fn alias_add(al: &mut Aliases, dl: &DentryInner, d: &DentryRef) {
 /// Unlink `d`, whose inode its d_lock `dl` (written) just let go of,
 /// from that inode's aliases `al` (Linux dentry_unlink_inode's
 /// hlist_del_init)
-fn alias_del(al: &mut Aliases, dl: &DentryInner, d: &Dentry) {
-    debug_assert!(dl.inode.is_none());
+fn alias_del(al: &mut Aliases, _dl: &DentryInner, d: &Dentry) {
+    debug_assert!(d.is_negative());
     // SAFETY: `d` was positive with the inode `al` belongs to, so on
     // that list (type invariant), under its lock
     unsafe { al.remove(d) };
@@ -964,8 +1024,7 @@ impl DentryRef {
         NR_DENTRY.this_add(1);
         let r = Self(NonNull::from(Box::leak(b)));
         // A positive one joins its inode's aliases (Linux d_instantiate)
-        let inode = r.d_lock.read().inode.clone();
-        if let Some(i) = inode {
+        if let Some(i) = r.get_inode() {
             let mut al = i.i_dentry.lock();
             alias_add(&mut al, &r.d_lock.read(), &r);
         }
@@ -1100,13 +1159,12 @@ unsafe fn dentry_kill(d: NonNull<Dentry>) -> Option<NonNull<Dentry>> {
     }
     // Its inode's alias lock first; nothing else changes the inode of
     // a dentry with no reference left
-    let inode = r.d_lock.read().inode.clone();
-    if let Some(i) = inode {
+    if let Some(i) = r.get_inode() {
         let mut al = i.i_dentry.lock();
         let mut dl = r.d_lock.write();
         // Linux dentry_unlink_inode: inside a d_seq write section
         let s = r.seq_write(&mut dl);
-        let taken = dl.inode.take();
+        let taken = r.take_inode(&mut dl);
         alias_del(&mut al, &dl, r);
         drop(s);
         drop(dl);
@@ -1163,7 +1221,7 @@ fn prune_one(parent: &DentryRef, d: &DentryRef, keep: bool) -> bool {
     let unused = DentryRef::count(d) == TREE_REFS + 1
         && di.children.is_empty()
         && !d.flag(DCACHE_MOUNTED)
-        && !(keep && di.inode.is_some());
+        && !(keep && !d.is_negative());
     if !unused {
         return false;
     }
@@ -1689,6 +1747,31 @@ mod tests {
         assert!(x.d_seq.read_retry(s1) && x.d_unhashed() && x.d_unlinked());
         // A root is unhashed but not unlinked (Linux d_unlinked)
         assert!(r.d_unhashed() && !r.d_unlinked());
+    }
+
+    /// `d_inode_rcu` borrows the dentry's inode with no reference and
+    /// `get_inode` takes one from it (Linux igrab); once the dentry is
+    /// made negative both see none
+    #[test]
+    fn d_inode_rcu_and_igrab() {
+        let r = DentryRef::new(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let i = inode();
+        let a = Dentry::alloc(&r, b"a", Some(i.clone())).unwrap();
+        let n = Arc::strong_count(&i);
+        {
+            let g = crate::sync::rcu::read_lock();
+            let b = a.d_inode_rcu(&g).unwrap();
+            assert!(core::ptr::eq(b, Arc::as_ptr(&i)) && Arc::strong_count(&i) == n);
+        }
+        let got = a.get_inode().unwrap();
+        assert!(Arc::ptr_eq(&got, &i) && Arc::strong_count(&i) == n + 1);
+        drop(got);
+        let s = a.d_seq.read_begin();
+        drop(a);
+        r.d_delete(b"a", 0);
+        let c = r.lookup_child(b"a").unwrap();
+        assert!(c.is_negative() && c.get_inode().is_none() && c.d_seq.read_retry(s));
+        assert_eq!(Arc::strong_count(&i), n - 1);
     }
 
     /// A real exchange swaps names and parents

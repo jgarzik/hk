@@ -2782,6 +2782,7 @@ pub struct Dentry {
     d_parent: AtomicPtr<Dentry>, // A reference (Linux d_parent); d_lock
     d_rcu: RcuHead,             // The free after a grace period
     d_seq: SeqCount,            // Linux d_seq; writers hold d_lock (write)
+    d_inode: AtomicPtr<Inode>,  // Linux d_inode; d_lock (write) + d_seq, read lock-free
     d_flags: AtomicU32,         // DCACHE_MOUNTED; d_lock (write), read lock-free
     d_sib: Link, d_sib_owner: Owner, // Parent's children (its d_lock)
     d_hash: Link,               // Hash bucket (its bit lock); linked = hashed
@@ -2792,7 +2793,6 @@ pub struct Dentry {
 }
 
 struct DentryInner {
-    inode: Option<Arc<Inode>>,
     children: OwnedList<SibAdapter, DentryRef>, // Linux d_children
 }
 ```
@@ -2814,6 +2814,20 @@ snapshot (an RCU reader confirms it by `d_seq`). A root, a pseudo
 filesystem's dentry and an O_TMPFILE file's are never hashed;
 `d_unlinked` (unhashed and not a root, Linux d_unlinked) is what
 d_path's " (deleted)", getcwd and pivot_root test.
+
+`d_inode` (Linux d_inode) is an atomic pointer owning the dentry's
+`Arc` of its inode (`Arc::into_raw`, null when negative): set and
+cleared under the dentry's d_lock held for writing inside a `d_seq`
+write section (Release), the reference dropped after the locks.
+`is_negative` is one Acquire load; `d_inode_rcu` borrows the inode for
+an RCU read guard with no lock and no reference (Linux
+READ_ONCE(dentry->d_inode)), sound because a writer clears the pointer
+before dropping its reference and the inode's memory is freed a grace
+period after its teardown (Inode free, above), so the reader may read
+its fields with no drop glue only; `get_inode` takes a reference from
+that with `Inode::igrab` (Linux igrab: refused once the last reference
+went, which happens only after the pointer was cleared), so neither
+stores to the dentry's lock word.
 
 A dentry is held through `DentryRef` (Linux dget/dput on d_lockref):
 the tree's two references, each child's `d_parent`, and every

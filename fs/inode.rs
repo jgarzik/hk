@@ -765,6 +765,24 @@ pub fn for_each_sb_inode(sb: &Arc<SuperBlock>, f: &mut dyn FnMut(&Arc<Inode>) ->
 }
 
 impl Inode {
+    /// A reference to an inode borrowed with none (under an RCU read
+    /// guard: a dentry's `d_inode_rcu`), unless its last one went and
+    /// it is being torn down or freed (Linux igrab: I_FREEING /
+    /// I_WILL_FREE)
+    pub fn igrab(&self) -> Option<Arc<Self>> {
+        let me = self.i_free.me.load(Ordering::Acquire);
+        if me.is_null() {
+            return None;
+        }
+        // SAFETY: the inode's own `Weak` (`IFree` invariant), released
+        // only by `i_callback`, a grace period after the teardown: not
+        // while `&self` is borrowed (an RCU reader's guard holds it off,
+        // and a holder's `Arc` keeps the teardown away). Borrowed here,
+        // never dropped.
+        let w = ManuallyDrop::new(unsafe { Weak::from_raw(me) });
+        w.upgrade()
+    }
+
     /// What a new inode starts with (Linux new_inode's caller filling
     /// in i_mode, i_uid, ...), for [`Inode::alloc`]
     ///
