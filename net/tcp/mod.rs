@@ -225,6 +225,10 @@ pub struct TcpSock {
     pub inet: Inet,
     lock: SockLock<Inner>,
     queue: Mutex<Option<Accept>>,
+    /// Children ready to accept (Linux sk_ack_backlog): changed under
+    /// `queue` with its `ready` list (sk_acceptq_added / removed),
+    /// read lock-free by poll, accept's wait and /proc (READ_ONCE)
+    ack_backlog: AtomicU32,
     snap: Snap,
     /// Its control block's fields /proc/net/tcp reads with no lock
     /// (`cb::Live`, shared with the block)
@@ -390,6 +394,7 @@ impl TcpSock {
                 connecting: false,
             }),
             queue: Mutex::new(None),
+            ack_backlog: AtomicU32::new(0),
             snap,
             live,
             mtu_info: AtomicU32::new(0),
@@ -986,6 +991,9 @@ impl TcpSock {
             .remove_first(|x| core::ptr::eq(x, Arc::as_ptr(c)))
             .unwrap_or_else(|| c.clone());
         q.ready.push_back(r);
+        // Under `queue` (Linux sk_acceptq_added)
+        self.ack_backlog
+            .store(q.ready.len() as u32, Ordering::Relaxed);
         true
     }
 
@@ -1168,6 +1176,14 @@ impl TcpSock {
     /// silently when its timer fires, or when a segment comes, which is
     /// then looked up again (`req_dead`; Linux reqsk_timer_handler,
     /// tcp_v4_rcv)
+    /// Take the listener's queues away (it stops listening): its ready
+    /// count goes to 0 with them, under `queue`
+    fn take_queue(&self) -> Option<Accept> {
+        let mut g = self.queue.lock();
+        self.ack_backlog.store(0, Ordering::Relaxed);
+        g.take()
+    }
+
     fn listen_stop(&self, mut q: Accept) {
         while q.syn.pop_front().is_some() {}
         while let Some(c) = q.ready.pop_front() {
@@ -1203,7 +1219,7 @@ impl TcpSock {
                 .net
                 .tcp
                 .listen_del(self.inet.get().sport, &self.arc());
-            let q = self.queue.lock().take();
+            let q = self.take_queue();
             if let Some(q) = q {
                 self.listen_stop(q);
             }
@@ -1890,7 +1906,7 @@ impl ProtoOps for TcpSock {
                 g.cb.set_closed(out);
                 // Its children stop as the owner (Linux tcp_close ->
                 // inet_csk_listen_stop under lock_sock, after TCP_CLOSE)
-                let q = self.queue.lock().take();
+                let q = self.take_queue();
                 if let Some(q) = q {
                     self.listen_stop(q);
                 }
@@ -2025,19 +2041,23 @@ impl ProtoOps for TcpSock {
         }
         let mut timeo = self.sk.rcv_timeo(nonblock);
         loop {
-            let c = self.queue.lock().as_mut().and_then(|q| q.ready.pop_front());
+            let c = self.queue.lock().as_mut().and_then(|q| {
+                let c = q.ready.pop_front();
+                // Under `queue` (Linux sk_acceptq_removed)
+                self.ack_backlog
+                    .store(q.ready.len() as u32, Ordering::Relaxed);
+                c
+            });
             if let Some(c) = c {
                 return Ok(c);
             }
             if self.state() != TcpState::Listen {
                 return Err(KernelError::InvalidArgument);
             }
+            // Linux inet_csk_wait_for_connect: the queue's emptiness
+            // read lock-free (reqsk_queue_empty)
             let ready = || {
-                self.queue
-                    .lock()
-                    .as_ref()
-                    .is_none_or(|q| !q.ready.is_empty())
-                    || self.state() != TcpState::Listen
+                self.ack_backlog.load(Ordering::Relaxed) != 0 || self.state() != TcpState::Listen
             };
             timeo = self.sk.wait(timeo, ready)?;
         }
@@ -2063,11 +2083,8 @@ impl ProtoOps for TcpSock {
     fn poll(&self) -> u16 {
         let state = self.state();
         if state == TcpState::Listen {
-            let ready = self
-                .queue
-                .lock()
-                .as_ref()
-                .is_some_and(|q| !q.ready.is_empty());
+            // Linux inet_csk_listen_poll: reqsk_queue_empty, lock-free
+            let ready = self.ack_backlog.load(Ordering::Relaxed) != 0;
             return if ready { POLLIN | POLLRDNORM } else { 0 };
         }
         let mut mask = 0;

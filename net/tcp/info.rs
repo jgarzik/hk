@@ -285,7 +285,7 @@ fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
     let v = ProcView::of(&s.live, state);
     let sndq = s.snap.sndq.load(Ordering::Acquire);
     let rxq = if state == TcpState::Listen {
-        s.queue.lock().as_ref().map_or(0, |q| q.ready.len())
+        s.ack_backlog.load(Ordering::Relaxed) as usize
     } else {
         s.snap.rcvq.load(Ordering::Acquire)
     };
