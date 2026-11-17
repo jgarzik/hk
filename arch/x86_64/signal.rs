@@ -220,7 +220,6 @@ pub fn setup_rt_frame(
     let regs = &mut r;
 
     // The interrupted user context (the task's pt_regs)
-    let user_rip = regs.rip;
     let user_rflags = regs.rflags;
     let user_rsp = regs.rsp;
 
@@ -241,7 +240,6 @@ pub fn setup_rt_frame(
         return Err(KernelError::InvalidArgument);
     };
 
-    let frame_size = signal_frame_size();
     let fp_size = fpu::sigframe_size();
     let (fpstate_addr, frame_addr) = get_sigframe(user_rsp, action, alt)?;
     let total = (fpstate_addr + fp_size as u64 - frame_addr) as usize;
@@ -251,66 +249,17 @@ pub fn setup_rt_frame(
         return Err(KernelError::BadAddress);
     }
 
-    // FP image of the interrupted code (live in the registers: the kernel
-    // does not use them)
-    let mut fp_area = fpu::FpuArea::init();
-    let fp_len = fpu::save_sigframe(&mut fp_area);
-    if copy_to_user(fpstate_addr, &fp_area.0[..fp_len]).is_err() {
-        return Err(KernelError::BadAddress);
-    }
+    copy_fpstate_to_sigframe(fpstate_addr)?;
 
-    // Build SigContext from saved registers
-    let sigctx = SigContext {
-        r8: regs.r8,
-        r9: regs.r9,
-        r10: regs.r10,
-        r11: regs.r11,
-        r12: regs.r12,
-        r13: regs.r13,
-        r14: regs.r14,
-        r15: regs.r15,
-        rdi: regs.rdi,
-        rsi: regs.rsi,
-        rbp: regs.rbp,
-        rbx: regs.rbx,
-        rdx: regs.rdx,
-        rax: regs.rax,
-        rcx: regs.rcx,
-        rsp: user_rsp,
-        rip: user_rip,
-        eflags: user_rflags,
-        cs: USER_CS,
-        ss: USER_SS,
-        err: trap.error,
-        trapno: trap.trapno,
-        oldmask: blocked.bits(),
-        cr2: trap.addr,
-        fpstate: fpstate_addr,
-        ..FromBytes::zeroed()
-    };
-
-    let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
-    if fpu::use_xsave() {
-        uc_flags |= UC_FP_XSTATE;
-    }
-
-    // Build the complete frame
-    let frame = RtSigFrame {
-        pretcode: restorer,
-        uc: UContext {
-            uc_flags,
-            uc_link: 0,
-            uc_stack: alt.save(),
-            uc_mcontext: sigctx,
-            uc_sigmask: blocked,
-        },
-        info: info.to_user(),
-    };
-
-    // Copy frame to user stack
-    if copy_to_user(frame_addr, &frame.as_bytes()[..frame_size]).is_err() {
-        return Err(KernelError::BadAddress);
-    }
+    put_rt_frame(
+        (fpstate_addr, frame_addr),
+        restorer,
+        regs,
+        blocked,
+        info,
+        trap,
+        alt,
+    )?;
 
     // Calculate addresses of info and ucontext within the frame
     let info_addr = frame_addr + core::mem::offset_of!(RtSigFrame, info) as u64;
@@ -337,6 +286,87 @@ pub fn setup_rt_frame(
     uframe.set(r);
 
     Ok(())
+}
+
+/// Write the handler frame at `frame`, its sigcontext pointing at the
+/// FP image at `fpstate`: the interrupted registers `regs`, mask
+/// `blocked`, `info` and `alt`'s settings (Linux __setup_rt_frame's puts
+/// and setup_sigcontext). Out of line, beside the FP image's writer.
+#[inline(never)]
+fn put_rt_frame(
+    (fpstate_addr, frame_addr): (u64, u64),
+    restorer: u64,
+    regs: &super::PtRegs,
+    blocked: SigSet,
+    info: &SigInfo,
+    trap: &Trap,
+    alt: &AltStack,
+) -> KernelResult<()> {
+    // Build SigContext from saved registers
+    let sigctx = SigContext {
+        r8: regs.r8,
+        r9: regs.r9,
+        r10: regs.r10,
+        r11: regs.r11,
+        r12: regs.r12,
+        r13: regs.r13,
+        r14: regs.r14,
+        r15: regs.r15,
+        rdi: regs.rdi,
+        rsi: regs.rsi,
+        rbp: regs.rbp,
+        rbx: regs.rbx,
+        rdx: regs.rdx,
+        rax: regs.rax,
+        rcx: regs.rcx,
+        rsp: regs.rsp,
+        rip: regs.rip,
+        eflags: regs.rflags,
+        cs: USER_CS,
+        ss: USER_SS,
+        err: trap.error,
+        trapno: trap.trapno,
+        oldmask: blocked.bits(),
+        cr2: trap.addr,
+        fpstate: fpstate_addr,
+        ..FromBytes::zeroed()
+    };
+
+    let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+    if super::fpu::use_xsave() {
+        uc_flags |= UC_FP_XSTATE;
+    }
+
+    // Build the complete frame
+    let frame = RtSigFrame {
+        pretcode: restorer,
+        uc: UContext {
+            uc_flags,
+            uc_link: 0,
+            uc_stack: alt.save(),
+            uc_mcontext: sigctx,
+            uc_sigmask: blocked,
+        },
+        info: info.to_user(),
+    };
+
+    // Copy frame to user stack
+    copy_to_user(frame_addr, frame.as_bytes())
+        .map(|_| ())
+        .map_err(|_| KernelError::BadAddress)
+}
+
+/// Write the FP image of the interrupted code (live in the registers:
+/// the kernel does not use them) at `fpstate` (Linux
+/// copy_fpstate_to_sigframe). Out of line: its image is on the stack
+/// only while it runs, not under the rest of the frame's building.
+#[inline(never)]
+fn copy_fpstate_to_sigframe(fpstate: u64) -> KernelResult<()> {
+    let mut area = super::fpu::FpuArea::init();
+    let len = super::fpu::save_sigframe(&mut area);
+    copy_to_user(fpstate, &area.0[..len])
+        .map(|_| ())
+        .map_err(|_| KernelError::BadAddress)
 }
 
 /// Where a handler frame for `action` goes when `rsp` is interrupted
