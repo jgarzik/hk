@@ -899,7 +899,7 @@ pub fn ptrace_stop_why(
         // do_notify_parent_cldstop under tasklist_lock); a completed
         // group stop also tells the real parent, unless it is the
         // tracer's process
-        let reparented = t.tracer().is_some_and(|tr| tr.pid != me.ppid());
+        let reparented = t.tracer().is_some_and(|tr| tr.pid != t.ppid());
         signal::notify::notify_parent_cldstop(&table, &me, true, why);
         if gstop_done && reparented {
             signal::notify::notify_parent_cldstop(&table, &me, false, why);

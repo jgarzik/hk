@@ -1014,8 +1014,9 @@ Designs that grew one commit at a time. Tag = roadmap phase
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
-- **Process-wide state per thread** (C): pgid/sid copied into every
-  thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
+- **Process-wide state per thread** (C): the group and session `Pid`
+  references (`TaskInner.pgrp`/`session`) held by every thread, not
+  once per process (Linux signal->pids); one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.
 - **`task/percpu.rs` is the largest file** (before C): scheduler core,
   do_clone, exit, wait, credential setters, several sleep APIs. Split

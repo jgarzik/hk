@@ -91,8 +91,6 @@ pub const KERNEL_STACK_SIZE: usize = crate::mm::vmstack::THREAD_SIZE;
 /// Groups all parameters needed to create a user task, avoiding clippy's
 /// too_many_arguments warning while keeping the API clear.
 pub struct UserTaskConfig {
-    /// Parent process ID
-    pub ppid: Pid,
     /// Process group ID
     pub pgid: Pid,
     /// Session ID
@@ -965,20 +963,31 @@ impl GlobalTaskTable {
         drop(unsafe { pi.children.remove(child) });
     }
 
-    /// Move `child` to `reaper`'s children (Linux
-    /// forget_original_parent, reparent_leader); `other_group`: the
-    /// reaper is not a thread of its old parent's process
+    /// Move `child` to `reaper`'s children, every thread of its
+    /// process with it (Linux forget_original_parent, reparent_leader);
+    /// `other_group`: the reaper is not a thread of its old parent's
+    /// process
     pub fn adopt(&mut self, child: &TaskRef, reaper: &TaskRef, other_group: bool) {
         self.unlink_child(child);
         let ci = self.inner_mut_of(child);
-        ci.real_parent = Some(Arc::downgrade(reaper));
         // Linux reparent_leader: no custom exit signal to a new
         // parent process ("we don't want people slaying init")
         if other_group {
             ci.exit_signal = crate::signal::ExitSignal::SIGCHLD;
         }
-        child.ppid.store(reaper.pid, Ordering::Relaxed);
+        self.set_parent(child, reaper);
         self.link_child(child);
+    }
+
+    /// Every thread of leader `l`'s process gets real parent `p`
+    /// (Linux forget_original_parent: for_each_thread, t->real_parent)
+    fn set_parent(&mut self, l: &Task, p: &TaskRef) {
+        self.inner_mut_of(l).real_parent = Some(Arc::downgrade(p));
+        let mut cur = self.inner_mut_of(l).threads.front();
+        while let Some(t) = cur {
+            self.inner_mut_of(&t).real_parent = Some(Arc::downgrade(p));
+            cur = self.inner_mut_of(l).threads.next(&t);
+        }
     }
 
     /// Add a task (fork, kernel thread creation); it has a pid. It joins
@@ -1119,8 +1128,6 @@ impl GlobalTaskTable {
             return;
         };
         let (pg, s) = (pi.pgrp.clone(), pi.session.clone());
-        child.pgid.store(parent.pgid(), Ordering::Relaxed);
-        child.sid.store(parent.sid(), Ordering::Relaxed);
         if let Some(ci) = child.inner().access_mut(self).as_mut() {
             ci.pgrp = pg;
             ci.session = s;
@@ -1202,7 +1209,6 @@ impl GlobalTaskTable {
                 "threads share a group"
             );
             drop(old);
-            t.pgid.store(Pid::from(pg.nr()), Ordering::Relaxed);
             if let Some(s) = s {
                 let old = ti.session.replace(s.clone());
                 debug_assert!(
@@ -1210,7 +1216,6 @@ impl GlobalTaskTable {
                     "threads share a session"
                 );
                 drop(old);
-                t.sid.store(Pid::from(s.nr()), Ordering::Relaxed);
             }
             cur = self.inner_mut_of(&l).threads.next(&t);
         }
@@ -1480,9 +1485,6 @@ fn create_kernel_task(
         tid,
         crate::task::TaskIds {
             pid,
-            ppid: 0,
-            pgid: pid,
-            sid: pid,
             seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
         },
         TaskKind::KernelThread,
@@ -1637,7 +1639,7 @@ pub fn can_sleep() -> bool {
 /// The kernel stack must already be allocated by the caller.
 ///
 /// # Arguments
-/// * `config` - User task configuration (pid, tid, ppid, pgid, sid, priority, stacks, page table)
+/// * `config` - User task configuration (pgid, sid, priority, stacks, page table)
 pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> {
     let cpu_id = crate::cpu::this_id();
     // init is pid 1 (Linux: the first pid of the root namespace); the
@@ -1671,9 +1673,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
         tid,
         crate::task::TaskIds {
             pid,
-            ppid: config.ppid,
-            pgid: config.pgid,
-            sid: config.sid,
             seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
         },
         TaskKind::UserProcess,
@@ -1780,15 +1779,17 @@ pub fn reap_zombie_child_times(
     target_pid: i64,
     wflags: i32,
 ) -> Option<(Pid, i32, u64, u64)> {
-    let pgid = current_pgid();
-    let w = Wait {
-        parent_pid,
-        target_pid,
-        wflags,
-        pgid,
-        ns: crate::task::pid::current_pid_ns(),
+    let (report, done) = {
+        let mut table = TASKLIST.write();
+        let w = Wait {
+            parent_pid,
+            target_pid,
+            wflags,
+            pgid: cur_pgid(&table),
+            ns: crate::task::pid::current_pid_ns(),
+        };
+        wait_zombie(&mut table, &w)?
     };
-    let (report, done) = wait_zombie(&mut TASKLIST.write(), &w)?;
     done.finish();
     Some(report)
 }
@@ -1823,10 +1824,7 @@ fn reapable(table: &GlobalTaskTable, t: &TaskView<'_>, w: &Wait) -> bool {
     if tracee_of(t, w.parent_pid) {
         return true;
     }
-    t.leader
-        && t.ptrace == 0
-        && t.task.ppid() == w.parent_pid
-        && wait_eligible(t.exit_signal, w.wflags)
+    t.leader && t.ptrace == 0 && t.ppid() == w.parent_pid && wait_eligible(t.exit_signal, w.wflags)
 }
 
 /// How [`wait_zombie`] releases the zombie it reaps
@@ -1855,7 +1853,7 @@ fn reap_kind(z: &TaskView<'_>) -> Reap {
 /// `t` is traced by a task outside its real parent's process (Linux
 /// ptrace_reparented)
 fn ptrace_reparented(t: &TaskView<'_>) -> bool {
-    t.tracer().is_some_and(|tr| tr.pid != t.task.ppid())
+    t.tracer().is_some_and(|tr| tr.pid != t.ppid())
 }
 
 /// [`reap_zombie_child_times`]'s TASKLIST write section: the zombie
@@ -1985,7 +1983,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
         drop(table);
         return gone;
     }
-    let (ppid, start, ucounts) = (l.task.ppid(), l.task.start_time(), l.ucounts());
+    let (start, ucounts) = (l.task.start_time(), l.ucounts());
     for t in table.threads(tgid) {
         if t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)) {
             gone_tids.push(t.task.tid());
@@ -2054,9 +2052,6 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     table.inner_mut_of(&me).threads.push_back(me.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;
-        m.task
-            .ppid
-            .store(ppid, core::sync::atomic::Ordering::Relaxed);
         // Linux de_thread: the new leader's exit signal is SIGCHLD
         m.exit_signal = crate::signal::ExitSignal::SIGCHLD;
         m.task.start_time.store(start, Ordering::Relaxed);
@@ -2091,8 +2086,8 @@ fn group_status(t: &TaskInner, own: i32) -> i32 {
 /// tracees are walked under the read lock, each stop read and its code
 /// taken under the tracee's Task.sig.
 pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32, Times)> {
-    let pgid = current_pgid();
     let table = TASKLIST.read();
+    let pgid = cur_pgid(&table);
     let (tid, pid, code) = table.iter().find_map(|t| {
         if !(tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid)) {
             return None;
@@ -2148,10 +2143,10 @@ pub fn wait_jobctl(
         return None;
     }
     let wnowait = wflags & WNOWAIT != 0;
-    let pgid = current_pgid();
     let table = TASKLIST.read();
+    let pgid = cur_pgid(&table);
     let (tid, pid, r, uid) = table.iter().find_map(|t| {
-        let child = t.leader && t.task.ppid() == parent_pid && wait_eligible(t.exit_signal, wflags);
+        let child = t.leader && t.ppid() == parent_pid && wait_eligible(t.exit_signal, wflags);
         let traced = tracee_of(&t, parent_pid);
         if !(child || traced) || !wait_match(&t, target_pid, pgid) {
             return None;
@@ -2186,8 +2181,8 @@ pub fn wait_jobctl(
 fn wait_match(t: &TaskView<'_>, target_pid: i64, pgid: Pid) -> bool {
     match target_pid {
         -1 => true,
-        0 => t.task.pgid() == pgid,
-        p if p < -1 => t.task.pgid() == p.unsigned_abs(),
+        0 => t.pgid() == pgid,
+        p if p < -1 => t.pgid() == p.unsigned_abs(),
         p => t.task.tid() == p as u64,
     }
 }
@@ -2200,8 +2195,8 @@ fn tracee_of(t: &TaskView<'_>, tracer_pid: Pid) -> bool {
 /// The group `tracer_pid` traces a task matching `target_pid` (so a
 /// wait for it is not ECHILD)
 pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
-    let pgid = current_pgid();
     let table = TASKLIST.read();
+    let pgid = cur_pgid(&table);
     table
         .iter()
         .any(|t| tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid))
@@ -2216,12 +2211,12 @@ pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
 ///   - -1: check for any child
 ///   - 0: check for any child in same process group
 pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
-    let pgid = current_pgid();
     let table = TASKLIST.read();
+    let pgid = cur_pgid(&table);
 
     table.iter().any(|t| {
         // Must be a child of the parent (a thread-group leader)
-        if t.task.ppid() != parent_pid || !t.leader {
+        if t.ppid() != parent_pid || !t.leader {
             return false;
         }
 
@@ -2362,9 +2357,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let current_tid = current_tid();
     let (
         parent_pid,
-        parent_ppid,
-        parent_pgid,
-        parent_sid,
         parent_sched,
         parent_cpus_allowed,
         parent_pt_phys,
@@ -2387,9 +2379,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             .map_or(crate::signal::ExitSignal::NONE, |l| l.exit_signal);
         (
             parent.task.pid,
-            parent.task.ppid(),
-            parent.task.pgid(),
-            parent.task.sid(),
             {
                 // One setting of the parameters (one load)
                 let p = parent.task.se.params();
@@ -2569,15 +2558,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         CurrentArch::new_clone_child_context(frame_top)
     };
 
-    // Determine child's parent PID
-    // CLONE_PARENT or CLONE_THREAD: child becomes sibling (same parent as caller)
-    // Otherwise: caller becomes the parent
-    let child_ppid = if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
-        parent_ppid // Child's parent is our parent (grandparent of normal fork)
-    } else {
-        parent_pid // Normal case: we are the parent
-    };
-
     // Create child task: pgrp/session are set from the creator's under TASKLIST
     // (`inherit_pids`); TLS fields and shared resources from the clone
     // flags below; pdeath_signal is never inherited
@@ -2651,9 +2631,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         child_tid,
         crate::task::TaskIds {
             pid: child_pid,
-            ppid: child_ppid,
-            pgid: parent_pgid,
-            sid: parent_sid,
             seccomp_mode: parent_seccomp_mode,
         },
         TaskKind::UserProcess,
@@ -3302,7 +3279,7 @@ fn traced_zombie(table: &GlobalTaskTable, me: &Task) -> Option<(Tid, Pid, bool, 
     table
         .find(|t| mine(t) && t.leader)
         .or_else(|| table.find(|t| mine(t)))
-        .map(|t| (t.task.tid(), t.task.pid, t.leader, t.task.ppid()))
+        .map(|t| (t.task.tid(), t.task.pid, t.leader, t.ppid()))
 }
 
 /// Wake the pidfd pollers of zombie `tid` (Linux do_notify_pidfd,
@@ -4578,33 +4555,34 @@ pub fn current_tid() -> Tid {
     current().tid()
 }
 
-/// Get the current task's parent process ID
-pub fn current_ppid() -> Pid {
-    current().ppid()
-}
-
 /// The current task's parent process as its pid namespace numbers it,
-/// 0 if outside it (Linux task_tgid_vnr(current->real_parent)):
-/// TASKLIST keeps the parent listed, and its number, while it is
-/// translated
+/// 0 for none or one outside it (Linux
+/// task_tgid_vnr(current->real_parent)): read through the parent link
+/// under TASKLIST, which keeps the parent listed, and its number,
+/// while it is translated
 pub fn current_ppid_vnr() -> u32 {
     let me = current();
-    let ns = me.task.pid_ns();
-    if ns.level == 0 {
-        return crate::task::pid::nr_ns(me.ppid(), ns);
-    }
-    let _table = TASKLIST.read();
-    crate::task::pid::nr_ns(me.ppid(), ns)
+    let table = TASKLIST.read();
+    let ppid = table.view(&me).map_or(0, |t| t.ppid());
+    crate::task::pid::nr_ns(ppid, me.task.pid_ns())
 }
 
-/// Get the current task's process group ID
+/// The current task's process group (root number), 0 for none (Linux
+/// pid_nr(task_pgrp(current))), under the caller's TASKLIST hold
+pub fn cur_pgid(table: &GlobalTaskTable) -> Pid {
+    table.view(&current()).map_or(0, |t| t.pgid())
+}
+
+/// The current task's process group (root number), read under
+/// TASKLIST
 pub fn current_pgid() -> Pid {
-    current().pgid()
+    cur_pgid(&TASKLIST.read())
 }
 
-/// Get the current task's session ID
+/// The current task's session (root number), 0 for none (Linux
+/// pid_nr(task_session(current))), read under TASKLIST
 pub fn current_sid() -> Pid {
-    current().sid()
+    TASKLIST.read().view(&current()).map_or(0, |t| t.sid())
 }
 
 /// Increment minor page fault counter for current task
@@ -4961,15 +4939,13 @@ fn change_class(p: &Task, f: impl FnOnce(&sched::SchedEntity)) {
 /// - ESRCH (3): Process not found
 /// - EPERM (1): a session leader, another session, or no group
 ///   `new_pgid` in the caller's session
-pub fn set_task_pgid(
-    caller_pid: Pid,
-    target_pid: Pid,
-    new_pgid: Pid,
-    caller_sid: Pid,
-) -> KernelResult<()> {
+pub fn set_task_pgid(caller_pid: Pid, target_pid: Pid, new_pgid: Pid) -> KernelResult<()> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
     let target = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, new_pgid);
     let mut table = TASKLIST.write();
+    // The caller's session, in the write section that changes the
+    // group (Linux sys_setpgid: task_session(group_leader))
+    let caller_sid = table.get(caller_pid).map_or(0, |l| l.sid());
     setpgid_who(&table, caller_pid, target_pid, caller_sid)?;
     let pg = setpgid_target(&table, target_pid, new_pgid, target.as_ref(), caller_sid)?;
     let old = table.change_pids(target_pid, &pg, None);
@@ -4999,7 +4975,7 @@ fn setpgid_who(
     if !child {
         return Err(KernelError::NoProcess);
     }
-    if p.task.sid() != caller_sid {
+    if p.sid() != caller_sid {
         return Err(KernelError::NotPermitted);
     }
     if !p.task.has_flag(crate::task::pf::FORKNOEXEC) {
@@ -5019,7 +4995,7 @@ fn setpgid_target(
     caller_sid: Pid,
 ) -> KernelResult<Arc<crate::task::pid::Pid>> {
     let l = table.get(pid).ok_or(KernelError::NoProcess)?;
-    let sid = l.task.sid();
+    let sid = l.sid();
     if pid == sid || sid != caller_sid {
         return Err(KernelError::NotPermitted);
     }
@@ -5028,7 +5004,7 @@ fn setpgid_target(
     }
     let pg = target.ok_or(KernelError::NotPermitted)?;
     match table.pgrp(pg).next() {
-        Some(g) if g.task.sid() == caller_sid => Ok(pg.clone()),
+        Some(g) if g.sid() == caller_sid => Ok(pg.clone()),
         _ => Err(KernelError::NotPermitted), // no such group in the caller's session
     }
 }
@@ -5044,7 +5020,7 @@ pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
         let pid = l.thread_pid.clone().ok_or(KernelError::NoProcess)?;
         // A session leader already, or a process group with the
         // caller's id exists (Linux ksys_setsid)
-        if l.task.sid() == caller_pid || table.pgrp(&pid).next().is_some() {
+        if l.sid() == caller_pid || table.pgrp(&pid).next().is_some() {
             return Err(KernelError::NotPermitted);
         }
         pid

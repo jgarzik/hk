@@ -2109,12 +2109,41 @@ pub fn kill_pgrp_info(
     // Flushed entries go after TASKLIST
     let mut gone = SigPending::new();
     let table = TASKLIST.read();
+    pgrp_send(&table, pg, sig, info, &check, &mut gone)
+}
+
+/// [`kill_pgrp_info`] to the caller's own group, read in the TASKLIST
+/// hold that walks it (Linux kill_something_info with pid 0:
+/// __kill_pgrp_info(task_pgrp(current)) under tasklist_lock)
+pub fn kill_own_pgrp(
+    sig: KillSig,
+    info: SendInfo,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
+) -> KernelResult<()> {
+    let mut gone = SigPending::new();
+    let table = TASKLIST.read();
+    let me = crate::task::percpu::current();
+    let pg = table.view(&me).and_then(|t| t.fields().pgrp());
+    let pg = pg.ok_or(KernelError::NoProcess)?;
+    pgrp_send(&table, pg, sig, info, &check, &mut gone)
+}
+
+/// [`kill_pgrp_info`]'s walk of group `pg`, under the caller's TASKLIST
+/// read hold; flushed entries go to `gone`
+fn pgrp_send(
+    table: &crate::task::percpu::GlobalTaskTable,
+    pg: &crate::task::pid::Pid,
+    sig: KillSig,
+    info: SendInfo,
+    check: &impl Fn(&crate::task::percpu::TaskView<'_>, Option<Signal>) -> KernelResult<()>,
+    gone: &mut SigPending,
+) -> KernelResult<()> {
     let mut ret = Err(KernelError::NoProcess);
     let mut ok = false;
     for v in table.pgrp(pg) {
-        ret = checked(&table, Some(v), PidType::Tgid, sig, &check).and_then(|t| {
+        ret = checked(table, Some(v), PidType::Tgid, sig, check).and_then(|t| {
             sig?.map_or(Ok(()), |s| {
-                send_task_in(&table, &t, s, info, PidType::Pgid, false, &mut gone)
+                send_task_in(table, &t, s, info, PidType::Pgid, false, gone)
             })
         });
         ok |= ret.is_ok();

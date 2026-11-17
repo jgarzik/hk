@@ -17,8 +17,8 @@ argued / published copy of locked state.
   atomics beside it (rule 1 of LOCKING.md §5.4 violated): `SchedEntity`,
   `PerCpuScheduler`, `TimerList`, `Pcp.count`, `AddressSpace.nrpages`.
 - **Published copies.** Locked state mirrored into a second set of atomics
-  on every unlock for lockless readers (`Pipe` head/tail, `TcpSock.snap`,
-  `Task.ppid/pgid/sid`), where Linux READ_ONCEs the real field. Costs a store
+  on every unlock for lockless readers (`Pipe` head/tail, `TcpSock.snap`),
+  where Linux READ_ONCEs the real field. Costs a store
   burst per operation and makes readers combine values from different steps.
 - **Global RMW on per-op paths** (`call_rcu`, inode eviction, netdev stats,
   dentry alloc, dirty throttling).
@@ -116,18 +116,6 @@ argued / published copy of locked state.
 - Fix: vmstat-style counter (per-CPU diff + global atomic folded at a
   threshold, i.e. `PercpuCounter`) and a per-CPU ratelimit before the check.
 
-### 17. `Task.ppid`/`pgid`/`sid`: published copies of TASKLIST state — (e)
-- Where: `task/mod.rs` `Task.ppid`, `pgid`, `sid`; writers in
-  `task/percpu.rs` (reparent, `setpgid`/`setsid`, fork); readers `getppid`,
-  `getpgid`, `do_wait` filters, `fs/proc/array.rs`.
-- Wrong: numeric mirrors of `TaskInner.pgrp`/`session`/parent link, kept in
-  step by hand across every thread of a group; a lockless reader can see a
-  number whose struct pid is already gone or reused, and `getpgrp` can
-  disagree with a concurrent `kill(-pgrp)` decided under TASKLIST.
-- Linux: no copies; `task_pgrp`/`task_session` dereference
-  `signal->pids[]` under RCU, `getppid` reads `rcu_dereference(real_parent)->tgid`.
-- Fix: read through the struct pid under RCU (or TASKLIST read where already
-  held); delete the mirrors.
 
 ### 22. Inode identity bits as unrelated atomics — (b), low
 - Where: `fs/inode.rs` `Inode.mode`, `uid`, `gid` (chown/chmod write them

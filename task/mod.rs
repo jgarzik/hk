@@ -690,7 +690,7 @@ pub mod tif {
 /// - hot counters and flags: atomics written by the task itself (or
 ///   its creator before it first runs) or under TASKLIST, and read
 ///   lock-free by anyone (accounting, `flags`, `thread_flags`, `cpu`,
-///   `ppid`/`pgid`/`sid`, `seccomp_mode`);
+///   `seccomp_mode`);
 /// - `cred`: read by the task itself without a lock and by others under
 ///   TASKLIST, replaced by the task under TASKLIST (commit_creds);
 /// - the `alloc_lock` fields (Linux task_lock: `mm`, `files`, `fs`,
@@ -756,13 +756,6 @@ pub struct Task {
     /// before its CPU's rq lock (`try_to_wake_up`)
     pub pi_lock: crate::sync::IrqSpinlock<()>,
 
-    /// Parent process ID (0 for init/orphans; written under TASKLIST)
-    pub ppid: AtomicU64,
-    /// Process group ID: the number of `TaskInner.pgrp` (written with
-    /// it under TASKLIST's write lock, in every thread of the group)
-    pub pgid: AtomicU64,
-    /// Session ID: likewise for `TaskInner.session`
-    pub sid: AtomicU64,
     /// User TLS register (x86-64 FS base, arm64 TPIDR_EL0), saved at
     /// switch-out and loaded at switch-in; set by the task itself or its
     /// creator (CLONE_SETTLS)
@@ -888,8 +881,9 @@ pub struct TaskInner {
     /// tasks, tid 0)
     thread_pid: Option<Arc<pid::Pid>>,
     /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
-    /// PIDTYPE_SID]): the same in every thread of the group, numbered
-    /// by the `pgid`/`sid` atomics; None for kernel threads
+    /// PIDTYPE_SID]): the same in every thread of the group, the only
+    /// record of its group and session ([`TaskInner::pgid`], `sid`);
+    /// None for kernel threads
     pgrp: Option<Arc<pid::Pid>>,
     session: Option<Arc<pid::Pid>>,
     /// A group leader on its `pgrp`'s and `session`'s lists
@@ -1123,6 +1117,25 @@ impl TaskInner {
         self.real_parent.as_ref().and_then(|w| w.upgrade())
     }
 
+    /// Its real parent's process (root number), 0 for none (Linux
+    /// task_tgid_nr(real_parent)); the parent is listed while TASKLIST
+    /// is held, so the reference taken frees nothing
+    pub fn ppid(&self) -> Pid {
+        self.real_parent().map_or(0, |p| p.pid)
+    }
+
+    /// Its process group (root number), 0 for none (Linux
+    /// pid_nr(task_pgrp))
+    pub fn pgid(&self) -> Pid {
+        self.pgrp.as_ref().map_or(0, |p| Pid::from(p.nr()))
+    }
+
+    /// Its session (root number), 0 for none (Linux
+    /// pid_nr(task_session))
+    pub fn sid(&self) -> Pid {
+        self.session.as_ref().map_or(0, |p| Pid::from(p.nr()))
+    }
+
     /// Its current state
     pub fn state(&self) -> TaskState {
         self.state
@@ -1219,9 +1232,6 @@ crate::owned_adapter!(pub ThreadNode, Task, thread_node, thread_owner);
 /// The ids a new task starts with
 pub struct TaskIds {
     pub pid: Pid,
-    pub ppid: Pid,
-    pub pgid: Pid,
-    pub sid: Pid,
     pub seccomp_mode: u8,
 }
 
@@ -1586,9 +1596,6 @@ impl Task {
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
             pi_lock: crate::sync::IrqSpinlock::new(()),
-            ppid: AtomicU64::new(ids.ppid),
-            pgid: AtomicU64::new(ids.pgid),
-            sid: AtomicU64::new(ids.sid),
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
@@ -1653,9 +1660,6 @@ impl Task {
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),
             pi_lock: crate::sync::IrqSpinlock::new(()),
-            ppid: AtomicU64::new(0),
-            pgid: AtomicU64::new(0),
-            sid: AtomicU64::new(0),
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(0),
@@ -1727,18 +1731,6 @@ impl Task {
     /// The locked fields (see [`TableCell`]); None for the boot task
     pub fn inner(&self) -> &TableCell<Option<TaskInner>> {
         &self.inner
-    }
-
-    pub fn ppid(&self) -> Pid {
-        self.ppid.load(Ordering::Relaxed)
-    }
-
-    pub fn pgid(&self) -> Pid {
-        self.pgid.load(Ordering::Relaxed)
-    }
-
-    pub fn sid(&self) -> Pid {
-        self.sid.load(Ordering::Relaxed)
     }
 
     /// Seccomp mode (syscall entry)

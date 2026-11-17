@@ -16,7 +16,7 @@ use crate::signal::{
     dequeue_signal, get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info,
     si_code, ss_flags, with_task_signal_state,
 };
-use crate::task::percpu::{TaskRef, current, current_pgid, current_tid, get_all_pids};
+use crate::task::percpu::{TaskRef, current, current_tid, get_all_pids};
 use crate::time::time_syscall::LinuxTimespec;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
@@ -245,7 +245,7 @@ impl Sender {
         if c.euid == tc.suid || c.euid == tc.uid || c.uid == tc.suid || c.uid == tc.uid {
             return Ok(());
         }
-        if sig == Some(SIGCONT) && self.sid == t.task.sid() {
+        if sig == Some(SIGCONT) && self.sid == t.sid() {
             return Ok(());
         }
         Err(KernelError::NotPermitted)
@@ -330,7 +330,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> KernelResult<()> {
     match pid {
         1.. => user_group_send(vpid(pid as u64)?, sig, SendInfo::User),
         // Every process in the caller's process group, once each
-        0 => kill_pgrp(current_pgid(), sig, SendInfo::User, check),
+        0 => crate::signal::kill_own_pgrp(sig, SendInfo::User, check),
         -1 => kill_all(sig),
         // Every process in group -pid, once each (signal 0: does the
         // group exist, may we signal it)

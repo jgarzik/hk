@@ -282,12 +282,11 @@ pub(crate) fn kmain() -> ! {
         + task::percpu::KERNEL_STACK_SIZE as u64;
 
     // The per-CPU scheduler with its idle task, then pid 1 (the idle
-    // tasks are tid 0, Linux swapper). ppid=0 (no parent), pgid=sid=0
+    // tasks are tid 0, Linux swapper). No parent, pgid=sid=0
     // like Linux's init_task (init/init_task.c); init calls setsid()
     // itself if it wants a session
     task::percpu::init();
     let init = task::percpu::create_user_task(task::percpu::UserTaskConfig {
-        ppid: 0, // init has no parent
         pgid: 0, // inherited from init_task, not a group leader
         sid: 0,  // not a session leader until setsid()
         kstack_top: kernel_stack,

@@ -16,18 +16,14 @@ use super::Pid;
 /// # Arguments
 /// * `pid` - Process ID to query (0 = calling process)
 /// * `caller_pid` - PID of calling process
-/// * `caller_pgid` - PGID of calling process
-pub fn sys_getpgid(pid: i32, caller_pid: Pid, caller_pgid: Pid) -> KernelResult<i64> {
+pub fn sys_getpgid(pid: i32, caller_pid: Pid) -> KernelResult<i64> {
     if pid < 0 {
         return Err(KernelError::NoProcess);
     }
-    // The caller's number (Linux find_task_by_vpid)
+    // The caller's number (Linux find_task_by_vpid); reported in the
+    // caller's namespace, 0 for a group outside it (Linux
+    // pid_vnr(task_pgrp(p)))
     let pid = super::pid::from_vnr_or(pid as Pid, caller_pid).ok_or(KernelError::NoProcess)?;
-    // Reported in the caller's namespace, 0 for a group outside it
-    // (Linux pid_vnr(task_pgrp(p)))
-    if pid == caller_pid {
-        return Ok(i64::from(super::pid::vnr(caller_pgid)));
-    }
     let pgid = super::percpu::lookup_task_pgid(pid).ok_or(KernelError::NoProcess)?;
     Ok(i64::from(pgid))
 }
@@ -42,15 +38,11 @@ pub fn sys_getpgid(pid: i32, caller_pid: Pid, caller_pgid: Pid) -> KernelResult<
 /// # Arguments
 /// * `pid` - Process ID to query (0 = calling process)
 /// * `caller_pid` - PID of calling process
-/// * `caller_sid` - SID of calling process
-pub fn sys_getsid(pid: i32, caller_pid: Pid, caller_sid: Pid) -> KernelResult<i64> {
+pub fn sys_getsid(pid: i32, caller_pid: Pid) -> KernelResult<i64> {
     if pid < 0 {
         return Err(KernelError::NoProcess);
     }
     let pid = super::pid::from_vnr_or(pid as Pid, caller_pid).ok_or(KernelError::NoProcess)?;
-    if pid == caller_pid {
-        return Ok(i64::from(super::pid::vnr(caller_sid)));
-    }
     let sid = super::percpu::lookup_task_sid(pid).ok_or(KernelError::NoProcess)?;
     Ok(i64::from(sid))
 }
@@ -71,15 +63,7 @@ pub fn sys_getsid(pid: i32, caller_pid: Pid, caller_sid: Pid) -> KernelResult<i6
 /// * `pid` - Process to modify (0 = calling process)
 /// * `pgid` - New process group ID (0 = use pid)
 /// * `caller_pid` - PID of calling process
-/// * `caller_pgid` - Current PGID of calling process
-/// * `caller_sid` - SID of calling process
-pub fn sys_setpgid(
-    pid: i32,
-    pgid: i32,
-    caller_pid: Pid,
-    _caller_pgid: Pid,
-    caller_sid: Pid,
-) -> KernelResult<()> {
+pub fn sys_setpgid(pid: i32, pgid: i32, caller_pid: Pid) -> KernelResult<()> {
     // Linux: a negative pgid is EINVAL, a negative pid names no task
     if pgid < 0 {
         return Err(KernelError::InvalidArgument);
@@ -97,7 +81,7 @@ pub fn sys_setpgid(
     } else {
         super::pid::from_vnr(pgid as Pid).ok_or(KernelError::NotPermitted)?
     };
-    super::percpu::set_task_pgid(caller_pid, target_pid, new_pgid, caller_sid)
+    super::percpu::set_task_pgid(caller_pid, target_pid, new_pgid)
 }
 
 /// sys_setsid - create session and set process group ID

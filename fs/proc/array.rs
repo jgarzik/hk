@@ -141,7 +141,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     Some(Snap {
         pid: u64::from(nr(me, ns)),
         tgid: u64::from(nr(leader, ns)),
-        ppid: task_nr(t.task.ppid()),
+        ppid: task_nr(t.ppid()),
         pgid: u64::from(nr(pg, ns)),
         sid: u64::from(nr(se, ns)),
         ns_ids,

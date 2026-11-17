@@ -446,7 +446,7 @@ fn get_task_info(t: &Task) -> TaskInfo {
         uid,
         gid,
         tgid: pid_of(t.pid),
-        parent: pid_of(t.ppid()),
+        parent: pid_of(table.view(t).map_or(0, |v| v.ppid())),
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,

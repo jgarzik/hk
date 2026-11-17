@@ -420,7 +420,7 @@ pub fn notify_cld() {
     super::notify::notify_parent_cldstop(&table, &me, false, why);
     if let Some(l) = table.get(me.pid)
         && l.ptrace() != 0
-        && l.tracer().is_some_and(|tr| tr.pid != l.task.ppid())
+        && l.tracer().is_some_and(|tr| tr.pid != l.ppid())
     {
         let leader = crate::task::percpu::task_ref(l.task);
         super::notify::notify_parent_cldstop(&table, &leader, true, why);

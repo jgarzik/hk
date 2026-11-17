@@ -1345,8 +1345,14 @@ numbers, so a recycled tid cannot inherit a parent or tracer link. A
 group leader is on its real parent's `children` (intrusive `ArcList`,
 link `Task.sibling`, one strong reference each; Linux only lists
 leaders); `link_child` at fork and exec's leader change, unlinked at
-reap. An exiting task first detaches its tracees (exit_ptrace), then
-hands its children to another live thread
+reap. Every thread of a process has the same `real_parent` (a
+CLONE_THREAD child copies its creator's; `adopt` moves them all, Linux
+forget_original_parent's for_each_thread), and a parent's pid is read
+only through it (`TaskInner::ppid`, Linux task_tgid_nr(real_parent))
+under TASKLIST: getppid, wait, /proc stat, acct. The parent is listed
+while the link is read, so the reference taken frees nothing. An
+exiting task first detaches its tracees (exit_ptrace), then hands its
+children to another live thread
 of its group, else a live thread of the nearest ancestor process in
 its pid namespace that is a child subreaper
 (`SignalStruct.subreaper`), else its namespace's reaper
@@ -1373,8 +1379,13 @@ them (`TaskInner.pids_linked`), like Linux: linked when inserted
 change; unlinked at `remove` (release or reap; a zombie leader stays,
 as in Linux). Every thread holds a reference to its group's and
 session's `Pid` (`TaskInner.pgrp`/`session`, Linux signal->pids), so
-a `Pid` outlives its group even after its own task is gone; the
-`pgid`/`sid` atomics carry the numbers for lock-free getpgid/getsid.
+a `Pid` outlives its group even after its own task is gone. They are
+the only record (Linux has no copies): a task's group and session
+numbers are read through them (`TaskInner::pgid`/`sid`, root numbers)
+under TASKLIST, the caller's own taking its read lock
+(`current_pgid`/`current_sid`) or inside a section it holds
+(`cur_pgid`: wait; kill(0) walks the group it reads, `kill_own_pgrp`;
+setpgid checks the caller's session in its write section).
 setpgid and setsid change every thread of the process in one write
 section (`change_pids`, walking the leader's `threads` list: nothing
 is allocated); fork copies the creator's under the same
@@ -1395,7 +1406,7 @@ A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
 `pid_ns`, `kind`, `kstack_top`); hot atomics written by the task itself (or its
 creator before it first runs) or under TASKLIST, and read lock-free
 by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
-`start_time`, `ppid`/`pgid`/`sid`, `seccomp_mode`, `tls`, utime/stime
+`start_time`, `seccomp_mode`, `tls`, utime/stime
 and the other counters; utime/stime are tick samples, added (a load
 and a store) only by the tick of the CPU running the task, interrupts
 off (3.5); `prev_cputime`, in the
@@ -1567,7 +1578,7 @@ frees it), so the pointer stays valid while the task runs.
 `task::percpu::current()` returns a `!Send` `Cur` handle; 0 means the
 boot task `INIT_TASK` (Linux init_task: tid 0, root, never in
 TASKLIST), so current is never missing. Read lock-free through it:
-`tid`, `pid`, the hot atomics (`ppid`/`pgid`/`sid`, `seccomp_mode`,
+`tid`, `pid`, the hot atomics (`seccomp_mode`,
 `flags`, `thread_flags`, accounting, `tls`), `cred` (others read it
 under TASKLIST) and the alloc_lock fields but `io_context` (Linux
 current->mm/files/fs/nsproxy/comm: only the task itself changes them,
