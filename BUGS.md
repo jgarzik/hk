@@ -1140,8 +1140,8 @@ Tag = roadmap phase (doc/ROADMAP.md).
   kernel SIMD use with kernel_neon_begin/end.
 - Large frames left: `do_clone` (TaskInner and the clone state live by
   value; Linux dup_task_struct builds in the allocated task), splice's
-  on-stack page buffers, `setup_rt_frame`, `gen_status`,
-  `munmap_locked`, `link_path_walk_rcu` and `Nd::lazy`.
+  on-stack page buffers, `setup_rt_frame`, `gen_status` and
+  `munmap_locked`.
 
 ## DRM dumb buffers are the boot framebuffer only
 

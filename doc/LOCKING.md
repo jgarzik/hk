@@ -3678,7 +3678,9 @@ copied. If a legitimize fails, or a
 sequence moved, the walk is ECHILD and the lookup is done again in
 ref mode from its start (a new `Nd`: path_init's sequences sampled
 again). What a failed legitimize took is put after the guard
-(`Puts`, Linux terminate_walk): a put may be the last. Its slots are
+(`Puts`, Linux terminate_walk; the links legitimize_links took stay
+on the link stack, which the walk's caller keeps, `Nd::walk`, and
+drops after the guard): a put may be the last. Its slots are
 fixed by role, as terminate_walk's set (the walk's place, the symlink
 being picked, the root, a mount taken without its dentry,
 try_to_unlazy_next's child), each filled at most once since every fill ends the walk; a

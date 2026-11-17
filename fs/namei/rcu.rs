@@ -103,7 +103,9 @@ struct Rcu<'g> {
 ///
 /// One slot per role, as Linux's terminate_walk puts a fixed set: the
 /// walk's own place (nd->path), the symlink being picked (the top of
-/// the link stack; the links below it in `links`), the root (ND_ROOT_GRABBED), a mount whose dentry
+/// the link stack; the links below it, as far as a failed
+/// legitimize_links took them, stay on the caller's [`Held`], put
+/// when the walk returns), the root (ND_ROOT_GRABBED), a mount whose dentry
 /// could not be taken (legitimize_mnt's put), and try_to_unlazy_next's
 /// child. Each is
 /// filled at most once: every fill is on a path that ends the RCU walk
@@ -121,10 +123,8 @@ pub(super) struct Puts {
     root: Option<Path>,
     mnt: Option<MountRef>,
     dentry: Option<DentryRef>,
-    /// The link stack, as far as a failed legitimize_links took it
-    /// (Linux drop_links and terminate_walk's puts up to nd->depth),
-    /// and the mount of the link it failed on
-    links: Option<Held>,
+    /// The mount of the link a failed legitimize_links stopped at
+    /// (Linux drop_links)
     links_mnt: Option<MountRef>,
 }
 
@@ -182,16 +182,15 @@ impl Puts {
 
 /// Where a walk goes on in ref mode once it left RCU mode (Linux: the
 /// same loop, LOOKUP_RCU cleared, from where try_to_unlazy returned):
-/// what it stood on, the link stack with each link held
-/// (legitimize_links), the rest of the caller's path below it, the
-/// flags (a trailing slash a symlink's body ended in added:
-/// lookup_last) and the symlinks followed so far (nd->total_link_count).
-/// The current text (the top body's rest, else `user`) starts at the
-/// component the walk stopped at (`Comp`, `Lookup`, `Child`), or after
-/// it (`Step`, `Link`: a body it ended put already); empty for `Done`.
+/// what it stood on, the rest of the caller's path below the link stack
+/// (each link held on the caller's [`Held`]: legitimize_links), the
+/// flags (a trailing slash added: lookup_last) and the symlinks
+/// followed so far (nd->total_link_count). The current text (the top
+/// body's rest, else `user`) starts at the component the walk stopped
+/// at (`Comp`, `Lookup`, `Child`), or after it (`Step`, `Link`: a body
+/// it ended put already); empty for `Done`.
 pub(super) struct Lazy<'p> {
     pub(super) to: To,
-    pub(super) stack: Held,
     pub(super) user: &'p [u8],
     pub(super) f: LookupFlags,
     pub(super) depth: usize,
@@ -446,27 +445,33 @@ impl<T> EmbStack<T> {
         self.emb.iter_mut().rev().find_map(Option::take).is_some()
     }
 
-    /// Its levels, bottom first
-    fn into_levels(self) -> impl Iterator<Item = T> {
-        self.emb.into_iter().flatten().chain(self.more)
+    /// Its levels taken out, bottom first, one at a time (none is
+    /// copied whole)
+    fn drain_levels(&mut self) -> impl Iterator<Item = T> + '_ {
+        let Self { emb, more } = self;
+        emb.iter_mut()
+            .filter_map(Option::take)
+            .chain(more.drain(..))
     }
 }
 
 /// The RCU walk's symlink stack (Linux nd->stack, nd->internal): two
 /// levels in place, the rest allocated GFP_ATOMIC on first need
 /// (nd_alloc_stack under LOOKUP_RCU), MAX_SYMLINK_DEPTH levels at most;
-/// with it, empty, the stack its levels become once legitimized, its
-/// room reserved alongside (no allocation in legitimize_links)
-struct Stack<'g> {
+/// with it, empty, the walk's ref-mode stack its levels become once
+/// legitimized, kept by the walk's caller (Linux nameidata on the
+/// caller's stack), its room reserved alongside (no allocation in
+/// legitimize_links)
+struct Stack<'g, 'h> {
     frames: EmbStack<Frame<'g>>,
-    held: Held,
+    held: &'h mut Held,
 }
 
-impl<'g> Stack<'g> {
-    fn new() -> Self {
+impl<'g, 'h> Stack<'g, 'h> {
+    fn new(held: &'h mut Held) -> Self {
         Self {
             frames: EmbStack::default(),
-            held: Held::default(),
+            held,
         }
     }
 
@@ -534,26 +539,25 @@ fn legitimize_path(
 }
 
 /// legitimize_links: a reference to each link on `stack`, bottom first,
-/// unless one moved since it was picked (its `d_seq`, MOUNT_LOCK's
-/// sequence `m_seq`); on a failure, what was taken (and the mount of
-/// the link it failed on) goes to `puts`, put after the guard (Linux
-/// drop_links, terminate_walk). No allocation: the levels past the
-/// embedded ones go in room reserved with them.
-fn legitimize_links(stack: Stack<'_>, m_seq: u32, puts: &mut Puts) -> Option<Held> {
-    let Stack { frames, mut held } = stack;
-    for fr in frames.into_levels() {
+/// onto its held stack, unless one moved since it was picked (its
+/// `d_seq`, MOUNT_LOCK's sequence `m_seq`): false then, what was taken
+/// left on the held stack, which its owner puts after the guard (Linux
+/// drop_links, terminate_walk), the mount of the link it failed on in
+/// `puts`. No allocation: the levels past the embedded ones go in room
+/// reserved with them.
+fn legitimize_links(stack: &mut Stack<'_, '_>, m_seq: u32, puts: &mut Puts) -> bool {
+    let Stack { frames, held } = stack;
+    for fr in frames.drain_levels() {
         let mnt = match MountRef::legitimize(fr.mnt, m_seq) {
             Ok(m) => m,
             Err(m) => {
                 puts.links_mnt = m;
-                puts.links = Some(held);
-                return None;
+                return false;
             }
         };
         let Some(d) = DentryRef::try_get(fr.link) else {
             puts.links_mnt = Some(mnt);
-            puts.links = Some(held);
-            return None;
+            return false;
         };
         let moved = fr.link.d_seq_retry(fr.seq);
         held.0.push(HeldFrame {
@@ -567,11 +571,10 @@ fn legitimize_links(stack: Stack<'_>, m_seq: u32, puts: &mut Puts) -> Option<Hel
             tail_empty: fr.tail_empty,
         });
         if moved {
-            puts.links = Some(held);
-            return None;
+            return false;
         }
     }
-    Some(held)
+    true
 }
 
 /// The end of step_into under LOOKUP_RCU, onto `d` (on `mnt`, its
@@ -622,7 +625,10 @@ impl Nd<'_> {
     /// the ref walk may go deep); ECHILD if it could not leave RCU mode
     /// (the caller walks again in ref mode). The root and the cwd are
     /// read under the fs_struct's sequence with no reference, a held
-    /// start borrowed (Linux path_init under LOOKUP_RCU).
+    /// start borrowed (Linux path_init under LOOKUP_RCU). The links the
+    /// walk holds on leaving RCU mode go on `links` (its caller's,
+    /// empty: put when the caller drops it, after the guard, whatever
+    /// the outcome).
     #[inline(never)]
     pub(super) fn walk_rcu<'p>(
         &self,
@@ -630,6 +636,7 @@ impl Nd<'_> {
         abs: bool,
         path: &'p [u8],
         f: LookupFlags,
+        links: &mut Held,
     ) -> Result<Lazy<'p>, KernelError> {
         let fs = self.fs();
         // Boot code with no fs_struct: the namespace's root, held
@@ -668,7 +675,9 @@ impl Nd<'_> {
             Start::Preset(_) => root,
         };
         let rc = Rcu { g: &g, root, held };
-        let r = self.link_path_walk_rcu(&rc, at, path, f, &mut puts);
+        let mut stack = Stack::new(links);
+        let r = self.link_path_walk_rcu(&rc, at, path, f, &mut stack, &mut puts);
+        drop(stack);
         drop(g);
         // leave_rcu, whatever the outcome; then terminate_walk's puts
         self.rcu.set(false);
@@ -687,10 +696,10 @@ impl Nd<'_> {
         mut cur: RcuPath<'g>,
         path: &'p [u8],
         mut f: LookupFlags,
+        stack: &mut Stack<'g, '_>,
         puts: &mut Puts,
     ) -> Result<Lazy<'p>, KernelError> {
         let mut user = path;
-        let mut stack = Stack::new();
         let mut total = 0;
         loop {
             // The current text: the top body's rest, else the path's
@@ -794,9 +803,7 @@ impl Nd<'_> {
                     tail_empty: last,
                 },
             };
-            if let Some(to) =
-                self.pick_link_rcu(rc, &mut cur, &mut stack, l, &mut total, f, puts)?
-            {
+            if let Some(to) = self.pick_link_rcu(rc, &mut cur, stack, l, &mut total, f, puts)? {
                 return self.lazy(to, stack, user, 0, f, total, puts);
             }
         }
@@ -806,7 +813,6 @@ impl Nd<'_> {
         let p = self.unlazy(rc, &cur, false, self.scoped, puts)?;
         Ok(Lazy {
             to: To::Done(p),
-            stack: Held::default(),
             user: &[],
             f,
             depth: total,
@@ -815,14 +821,14 @@ impl Nd<'_> {
 
     /// What ref mode goes on with: `to`, and the rest of the name from
     /// offset `from` of the current text (the top body's rest, else the
-    /// path's), with the link stack held (Linux try_to_unlazy's
-    /// legitimize_links; ECHILD if a link moved, and the lookup starts
-    /// over in ref mode); no body is copied
+    /// path's), with the link stack held on the caller's stack (Linux
+    /// try_to_unlazy's legitimize_links; ECHILD if a link moved, and the
+    /// lookup starts over in ref mode); no body is copied
     #[allow(clippy::too_many_arguments)]
     fn lazy<'p>(
         &self,
         to: To,
-        stack: Stack<'_>,
+        stack: &mut Stack<'_, '_>,
         user: &'p [u8],
         from: usize,
         f: LookupFlags,
@@ -832,28 +838,21 @@ impl Nd<'_> {
         if stack.depth() == 0 {
             return Ok(Lazy {
                 to,
-                stack: Held::default(),
                 user: &user[from..],
                 f,
                 depth,
             });
         }
-        let Some(mut held) = legitimize_links(stack, self.m_seq, puts) else {
+        if !legitimize_links(stack, self.m_seq, puts) {
             // `to`'s references go after the guard, with the walk's
             // other leftovers
             puts.to(to);
             return Err(ECHILD);
-        };
-        if let Some(top) = held.0.top_mut() {
+        }
+        if let Some(top) = stack.held.0.top_mut() {
             top.pos += from;
         }
-        Ok(Lazy {
-            to,
-            stack: held,
-            user,
-            f,
-            depth,
-        })
+        Ok(Lazy { to, user, f, depth })
     }
 
     /// may_lookup under LOOKUP_RCU: `cur` is a directory (link_path_walk's
@@ -874,7 +873,9 @@ impl Nd<'_> {
     /// where ref mode takes over (a miss, an answer other than valid).
     /// For an O_CREAT open's last name (lookup_fast_for_open), O_EXCL
     /// does not look and a negative entry is discarded: ref mode's
-    /// lookup_open, after try_to_unlazy.
+    /// lookup_open, after try_to_unlazy. Out of line, as
+    /// [`Nd::pick_link_rcu`]: its locals stay out of the loop's frame.
+    #[inline(never)]
     fn lookup_fast_rcu<'g>(
         &self,
         rc: &Rcu<'g>,
@@ -1073,11 +1074,12 @@ impl Nd<'_> {
     /// to update, a body only ref mode can give (ECHILD), or a stack
     /// level that could not be allocated.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn pick_link_rcu<'g>(
         &self,
         rc: &Rcu<'g>,
         cur: &mut RcuPath<'g>,
-        stack: &mut Stack<'g>,
+        stack: &mut Stack<'g, '_>,
         l: PickRcu<'g>,
         total: &mut usize,
         f: LookupFlags,

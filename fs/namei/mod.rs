@@ -449,9 +449,11 @@ fn link_body(inode: &Inode) -> Result<Body, KernelError> {
 /// A ref-mode walk's name and link stack (Linux nameidata's nd->stack
 /// and the name it walks, LOOKUP_RCU clear): the current text is the
 /// top body's rest, else the caller's path; each link stays held until
-/// its body is walked (put_link), so no body is copied
-struct RefWalk<'p> {
-    stack: Held,
+/// its body is walked (put_link), so no body is copied. The stack is
+/// the walk's caller's ([`Nd::walk`]: Linux keeps nameidata, nd->stack's
+/// embedded levels in it, on its caller's stack), borrowed, never moved.
+struct RefWalk<'p, 'h> {
+    stack: &'h mut Held,
     user: &'p [u8],
     f: LookupFlags,
     /// Symlinks followed so far (nd->total_link_count)
@@ -469,9 +471,9 @@ struct Comp {
     slash: bool,
 }
 
-impl<'p> RefWalk<'p> {
+impl<'p, 'h> RefWalk<'p, 'h> {
     fn new(
-        mut stack: Held,
+        stack: &'h mut Held,
         user: &'p [u8],
         f: LookupFlags,
         total: usize,
@@ -786,7 +788,9 @@ impl<'a> Nd<'a> {
     /// link_path_walk + lookup_last from `start` (the root for an
     /// absolute path): in RCU mode while the lookup is still in it
     /// (only its first walk; a later walk starts in ref mode), else in
-    /// ref mode, each following symlinks on its own link stack
+    /// ref mode, each following symlinks on the link stack kept here
+    /// (Linux nd->stack: the links an RCU walk legitimized, then the
+    /// ref walk's; put when this returns, after any RCU guard)
     fn walk(&self, start: Start<'_>, path: &[u8], f: LookupFlags) -> Result<Path, KernelError> {
         // An absolute path starts at the root (nd_jump_root): never
         // beneath dirfd
@@ -794,11 +798,12 @@ impl<'a> Nd<'a> {
         if abs && f.beneath {
             return Err(KernelError::CrossDevice);
         }
+        let mut links = Held::default();
         if self.rcu.get() {
-            let l = self.walk_rcu(start, abs, path, f)?;
-            return self.unlazied(l);
+            let l = self.walk_rcu(start, abs, path, f, &mut links)?;
+            return self.unlazied(l, &mut links);
         }
-        self.walk_ref_from(start, abs, path, f)
+        self.walk_ref_from(start, abs, path, f, &mut links)
     }
 
     /// A walk in ref mode from its start (Linux link_path_walk without
@@ -811,20 +816,21 @@ impl<'a> Nd<'a> {
         abs: bool,
         path: &[u8],
         f: LookupFlags,
+        links: &mut Held,
     ) -> Result<Path, KernelError> {
         let start = if abs {
             self.root()?.clone()
         } else {
             self.start_ref(start)?
         };
-        let mut w = RefWalk::new(Held::default(), path, f, 0)?;
+        let mut w = RefWalk::new(links, path, f, 0)?;
         self.walk_ref(start, &mut w)
     }
 
     /// The walk's loop in ref mode, from `cur` (Linux link_path_walk
     /// without LOOKUP_RCU, then lookup_last): a symlink's body is walked
     /// from the link stack, the link held meanwhile
-    fn walk_ref(&self, mut cur: Path, w: &mut RefWalk<'_>) -> Result<Path, KernelError> {
+    fn walk_ref(&self, mut cur: Path, w: &mut RefWalk<'_, '_>) -> Result<Path, KernelError> {
         while let Some(c) = w.next()? {
             let dir = may_lookup(self.cred(), &cur.dentry)?;
             if c.last {
@@ -958,7 +964,7 @@ impl<'a> Nd<'a> {
         cur: Path,
         found: Found,
         last: bool,
-        w: &mut RefWalk<'_>,
+        w: &mut RefWalk<'_, '_>,
     ) -> Result<Path, KernelError> {
         match found {
             Found::Child(d) => self.step(cur, d, last, w),
@@ -983,7 +989,7 @@ impl<'a> Nd<'a> {
         cur: Path,
         d: DentryRef,
         last: bool,
-        w: &mut RefWalk<'_>,
+        w: &mut RefWalk<'_, '_>,
     ) -> Result<Path, KernelError> {
         let child = step_mounts(Path::new(cur.mnt.clone(), d), w.f)?;
         if (!last || w.f.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
@@ -997,15 +1003,9 @@ impl<'a> Nd<'a> {
     /// rest of the name it handed over and the symlinks it followed
     /// counted
     #[inline(never)]
-    fn unlazied(&self, l: Lazy<'_>) -> Result<Path, KernelError> {
-        let Lazy {
-            to,
-            stack,
-            user,
-            f,
-            depth,
-        } = l;
-        let mut w = RefWalk::new(stack, user, f, depth)?;
+    fn unlazied(&self, l: Lazy<'_>, links: &mut Held) -> Result<Path, KernelError> {
+        let Lazy { to, user, f, depth } = l;
+        let mut w = RefWalk::new(links, user, f, depth)?;
         let cur = match to {
             To::Done(p) => return self.finish(p, w.f),
             To::Comp(cur) => cur,
@@ -1061,7 +1061,7 @@ impl<'a> Nd<'a> {
         dir: Path,
         link: Path,
         last: bool,
-        w: &mut RefWalk<'_>,
+        w: &mut RefWalk<'_, '_>,
     ) -> Result<Path, KernelError> {
         if w.total >= MAX_SYMLINK_DEPTH {
             return Err(KernelError::TooManySymlinks);
@@ -1104,7 +1104,7 @@ impl<'a> Nd<'a> {
         dir: Path,
         link: Path,
         last: bool,
-        w: &mut RefWalk<'_>,
+        w: &mut RefWalk<'_, '_>,
     ) -> Result<Path, KernelError> {
         let inode = link.get_inode().ok_or(KernelError::NotFound)?;
         inode.touch_atime(&link.mnt);
@@ -1647,7 +1647,7 @@ mod tests {
             let mut stack = Held::default();
             stack.push(fr).unwrap();
             let mut w = RefWalk {
-                stack,
+                stack: &mut stack,
                 user: b"x",
                 f: LookupFlags::default(),
                 total: 0,
@@ -1674,7 +1674,7 @@ mod tests {
             })
             .unwrap();
         let mut w = RefWalk {
-            stack,
+            stack: &mut stack,
             user: b"x",
             f: LookupFlags::default(),
             total: 0,
