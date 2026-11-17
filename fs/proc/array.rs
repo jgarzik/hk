@@ -13,6 +13,7 @@
 //! remote reads of cmdline/environ), the sighand action lock, the shared
 //! pending set, `FsStruct.inner` (umask) and the descriptor table lock.
 
+use crate::util::textbuf::TextBuf;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -209,16 +210,6 @@ fn comm(s: &Snap, escape: bool) -> Vec<u8> {
     out
 }
 
-/// A byte buffer that formats like a String but also takes raw bytes
-struct Out(Vec<u8>);
-
-impl core::fmt::Write for Out {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
-    }
-}
-
 /// (ignored, caught) signals (Linux collect_sigign_sigcatch)
 fn ign_cgt(s: &Snap) -> (u64, u64) {
     s.sighand.as_ref().map_or((0, 0), |h| h.ign_cgt())
@@ -304,7 +295,7 @@ pub fn gen_status(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
     let Some(s) = snap(t, ns) else {
         return Vec::new();
     };
-    let mut o = Out(Vec::new());
+    let mut o = TextBuf::default();
     let c = &s.cred;
     let (letter, name) = state(&s);
     o.0.extend_from_slice(b"Name:\t");
@@ -369,7 +360,7 @@ pub fn gen_status(t: &TaskRef, ns: &PidNamespace) -> Vec<u8> {
 
 /// The Vm* lines (Linux task_mem; hk keeps no high-water marks, so
 /// VmPeak/VmHWM are the current sizes)
-fn status_mem(o: &mut Out, v: &VmStat) {
+fn status_mem(o: &mut TextBuf, v: &VmStat) {
     // Printed one by one, as Linux task_mem: no table on the stack
     kb_line(o, "VmPeak", v.total);
     kb_line(o, "VmSize", v.total);
@@ -391,7 +382,7 @@ fn status_mem(o: &mut Out, v: &VmStat) {
 }
 
 /// Threads, SigQ and the signal sets (Linux task_sig)
-fn status_sig(o: &mut Out, s: &Snap) {
+fn status_sig(o: &mut TextBuf, s: &Snap) {
     let qlim = s
         .signal
         .as_ref()
@@ -409,13 +400,13 @@ fn status_sig(o: &mut Out, s: &Snap) {
 }
 
 /// A `key:\t` line of `pages` in kB (Linux task_mem's SEQ_PUT_DEC)
-fn kb_line(o: &mut Out, key: &str, pages: u64) {
+fn kb_line(o: &mut TextBuf, key: &str, pages: u64) {
     let _ = writeln!(o, "{key}:\t{:>8} kB", pages * 4);
 }
 
 /// A `key:\t` line of a 64-bit set in hex (Linux render_sigset_t,
 /// render_cap_t)
-fn hex_line(o: &mut Out, key: &str, v: u64) {
+fn hex_line(o: &mut TextBuf, key: &str, v: u64) {
     let _ = writeln!(o, "{key}:\t{v:016x}");
 }
 
@@ -451,7 +442,7 @@ fn fmt_stat(
     let flags = if s.kthread { PF_KTHREAD } else { 0 } | if s.exiting { PF_EXITING } else { 0 };
     let running = matches!(s.state, TaskState::Running | TaskState::Ready);
     let wchan = u8::from(permitted && s.threads < 2 && !running);
-    let mut o = Out(Vec::new());
+    let mut o = TextBuf::default();
     let _ = write!(o, "{} (", s.pid);
     o.0.extend_from_slice(&comm(s, false));
     let _ = write!(o, ") {} ", state(s).0);

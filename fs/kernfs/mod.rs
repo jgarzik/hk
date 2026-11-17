@@ -45,7 +45,6 @@ pub mod vfs;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::fmt;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::RwSem;
@@ -67,21 +66,7 @@ const DEACTIVATED: i32 = i32::MIN / 2;
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 
 /// Output of a show() (Linux sysfs_emit buffer)
-#[derive(Default)]
-pub struct SysBuf(pub Vec<u8>);
-
-impl SysBuf {
-    pub fn bytes(&mut self, b: &[u8]) {
-        self.0.extend_from_slice(b);
-    }
-}
-
-impl fmt::Write for SysBuf {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
-    }
-}
+pub use crate::util::textbuf::TextBuf as SysBuf;
 
 /// A text attribute (Linux sysfs_ops show/store)
 pub trait Attr: Send + Sync {

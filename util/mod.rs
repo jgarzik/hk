@@ -28,3 +28,4 @@ pub mod scope;
 pub mod seg;
 pub mod siphash;
 pub mod smallvec;
+pub mod textbuf;

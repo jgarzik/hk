@@ -46,6 +46,7 @@ use crate::fs::tracefs::{self, TraceFops};
 use crate::sync::{IrqSpinlock, Mutex};
 use crate::util::kalloc::arc_nofail;
 use crate::util::kmem::try_vec;
+use crate::util::textbuf::TextBuf;
 
 /// Bytes of each CPU's ring
 const RING_SIZE: usize = 64 * 1024;
@@ -446,7 +447,7 @@ fn trace_text() -> Result<Vec<u8>, KernelError> {
             .map_err(|_| KernelError::OutOfMemory)?;
         copies.push((cpu, b));
     }
-    let mut out = Out(Vec::new());
+    let mut out = TextBuf::default();
     let _ = write!(
         out,
         "# tracer: nop\n#\n# entries-in-buffer/entries-written: {}/{}   #P:{}\n#\n\
@@ -484,16 +485,6 @@ fn trace_text() -> Result<Vec<u8>, KernelError> {
         pos[i] += l;
     }
     Ok(out.0)
-}
-
-/// The `trace` file's text as it grows (formatting cannot fail)
-struct Out(Vec<u8>);
-
-impl Write for Out {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
-    }
 }
 
 /// /sys/kernel/tracing/trace (Linux tracing_fops)
