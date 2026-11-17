@@ -81,24 +81,30 @@ pub fn format(v: &[i64]) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// One integer as Linux proc_get_long: an optional '-', then a digit,
-/// then base 0 (`0x` hex, a leading `0` octal, else decimal); no '+'
+/// Linux TMPBUFLEN: proc_get_long reads a number from at most this
+/// many bytes less one, and refuses one that fills them
+const TMPBUFLEN: usize = 22;
+
+/// One integer, a whitespace-separated word, as Linux proc_get_long:
+/// an optional '-', then a digit, then base 0 (`0x` hex, a leading `0`
+/// octal, else decimal, strtoul_lenient: no overflow); no '+', nothing
+/// after it, shorter than TMPBUFLEN - 1
 fn parse_long(tok: &str) -> Option<i64> {
-    let (neg, body) = match tok.strip_prefix('-') {
+    if tok.len() >= TMPBUFLEN - 1 {
+        return None;
+    }
+    let tok = tok.as_bytes();
+    let (neg, body) = match tok.strip_prefix(b"-") {
         Some(b) => (true, b),
         None => (false, tok),
     };
-    if !body.as_bytes().first()?.is_ascii_digit() {
+    if !body.first()?.is_ascii_digit() {
         return None;
     }
-    let (radix, digits) = if let Some(h) = body.strip_prefix("0x").or(body.strip_prefix("0X")) {
-        (16, h)
-    } else if body.len() > 1 && body.starts_with('0') {
-        (8, &body[1..])
-    } else {
-        (10, body)
-    };
-    let v = u64::from_str_radix(digits, radix).ok()?;
+    let (v, rest) = crate::util::kstrtox::strtoull_lenient(body, 0).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
     if neg {
         0i64.checked_sub_unsigned(v)
     } else {
@@ -192,6 +198,13 @@ mod tests {
         assert!(parse(b"-", &[5]).is_err());
         assert!(parse(b"1x", &[5]).is_err());
         assert!(parse(b"\n", &[5]).is_err());
+        // u64::from_str_radix took a sign after the prefix; Linux not
+        assert!(parse(b"0+5", &[5]).is_err());
+        assert!(parse(b"0x-5", &[5]).is_err());
+        // 21 bytes fill Linux's buffer: refused, however valid
+        assert_eq!(parse(b"00000000000000000001", &[5]).unwrap(), [1]);
+        assert!(parse(b"000000000000000000001", &[5]).is_err());
+        assert!(parse(b"18446744073709551616", &[5]).is_err());
         assert_eq!(format(&[1, 0]), b"1\t0\n");
     }
 }

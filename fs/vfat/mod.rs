@@ -722,7 +722,7 @@ impl VfatOpts {
                 // Minutes, within a day either way (Linux fsparam_s32:
                 // kstrtoint base 0)
                 b"time_offset" => {
-                    let n = crate::util::kstrtox::kstrtoint(v)
+                    let n = crate::util::kstrtox::kstrtoint(v, 0)
                         .ok()
                         .filter(|n| (-24 * 60..=24 * 60).contains(n))
                         .ok_or(bad)?;

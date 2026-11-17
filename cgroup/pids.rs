@@ -272,7 +272,7 @@ fn pids_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelErro
             PIDS_MAX_UNLIMITED
         } else {
             // Linux pids_max_write: kstrtoll, then 0..PIDS_MAX
-            let v = crate::util::kstrtox::kstrtoll(trimmed.as_bytes())?;
+            let v = crate::util::kstrtox::kstrtoll(trimmed.as_bytes(), 0)?;
             if !(0..PIDS_MAX).contains(&v) {
                 return Err(KernelError::InvalidArgument);
             }

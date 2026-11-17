@@ -33,6 +33,7 @@ use crate::fs::superblock::{
 use crate::mm::filemap::{self, PageAcct};
 use crate::sync::IrqSpinlock;
 use crate::util::kalloc::try_arc;
+use crate::util::kstrtox::{kstrtouint, memparse};
 use crate::util::percpu_counter::PercpuCounter;
 
 /// Inode space one inode takes (Linux BOGO_INODE_SIZE)
@@ -326,66 +327,10 @@ struct Opts {
     noswap: bool,
 }
 
-/// An unsigned number as Linux simple_strtoull with base 0 (0x hex,
-/// leading 0 octal, else decimal): its value and the rest. Wraps on
-/// overflow, as Linux.
-fn strtoull(s: &[u8]) -> (u64, &[u8]) {
-    let (base, mut i) = match s {
-        [b'0', b'x' | b'X', c, ..] if c.is_ascii_hexdigit() => (16, 2),
-        [b'0', ..] => (8, 0),
-        _ => (10, 0),
-    };
-    let mut v = 0u64;
-    while let Some(d) = s.get(i).and_then(|&c| (c as char).to_digit(base)) {
-        v = v.wrapping_mul(u64::from(base)).wrapping_add(u64::from(d));
-        i += 1;
-    }
-    (v, &s[i..])
-}
-
-/// Linux memparse: a number with an optional K, M, G, T, P or E suffix
-/// (either case); its value and the rest
-fn memparse(s: &[u8]) -> (u64, &[u8]) {
-    let (v, rest) = strtoull(s);
-    let shift = match rest.first().map(u8::to_ascii_lowercase) {
-        Some(b'k') => 10,
-        Some(b'm') => 20,
-        Some(b'g') => 30,
-        Some(b't') => 40,
-        Some(b'p') => 50,
-        Some(b'e') => 60,
-        _ => return (v, rest),
-    };
-    (v << shift, &rest[1..])
-}
-
-/// A whole-string unsigned number in `base` (Linux kstrtouint: a
-/// leading '+', base 0 as strtoull, a trailing newline), fitting u32
-fn kstrtou32(s: &[u8], base: u32) -> Option<u32> {
-    let s = s.strip_prefix(b"+").unwrap_or(s);
-    let s = s.strip_suffix(b"\n").unwrap_or(s);
-    let (v, rest) = if base == 0 {
-        strtoull(s)
-    } else {
-        let n = s
-            .iter()
-            .take_while(|&&c| (c as char).is_digit(base))
-            .count();
-        let v = s[..n].iter().try_fold(0u64, |v, &c| {
-            v.checked_mul(u64::from(base))?
-                .checked_add(u64::from((c as char).to_digit(base)?))
-        })?;
-        (v, &s[n..])
-    };
-    if s.is_empty() || !rest.is_empty() {
-        return None;
-    }
-    u32::try_from(v).ok()
-}
-
 /// A uid or gid option: -1 is not a valid id (Linux make_kuid)
+/// (Linux fsparam_u32: kstrtouint base 0)
 fn id(v: &[u8]) -> Option<u32> {
-    kstrtou32(v, 0).filter(|&n| n != u32::MAX)
+    kstrtouint(v, 0).ok().filter(|&n| n != u32::MAX)
 }
 
 /// Split an options string at commas not followed by a digit (Linux
@@ -460,7 +405,7 @@ fn parse(data: &[u8]) -> Result<Opts, KernelError> {
                 o.inodes = Some(n);
             }
             // Linux fsparam_u32oct: octal, masked to the mode bits
-            b"mode" => o.mode = Some((kstrtou32(val()?, 8).ok_or(bad)? & 0o7777) as u16),
+            b"mode" => o.mode = Some((kstrtouint(val()?, 8).map_err(|_| bad)? & 0o7777) as u16),
             b"uid" => o.uid = Some(id(val()?).ok_or(bad)?),
             b"gid" => o.gid = Some(id(val()?).ok_or(bad)?),
             b"huge" if val()? == b"never" => {}
@@ -682,14 +627,9 @@ mod tests {
 
     #[test]
     fn numbers() {
-        assert_eq!(memparse(b"8k"), (8192, &b""[..]));
-        assert_eq!(memparse(b"0x10M"), (16 << 20, &b""[..]));
-        assert_eq!(memparse(b"010"), (8, &b""[..]));
-        assert_eq!(memparse(b"5%"), (5, &b"%"[..]));
-        assert_eq!(kstrtou32(b"755", 8), Some(0o755));
-        assert_eq!(kstrtou32(b"8", 8), None);
-        assert_eq!(kstrtou32(b"", 8), None);
         assert_eq!(id(b"4294967295"), None);
+        assert_eq!(id(b"18446744073709551617"), None);
+        assert_eq!(id(b"+1000\n"), Some(1000));
         assert_eq!(id(b"1000"), Some(1000));
     }
 
