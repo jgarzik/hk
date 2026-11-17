@@ -1971,6 +1971,10 @@ impl InodeOps for VfatInodeOps {
             start_cluster,
             file_size,
         )?;
+        // Linux vfat_create: inode_inc_iversion(dir) right after
+        // vfat_add_entry, before anything that can fail: a negative
+        // dentry of the name is stale from here on
+        dir.inc_iversion();
 
         // Create and return the new inode
         let ino = sb.alloc_ino();
@@ -1997,8 +2001,6 @@ impl InodeOps for VfatInodeOps {
             clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-        // Linux vfat_create: inode_inc_iversion(dir)
-        dir.inc_iversion();
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2061,6 +2063,9 @@ impl InodeOps for VfatInodeOps {
             new_cluster,
             0, // Directories have size 0 in FAT
         )?;
+        // Linux vfat_mkdir: inode_inc_iversion(dir) right after
+        // vfat_add_entry, before anything that can fail
+        dir.inc_iversion();
 
         // Create and return the new inode
         let ino = sb.alloc_ino();
@@ -2087,8 +2092,6 @@ impl InodeOps for VfatInodeOps {
             clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-        // Linux vfat_mkdir: inode_inc_iversion(dir)
-        dir.inc_iversion();
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2326,12 +2329,13 @@ impl InodeOps for VfatInodeOps {
             old_entry.start_cluster,
             old_entry.file_size,
         )?;
+        // Linux vfat_rename: inode_inc_iversion(new_dir) once the new
+        // entry is there, before the old one's removal can fail
+        new_dir.inc_iversion();
 
         // Delete old entry (don't free clusters - they belong to new entry now)
         delete_dir_entry(&sb_data, old_dir_data.start_cluster, old_name)?;
-        // Linux vfat_rename: both directories' versions move on
-        // (inode_inc_iversion(new_dir), fat_remove_entries' of old_dir)
-        new_dir.inc_iversion();
+        // fat_remove_entries: inode_inc_iversion(old_dir)
         old_dir.inc_iversion();
 
         // The moved object keeps its inode (Linux fat_detach + fat_attach)
