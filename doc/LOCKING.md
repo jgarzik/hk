@@ -2173,9 +2173,12 @@ pub struct Zone {
   copy-on-write break flushes the page it replaces (`flush_tlb_page`)
   before dropping its reference; munmap, MADV_DONTNEED/REMOVE and exit
   clear entries into a `Gather` (`mm/gather.rs`, Linux mmu_gather) that
-  flushes the whole range once per batch of 64 frames and only then
-  releases them (and, at exit, the page tables): no frame is reused
-  while a CPU may still reach it through its TLB. rmap flushes in the
+  flushes the whole range once per batch chain and only then releases
+  the frames (and, at exit, the page tables): no frame is reused while
+  a CPU may still reach it through its TLB. The chain is the gather's
+  own 8 frames, then pages of them allocated GFP_NOWAIT under the page
+  table lock (Linux tlb_next_batch), up to MAX_GATHER_BATCH_COUNT; at
+  the cap or when an allocation fails it flushes. rmap flushes in the
   chain's address space, not the one this CPU runs.
 - Break-before-make: a live entry is never overwritten by one mapping
   another page or another size. A 2MB page split into a table
