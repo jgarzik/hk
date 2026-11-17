@@ -39,6 +39,9 @@
 //!   clean): a size change waits in memory while its pages are written
 //!   (sync_file_range) and dirtied again and again, and the periodic
 //!   writeback still writes its entry once it expires
+//! - VFAT_DIRSYNC: on a dirsync mount, mkdir, create, rename, unlink
+//!   and rmdir work, and a create writes its directory's new times to
+//!   its entry at once (Linux vfat_add_entry: sync_inode_metadata)
 //! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
 //!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
 //!   and on hk its cluster stays allocated. Linux frees it: the refused
@@ -197,6 +200,7 @@ pub fn run_tests() {
     fsync_times(dev);
     remount_ro(dev);
     dirty_expire(dev);
+    dirsync(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -889,5 +893,39 @@ fn dirty_expire(dev: &[u8]) {
         let mut d = [0u8; 16];
         sysctl_swap(wb, &old_wb[..nw as usize], &mut d);
     }
+    t.done();
+}
+
+/// VFAT_DIRSYNC on DS in the root, mounted dirsync and tz=UTC
+fn dirsync(dev: &[u8]) {
+    const MS_DIRSYNC: u64 = 128;
+    // utimensat's 2017-07-14 02:40:00 UTC as FAT (time, date)
+    const OLD: (i64, i64) = (2 << 11 | 40 << 5, 37 << 9 | 7 << 5 | 14);
+    let mut t = T::new(b"VFAT_DIRSYNC");
+    let (d, short) = (b"/tmp/vdk/DS\0", b"DS         ");
+    let (f, g) = (b"/tmp/vdk/DS/F\0", b"/tmp/vdk/DS/G\0");
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    let r = sys_mount(
+        dev.as_ptr(),
+        MNT.as_ptr(),
+        b"vfat\0".as_ptr(),
+        MS_DIRSYNC,
+        b"iocharset=cp437,tz=UTC\0".as_ptr() as u64,
+    );
+    t.eq(b"mount dirsync", r, 0);
+    t.eq(b"mkdir", sys_mkdir(d.as_ptr(), 0o755), 0);
+    t.eq(b"utimensat", utimes(d, 1_500_000_000), 0);
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    let got = disk_time(dev, short);
+    t.ok(b"dir times written", got != OLD && got.1 > 0, got.1);
+    t.eq(b"rename", sys_rename(f.as_ptr(), g.as_ptr()), 0);
+    t.eq(b"unlink", sys_unlink(g.as_ptr()), 0);
+    t.eq(b"rmdir", sys_rmdir(d.as_ptr()), 0);
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
     t.done();
 }

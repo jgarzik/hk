@@ -2947,9 +2947,10 @@ and an entry is read, patched and written under it (`write_inode_sb`,
 Linux __fat_write_inode; rename's `write_entry`), so a write never
 lands on a slot its inode no longer owns. Every other change of a
 directory's slots is under it too: a new entry's slots written
-(`create_dir_entry_with_lfn`, after any cluster for them is
-allocated), and an entry's removal (`remove_entries`, Linux
-fat_remove_entries), whose unlink/rmdir detach of the cached inode
+(`fat_add_entries`, after any cluster for them is allocated; on a
+dirsync mount they are synced with it released, and on failure marked
+deleted again under it), and an entry's removal (`fat_remove_entries`,
+synced likewise after the hold), whose unlink/rmdir detach of the cached inode
 (i_pos 0, Linux fat_detach) is in the same hold, so no write-back of
 an inode (an atime update of an open file, no `i_rwsem`) puts back a
 deleted entry. That inode is looked up before the lock: the lookup may

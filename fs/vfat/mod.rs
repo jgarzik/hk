@@ -1816,20 +1816,29 @@ fn cluster_of(sb_data: &VfatSbData, off: u64) -> u32 {
     ((off - data) / u64::from(sb_data.cluster_size)) as u32 + 2
 }
 
-/// Create a new directory entry with LFN support, its long-name entries
-/// (if the name is not its own 8.3 form) followed by the short entry,
-/// in the directory at `parent_cluster` whose entries are `existing`.
-/// Returns the short name and the disk offsets of the slots written,
-/// the short entry's (its i_pos) last.
-fn create_dir_entry_with_lfn(
+/// A new directory entry: its name, attributes, first cluster and
+/// size, and the time all its times are (Linux vfat_build_slots' ts)
+struct NewEntry<'a> {
+    name: &'a str,
+    attr: u8,
+    extent: (u32, u32),
+    ts: Timespec,
+}
+
+/// Add entry `e` to the directory at `parent_cluster` whose entries are
+/// `existing` (Linux vfat_build_slots + fat_add_entries): its long-name
+/// slots (unless the name is its own 8.3 form) then its short one; on
+/// a dirsync mount they are synced, and removed again if that fails
+/// (fat_add_entries' error_remove). The short name and the slots' disk
+/// offsets, the short entry's (its i_pos) last.
+fn fat_add_entries(
     sb_data: &VfatSbData,
+    dirsync: bool,
     parent_cluster: u32,
     existing: &[ParsedDirEntry],
-    name: &str,
-    attributes: u8,
-    (start_cluster, file_size): (u32, u32),
-    times: &EntryTimes,
+    e: &NewEntry<'_>,
 ) -> Result<([u8; 11], Vec<u64>), KernelError> {
+    let name = e.name;
     // Existing short names, to avoid collisions
     let existing_short_names: Vec<[u8; 11]> = existing.iter().map(|e| e.short_name).collect();
 
@@ -1859,18 +1868,26 @@ fn create_dir_entry_with_lfn(
 
     let mut short_bytes = [0u8; 32];
     short_bytes[0..11].copy_from_slice(&short_name);
-    short_bytes[11] = attributes;
-    entry_set_extent(&mut short_bytes, start_cluster, file_size);
-    times.put(&mut short_bytes);
+    short_bytes[11] = e.attr;
+    entry_set_extent(&mut short_bytes, e.extent.0, e.extent.1);
+    EntryTimes::at(sb_data.opts.tz(), e.ts).put(&mut short_bytes);
 
-    // Every entry change under the location lock, as write_inode's
-    let _l = sb_data.ipos.lock();
-    // LFN entries first on disk, in reverse sequence order (the entry's
-    // on-disk bytes: packed, little-endian, its layout)
-    for (lfn, &off) in lfn_entries.iter().zip(&offs) {
-        write_bytes(&sb_data.bdev, off, lfn.as_bytes())?;
+    {
+        // Every entry change under the location lock, as write_inode's
+        let _l = sb_data.ipos.lock();
+        // LFN entries first on disk, in reverse sequence order (the
+        // entry's on-disk bytes: packed, little-endian, its layout)
+        for (lfn, &off) in lfn_entries.iter().zip(&offs) {
+            write_bytes(&sb_data.bdev, off, lfn.as_bytes())?;
+        }
+        write_bytes(&sb_data.bdev, i_pos, &short_bytes)?;
     }
-    write_bytes(&sb_data.bdev, i_pos, &short_bytes)?;
+    if dirsync && let Err(err) = sync_buffers(sb_data) {
+        // error_remove: __fat_remove_entries, its error ignored
+        let _l = sb_data.ipos.lock();
+        let _ = mark_deleted(sb_data, &offs);
+        return Err(err);
+    }
     Ok((short_name, offs))
 }
 
@@ -1927,28 +1944,72 @@ fn mark_deleted(sb_data: &VfatSbData, offs: &[u64]) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Remove entry `e` of the directory at `parent`, its long-name slots
-/// with it (Linux fat_remove_entries), under `ipos`; with `detach`, the
-/// inode leaves the entry (i_pos 0, Linux fat_detach) in the same hold:
-/// no write_inode writes the entry back after its deletion
-fn remove_entries(
+/// Remove an entry of `dir` whose slots are at `offs` (Linux
+/// fat_remove_entries): they are marked deleted under `ipos`, with
+/// `detach`'s inode leaving the entry in the same hold (i_pos 0, Linux
+/// fat_detach: no write_inode writes the entry back after its
+/// deletion); on a dirsync mount they are synced, an error returned
+/// before anything else changes; then the directory's version and its
+/// end of change, atime too (`dir_update`)
+fn fat_remove_entries(
+    dir: &Inode,
+    sb: &SuperBlock,
     sb_data: &VfatSbData,
-    parent: u32,
-    e: &ParsedDirEntry,
+    offs: &[u64],
     detach: Option<&Inode>,
 ) -> Result<(), KernelError> {
-    let offs = entry_slots(sb_data, parent, e)?;
-    let _l = sb_data.ipos.lock();
-    mark_deleted(sb_data, &offs)?;
-    if let Some(i) = detach {
-        with_vi(i, |v| v.d.lock().i_pos = 0)?;
+    {
+        let _l = sb_data.ipos.lock();
+        mark_deleted(sb_data, offs)?;
+        if let Some(i) = detach {
+            with_vi(i, |v| v.d.lock().i_pos = 0)?;
+        }
     }
+    if sb.dirsync() {
+        sync_buffers(sb_data)?;
+    }
+    dir.inc_iversion();
+    dir_update(dir, sb, sb_data, None, true);
     Ok(())
 }
 
 // ============================================================================
 // VFAT Inode Operations
 // ============================================================================
+
+/// A new directory's cluster, zeroed, with its "." and ".." entries
+/// (".." the parent's i_logstart, 0 for the root) at times `et`
+/// (Linux fat_alloc_new_dir); freed again if a write fails
+fn fat_alloc_new_dir(
+    sb_data: &VfatSbData,
+    parent_cluster: u32,
+    et: &EntryTimes,
+) -> Result<u32, KernelError> {
+    let c = allocate_cluster(sb_data)?;
+    let fill = || {
+        let off = cluster_to_offset(sb_data, c);
+        let zeros = crate::util::kmem::try_vec(sb_data.cluster_size as usize, 0u8)?;
+        write_bytes(&sb_data.bdev, off, &zeros)?;
+        let up = logstart(sb_data, parent_cluster);
+        for (i, (name, start)) in [(b".          ", c), (b"..         ", up)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut b = [0u8; 32];
+            b[0..11].copy_from_slice(name);
+            b[11] = attr::DIRECTORY;
+            entry_set_start(&mut b, start);
+            et.put(&mut b);
+            write_bytes(&sb_data.bdev, off + 32 * i as u64, &b)?;
+        }
+        Ok(())
+    };
+    if let Err(e) = fill() {
+        let _ = free_cluster_chain(sb_data, c);
+        return Err(e);
+    }
+    Ok(c)
+}
 
 /// VFAT inode operations
 pub struct VfatInodeOps;
@@ -2093,23 +2154,14 @@ impl InodeOps for VfatInodeOps {
         // Linux vfat_create: the entry's times all now (vfat_add_entry)
         let ts = crate::time::TIMEKEEPER.current_time();
         let et = EntryTimes::at(sb_data.opts.tz(), ts);
-        let (short_name, offs) = create_dir_entry_with_lfn(
-            &sb_data,
-            parent_cluster,
-            &entries,
+        let e = NewEntry {
             name,
-            attr::ARCHIVE,
-            (start_cluster, file_size),
-            &et,
-        )?;
+            attr: attr::ARCHIVE,
+            extent: (start_cluster, file_size),
+            ts,
+        };
+        let (short_name, offs) = vfat_add_entry(dir, &sb, &sb_data, parent_cluster, &entries, &e)?;
         let i_pos = *offs.last().ok_or(KernelError::Io)?;
-        // vfat_add_entry: the slots synced on a dirsync mount
-        // (fat_add_entries), then the directory's mtime and ctime are
-        // `ts`, the directory written or marked dirty: no error once
-        // the entry is there
-        dir_sync(&sb, &sb_data)?;
-        fat_truncate_time(dir, Some(ts), false, true);
-        dir_changed(dir, &sb, &sb_data);
         // Linux vfat_create: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail: a negative
         // dentry of the name is stale from here on
@@ -2165,60 +2217,28 @@ impl InodeOps for VfatInodeOps {
             }
         }
 
-        // Allocate a cluster for the new directory
-        let new_cluster = allocate_cluster(&sb_data)?;
-
-        // Initialize directory with . and .. entries
-        let cluster_offset = cluster_to_offset(&sb_data, new_cluster);
-        let cluster_size = sb_data.cluster_size as usize;
-
-        // Zero out the cluster first
-        let zeros = crate::util::kmem::try_vec(cluster_size, 0u8)?;
-        write_bytes(&sb_data.bdev, cluster_offset, &zeros)?;
-
         // Linux vfat_mkdir: the new entries' times all now
         let ts = crate::time::TIMEKEEPER.current_time();
         let et = EntryTimes::at(sb_data.opts.tz(), ts);
-
-        // Create . entry (points to self)
-        let mut dot_entry = [0u8; 32];
-        dot_entry[0..8].copy_from_slice(b".       ");
-        dot_entry[8..11].copy_from_slice(b"   ");
-        dot_entry[11] = attr::DIRECTORY;
-        dot_entry[20..22].copy_from_slice(&((new_cluster >> 16) as u16).to_le_bytes());
-        dot_entry[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
-        et.put(&mut dot_entry);
-        write_bytes(&sb_data.bdev, cluster_offset, &dot_entry)?;
-
-        // Create .. entry (points to parent: Linux fat_alloc_new_dir,
-        // the parent's i_logstart, 0 for the root)
-        let mut dotdot_entry = [0u8; 32];
-        dotdot_entry[0..8].copy_from_slice(b"..      ");
-        dotdot_entry[8..11].copy_from_slice(b"   ");
-        dotdot_entry[11] = attr::DIRECTORY;
         let parent_cluster = dir_inode_data.start_cluster;
-        let up = logstart(&sb_data, parent_cluster);
-        dotdot_entry[20..22].copy_from_slice(&((up >> 16) as u16).to_le_bytes());
-        dotdot_entry[26..28].copy_from_slice(&(up as u16).to_le_bytes());
-        et.put(&mut dotdot_entry);
-        write_bytes(&sb_data.bdev, cluster_offset + 32, &dotdot_entry)?;
-
-        // Create entry in parent (function returns the generated short name)
-        let (short_name, offs) = create_dir_entry_with_lfn(
-            &sb_data,
-            parent_cluster,
-            &entries,
+        let new_cluster = fat_alloc_new_dir(&sb_data, parent_cluster, &et)?;
+        let e = NewEntry {
             name,
-            attr::DIRECTORY,
+            attr: attr::DIRECTORY,
             // Directories have size 0 in FAT
-            (new_cluster, 0),
-            &et,
-        )?;
+            extent: (new_cluster, 0),
+            ts,
+        };
+        let (short_name, offs) =
+            match vfat_add_entry(dir, &sb, &sb_data, parent_cluster, &entries, &e) {
+                Ok(m) => m,
+                Err(e) => {
+                    // Linux vfat_mkdir: out_free
+                    let _ = free_cluster_chain(&sb_data, new_cluster);
+                    return Err(e);
+                }
+            };
         let i_pos = *offs.last().ok_or(KernelError::Io)?;
-        // vfat_add_entry, as for create
-        dir_sync(&sb, &sb_data)?;
-        fat_truncate_time(dir, Some(ts), false, true);
-        dir_changed(dir, &sb, &sb_data);
         // Linux vfat_mkdir: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail
         dir.inc_iversion();
@@ -2279,23 +2299,19 @@ impl InodeOps for VfatInodeOps {
         }
 
         // Delete the directory entry; its clusters go now, or with the
-        // last reference to its inode (Linux vfat_unlink: fat_remove_entries,
-        // then fat_detach; fat_evict_inode)
-        unlink_entry(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
-        // Linux fat_remove_entries: inode_inc_iversion(dir)
-        dir.inc_iversion();
+        // last reference to its inode (Linux vfat_unlink:
+        // fat_remove_entries, then fat_detach; fat_evict_inode)
+        unlink_entry(dir, &sb, &sb_data, dir_inode_data.start_cluster, entry)?;
+        // vfat_unlink: the victim's atime, mtime and ctime now, in
+        // memory only
+        if let Some(i) = d.get_inode() {
+            fat_truncate_time(&i, None, true, true);
+        }
         // The dentry the VFS makes negative next is valid at this
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
         d.set_d_time(dir.iversion());
-        // fat_remove_entries: the directory's atime, mtime and ctime now;
-        // the victim's too (vfat_unlink / vfat_rmdir), in memory only
-        fat_truncate_time(dir, None, true, true);
-        dir_changed(dir, &sb, &sb_data);
-        if let Some(i) = d.get_inode() {
-            fat_truncate_time(&i, None, true, true);
-        }
-        dir_sync(&sb, &sb_data)
+        Ok(())
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
@@ -2328,9 +2344,7 @@ impl InodeOps for VfatInodeOps {
         }
 
         // Delete the directory entry (clusters as for unlink)
-        unlink_entry(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
-        // Linux fat_remove_entries: inode_inc_iversion(dir)
-        dir.inc_iversion();
+        unlink_entry(dir, &sb, &sb_data, dir_inode_data.start_cluster, entry)?;
         // Linux vfat_rmdir: the parent loses the ".." link
         if dir.get_nlink() >= 3 {
             dir.dec_nlink();
@@ -2340,18 +2354,16 @@ impl InodeOps for VfatInodeOps {
                 dir.get_nlink()
             );
         }
+        // vfat_rmdir: the victim's atime, mtime and ctime now, in
+        // memory only
+        if let Some(i) = d.get_inode() {
+            fat_truncate_time(&i, None, true, true);
+        }
         // The dentry the VFS makes negative next is valid at this
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
         d.set_d_time(dir.iversion());
-        // fat_remove_entries: the directory's atime, mtime and ctime now;
-        // the victim's too (vfat_unlink / vfat_rmdir), in memory only
-        fat_truncate_time(dir, None, true, true);
-        dir_changed(dir, &sb, &sb_data);
-        if let Some(i) = d.get_inode() {
-            fat_truncate_time(&i, None, true, true);
-        }
-        dir_sync(&sb, &sb_data)
+        Ok(())
     }
 
     /// Linux fat_setattr(ATTR_SIZE): direct I/O in flight waited for
@@ -2503,20 +2515,14 @@ impl InodeOps for VfatInodeOps {
                 } else {
                     attr::ARCHIVE
                 };
-                let et = EntryTimes::at(sb_data.opts.tz(), ts);
-                let made = create_dir_entry_with_lfn(
-                    &sb_data,
-                    np,
-                    &new_entries,
-                    new_name,
-                    a,
-                    (0, 0),
-                    &et,
-                )?;
+                let e = NewEntry {
+                    name: new_name,
+                    attr: a,
+                    extent: (0, 0),
+                    ts,
+                };
+                let made = vfat_add_entry(new_dir, &sb, &sb_data, np, &new_entries, &e)?;
                 added = made.1;
-                // vfat_add_entry: the new directory's mtime and ctime
-                fat_truncate_time(new_dir, Some(ts), false, true);
-                dir_changed(new_dir, &sb, &sb_data);
                 (made.0, *added.last().ok_or(KernelError::Io)?)
             }
         };
@@ -2526,7 +2532,9 @@ impl InodeOps for VfatInodeOps {
         // entry, then written there (vfat_sync_ipos)
         // From here every failure is undone (Linux error_inode)
         let unwind = Unwind {
+            sb: &sb,
             sb_data: &sb_data,
+            dir: new_dir,
             new_dir: np,
             added: &added,
             old: (&old_inode, op, old_entry.short_name, old_ipos),
@@ -2544,15 +2552,28 @@ impl InodeOps for VfatInodeOps {
                 }
                 None => ((e.start_cluster, e.file_size), e.times),
             };
-            write_entry(&sb_data, new_ipos, e.attr, ext, &times)
+            write_entry(&sb_data, new_ipos, e.attr, ext, &times)?;
+            // vfat_sync_ipos: on a dirsync mount at once
+            if sb.dirsync() {
+                sync_buffers(&sb_data)?;
+            }
+            Ok(())
         };
         if let Err(e) = sync_ipos() {
             unwind.inode(None);
             return Err(e);
         }
         if let Some(off) = dotdot {
-            // vfat_update_dotdot_de: the parent is new_dir now
-            if let Err(e) = set_start(&sb_data, off, logstart(&sb_data, np)) {
+            // vfat_update_dotdot_de: the parent is new_dir now, synced
+            // at once on a dirsync mount
+            let r = set_start(&sb_data, off, logstart(&sb_data, np)).and_then(|()| {
+                if sb.dirsync() {
+                    sync_buffers(&sb_data)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = r {
                 unwind.dotdot(dotdot, op);
                 return Err(e);
             }
@@ -2561,19 +2582,14 @@ impl InodeOps for VfatInodeOps {
                 new_dir.inc_nlink();
             }
         }
-        // fat_remove_entries(old_dir) and its inode_inc_iversion, then
-        // vfat_update_dir_metadata's
-        if let Err(e) = remove_entries(&sb_data, op, &old_entry, None) {
+        // fat_remove_entries(old_dir), then vfat_update_dir_metadata
+        let removed = entry_slots(&sb_data, op, &old_entry)
+            .and_then(|offs| fat_remove_entries(old_dir, &sb, &sb_data, &offs, None));
+        if let Err(e) = removed {
             unwind.dotdot(dotdot, op);
             return Err(e);
         }
-        old_dir.inc_iversion();
-        // fat_remove_entries: atime, mtime, ctime now; then
-        // vfat_update_dir_metadata: mtime and ctime `ts`, written
-        fat_truncate_time(old_dir, None, true, true);
-        old_dir.inc_iversion();
-        fat_truncate_time(old_dir, Some(ts), false, true);
-        dir_changed(old_dir, &sb, &sb_data);
+        vfat_update_dir_metadata(old_dir, &sb, &sb_data, ts);
 
         // The replaced object loses its name (drop_nlink): its clusters
         // go with its inode, or now if none is cached
@@ -2584,7 +2600,7 @@ impl InodeOps for VfatInodeOps {
                 None => {}
             }
         }
-        dir_sync(&sb, &sb_data)
+        Ok(())
     }
 }
 
@@ -2696,7 +2712,10 @@ fn inode_entry(
 /// What a failed rename puts back (Linux vfat_rename's error_dotdot and
 /// error_inode)
 struct Unwind<'a> {
+    sb: &'a SuperBlock,
     sb_data: &'a VfatSbData,
+    /// The target directory, at `new_dir`
+    dir: &'a Inode,
     new_dir: u32,
     /// The slots of the entry rename added (none if it reused one)
     added: &'a [u64],
@@ -2746,9 +2765,8 @@ impl Unwind<'_> {
                 }
             }
             None => {
-                let l = self.sb_data.ipos.lock();
-                let r = mark_deleted(self.sb_data, self.added);
-                drop(l);
+                // Linux fat_remove_entries(new_dir)
+                let r = fat_remove_entries(self.dir, self.sb, self.sb_data, self.added, None);
                 failed |= corrupt.is_some() && r.is_err();
             }
         }
@@ -2760,26 +2778,60 @@ impl Unwind<'_> {
 
 pub static VFAT_INODE_OPS: VfatInodeOps = VfatInodeOps;
 
-/// A directory change on a dirsync or sync mount reaches the disk
-/// before the call returns (Linux fat: IS_DIRSYNC, sync_dirty_buffer of
-/// the entry and FAT blocks)
-fn dir_sync(sb: &SuperBlock, sb_data: &VfatSbData) -> Result<(), KernelError> {
-    if !sb.dirsync() {
-        return Ok(());
-    }
+/// The device's cache on the disk (Linux sync_dirty_buffer of vfat's
+/// metadata blocks: a directory change's on a dirsync or sync mount)
+fn sync_buffers(sb_data: &VfatSbData) -> Result<(), KernelError> {
     crate::block::blkdev::sync_blockdev(&sb_data.bdev)
 }
 
-/// A directory's entries or times changed (Linux vfat_add_entry,
-/// fat_remove_entries, vfat_update_dir_metadata): on a dirsync mount
-/// its entry is written now, its error ignored (fat_sync_inode's
-/// (void)), else it is marked dirty
-fn dir_changed(dir: &Inode, sb: &SuperBlock, sb_data: &VfatSbData) {
+/// Linux sync_inode_metadata(inode, 1) on vfat: its entry written if
+/// it is dirty (->write_inode), then on the disk (fat_write_inode's
+/// wait: sync_dirty_buffer)
+fn sync_inode_metadata(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
+    super::fs_writeback::sync_inode_metadata(inode)?;
+    sync_buffers(sb_data)
+}
+
+/// The end of a change to directory `dir` (Linux vfat_add_entry's,
+/// fat_remove_entries', vfat_update_dir_metadata's): its mtime and
+/// ctime `ts` (else now) and with `atime` its atime, the inode marked
+/// dirty, and on a dirsync mount synced at once (sync_inode_metadata,
+/// its error ignored as Linux's (void))
+fn dir_update(
+    dir: &Inode,
+    sb: &SuperBlock,
+    sb_data: &VfatSbData,
+    ts: Option<Timespec>,
+    atime: bool,
+) {
+    fat_truncate_time(dir, ts, atime, true);
+    super::fs_writeback::mark_inode_dirty(dir);
     if sb.dirsync() {
-        let _ = write_inode_sb(dir, sb_data);
-    } else {
-        super::fs_writeback::mark_inode_dirty(dir);
+        let _ = sync_inode_metadata(dir, sb_data);
     }
+}
+
+/// Linux vfat_add_entry: `e` added to `dir` (at `parent`, whose entries
+/// are `existing`: `fat_add_entries`), then the directory's end of
+/// change at `e`'s time
+fn vfat_add_entry(
+    dir: &Inode,
+    sb: &SuperBlock,
+    sb_data: &VfatSbData,
+    parent: u32,
+    existing: &[ParsedDirEntry],
+    e: &NewEntry<'_>,
+) -> Result<([u8; 11], Vec<u64>), KernelError> {
+    let made = fat_add_entries(sb_data, sb.dirsync(), parent, existing, e)?;
+    dir_update(dir, sb, sb_data, Some(e.ts), false);
+    Ok(made)
+}
+
+/// Linux vfat_update_dir_metadata: a rename's source directory, its
+/// version, then its end of change at `ts`
+fn vfat_update_dir_metadata(dir: &Inode, sb: &SuperBlock, sb_data: &VfatSbData, ts: Timespec) {
+    dir.inc_iversion();
+    dir_update(dir, sb, sb_data, Some(ts), false);
 }
 
 /// Inode cache key of the entry `short` in the directory at `parent`
@@ -2819,14 +2871,15 @@ fn vfat_iget(
     )
 }
 
-/// Remove the entry `entry` of the directory at `parent`: its cached
-/// inode leaves it in the same `ipos` hold (`remove_entries`), then
+/// Remove the entry `entry` of `dir` (at `parent`): its cached inode
+/// leaves it in the same `ipos` hold (`fat_remove_entries`), then
 /// becomes unlinked (nlink 0, unhashed) and keeps its clusters until
 /// its last reference goes (`evict_inode`); with no cached inode they
 /// are freed now. An unlinked inode has no directory entry any more
 /// (Linux fat_detach): writes and truncates never update one (the slot
 /// may belong to a new file by then).
 fn unlink_entry(
+    dir: &Inode,
     sb: &Arc<SuperBlock>,
     sb_data: &VfatSbData,
     parent: u32,
@@ -2835,7 +2888,8 @@ fn unlink_entry(
     // Looked up before `ipos`: the lookup may wait for an inode being
     // freed, whose write-back takes it
     let inode = cached(sb, parent, &entry.short_name);
-    remove_entries(sb_data, parent, entry, inode.as_deref())?;
+    let offs = entry_slots(sb_data, parent, entry)?;
+    fat_remove_entries(dir, sb, sb_data, &offs, inode.as_deref())?;
     match inode {
         Some(i) => {
             i.nlink.store(0, core::sync::atomic::Ordering::Release);
