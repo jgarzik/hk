@@ -688,13 +688,8 @@ waiting).
 
 ## RCU path walk gaps
 
-**Location**: `fs/namei/`, `fs/inode.rs` (`InodeOps::get_link`),
-`fs/proc/mod.rs`
+**Location**: `fs/namei/mod.rs` (`path_start`)
 
-- procfs's revalidate and permission are ECHILD in an RCU walk (its
-  inode data is not RCU-readable); Linux's pid_revalidate and
-  proc_pid_permission run there, so /proc/<pid> walks leave RCU mode
-  at /proc and RESOLVE_CACHED is EAGAIN under it.
 - A dirfd's walk takes the fd table lock and a file reference
   (`path_start`); Linux's fdget looks the fd up under RCU, with no
   reference for an unshared table (no RCU fd table here).

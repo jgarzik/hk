@@ -27,6 +27,58 @@ pub fn run_tests() {
     report_r(b"DROP_CACHES_DENTRIES", drop_dentries());
     report_r(b"DCACHE_UMOUNT_FREED", umount_freed());
     report_r(b"PROC_FLUSH_DETACH", flush_detach());
+    report_r(b"PROC_RCU_CACHED", rcu_cached());
+}
+
+/// openat2 from `dfd` with `flags` and `resolve`
+fn open2(dfd: i32, p: &[u8], flags: u64, resolve: u64) -> i64 {
+    let mut b = [0u8; 24];
+    b[..8].copy_from_slice(&flags.to_ne_bytes());
+    b[16..].copy_from_slice(&resolve.to_ne_bytes());
+    hk_syscall::sys_openat2(dfd, p.as_ptr(), b.as_ptr(), 24)
+}
+
+/// A process's /proc entries answer an RCU walk (Linux pid_revalidate
+/// and proc_pid_permission under LOOKUP_RCU; proc_self_get_link with a
+/// NULL dentry): looked up once, they resolve with RESOLVE_CACHED, from
+/// the process directory and through /proc/self
+fn rcu_cached() -> R {
+    const O_PATH: u64 = 0o10_000_000;
+    const RESOLVE_CACHED: u64 = 0x20;
+    const EAGAIN: i64 = -11;
+    let dir = sys_open(b"/proc/self\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    check(b"open /proc/self", dir >= 0, dir)?;
+    let warm = |p: &[u8]| {
+        let fd = sys_open(p.as_ptr(), O_RDONLY, 0);
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+        fd >= 0
+    };
+    // Looked up, then again a clock tick later (the link's atime then
+    // needs no update: relatime)
+    let ok = warm(b"/proc/self/status\0");
+    crate::helpers::msleep(30);
+    let ok = ok && warm(b"/proc/self/status\0");
+    check(b"warm", ok, -1)?;
+    let r = open2(dir as i32, b"status\0", O_PATH, RESOLVE_CACHED);
+    let from_dir = r;
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    let r = open2(-100, b"/proc/self/status\0", O_PATH, RESOLVE_CACHED);
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    let fd0 = open2(-100, b"/proc/self/fd/0\0", O_PATH, RESOLVE_CACHED);
+    if fd0 >= 0 {
+        sys_close(fd0 as u64);
+    }
+    sys_close(dir as u64);
+    check(b"from the process directory", from_dir >= 0, from_dir)?;
+    check(b"through /proc/self", r >= 0, r)?;
+    // fd/<n> still leaves RCU mode (tid_fd_revalidate: ECHILD)
+    check(b"fd link", fd0 == EAGAIN, fd0)
 }
 
 /// A mount on /proc/<pid> goes when the process is reaped (Linux

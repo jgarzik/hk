@@ -455,10 +455,14 @@ impl InodeOps for ProcfsInodeOps {
     /// /proc/self and the fixed links are text
     fn get_link(&self, inode: &Inode, rcu: bool) -> Result<crate::fs::inode::Link, KernelError> {
         use crate::fs::inode::Link;
-        // The inode data is not RCU-readable: ref mode (Linux
-        // proc_pid_get_link and proc_ns_get_link are ECHILD there too)
+        // /proc/self in RCU mode (Linux proc_self_get_link, GFP_ATOMIC);
+        // the magic links are ECHILD there (proc_pid_get_link,
+        // proc_ns_get_link)
         if rcu {
-            return Err(KernelError::NoChild);
+            return match proc_rcu(inode) {
+                Some(r) if r.kind == RcuKind::SelfLink => self_link_rcu(r).map(Link::Text),
+                _ => Err(KernelError::NoChild),
+            };
         }
         enum J {
             Fd(ProcPid, i32),
@@ -500,10 +504,10 @@ impl InodeOps for ProcfsInodeOps {
     }
 
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
-        // Every answer needs the inode data, which an RCU walk may not
-        // read (`private` goes with the teardown): ref mode
+        // An RCU walk reads what the inode keeps for it (`private`
+        // goes with the teardown)
         if mask & crate::fs::dac::MAY_NOT_BLOCK != 0 {
-            return Err(KernelError::NoChild);
+            return permission_rcu(inode, cred, mask);
         }
         // A process directory hidepid= hides (Linux proc_pid_permission)
         if let Some(t) = pid_dir_pid(inode) {
@@ -518,7 +522,7 @@ impl InodeOps for ProcfsInodeOps {
         // The owner follows the task's identity and dumpability (Linux
         // pid_revalidate -> pid_update_inode)
         if let Some(t) = pid_file_pid(inode) {
-            let (uid, gid) = dump_owner(&t);
+            let (uid, gid) = task_dump_owner(&t, inode.mode());
             inode.set_uid(uid);
             inode.set_gid(gid);
         }
@@ -533,14 +537,12 @@ impl InodeOps for ProcfsInodeOps {
 
     /// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that
     /// is gone, or of an fd no longer open, is invalid; a live one takes
-    /// the task's current owner (pid_update_inode). ECHILD in an RCU
-    /// walk: Linux's tid_fd_revalidate, proc_sys_revalidate and
-    /// proc_misc_d_revalidate are; its pid_revalidate is not, but here
-    /// every answer needs the inode data, which an RCU walk may not read
-    /// (`private` goes with the teardown).
+    /// the task's current owner (pid_update_inode). An RCU walk is
+    /// answered from what the inode keeps for it, ECHILD where Linux's
+    /// is (`revalidate_rcu`).
     fn revalidate(&self, inode: &Inode, rcu: bool) -> Result<bool, KernelError> {
         if rcu {
-            return Err(KernelError::NoChild);
+            return revalidate_rcu(inode);
         }
         Ok(revalidate_ref(inode))
     }
@@ -553,6 +555,170 @@ impl InodeOps for ProcfsInodeOps {
         pid_update_inode(&inode);
         Ok(inode)
     }
+}
+
+/// What an RCU walk reads of a procfs inode (Linux proc_inode's pid
+/// and sysctl entry, the dentry operations picked at instantiate, and
+/// i_sb's proc_fs_info): fixed at creation, released a grace period
+/// after the inode's teardown (`Inode::private_rcu`; Linux
+/// proc_free_inode's put_pid), so its drop (a `Pid`'s, the options')
+/// is fit for an RCU callback
+pub struct ProcRcu {
+    pid: Option<ProcPid>,
+    kind: RcuKind,
+    ctl: Option<&'static crate::sysctl::Ctl>,
+    /// The superblock's options (`ProcOpts`)
+    opts: Option<Arc<dyn crate::fs::superblock::SuperBlockData>>,
+}
+
+impl AsAny for ProcRcu {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+impl InodeData for ProcRcu {}
+
+/// How a procfs inode answers an RCU walk (Linux its d_op and i_op)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RcuKind {
+    /// A static entry (a PDE: proc_misc_d_revalidate, ECHILD), or a
+    /// directory with no special permission
+    Static,
+    /// /proc/self (no d_op; proc_self_get_link works in RCU mode)
+    SelfLink,
+    /// An entry of a process (pid_dentry_operations: pid_revalidate)
+    Pid,
+    /// /proc/<pid> and task/<tid> (proc_pid_permission)
+    PidDir,
+    /// fd/ and fdinfo/ (ptrace-read access)
+    Fds,
+    /// A per-process file, whose owner follows the task
+    PidFile,
+    /// fd/<n>, fdinfo/<n> (tid_fd_revalidate: ECHILD)
+    Fd,
+    /// /proc/sys (proc_sys_revalidate: ECHILD; proc_sys_permission)
+    Sysctl,
+    /// /proc/<pid>/net/* (proc_net_d_revalidate: always stale)
+    Net,
+}
+
+impl ProcRcu {
+    fn of(
+        d: &ProcfsInodeData,
+        opts: Option<Arc<dyn crate::fs::superblock::SuperBlockData>>,
+    ) -> Self {
+        use ProcfsInodeData as D;
+        let kind = match d {
+            D::Directory { .. } | D::File { .. } | D::FixedLink(_) => RcuKind::Static,
+            D::SelfLink => RcuKind::SelfLink,
+            D::PidDirectory { .. } => RcuKind::PidDir,
+            D::PidFdDirectory { .. } | D::PidFdinfoDirectory { .. } => RcuKind::Fds,
+            D::PidFile { .. } => RcuKind::PidFile,
+            D::FdSymlink { .. } | D::FdinfoFile { .. } => RcuKind::Fd,
+            D::Sysctl { .. } => RcuKind::Sysctl,
+            D::NetFile { .. } => RcuKind::Net,
+            D::PidNsDirectory { .. }
+            | D::NamespaceFile { .. }
+            | D::PidTaskDirectory { .. }
+            | D::PidLink { .. }
+            | D::FailNth { .. }
+            | D::PidNetDirectory { .. } => RcuKind::Pid,
+        };
+        let ctl = match d {
+            D::Sysctl { ctl } => Some(*ctl),
+            _ => None,
+        };
+        Self {
+            pid: d.pid(),
+            kind,
+            ctl,
+            opts,
+        }
+    }
+
+    /// The superblock's options
+    fn opts(&self) -> Option<&opts::ProcOpts> {
+        self.opts
+            .as_ref()?
+            .as_any()
+            .downcast_ref::<opts::ProcOpts>()
+    }
+
+    /// The task, borrowed for `g` (Linux pid_task under rcu_read_lock)
+    fn task<'g>(&'g self, g: &'g crate::sync::rcu::RcuReadGuard) -> Option<&'g crate::task::Task> {
+        self.pid.as_ref()?.0.task(g)
+    }
+}
+
+/// A new procfs inode's data, and what an RCU walk reads of it, before
+/// the inode is visible
+fn set_data(inode: &Arc<Inode>, data: ProcfsInodeData) -> Result<(), KernelError> {
+    let opts = inode.superblock().and_then(|sb| sb.get_private());
+    inode.set_private_rcu(try_arc(ProcRcu::of(&data, opts))?);
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+    Ok(())
+}
+
+/// The RCU-readable data of a procfs inode
+fn proc_rcu(inode: &Inode) -> Option<&ProcRcu> {
+    inode.private_rcu()?.as_any().downcast_ref::<ProcRcu>()
+}
+
+/// [`InodeOps::revalidate`] under LOOKUP_RCU (Linux pid_revalidate:
+/// the task under rcu_read_lock, its owner taken over; tid_fd_revalidate,
+/// proc_sys_revalidate and proc_misc_d_revalidate are ECHILD;
+/// proc_net_d_revalidate is always stale)
+fn revalidate_rcu(inode: &Inode) -> Result<bool, KernelError> {
+    let r = proc_rcu(inode).ok_or(KernelError::NoChild)?;
+    match r.kind {
+        RcuKind::Static | RcuKind::Fd | RcuKind::Sysctl => Err(KernelError::NoChild),
+        RcuKind::SelfLink => Ok(true),
+        RcuKind::Net => Ok(false),
+        RcuKind::Pid | RcuKind::PidDir | RcuKind::Fds | RcuKind::PidFile => {
+            let g = crate::sync::rcu::read_lock();
+            let Some(t) = r.task(&g) else {
+                return Ok(false);
+            };
+            let (uid, gid) = task_dump_owner(t, inode.mode());
+            inode.set_uid(uid);
+            inode.set_gid(gid);
+            Ok(true)
+        }
+    }
+}
+
+/// [`InodeOps::permission`] with MAY_NOT_BLOCK: what ref mode checks,
+/// from the RCU-readable data (Linux proc_pid_permission,
+/// proc_fd_permission and proc_sys_permission run there too)
+fn permission_rcu(inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+    let r = proc_rcu(inode).ok_or(KernelError::NoChild)?;
+    let g = crate::sync::rcu::read_lock();
+    let t = r.task(&g);
+    match (r.kind, t) {
+        (RcuKind::PidDir, Some(t)) => {
+            let o = r.opts().ok_or(KernelError::NoChild)?;
+            o.pid_permission(t)?;
+        }
+        (RcuKind::Fds, Some(t)) if !crate::task::ptrace::may_access_task(t, true) => {
+            return Err(KernelError::PermissionDenied);
+        }
+        (RcuKind::PidFile, Some(t)) => {
+            let (uid, gid) = task_dump_owner(t, inode.mode());
+            inode.set_uid(uid);
+            inode.set_gid(gid);
+        }
+        (RcuKind::Sysctl, _) => {
+            let ctl = r.ctl.ok_or(KernelError::NoChild)?;
+            if mask & crate::fs::MAY_EXEC != 0 {
+                return Err(KernelError::PermissionDenied);
+            }
+            return crate::sysctl::permission(ctl, cred, mask);
+        }
+        _ => {}
+    }
+    drop(g);
+    crate::fs::dac::generic_permission(cred, inode, mask)
 }
 
 /// [`InodeOps::revalidate`] of a procfs inode in ref mode
@@ -578,7 +744,7 @@ fn revalidate_ref(inode: &Inode) -> bool {
         };
         fd_update_inode(inode, &file);
     }
-    let (uid, gid) = dump_owner(&t);
+    let (uid, gid) = task_dump_owner(&t, inode.mode());
     inode.set_uid(uid);
     inode.set_gid(gid);
     true
@@ -600,7 +766,7 @@ fn pid_update_inode(inode: &Inode) {
     // Copied out: dump_owner takes TASKLIST, never under the data's lock
     let p = with_data(inode, ProcfsInodeData::pid).flatten();
     if let Some(t) = p.and_then(|p| p.task()) {
-        let (uid, gid) = dump_owner(&t);
+        let (uid, gid) = task_dump_owner(&t, inode.mode());
         inode.set_uid(uid);
         inode.set_gid(gid);
     }
@@ -746,7 +912,7 @@ fn create_dir_inode(
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+    set_data(&inode, data)?;
     Ok(inode)
 }
 
@@ -768,7 +934,7 @@ fn create_file_inode(
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+    set_data(&inode, data)?;
     Ok(inode)
 }
 
@@ -784,9 +950,7 @@ fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<Arc<Inode>, Kern
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_pid_dir(pid),
-    )))?);
+    set_data(&inode, ProcfsInodeData::new_pid_dir(pid))?;
     Ok(inode)
 }
 
@@ -810,9 +974,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
             ))?;
-            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::new_pid_ns_dir(p.clone()),
-            )))?);
+            set_data(&inode, ProcfsInodeData::new_pid_ns_dir(p.clone()))?;
             Ok(inode)
         }
         "fd" => {
@@ -828,9 +990,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
             ))?;
-            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::new_pid_fd_dir(p.clone()),
-            )))?);
+            set_data(&inode, ProcfsInodeData::new_pid_fd_dir(p.clone()))?;
             Ok(inode)
         }
         "task" => create_dir_inode(
@@ -857,9 +1017,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
             ))?;
-            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::new_pid_fdinfo_dir(p.clone()),
-            )))?);
+            set_data(&inode, ProcfsInodeData::new_pid_fdinfo_dir(p.clone()))?;
             Ok(inode)
         }
         name if PID_LINKS.iter().any(|(n, _, _)| *n == name) => {
@@ -878,17 +1036,18 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
             ))?;
-            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
+            set_data(
+                &inode,
                 ProcfsInodeData::PidLink {
                     pid: p.clone(),
                     target,
                 },
-            )))?);
+            )?;
             Ok(inode)
         }
         "fail-nth" => {
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let (uid, gid) = dump_owner(&t);
+            let (uid, gid) = task_dump_owner(&t, InodeMode::regular(0o644));
             let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, FAIL_NTH_INO),
                 InodeMode::regular(0o644),
@@ -899,15 +1058,13 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
             ))?;
-            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::FailNth { pid: p.clone() },
-            )))?);
+            set_data(&inode, ProcfsInodeData::FailNth { pid: p.clone() })?;
             Ok(inode)
         }
         name if pid_file(name).is_some() => {
             let (off, mode, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let (uid, gid) = dump_owner(&t);
+            let (uid, gid) = task_dump_owner(&t, InodeMode::regular(mode));
             let inode = Inode::alloc(Inode::new(
                 pid_ino(pid, off),
                 InodeMode::regular(mode),
@@ -918,9 +1075,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode>, 
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
             ))?;
-            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::new_pid_file(p.clone(), generator),
-            )))?);
+            set_data(&inode, ProcfsInodeData::new_pid_file(p.clone(), generator))?;
             Ok(inode)
         }
         _ => Err(KernelError::NotFound),
@@ -952,9 +1107,7 @@ fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_ns_file(p.clone(), ns_type),
-    )))?);
+    set_data(&inode, ProcfsInodeData::new_ns_file(p.clone(), ns_type))?;
     Ok(inode)
 }
 
@@ -967,6 +1120,33 @@ fn self_link(inode: &Inode) -> Result<Vec<u8>, KernelError> {
         0 => Err(KernelError::NotFound),
         n => Ok(alloc::format!("{n}").into_bytes()),
     }
+}
+
+/// [`self_link`] for an RCU walk (Linux proc_self_get_link with a NULL
+/// dentry): the mount's pid namespace from the RCU-readable data, the
+/// text allocated GFP_ATOMIC, ECHILD if that fails
+fn self_link_rcu(r: &ProcRcu) -> Result<Vec<u8>, KernelError> {
+    let ns = r.opts().ok_or(KernelError::NoChild)?.pid_ns_ref();
+    let n = crate::task::pid::nr_ns(crate::task::percpu::current_pid(), ns);
+    if n == 0 {
+        return Err(KernelError::NotFound);
+    }
+    let mut d = [0u8; 10];
+    let (mut v, mut k) = (n, d.len());
+    while v > 0 {
+        k -= 1;
+        d[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let mut out = Vec::new();
+    let ok = crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
+        out.try_reserve_exact(d.len() - k).is_ok()
+    });
+    if !ok {
+        return Err(KernelError::NoChild);
+    }
+    out.extend_from_slice(&d[k..]);
+    Ok(out)
 }
 
 /// /proc/self (resolved at readlink time to the reader's pid)
@@ -982,9 +1162,7 @@ fn create_self_link(parent: &Inode) -> Result<Arc<Inode>, KernelError> {
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::SelfLink,
-    )))?);
+    set_data(&inode, ProcfsInodeData::SelfLink)?;
     Ok(inode)
 }
 
@@ -1056,9 +1234,7 @@ fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Arc<Inode
         &PROCFS_INODE_OPS,
     ))?;
     fd_update_inode(&inode, &file);
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_fd_symlink(p.clone(), fd),
-    )))?);
+    set_data(&inode, ProcfsInodeData::new_fd_symlink(p.clone(), fd))?;
     Ok(inode)
 }
 
@@ -1113,9 +1289,7 @@ fn lookup_pid_fdinfo_entry(
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
     ))?;
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_fdinfo_file(p.clone(), fd),
-    )))?);
+    set_data(&inode, ProcfsInodeData::new_fdinfo_file(p.clone(), fd))?;
     Ok(inode)
 }
 
@@ -1459,21 +1633,32 @@ fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
         .map(|&(_, off, mode, g)| (off, mode, g))
 }
 
-/// Owner of a /proc/<pid>/ file (Linux task_dump_owner): the task's
-/// euid/egid while it is dumpable, else root, so a non-dumpable task's
-/// mode-0400 files are root's
-fn dump_owner(task: &TaskRef) -> (u32, u32) {
-    use crate::task::percpu::TASKLIST;
-    let table = TASKLIST.read();
-    table
-        .view(task)
-        .filter(|t| {
-            t.task
-                .task_lock()
-                .mm()
-                .is_none_or(|m| m.dumpable() == crate::task::dumpable::SUID_DUMP_USER)
-        })
-        .map_or((0, 0), |t| (t.cred().euid, t.cred().egid))
+/// Owner of a /proc/<pid> inode of `mode` (Linux task_dump_owner): a
+/// kernel thread's are root's; else the task's euid/egid (its
+/// credentials read under RCU), but for anything other than a
+/// world-readable and -searchable directory root's while it is not
+/// dumpable or has no address space (task_lock). No sleeping lock: an
+/// RCU walk asks too.
+fn task_dump_owner(t: &crate::task::Task, mode: InodeMode) -> (u32, u32) {
+    if t.has_flag(crate::task::pf::KTHREAD) {
+        return (0, 0);
+    }
+    let (uid, gid) = {
+        let g = crate::sync::rcu::read_lock();
+        let c = t.cred_rcu(&g);
+        (c.euid, c.egid)
+    };
+    if mode.raw() == InodeMode::directory(0o555).raw() {
+        return (uid, gid);
+    }
+    let dumpable = t
+        .task_lock()
+        .mm()
+        .map(|m| m.dumpable() == crate::task::dumpable::SUID_DUMP_USER);
+    match dumpable {
+        Some(true) => (uid, gid),
+        _ => (0, 0),
+    }
 }
 
 /// The process a per-process file belongs to
@@ -2247,9 +2432,7 @@ impl SuperOps for ProcfsSuperOps {
         ))?;
 
         // Default to empty directory
-        inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
-            ProcfsInodeData::new_dir()?,
-        )))?);
+        set_data(&inode, ProcfsInodeData::new_dir()?)?;
 
         Ok(inode)
     }
@@ -2390,7 +2573,7 @@ fn mk_inode(
     if let ProcfsInodeData::FixedLink(t) = &data {
         inode.set_link(t.to_vec().into_boxed_slice());
     }
-    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+    set_data(&inode, data)?;
     Ok(inode)
 }
 
@@ -2457,8 +2640,7 @@ impl DirBuild {
         let data = ProcfsInodeData::Directory {
             children: try_arc(map)?,
         };
-        self.inode
-            .set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+        set_data(&self.inode, data)?;
         Ok(self.inode)
     }
 }

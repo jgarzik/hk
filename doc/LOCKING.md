@@ -2802,7 +2802,8 @@ no reference (a dentry's `d_inode`) may read it until its guard ends,
 a torn-down one included, but only its fields with no drop glue
 (atomics, `ino`, `i_op`; Linux's RCU walk reads i_mode, i_uid, i_op
 the same way), never one a teardown releases (`private`, `i_data`,
-`sb`). A symlink's `i_link` (Linux inode->i_link) is set once before
+`sb`). A symlink's `i_link` (Linux inode->i_link) and a file
+system's `private_rcu` data are set once before
 the inode is visible (`set_link`, a `spin::Once`) and dropped only by
 `i_callback`, a grace period after the teardown, so an RCU walk reads
 it too. No lock is added.
@@ -3069,13 +3070,20 @@ take it again), and nothing else is taken under it.
 
 A cached child is revalidated (`InodeOps::revalidate`, Linux
 d_revalidate) after its d_lock is released, inside whatever i_rwsem the
-walk holds: procfs's takes TASKLIST (read) and the task's fd table
+walk holds: procfs's takes the task's task_lock and its fd table
 lock. Asked by an RCU walk (`rcu`, Linux LOOKUP_RCU; and a permission
 check's MAY_NOT_BLOCK) the inode is borrowed under the guard with no
 reference and may be torn down already: the answer may read only
 fields with no drop glue and take nothing that sleeps, else it is
-ECHILD; procfs and kernfs, whose answers need the inode data, always
-are. A stale answer invalidates that dentry (`dentry::d_invalidate`,
+ECHILD; kernfs, whose answers need the inode data, always is. procfs
+answers from `ProcRcu` (`Inode::private_rcu`, Linux proc_inode's pid
+put by ->free_inode: set before the inode is visible, dropped by
+`i_callback` a grace period after the teardown): the task through its
+`Pid` under a nested guard (pid_task), its owner taken over with
+`task_dump_owner` (credentials under RCU, the mm under task_lock, a
+spin leaf), hidepid and fd/ checks with the superblock's options and
+`ptrace::may_access_task` (TASKLIST read, task_lock: spin, no sleep);
+ECHILD where Linux is (PDE entries, fd/<n>, /proc/sys). A stale answer invalidates that dentry (`dentry::d_invalidate`,
 Linux d_invalidate: the parent's d_lock, then its own, as every
 unhook, the parent read again if a rename moved it meanwhile; then
 each mountpoint at or below it, found by a walk of child lists under

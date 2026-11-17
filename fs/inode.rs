@@ -680,6 +680,12 @@ pub struct Inode {
     /// with no reference; freed with the inode's memory, a grace period
     /// after its teardown (Linux ->free_inode: `i_callback`)
     i_link: ManuallyDrop<spin::Once<alloc::boxed::Box<[u8]>>>,
+    /// File system data an RCU walk reads with no reference (Linux: the
+    /// fields of a file system's inode its ->free_inode releases, as
+    /// proc_inode's pid): set once before the inode is visible, dropped
+    /// by `i_callback` a grace period after the teardown, so its drop
+    /// must be fit for an RCU callback (no sleep; spin leaves only)
+    i_private_rcu: ManuallyDrop<spin::Once<Arc<dyn InodeData>>>,
     /// Its dentries (Linux i_dentry, under i_lock): every live dentry
     /// whose inode it is, linked through `Dentry.d_alias`; a spin lock
     /// taken before any d_lock (`fs::dentry`)
@@ -937,6 +943,7 @@ impl Inode {
             i_sequence: crate::task::futex::KeySeq::new(),
             i_sb_list: list::Link::new(),
             i_link: ManuallyDrop::new(spin::Once::new()),
+            i_private_rcu: ManuallyDrop::new(spin::Once::new()),
             i_dentry: Mutex::new(list::List::new()),
         }
     }
@@ -947,6 +954,22 @@ impl Inode {
         let mut t = Some(target);
         self.i_link.call_once(|| t.take().expect("inode: set_link"));
         debug_assert!(t.is_none(), "inode: a symlink's target set twice");
+    }
+
+    /// Give a new inode its RCU-readable data ([`Inode::private_rcu`]),
+    /// before it is visible to any lookup; once
+    pub fn set_private_rcu(&self, d: Arc<dyn InodeData>) {
+        let mut d = Some(d);
+        self.i_private_rcu
+            .call_once(|| d.take().expect("inode: set_private_rcu"));
+        debug_assert!(d.is_none(), "inode: RCU data set twice");
+    }
+
+    /// Its RCU-readable file system data: readable by any borrower of
+    /// the inode, an RCU walk's too, since it is fixed and freed only
+    /// with the memory
+    pub fn private_rcu(&self) -> Option<&dyn InodeData> {
+        self.i_private_rcu.get().map(|a| &**a)
     }
 
     /// The symlink's target, if it is kept in the inode (Linux
@@ -1635,12 +1658,14 @@ const _: () = {
         i_sequence,
         i_sb_list,
         i_link,
+        i_private_rcu,
         i_dentry,
     );
 };
 
 /// The inode's memory, a grace period after its teardown (Linux
-/// i_callback -> ->free_inode): a symlink's `i_link`, then the `Weak`
+/// i_callback -> ->free_inode): a symlink's `i_link` and the RCU data
+/// (procfs's pid), then the `Weak`
 /// it kept, whose drop frees the block once the `Arc`'s own is gone
 ///
 /// # Safety
@@ -1651,6 +1676,8 @@ unsafe fn i_callback(p: *const ()) {
     // its teardown left `i_link` alone and no reader stands on it a
     // grace period later; dropped once, here
     unsafe { drop_field(&raw mut (*i).i_link) };
+    // SAFETY: as above
+    unsafe { drop_field(&raw mut (*i).i_private_rcu) };
     // SAFETY: the `Weak` `Inode::alloc` leaked (`IFree` invariant)
     drop(unsafe { Weak::from_raw(p.cast::<Inode>()) });
 }

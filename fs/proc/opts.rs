@@ -123,6 +123,11 @@ impl ProcOpts {
         Ok(())
     }
 
+    /// The pid namespace it shows, borrowed
+    pub fn pid_ns_ref(&self) -> &PidNamespace {
+        &self.pid_ns
+    }
+
     /// subset=pid is set
     pub fn pidonly(&self) -> bool {
         self.pidonly.load(Ordering::Relaxed)
