@@ -3409,7 +3409,11 @@ MOUNT_LOCK's sequence sampled, then a reference to the mount found
 sequence; if it moved, MOUNT_LOCK's locking read decides whether the
 add came too late for a doomed mount) and to the mountpoint
 (`DentryRef::try_get`); a raced climb puts what it took after
-releasing the guard and repeats.
+releasing the guard and repeats. The parent ".." lands on must still
+be under the mount's root (`mount::path_connected`, Linux
+path_connected: a bind mount's root only, `is_subdir` under
+RENAME_LOCK's sequence or locking read, nothing else held), else
+ENOENT: a rename may have taken the directory out of the subtree.
 
 A scoped walk (openat2 RESOLVE_BENEATH / RESOLVE_IN_ROOT, `namei::Nd`;
 Linux nd->m_seq, nd->r_seq) samples `MOUNT_LOCK`'s and `RENAME_LOCK`'s

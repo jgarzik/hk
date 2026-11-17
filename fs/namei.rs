@@ -19,7 +19,9 @@ use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::{Dentry, DentryRef};
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use super::inode::{Inode, Link};
-use super::mount::{MOUNT_LOCK, MountRef, choose_mountpoint, follow_mount, is_path_reachable};
+use super::mount::{
+    MOUNT_LOCK, MountRef, choose_mountpoint, follow_mount, is_path_reachable, path_connected,
+};
 use super::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
 use crate::ns::current_mnt_ns;
@@ -589,9 +591,10 @@ pub fn nd_root() -> Result<Path, KernelError> {
 /// at a mount's root, climb to its mountpoint (`choose_mountpoint`:
 /// through mounts stacked on their parent's root; EXDEV for a no-xdev
 /// walk) and take that one's parent; a climb that meets the root, or a
-/// detached or namespace root, stays like the root. Whatever is mounted
-/// on the result is crossed, the root's included (EXDEV for a no-xdev
-/// walk).
+/// detached or namespace root, stays like the root. A parent a rename
+/// left outside the mount's root is ENOENT (path_connected). Whatever
+/// is mounted on the result is crossed, the root's included (EXDEV for
+/// a no-xdev walk).
 fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelError> {
     // Where ".." stays put, it still lands on what is mounted there
     // (Linux in_root, then step_into's handle_mounts)
@@ -617,6 +620,9 @@ fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelErr
     }
     // A root dentry is its own parent (Linux dget_parent of IS_ROOT)
     let parent = p.dentry.get_parent().unwrap_or_else(|| p.dentry.clone());
+    if !path_connected(&p.mnt, &parent) {
+        return Err(KernelError::NotFound);
+    }
     step_mounts(Path::new(p.mnt.clone(), parent), f)
 }
 

@@ -361,6 +361,10 @@ pub struct Mount {
 
     /// Root dentry of the mounted filesystem (Linux mnt_root)
     pub root: MntOwned<DentryRef>,
+    /// `root` is its superblock's root, not a bind mount of a directory
+    /// below it (Linux mnt_root == sb->s_root, both fixed once the
+    /// mount is made): immutable
+    root_is_sb_root: bool,
 
     /// Parent mount (Linux mnt_parent): a `Weak`'s raw pointer
     /// (`Weak::into_raw`: no reference to the mount), null for none.
@@ -514,9 +518,15 @@ impl Mount {
         mnt_id: u32,
     ) -> Self {
         let (mnt_pcp, mnt_writers) = pcp;
+        let root_is_sb_root = sb
+            .root
+            .read()
+            .as_ref()
+            .is_some_and(|r| DentryRef::ptr_eq(r, &root));
         Self {
             sb: MntOwned::new(sb),
             root: MntOwned::new(root),
+            root_is_sb_root,
             mnt_parent: AtomicPtr::new(core::ptr::null_mut()),
             mnt_mountpoint: AtomicPtr::new(core::ptr::null_mut()),
             mnt_mp: AtomicPtr::new(core::ptr::null_mut()),
@@ -2311,6 +2321,14 @@ fn choose_mountpoint_rcu<'g>(
         m = p;
     }
     None
+}
+
+/// `d` is still under `m`'s root (Linux path_connected): always on a
+/// mount of a whole file system; a rename may have taken a directory
+/// out of a bind mount's subtree, and ".." from it must not climb past
+/// the mount's root unseen
+pub fn path_connected(m: &Mount, d: &Dentry) -> bool {
+    m.root_is_sb_root || super::dentry::is_subdir_borrowed(d, &m.root)
 }
 
 /// `p` is at or below `root`, across mounts (Linux path_is_under:

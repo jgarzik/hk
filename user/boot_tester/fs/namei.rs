@@ -2,14 +2,15 @@
 //! path_init, filename_parentat, filename_create): an empty name is
 //! ENOENT unless AT_EMPTY_PATH, a name without a NUL in PATH_MAX bytes is
 //! ENAMETOOLONG, a dirfd must be an open directory unless the path is
-//! absolute, a trailing slash asks for a directory, and a last name of
-//! "/", "." or ".." gets each call's own errno
+//! absolute, a trailing slash asks for a directory, a last name of
+//! "/", "." or ".." gets each call's own errno, and ".." never leaves a
+//! bind mount through a directory renamed out of it
 
 use crate::harness::{R, report_r};
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_execve, sys_fstatat, sys_link,
-    sys_lstat, sys_mkdir, sys_open, sys_rename, sys_renameat2, sys_rmdir, sys_stat, sys_symlink,
-    sys_unlink,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_execve,
+    sys_fstatat, sys_link, sys_lstat, sys_mkdir, sys_mount, sys_open, sys_openat, sys_rename,
+    sys_renameat2, sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink,
 };
 
 const ENOENT: i64 = -2;
@@ -35,6 +36,7 @@ pub fn run_tests() {
     report_r(b"DOTDOT_LAST_NAME", dots());
     report_r(b"CREAT_DANGLING_LINK", creat_dangling());
     report_r(b"NEG_DENTRY_CREATE", negative());
+    report_r(b"DOTDOT_DISCONNECTED", disconnected());
 }
 
 /// `got` must be `want`
@@ -285,6 +287,45 @@ fn negative() -> R {
     })();
     sys_unlink(p);
     sys_unlink(b"/tmp/nd_y\0".as_ptr());
+    r
+}
+
+/// ".." from a directory a rename took out of the bind mount it was
+/// reached through is ENOENT, not its new parent outside the mount's
+/// root (Linux follow_dotdot: path_connected)
+fn disconnected() -> R {
+    const MS_BIND: u64 = 4096;
+    for d in [&b"/tmp/pc\0"[..], b"/tmp/pc/a\0", b"/tmp/pc/a/b\0", b"/tmp/pc/a/b/c\0", b"/tmp/pc/m\0"] {
+        sys_mkdir(d.as_ptr(), 0o755);
+    }
+    let null = core::ptr::null();
+    let r = (|| {
+        let m = sys_mount(b"/tmp/pc/a/b\0".as_ptr(), b"/tmp/pc/m\0".as_ptr(), null, MS_BIND, 0);
+        want(b"bind", m, 0)?;
+        let fd = sys_open(b"/tmp/pc/m/c\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+        if fd < 0 {
+            return Err((&b"open"[..], fd));
+        }
+        let up = sys_openat(fd as i32, b"..\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+        let r = (|| {
+            want(b"dotdot inside", up.min(0), 0)?;
+            want(b"rename out", sys_rename(b"/tmp/pc/a/b/c\0".as_ptr(), b"/tmp/pc/a/c\0".as_ptr()), 0)?;
+            let out = sys_openat(fd as i32, b"..\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+            if out >= 0 {
+                sys_close(out as u64);
+            }
+            want(b"dotdot outside", out, ENOENT)
+        })();
+        if up >= 0 {
+            sys_close(up as u64);
+        }
+        sys_close(fd as u64);
+        r
+    })();
+    sys_umount2(b"/tmp/pc/m\0".as_ptr(), 0);
+    for d in [&b"/tmp/pc/a/c\0"[..], b"/tmp/pc/a/b/c\0", b"/tmp/pc/a/b\0", b"/tmp/pc/a\0", b"/tmp/pc/m\0", b"/tmp/pc\0"] {
+        sys_rmdir(d.as_ptr());
+    }
     r
 }
 
