@@ -28,7 +28,7 @@ pub use sig::*;
 
 use crate::sync::spin::Mutex;
 use crate::util::error::{KernelError, KernelResult};
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::try_arc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -2872,14 +2872,27 @@ impl SignalStruct {
     /// INIT_RLIMITS as fork_init leaves them), its itimers included;
     /// ENOMEM
     pub fn alloc() -> Result<Arc<Self>, KernelError> {
-        // SAFETY: put in its Arc at once and owned before it is shared
-        Ok(Self::owned(try_arc(unsafe { Self::new() })?))
+        let a = crate::util::kalloc::try_arc_uninit::<Self>()?;
+        Ok(Self::owned(Self::init(a)))
     }
 
     /// [`alloc`](Self::alloc) at boot, where failure cannot be reported
     fn alloc_nofail() -> Arc<Self> {
-        // SAFETY: as in `alloc`
-        Self::owned(arc_nofail(unsafe { Self::new() }))
+        Self::alloc().expect("boot: SignalStruct allocation")
+    }
+
+    /// Fill the new block `a` in place (the struct is large: built on
+    /// the stack it cost fork ~3 KB of frame on arm64, as Inode::alloc)
+    fn init(mut a: Arc<core::mem::MaybeUninit<Self>>) -> Arc<Self> {
+        let p = Arc::get_mut(&mut a)
+            .expect("SignalStruct: a new Arc is unshared")
+            .as_mut_ptr();
+        // SAFETY: `p` is the new block, unshared, valid for writes; it
+        // stays in this Arc (never moved) and `owned` runs before it is
+        // shared (ITimers::new's contract)
+        unsafe { Self::init_at(p) };
+        // SAFETY: `init_at` wrote every field
+        unsafe { a.assume_init() }
     }
 
     /// Its itimers pointed at it, in its Arc
@@ -2898,18 +2911,39 @@ impl SignalStruct {
         self.leader_pid.replace(pid, table).defer_put();
     }
 
+    /// Write every field of a new SignalStruct at `p`, one at a time,
+    /// so it never sits on the stack whole
+    ///
     /// # Safety
-    /// As `ITimers::new`: the value goes into an Arc, never moved after,
-    /// and `owned` runs on it before it is shared.
-    unsafe fn new() -> Self {
-        Self {
+    /// `p` is valid for writes of a `SignalStruct`, unshared; the value
+    /// is never moved after and `owned` runs on it before it is shared
+    /// (`ITimers::new`).
+    unsafe fn init_at(p: *mut Self) {
+        // Each field written once, and every field: the pattern names
+        // the same list without `..`, so a field missed or named twice
+        // fails to build
+        macro_rules! init {
+            ($($f:ident: $v:expr),* $(,)?) => {
+                $(
+                    // SAFETY: `p` is valid for writes of a SignalStruct
+                    // (the caller's contract); a field write drops nothing
+                    unsafe { (&raw mut (*p).$f).write($v) };
+                )*
+                let _ = |s: &Self| {
+                    let Self { $($f: _),* } = s;
+                };
+            };
+        }
+        // SAFETY: the caller's promise (never moved after the write
+        // below, `owned` before sharing)
+        let itimers = unsafe { crate::time::posix_timer::ITimers::new() };
+        init! {
             rlim: IrqSpinlock::new(crate::task::rlimit::init_rlimits()),
             cred_guard: crate::sync::Mutex::new(()),
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),
             posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
-            // SAFETY: the caller's promise
-            itimers: unsafe { crate::time::posix_timer::ITimers::new() },
+            itimers: itimers,
             leader_pid: crate::sync::rcu::RcuLockedArc::none(),
             live: AtomicU32::new(1),
             dead_times: [const { AtomicU64::new(0) }; 3],
