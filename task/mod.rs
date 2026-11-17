@@ -976,10 +976,6 @@ pub struct Task {
     /// Releases the task list's reference a grace period after it is
     /// unlisted (type invariant)
     rcu: crate::sync::rcu::RcuHead,
-    /// The group and session lists' references, dropped a grace period
-    /// after the task leaves a list (`put_rcu`; it may leave and join
-    /// lists several times within one: setpgid)
-    rcu_puts: crate::sync::rcu::RcuPuts,
     /// Its signal handlers (Linux task->sighand, `__rcu`; shared with
     /// CLONE_SIGHAND): written under TASKLIST's write lock and the old
     /// table's `siglock`, the replaced one dropped a grace period later
@@ -1006,7 +1002,6 @@ pub struct Task {
 }
 
 crate::rcu_head!(Task, rcu);
-crate::rcu_puts!(Task, rcu_puts);
 
 /// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner {
@@ -1695,7 +1690,6 @@ impl Task {
             pgrp: crate::sync::rcu::RcuLockedArc::none(),
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
-            rcu_puts: crate::sync::rcu::RcuPuts::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::new(ids.thread_pid),
             ptrace: AtomicU32::new(0),
@@ -1769,7 +1763,6 @@ impl Task {
             pgrp: crate::sync::rcu::RcuLockedArc::none(),
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
-            rcu_puts: crate::sync::rcu::RcuPuts::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::none(),
             ptrace: AtomicU32::new(0),

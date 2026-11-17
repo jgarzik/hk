@@ -1494,17 +1494,17 @@ thread).
 
 **Process groups and sessions** (Linux pid->tasks[PIDTYPE_PGID,
 PIDTYPE_SID]): each `Pid` has a `pgrp` and a `session` list
-(`RcuHList` chains owned by TASKLIST, links
+(`RcuHListBare` chains owned by TASKLIST, links
 `Task.pgrp_link`/`session_link`), changed under TASKLIST's write lock
 (added at the head, Linux hlist_add_head_rcu) and walked under its
 read lock (through `GlobalTaskTable::pgrp`/`pgrp_threads`) or, for
 the first leader only, under an RCU read guard (`Pid::pgrp_task`,
-Linux pid_task(PIDTYPE_PGID): F_GETOWN). Each list holds a reference
-to a leader on it, given back at removal through `put_rcu` on
-`Task.rcu_puts` (a leader may leave and rejoin lists several times in
-one grace period: setpgid), so a reader on a removed leader keeps it
-(Linux needs none: its task outlives the unlink by a grace period, as
-hk's does too). Only group leaders are on
+Linux pid_task(PIDTYPE_PGID): F_GETOWN). A list holds no reference
+(Linux's bare pid_links): a leader is linked only while it is in the
+task list, unlinked by `detach_pids` in `unhash` before it leaves
+that list, whose reference goes a grace period later (`kfree_rcu`),
+so a reader on a removed leader stands on allocated memory (the
+`add_head` contract, as `Pid.task`'s `RcuPtr`). Only group leaders are on
 them (`TaskInner.pids_linked`), like Linux: linked when inserted
 (fork), by the new leader at exec's `take_leadership`, and after a
 change; unlinked at `remove` (release or reap; a zombie leader stays,
@@ -1773,7 +1773,7 @@ from `Task.se`.
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
 | `sighand->siglock` | Signal state, handlers | `SigHand.siglock` with the per-task state it owns (`Task.sig`), `SignalStruct.jobctl` (group stop state) and `SignalStruct.shared` (owned too), `SignalStruct.ignored_timers`, the action table (the siglock's own data; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
-| RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHList`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
+| RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHListBare`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
 | RCU (`cred`, put_cred_rcu) | Credentials | `Task.cred` (`TaskCred`): lock-free for the task, an RCU read guard for others, the old set through `put_rcu` |
 
 Remaining differences: the `task_struct` fields Linux leaves to the

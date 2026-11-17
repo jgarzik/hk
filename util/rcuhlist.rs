@@ -218,11 +218,19 @@ impl<A: HAdapter, O: UniqueOwner> RcuHList<A, O> {
     /// Link `item` first (Linux hlist_add_head_rcu); panics if it is on
     /// a chain, or being linked into one
     pub fn add_head(&self, item: Arc<A::Item>, o: &mut O) {
-        let n = A::node(&item);
+        self.link(&item, o);
+        // INVARIANT: linked first, holding the into_raw reference
+        let _ = Arc::into_raw(item);
+    }
+
+    /// Link `item`'s node first; panics if it is on a chain or being
+    /// linked into one. The caller says what keeps the item allocated.
+    fn link(&self, item: &A::Item, o: &mut O) {
+        let n = A::node(item);
         assert!(n.claim(), "RcuHList: item already hashed");
         let id = self.id(o);
         let first = self.first.load(Relaxed);
-        let np = Self::np(&item);
+        let np = Self::np(item);
         // A reader standing on `n` (it was on a chain) sees `first`
         // initialized
         n.next.store(first, Release);
@@ -237,8 +245,6 @@ impl<A: HAdapter, O: UniqueOwner> RcuHList<A, O> {
             f.pprev
                 .store(core::ptr::from_ref(&n.next).cast_mut(), Relaxed);
         }
-        // INVARIANT: linked first, holding the into_raw reference
-        let _ = Arc::into_raw(item);
     }
 
     /// Unlink `item` (Linux hlist_del_init_rcu): its node is free for a
@@ -246,13 +252,24 @@ impl<A: HAdapter, O: UniqueOwner> RcuHList<A, O> {
     /// chain's reference comes back, to release after a grace period.
     /// None if it is not on this chain.
     #[must_use]
-    pub fn del_init(&self, item: &A::Item, _o: &mut O) -> Option<RcuHRef<A>> {
+    pub fn del_init(&self, item: &A::Item, o: &mut O) -> Option<RcuHRef<A>> {
+        if !self.unlink(item, o) {
+            return None;
+        }
+        // SAFETY: the reference the chain took with into_raw
+        let arc = unsafe { Arc::from_raw(core::ptr::from_ref(item)) };
+        Some(RcuHRef(Some(arc), PhantomData))
+    }
+
+    /// Unlink `item`'s node, keeping `next` for readers on it; false if
+    /// it is not on this chain
+    fn unlink(&self, item: &A::Item, _o: &mut O) -> bool {
         let n = A::node(item);
         let id = self.id.load(Relaxed);
         // `chain` is set and cleared under the lock of the chain it
         // names: held for this one, so it cannot become `id` meanwhile
         if id == 0 || n.chain.load(Relaxed) != id {
-            return None;
+            return false;
         }
         let next = n.next.load(Relaxed);
         let pprev = n.pprev.load(Relaxed);
@@ -271,9 +288,7 @@ impl<A: HAdapter, O: UniqueOwner> RcuHList<A, O> {
         // Release pairs with the next insert's claim
         n.chain.store(0, Relaxed);
         n.pprev.store(null_mut(), Release);
-        // SAFETY: the reference the chain took with into_raw
-        let arc = unsafe { Arc::from_raw(core::ptr::from_ref(item)) };
-        Some(RcuHRef(Some(arc), PhantomData))
+        true
     }
 
     /// Unlink the first entry `f` accepts (a walk, then
@@ -337,6 +352,87 @@ impl<A: HAdapter, O: UniqueOwner> Drop for RcuHList<A, O> {
             n.pprev.store(null_mut(), Release);
             // SAFETY: the chain's into_raw reference, taken back once
             drop(unsafe { Arc::from_raw(A::item(cur)) });
+            cur = next;
+        }
+    }
+}
+
+/// An RCU hash chain that owns nothing (Linux pid->tasks[type]: bare
+/// hlist nodes of tasks, which outlive their links by their own rule):
+/// [`RcuHList`]'s links without its references
+///
+/// # Invariants
+/// As [`RcuHList`]'s, but an entry holds no chain reference: each was
+/// linked under [`add_head`](Self::add_head)'s contract, so it stays
+/// allocated while linked and for a grace period after it is unlinked.
+pub struct RcuHListBare<A: HAdapter, O: UniqueOwner> {
+    /// Never dropped as an `RcuHList` (it holds no references)
+    c: core::mem::ManuallyDrop<RcuHList<A, O>>,
+}
+
+impl<A: HAdapter, O: UniqueOwner> RcuHListBare<A, O> {
+    pub const fn new() -> Self {
+        Self {
+            c: core::mem::ManuallyDrop::new(RcuHList::new()),
+        }
+    }
+
+    /// The entries, valid while `g` is held (Linux
+    /// hlist_for_each_entry_rcu); as [`RcuHList::iter`]
+    pub fn iter<'a>(&'a self, g: &'a RcuReadGuard) -> RcuHIter<'a, A> {
+        self.c.iter(g)
+    }
+
+    /// The entries as their writer sees them, its lock held
+    pub fn iter_locked<'a>(&'a self, _o: &'a O) -> RcuHIter<'a, A> {
+        RcuHIter {
+            cur: self.c.first.load(Relaxed),
+            _l: PhantomData,
+        }
+    }
+
+    /// Link `item` first (Linux hlist_add_head_rcu), no reference
+    /// taken; panics if it is on a chain or being linked into one
+    ///
+    /// # Safety
+    /// `item` stays allocated while it is on this chain and for a grace
+    /// period after it leaves it ([`del_init`](Self::del_init) before
+    /// its memory can be freed, and that free deferred a grace period:
+    /// a task, unlinked under TASKLIST at release and freed a grace
+    /// period after it leaves the task list, as `RcuPtr`'s targets).
+    pub unsafe fn add_head(&self, item: &A::Item, o: &mut O) {
+        // INVARIANT: the caller keeps it allocated as required
+        self.c.link(item, o);
+    }
+
+    /// Unlink `item` (Linux hlist_del_init_rcu): readers on it go on;
+    /// false if it is not on this chain
+    pub fn del_init(&self, item: &A::Item, o: &mut O) -> bool {
+        self.c.unlink(item, o)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.c.is_empty()
+    }
+}
+
+impl<A: HAdapter, O: UniqueOwner> Default for RcuHListBare<A, O> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: HAdapter, O: UniqueOwner> Drop for RcuHListBare<A, O> {
+    /// Entries left on it are unlinked, nothing released (the chain
+    /// owns none)
+    fn drop(&mut self) {
+        let mut cur = *self.c.first.get_mut();
+        // SAFETY: no reader or writer borrows the chain (`&mut`); its
+        // nodes are of entries still allocated (type invariant)
+        while let Some(n) = unsafe { cur.as_ref() } {
+            let next = n.next.load(Relaxed);
+            n.chain.store(0, Relaxed);
+            n.pprev.store(null_mut(), Release);
             cur = next;
         }
     }

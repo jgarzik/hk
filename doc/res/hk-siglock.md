@@ -213,7 +213,7 @@ Also in this series:
 
 - [x] `Task.thread_pid` an RCU pointer (TASKLIST write: creation,
   exchange_tids, release); `Task::pid_nr_ns` reads it directly.
-- [ ] `Pid.pgrp`/`session` (`task/pid.rs`, `util/rcuhlist.rs`) hold a
+- [x] `Pid.pgrp`/`session` (`task/pid.rs`, `util/rcuhlist.rs`) hold a
   reference to each listed leader; Linux holds none (pid_links are
   bare hlist nodes; a task is freed a grace period after release,
   after detach_pid). Needs a non-owning RCU chain (writers under

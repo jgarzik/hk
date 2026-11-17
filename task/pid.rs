@@ -29,7 +29,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use crate::ns::{Namespace, PidNamespace};
 use crate::sync::spin::Mutex;
 use crate::task::percpu::{GlobalTaskTable, PgrpLink, SessionLink};
-use crate::util::rcuhlist::RcuHList;
+use crate::util::rcuhlist::RcuHListBare;
 
 /// Ids per bitmap page (Linux BITS_PER_PAGE)
 const PER_PAGE: u32 = 4096 * 8;
@@ -70,16 +70,17 @@ pub struct Pid {
     task: crate::sync::rcu::RcuPtr<crate::task::Task>,
     /// The process group whose id this is: its member processes'
     /// group leaders (Linux pid->tasks[PIDTYPE_PGID]; links
-    /// `Task.pgrp_link`, a reference each, released a grace period
-    /// after the leader leaves it), changed under TASKLIST's write lock
-    /// and walked under it or an RCU read guard ([`Pid::pgrp_task`],
-    /// Linux pid_task(pid, PIDTYPE_PGID)). Every thread of a member
-    /// holds a reference to this `Pid` (`Task.pgrp`), so it outlives
-    /// its group.
-    pub(crate) pgrp: RcuHList<PgrpLink, GlobalTaskTable>,
+    /// `Task.pgrp_link`, no reference: a leader is linked only while
+    /// it is in the task list, unlinked at its release before it
+    /// leaves it, and freed a grace period after that, as
+    /// `Pid.task`'s target), changed under TASKLIST's write lock and
+    /// walked under it or an RCU read guard ([`Pid::pgrp_task`], Linux
+    /// pid_task(pid, PIDTYPE_PGID)). Every thread of a member holds a
+    /// reference to this `Pid` (`Task.pgrp`), so it outlives its group.
+    pub(crate) pgrp: RcuHListBare<PgrpLink, GlobalTaskTable>,
     /// The session whose id this is, likewise (Linux
     /// pid->tasks[PIDTYPE_SID]; links `Task.session_link`)
-    pub(crate) session: RcuHList<SessionLink, GlobalTaskTable>,
+    pub(crate) session: RcuHListBare<SessionLink, GlobalTaskTable>,
     /// pidfd pollers of the task it names (Linux wait_pidfd): woken
     /// under TASKLIST when it exits and when it is released
     pub wait_pidfd: crate::sync::waitqueue::WaitQueue,
@@ -421,8 +422,8 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
         task: crate::sync::rcu::RcuPtr::null(),
-        pgrp: RcuHList::new(),
-        session: RcuHList::new(),
+        pgrp: RcuHListBare::new(),
+        session: RcuHListBare::new(),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(true),
@@ -565,8 +566,8 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
             pid: AtomicPtr::new(core::ptr::null_mut()),
         }]),
         task: crate::sync::rcu::RcuPtr::null(),
-        pgrp: RcuHList::new(),
-        session: RcuHList::new(),
+        pgrp: RcuHListBare::new(),
+        session: RcuHListBare::new(),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(false),

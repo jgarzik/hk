@@ -1339,7 +1339,7 @@ impl GlobalTaskTable {
         &'a self,
         pg: &'a crate::task::pid::Pid,
     ) -> impl Iterator<Item = TaskView<'a>> + 'a {
-        pg.pgrp.iter_locked(self).map(move |t| view(self, t.item()))
+        pg.pgrp.iter_locked(self).map(move |t| view(self, t))
     }
 
     /// The group leaders in session `s` (Linux do_each_pid_task(s,
@@ -1348,9 +1348,7 @@ impl GlobalTaskTable {
         &'a self,
         s: &'a crate::task::pid::Pid,
     ) -> impl Iterator<Item = TaskView<'a>> + 'a {
-        s.session
-            .iter_locked(self)
-            .map(move |t| view(self, t.item()))
+        s.session.iter_locked(self).map(move |t| view(self, t))
     }
 
     /// The threads of every process in group `pg` (Linux
@@ -1391,9 +1389,15 @@ impl GlobalTaskTable {
             return;
         };
         self.inner_mut_of(t).pids_linked = true;
-        // Each list holds a reference (Linux hlist_add_head_rcu)
-        pg.pgrp.add_head(task_ref(t), self);
-        s.session.add_head(task_ref(t), self);
+        // No reference (Linux hlist_add_head_rcu of the task's bare
+        // pid_links)
+        // SAFETY: `t` is listed (`inner_mut_of` found it) and is unlinked
+        // by `detach_pids` in `unhash`, before it leaves the task list,
+        // whose reference goes a grace period after that (`kfree_rcu`)
+        unsafe {
+            pg.pgrp.add_head(t, self);
+            s.session.add_head(t, self);
+        }
     }
 
     /// Take `t` off its process group's and session's lists (Linux
@@ -1404,13 +1408,11 @@ impl GlobalTaskTable {
             return;
         }
         if let (Some(pg), Some(s)) = (t.pgrp.get_protected(self), t.session.get_protected(self)) {
-            // RCU readers may stand on it: the lists' references go a
-            // grace period later (Linux hlist_del_rcu; the task outlives
-            // them by its own rule)
+            // RCU readers may stand on it: the task outlives them by its
+            // own rule (Linux hlist_del_rcu; freed a grace period after
+            // it leaves the task list)
             let (p, q) = (pg.pgrp.del_init(t, self), s.session.del_init(t, self));
-            debug_assert!(p.is_some() && q.is_some(), "linked: on both lists");
-            p.into_iter().for_each(|r| r.defer_put());
-            q.into_iter().for_each(|r| r.defer_put());
+            debug_assert!(p && q, "linked: on both lists");
         }
     }
 
