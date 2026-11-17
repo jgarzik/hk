@@ -491,9 +491,10 @@ fn write_async(
         return sync(&*io);
     }
     let m = map(&sb, inode, pos, count)?;
-    // file_modified, before the data (Linux __generic_file_write_iter)
+    // file_modified, before the data (Linux __generic_file_write_iter):
+    // the times through the filesystem (fat_update_time)
     crate::fs::dac::remove_privs(inode);
-    inode.touch_mc();
+    inode.file_update_time();
     let w = VfatAio::new(io, inode, count, Some(pos))?;
     dio::submit_async_map(&sb.bdev, w, &m, count, true, flags)?;
     drop(lock);

@@ -14,7 +14,8 @@
 //! - AIO_VFAT_DIO: on a vda1 vfat file, an extending O_DIRECT write
 //!   (synchronous, as Linux), overwrites within the size and reads back
 //!   by AIO match a buffered read; a read at the end is 0; misaligned
-//!   memory is an EINVAL event
+//!   memory is an EINVAL event; the async overwrites' mtime is FAT's,
+//!   in 2 s steps (Linux file_modified -> fat_update_time)
 //! - AIO_VFAT_APPEND, IO_URING_VFAT_APPEND: on a vda1 vfat file opened
 //!   O_DIRECT, RWF_APPEND sends a write within the size to the end
 //!   (Linux kiocb_set_rw_flags: IOCB_APPEND), and RWF_NOAPPEND on an
@@ -368,6 +369,10 @@ fn vfat_io() -> R {
         c.get_all(&mut ev)?;
         let mut seen = [false; 16];
         check_events(&ev, &cbs, PAGE as i64, &mut seen)?;
+        let mut st = hk_syscall::Stat::default();
+        check(b"fstat", hk_syscall::sys_fstat(fd, &mut st) == 0, 0)?;
+        let ns = st.st_mtime_nsec as i64;
+        check(b"mtime 2 s", ns == 0 && st.st_mtime % 2 == 0, ns)?;
         // Read back by AIO
         let back = Buf::new(LEN + PAGE)?;
         c.submit1(&iocb(IOCB_CMD_PREAD, fd, back.addr(0), LEN as u64, 0, 2))?;
