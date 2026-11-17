@@ -18,7 +18,8 @@
 //!   so removing or stepping from any given item is safe in O(1): a
 //!   dentry's children.
 //! - [`WeakList`]: the list holds a `Weak` per entry, which leaves it in
-//!   its own teardown: superblocks, a superblock's mounts and inodes.
+//!   its own teardown: superblocks, a superblock's mounts (inodes are on
+//!   `fs::inode::InodeList`s, which hold no reference).
 //!
 //! A list and the links of its entries are only touched under the lock
 //! that owns the list (the caller's: `&mut List` is that proof); the

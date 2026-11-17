@@ -155,8 +155,9 @@ pub struct AddressSpace {
     /// writeback (vm.dirty_expire_centisecs)
     pub dirtied_when: AtomicU64,
     /// The inode it belongs to, for page dirtying to mark it dirty
-    /// (Linux mapping->host; set with the aops by `set_aops`)
-    host: Once<alloc::sync::Weak<Inode>>,
+    /// (Linux mapping->host; set with the aops by `set_aops`): null, or
+    /// the inode whose `i_data` this is, set before any page is cached
+    host: core::sync::atomic::AtomicPtr<Inode>,
     /// Writeback errors, reported once to each open file by fsync
     /// (Linux mapping->wb_err)
     pub wb_err: crate::util::errseq::ErrSeq,
@@ -175,7 +176,7 @@ impl AddressSpace {
             writable: core::sync::atomic::AtomicI64::new(0),
             i_mmap: AnonVma::default(),
             dirtied_when: AtomicU64::new(0),
-            host: Once::new(),
+            host: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             wb_err: crate::util::errseq::ErrSeq::new(),
         }
     }
@@ -186,8 +187,23 @@ impl AddressSpace {
     pub fn set_aops(&self, a: &'static dyn Aops, host: Option<&InodeRef>) {
         self.a_ops.call_once(|| a);
         if let Some(h) = host {
-            self.host.call_once(|| alloc::sync::Arc::downgrade(h));
+            // INVARIANT: the host's own mapping (Linux inode->i_data)
+            assert!(
+                core::ptr::eq(&raw const *h.i_data, self),
+                "filemap: a host's own mapping"
+            );
+            self.host
+                .store(InodeRef::as_ptr(h).cast_mut(), Ordering::Release);
         }
+    }
+
+    /// The inode it belongs to (Linux mapping->host), if one was set:
+    /// borrowed with the mapping, which is part of it
+    fn host(&self) -> Option<&Inode> {
+        let p = self.host.load(Ordering::Acquire);
+        // SAFETY: null or the inode this mapping is the `i_data` of
+        // (`set_aops`), so its memory outlives this borrow of the mapping
+        (!p.is_null()).then(|| unsafe { &*p })
     }
 
     pub fn aops(&self) -> &'static dyn Aops {
@@ -560,7 +576,9 @@ pub fn dirty_page(m: &AddressSpace, phys: u64) {
         return;
     }
     m.aops().dirty_folio(m, phys);
-    if let Some(inode) = m.host.get().and_then(alloc::sync::Weak::upgrade) {
+    // A reference unless its last went (Linux __mark_inode_dirty skips
+    // an I_FREEING inode)
+    if let Some(inode) = m.host().and_then(Inode::igrab) {
         crate::fs::fs_writeback::mark_inode_dirty(&inode);
     }
 }

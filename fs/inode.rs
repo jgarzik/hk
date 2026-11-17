@@ -11,7 +11,7 @@ use crate::sync::rcu::RcuHead;
 use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::kalloc::try_arc_uninit;
-use crate::util::list::{self, WeakList};
+use crate::util::list;
 use ::core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::RwSem;
@@ -558,6 +558,120 @@ pub mod iflags {
 /// `struct inode *`)
 pub type InodeRef = Arc<Inode>;
 
+/// A list of inodes that holds no reference to them (Linux s_inodes,
+/// an inode_hashtable chain, wb->b_dirty and b_io: list_heads through
+/// the inode): an inode is linked by a holder of a reference and
+/// unlinked at the latest by its eviction, which takes the list's lock
+/// to do so before its memory can go. So under that lock every linked
+/// inode is live memory: a walker reads it and takes a reference with
+/// [`Inode::igrab`] (Linux __iget under i_lock), which fails once its
+/// last reference went.
+///
+/// # Invariants
+/// Every inode on `list` is live memory; each is unlinked, under the
+/// lock that guards the list, before its memory is freed.
+pub struct InodeList<A: list::Adapter<Item = Inode>> {
+    list: list::List<A>,
+}
+
+impl<A: list::Adapter<Item = Inode>> InodeList<A> {
+    /// An empty list
+    ///
+    /// # Safety
+    /// The inodes' eviction unlinks each from this list under the lock
+    /// that guards it (`evict`), whatever else took it off meanwhile.
+    pub const unsafe fn new() -> Self {
+        Self {
+            list: list::List::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Append `inode` (Linux list_add_tail); panics if it is on a list
+    /// through this link
+    pub fn push_back(&mut self, inode: &InodeRef) {
+        assert!(!A::link(inode).is_linked(), "inode: already listed");
+        // SAFETY: a reference is held, so its eviction (which unlinks
+        // it under this list's lock, the type's contract) has not run;
+        // unlinked (checked under the lock)
+        unsafe { self.list.push_back(InodeRef::as_ptr(inode)) };
+    }
+
+    /// Prepend `inode` (Linux list_add / hlist_add_head)
+    pub fn push_front(&mut self, inode: &InodeRef) {
+        assert!(!A::link(inode).is_linked(), "inode: already listed");
+        // SAFETY: as in push_back
+        unsafe { self.list.push_front(InodeRef::as_ptr(inode)) };
+    }
+
+    /// Unlink `inode` (Linux list_del_init)
+    ///
+    /// # Safety
+    /// `inode` is on this list.
+    pub unsafe fn remove(&mut self, inode: &Inode) {
+        // SAFETY: on this list (the caller)
+        unsafe { self.list.remove(inode) };
+    }
+
+    /// The first inode, live while the list is borrowed
+    pub fn front(&self) -> Option<&Inode> {
+        // SAFETY: linked, so live (type invariant) while the list's lock
+        // (the borrow) is held
+        self.list.front().map(|p| unsafe { &*p })
+    }
+
+    /// Unlink the first inode, if any
+    pub fn pop_front(&mut self) {
+        let _ = self.list.pop_front();
+    }
+
+    /// Unlink every inode (a superblock's shutdown)
+    pub fn clear(&mut self) {
+        while self.list.pop_front().is_some() {}
+    }
+
+    /// The inodes, front to back, live while the list is borrowed
+    pub fn iter(&self) -> list::Iter<'_, A> {
+        self.list.iter()
+    }
+
+    /// The inodes after `inode` (Linux list_for_each_entry_continue)
+    ///
+    /// # Safety
+    /// `inode` is on this list.
+    pub unsafe fn iter_after(&self, inode: &Inode) -> impl Iterator<Item = &Inode> + '_ {
+        // SAFETY: on this list (the caller)
+        let first = unsafe { self.list.next(inode) };
+        // SAFETY: each is on this list, which the borrow keeps unchanged
+        core::iter::successors(first, move |&p| unsafe { self.list.next(p) })
+            // SAFETY: linked, so live (type invariant) while borrowed
+            .map(|p| unsafe { &*p })
+    }
+
+    /// Move every inode `f` picks to the tail of `to`, in order (Linux
+    /// move_expired_inodes' list_move); both under the one lock
+    pub fn move_if(&mut self, to: &mut Self, mut f: impl FnMut(&Inode) -> bool) {
+        let mut cur = self.list.front();
+        while let Some(p) = cur {
+            // SAFETY: `p` is on this list; its successor is read before
+            // `p` may leave it
+            cur = unsafe { self.list.next(p) };
+            // SAFETY: linked, so live (type invariant)
+            if f(unsafe { &*p }) {
+                // SAFETY: on this list, then on none; `to` is under the
+                // same lock and eviction contract
+                unsafe {
+                    self.list.remove(p);
+                    to.list.push_back(p);
+                }
+            }
+        }
+    }
+}
+
 /// A FIFO inode's pipe and its open count (`Inode.i_pipe`)
 pub type PipeSlot = Option<(Arc<crate::io::pipe::Pipe>, usize)>;
 
@@ -723,9 +837,16 @@ pub struct InodeSbLists(());
 // private)
 unsafe impl UniqueOwner for InodeSbLists {}
 
-/// A superblock's inodes (Linux s_inodes): a `WeakList` through
+/// A superblock's inodes (Linux s_inodes): an [`InodeList`] through
 /// `Inode.i_sb_list`
-pub type SbInodes = LockedBy<WeakList<SbInodeA>, InodeSbLists>;
+pub type SbInodes = LockedBy<InodeList<SbInodeA>, InodeSbLists>;
+
+/// A superblock's empty `s_inodes`
+pub fn sb_inodes() -> SbInodes {
+    // SAFETY: an inode's eviction unlinks it under INODE_SB_LIST_LOCK
+    // (`sb_list_del`), unless the superblock's shutdown drained it
+    LockedBy::new(unsafe { InodeList::new() })
+}
 
 /// Linux inode_sb_list_lock (one lock for every superblock's s_inodes,
 /// as Linux had before s_inode_list_lock went per superblock): an
@@ -749,20 +870,17 @@ fn sb_list_add(sb: &SuperBlock, inode: &InodeRef) {
 /// Take an evicted inode off its superblock's list (Linux
 /// inode_sb_list_del), unless the superblock's shutdown drained it
 fn sb_list_del(inode: &Inode) {
-    let weak = {
-        let mut l = INODE_SB_LIST_LOCK.lock();
-        if !inode.i_sb_list.is_linked() {
-            return;
-        }
-        // SAFETY: linked, so `sb` is the superblock `alloc` listed it on
-        // (alive then), whose shutdown drains s_inodes under this lock
-        // before its last passive put frees any field: they are intact,
-        // and the inode's Weak keeps the allocation
-        let sb = unsafe { &*inode.sb.as_ptr() };
-        // SAFETY: linked on its superblock's list
-        unsafe { sb.s_inodes.access_mut(&mut l).remove(inode) }
-    };
-    drop(weak);
+    let mut l = INODE_SB_LIST_LOCK.lock();
+    if !inode.i_sb_list.is_linked() {
+        return;
+    }
+    // SAFETY: linked, so `sb` is the superblock `alloc` listed it on
+    // (alive then), whose shutdown drains s_inodes under this lock
+    // before its last passive put frees any field: they are intact,
+    // and the inode's Weak keeps the allocation
+    let sb = unsafe { &*inode.sb.as_ptr() };
+    // SAFETY: linked on its superblock's list
+    unsafe { sb.s_inodes.access_mut(&mut l).remove(inode) }
 }
 
 /// Unlink every inode of a superblock in its shutdown (Linux
@@ -770,29 +888,27 @@ fn sb_list_del(inode: &Inode) {
 /// shutdown, so its later eviction finds itself unlinked)
 pub(super) fn sb_list_drain(list: &SbInodes) {
     let mut l = INODE_SB_LIST_LOCK.lock();
-    let list = list.access_mut(&mut l);
-    // Only weak references go: no inode's Drop runs here
-    while list.pop_front().is_some() {}
+    list.access_mut(&mut l).clear();
 }
 
 /// `f` on each live inode of `sb` until it returns false (Linux
 /// drop_pagecache_sb's walk): each taken under `INODE_SB_LIST_LOCK`
 /// and held while `f` runs with no lock, released after the next one is
 /// taken; allocates nothing. False if `f` stopped the walk.
-pub fn for_each_sb_inode(sb: &Arc<SuperBlock>, f: &mut dyn FnMut(&InodeRef) -> bool) -> bool {
+pub fn for_each_sb_inode(sb: &SuperBlock, f: &mut dyn FnMut(&InodeRef) -> bool) -> bool {
     let mut cur: Option<InodeRef> = None;
     loop {
         let next = {
             let l = INODE_SB_LIST_LOCK.lock();
             let list = sb.s_inodes.access(&l);
-            let mut it = match &cur {
+            match &cur {
                 // SAFETY: `c` is alive (held) and `sb` too (the caller's
-                // reference): neither its eviction nor the superblock's
-                // drain has unlinked it, and nothing else does
-                Some(c) => unsafe { list.iter_after(c) },
-                None => list.iter(),
-            };
-            it.find_map(|e| e.upgrade())
+                // reference, or its shutdown before the drain): neither
+                // its eviction nor the drain has unlinked it, and nothing
+                // else does
+                Some(c) => unsafe { list.iter_after(c) }.find_map(Inode::igrab),
+                None => list.iter().find_map(Inode::igrab),
+            }
         };
         // The previous one goes with the lock released: its last
         // reference's eviction takes it
@@ -1583,7 +1699,7 @@ impl Drop for IFree {
 /// hashed, inode_generic_drop) is written back first, as Linux does for
 /// one it does not keep cached (hk keeps no unused inodes):
 /// write_inode_now; then off its superblock's and writeback lists (the
-/// lists' contract, `WeakList`) and the filesystem's eviction.
+/// lists' contract, `InodeList`) and the filesystem's eviction.
 fn evict(i: &Inode) {
     let keep = i.get_nlink() != 0 && i.i_hash_node.is_linked();
     if keep && i.i_dirty.load(Ordering::Acquire) {

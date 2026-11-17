@@ -641,7 +641,7 @@ pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
     sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
     let root = sb.root.write().take();
     if let Some(root) = root {
-        sb.s_fsnotify.sb_delete();
+        crate::io::inotify::sb_delete(sb);
         super::dentry::d_drop_tree(&root);
         drop(root);
         // Linux ignores sync_filesystem's error here too
@@ -1046,9 +1046,6 @@ pub struct SuperBlock {
     /// Its inodes (Linux s_inodes, under inode_sb_list_lock)
     pub(super) s_inodes: super::inode::SbInodes,
 
-    /// Its inodes that have had inotify watches (Linux s_fsnotify_info)
-    pub s_fsnotify: crate::io::inotify::SbMarks,
-
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
     /// Serializes all cross-directory renames on this filesystem to
@@ -1106,8 +1103,7 @@ impl SuperBlock {
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
             s_bdev_file: Mutex::new(None),
-            s_inodes: super::inode::SbInodes::new(WeakList::new()),
-            s_fsnotify: crate::io::inotify::SbMarks::default(),
+            s_inodes: super::inode::sb_inodes(),
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_wb_err: crate::util::errseq::ErrSeq::new(),
             s_umount: sync::RwSem::new(()),

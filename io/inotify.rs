@@ -343,12 +343,10 @@ fn push_if<T>(m: &Mutex<Vec<T>>, f: impl FnOnce(&mut Vec<T>)) -> Result<(), Kern
 }
 
 /// The watches on an inode (Linux inode->i_fsnotify_marks): `list` a
-/// spin leaf; `on_sb` set, under the `SbMarks` lock, once the inode is
-/// on its superblock's `SbMarks` (it stays there until the inode dies)
+/// spin leaf
 #[derive(Default)]
 pub struct Marks {
     list: Mutex<Vec<Mark>>,
-    on_sb: core::sync::atomic::AtomicBool,
 }
 
 impl Marks {
@@ -372,52 +370,18 @@ impl Marks {
     }
 }
 
-/// The inodes of a superblock that have had watches (Linux
-/// sb->s_fsnotify_info's connector list), for its shutdown: a spin
-/// leaf. Each inode is listed once (`Marks.on_sb`); entries of dead
-/// inodes are dropped when the list would grow.
-#[derive(Default)]
-pub struct SbMarks(Mutex<Vec<Weak<Inode>>>);
-
-impl SbMarks {
-    /// List `inode` if it is not yet; ENOMEM if the list cannot grow.
-    /// `on_sb` is set only under the list's lock, by the adder that
-    /// pushes the inode, after the push: an adder that sees it set
-    /// knows the inode is listed, and a failed growth leaves it unset
-    /// for the next adder to try.
-    fn add(&self, inode: &InodeRef) -> Result<(), KernelError> {
-        let on_sb = &inode.fsnotify.on_sb;
-        if on_sb.load(Ordering::Acquire) {
-            return Ok(());
+/// The filesystem is shutting down (Linux fsnotify_sb_delete ->
+/// fsnotify_unmount_inodes, from generic_shutdown_super, as of the
+/// s_inodes walk): every watch on its inodes gets IN_UNMOUNT, then
+/// IN_IGNORED, and goes, releasing its inode. A watched inode is live
+/// (its watch holds it), so the walk of `s_inodes` finds every one.
+pub fn sb_delete(sb: &crate::fs::SuperBlock) {
+    crate::fs::inode::for_each_sb_inode(sb, &mut |inode| {
+        if !inode.fsnotify.is_empty() {
+            destroy_marks(inode, IN_UNMOUNT);
         }
-        {
-            // Dead inodes' entries go before the list would grow
-            // (amortized: only when it is full)
-            let mut v = self.0.lock();
-            if v.len() == v.capacity() {
-                v.retain(|w| w.strong_count() != 0);
-            }
-        }
-        let w = Arc::downgrade(inode);
-        push_if(&self.0, |v| {
-            if !on_sb.load(Ordering::Relaxed) {
-                v.push(w);
-                on_sb.store(true, Ordering::Release);
-            }
-        })
-    }
-
-    /// The filesystem is shutting down (Linux fsnotify_sb_delete, from
-    /// generic_shutdown_super): every watch on its inodes gets
-    /// IN_UNMOUNT, then IN_IGNORED, and goes, releasing its inode
-    pub fn sb_delete(&self) {
-        let list = core::mem::take(&mut *self.0.lock());
-        for w in list {
-            if let Some(inode) = w.upgrade() {
-                destroy_marks(&inode, IN_UNMOUNT);
-            }
-        }
-    }
+        true
+    });
 }
 
 /// A dentry lets go of `inode` (Linux dentry_unlink_inode): if no name
@@ -580,12 +544,6 @@ impl Inotify {
         let Some(wd) = self.inner.lock().alloc_wd() else {
             return undo(KernelError::NoSpace);
         };
-        // The inode on its superblock's list, then the mark on the inode
-        if let Some(sb) = inode.sb.upgrade()
-            && let Err(e) = sb.s_fsnotify.add(&inode)
-        {
-            return undo(e);
-        }
         let mark = Mark {
             group: Arc::downgrade(self),
             wd,

@@ -10,11 +10,11 @@
 //! file handle is first made of it, for open_by_handle_at's lookup
 //! (Linux shmem_encode_fh, shmem_fh_to_dentry).
 //!
-//! An inode lives as long as someone holds an `Arc` to it: a dentry, an
-//! open file, a mapping (the writeback lists hold none). The hash
-//! holds a `Weak` only (a `WeakList` per bucket, linked through the
-//! inode's own `i_hash_node`: hashing allocates nothing). When the last
-//! `Arc` goes, its teardown (`inode::IFree`) runs [`evict`]: it
+//! An inode lives as long as someone holds a reference to it: a
+//! dentry, an open file, a mapping. The hash holds none (an
+//! `InodeList` per bucket, linked through the inode's own
+//! `i_hash_node`: hashing allocates nothing). When the last reference
+//! goes, its teardown (`inode::IFree`) runs [`evict`]: it
 //! unhashes the inode and calls the filesystem's `evict_inode`, which frees what an
 //! unlinked object still owns (Linux iput_final -> evict ->
 //! ->evict_inode). Deviation from Linux: no LRU of unused inodes (Linux
@@ -28,8 +28,8 @@
 //! dropped, never seen). So there is no I_NEW state to wait on. A lookup
 //! runs the filesystem's `test` on each candidate before taking a
 //! reference (Linux find_inode). One whose last reference went (its
-//! `Drop` writing it back or evicting it while still hashed: Linux
-//! I_WILL_FREE, I_FREEING) cannot be upgraded: the lookup sleeps until
+//! teardown writing it back or evicting it while still hashed: Linux
+//! I_WILL_FREE, I_FREEING) cannot be grabbed: the lookup sleeps until
 //! an eviction finishes and searches again (Linux
 //! __wait_on_freeing_inode), so no second inode of the object is built
 //! while the first may still write it or free its blocks.
@@ -48,12 +48,11 @@ use core::sync::atomic::Ordering;
 
 use spin::Once;
 
-use super::inode::{Inode, InodeRef};
+use super::inode::{Inode, InodeList, InodeRef};
 use super::superblock::SuperBlock;
 use crate::sync::spin::Mutex;
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::error::KernelError;
-use crate::util::list::WeakList;
 
 crate::adapter!(pub HashA, Inode, i_hash_node);
 
@@ -67,8 +66,9 @@ unsafe impl UniqueOwner for InodeHash {}
 /// Linux inode_hash_lock
 static INODE_HASH_LOCK: Mutex<InodeHash> = Mutex::new(InodeHash(()));
 
-/// One bucket (Linux hlist_head): the hashed inodes, by `Weak`
-type Bucket = LockedBy<WeakList<HashA>, InodeHash>;
+/// One bucket (Linux hlist_head): the hashed inodes, holding no
+/// reference
+type Bucket = LockedBy<InodeList<HashA>, InodeHash>;
 
 static TABLE: Once<Box<[Bucket]>> = Once::new();
 
@@ -82,7 +82,9 @@ fn table_size() -> usize {
 fn table() -> &'static [Bucket] {
     TABLE.call_once(|| {
         (0..table_size())
-            .map(|_| LockedBy::new(WeakList::new()))
+            // SAFETY: an inode's eviction unhashes it under
+            // INODE_HASH_LOCK (`evict`), as every other unhash does
+            .map(|_| LockedBy::new(unsafe { InodeList::new() }))
             .collect()
     })
 }
@@ -117,13 +119,12 @@ fn find(
     test: &dyn Fn(&Inode) -> bool,
 ) -> Found {
     let mut dying = None;
-    for e in b.access(l).iter() {
-        let i = e.get();
+    for i in b.access(l).iter() {
         if core::ptr::eq(i.sb.as_ptr(), sb)
             && i.i_hash.load(Ordering::Relaxed) == hashval
             && test(i)
         {
-            match e.upgrade() {
+            match i.igrab() {
                 Some(a) => return Found::Live(a),
                 None => dying = Some(core::ptr::from_ref(i) as usize),
             }
@@ -251,19 +252,15 @@ fn unhash(inode: &Inode) -> bool {
     if !inode.i_hash_node.is_linked() {
         return false;
     }
-    let weak = {
-        let mut l = INODE_HASH_LOCK.lock();
-        if !inode.i_hash_node.is_linked() {
-            return false;
-        }
-        let b = bucket(inode.sb.as_ptr(), inode.i_hash.load(Ordering::Relaxed));
-        // SAFETY: linked, so on the bucket of its superblock and hash
-        // value (both unchanged while hashed: `i_hash` is set before it
-        // is linked, under this lock)
-        unsafe { b.access_mut(&mut l).remove(inode) }
-    };
-    // Only the hash's weak reference goes: never the inode's Drop
-    drop(weak);
+    let mut l = INODE_HASH_LOCK.lock();
+    if !inode.i_hash_node.is_linked() {
+        return false;
+    }
+    let b = bucket(inode.sb.as_ptr(), inode.i_hash.load(Ordering::Relaxed));
+    // SAFETY: linked, so on the bucket of its superblock and hash value
+    // (both unchanged while hashed: `i_hash` is set before it is
+    // linked, under this lock)
+    unsafe { b.access_mut(&mut l).remove(inode) };
     true
 }
 
