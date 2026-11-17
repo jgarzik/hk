@@ -152,14 +152,11 @@ pub struct MntNamespace {
     pub events: Arc<MntEvents>,
 }
 
-/// The last mount change's number, of any namespace (Linux
-/// fs/namespace.c event, under namespace_sem; an atomic, as a remount
-/// changes a namespace outside it)
-static MNT_EVENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 /// A mount namespace's change number and the pollers of its mount lists
 /// (Linux mnt_namespace.event, .poll)
 pub struct MntEvents {
+    /// Written under MOUNT_LOCK write (fs::mount), read lock-free by
+    /// pollers (Linux READ_ONCE(ns->event))
     event: core::sync::atomic::AtomicU64,
     pub poll: crate::sync::waitqueue::WaitQueue,
 }
@@ -172,28 +169,19 @@ impl MntEvents {
         }
     }
 
-    /// A change: a new number (Linux touch_mnt_namespace's ++event),
-    /// never below one stored before; pollers are woken by the caller
-    pub fn bump(&self) {
-        use core::sync::atomic::Ordering;
-        let e = MNT_EVENT.fetch_add(1, Ordering::Relaxed) + 1;
-        self.event.fetch_max(e, Ordering::AcqRel);
+    /// Its number is now `e` (Linux touch_mnt_namespace's ns->event =
+    /// ++event), under MOUNT_LOCK write; pollers are woken by the caller
+    pub fn set(&self, e: u64) {
+        self.event.store(e, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The number of its last change (Linux ns->event)
+    /// The number of its last change (Linux READ_ONCE(ns->event))
     pub fn event(&self) -> u64 {
-        self.event.load(core::sync::atomic::Ordering::Acquire)
+        self.event.load(core::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl MntNamespace {
-    /// Its mount table changed (Linux touch_mnt_namespace): a new
-    /// change number, and its pollers woken
-    pub fn touch(&self) {
-        self.events.bump();
-        self.events.poll.wake_all();
-    }
-
     /// A new empty mount namespace owned by `user_ns`, not yet in the
     /// namespace tree, or ENOMEM (Linux alloc_mnt_ns)
     fn alloc(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {

@@ -87,7 +87,25 @@ const MNT_INTERNAL_FLAGS: u32 = MNT_SYNC_UMOUNT | MNT_LOCKED | MNT_UMOUNT;
 /// What [`MOUNT_LOCK`] owns: the mount tree's links, with
 /// NAMESPACE_SEM ([`NsTree`]); `&MntHash` (a locking read) holds them
 /// still
-pub struct MntHash(());
+pub struct MntHash {
+    /// The last mount change's number, of any namespace (Linux
+    /// fs/namespace.c `event`, under mount_lock held for writing)
+    event: u64,
+}
+
+impl MntHash {
+    /// Namespace `id` changed (Linux touch_mnt_namespace): a new number
+    fn touch(&mut self, id: u64) {
+        self.event += 1;
+        crate::ns::tree::mnt_set_event(id, self.event);
+    }
+
+    /// Namespace `id` lost mounts to an umount that took its number
+    /// first (Linux __touch_mnt_namespace): the current number
+    fn touch_cur(&mut self, id: u64) {
+        crate::ns::tree::mnt_set_event(id, self.event);
+    }
+}
 
 // SAFETY: one value, built here for MOUNT_LOCK alone (private field)
 // and reachable only through its guards
@@ -98,7 +116,7 @@ unsafe impl UniqueOwner for MntHash {}
 /// sequence lockless readers may check; read_seqlock_excl is
 /// `read_excl`); under NAMESPACE_SEM and s_umount, above RENAME_LOCK
 /// (d_path, path_is_under) and leaves
-pub static MOUNT_LOCK: SeqLock<MntHash> = SeqLock::new(MntHash(()));
+pub static MOUNT_LOCK: SeqLock<MntHash> = SeqLock::new(MntHash { event: 0 });
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
 pub type MountMap = Vec<(MountRef, MountRef)>;
@@ -141,13 +159,12 @@ impl Touched {
         }
     }
 
-    /// Namespace `id` changed (Linux touch_mnt_namespace): its number
-    /// now (NS_TREE, a leaf), its wakeup after the unlock
+    /// Namespace `id` changed: its wakeup after the unlock (its number
+    /// was set under MOUNT_LOCK)
     fn add(&mut self, id: u64) {
         if id == 0 || id == MNT_NS_INTERNAL {
             return;
         }
-        crate::ns::tree::mnt_bump(id);
         if self.all || self.ids[..self.n].contains(&id) {
             return;
         }
@@ -186,8 +203,22 @@ impl Touched {
 unsafe impl UniqueOwner for NsTree {}
 
 impl NsTree {
-    /// Namespace `id`'s mount table changed: touched after the unlock
-    pub(super) fn touch(&mut self, id: u64) {
+    /// Namespace `id`'s mount table changed (Linux touch_mnt_namespace,
+    /// under mount_lock): a new number now, its pollers woken after the
+    /// unlock
+    pub(super) fn touch(&mut self, ml: &mut MntHash, id: u64) {
+        if id != 0 && id != MNT_NS_INTERNAL {
+            ml.touch(id);
+        }
+        self.touched.add(id);
+    }
+
+    /// [`touch`](Self::touch) for an umount, whose number was taken
+    /// before it (Linux __touch_mnt_namespace)
+    fn touch_cur(&mut self, ml: &mut MntHash, id: u64) {
+        if id != 0 && id != MNT_NS_INTERNAL {
+            ml.touch_cur(id);
+        }
         self.touched.add(id);
     }
 
@@ -1499,6 +1530,19 @@ pub fn check_mnt(m: &Mount) -> bool {
     m.ns() == crate::ns::current_mnt_ns().id()
 }
 
+/// Namespace `id` changed outside NAMESPACE_SEM (a remount: Linux
+/// set_mount_attributes' touch_mnt_namespace under mount_lock): a new
+/// number, its pollers woken after the lock
+pub fn touch_mnt_ns(id: u64) {
+    if id == 0 || id == MNT_NS_INTERNAL {
+        return;
+    }
+    MOUNT_LOCK.write().touch(id);
+    if let Some(e) = crate::ns::tree::mnt_events(id) {
+        e.poll.wake_all();
+    }
+}
+
 /// The tree at `m`, just hung on its parent, joins the parent's
 /// namespace (Linux commit_tree); under NAMESPACE_SEM write
 pub(super) fn commit_tree(ns: &mut NsTree, m: &MountRef) {
@@ -1506,7 +1550,7 @@ pub(super) fn commit_tree(ns: &mut NsTree, m: &MountRef) {
     for t in walk(m, ns) {
         t.set_ns(id);
     }
-    ns.touch(id);
+    ns.touch(&mut MOUNT_LOCK.write(), id);
 }
 
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
@@ -1793,6 +1837,8 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         if !check_mnt(&mount) || mount.flags() & MNT_LOCKED != 0 || !mount.has_parent(&*ns) {
             return Err(KernelError::InvalidArgument);
         }
+        // The umount's change number (Linux do_umount: event++)
+        ml.event += 1;
         if detach {
             umount_tree(&mut ns, &mut ml, &mount, UMOUNT_PROPAGATE);
         } else {
@@ -1865,7 +1911,7 @@ fn umount_tree(ns: &mut NsTree, ml: &mut MntHash, mnt: &Mount, how: u32) {
     }
     super::pnode::bulk_make_private(ns, &set);
     while let Some(p) = set.pop_front() {
-        ns.touch(p.ns());
+        ns.touch_cur(ml, p.ns());
         p.set_ns(0);
         if how & UMOUNT_SYNC != 0 {
             p.mnt_flags.fetch_or(MNT_SYNC_UMOUNT, Ordering::SeqCst);
@@ -2441,7 +2487,7 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     attach_at(ns, tr, put_old);
     attach_mnt(ns, tn, &root_parent, root_mp.mp());
     // Linux path_pivot_root: touch_mnt_namespace
-    ns.touch(new.mnt.ns());
+    ns.touch(&mut MOUNT_LOCK.write(), new.mnt.ns());
     let gone = unpin_mountpoint(&mut MOUNT_LOCK.read_excl(), root_mp);
     drop(l);
     drop(gone);

@@ -175,7 +175,7 @@ fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), Ke
     m.set_flags(remount_flags(flags, m.flags()))?;
     // Linux set_mount_attributes: touch_mnt_namespace (the caller's
     // namespace: check_mnt)
-    crate::ns::current_mnt_ns().touch();
+    super::mount::touch_mnt_ns(crate::ns::current_mnt_ns().id());
     Ok(())
 }
 
@@ -190,7 +190,7 @@ fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelE
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();
     m.set_flags(remount_flags(flags, m.flags()))?;
-    crate::ns::current_mnt_ns().touch();
+    super::mount::touch_mnt_ns(crate::ns::current_mnt_ns().id());
     Ok(())
 }
 
@@ -223,7 +223,7 @@ fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError
         change_mnt_propagation(&mut ns, m, p);
     }
     // Linux do_change_type: touch_mnt_namespace
-    ns.touch(m.ns());
+    ns.touch(&mut super::mount::MOUNT_LOCK.write(), m.ns());
     Ok(())
 }
 

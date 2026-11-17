@@ -131,19 +131,6 @@ argued / published copy of locked state.
 - Fix: vmstat-style counter (per-CPU diff + global atomic folded at a
   threshold, i.e. `PercpuCounter`) and a per-CPU ratelimit before the check.
 
-### 16. Mount change numbers: global atomic + `fetch_max` instead of `mount_lock` — (d)(b)
-- Where: `ns/mod.rs` `MNT_EVENT`, `MntEvents.event`, `MntEvents::bump`.
-- Wrong: two atomics updated separately and a `fetch_max` to repair the
-  ordering between racing bumps; the comment says remount changes a namespace
-  outside `namespace_sem`, so a lock-free scheme was invented.
-- Linux: `event` and `ns->event` change in `touch_mnt_namespace` /
-  `__touch_mnt_namespace` under `mount_lock` held for writing (remount
-  included), read with READ_ONCE by `mounts_poll`.
-- Fix: bump under `fs/mount.rs` `MOUNT_LOCK` write (already held at every
-  tree change; take it in remount as Linux does); `MNT_EVENT` a plain field
-  of the lock's data, `MntEvents.event` a Relaxed store for pollers.
-  LOCKING.md §3.4.
-
 ### 17. `Task.ppid`/`pgid`/`sid`: published copies of TASKLIST state — (e)
 - Where: `task/mod.rs` `Task.ppid`, `pgid`, `sid`; writers in
   `task/percpu.rs` (reparent, `setpgid`/`setsid`, fork); readers `getppid`,

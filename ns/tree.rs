@@ -315,17 +315,17 @@ pub fn remove(ns: &NsCommon) {
     drop(nodes);
 }
 
-/// A change of mount namespace `id`, active or not (Linux
-/// touch_mnt_namespace's ns->event): its number bumped under the lock,
-/// no reference taken, nothing dropped; its pollers are woken by
-/// [`mnt_events`] after the caller's locks
-pub fn mnt_bump(id: u64) {
+/// Mount namespace `id`, active or not, changed (Linux
+/// touch_mnt_namespace's ns->event): its number set to `event`, under
+/// MOUNT_LOCK write; no reference taken, nothing dropped; its pollers
+/// are woken by [`mnt_events`] after the caller's locks
+pub fn mnt_set_event(id: u64, event: u64) {
     let t = NS_TREE.lock();
     if let Some(e) = t
         .get(Tree::Type(CLONE_NEWNS), id)
         .and_then(|e| e.mnt.as_ref())
     {
-        e.bump();
+        e.set(event);
     }
 }
 
