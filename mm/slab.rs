@@ -689,20 +689,6 @@ fn large_order(size: usize, align: usize) -> u32 {
 // Named caches
 // ============================================================================
 
-/// Layout of an `Arc<T>` allocation: std's repr(C) ArcInner { strong,
-/// weak, data }
-const fn arc_layout(size: usize, align: usize) -> (usize, usize) {
-    let a = if align > 8 { align } else { 8 };
-    (
-        (16usize.next_multiple_of(align) + size).next_multiple_of(a),
-        a,
-    )
-}
-
-const fn arc_of<T>() -> (usize, usize) {
-    arc_layout(core::mem::size_of::<T>(), core::mem::align_of::<T>())
-}
-
 const fn box_of<T>() -> (usize, usize) {
     (core::mem::size_of::<T>(), core::mem::align_of::<T>())
 }
@@ -719,7 +705,7 @@ macro_rules! named_cache {
 /// VMAs (`Box<Vma>`; Linux vm_area_cachep)
 pub static VMA_CACHE: KmemCache = named_cache!("vm_area_struct", box_of::<crate::mm::Vma>());
 /// Dentries (`DentryRef`; Linux dentry_cache)
-pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", arc_of::<crate::fs::dentry::Dentry>());
+pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", box_of::<crate::fs::dentry::Dentry>());
 /// Inodes (`InodeRef`; Linux inode_cache)
 pub static INODE_CACHE: KmemCache =
     named_cache!("inode_cache", box_of::<crate::fs::inode::Inode>());
@@ -1098,14 +1084,12 @@ pub mod tests {
 
     #[test]
     fn named_caches_take_their_exact_layout() {
-        #[repr(align(64))]
-        struct Odd([u8; 200]);
-        assert_eq!(arc_of::<Odd>(), (320, 64));
-        assert_eq!(arc_of::<u8>(), (24, 8));
         let (s, a) = box_of::<crate::mm::Vma>();
         assert!(core::ptr::eq(cache_for(s, a).unwrap(), &VMA_CACHE));
-        let (s, a) = arc_of::<crate::fs::dentry::Dentry>();
+        let (s, a) = box_of::<crate::fs::dentry::Dentry>();
         assert!(core::ptr::eq(cache_for(s, a).unwrap(), &DENTRY_CACHE));
+        let (s, a) = box_of::<crate::fs::inode::Inode>();
+        assert!(core::ptr::eq(cache_for(s, a).unwrap(), &INODE_CACHE));
     }
 
     #[test]
