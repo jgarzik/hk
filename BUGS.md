@@ -1134,10 +1134,10 @@ Tag = roadmap phase (doc/ROADMAP.md).
 
 **Location**: `task/fork.rs`, others named below
 
-- Large frames left: `do_clone` (TaskInner and the clone state live by
-  value; Linux dup_task_struct builds in the allocated task) and x86
-  `copy_fpstate_to_sigframe` (the FP image on the stack; Linux XSAVEs
-  straight into the user frame).
+- Large frames left: `do_clone` (the clone state is gathered on its
+  frame before the task exists; Linux copy_process fills the task
+  dup_task_struct allocated) and x86 `copy_fpstate_to_sigframe` (the FP
+  image on the stack; Linux XSAVEs straight into the user frame).
 
 ## DRM dumb buffers are the boot framebuffer only
 

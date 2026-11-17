@@ -1771,30 +1771,32 @@ fn create_kernel_task(
     // In no process group or session (never signalled by group); no
     // exit signal, no user-space resources, never traced
     let task_inner = crate::task::TaskInner::new(TaskState::Ready, ArchPageTable::kernel_root());
-    let task = Task::new(
-        tid,
-        crate::task::TaskIds {
-            pid,
-            seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
-            thread_pid,
-        },
-        TaskKind::KernelThread,
-        stack_top,
-        cpu_id,
-        &crate::util::cpumask::CpuSet::one(cpu_id),
-        cred,
-        None,
-        crate::task::TaskAlloc::named(name.as_bytes()),
-        sig,
-        task_inner,
-    );
+    // Built in its block; on failure the stack goes with the task's
+    // parts
+    let task = crate::util::kalloc::try_arc_with(|| {
+        Task::new(
+            tid,
+            crate::task::TaskIds {
+                pid,
+                seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+                thread_pid,
+            },
+            TaskKind::KernelThread,
+            stack_top,
+            cpu_id,
+            &crate::util::cpumask::CpuSet::one(cpu_id),
+            cred,
+            None,
+            crate::task::TaskAlloc::named(name.as_bytes()),
+            sig,
+            task_inner,
+        )
+    })?;
 
     set_kthread_class(&task.se, priority);
     // SAFETY: not on a run queue yet
     unsafe { *task.se.ctx() = TaskContext::new_kernel_thread(entry, stack_top) };
     task.se.stack.set(stack);
-    // On failure the stack goes with the task
-    let task = try_arc(task)?;
     if idle {
         set_idle(cpu_id, &task);
     } else {
@@ -1958,26 +1960,30 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
         // Shared resources: set by the caller via init_* functions
         ..crate::task::TaskInner::new(TaskState::Running, config.page_table.root_table_phys())
     };
-    // The boot-time init task: failure cannot be reported
-    let task = arc_nofail(Task::new(
-        tid,
-        crate::task::TaskIds {
-            pid,
-            seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
-            thread_pid: Some(thread_pid),
-        },
-        TaskKind::UserProcess,
-        config.kstack_top,
-        cpu_id,
-        &crate::util::cpumask::CpuSet::all(),
-        arc_nofail(Cred::root()),
-        Some(mm),
-        // comm after the init binary, /bin/init (Linux names init after
-        // the file it execs)
-        crate::task::TaskAlloc::named(b"init"),
-        crate::signal::TaskSignalState::new(),
-        task_inner,
-    ));
+    // The boot-time init task, built in its block: failure cannot be
+    // reported
+    let task = crate::util::kalloc::try_arc_with(|| {
+        Task::new(
+            tid,
+            crate::task::TaskIds {
+                pid,
+                seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+                thread_pid: Some(thread_pid),
+            },
+            TaskKind::UserProcess,
+            config.kstack_top,
+            cpu_id,
+            &crate::util::cpumask::CpuSet::all(),
+            arc_nofail(Cred::root()),
+            Some(mm),
+            // comm after the init binary, /bin/init (Linux names init after
+            // the file it execs)
+            crate::task::TaskAlloc::named(b"init"),
+            crate::signal::TaskSignalState::new(),
+            task_inner,
+        )
+    })
+    .expect("boot: no memory for the init task");
 
     // Add to global table, as the root namespace's child reaper
     {
@@ -2912,7 +2918,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         ..crate::task::TaskInner::new(TaskState::Ready, child_pgd)
     };
     // Built in its block (Linux dup_task_struct fills the slab object):
-    // a task copied through fork's frames costs kilobytes of stack. On
+    // a task on fork's frames would cost its size under every call. On
     // failure the stack, pid and mm go with the unbuilt task's parts
     let child_task = crate::util::kalloc::try_arc_with(|| {
         Task::new(

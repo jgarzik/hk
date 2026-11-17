@@ -186,15 +186,27 @@ pub fn try_box_array<T, const N: usize>(f: impl FnMut() -> T) -> Result<Box<[T; 
 /// `Arc::new(f())` with the block allocated first and `f`'s value made
 /// in it, or ENOMEM before `f` runs: for a large `T`, which
 /// `try_arc(v)` copies through the caller's frame and its own (Linux
-/// fills a slab object in place, dup_task_struct)
+/// fills a slab object in place, dup_task_struct). `f` must inline to
+/// the value's struct expression (an `#[inline(always)]` constructor):
+/// rustc returns a value from an opaque call into a temporary and
+/// copies it.
 #[inline(always)]
 pub fn try_arc_with<T>(f: impl FnOnce() -> T) -> Result<Arc<T>, KernelError> {
     let mut a = try_arc_uninit::<T>()?;
-    Arc::get_mut(&mut a)
-        .expect("try_arc_with: a new Arc is unshared")
-        .write(f());
+    fill(
+        Arc::get_mut(&mut a).expect("try_arc_with: a new Arc is unshared"),
+        f,
+    );
     // SAFETY: the value was written just above
     Ok(unsafe { a.assume_init() })
+}
+
+/// `slot.write(f())`, out of line: with `slot` a unique argument the
+/// struct expression `f` inlines to is stored field by field into it,
+/// where the caller would build it in its own frame first
+#[inline(never)]
+fn fill<T>(slot: &mut core::mem::MaybeUninit<T>, f: impl FnOnce() -> T) {
+    slot.write(f());
 }
 
 /// `Arc::<[T]>::from(s)`, or ENOMEM (a refcounted copy of a slice:
