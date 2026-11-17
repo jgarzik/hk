@@ -720,11 +720,11 @@ impl VfatOpts {
                 | b"uni_xlate" | b"allow_utime" | b"errors" | b"check" | b"nfs" => {}
                 // Linux fat_parse_param: tz= takes only UTC
                 b"tz" if v == b"UTC" => (o.tz_set, o.time_offset) = (true, 0),
-                // Minutes, within a day either way
+                // Minutes, within a day either way (Linux fsparam_s32:
+                // kstrtoint base 0)
                 b"time_offset" => {
-                    let n = core::str::from_utf8(v)
+                    let n = crate::util::kstrtox::kstrtoint(v)
                         .ok()
-                        .and_then(|v| v.parse::<i32>().ok())
                         .filter(|n| (-24 * 60..=24 * 60).contains(n))
                         .ok_or(bad)?;
                     (o.tz_set, o.time_offset) = (true, n);

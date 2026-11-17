@@ -15,6 +15,7 @@ pub mod kalloc;
 pub mod kfifo;
 pub mod klist;
 pub mod kmem;
+pub mod kstrtox;
 pub mod list;
 pub mod percpu_alloc;
 pub mod percpu_counter;
