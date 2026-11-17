@@ -687,6 +687,15 @@ waiting).
   inode data is not RCU-readable); Linux's pid_revalidate and
   proc_pid_permission run there, so /proc/<pid> walks leave RCU mode
   at /proc and RESOLVE_CACHED is EAGAIN under it.
+- path_init takes references per lookup where Linux's RCU mode takes
+  none: the root (`nd_root`: `FsStruct::get_root` under the fs_struct's
+  Mutex), the cwd (`current_cwd`), a dirfd's path (the fd table lock, a
+  file reference), and a copy of the caller's `Cred`: stores to the
+  root and cwd dentries' counts and the fs_struct's lock word on every
+  lookup. Linux reads fs->root and fs->pwd under fs->seq with no
+  reference (set_root, path_init), legitimizes the root at unlazy
+  (legitimize_root, nd->root_seq), and uses fdget and current_cred
+  without one.
 
 ## renameat2 flag gaps
 

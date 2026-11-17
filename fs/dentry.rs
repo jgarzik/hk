@@ -826,7 +826,10 @@ impl Dentry {
     /// at the time of the read, or for a killed dentry the one it held
     /// until its kill. A walk on it checks RENAME_LOCK's sequence after,
     /// or holds that lock (then it is the parent still).
-    fn parent_rcu<'g>(&self, _g: &'g crate::sync::rcu::RcuReadGuard) -> Option<&'g Dentry> {
+    pub(super) fn parent_rcu<'g>(
+        &self,
+        _g: &'g crate::sync::rcu::RcuReadGuard,
+    ) -> Option<&'g Dentry> {
         let p = self.parent_ptr();
         // SAFETY: `self` is readable under the guard, so it was live when
         // the guard began or reached through links read under it; its

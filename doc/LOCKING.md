@@ -3440,9 +3440,17 @@ Linux __follow_mount_rcu): `__lookup_mnt` under the guard, the mount's
 root borrowed (`Mount::root_rcu`: the hash chain's reference keeps the
 mount's teardown, which puts its root, after the guard began) with its
 `d_seq` sampled, MOUNT_LOCK's sequence checked after each step; a
-no-xdev walk or a raced mount change leaves RCU mode there. Where it
-must leave RCU mode (a miss, a symlink's body, "..", a revalidation
-or permission check that said ECHILD) it
+no-xdev walk or a raced mount change leaves RCU mode there. ".."
+climbs in RCU mode too (`follow_dotdot_rcu`, Linux follow_dotdot_rcu):
+at a mount's root to its mountpoint (`choose_mountpoint_rcu`, the
+links read with `up_rcu`, the root compared by address), then the
+parent through `d_parent` (`Dentry::parent_rcu`) with its `d_seq`
+sampled before the child's is checked, MOUNT_LOCK's sequence checked
+after a climb or at the root, and `path_connected` (`is_subdir`, under
+RENAME_LOCK's sequence) for a bind mount; the root, beneath, a no-xdev
+climb or a disconnected parent is ECHILD, and the ref walk gives the
+answer. Where it must leave RCU mode (a miss, a symlink's body, a
+revalidation or permission check that said ECHILD) it
 takes references to where it stands (`try_to_unlazy`,
 `try_to_unlazy_next` for a child too, `legitimize_path`:
 `MountRef::legitimize` against MOUNT_LOCK's sequence sampled at the
@@ -5665,7 +5673,7 @@ guard.a = 1;
 guard.b = 2;
 ```
 
-#### Rules (phase L, from the 2026-11-03 atomics audit)
+#### Rules (phase L)
 
 1. **Lock first, atomics second.** An object with a lock keeps its fields
    as plain data inside that lock. An atomic is justified only by a named

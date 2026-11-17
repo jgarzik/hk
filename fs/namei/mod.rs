@@ -492,9 +492,21 @@ impl Nd {
             Lazy::Child {
                 cur,
                 child,
+                rest,
+                dots: true,
+                ..
+            } => {
+                let p = step_mounts(Path::new(cur.mnt.clone(), child), f)?;
+                self.recheck()?;
+                return self.walk_ref(p, rest, f, 0);
+            }
+            Lazy::Child {
+                cur,
+                child,
                 name,
                 rest,
                 reval,
+                dots: false,
             } => {
                 let d = if reval {
                     lookup_fast_ref(&cur.dentry, child, name)?
@@ -745,7 +757,7 @@ fn follow_dotdot(p: Path, root: &Path, f: LookupFlags) -> Result<Path, KernelErr
     }
     // A root dentry is its own parent (Linux dget_parent of IS_ROOT)
     let parent = p.dentry.get_parent().unwrap_or_else(|| p.dentry.clone());
-    if !path_connected(&p.mnt, &parent) {
+    if !path_connected(&p.mnt, &parent, &crate::sync::rcu::read_lock()) {
         return Err(KernelError::NotFound);
     }
     step_mounts(Path::new(p.mnt.clone(), parent), f)

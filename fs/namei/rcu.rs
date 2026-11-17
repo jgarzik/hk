@@ -29,7 +29,10 @@ use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, MAY_NOT_BLOCK, may_follow_link, permission_as};
 use crate::fs::dentry::{__d_lookup_rcu, Dentry, DentryRef};
 use crate::fs::inode::Inode;
-use crate::fs::mount::{__lookup_mnt, MNT_NOSYMFOLLOW, MOUNT_LOCK, Mount, MountRef};
+use crate::fs::mount::{
+    __lookup_mnt, MNT_NOSYMFOLLOW, MOUNT_LOCK, Mount, MountRef, choose_mountpoint_rcu,
+    path_connected,
+};
 use crate::fs::path_ref::Path;
 use crate::sync::rcu::RcuReadGuard;
 
@@ -95,13 +98,15 @@ pub(super) enum Lazy<'p> {
     Lookup(Path, &'p [u8], &'p [u8]),
     /// try_to_unlazy_next with `child`, found for `name` in `cur`:
     /// revalidated in ref mode if `reval`, then stepped into, then
-    /// `rest`
+    /// `rest`; `dots`: the parent ".." gave (WALK_NOFOLLOW, then
+    /// handle_dots' scoped check)
     Child {
         cur: Path,
         child: DentryRef,
         name: &'p [u8],
         rest: &'p [u8],
         reval: bool,
+        dots: bool,
     },
     /// pick_link: symlink `link` in `cur`, checked; its body in ref
     /// mode, then `rest`
@@ -134,6 +139,13 @@ fn legitimize_path(mnt: &Mount, d: &Dentry, seq: u32, m_seq: u32, puts: &mut Put
     }
     Some(p)
 }
+
+/// step_into's flags (Linux WALK_TRAILING, WALK_MORE, WALK_NOFOLLOW):
+/// the last component, one more follows, never follow a symlink (".."
+/// lands on a directory)
+const WALK_TRAILING: u8 = 1;
+const WALK_MORE: u8 = 2;
+const WALK_NOFOLLOW: u8 = 4;
 
 impl Nd {
     /// link_path_walk and complete_walk from `start` in RCU mode,
@@ -182,11 +194,30 @@ impl Nd {
             match name {
                 b"." => {}
                 b".." => {
-                    // follow_dotdot needs the ref-walk here
-                    return Ok(Lazy::Comp(self.try_to_unlazy(&cur, f.cached, puts)?, p));
+                    // handle_dots: follow_dotdot_rcu, step_into with
+                    // WALK_NOFOLLOW, then a scoped walk's check
+                    let (d, seq) = self.follow_dotdot_rcu(g, &mut cur, f)?;
+                    let inode = d.d_inode_rcu(g);
+                    let step = self.step_into_rcu(
+                        g,
+                        &mut cur,
+                        d,
+                        inode,
+                        seq,
+                        name,
+                        rest,
+                        WALK_NOFOLLOW,
+                        f,
+                        puts,
+                    )?;
+                    if let Some(l) = step {
+                        return Ok(l);
+                    }
+                    self.recheck()?;
                 }
                 _ => {
-                    let step = self.walk_component_rcu(g, &mut cur, name, rest, last, f, puts)?;
+                    let flags = if last { WALK_TRAILING } else { WALK_MORE };
+                    let step = self.walk_component_rcu(g, &mut cur, name, rest, flags, f, puts)?;
                     if let Some(l) = step {
                         return Ok(l);
                     }
@@ -220,7 +251,7 @@ impl Nd {
         cur: &mut RcuPath<'g>,
         name: &'p [u8],
         rest: &'p [u8],
-        last: bool,
+        flags: u8,
         f: LookupFlags,
         puts: &mut Puts,
     ) -> Result<Option<Lazy<'p>>, KernelError> {
@@ -245,14 +276,15 @@ impl Nd {
                 name,
                 rest,
                 reval: true,
+                dots: false,
             }));
         }
-        self.step_into_rcu(g, cur, child, inode, seq, name, rest, last, f, puts)
+        self.step_into_rcu(g, cur, child, inode, seq, name, rest, flags, f, puts)
     }
 
     /// step_into under LOOKUP_RCU: onto `child` (its `d_seq` was
-    /// `seq` when `inode` was read) unless it is mounted on or a
-    /// symlink to follow
+    /// `seq` when `inode` was read), across what is mounted on it,
+    /// unless it is a symlink to follow (`flags`: WALK_*)
     #[allow(clippy::too_many_arguments)]
     fn step_into_rcu<'g, 'p>(
         &self,
@@ -263,7 +295,7 @@ impl Nd {
         seq: u32,
         name: &'p [u8],
         rest: &'p [u8],
-        last: bool,
+        flags: u8,
         f: LookupFlags,
         puts: &mut Puts,
     ) -> Result<Option<Lazy<'p>>, KernelError> {
@@ -279,12 +311,14 @@ impl Nd {
                     name,
                     rest,
                     reval: false,
+                    dots: flags & WALK_NOFOLLOW != 0,
                 }));
             };
             (mnt, d, seq, inode) = (m, r, s, r.d_inode_rcu(g));
         }
-        let link = inode.is_some_and(|i| i.mode().is_symlink());
-        if link && (!last || f.follow) {
+        let last = flags & WALK_TRAILING != 0;
+        let follow = flags & WALK_NOFOLLOW == 0 && (!last || f.follow);
+        if follow && inode.is_some_and(|i| i.mode().is_symlink()) {
             let l = self.pick_link_rcu(cur, mnt, d, inode, seq, rest, last, f, puts)?;
             return Ok(Some(l));
         }
@@ -308,6 +342,67 @@ impl Nd {
             seq,
         };
         Ok(None)
+    }
+
+    /// follow_dotdot_rcu: the parent ".." lands on from `cur` and its
+    /// `d_seq` sample. At the root it stays (EXDEV beneath: ECHILD, the
+    /// ref walk reports it); at a mount's root `cur` climbs to the
+    /// mountpoint first (choose_mountpoint_rcu; a no-xdev walk's EXDEV
+    /// is the ref walk's too). Each step is checked against MOUNT_LOCK's
+    /// sequence and `cur`'s `d_seq`; a parent a rename left outside a
+    /// bind mount's root is ECHILD (path_connected, ENOENT in ref mode).
+    fn follow_dotdot_rcu<'g>(
+        &self,
+        g: &'g RcuReadGuard,
+        cur: &mut RcuPath<'g>,
+        f: LookupFlags,
+    ) -> Result<(&'g Dentry, u32), KernelError> {
+        let root = &self.root;
+        let at_root = core::ptr::eq(cur.mnt, MountRef::as_ptr(&root.mnt))
+            && core::ptr::eq(cur.dentry, DentryRef::as_ptr(&root.dentry));
+        if !at_root && core::ptr::eq(cur.dentry, cur.mnt.root_addr()) {
+            match choose_mountpoint_rcu(cur.mnt, root, g) {
+                Some((m, mp)) => {
+                    if f.no_xdev {
+                        return Err(ECHILD);
+                    }
+                    let seq = mp.d_seq_begin();
+                    *cur = RcuPath {
+                        mnt: m,
+                        dentry: mp,
+                        inode: mp.d_inode_rcu(g),
+                        seq,
+                    };
+                    // A ref walk could have reached this
+                    if MOUNT_LOCK.read_retry(self.m_seq) {
+                        return Err(ECHILD);
+                    }
+                }
+                None => return self.in_root_rcu(cur, f),
+            }
+        } else if at_root {
+            return self.in_root_rcu(cur, f);
+        }
+        let old = cur.dentry;
+        // A root dentry is its own parent (IS_ROOT)
+        let parent = old.parent_rcu(g).unwrap_or(old);
+        let seq = parent.d_seq_begin();
+        if old.d_seq_retry(cur.seq) || !path_connected(cur.mnt, parent, g) {
+            return Err(ECHILD);
+        }
+        Ok((parent, seq))
+    }
+
+    /// follow_dotdot_rcu's in_root: ".." stays where it is
+    fn in_root_rcu<'g>(
+        &self,
+        cur: &RcuPath<'g>,
+        f: LookupFlags,
+    ) -> Result<(&'g Dentry, u32), KernelError> {
+        if MOUNT_LOCK.read_retry(self.m_seq) || f.beneath {
+            return Err(ECHILD);
+        }
+        Ok((cur.dentry, cur.seq))
     }
 
     /// __follow_mount_rcu: from `d` in `mnt` (its `d_seq` sampled as

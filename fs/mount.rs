@@ -2319,7 +2319,7 @@ pub fn choose_mountpoint(m: &Mount, root: &Path) -> Option<Path> {
 }
 
 /// One climb of [`choose_mountpoint`] (Linux choose_mountpoint_rcu)
-fn choose_mountpoint_rcu<'g>(
+pub(super) fn choose_mountpoint_rcu<'g>(
     m: &'g Mount,
     root: &Path,
     g: &'g crate::sync::rcu::RcuReadGuard,
@@ -2342,9 +2342,9 @@ fn choose_mountpoint_rcu<'g>(
 /// `d` is still under `m`'s root (Linux path_connected): always on a
 /// mount of a whole file system; a rename may have taken a directory
 /// out of a bind mount's subtree, and ".." from it must not climb past
-/// the mount's root unseen
-pub fn path_connected(m: &Mount, d: &Dentry) -> bool {
-    m.root_is_sb_root || super::dentry::is_subdir_borrowed(d, &m.root)
+/// the mount's root unseen. `m` is held, or was reached under `g`.
+pub fn path_connected(m: &Mount, d: &Dentry, g: &RcuReadGuard) -> bool {
+    m.root_is_sb_root || super::dentry::is_subdir_borrowed(d, m.root_rcu(g))
 }
 
 /// `p` is at or below `root`, across mounts (Linux path_is_under:
