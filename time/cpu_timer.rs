@@ -275,7 +275,11 @@ pub fn tick(t: &crate::task::Task) {
 }
 
 /// Run the calling task's due CPU timers and its group's (task context,
-/// on the way back to user mode; Linux handle_posix_cpu_timers)
+/// on the way back to user mode; Linux handle_posix_cpu_timers). Out of
+/// line: inlined, its sends grew the return path's frame (every return
+/// to user mode, and the signal delivery under it) by ~370 bytes on
+/// arm64
+#[inline(never)]
 pub fn run() {
     use crate::task::percpu;
     let me = percpu::current();
