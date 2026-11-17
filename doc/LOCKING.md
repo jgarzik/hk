@@ -2432,9 +2432,14 @@ dropped before and after it is zeroed on the disk.)
   lock (mmap_lock read -> page lock -> PTE lock), so writeback never
   sees it writable but clean; then it may throttle (balance_dirty_pages
   writes the inode back: mmap_lock -> page lock -> i_mmap).
-- Dirty, cached and unevictable pages are counted per CPU
-  (`NR_DIRTY`, `NR_FILE`, `NR_UNEVICT`: atomics, Linux vmstat), summed
-  lock-free for the dirty limits and /proc/meminfo.
+- Dirty, cached, unevictable and tmpfs pages are vmstat counters
+  (`mm::vmstat::VmStat`, Linux vm_node_stat): each CPU's difference is
+  a word only it writes, interrupts off, folded into the global atomic
+  past the threshold (Linux calculate_normal_threshold); the dirty
+  limits and /proc/meminfo read the global with one load. A CPU's
+  dirtied pages since its last throttle check (`BDP_RATELIMITS`, Linux
+  bdp_ratelimits) gate balance_dirty_pages to once per
+  `RATELIMIT_PAGES`.
 - Reclaim and drop_caches (`shrink_cache`, `drop_pagecache`) walk
   the cached inodes in place, allocating nothing: one inode reference
   at a time is taken under its inode-cache bucket lock (or the block

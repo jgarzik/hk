@@ -55,18 +55,6 @@ argued / published copy of locked state.
 
 
 
-### 13. Dirty throttling sums every possible CPU's slot per write — (c)
-- Where: `mm/writeback.rs` `balance_dirty_pages` -> `mm/filemap.rs`
-  `nr_dirty`/`sum` over `NR_DIRTY` (every possible CPU's slot), plus
-  `FRAME_ALLOCATOR.stats()`.
-- Wrong: every buffered write and write fault walks the whole per-CPU array.
-- Linux: `global_node_page_state` reads one atomic (per-CPU diffs folded past
-  a threshold); `balance_dirty_pages_ratelimited` checks only every
-  `ratelimit_pages` per CPU.
-- Fix: vmstat-style counter (per-CPU diff + global atomic folded at a
-  threshold, i.e. `PercpuCounter`) and a per-CPU ratelimit before the check.
-
-
 ### 22. Inode identity bits as unrelated atomics — (b), low
 - Where: `fs/inode.rs` `Inode.mode`, `uid`, `gid` (chown/chmod write them
   separately), `dead`, `i_swapfile`, `i_linkable`.

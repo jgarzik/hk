@@ -280,64 +280,67 @@ impl Drop for AddressSpace {
 }
 
 crate::percpu! {
-    /// Dirty page-cache pages, per CPU (Linux NR_FILE_DIRTY vmstat): summed
-    /// for balance_dirty_pages and /proc/meminfo
-    static NR_DIRTY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+    static DIRTY_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
+crate::percpu! {
+    static FILE_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
+crate::percpu! {
+    static UNEVICT_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
+crate::percpu! {
+    static SHMEM_DIFF: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 }
 
-crate::percpu! {
-    /// Page-cache pages, and those of unevictable mappings, per CPU
-    /// (Linux NR_FILE_PAGES, NR_UNEVICTABLE): /proc/meminfo
-    static NR_FILE: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-}
-crate::percpu! {
-    static NR_UNEVICT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-}
-crate::percpu! {
-    /// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
-    static NR_SHMEM: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-}
+use super::vmstat::VmStat;
 
-fn sum(c: &crate::cpu::PerCpu<core::sync::atomic::AtomicI64>) -> u64 {
-    c.for_each_possible()
-        .map(|(_, c)| c.load(Ordering::Relaxed))
-        .sum::<i64>()
-        .max(0) as u64
-}
+/// Dirty page-cache pages (Linux NR_FILE_DIRTY): balance_dirty_pages
+/// and /proc/meminfo
+static NR_DIRTY: VmStat = VmStat::new(&DIRTY_DIFF);
+/// Page-cache pages, and those of unevictable mappings (Linux
+/// NR_FILE_PAGES, NR_UNEVICTABLE): /proc/meminfo
+static NR_FILE: VmStat = VmStat::new(&FILE_DIFF);
+static NR_UNEVICT: VmStat = VmStat::new(&UNEVICT_DIFF);
+/// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
+static NR_SHMEM: VmStat = VmStat::new(&SHMEM_DIFF);
 
 /// `d` pages entered (or left) the cache of `m`
 fn count_file(m: &AddressSpace, d: i64) {
-    NR_FILE.this_add(d);
+    NR_FILE.add(d);
     if m.has_flag(AS_UNEVICTABLE) {
-        NR_UNEVICT.this_add(d);
+        NR_UNEVICT.add(d);
     }
     if m.acct.get().is_some() {
-        NR_SHMEM.this_add(d);
+        NR_SHMEM.add(d);
     }
 }
 
 /// tmpfs and shared memory pages (Linux NR_SHMEM): /proc/meminfo Shmem
 pub fn nr_shmem() -> u64 {
-    sum(&NR_SHMEM)
+    NR_SHMEM.read()
 }
 
 /// Page-cache pages (Linux NR_FILE_PAGES)
 pub fn nr_file_pages() -> u64 {
-    sum(&NR_FILE)
+    NR_FILE.read()
 }
 
 /// Page-cache pages that never leave memory (ramfs; Linux Unevictable)
 pub fn nr_unevictable() -> u64 {
-    sum(&NR_UNEVICT)
+    NR_UNEVICT.read()
 }
 
 fn count_dirty(d: i64) {
-    NR_DIRTY.this_add(d);
+    NR_DIRTY.add(d);
+    if d > 0 {
+        // Linux account_page_dirtied: this_cpu_inc(bdp_ratelimits)
+        super::writeback::dirtied(d);
+    }
 }
 
 /// Dirty page-cache pages (Linux global_node_page_state(NR_FILE_DIRTY))
 pub fn nr_dirty() -> u64 {
-    sum(&NR_DIRTY)
+    NR_DIRTY.read()
 }
 
 /// Clear the page's dirty bit; true (and uncounted) if it was set
