@@ -652,7 +652,16 @@ impl<'a> Nd<'a> {
             mut f,
             depth,
         } = l;
-        let text = text.bytes();
+        // A link stack's bodies and the path's rest in one text, the
+        // links put after the copy (ref mode: no guard held)
+        let own;
+        let text = match text {
+            rcu::Rest::Path(p) => p,
+            rcu::Rest::Links { held, from, user } => {
+                own = held.text(from, user)?;
+                own.as_slice()
+            }
+        };
         if text.ends_with(b"/") {
             f.follow = true;
             f.directory = true;

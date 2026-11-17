@@ -688,11 +688,13 @@ waiting).
 
 ## RCU path walk gaps
 
-**Location**: `fs/namei/mod.rs` (`path_start`)
+**Location**: `fs/namei/`, `fs/open.rs`, `fs/proc/`
 
-- Leaving RCU mode inside a symlink body copies the rest of the name
-  (GFP_ATOMIC) and continues in ref mode; Linux keeps the link stack
-  and legitimizes it (legitimize_links) at try_to_unlazy.
+- The ref-mode walk follows a symlink by copying its body and the
+  rest of the name into one buffer and walking that (`get_link`, and
+  `Held::text` for the stack an RCU walk hands over); Linux's one
+  link_path_walk loop keeps the link stack (nd->stack) in ref mode
+  too, the links held until each body is walked.
 - `file_open_root` (`OpenAt::Root`) resolves absolute bodies and ".."
   against the task root, not the given root (Linux ND_ROOT_PRESET).
 - /proc/<pid> permission for a task that is gone falls back to the

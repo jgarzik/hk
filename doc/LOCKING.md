@@ -3538,11 +3538,15 @@ sleeps; ECHILD otherwise), pushed on the walk's own stack (two levels
 in place, more allocated GFP_ATOMIC; Linux nd->stack), an absolute
 one moving the walk to the root it read at its start; an atime to
 update, an ECHILD body or a failed stack allocation leaves RCU mode
-there with the link held (legitimize_path, as legitimize_links). The
-rest of the name it hands to ref mode is copied into one buffer under
-the guard (GFP_ATOMIC; ECHILD if that fails), the bodies being valid
-only for the guard (the ref walk's own form: a body with what follows
-it), so no link stays held. Where it must leave RCU mode (a miss, a
+there with the link held (legitimize_path, as legitimize_links). Each
+stack level keeps its link (mount, dentry, `d_seq` sample) borrowed;
+leaving RCU mode with levels on the stack takes a reference to each
+link (`legitimize_links`, Linux the same: ECHILD if one moved, what was
+taken put after the guard; the levels past the embedded ones go in
+room reserved, GFP_ATOMIC, with the stack's), so an `i_link` body stays
+valid in ref mode through its held link, which copies the bodies' and
+the name's rests into one buffer with no guard held (the ref walk's
+own form, `Held::text`) and puts the links. Where it must leave RCU mode (a miss, a
 revalidation or permission check that said ECHILD) it
 takes references to where it stands (`try_to_unlazy`,
 `try_to_unlazy_next` for a child too, `legitimize_path`:
@@ -3555,8 +3559,8 @@ under `FsStruct.seq`'s sequence (`root_rcu`, `pwd_rcu`: the paths'
 addresses, kept in atomics stored in the write section beside the
 owned paths, and their `d_seq` sampled in the same read; the old
 paths are put after the write section and freed a grace period
-later), a dirfd's path borrowed from its file (the fd table lock and
-a file reference, held for the lookup: hk has no RCU fd lookup), a
+later), a dirfd's path borrowed from its file (`fdget_raw`: no lock,
+and no reference from a table no other task uses), a
 held start (a parent, file_open_root's root) borrowed. The root is
 legitimized at the first unlazy that needs it (`legitimize_root`,
 Linux nd->root_seq: against its `d_seq` and MOUNT_LOCK's sequence,

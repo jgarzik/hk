@@ -37,6 +37,7 @@ pub fn run_tests() {
     report_r(b"CREAT_DANGLING_LINK", creat_dangling());
     report_r(b"NEG_DENTRY_CREATE", negative());
     report_r(b"DOTDOT_DISCONNECTED", disconnected());
+    report_r(b"LINK_STACK_UNLAZY", link_stack());
 }
 
 /// `got` must be `want`
@@ -354,6 +355,43 @@ fn disconnected() -> R {
 
 /// open(O_CREAT) through a dangling symlink creates its target (Linux
 /// open_last_lookups follows the link); with O_EXCL it is EEXIST
+/// Symlinks nested three deep whose last body leads into procfs, which
+/// computes its entries behind the dcache: the walk follows the links,
+/// then must look a name up the slow way inside the innermost body
+/// (Linux: try_to_unlazy with the link stack legitimized) and lands
+/// where the plain path does
+fn link_stack() -> R {
+    let links: [(&[u8], &[u8]); 6] = [
+        (b"/proc/self/stat\0", b"/tmp/ls_a\0"),
+        (b"/tmp/ls_a\0", b"/tmp/ls_b\0"),
+        (b"/tmp/ls_b\0", b"/tmp/ls_c\0"),
+        (b"/proc/self/fd\0", b"/tmp/ls_d\0"),
+        (b"/tmp/ls_d/\0", b"/tmp/ls_e\0"),
+        (b"/tmp/ls_e\0", b"/tmp/ls_f\0"),
+    ];
+    for (t, l) in links {
+        sys_unlink(l.as_ptr());
+        sys_symlink(t.as_ptr(), l.as_ptr());
+    }
+    let (mut a, mut b) = (Stat::default(), Stat::default());
+    let r1 = sys_stat(b"/tmp/ls_c\0".as_ptr(), &mut a);
+    let r2 = sys_stat(b"/proc/self/stat\0".as_ptr(), &mut b);
+    let same = a.st_ino == b.st_ino && a.st_dev == b.st_dev;
+    let (mut c, mut d) = (Stat::default(), Stat::default());
+    let r3 = sys_stat(b"/tmp/ls_f/0\0".as_ptr(), &mut c);
+    let r4 = sys_stat(b"/proc/self/fd/0\0".as_ptr(), &mut d);
+    let same2 = c.st_ino == d.st_ino && c.st_dev == d.st_dev;
+    for (_, l) in links {
+        sys_unlink(l.as_ptr());
+    }
+    want(b"stat link", r1, 0)?;
+    want(b"stat path", r2, 0)?;
+    want(b"same file", same as i64, 1)?;
+    want(b"stat dir link", r3, 0)?;
+    want(b"stat fd path", r4, 0)?;
+    want(b"same fd", same2 as i64, 1)
+}
+
 fn creat_dangling() -> R {
     let link = b"/tmp/dangle\0";
     let target = b"/tmp/dangle_target\0";
