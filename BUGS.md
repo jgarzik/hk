@@ -704,6 +704,13 @@ with RAM; what is missing: no shrinker (caches give back empty slabs
 beyond two each, but nothing asks them under pressure), no slab
 merging, poisoning or red zones.
 
+SLAB_TYPESAFE_BY_RCU caches (`mm/slab.rs` `KmemCache::typesafe_by_rcu`,
+the filp cache) queue one RCU head per cache for a batch of emptied
+slabs (`RcuSlabs`, under `KmemCache.rcu`), where Linux queues one per
+slab in `struct slab` (rcu_free_slab): hk's 64-byte `Page` has no room
+for an `RcuHead`, so a slab emptied after the batch's head was queued
+waits for the next grace period.
+
 Objects are built fallibly (`util/kalloc.rs` try_box/try_arc, ENOMEM) and
 buffers sized from outside through `kmem`; the `*_nofail` calls (boot
 setup, NOFAIL paths) and plain `Vec`/`String` growth bounded by a sysctl
@@ -1139,8 +1146,9 @@ Tag = roadmap phase (doc/ROADMAP.md).
 14. **MM_LIFE_FORK_EXEC_OBJS bound inside its noise**: Slab over 300
     fork+exec moves from about -270 to +50 kB run to run (x86, 15
     instrumented runs); the test's 64 kB bound sits inside that spread,
-    so it fails now and then (+72 kB seen twice) with no leak. Measure
-    a quieter quantity or a bound above the noise.
+    so it fails now and then (+72 kB seen twice, +152 kB once on an x86
+    debug-assertions boot) with no leak. Measure a quieter quantity or a
+    bound above the noise.
 
 ## DRM dumb buffers are the boot framebuffer only
 
