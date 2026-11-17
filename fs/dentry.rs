@@ -1231,6 +1231,17 @@ impl DentryRef {
         this.d_count.load(Ordering::Acquire)
     }
 
+    /// Put a reference that is not the last: one the caller holds
+    /// outlives it (a dentry the tree drops under MOUNT_LOCK, Linux
+    /// d_drop's, which holds none). A decrement alone, safe under any
+    /// spin lock; a put that is the last instead leaks the dentry,
+    /// never kills it.
+    fn put_held(self) {
+        let me = ManuallyDrop::new(self);
+        let n = me.d_count.fetch_sub(1, Ordering::Release);
+        debug_assert!(n > 1, "dcache: put_held put the last reference");
+    }
+
     /// A reference to `d`, unless its last one went (Linux
     /// lockref_get_not_dead): for a dentry found with no reference held,
     /// under an RCU read guard that keeps its memory
@@ -1446,16 +1457,24 @@ fn prune_one(parent: &DentryRef, d: &DentryRef, keep: bool) -> bool {
 
 /// Take `d` out of the tree unless it left already (Linux d_drop): the
 /// parent's d_lock, then its own, the parent read again if a rename
-/// moved it meanwhile. The children list's reference comes back, for
-/// the caller to put after its own locks.
-#[must_use]
-pub fn d_drop(d: &Dentry) -> Option<DentryRef> {
+/// moved it meanwhile. The parent is borrowed under an RCU read guard
+/// (Linux lock_parent), and the tree's references go with
+/// [`DentryRef::put_held`] (the caller's own outlives them), so no
+/// reference is taken or put last: callable under MOUNT_LOCK, as Linux
+/// d_drop, which takes and puts none. Whether it was in the tree.
+pub fn d_drop(d: &DentryRef) -> bool {
+    let g = crate::sync::rcu::read_lock();
     loop {
-        let parent = d.get_parent()?;
+        let Some(parent) = d.parent_rcu(&g) else {
+            return false;
+        };
         let mut p = parent.d_lock.write();
         let mut dl = d.d_lock.write();
-        if core::ptr::eq(d.parent_ptr(), DentryRef::as_ptr(&parent)) {
-            return __d_drop(&mut p, d, &mut dl);
+        // Under both locks a parent `d` still names is the one `d`
+        // holds a reference to: live
+        if core::ptr::eq(d.parent_ptr(), parent) {
+            let ours = __d_drop(&mut p, d, &mut dl);
+            return ours.map(DentryRef::put_held).is_some();
         }
     }
 }

@@ -2760,25 +2760,22 @@ impl Drop for Mount {
 /// `d` itself go, as the dentry does.
 ///
 /// Whether anything was detached or dropped (false: nothing mounted).
-pub fn detach_mounts(d: &Dentry) -> bool {
+pub fn detach_mounts(d: &DentryRef) -> bool {
     if !d.is_mountpoint() {
         return false;
     }
     let mut ns = namespace_lock();
     let mut freed = BoxList::<MpHashA>::new();
-    let (mp, pin) = {
+    let gone = {
         let mut ml = MOUNT_LOCK.write();
         let Some(mp) = lookup_mountpoint(&ml, d) else {
             return false;
         };
-        (mp, pin_mp(&mut ml, mp))
-    };
-    // The name goes first, what covered it second (Linux: under
-    // mount_lock; here between its sections, NAMESPACE_SEM keeping the
-    // mounts as they are, so no reference is put under MOUNT_LOCK)
-    let dropped = super::dentry::d_drop(d);
-    let gone = {
-        let mut ml = MOUNT_LOCK.write();
+        let pin = pin_mp(&mut ml, mp);
+        // The name goes first, what covered it second (Linux, in the
+        // same mount_lock section); d_drop takes and puts no last
+        // reference (the caller's and the mountpoint's outlive it)
+        let _ = super::dentry::d_drop(d);
         ml.event += 1;
         let mut any = false;
         // Each pass takes the list's head off it (Linux: while
@@ -2817,7 +2814,6 @@ pub fn detach_mounts(d: &Dentry) -> bool {
     drop(ns);
     drop(gone.0);
     drop(freed);
-    drop(dropped);
     gone.1
 }
 
@@ -3070,6 +3066,24 @@ mod tests {
         put_unhung(l);
         assert!(!q.has_parent(&*MOUNT_LOCK.read_excl()));
         assert!(!detach_mounts(&p.root));
+    }
+
+    /// detach_mounts drops a hashed mountpoint from the dcache in its
+    /// MOUNT_LOCK section, putting the tree's references, none the
+    /// last: the caller's is all that is left once the mountpoint goes
+    #[test]
+    fn detach_mounts_drops_dentry() {
+        let a = mnt();
+        let d = Dentry::alloc(&a.root, b"mp", Some(a.root.get_inode().unwrap())).unwrap();
+        let c = mnt();
+        let mut ns = namespace_lock();
+        attach_at(&mut ns, c.clone(), &Path::new(a.clone(), d.clone()));
+        drop(ns);
+        assert!(!d.d_unhashed() && d.is_mountpoint());
+        assert!(detach_mounts(&d));
+        assert!(d.d_unhashed() && a.root.lookup_child(b"mp").is_none());
+        assert_eq!(DentryRef::count(&d), 1);
+        assert!(!detach_mounts(&d));
     }
 
     #[test]
