@@ -457,12 +457,14 @@ struct RefWalk<'p> {
     total: usize,
 }
 
-/// A component of the current text: the name's offsets, and whether it
-/// is the walk's last
+/// A component of the current text: the name's offsets, whether it is
+/// the walk's last, and whether another follows in this text (Linux
+/// WALK_MORE)
 struct Comp {
     at: usize,
     end: usize,
     last: bool,
+    more: bool,
 }
 
 impl<'p> RefWalk<'p> {
@@ -490,28 +492,34 @@ impl<'p> RefWalk<'p> {
         }
     }
 
-    /// The next component, a body walked to its end popped first (Linux
-    /// link_path_walk: put_link, then the saved name below); a slash
-    /// after a body's last component asks for a directory, through a
-    /// final symlink (lookup_last)
+    /// The next component, None at the end of the caller's path; a
+    /// slash after a body's last component asks for a directory,
+    /// through a final symlink (lookup_last). A body is put with its
+    /// last component ([`RefWalk::advance`]): one left on the stack
+    /// with nothing in it is a broken stack (ECHILD), never a shorter
+    /// name.
     fn next(&mut self) -> Result<Option<Comp>, KernelError> {
-        loop {
-            let (t, tail_empty) = self.text()?;
-            let Some((name, after)) = next_comp(t) else {
-                if self.stack.pop() {
-                    continue;
-                }
-                return Ok(None);
-            };
-            let at = t.len() - name.len() - after.len();
-            let end = t.len() - after.len();
-            let last = tail_empty && next_comp(after).is_none();
-            if last && self.stack.len() > 0 && !after.is_empty() {
-                self.f.follow = true;
-                self.f.directory = true;
+        let (t, tail_empty) = self.text()?;
+        let Some((name, after)) = next_comp(t) else {
+            if self.stack.len() > 0 {
+                return Err(ECHILD);
             }
-            return Ok(Some(Comp { at, end, last }));
+            return Ok(None);
+        };
+        let at = t.len() - name.len() - after.len();
+        let end = t.len() - after.len();
+        let more = next_comp(after).is_some();
+        let last = tail_empty && !more;
+        if last && self.stack.len() > 0 && !after.is_empty() {
+            self.f.follow = true;
+            self.f.directory = true;
         }
+        Ok(Some(Comp {
+            at,
+            end,
+            last,
+            more,
+        }))
     }
 
     /// The name of `c`
@@ -519,8 +527,16 @@ impl<'p> RefWalk<'p> {
         Ok(&self.text()?.0[c.at..c.end])
     }
 
-    /// Past `c`
+    /// Past `c`, once it is looked up and before it is stepped into: a
+    /// body whose last component `c` is goes, its link put (Linux
+    /// walk_component: put_link unless WALK_MORE), so a link whose
+    /// body ends in another link is gone before that one is picked and
+    /// a chain of links holds one, not one per level; the name below
+    /// it was moved past the link when it was picked
     fn advance(&mut self, c: &Comp) {
+        if !c.more && self.stack.pop() {
+            return;
+        }
         match self.stack.top_mut() {
             Some(fr) => fr.pos += c.end,
             None => self.user = &self.user[c.end..],
@@ -810,32 +826,29 @@ impl<'a> Nd<'a> {
                 w.advance(&c);
                 self.step(cur, d, c.last, &mut w)?
             }
-            To::Child {
+            To::Child { cur, child, reval } => {
+                let c = w.next()?.ok_or(ECHILD)?;
+                let d = lookup_fast_ref(&cur.dentry, child, w.name(&c)?, reval, w.f)?;
+                w.advance(&c);
+                self.step(cur, d, c.last, &mut w)?
+            }
+            // The component is behind: step_into goes on
+            To::Step {
                 cur,
                 child,
                 dots: true,
                 ..
             } => {
-                let c = w.next()?.ok_or(ECHILD)?;
-                w.advance(&c);
                 let p = step_mounts(Path::new(cur.mnt.clone(), child), w.f)?;
                 self.recheck()?;
                 p
             }
-            To::Child {
+            To::Step {
                 cur,
                 child,
-                reval,
+                last,
                 dots: false,
-            } => {
-                let c = w.next()?.ok_or(ECHILD)?;
-                let d = match reval {
-                    Some(s) => lookup_fast_ref(&cur.dentry, child, w.name(&c)?, s, w.f)?,
-                    None => child,
-                };
-                w.advance(&c);
-                self.step(cur, d, c.last, &mut w)?
-            }
+            } => self.step(cur, child, last, &mut w)?,
         };
         self.walk_ref(cur, &mut w)
     }
@@ -1495,6 +1508,41 @@ mod tests {
             };
             assert_eq!(w.next().err(), Some(ECHILD));
         }
+    }
+
+    /// A body is put as soon as its last component is looked up, before
+    /// the step into it (Linux walk_component: put_link unless
+    /// WALK_MORE): a link there is picked with the walked one gone, and
+    /// the name below goes on where the link left it
+    #[test]
+    fn body_put_before_its_last_step() {
+        let m = crate::fs::mount::test_mnt();
+        let mut stack = Held::default();
+        stack
+            .push(HeldFrame {
+                link: Path::new(m.clone(), m.root.clone()),
+                body: Some(b"a/c".to_vec()),
+                inode: None,
+                pos: 0,
+                tail_empty: false,
+            })
+            .unwrap();
+        let mut w = RefWalk {
+            stack,
+            user: b"x",
+            f: LookupFlags::default(),
+            total: 0,
+        };
+        let a = w.next().unwrap().unwrap();
+        w.advance(&a);
+        assert_eq!(w.stack.len(), 1);
+        let c = w.next().unwrap().unwrap();
+        assert_eq!(w.name(&c).unwrap(), b"c");
+        w.advance(&c);
+        assert_eq!(w.stack.len(), 0, "the walked body is still held");
+        let x = w.next().unwrap().unwrap();
+        assert_eq!(w.name(&x).unwrap(), b"x");
+        assert!(x.last);
     }
 
     #[test]

@@ -168,7 +168,7 @@ impl Puts {
     fn to(&mut self, to: To) {
         match to {
             To::Done(p) | To::Comp(p) | To::Lookup(p) => self.path(Role::Path, p),
-            To::Child { cur, child, .. } => {
+            To::Child { cur, child, .. } | To::Step { cur, child, .. } => {
                 self.path(Role::Path, cur);
                 self.dentry(child);
             }
@@ -188,7 +188,7 @@ impl Puts {
 /// lookup_last) and the symlinks followed so far (nd->total_link_count).
 /// The current text (the top body's rest, else `user`) starts at the
 /// component the walk stopped at (`Comp`, `Lookup`, `Child`), or after
-/// the symlink (`Link`); empty for `Done`.
+/// it (`Step`, `Link`: a body it ended put already); empty for `Done`.
 pub(super) struct Lazy<'p> {
     pub(super) to: To,
     pub(super) stack: Held,
@@ -292,15 +292,24 @@ pub(super) enum To {
     Comp(Path),
     /// lookup_fast's miss: lookup_slow of the component
     Lookup(Path),
-    /// try_to_unlazy_next with `child`, found for the component in
-    /// `cur`: handled in ref mode as `reval` (what its revalidation
-    /// under LOOKUP_RCU said, if it was not valid), then stepped into;
-    /// `dots`: the parent ".." gave (WALK_NOFOLLOW, then handle_dots'
-    /// scoped check)
+    /// lookup_fast's try_to_unlazy_next with `child`, found for the
+    /// component in `cur` and not valid under LOOKUP_RCU (`reval`, what
+    /// its revalidation said): revalidated in ref mode, then stepped
+    /// into
     Child {
         cur: Path,
         child: DentryRef,
-        reval: Option<Result<bool, KernelError>>,
+        reval: Result<bool, KernelError>,
+    },
+    /// step_into's try_to_unlazy_next (handle_mounts): `child`, found
+    /// for the component in `cur` and already past it (its link put),
+    /// stepped into in ref mode; `last`: the walk's last component
+    /// (WALK_TRAILING); `dots`: the parent ".." gave (WALK_NOFOLLOW,
+    /// then handle_dots' scoped check)
+    Step {
+        cur: Path,
+        child: DentryRef,
+        last: bool,
         dots: bool,
     },
     /// pick_link: symlink `link` in `cur`, checked and counted; its
@@ -321,6 +330,10 @@ enum Step<'g> {
         last: bool,
     },
 }
+
+/// What lookup_fast found under LOOKUP_RCU: the child, its inode and
+/// the `d_seq` sample it was read under
+type Hit<'g> = (&'g Dentry, Option<&'g Inode>, u32);
 
 /// A symlink body being walked (Linux struct saved's name): kept in the
 /// inode (`i_link`), or made by an RCU ->get_link
@@ -685,15 +698,19 @@ impl Nd<'_> {
                 None => (user, true),
             };
             let Some((name, after)) = next_comp(text) else {
-                // A body walked to its end: what followed it goes on
-                if stack.pop() {
-                    continue;
+                // A body is put with its last component: one left on
+                // the stack with nothing in it is a broken stack, never
+                // a shorter name
+                if stack.depth() > 0 {
+                    return Err(ECHILD);
                 }
                 break;
             };
             let at = text.len() - name.len() - after.len();
             let next = text.len() - after.len();
-            let last = tail_empty && next_comp(after).is_none();
+            // WALK_MORE: a component follows in this text
+            let more = next_comp(after).is_some();
+            let last = tail_empty && !more;
             // lookup_last of a body's last component: a slash after it
             // asks for a directory, through a final symlink
             if last && stack.depth() > 0 && !after.is_empty() {
@@ -710,9 +727,37 @@ impl Nd<'_> {
                 }
                 return self.lazy(To::Comp(p), stack, user, at, f, total, puts);
             }
-            let step = match name {
-                b"." => Step::On,
-                b".." => {
+            // walk_component: lookup_fast ("." and ".." need none)
+            let dot = name == b".";
+            let got = match name {
+                b"." | b".." => None,
+                _ => match self.lookup_fast_rcu(rc, &cur, name, f, puts)? {
+                    Ok(c) => Some(c),
+                    Err(to) => return self.lazy(to, stack, user, at, f, total, puts),
+                },
+            };
+            // Past the component; a body whose last component this is
+            // goes before the step (Linux walk_component: put_link
+            // unless WALK_MORE), so a chain of links holds one
+            if !more && stack.depth() > 0 {
+                stack.pop();
+            } else {
+                match stack.top_mut() {
+                    Some(fr) => fr.pos += next,
+                    None => user = &user[next..],
+                }
+            }
+            let step = match got {
+                Some((child, inode, seq)) => {
+                    let flags = match (last, more) {
+                        (true, _) => WALK_TRAILING,
+                        (false, true) => WALK_MORE,
+                        (false, false) => 0,
+                    };
+                    self.step_into_rcu(rc, &mut cur, child, inode, seq, flags, f, puts)?
+                }
+                None if dot => Step::On,
+                None => {
                     // handle_dots: follow_dotdot_rcu, step_into with
                     // WALK_NOFOLLOW, then a scoped walk's check
                     let (d, seq) = self.follow_dotdot_rcu(rc, &mut cur, f)?;
@@ -724,38 +769,24 @@ impl Nd<'_> {
                     }
                     s
                 }
-                _ => {
-                    let flags = if last { WALK_TRAILING } else { WALK_MORE };
-                    self.walk_component_rcu(rc, &mut cur, name, flags, f, puts)?
-                }
             };
-            let (mnt, link, inode, seq, last) = match step {
-                Step::On => (None, None, None, 0, false),
-                Step::Lazy(to) => return self.lazy(to, stack, user, at, f, total, puts),
+            let l = match step {
+                Step::On => continue,
+                Step::Lazy(to) => return self.lazy(to, stack, user, 0, f, total, puts),
                 Step::Link {
                     mnt,
                     link,
                     inode,
                     seq,
                     last,
-                } => (Some(mnt), Some(link), Some(inode), seq, last),
-            };
-            // Past the component
-            let body_tail = tail_empty && next_comp(after).is_none();
-            match stack.top_mut() {
-                Some(fr) => fr.pos += next,
-                None => user = &user[next..],
-            }
-            let (Some(mnt), Some(link), Some(inode)) = (mnt, link, inode) else {
-                continue;
-            };
-            let l = PickRcu {
-                mnt,
-                link,
-                inode,
-                seq,
-                last,
-                tail_empty: body_tail,
+                } => PickRcu {
+                    mnt,
+                    link,
+                    inode,
+                    seq,
+                    last,
+                    tail_empty: last,
+                },
             };
             if let Some(to) =
                 self.pick_link_rcu(rc, &mut cur, &mut stack, l, &mut total, f, puts)?
@@ -831,22 +862,22 @@ impl Nd<'_> {
         permission_as(self.cred(), inode, MAY_EXEC | MAY_NOT_BLOCK)
     }
 
-    /// walk_component under LOOKUP_RCU: lookup_fast, then step_into
-    #[allow(clippy::too_many_arguments)]
-    fn walk_component_rcu<'g>(
+    /// lookup_fast under LOOKUP_RCU: `name` in `cur` from the dcache,
+    /// revalidated: the child, its inode and its `d_seq` sample; else
+    /// where ref mode takes over (a miss, an answer other than valid)
+    fn lookup_fast_rcu<'g>(
         &self,
         rc: &Rcu<'g>,
-        cur: &mut RcuPath<'g>,
+        cur: &RcuPath<'g>,
         name: &[u8],
-        flags: u8,
         f: LookupFlags,
         puts: &mut Puts,
-    ) -> Result<Step<'g>, KernelError> {
+    ) -> Result<Result<Hit<'g>, To>, KernelError> {
         // A miss, maybe a rename's (no RENAME_LOCK check: lookup_slow
         // decides under the directory's lock)
         let Some((child, seq)) = __d_lookup_rcu(cur.dentry, name, rc.g) else {
             let at = self.try_to_unlazy(rc, cur, f.cached, puts)?;
-            return Ok(Step::Lazy(To::Lookup(at)));
+            return Ok(Err(To::Lookup(at)));
         };
         // The parent did not change during the lookup
         if cur.dentry.d_seq_retry(cur.seq) {
@@ -862,14 +893,13 @@ impl Nd<'_> {
         let status = child.revalidate(dir, inode, LookupBits::RCU | f.bits());
         if status != Ok(true) {
             let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
-            return Ok(Step::Lazy(To::Child {
+            return Ok(Err(To::Child {
                 cur: at,
                 child: c,
-                reval: Some(status),
-                dots: false,
+                reval: status,
             }));
         }
-        self.step_into_rcu(rc, cur, child, inode, seq, flags, f, puts)
+        Ok(Ok((child, inode, seq)))
     }
 
     /// step_into under LOOKUP_RCU: onto `child` (its `d_seq` was
@@ -893,10 +923,10 @@ impl Nd<'_> {
         if child.is_mountpoint() {
             let Some((m, r, s)) = self.follow_mount_rcu(rc.g, mnt, child, seq, f) else {
                 let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
-                return Ok(Step::Lazy(To::Child {
+                return Ok(Step::Lazy(To::Step {
                     cur: at,
                     child: c,
-                    reval: None,
+                    last: flags & WALK_TRAILING != 0,
                     dots: flags & WALK_NOFOLLOW != 0,
                 }));
             };

@@ -3638,7 +3638,10 @@ room reserved, GFP_ATOMIC, with the stack's), so an `i_link` body stays
 valid in ref mode through its held link: the ref walk goes on from the
 same stack (Linux's one link_path_walk loop: `Held`, nothing copied),
 each link held until its body is walked and put as its level pops
-(put_link, sleeping allowed: no guard then). A walk that starts in
+(put_link, sleeping allowed: no guard then): in either mode a level
+pops once its last component is looked up, before that component is
+stepped into (Linux walk_component's put_link unless WALK_MORE), so a
+chain of links holds one. A walk that starts in
 ref mode pushes its links on such a stack too (two levels in place,
 more allocated GFP_KERNEL on first need: ENOMEM, Linux
 nd_alloc_stack), the link held, its inode too for an `i_link` body.
