@@ -1,5 +1,7 @@
 # Atomics audit: where `Atomic*` replaced a design
 
+Delete this file in the commit that closes its last finding.
+
 Research only. Findings are ranked most damaging first; each names file + symbol,
 category, the defect, Linux's design and the proper hk design. Categories:
 (a) redundant (always under a lock), (b) torn multi-atomic invariant, (c) hot
