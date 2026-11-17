@@ -248,10 +248,7 @@ pub fn may_delete(c: &Cred, dir: &Inode, victim: &Inode, isdir: bool) -> Result<
     }
     // An active swap file is neither unlinked nor renamed (Linux
     // vfs_unlink / vfs_rename: IS_SWAPFILE -> EPERM)
-    if victim
-        .i_swapfile
-        .load(core::sync::atomic::Ordering::Acquire)
-    {
+    if victim.is_swapfile() {
         return Err(KernelError::NotPermitted);
     }
     let is_dir = victim.mode().is_dir();

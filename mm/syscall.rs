@@ -72,9 +72,7 @@ fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
         if !f.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
-        if f.mapping_inode()
-            .is_some_and(|i| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire))
-        {
+        if f.mapping_inode().is_some_and(|i| i.is_swapfile()) {
             return Err(KernelError::TextBusy);
         }
     }

@@ -15,7 +15,6 @@
 //! lock).
 
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
 
 use super::anon_vma::AnonVma;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
@@ -438,7 +437,7 @@ fn file_page(
         Err(e) => return Some(Err(e)),
     };
     paging::sync_page(page, exec);
-    if area.shared && area.prot & PROT_WRITE != 0 && inode.i_swapfile.load(Ordering::Acquire) {
+    if area.shared && area.prot & PROT_WRITE != 0 && inode.is_swapfile() {
         // An active swap file is written only by swap: a write through
         // a mapping made before swapon is SIGBUS (Linux
         // do_page_mkwrite), a read maps the page read-only
@@ -626,7 +625,7 @@ fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Resul
     {
         // An active swap file is written only by swap (Linux
         // do_page_mkwrite: SIGBUS), also after a read mapped it
-        if inode.i_swapfile.load(Ordering::Acquire) {
+        if inode.is_swapfile() {
             return Err(VmFault::Bus);
         }
         let phys = paging::pte_addr(pte);

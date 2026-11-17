@@ -320,7 +320,7 @@ fn write_ok(file: &File, len: usize, pos: u64) -> Result<bool, KernelError> {
         return Err(KernelError::NotPermitted);
     }
     // An active swap partition (Linux blkdev_write_iter: IS_SWAPFILE)
-    if b.bd_inode.i_swapfile.load(Ordering::Acquire) {
+    if b.bd_inode.is_swapfile() {
         return Err(KernelError::TextBusy);
     }
     if len == 0 {

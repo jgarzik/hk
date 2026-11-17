@@ -49,7 +49,7 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelRes
     // Under i_rwsem, like Linux do_truncate: atomic with writes; an
     // active swap area (set by swapon under i_rwsem) is ETXTBSY
     let lock = inode.lock();
-    let r = if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+    let r = if inode.is_swapfile() {
         Err(KernelError::TextBusy)
     } else {
         // The set-id kill with the size change (Linux do_truncate:

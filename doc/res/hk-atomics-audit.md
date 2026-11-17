@@ -55,14 +55,6 @@ argued / published copy of locked state.
 
 
 
-### 22. Inode identity bits as unrelated atomics — (b), low
-- Where: `fs/inode.rs` `Inode.mode`, `uid`, `gid` (chown/chmod write them
-  separately), `dead`, `i_swapfile`, `i_linkable`.
-- Note: Linux also reads mode/uid/gid locklessly for permission checks, but
-  takes `inode_lock` in `bprm_fill_uid` so set-id exec never sees a new owner
-  with the old mode. hk has no set-id exec yet; when it lands it must read
-  these under `i_rwsem`. The S_* booleans belong in one `i_flags` word.
-
 ## Checked and judged legitimate (f)
 
 - `task/ucount.rs` `Ucounts.rlimit[]`: Linux `atomic_long_t` with

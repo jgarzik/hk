@@ -235,7 +235,10 @@ nosuid, without no_new_privs or a ptracer in the way) sets the
 effective (and saved) uid / gid to the file's owner, and file
 capabilities (security.capability) raise the permitted set
 (bprm_fill_uid, cap_bprm_creds_from_file). hk exec keeps the caller's
-credentials unchanged, so set-id programs run unprivileged.
+credentials unchanged, so set-id programs run unprivileged. The fix
+must read the file's mode, uid and gid under its `i_rwsem`
+(bprm_fill_uid's inode_lock), so a racing chown/chmod never pairs a new
+owner with the old set-id bits.
 
 ## CPU-time timer gaps
 

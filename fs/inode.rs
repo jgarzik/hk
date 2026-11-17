@@ -522,6 +522,18 @@ impl InodeTime {
     }
 }
 
+/// Bits of `Inode.i_flags`
+pub mod iflags {
+    /// A removed directory (Linux S_DEAD): set by rmdir, or a rename
+    /// replacing it, under its i_rwsem; mount refuses it
+    pub const S_DEAD: u32 = 1 << 4;
+    /// An active swap area (Linux S_SWAPFILE)
+    pub const S_SWAPFILE: u32 = 1 << 8;
+    /// linkat may name it though it has no link (Linux I_LINKABLE, an
+    /// i_state bit there)
+    pub const I_LINKABLE: u32 = 1 << 16;
+}
+
 /// The inode structure - represents a file object
 pub struct Inode {
     /// Inode number (unique within filesystem)
@@ -548,9 +560,12 @@ pub struct Inode {
     /// set by the filesystem before the inode is shared, then fixed
     pub i_generation: u32,
 
-    /// A removed directory (Linux S_DEAD): set by rmdir, or a rename
-    /// replacing it, under its i_rwsem; mount refuses it
-    dead: core::sync::atomic::AtomicBool,
+    /// `iflags::*` bits (Linux i_flags' S_DEAD, S_SWAPFILE, and
+    /// i_state's I_LINKABLE): each set or cleared under the lock its
+    /// Linux bit is (i_rwsem; swapon/swapoff's), read lock-free; one
+    /// word, changed with fetch_or / fetch_and (bits of different
+    /// writers share it, Linux inode_set_flags' cmpxchg)
+    i_flags: core::sync::atomic::AtomicU32,
 
     /// Device ID for character/block devices (major/minor)
     /// For non-device files, this is DevId::null()
@@ -616,14 +631,6 @@ pub struct Inode {
     /// Writers (> 0) or executions denying them (< 0) (Linux
     /// i_writecount; `get_write_access`, `deny_write`)
     i_writecount: core::sync::atomic::AtomicI32,
-
-    /// An active swap area (Linux S_SWAPFILE): writes and truncates are
-    /// ETXTBSY
-    pub i_swapfile: core::sync::atomic::AtomicBool,
-
-    /// An O_TMPFILE file not opened O_EXCL: linkat may give it its first
-    /// name though it has no link (Linux I_LINKABLE)
-    pub i_linkable: core::sync::atomic::AtomicBool,
 
     /// Its flock and POSIX locks (Linux i_flctx; `fs::locks`)
     pub i_flctx: super::locks::FileLockCtx,
@@ -761,7 +768,7 @@ impl Inode {
             size: AtomicU64::new(size),
             nlink: AtomicU32::new(1),
             i_generation: 0,
-            dead: core::sync::atomic::AtomicBool::new(false),
+            i_flags: core::sync::atomic::AtomicU32::new(0),
             rdev: DevId::null(),
             atime: InodeTime::new(mtime),
             mtime: InodeTime::new(mtime),
@@ -780,9 +787,7 @@ impl Inode {
             i_io_on: core::sync::atomic::AtomicU8::new(0),
             i_wb: spin::Once::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
-            i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),
-            i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
             i_sb_list: list::Link::new(),
@@ -826,7 +831,7 @@ impl Inode {
             size: AtomicU64::new(0),
             nlink: AtomicU32::new(1),
             i_generation: 0,
-            dead: core::sync::atomic::AtomicBool::new(false),
+            i_flags: core::sync::atomic::AtomicU32::new(0),
             rdev,
             atime: InodeTime::new(mtime),
             mtime: InodeTime::new(mtime),
@@ -845,9 +850,7 @@ impl Inode {
             i_io_on: core::sync::atomic::AtomicU8::new(0),
             i_wb: spin::Once::new(),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
-            i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_dio_count: AtomicU32::new(0),
-            i_linkable: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
             i_sb_list: list::Link::new(),
@@ -855,14 +858,47 @@ impl Inode {
         }
     }
 
+    fn iflag(&self, f: u32) -> bool {
+        self.i_flags.load(Ordering::Acquire) & f != 0
+    }
+
+    fn set_iflag(&self, f: u32, on: bool) {
+        if on {
+            self.i_flags.fetch_or(f, Ordering::Release);
+        } else {
+            self.i_flags.fetch_and(!f, Ordering::Release);
+        }
+    }
+
     /// Mark a removed directory dead (caller holds its i_rwsem)
     pub fn set_dead(&self) {
-        self.dead.store(true, Ordering::Release);
+        self.set_iflag(iflags::S_DEAD, true);
     }
 
     /// Removed directory (Linux IS_DEADDIR)
     pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Acquire)
+        self.iflag(iflags::S_DEAD)
+    }
+
+    /// An active swap area (Linux IS_SWAPFILE): writes and truncates are
+    /// ETXTBSY
+    pub fn is_swapfile(&self) -> bool {
+        self.iflag(iflags::S_SWAPFILE)
+    }
+
+    /// swapon / swapoff (under the inode's i_rwsem)
+    pub fn set_swapfile(&self, on: bool) {
+        self.set_iflag(iflags::S_SWAPFILE, on);
+    }
+
+    /// An O_TMPFILE file not opened O_EXCL: linkat may give it its first
+    /// name though it has no link (Linux I_LINKABLE)
+    pub fn is_linkable(&self) -> bool {
+        self.iflag(iflags::I_LINKABLE)
+    }
+
+    pub fn set_linkable(&self, on: bool) {
+        self.set_iflag(iflags::I_LINKABLE, on);
     }
 
     /// Get file mode (type + permissions)
@@ -1077,7 +1113,7 @@ impl Inode {
             if size > self.maxbytes() {
                 return Err(KernelError::FileTooLarge);
             }
-        } else if self.i_swapfile.load(Ordering::Acquire) {
+        } else if self.is_swapfile() {
             return Err(KernelError::TextBusy);
         }
         Ok(())

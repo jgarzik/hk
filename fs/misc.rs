@@ -983,7 +983,7 @@ pub fn vfs_fallocate(file: &super::File, mode: i32, offset: i64, len: i64) -> Ke
         return Err(KernelError::BadFd);
     }
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+    if inode.is_swapfile() {
         return Err(KernelError::TextBusy);
     }
     let m = inode.mode();

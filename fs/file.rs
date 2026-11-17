@@ -966,7 +966,7 @@ impl File {
         let (pos, n) = (|| {
             // An active swap file (Linux generic_write_checks:
             // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
-            if inode.i_swapfile.load(Ordering::Acquire) {
+            if inode.is_swapfile() {
                 return Err(KernelError::TextBusy);
             }
             let at = match (append, at) {

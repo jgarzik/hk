@@ -625,7 +625,7 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
-    si_inode.i_swapfile.store(true, Ordering::Release);
+    si_inode.set_swapfile(true);
     drop(lock);
     SWAP_INFO.write()[swap_type as usize] = Some(si);
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
@@ -664,7 +664,7 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     let table = SWAP_INFO.write()[t as usize].take();
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
-    si_inode.i_swapfile.store(false, Ordering::Release);
+    si_inode.set_swapfile(false);
     drop(lock);
     TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);

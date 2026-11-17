@@ -457,7 +457,7 @@ fn write_async(
     let end = pos
         .checked_add(count as u64)
         .ok_or(KernelError::InvalidArgument)?;
-    let fits = !inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire)
+    let fits = !inode.is_swapfile()
         && end <= inode.get_size()
         && get_inode_data(inode)?.mmu_private >= end
         && inode.i_data.nrpages() == 0

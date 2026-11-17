@@ -164,14 +164,13 @@ pub fn sys_link(oldpath_ptr: UserPtr<u8>, newpath_ptr: UserPtr<u8>) -> KernelRes
 /// and no unlink can drop its last link between that check and the link
 /// (Linux vfs_link: inode_lock(inode), i_nlink == 0 -> ENOENT)
 fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), KernelError> {
-    use core::sync::atomic::Ordering::Relaxed;
     let _lock = inode.lock();
     // An O_TMPFILE file (I_LINKABLE) gets its first name once
-    if inode.get_nlink() == 0 && !inode.i_linkable.load(Relaxed) {
+    if inode.get_nlink() == 0 && !inode.is_linkable() {
         return Err(KernelError::NotFound);
     }
     dir.i_op.link(dir, name, inode)?;
-    inode.i_linkable.store(false, Relaxed);
+    inode.set_linkable(false);
     inode.touch_c();
     Ok(())
 }

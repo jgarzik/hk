@@ -439,9 +439,7 @@ fn tmpfile_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, 
         .i_op
         .tmpfile(&dir_inode, InodeMode::regular(perm))?;
     if op.flags & O_EXCL == 0 {
-        inode
-            .i_linkable
-            .store(true, core::sync::atomic::Ordering::Relaxed);
+        inode.set_linkable(true);
     }
     let dentry = Dentry::tmpfile(&dir.dentry, inode.clone())?;
     let iw = inode.get_write_access()?;
@@ -536,7 +534,7 @@ fn filp_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, Ker
     if flags & O_TRUNC != 0 && !created && inode.mode().is_file() {
         let _lock = inode.lock();
         // An active swap file (S_SWAPFILE, set under i_rwsem): ETXTBSY
-        if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+        if inode.is_swapfile() {
             return Err(KernelError::TextBusy);
         }
         dac::remove_privs(&inode);

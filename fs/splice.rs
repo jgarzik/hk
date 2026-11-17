@@ -938,7 +938,7 @@ fn copy_len(
     if !same_sb {
         return Err(KernelError::CrossDevice);
     }
-    let swap = |i: &crate::fs::Inode| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire);
+    let swap = |i: &crate::fs::Inode| i.is_swapfile();
     if swap(&iin) || swap(&iout) {
         return Err(KernelError::TextBusy);
     }
