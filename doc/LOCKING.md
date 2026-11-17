@@ -973,10 +973,8 @@ a queued task is taken off its list first and put back on its new one)
 and read lock-free. Classes (Linux sched_class), highest first: stop
 (`migration/N`), rt (SCHED_FIFO/RR: 99 levels, FIFO never time-sliced,
 RR every 100 ms, a preempted rt task keeps the head of its level), fair
-(SCHED_NORMAL/BATCH/IDLE: EEVDF, `task/fair.rs`; the entity's
-vruntime, deadline, lag and exec_start change under the rq lock of its
-CPU, and the tick charges the running one under it), idle (never
-queued). A woken task preempts a lower class, a lower rt priority, or
+(SCHED_NORMAL/BATCH/IDLE: EEVDF, `task/fair.rs`; the tick charges the
+running one under its rq lock), idle (never queued). A woken task preempts a lower class, a lower rt priority, or
 a fair task EEVDF would not pick at that point (not for SCHED_BATCH/IDLE).
 rt bandwidth (`task/rt.rs`, Linux rt_rq->rt_time): `CpuRunQueue.rt_bw`
 holds the rt time run on that CPU in the current 1 s period, under its
@@ -999,6 +997,34 @@ task's rq lock (`task_rq_lock`; TASKLIST may be held) and charges it
 first if it is running.
 `CpuRunQueue.min_vruntime` (under the rq lock) stands for the average
 when no fair task is there.
+
+Which lock owns each `SchedEntity` field (Linux: sched_entity and
+sched_rt_entity are plain under rq->lock, the task_struct scheduling
+fields READ_ONCE'd where read without it):
+- `se.rq` (`SeRq`: vruntime, deadline, vlag, exec_start, the RR slice
+  `rr_left`, `requeue_tail`, `contrib_load`): a `sync::LockedCell`
+  owned by the lock of the run queue the task is on, the one
+  `Task.cpu` names (Linux task_rq). No lockless reader: every access
+  goes through that `CpuRunQueue` (`ent`/`set_ent`/`with_ent`), which
+  checks `Task.cpu` names it (`owns`, `IrqSpinlock::owns`). Ownership
+  moves with `Task.cpu` (rule 1): under the old rq lock (and the new
+  one in the balancer) for a queued task, accessed on the old queue
+  before `set_task_cpu` and on the new one after; under the pi_lock
+  for a task on no run queue, which nothing holding an rq lock touches
+  then (a wakeup reads `on_rq` false under the old lock only after the
+  sleeper's switch released it, and waits for `on_cpu`, Acquire;
+  priority changes hold the pi_lock too). The fair math (`fair.rs`)
+  works on copies the run queue reads out and writes back.
+- `state`, `on_rq`, `on_cpu`: atomics (wakers read `state` and spin on
+  `on_cpu` with no rq lock; `task_sched_runtime` reads `on_rq` and
+  `on_cpu` lock-free; Linux READ_ONCE / smp_cond_load_acquire).
+- `params`, `reset_on_fork`: atomics written under the pi_lock and rq
+  lock, read lock-free (getpriority, sched_getattr, /proc, fork,
+  wakeup placement; Linux reads p->policy, p->prio,
+  sched_reset_on_fork so).
+- `sum_exec_runtime`: atomic written under the rq lock, read lock-free
+  (above).
+- `link`, `ctx`: the rq lock (the run list; the switch frame).
 
 Each `PerCpu` (per-CPU data) contains:
 ```rust

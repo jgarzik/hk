@@ -15,12 +15,11 @@
 //! granularity (no hrtick); a weight change keeps the vruntime (no
 //! reweight_entity).
 //!
-//! Locking: the fields are the task's `SchedEntity` atomics, changed
-//! under the rq lock of its CPU.
+//! Locking: the fields are the task's `SeRq`, owned by the lock of its
+//! run queue, which reads them out, passes them here and writes them
+//! back; the weight comes from the lock-free `params`.
 
-use core::sync::atomic::Ordering;
-
-use super::sched::SchedEntity;
+use super::sched::{SchedEntity, SeRq};
 
 /// The weight of nice 0 (Linux NICE_0_LOAD, without the fixed-point
 /// shift)
@@ -62,81 +61,73 @@ fn calc_delta_fair(delta: u64, se: &SchedEntity) -> u64 {
     (u128::from(delta) * u128::from(NICE_0_LOAD) / u128::from(w)) as u64
 }
 
-/// Advance the running `se` by `delta` ns it ran (Linux update_curr's
-/// fair part, after update_se charged the runtime; update_deadline):
-/// true once it used up its slice, which gives it a new deadline
-pub fn update_curr(se: &SchedEntity, delta: u64) -> bool {
-    // Under the rq lock: loads and stores
-    let v = se.vruntime.load(Ordering::Relaxed) + calc_delta_fair(delta, se);
-    se.vruntime.store(v, Ordering::Relaxed);
-    if v < se.deadline.load(Ordering::Relaxed) {
+/// Advance the running `se` (its run-queue fields `e`) by `delta` ns
+/// it ran (Linux update_curr's fair part, after update_se charged the
+/// runtime; update_deadline): true once it used up its slice, which
+/// gives it a new deadline
+pub fn update_curr(se: &SchedEntity, e: &mut SeRq, delta: u64) -> bool {
+    e.vruntime += calc_delta_fair(delta, se);
+    if e.vruntime < e.deadline {
         return false;
     }
-    se.deadline
-        .store(v + calc_delta_fair(base_slice(), se), Ordering::Relaxed);
+    e.deadline = e.vruntime + calc_delta_fair(base_slice(), se);
     true
 }
 
-/// The weighted average vruntime of `ents` (Linux avg_vruntime), None
-/// for none
-pub fn avg_vruntime<'a>(ents: impl Iterator<Item = &'a SchedEntity> + Clone) -> Option<u64> {
-    let base = ents
-        .clone()
-        .map(|e| e.vruntime.load(Ordering::Relaxed))
-        .min()?;
+/// The weighted average vruntime of `ents`, (weight, vruntime) pairs
+/// (Linux avg_vruntime), None for none
+pub fn avg_vruntime(ents: impl Iterator<Item = (u64, u64)> + Clone) -> Option<u64> {
+    let base = ents.clone().map(|(_, v)| v).min()?;
     let (mut sum, mut w) = (0i128, 0i128);
-    for e in ents {
-        let ew = i128::from(weight(e));
-        sum += ew * i128::from(e.vruntime.load(Ordering::Relaxed) - base);
+    for (ew, v) in ents {
+        let ew = i128::from(ew);
+        sum += ew * i128::from(v - base);
         w += ew;
     }
     Some(base + (sum / w) as u64)
 }
 
-/// The entity to run next of `ents`: the earliest deadline among those
-/// not ahead of the average (Linux pick_eevdf; the one with the least
-/// vruntime is always eligible)
-pub fn pick<'a, T: Copy>(ents: impl Iterator<Item = (T, &'a SchedEntity)> + Clone) -> Option<T> {
-    let avg = avg_vruntime(ents.clone().map(|(_, e)| e))?;
-    ents.filter(|(_, e)| e.vruntime.load(Ordering::Relaxed) <= avg)
-        .min_by_key(|(_, e)| e.deadline.load(Ordering::Relaxed))
-        .map(|(t, _)| t)
+/// The entity to run next of `ents` (each with its weight and run-queue
+/// fields): the earliest deadline among those not ahead of the average
+/// (Linux pick_eevdf; the one with the least vruntime is always
+/// eligible)
+pub fn pick<T: Copy>(ents: impl Iterator<Item = (T, u64, SeRq)> + Clone) -> Option<T> {
+    let avg = avg_vruntime(ents.clone().map(|(_, w, e)| (w, e.vruntime)))?;
+    ents.filter(|(_, _, e)| e.vruntime <= avg)
+        .min_by_key(|(_, _, e)| e.deadline)
+        .map(|(t, _, _)| t)
 }
 
 /// Remember how far `se`, leaving the run queue, is behind the average
 /// `avg` (Linux entity_lag: clamped to the longest slice plus a tick,
 /// the timing granularity; every slice here is the base slice)
-pub fn save_lag(se: &SchedEntity, avg: u64) {
+pub fn save_lag(se: &SchedEntity, e: &mut SeRq, avg: u64) {
     let limit = calc_delta_fair(base_slice() + super::percpu::TICK_NS, se) as i64;
-    let lag = (i128::from(avg) - i128::from(se.vruntime.load(Ordering::Relaxed)))
-        .clamp(i128::from(-limit), i128::from(limit)) as i64;
-    se.vlag.store(lag, Ordering::Relaxed);
+    e.vlag = (i128::from(avg) - i128::from(e.vruntime)).clamp(i128::from(-limit), i128::from(limit))
+        as i64;
 }
 
 /// Place `se`, joining a run queue whose entities average `avg` with
 /// total weight `load`, by its saved lag (Linux place_entity: the lag
 /// scaled so the average stays put); a new task (`initial`) gets half a
 /// slice to its first deadline (PLACE_DEADLINE_INITIAL)
-pub fn place(se: &SchedEntity, avg: u64, load: u64, initial: bool) {
+pub fn place(se: &SchedEntity, e: &mut SeRq, avg: u64, load: u64, initial: bool) {
     let w = i128::from(weight(se));
-    // Under the rq lock (Linux se->vlag)
-    let mut lag = i128::from(se.vlag.load(Ordering::Relaxed));
-    se.vlag.store(0, Ordering::Relaxed);
+    let mut lag = i128::from(e.vlag);
+    e.vlag = 0;
     if load > 0 {
         lag = lag * (i128::from(load) + w) / i128::from(load);
     }
-    let v = (i128::from(avg) - lag).max(0) as u64;
-    se.vruntime.store(v, Ordering::Relaxed);
+    e.vruntime = (i128::from(avg) - lag).max(0) as u64;
     let mut vslice = calc_delta_fair(base_slice(), se);
     if initial {
         vslice /= 2;
     }
-    se.deadline.store(v + vslice, Ordering::Relaxed);
+    e.deadline = e.vruntime + vslice;
 }
 
 /// A sched_yield: its deadline moves a slice on (Linux
 /// yield_task_fair)
-pub fn yield_task(se: &SchedEntity) {
-    se.deadline
-        .fetch_add(calc_delta_fair(base_slice(), se), Ordering::Relaxed);
+pub fn yield_task(se: &SchedEntity, e: &mut SeRq) {
+    e.deadline += calc_delta_fair(base_slice(), se);
 }

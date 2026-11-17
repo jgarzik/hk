@@ -35,18 +35,6 @@ argued / published copy of locked state.
   shared dentries.
 - Fix: RCU-walk for dcache (its own phase).
 
-### 4. `SchedEntity` fields owned by the rq lock kept as atomics — (a)
-- Where: `task/sched.rs` `SchedEntity` `vruntime`, `deadline`, `vlag`,
-  `exec_start`, `rr_left`, `requeue_tail`, `contrib_load`. Their updates
-  are loads and stores under the rq lock now (no RMW), the parameters one
-  word (`Params`), the run-queue counts plain under their lock.
-- Wrong: still atomics only for interior mutability: the type does not
-  say which lock owns them.
-- Linux: plain fields of sched_entity / sched_rt_entity under the rq lock.
-- Fix: an rq-lock-owned cell (accessed with the rq guard as proof, like
-  `ctx`) for the fields with no lockless reader. LOCKING.md §3.1 lists
-  each field's lock.
-
 ### 5. Page allocator boot-only fields as atomics — (a)
 - Where: `mm/page_alloc.rs` `Zone.map`, `start`, `end`, `managed`,
   `sections`, `batch`, `high` (set at boot, atomics rather than set-once,
@@ -89,7 +77,8 @@ LOCKING.md §5.4 rules 10-12 (single writers, per-CPU areas, no published
 copies) and the primitives behind them (`percpu!` areas, queued spin and
 rwlocks, `cpu::LocalWord`) are in place, and `sync::LockedCell` (a cell
 owned by one of many instances of a lock, first used by the timer
-bases). Still to do: its rq/zone users. Each atomic field's doc
+bases and the run queues (`SchedEntity.rq`). Still to do: its zone
+users. Each atomic field's doc
 comment names its lockless reader and Linux equivalent (rule 7); a field
 "under lock X" with no lockless reader is a bug to fix. Remaining phases
 by blast radius: 4-6 and 15/21 (scheduler, allocator, syscall path),

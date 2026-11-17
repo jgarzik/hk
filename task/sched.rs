@@ -7,9 +7,10 @@
 //! change in interrupt context.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::Priority;
+use crate::sync::LockedCell;
 use crate::util::list::{Adapter, Link, List};
 
 /// Scheduling class, highest first (Linux stop/rt/fair/idle_sched_class)
@@ -84,6 +85,57 @@ pub type TaskContext = <crate::arch::CurrentArch as crate::arch::ContextOps>::Ta
 /// Number of priority levels (0-255)
 pub const NUM_PRIORITIES: usize = 256;
 
+/// The fields of a task's entity owned by the lock of the run queue it
+/// is on (Linux plain sched_entity / sched_rt_entity fields under
+/// rq->lock): read and written only through that `CpuRunQueue`
+/// (`SchedEntity.rq`, a `LockedCell`)
+#[derive(Clone, Copy)]
+pub struct SeRq {
+    /// Fair: virtual runtime, ns (Linux se->vruntime; `fair`)
+    pub vruntime: u64,
+    /// Fair: virtual deadline (Linux se->deadline)
+    pub deadline: u64,
+    /// Fair: lag saved when it left its run queue (Linux se->vlag)
+    pub vlag: i64,
+    /// When it last started running or was charged (monotonic ns; 0
+    /// before it first runs; Linux se->exec_start)
+    pub exec_start: u64,
+    /// SCHED_RR: ticks left of its slice (Linux p->rt.time_slice)
+    pub rr_left: u32,
+    /// Its slice ran out: requeued at the tail, not the head
+    pub requeue_tail: bool,
+    /// It went to sleep counted in its run queue's `nr_uninterruptible`
+    /// (Linux p->sched_contributes_to_load); its wakeup uncounts it
+    pub contrib_load: bool,
+}
+
+impl SeRq {
+    const fn new() -> Self {
+        Self {
+            vruntime: 0,
+            deadline: 0,
+            vlag: 0,
+            exec_start: 0,
+            rr_left: RR_TICKS,
+            requeue_tail: false,
+            contrib_load: false,
+        }
+    }
+
+    /// SCHED_RR tick (its own CPU's tick): true once its slice is used
+    /// up, which starts a new one and requeues it at the tail (Linux
+    /// task_tick_rt)
+    pub fn rr_tick(&mut self) -> bool {
+        if self.rr_left > 1 {
+            self.rr_left -= 1;
+            return false;
+        }
+        self.rr_left = RR_TICKS;
+        self.requeue_tail = true;
+        true
+    }
+}
+
 /// A task's scheduling state (Linux p->__state, p->on_rq, run_list)
 ///
 /// `state` is written by the task itself (set_current_state) and by its
@@ -92,44 +144,36 @@ pub const NUM_PRIORITIES: usize = 256;
 /// run queue (`on_rq`) while it is queued or running; a sleeper leaves
 /// it in `schedule()`.
 pub struct SchedEntity {
-    /// `SleepState` as u8
+    /// `SleepState` as u8: set by the task and its wakers with no rq
+    /// lock, read by wakers before any (Linux p->__state, READ_ONCE)
     state: AtomicU8,
-    /// Queued or running on its CPU's run queue
+    /// Queued or running on its CPU's run queue: changed under that rq
+    /// lock, read without it (task_sched_runtime's fast path;
+    /// Linux task_on_rq_queued's READ_ONCE of p->on_rq)
     on_rq: AtomicBool,
-    /// It went to sleep counted in its run queue's `nr_uninterruptible`
-    /// (Linux p->sched_contributes_to_load), under that rq lock; its
-    /// wakeup uncounts it
-    pub contrib_load: AtomicBool,
     /// Its CPU runs it or is still switching away from it (Linux
     /// p->on_cpu): set when it is made current, cleared by the task
-    /// switched to once the switch is complete (finish_task_switch)
+    /// switched to once the switch is complete (finish_task_switch);
+    /// a waker spins on it with no rq lock (smp_cond_load_acquire)
     on_cpu: AtomicBool,
     /// Scheduling parameters, one word so a lockless reader sees one
     /// setting (`Params`): class, SCHED_* policy (Linux p->policy),
     /// 100 + 20 + nice (p->static_prio), 1..99 for SCHED_FIFO/RR else 0
-    /// (p->rt_priority); set under pi_lock and the rq lock
+    /// (p->rt_priority); set under pi_lock and the rq lock, read
+    /// lock-free (getpriority, sched_getattr, /proc, wakeup placement)
     params: AtomicU32,
     /// A fork child starts with SCHED_NORMAL and nice >= 0 (Linux
-    /// p->sched_reset_on_fork)
+    /// p->sched_reset_on_fork): set under pi_lock and the rq lock, read
+    /// lock-free by fork and sched_getattr
     reset_on_fork: AtomicBool,
-    /// SCHED_RR: ticks left of its slice (Linux p->rt.time_slice)
-    rr_left: AtomicU32,
-    /// Fair: virtual runtime, ns (Linux se->vruntime; `fair`)
-    pub vruntime: AtomicU64,
-    /// Fair: virtual deadline (Linux se->deadline)
-    pub deadline: AtomicU64,
-    /// Fair: lag saved when it left its run queue (Linux se->vlag)
-    pub vlag: AtomicI64,
-    /// When it last started running or was charged (monotonic ns; 0
-    /// before it first runs; Linux se->exec_start), under the rq lock
-    pub exec_start: AtomicU64,
+    /// Owned by the lock of the run queue it is on, `Task.cpu`'s
+    /// (accessed through `CpuRunQueue::ent`, which checks that)
+    pub(super) rq: LockedCell<SeRq>,
     /// Time run in total, ns (Linux se->sum_exec_runtime): advanced
     /// under the rq lock of its CPU (`update_se`), read lock-free
     /// (thread_group_cputime, cputime_adjust: Linux
     /// read_sum_exec_runtime's READ_ONCE)
     sum_exec_runtime: AtomicU64,
-    /// Its slice ran out: requeued at the tail, not the head
-    requeue_tail: AtomicBool,
     /// Its place in a priority list (under the rq lock)
     pub link: Link,
     /// Saved kernel context while switched out (under the rq lock)
@@ -140,7 +184,7 @@ pub struct SchedEntity {
 }
 
 // SAFETY: `ctx` (the UnsafeCell) is only touched under the rq lock of the
-// task's CPU; every other field is atomic
+// task's CPU; `rq` is Sync itself, every other field is atomic
 unsafe impl Sync for SchedEntity {}
 
 impl SchedEntity {
@@ -150,16 +194,10 @@ impl SchedEntity {
             state: AtomicU8::new(state),
             on_rq: AtomicBool::new(false),
             on_cpu: AtomicBool::new(false),
-            contrib_load: AtomicBool::new(false),
             params: AtomicU32::new(Params::pack(Class::Fair, 0, DEFAULT_PRIO, 0)),
             reset_on_fork: AtomicBool::new(false),
-            rr_left: AtomicU32::new(RR_TICKS),
-            vruntime: AtomicU64::new(0),
-            deadline: AtomicU64::new(0),
-            vlag: AtomicI64::new(0),
-            exec_start: AtomicU64::new(0),
+            rq: LockedCell::new(SeRq::new()),
             sum_exec_runtime: AtomicU64::new(0),
-            requeue_tail: AtomicBool::new(false),
             link: Link::new(),
             ctx: UnsafeCell::new(
                 <crate::arch::CurrentArch as crate::arch::ContextOps>::ZERO_CONTEXT,
@@ -259,30 +297,6 @@ impl SchedEntity {
         self.reset_on_fork.store(v, Ordering::Relaxed);
     }
 
-    /// SCHED_RR tick (its own CPU's tick): true once its slice is used
-    /// up, which starts a new one and requeues it at the tail (Linux
-    /// task_tick_rt)
-    pub fn rr_tick(&self) -> bool {
-        // Under the rq lock (Linux p->rt.time_slice--)
-        let left = self.rr_left.load(Ordering::Relaxed);
-        if left > 1 {
-            self.rr_left.store(left - 1, Ordering::Relaxed);
-            return false;
-        }
-        self.rr_left.store(RR_TICKS, Ordering::Relaxed);
-        self.requeue_tail.store(true, Ordering::Relaxed);
-        true
-    }
-
-    /// Whether a preempted task goes to the tail (its slice ran out),
-    /// clearing that
-    pub fn take_requeue_tail(&self) -> bool {
-        // Under the rq lock: a load and a store
-        let v = self.requeue_tail.load(Ordering::Relaxed);
-        self.requeue_tail.store(false, Ordering::Relaxed);
-        v
-    }
-
     /// The switch frame
     ///
     /// # Safety
@@ -295,25 +309,24 @@ impl SchedEntity {
     }
 }
 
-/// Charge running task `t` for its time since `exec_start` (Linux
-/// update_se, every class's update_curr): its sum_exec_runtime and,
-/// while its thread group keeps CPU timer totals, the group's
-/// (account_group_exec_runtime). Under the rq lock of its CPU. The
-/// time charged, 0 for none.
-pub fn update_se(t: &super::Task, now: u64) -> u64 {
-    let se = &t.se;
-    // Under the rq lock: loads and stores (Linux se->exec_start,
-    // se->sum_exec_runtime += delta)
-    let start = se.exec_start.load(Ordering::Relaxed);
+/// Charge running task `t` (its run-queue fields `e`) for its time
+/// since `exec_start` (Linux update_se, every class's update_curr): its
+/// sum_exec_runtime and, while its thread group keeps CPU timer totals,
+/// the group's (account_group_exec_runtime). Under the rq lock of its
+/// CPU. The time charged, 0 for none.
+pub fn update_se(t: &super::Task, e: &mut SeRq, now: u64) -> u64 {
+    let start = e.exec_start;
     if now <= start {
         return 0;
     }
-    se.exec_start.store(now, Ordering::Relaxed);
+    e.exec_start = now;
     if start == 0 {
         return 0;
     }
     let delta = now - start;
-    crate::sync::Sole::sole_add(&se.sum_exec_runtime, delta);
+    // Under the rq lock: a load and a store (Linux
+    // se->sum_exec_runtime += delta)
+    crate::sync::Sole::sole_add(&t.se.sum_exec_runtime, delta);
     if let Some(g) = t.cpu_group() {
         g.cputimer.account_exec_runtime(delta);
     }

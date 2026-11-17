@@ -24,7 +24,7 @@ use crate::printkln;
 use crate::signal::notify::{Told, Zombie, notify};
 use crate::sync::IrqSpinlock;
 use crate::sync::spin::RwLock;
-use crate::task::sched::{self, Class, ClassQueues};
+use crate::task::sched::{self, Class, ClassQueues, SeRq};
 use crate::task::{Cred, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -261,6 +261,36 @@ impl CpuRunQueue {
         self.queue.as_mut().expect("run queue not initialized")
     }
 
+    /// `t` belongs to this run queue (Linux task_rq(p) == rq): its
+    /// `Task.cpu` names it, so its `se.rq` is ours to touch
+    fn owns(&self, t: &Task) -> bool {
+        PERCPU_SCHEDS.get(t.cpu()).lock.owns(self)
+    }
+
+    /// `t`'s run-queue fields (panics unless `t` belongs here)
+    fn ent(&self, t: &Task) -> SeRq {
+        assert!(self.owns(t), "sched: task not on this run queue");
+        // SAFETY: `self` is the data of `t`'s rq lock (checked), held by
+        // the guard it is borrowed from; `Task.cpu` moves only under
+        // this lock or while nothing holding an rq lock reaches `t`
+        // (LOCKING.md 3.1, rule 1)
+        unsafe { t.se.rq.get(self) }
+    }
+
+    fn set_ent(&mut self, t: &Task, e: SeRq) {
+        assert!(self.owns(t), "sched: task not on this run queue");
+        // SAFETY: as in `ent`, borrowed mutably
+        unsafe { t.se.rq.set(self, e) };
+    }
+
+    /// Change `t`'s run-queue fields with `f`
+    fn with_ent<R>(&mut self, t: &Task, f: impl FnOnce(&mut SeRq) -> R) -> R {
+        let mut e = self.ent(t);
+        let r = f(&mut e);
+        self.set_ent(t, e);
+        r
+    }
+
     /// Put `p` (runnable, neither running nor queued) on its class's
     /// list (Linux enqueue_task)
     fn enqueue(&mut self, p: &Task) {
@@ -277,8 +307,14 @@ impl CpuRunQueue {
     /// before its slice ran out keeps the head of its level (Linux
     /// put_prev_task_rt), anything else goes to the tail
     fn enqueue_prev(&mut self, p: &Task, preempted: bool) {
-        let expired = p.se.take_requeue_tail();
+        let expired = self.take_requeue_tail(p);
         self.enqueue_at(p, preempted && p.se.class() == Class::Rt && !expired);
+    }
+
+    /// Whether preempted `p` goes to the tail (its slice ran out),
+    /// clearing that
+    fn take_requeue_tail(&mut self, p: &Task) -> bool {
+        self.with_ent(p, |e| core::mem::take(&mut e.requeue_tail))
     }
 
     /// Take queued `p` off its list (Linux dequeue_task)
@@ -295,8 +331,7 @@ impl CpuRunQueue {
         // Under this rq's lock: plain updates (Linux
         // p->sched_contributes_to_load, rq->nr_uninterruptible--); a
         // run queue's count may go negative, the sum is right
-        if p.se.contrib_load.load(Ordering::Relaxed) {
-            p.se.contrib_load.store(false, Ordering::Relaxed);
+        if self.with_ent(p, |e| core::mem::take(&mut e.contrib_load)) {
             crate::sync::Sole::sole_add(&PERCPU_SCHEDS.get(self.cpu).nr_uninterruptible, -1);
         }
         if !p.se.on_rq() {
@@ -343,14 +378,7 @@ impl CpuRunQueue {
             return true;
         }
         self.update_curr(crate::time::monotonic_ns());
-        let q = self.queue.as_ref().expect("run queue not initialized");
-        let ents = q
-            .fair_iter()
-            .map(|t| (core::ptr::from_ref::<Task>(t), &t.se))
-            .chain(
-                self.curr_fair()
-                    .map(|c| (core::ptr::from_ref::<Task>(c), &c.se)),
-            );
+        let ents = self.fair_tasks(true).map(|t| self.fair_ent(t));
         crate::task::fair::pick(ents).is_some_and(|t| core::ptr::eq(t, p))
     }
 
@@ -395,17 +423,11 @@ impl CpuRunQueue {
 
     /// EEVDF's pick among the queued fair tasks, taken off their list
     fn pick_fair(&mut self) -> Option<*const Task> {
-        let t = {
-            let q = self.queue.as_ref().expect("run queue not initialized");
-            crate::task::fair::pick(
-                q.fair_iter()
-                    .map(|t| (core::ptr::from_ref::<Task>(t), &t.se)),
-            )?
-        };
+        let t = crate::task::fair::pick(self.fair_tasks(false).map(|t| self.fair_ent(t)))?;
         // SAFETY: on the fair list (just found there)
         unsafe { self.queue().remove(t, Class::Fair, 0) };
         // SAFETY: as above
-        let v = unsafe { &*t }.se.vruntime.load(Ordering::Relaxed);
+        let v = self.ent(unsafe { &*t }).vruntime;
         self.min_vruntime = self.min_vruntime.max(v.min(self.fair_avg(false)));
         Some(t)
     }
@@ -435,18 +457,18 @@ impl CpuRunQueue {
         if self.curr_is_idle() {
             return false;
         }
-        let delta = sched::update_se(curr, now);
-        if delta == 0 {
-            return false;
-        }
-        match curr.se.class() {
-            Class::Fair => crate::task::fair::update_curr(&curr.se, delta),
-            Class::Rt => {
+        let mut e = self.ent(curr);
+        let delta = sched::update_se(curr, &mut e, now);
+        let out = match curr.se.class() {
+            Class::Fair if delta != 0 => crate::task::fair::update_curr(&curr.se, &mut e, delta),
+            Class::Rt if delta != 0 => {
                 self.rt_bw.charge(now, delta);
                 false
             }
-            Class::Stop | Class::Idle => false,
-        }
+            _ => false,
+        };
+        self.set_ent(curr, e);
+        out
     }
 
     /// The tick of a running rt task: charged, true if that used up
@@ -471,39 +493,63 @@ impl CpuRunQueue {
             .filter(|c| !self.curr_is_idle() && c.se.class() == Class::Fair && c.se.on_rq())
     }
 
-    /// The fair entities competing here: the queued ones, plus the
-    /// running one if `with_curr` and it is one (`curr_fair`)
-    fn fair_ents(&self, with_curr: bool) -> impl Iterator<Item = &sched::SchedEntity> + Clone {
+    /// The fair tasks competing here: the queued ones, plus the running
+    /// one if `with_curr` and it is one (`curr_fair`)
+    fn fair_tasks(&self, with_curr: bool) -> impl Iterator<Item = &Task> + Clone {
         let q = self.queue.as_ref().expect("run queue not initialized");
         let curr = if with_curr { self.curr_fair() } else { None };
-        q.fair_iter().map(|t| &t.se).chain(curr.map(|c| &c.se))
+        q.fair_iter().chain(curr)
+    }
+
+    /// Fair task `t` of this run queue as EEVDF sees it: its address,
+    /// weight and run-queue fields
+    fn fair_ent(&self, t: &Task) -> (*const Task, u64, SeRq) {
+        (
+            core::ptr::from_ref(t),
+            crate::task::fair::weight(&t.se),
+            self.ent(t),
+        )
     }
 
     /// Their weighted average vruntime (`min_vruntime` if none)
     fn fair_avg(&self, with_curr: bool) -> u64 {
-        crate::task::fair::avg_vruntime(self.fair_ents(with_curr)).unwrap_or(self.min_vruntime)
+        let ents = self.fair_tasks(with_curr).map(|t| {
+            let (_, w, e) = self.fair_ent(t);
+            (w, e.vruntime)
+        });
+        crate::task::fair::avg_vruntime(ents).unwrap_or(self.min_vruntime)
     }
 
     /// Their total weight (Linux cfs_rq->load.weight)
     fn fair_load(&self, with_curr: bool) -> u64 {
-        self.fair_ents(with_curr)
-            .map(crate::task::fair::weight)
+        self.fair_tasks(with_curr)
+            .map(|t| crate::task::fair::weight(&t.se))
             .sum()
     }
 
     /// Place fair `p`, joining this run queue, by its lag (Linux
     /// place_entity; `initial`: a new task)
-    fn place_fair(&self, p: &Task, initial: bool) {
+    fn place_fair(&mut self, p: &Task, initial: bool) {
         if p.se.class() == Class::Fair {
-            crate::task::fair::place(&p.se, self.fair_avg(true), self.fair_load(true), initial);
+            let (avg, load) = (self.fair_avg(true), self.fair_load(true));
+            self.with_ent(p, |e| {
+                crate::task::fair::place(&p.se, e, avg, load, initial)
+            });
         }
     }
 
     /// Fair `p` (queued here, or running) leaves: keep its lag (Linux
     /// update_entity_lag)
-    fn save_lag(&self, p: &Task) {
+    fn save_lag(&mut self, p: &Task) {
+        let avg = self.fair_avg(true);
+        self.save_lag_at(p, avg);
+    }
+
+    /// `save_lag` against the average `avg`, measured before `p` left
+    /// its list
+    fn save_lag_at(&mut self, p: &Task, avg: u64) {
         if p.se.class() == Class::Fair {
-            crate::task::fair::save_lag(&p.se, self.fair_avg(true));
+            self.with_ent(p, |e| crate::task::fair::save_lag(&p.se, e, avg));
         }
     }
 
@@ -3549,7 +3595,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
     let next = rq.pick_next();
     // SAFETY: a task of this run queue, alive while it holds it
-    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
+    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(&mut rq, unsafe { &*next });
     rq.curr = next;
     rq.prev = &raw const *me;
     // Under the rq lock (Linux rq->nr_switches++)
@@ -3577,7 +3623,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
 /// changes its address space meanwhile (only the task itself does, or
 /// its creator before it first runs), and the run queue's reference
 /// keeps it alive until it has switched away for good.
-fn make_current(t: &Task) -> (u64, *const crate::mm::Mm, (u64, u64)) {
+fn make_current(rq: &mut CpuRunQueue, t: &Task) -> (u64, *const crate::mm::Mm, (u64, u64)) {
     // Running: its owner fields are its own from now on (owner_check;
     // covers kernel threads and every other way a task first runs)
     if !t.started.load(Ordering::Relaxed) {
@@ -3610,8 +3656,8 @@ fn make_current(t: &Task) -> (u64, *const crate::mm::Mm, (u64, u64)) {
     // Linux prepare_task
     t.se.set_on_cpu(true);
     // Its runtime counts from now (Linux set_next_entity, set_next_task_*)
-    t.se.exec_start
-        .store(crate::time::monotonic_ns(), Ordering::Relaxed);
+    let now = crate::time::monotonic_ns();
+    rq.with_ent(t, |e| e.exec_start = now);
     let tls = (
         t.tls.load(Ordering::Relaxed),
         t.gsbase.load(Ordering::Relaxed),
@@ -3662,7 +3708,7 @@ fn context_switch_locked(
     if prev.se.on_rq() {
         rq.update_curr(crate::time::monotonic_ns());
     }
-    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
+    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(&mut rq, n);
     rq.curr = next;
     rq.prev = prev;
     // Under the rq lock (Linux rq->nr_switches++)
@@ -3758,10 +3804,10 @@ pub fn schedule() {
     me.se.set_on_rq(false);
     rq.add_nr(-1);
     // A slice that ran out is not carried past the sleep
-    me.se.take_requeue_tail();
+    rq.take_requeue_tail(&me);
     let st = me.se.state();
     if st == SleepState::Uninterruptible as u8 || st == SleepState::Killable as u8 {
-        me.se.contrib_load.store(true, Ordering::Relaxed);
+        rq.with_ent(&me, |e| e.contrib_load = true);
         // Under this rq's lock (Linux rq->nr_uninterruptible++)
         crate::sync::Sole::sole_add(&sched.nr_uninterruptible, 1);
     }
@@ -4159,10 +4205,7 @@ fn sched_balance_rq(this: u32) {
             break;
         }
         // SAFETY: as above
-        let p = unsafe { &*moved[n] };
-        if p.se.class() == Class::Fair {
-            crate::task::fair::save_lag(&p.se, avg);
-        }
+        src.save_lag_at(unsafe { &*moved[n] }, avg);
         n += 1;
     }
     for &t in &moved[..n] {
@@ -4366,7 +4409,7 @@ pub fn scheduler_tick() {
         // Under the rq lock (Linux scheduler_tick -> task_tick_rt)
         Class::Rt => this_sched().is_some_and(|s| {
             let mut rq = s.lock.lock();
-            let rr = me.se.policy() == crate::task::SCHED_RR && me.se.rr_tick();
+            let rr = me.se.policy() == crate::task::SCHED_RR && rq.with_ent(&me, SeRq::rr_tick);
             rr | rq.rt_tick(now)
         }),
         // A used-up slice (new deadline) lets EEVDF pick again (Linux
@@ -4541,7 +4584,7 @@ fn yield_cpu(preempted: bool) -> bool {
     if !rq.curr_is_idle() {
         rq.update_curr(crate::time::monotonic_ns());
         if me.se.class() == Class::Fair && !preempted {
-            crate::task::fair::yield_task(&me.se);
+            rq.with_ent(&me, |e| crate::task::fair::yield_task(&me.se, e));
         }
         rq.enqueue_prev(&me, preempted);
     }
@@ -4929,7 +4972,7 @@ fn change_class(p: &Task, f: impl FnOnce(&sched::SchedEntity)) {
     }
     // Into the fair class: placed at the average (Linux switched_to_fair)
     if old != Class::Fair && p.se.class() == Class::Fair {
-        p.se.vlag.store(0, Ordering::Relaxed);
+        rq.with_ent(p, |e| e.vlag = 0);
         rq.place_fair(p, false);
     }
     if queued {
@@ -5443,7 +5486,7 @@ pub fn try_schedule() {
     let mut rq = sched.lock.lock();
     let next = rq.pick_next();
     // SAFETY: a task of this run queue, alive while it holds it
-    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
+    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(&mut rq, unsafe { &*next });
     rq.curr = next;
     // Under the rq lock (Linux rq->nr_switches++)
     crate::sync::Sole::sole_add(&sched.nr_switches, 1);
