@@ -267,7 +267,6 @@ fn do_utimes(
         Some(t) => (pick(&t[0]), pick(&t[1])),
     };
     inode.set_times(atime, mtime, Some(now));
-    inode.i_op.setattr_done(&inode);
     drop(lock);
     Ok(())
 }

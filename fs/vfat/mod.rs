@@ -2008,10 +2008,10 @@ impl InodeOps for VfatInodeOps {
         let _ = fat_write_inode(inode);
     }
 
-    /// Linux fat_setattr's times: atime to the day, mtime to 2 s with
+    /// Linux fat_setattr's end: atime to the day, mtime to 2 s with
     /// ctime the same; a ctime alone is dropped (ctime and mtime share
-    /// the entry's field); the entry written
-    fn setattr_times(
+    /// the entry's field); the entry written once
+    fn setattr(
         &self,
         inode: &Inode,
         atime: Option<Timespec>,
@@ -2024,11 +2024,6 @@ impl InodeOps for VfatInodeOps {
         if let Some(t) = mtime {
             fat_truncate_time(inode, Some(t), false, true);
         }
-        let _ = fat_write_inode(inode);
-    }
-
-    /// Linux fat_setattr's mark_inode_dirty
-    fn setattr_done(&self, inode: &Inode) {
         let _ = fat_write_inode(inode);
     }
 

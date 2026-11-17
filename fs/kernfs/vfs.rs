@@ -154,9 +154,17 @@ impl InodeOps for KernfsIops {
         })
     }
 
-    /// Linux kernfs_iop_setattr: the node keeps the attributes, so an
-    /// inode made after this one is dropped shows them too
-    fn setattr_done(&self, inode: &Inode) {
+    /// Linux kernfs_iop_setattr: setattr_copy, then the node keeps the
+    /// attributes, so an inode made after this one is dropped shows
+    /// them too
+    fn setattr(
+        &self,
+        inode: &Inode,
+        atime: Option<crate::time::Timespec>,
+        mtime: Option<crate::time::Timespec>,
+        ctime: Option<crate::time::Timespec>,
+    ) {
+        crate::fs::inode::setattr_copy_times(inode, atime, mtime, ctime);
         let Some(kn) = knode(inode) else { return };
         *kn.iattr.lock() = Some(super::Iattr {
             perm: inode.mode().perm(),

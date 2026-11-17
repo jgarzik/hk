@@ -225,13 +225,6 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
-    /// Attributes changed (chmod, chown, utimes), under i_rwsem: a file
-    /// system that keeps them outside the inode saves them (Linux
-    /// kernfs_iop_setattr into kn->iattr). Default nothing.
-    fn setattr_done(&self, inode: &Inode) {
-        let _ = inode;
-    }
-
     /// A time update (Linux ->update_time, else generic_update_time):
     /// atime, or mtime and ctime, become `now`. A filesystem with
     /// coarser times or times of its own on disk overrides it (vfat).
@@ -239,25 +232,20 @@ pub trait InodeOps: Send + Sync {
         generic_update_time(inode, what, now);
     }
 
-    /// The times part of a setattr (Linux ->setattr applying ATTR_ATIME,
-    /// ATTR_MTIME, ATTR_CTIME the VFS computed: utimes, truncate,
-    /// chmod, chown), under i_rwsem; default setattr_copy's
-    fn setattr_times(
+    /// A setattr's end (Linux ->setattr: utimes, truncate, chmod, chown),
+    /// under i_rwsem, after the VFS's checks and its changes of mode,
+    /// ids and size: the times it computed (ATTR_ATIME, ATTR_MTIME,
+    /// ATTR_CTIME) set, and the inode kept (a filesystem with its own
+    /// copy saves it: kernfs's kn->iattr; vfat marks it dirty). Default
+    /// setattr_copy's times.
+    fn setattr(
         &self,
         inode: &Inode,
         atime: Option<Timespec>,
         mtime: Option<Timespec>,
         ctime: Option<Timespec>,
     ) {
-        if let Some(t) = atime {
-            inode.set_atime(t);
-        }
-        if let Some(t) = mtime {
-            inode.set_mtime(t);
-        }
-        if let Some(t) = ctime {
-            inode.set_ctime(t);
-        }
+        setattr_copy_times(inode, atime, mtime, ctime);
     }
 
     /// Create a new file in a directory
@@ -1530,7 +1518,7 @@ impl Inode {
         mtime: Option<Timespec>,
         ctime: Option<Timespec>,
     ) {
-        self.i_op.setattr_times(self, atime, mtime, ctime);
+        self.i_op.setattr(self, atime, mtime, ctime);
     }
 
     /// An access through `mnt` (Linux touch_atime): atime becomes the
@@ -1823,6 +1811,24 @@ pub static NULL_INODE_OPS: NullInodeOps = NullInodeOps;
 pub enum TimeUpdate {
     Atime,
     CMtime,
+}
+
+/// Linux setattr_copy's times: those given are set
+pub fn setattr_copy_times(
+    inode: &Inode,
+    atime: Option<Timespec>,
+    mtime: Option<Timespec>,
+    ctime: Option<Timespec>,
+) {
+    if let Some(t) = atime {
+        inode.set_atime(t);
+    }
+    if let Some(t) = mtime {
+        inode.set_mtime(t);
+    }
+    if let Some(t) = ctime {
+        inode.set_ctime(t);
+    }
 }
 
 /// Linux generic_update_time: the times `what` names become `now`
