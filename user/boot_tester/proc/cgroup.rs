@@ -29,7 +29,8 @@ pub fn run_tests() {
 }
 
 /// CGROUPFS_TWO_MOUNTS: two cgroup2 mounts show the one hierarchy
-/// (Linux cgrp_dfl_root): a name that failed in one (a negative dentry,
+/// (Linux cgrp_dfl_root) through one superblock (one st_dev): a name
+/// that failed in one (a negative dentry,
 /// kept while its directory's revision stands: kernfs_iop_lookup,
 /// kernfs_dop_revalidate) is found once the other makes it, its control
 /// files too; a cgroup removed through one is gone from the other
@@ -56,6 +57,14 @@ fn two_mounts() {
 
 fn two_mounts_cases(t: &mut T) {
     const ENOENT: i64 = -2;
+    // One superblock for both (Linux kernfs_get_tree: sget keyed on
+    // the hierarchy's kernfs root), so one device number
+    let (mut sa, mut sb) = (Stat::default(), Stat::default());
+    let a = sys_stat(b"/tmp/cga\0".as_ptr(), &mut sa);
+    let b = sys_stat(b"/tmp/cgb\0".as_ptr(), &mut sb);
+    if t.eq(b"stat a", a, 0) && t.eq(b"stat b", b, 0) {
+        t.ok(b"one st_dev", sa.st_dev == sb.st_dev, sb.st_dev as i64);
+    }
     let mut st = Stat::default();
     let bx = b"/tmp/cgb/tm2\0".as_ptr();
     let bp = b"/tmp/cgb/tm2/cgroup.procs\0".as_ptr();

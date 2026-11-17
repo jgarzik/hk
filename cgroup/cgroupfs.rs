@@ -785,11 +785,51 @@ pub static CGROUPFS_SUPER_OPS: CgroupfsSuperOps = CgroupfsSuperOps;
 // Mount Function
 // ============================================================================
 
-/// Mount cgroupfs
+/// What a cgroup2 superblock shows (Linux kernfs_super_info: its kernfs
+/// root, cgrp_dfl_root's, and namespace tag, none for cgroup2): the key
+/// its mounts share it by
+struct CgSuper {
+    root: Arc<crate::cgroup::CgroupRoot>,
+}
+
+impl AsAny for CgSuper {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+impl crate::fs::superblock::SuperBlockData for CgSuper {}
+
+/// Whether `sb` shows the hierarchy `root` (Linux kernfs_test_super:
+/// the same kernfs root and namespace tag)
+fn shows(sb: &SuperBlock, root: &Arc<crate::cgroup::CgroupRoot>) -> bool {
+    let p = sb.private.read();
+    p.as_ref()
+        .and_then(|p| p.as_any().downcast_ref::<CgSuper>())
+        .is_some_and(|c| Arc::ptr_eq(&c.root, root))
+}
+
+/// Mount cgroup2 (Linux cgroup_get_tree -> kernfs_get_tree): the
+/// default hierarchy's superblock, one shared by all its mounts (sget
+/// keyed on the hierarchy, kernfs_test_super / kernfs_set_super), so
+/// they have one device number and one dcache; filled if new
 fn cgroupfs_mount(
     fc: &crate::fs::superblock::FsContext<'_>,
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
-    crate::fs::superblock::get_tree_nodev(fc, &CGROUPFS_SUPER_OPS, cgroupfs_fill)
+    let root = CGROUP_ROOT.clone();
+    let info: Arc<dyn crate::fs::superblock::SuperBlockData> =
+        try_arc(CgSuper { root: root.clone() })?;
+    let test = |sb: &SuperBlock| shows(sb, &root);
+    let sb = crate::fs::superblock::sget(fc, &CGROUPFS_SUPER_OPS, Some(&test), &|sb| {
+        // Linux kernfs_set_super
+        sb.set_private(info.clone());
+        crate::fs::superblock::set_anon_super(sb)
+    })?;
+    if !sb.has_root() {
+        cgroupfs_fill(&sb)?;
+        sb.set_active();
+    }
+    Ok(sb)
 }
 
 /// cgroup2's dentry operations (Linux kernfs_dops: cgroup2 is a kernfs
@@ -820,9 +860,8 @@ fn cgroupfs_revalidate(
 }
 
 /// kernfs_dop_revalidate's checks of a positive cgroupfs dentry `d` of
-/// `inode` in `dir`: its cgroup is not removed (kernfs_active: an
-/// rmdir through another mount, which keeps its own dentries, leaves
-/// this one stale), and it is still `dir`'s entry of that name: a
+/// `inode` in `dir`: its cgroup is not removed (kernfs_active), and it
+/// is still `dir`'s entry of that name (the parent and name checks): a
 /// child cgroup that parent's child by the dentry's name, a control
 /// file its own directory's, a controller's file while the controller
 /// is enabled there (Linux css_clear_dir removes its nodes)
@@ -882,11 +921,13 @@ fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// cgroup2's kill_sb (Linux cgroup_kill_sb, ending in kernfs_kill_sb's
-/// kill_anon_super; hk's cgroupfs keeps no root reference or kernfs
-/// info on the superblock)
+/// cgroup2's kill_sb (Linux cgroup_kill_sb, ending in kernfs_kill_sb:
+/// kill_anon_super, then the kernfs info freed; the default hierarchy
+/// is never killed)
 fn cgroup_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
     crate::fs::superblock::kill_anon_super(sb, g);
+    let info = sb.private.write().take();
+    drop(info);
 }
 
 /// Cgroupfs filesystem type
