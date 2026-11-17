@@ -29,7 +29,7 @@ use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, MAY_NOT_BLOCK, may_follow_link, permission_as};
 use crate::fs::dentry::{__d_lookup_rcu, Dentry, DentryRef};
 use crate::fs::inode::Inode;
-use crate::fs::mount::{MNT_NOSYMFOLLOW, Mount, MountRef};
+use crate::fs::mount::{__lookup_mnt, MNT_NOSYMFOLLOW, MOUNT_LOCK, Mount, MountRef};
 use crate::fs::path_ref::Path;
 use crate::sync::rcu::RcuReadGuard;
 
@@ -247,7 +247,7 @@ impl Nd {
                 reval: true,
             }));
         }
-        self.step_into_rcu(cur, child, inode, seq, name, rest, last, f, puts)
+        self.step_into_rcu(g, cur, child, inode, seq, name, rest, last, f, puts)
     }
 
     /// step_into under LOOKUP_RCU: onto `child` (its `d_seq` was
@@ -256,6 +256,7 @@ impl Nd {
     #[allow(clippy::too_many_arguments)]
     fn step_into_rcu<'g, 'p>(
         &self,
+        g: &'g RcuReadGuard,
         cur: &mut RcuPath<'g>,
         child: &'g Dentry,
         inode: Option<&'g Inode>,
@@ -266,23 +267,28 @@ impl Nd {
         f: LookupFlags,
         puts: &mut Puts,
     ) -> Result<Option<Lazy<'p>>, KernelError> {
+        // handle_mounts: what is mounted on it crossed in RCU mode, else
+        // try_to_unlazy_next and traverse_mounts in ref mode
+        let (mut mnt, mut d, mut seq, mut inode) = (cur.mnt, child, seq, inode);
         if child.is_mountpoint() {
-            // handle_mounts needs the ref-walk here
-            let (at, c) = self.try_to_unlazy_next(cur, child, seq, f.cached, puts)?;
-            return Ok(Some(Lazy::Child {
-                cur: at,
-                child: c,
-                name,
-                rest,
-                reval: false,
-            }));
+            let Some((m, r, s)) = self.follow_mount_rcu(g, mnt, child, seq, f) else {
+                let (at, c) = self.try_to_unlazy_next(cur, child, seq, f.cached, puts)?;
+                return Ok(Some(Lazy::Child {
+                    cur: at,
+                    child: c,
+                    name,
+                    rest,
+                    reval: false,
+                }));
+            };
+            (mnt, d, seq, inode) = (m, r, s, r.d_inode_rcu(g));
         }
         let link = inode.is_some_and(|i| i.mode().is_symlink());
         if link && (!last || f.follow) {
-            let l = self.pick_link_rcu(cur, cur.mnt, child, inode, seq, rest, last, f, puts)?;
+            let l = self.pick_link_rcu(cur, mnt, d, inode, seq, rest, last, f, puts)?;
             return Ok(Some(l));
         }
-        if child.d_seq_retry(seq) {
+        if d.d_seq_retry(seq) {
             return Err(ECHILD);
         }
         let Some(inode) = inode else {
@@ -296,12 +302,44 @@ impl Nd {
             });
         };
         *cur = RcuPath {
-            mnt: cur.mnt,
-            dentry: child,
+            mnt,
+            dentry: d,
             inode: Some(inode),
             seq,
         };
         Ok(None)
+    }
+
+    /// __follow_mount_rcu: from `d` in `mnt` (its `d_seq` sampled as
+    /// `seq`) down the mounts stacked on it to the topmost one's root
+    /// and that root's `d_seq` sample, each step checked against
+    /// MOUNT_LOCK's sequence (a ref walk could have reached that
+    /// state); None where ref mode must decide: a no-xdev walk (EXDEV
+    /// there), or a mount change
+    fn follow_mount_rcu<'g>(
+        &self,
+        g: &'g RcuReadGuard,
+        mut mnt: &'g Mount,
+        mut d: &'g Dentry,
+        mut seq: u32,
+        f: LookupFlags,
+    ) -> Option<(&'g Mount, &'g Dentry, u32)> {
+        if f.no_xdev {
+            return None;
+        }
+        while d.is_mountpoint() {
+            let m = __lookup_mnt(mnt, d, g);
+            if MOUNT_LOCK.read_retry(self.m_seq) {
+                return None;
+            }
+            let Some(m) = m else {
+                break;
+            };
+            mnt = m;
+            d = m.root_rcu(g);
+            seq = d.d_seq_begin();
+        }
+        Some((mnt, d, seq))
     }
 
     /// pick_link under LOOKUP_RCU: symlink `link` on `mnt`, its checks

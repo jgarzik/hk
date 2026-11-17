@@ -883,6 +883,22 @@ impl Mount {
         Some(unsafe { (&*parent, &*mp) })
     }
 
+    /// The root dentry, borrowed for an RCU read guard's life with no
+    /// reference (Linux READ_ONCE(mnt->mnt_root) in an RCU walk), for a
+    /// mount reached under that guard: what __follow_mount_rcu steps
+    /// onto, which the walk confirms by its `d_seq` and MOUNT_LOCK's
+    /// sequence
+    pub(super) fn root_rcu<'g>(&'g self, _g: &'g RcuReadGuard) -> &'g Dentry {
+        // SAFETY: `self` was reached under the guard: held by the walk,
+        // or found in the mount hash, whose chain keeps a reference
+        // until a grace period after the mount leaves it; either way its
+        // teardown, which puts the root, comes after the guard began.
+        // A dentry is freed a grace period after its last put
+        // (`dentry_kill`'s call_rcu), which waits for the guard; the
+        // address `root_addr` reads stays in place after the teardown.
+        unsafe { &*self.root_addr() }
+    }
+
     /// The root dentry's address, read even after the teardown released
     /// it (Linux compares mnt_root of a mount an RCU walk reached): for
     /// comparison only
@@ -1375,7 +1391,7 @@ pub(super) fn __lookup_mnt<'g>(
     {
         return None;
     }
-    let dir = d.get_inode().is_some_and(|i| i.mode().is_dir());
+    let dir = d.d_inode_rcu(g).is_some_and(|i| i.mode().is_dir());
     let stand_in = if dir { &KNULLFS } else { &KNULLFS_FILE };
     stand_in.get().map(|m| &**m)
 }

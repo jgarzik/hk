@@ -46,7 +46,7 @@ argued / published copy of locked state.
 - Done (stage 2): the LOOKUP_RCU walk (`fs/namei/rcu.rs`: lookup_fast,
   step_into, may_lookup with MAY_NOT_BLOCK, try_to_unlazy(_next),
   ECHILD retry in ref mode, RESOLVE_CACHED through it).
-- Left (stage 2): mounts and ".." in RCU mode (they unlazy), path_init
+- Left (stage 2): ".." in RCU mode (it unlazies), path_init
   without references to the root and cwd.
 
 

@@ -3400,8 +3400,9 @@ a group's last member leaves.
 
 **Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```
-1. RCU read guard, MOUNT_LOCK's sequence sampled (lookup_mnt; a
-   legitimize that saw it move takes the locking read)
+1. RCU read guard, MOUNT_LOCK's sequence sampled (lookup_mnt; the
+   RCU walk's at the lookup's start; a legitimize that saw it move
+   takes the locking read)
 2. child.mnt_parent, child.mnt_mountpoint (loads, comparing addresses)
 ```
 The walk carries a Path{mnt, dentry}: a dentry marked mounted is
@@ -3434,8 +3435,14 @@ and checked against the child's sample before the walk stands on it
 (Linux nd->seq / nd->next_seq). The search permission is asked with
 MAY_NOT_BLOCK on the borrowed inode, a revalidation with LOOKUP_RCU
 (above: ECHILD where the answer needs more than RCU-readable fields).
-Where it must leave RCU mode (a miss, a symlink's body, ".." or a
-mountpoint, a revalidation or permission check that said ECHILD) it
+A dentry marked mounted is crossed in RCU mode (`follow_mount_rcu`,
+Linux __follow_mount_rcu): `__lookup_mnt` under the guard, the mount's
+root borrowed (`Mount::root_rcu`: the hash chain's reference keeps the
+mount's teardown, which puts its root, after the guard began) with its
+`d_seq` sampled, MOUNT_LOCK's sequence checked after each step; a
+no-xdev walk or a raced mount change leaves RCU mode there. Where it
+must leave RCU mode (a miss, a symlink's body, "..", a revalidation
+or permission check that said ECHILD) it
 takes references to where it stands (`try_to_unlazy`,
 `try_to_unlazy_next` for a child too, `legitimize_path`:
 `MountRef::legitimize` against MOUNT_LOCK's sequence sampled at the
