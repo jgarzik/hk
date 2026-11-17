@@ -690,6 +690,12 @@ waiting).
   I_DIRTY_SYNC unless I_DIRTY_DATASYNC).
 - No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
   such as touch_atime take mount write access only.
+- `SuperOps::write_inode` takes no wait argument (Linux
+  writeback_control sync_mode), so vfat's dirsync wait syncs the whole
+  device.
+- vfat `fat_add_entries` allocates a new directory cluster before it
+  writes the free slots it already has (Linux writes those first), so
+  a failed dirsync sync leaves the zeroed cluster linked in.
 
 ## No buffer heads
 
