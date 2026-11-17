@@ -8,9 +8,9 @@
 
 use crate::harness::{R, report_r};
 use hk_syscall::{
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_execve, sys_fstatat,
-    sys_link, sys_lstat, sys_mkdir, sys_mount, sys_open, sys_openat, sys_rename, sys_renameat2,
-    sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_dup3, sys_execve,
+    sys_fstatat, sys_link, sys_lstat, sys_mkdir, sys_mount, sys_open, sys_openat, sys_rename,
+    sys_renameat2, sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink,
 };
 
 const ENOENT: i64 = -2;
@@ -21,6 +21,7 @@ const ENOTDIR: i64 = -20;
 const EISDIR: i64 = -21;
 const EINVAL: i64 = -22;
 const ENAMETOOLONG: i64 = -36;
+const ELOOP: i64 = -40;
 const ENOTEMPTY: i64 = -39;
 const AT_FDCWD: i32 = -100;
 const AT_EMPTY_PATH: i32 = 0x1000;
@@ -38,6 +39,7 @@ pub fn run_tests() {
     report_r(b"NEG_DENTRY_CREATE", negative());
     report_r(b"DOTDOT_DISCONNECTED", disconnected());
     report_r(b"LINK_STACK_UNLAZY", link_stack());
+    report_r(b"LINK_STACK_REF", link_stack_ref());
 }
 
 /// `got` must be `want`
@@ -390,6 +392,106 @@ fn link_stack() -> R {
     want(b"stat dir link", r3, 0)?;
     want(b"stat fd path", r4, 0)?;
     want(b"same fd", same2 as i64, 1)
+}
+
+/// `pre` + two decimal digits of `i` + `post` + NUL, in `b`
+fn numbered<'a>(b: &'a mut [u8; 64], pre: &[u8], i: usize, post: &[u8]) -> &'a [u8] {
+    let digits = [b'0' + (i / 10 % 10) as u8, b'0' + (i % 10) as u8];
+    let mut n = 0;
+    for &c in pre.iter().chain(&digits).chain(post) {
+        b[n] = c;
+        n += 1;
+    }
+    b[n] = 0;
+    &b[..=n]
+}
+
+/// A chain of `n` relative links /tmp/lsr/`c`NN, each body the next
+/// link with "/." after it (a body with a rest still to walk), the
+/// last's "d/."
+fn chain(c: u8, n: usize) {
+    let (mut lb, mut tb) = ([0u8; 64], [0u8; 64]);
+    for i in 0..n {
+        let l = numbered(
+            &mut lb,
+            &[b'/', b't', b'm', b'p', b'/', b'l', b's', b'r', b'/', c],
+            i,
+            b"",
+        );
+        let t: &[u8] = if i + 1 == n {
+            b"d/.\0"
+        } else {
+            numbered(&mut tb, &[c], i + 1, b"/.")
+        };
+        sys_unlink(l.as_ptr());
+        sys_symlink(t.as_ptr(), l.as_ptr());
+    }
+}
+
+fn unchain(c: u8, n: usize) {
+    let mut lb = [0u8; 64];
+    for i in 0..n {
+        let l = numbered(
+            &mut lb,
+            &[b'/', b't', b'm', b'p', b'/', b'l', b's', b'r', b'/', c],
+            i,
+            b"",
+        );
+        sys_unlink(l.as_ptr());
+    }
+}
+
+/// Links followed in ref mode (a fresh link's atime update makes the
+/// walk leave RCU mode at the first): 40 nested bodies, each with a
+/// rest walked after its inner ones (Linux nd->stack, each link held
+/// until its body is walked), resolve; 41 are ELOOP; a body whose last
+/// component has a slash after it, onto a file, is ENOTDIR; a magic
+/// link (/proc/self/fd/N) mid-path goes on from its object
+fn link_stack_ref() -> R {
+    sys_mkdir(b"/tmp/lsr\0".as_ptr(), 0o755);
+    sys_mkdir(b"/tmp/lsr/d\0".as_ptr(), 0o755);
+    let fd = sys_open(b"/tmp/lsr/d/f\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    chain(b'n', 40);
+    chain(b'm', 41);
+    sys_symlink(b"d/f/\0".as_ptr(), b"/tmp/lsr/tf\0".as_ptr());
+    let (mut a, mut b) = (Stat::default(), Stat::default());
+    let r1 = sys_stat(b"/tmp/lsr/n00/f\0".as_ptr(), &mut a);
+    let r2 = sys_stat(b"/tmp/lsr/d/f\0".as_ptr(), &mut b);
+    let same = a.st_ino == b.st_ino && a.st_dev == b.st_dev;
+    let r3 = sys_stat(b"/tmp/lsr/m00/f\0".as_ptr(), &mut a);
+    let r4 = sys_stat(b"/tmp/lsr/tf\0".as_ptr(), &mut a);
+    // Descriptor 42, a two-digit name
+    let fd = sys_open(b"/tmp/lsr/d\0".as_ptr(), O_DIRECTORY | O_RDONLY, 0);
+    let dfd = if fd >= 0 {
+        sys_dup3(fd as i32, 42, 0)
+    } else {
+        fd
+    };
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    let r5 = sys_stat(b"/proc/self/fd/42/f\0".as_ptr(), &mut a);
+    let same2 = a.st_ino == b.st_ino && a.st_dev == b.st_dev;
+    if dfd >= 0 {
+        sys_close(dfd as u64);
+    }
+    unchain(b'n', 40);
+    unchain(b'm', 41);
+    sys_unlink(b"/tmp/lsr/tf\0".as_ptr());
+    sys_unlink(b"/tmp/lsr/d/f\0".as_ptr());
+    sys_rmdir(b"/tmp/lsr/d\0".as_ptr());
+    sys_rmdir(b"/tmp/lsr\0".as_ptr());
+    want(b"40 links", r1, 0)?;
+    want(b"plain path", r2, 0)?;
+    want(b"same file", same as i64, 1)?;
+    want(b"41 links", r3, ELOOP)?;
+    want(b"slash after body", r4, ENOTDIR)?;
+    want(b"dirfd", dfd, 42)?;
+    want(b"magic link", r5, 0)?;
+    want(b"magic same file", same2 as i64, 1)
 }
 
 fn creat_dangling() -> R {

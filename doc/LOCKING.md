@@ -3577,9 +3577,14 @@ leaving RCU mode with levels on the stack takes a reference to each
 link (`legitimize_links`, Linux the same: ECHILD if one moved, what was
 taken put after the guard; the levels past the embedded ones go in
 room reserved, GFP_ATOMIC, with the stack's), so an `i_link` body stays
-valid in ref mode through its held link, which copies the bodies' and
-the name's rests into one buffer with no guard held (the ref walk's
-own form, `Held::text`) and puts the links. Where it must leave RCU mode (a miss, a
+valid in ref mode through its held link: the ref walk goes on from the
+same stack (Linux's one link_path_walk loop: `Held`, nothing copied),
+each link held until its body is walked and put as its level pops
+(put_link, sleeping allowed: no guard then). A walk that starts in
+ref mode pushes its links on such a stack too (two levels in place,
+more allocated GFP_KERNEL on first need: ENOMEM, Linux
+nd_alloc_stack), the link held, its inode too for an `i_link` body.
+Where it must leave RCU mode (a miss, a
 revalidation or permission check that said ECHILD) it
 takes references to where it stands (`try_to_unlazy`,
 `try_to_unlazy_next` for a child too, `legitimize_path`:

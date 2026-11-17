@@ -678,11 +678,6 @@ waiting).
 
 **Location**: `fs/namei/`
 
-- The ref-mode walk follows a symlink by copying its body and the
-  rest of the name into one buffer and walking that (`get_link`, and
-  `Held::text` for the stack an RCU walk hands over); Linux's one
-  link_path_walk loop keeps the link stack (nd->stack) in ref mode
-  too, the links held until each body is walked.
 - vfat and kernfs/cgroupfs cache no negative dentry at lookup
   (`namei::lookup_one`); Linux's vfat_lookup and kernfs_iop_lookup do
   (d_splice_alias(NULL)) and keep it valid while the directory's

@@ -40,6 +40,7 @@ use crate::fs::mount::{
 };
 use crate::fs::path_ref::Path;
 use crate::sync::rcu::RcuReadGuard;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// Where an RCU walk stands (Linux nameidata's path, inode and seq
@@ -172,7 +173,7 @@ impl Puts {
                 self.path(Role::Path, cur);
                 self.dentry(child);
             }
-            To::Link { cur, link } => {
+            To::Link { cur, link, .. } => {
                 self.path(Role::Path, cur);
                 self.path(Role::Link, link);
             }
@@ -182,84 +183,102 @@ impl Puts {
 
 /// Where a walk goes on in ref mode once it left RCU mode (Linux: the
 /// same loop, LOOKUP_RCU cleared, from where try_to_unlazy returned):
-/// what it stood on, the rest of the name, the flags (a trailing slash
-/// a symlink's body ended in added: lookup_last) and the symlinks
-/// followed so far (nd->total_link_count)
+/// what it stood on, the link stack with each link held
+/// (legitimize_links), the rest of the caller's path below it, the
+/// flags (a trailing slash a symlink's body ended in added:
+/// lookup_last) and the symlinks followed so far (nd->total_link_count).
+/// The current text (the top body's rest, else `user`) starts at the
+/// component the walk stopped at (`Comp`, `Lookup`, `Child`), or after
+/// the symlink (`Link`); empty for `Done`.
 pub(super) struct Lazy<'p> {
     pub(super) to: To,
-    /// From the component the walk stopped at (`Comp`, `Lookup`,
-    /// `Child`), or after the symlink (`Link`); empty for `Done`
-    pub(super) text: Rest<'p>,
+    pub(super) stack: Held,
+    pub(super) user: &'p [u8],
     pub(super) f: LookupFlags,
     pub(super) depth: usize,
 }
 
-/// The rest of a name an RCU walk hands to ref mode: the caller's path,
-/// or, inside symlinks it followed, the link stack with each link held
-/// (legitimize_links), its top body's rest starting at `from`, then the
-/// other bodies' and the path's
-pub(super) enum Rest<'p> {
-    Path(&'p [u8]),
-    Links {
-        held: Held,
-        from: usize,
-        user: &'p [u8],
-    },
-}
-
-/// A level of the link stack once legitimized (Linux struct saved with
-/// its link held): the link, which keeps an `i_link` body, or the body
-/// an RCU ->get_link made
+/// A level of the link stack in ref mode (Linux struct saved, its link
+/// held): the link, the body (an `i_link` read through `inode`, the
+/// link's inode, or one ->get_link made), where its rest begins, and
+/// whether nothing follows it below (its last component is the walk's
+/// last). The link is put as the level is popped (put_link).
 pub(super) struct HeldFrame {
-    link: Path,
-    body: Option<Vec<u8>>,
-    pos: usize,
+    pub(super) link: Path,
+    pub(super) body: Option<Vec<u8>>,
+    pub(super) inode: Option<Arc<Inode>>,
+    pub(super) pos: usize,
+    pub(super) tail_empty: bool,
 }
 
 impl HeldFrame {
-    /// Append its rest, from `from` past where it stands, to `v`
-    fn rest_to(&self, from: usize, v: &mut Vec<u8>) -> Result<(), KernelError> {
-        let inode;
-        let b = match &self.body {
-            Some(b) => b.as_slice(),
-            // The held link's inode, and its body, are the ones the RCU
-            // walk read (its sequence was checked when it was taken)
-            None => {
-                inode = self.link.get_inode().ok_or(ECHILD)?;
-                inode.i_link().ok_or(ECHILD)?
-            }
-        };
-        let r = b.get(self.pos + from..).ok_or(ECHILD)?;
-        v.try_reserve(r.len())
-            .map_err(|_| KernelError::OutOfMemory)?;
-        v.extend_from_slice(r);
+    pub(super) fn bytes(&self) -> &[u8] {
+        match (&self.body, &self.inode) {
+            (Some(b), _) => b,
+            (None, Some(i)) => i.i_link().unwrap_or(&[]),
+            (None, None) => &[],
+        }
+    }
+
+    /// The body from where the walk stands in it
+    pub(super) fn rest(&self) -> &[u8] {
+        self.bytes().get(self.pos..).unwrap_or(&[])
+    }
+
+    /// An RCU walk's level in ref mode: the held link's inode, whose
+    /// `i_link` the walk read (its sequence was checked when the link
+    /// was taken); ECHILD if it has none
+    fn prepare(&mut self) -> Result<(), KernelError> {
+        if self.body.is_some() || self.inode.is_some() {
+            return Ok(());
+        }
+        let i = self.link.get_inode().ok_or(ECHILD)?;
+        i.i_link().ok_or(ECHILD)?;
+        self.inode = Some(i);
         Ok(())
     }
 }
 
-/// The legitimized link stack (Linux nd->stack after legitimize_links):
-/// its levels past the embedded ones in room reserved while the RCU
-/// walk pushed them, bottom first
+/// The link stack in ref mode (Linux nd->stack): legitimized from an
+/// RCU walk's (its levels past the embedded ones in room reserved while
+/// the RCU walk pushed them), or pushed by a ref-mode walk (room
+/// allocated on first need, Linux nd_alloc_stack: ENOMEM), bottom first
 #[derive(Default)]
 pub(super) struct Held(EmbStack<HeldFrame>);
 
 impl Held {
-    /// The rest of the name in ref mode: the top body's rest from
-    /// `from`, the bodies below it, then `user`, in one text (the ref
-    /// walk's form: a body with what follows it), allocated with no
-    /// guard held; the links are put as it drops
-    pub(super) fn text(&self, from: usize, user: &[u8]) -> Result<Vec<u8>, KernelError> {
-        let mut v = Vec::new();
-        let n = self.0.len();
-        for i in (0..n).rev() {
-            self.0
-                .get(i)
-                .rest_to(if i == n - 1 { from } else { 0 }, &mut v)?;
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(super) fn top(&self) -> Option<&HeldFrame> {
+        self.0.top()
+    }
+
+    pub(super) fn top_mut(&mut self) -> Option<&mut HeldFrame> {
+        self.0.top_mut()
+    }
+
+    /// Push a level, allocating room past the embedded ones (ENOMEM)
+    pub(super) fn push(&mut self, f: HeldFrame) -> Result<(), KernelError> {
+        if !self.0.has_room() && !self.0.reserve_more() {
+            return Err(KernelError::OutOfMemory);
         }
-        v.try_reserve(user.len())
-            .map_err(|_| KernelError::OutOfMemory)?;
-        v.extend_from_slice(user);
-        Ok(v)
+        self.0.push(f);
+        Ok(())
+    }
+
+    /// Pop the top level, its link put (put_link)
+    pub(super) fn pop(&mut self) -> bool {
+        self.0.pop()
+    }
+
+    /// Every level ready for ref mode ([`HeldFrame::prepare`])
+    pub(super) fn prepare(&mut self) -> Result<(), KernelError> {
+        for i in 0..self.0.len() {
+            self.0.get_mut(i).prepare()?;
+        }
+        Ok(())
     }
 }
 
@@ -282,8 +301,9 @@ pub(super) enum To {
         reval: Option<Result<bool, KernelError>>,
         dots: bool,
     },
-    /// pick_link: symlink `link` in `cur`, checked; its body in ref mode
-    Link { cur: Path, link: Path },
+    /// pick_link: symlink `link` in `cur`, checked and counted; its
+    /// body in ref mode; `last`: the walk's last component
+    Link { cur: Path, link: Path, last: bool },
 }
 
 /// What one RCU step gives the loop: it stands on the child, it left
@@ -363,6 +383,13 @@ impl<T> EmbStack<T> {
         match self.emb.get(i) {
             Some(f) => f.as_ref().expect("namei: a hole in the link stack"),
             None => &self.more[i - EMBEDDED],
+        }
+    }
+
+    fn get_mut(&mut self, i: usize) -> &mut T {
+        match self.emb.get_mut(i) {
+            Some(f) => f.as_mut().expect("namei: a hole in the link stack"),
+            None => &mut self.more[i - EMBEDDED],
         }
     }
 
@@ -519,7 +546,9 @@ fn legitimize_links(stack: Stack<'_>, m_seq: u32, puts: &mut Puts) -> Option<Hel
                 Body::Ref(_) => None,
                 Body::Own(v) => Some(v),
             },
+            inode: None,
             pos: fr.pos,
+            tail_empty: fr.tail_empty,
         });
         if moved {
             puts.links = Some(held);
@@ -736,7 +765,8 @@ impl Nd<'_> {
         let p = self.unlazy(rc, &cur, false, self.scoped, puts)?;
         Ok(Lazy {
             to: To::Done(p),
-            text: Rest::Path(&[]),
+            stack: Held::default(),
+            user: &[],
             f,
             depth: total,
         })
@@ -746,7 +776,7 @@ impl Nd<'_> {
     /// offset `from` of the current text (the top body's rest, else the
     /// path's), with the link stack held (Linux try_to_unlazy's
     /// legitimize_links; ECHILD if a link moved, and the lookup starts
-    /// over in ref mode)
+    /// over in ref mode); no body is copied
     #[allow(clippy::too_many_arguments)]
     fn lazy<'p>(
         &self,
@@ -761,20 +791,25 @@ impl Nd<'_> {
         if stack.depth() == 0 {
             return Ok(Lazy {
                 to,
-                text: Rest::Path(&user[from..]),
+                stack: Held::default(),
+                user: &user[from..],
                 f,
                 depth,
             });
         }
-        let Some(held) = legitimize_links(stack, self.m_seq, puts) else {
+        let Some(mut held) = legitimize_links(stack, self.m_seq, puts) else {
             // `to`'s references go after the guard, with the walk's
             // other leftovers
             puts.to(to);
             return Err(ECHILD);
         };
+        if let Some(top) = held.0.top_mut() {
+            top.pos += from;
+        }
         Ok(Lazy {
             to,
-            text: Rest::Links { held, from, user },
+            stack: held,
+            user,
             f,
             depth,
         })
@@ -1088,7 +1123,11 @@ impl Nd<'_> {
         let link =
             legitimize_path(l.mnt, l.link, l.seq, self.m_seq, puts, Role::Link).ok_or(ECHILD)?;
         match self.try_to_unlazy(rc, cur, false, puts) {
-            Ok(at) => Ok(To::Link { cur: at, link }),
+            Ok(at) => Ok(To::Link {
+                cur: at,
+                link,
+                last: l.last,
+            }),
             Err(e) => {
                 puts.path(Role::Link, link);
                 Err(e)

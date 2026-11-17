@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, OnceCell};
 
-use self::rcu::{Lazy, To};
+use self::rcu::{Held, HeldFrame, Lazy, To};
 
 use crate::fs::File;
 use crate::fs::KernelError;
@@ -355,11 +355,86 @@ fn link_body(inode: &Inode) -> Result<Link, KernelError> {
     }
 }
 
-/// What a ref-mode step gives: the walk goes on from it, or it was a
-/// symlink whose walk ended the lookup
-enum Walked {
-    On(Path),
-    Done(Path),
+/// A ref-mode walk's name and link stack (Linux nameidata's nd->stack
+/// and the name it walks, LOOKUP_RCU clear): the current text is the
+/// top body's rest, else the caller's path; each link stays held until
+/// its body is walked (put_link), so no body is copied
+struct RefWalk<'p> {
+    stack: Held,
+    user: &'p [u8],
+    f: LookupFlags,
+    /// Symlinks followed so far (nd->total_link_count)
+    total: usize,
+}
+
+/// A component of the current text: the name's offsets, and whether it
+/// is the walk's last
+struct Comp {
+    at: usize,
+    end: usize,
+    last: bool,
+}
+
+impl<'p> RefWalk<'p> {
+    fn new(
+        mut stack: Held,
+        user: &'p [u8],
+        f: LookupFlags,
+        total: usize,
+    ) -> Result<Self, KernelError> {
+        stack.prepare()?;
+        Ok(Self {
+            stack,
+            user,
+            f,
+            total,
+        })
+    }
+
+    /// The current text, and whether nothing follows it below
+    fn text(&self) -> (&[u8], bool) {
+        match self.stack.top() {
+            Some(fr) => (fr.rest(), fr.tail_empty),
+            None => (self.user, true),
+        }
+    }
+
+    /// The next component, a body walked to its end popped first (Linux
+    /// link_path_walk: put_link, then the saved name below); a slash
+    /// after a body's last component asks for a directory, through a
+    /// final symlink (lookup_last)
+    fn next(&mut self) -> Option<Comp> {
+        loop {
+            let (t, tail_empty) = self.text();
+            let Some((name, after)) = next_comp(t) else {
+                if self.stack.pop() {
+                    continue;
+                }
+                return None;
+            };
+            let at = t.len() - name.len() - after.len();
+            let end = t.len() - after.len();
+            let last = tail_empty && next_comp(after).is_none();
+            if last && self.stack.len() > 0 && !after.is_empty() {
+                self.f.follow = true;
+                self.f.directory = true;
+            }
+            return Some(Comp { at, end, last });
+        }
+    }
+
+    /// The name of `c`
+    fn name(&self, c: &Comp) -> &[u8] {
+        &self.text().0[c.at..c.end]
+    }
+
+    /// Past `c`
+    fn advance(&mut self, c: &Comp) {
+        match self.stack.top_mut() {
+            Some(fr) => fr.pos += c.end,
+            None => self.user = &self.user[c.end..],
+        }
+    }
 }
 
 /// may_lookup: `dir` must be a searchable directory
@@ -487,7 +562,7 @@ impl<'a> Nd<'a> {
         path: &[u8],
         f: LookupFlags,
     ) -> Result<Path, KernelError> {
-        let p = self.walk(start, path, f, 0)?;
+        let p = self.walk(start, path, f)?;
         self.complete(p)
     }
 
@@ -538,18 +613,9 @@ impl<'a> Nd<'a> {
 
     /// link_path_walk + lookup_last from `start` (the root for an
     /// absolute path): in RCU mode while the lookup is still in it
-    /// (only its first walk: the RCU walk follows symlinks on its own
-    /// stack, and a later walk starts in ref mode), else in ref mode
-    fn walk(
-        &self,
-        start: Start<'_>,
-        path: &[u8],
-        mut f: LookupFlags,
-        depth: usize,
-    ) -> Result<Path, KernelError> {
-        if depth > MAX_SYMLINK_DEPTH {
-            return Err(KernelError::TooManySymlinks);
-        }
+    /// (only its first walk; a later walk starts in ref mode), else in
+    /// ref mode, each following symlinks on its own link stack
+    fn walk(&self, start: Start<'_>, path: &[u8], mut f: LookupFlags) -> Result<Path, KernelError> {
         // A trailing slash asks for a directory, through a final symlink
         // (Linux link_path_walk: LOOKUP_FOLLOW | LOOKUP_DIRECTORY)
         if path.ends_with(b"/") {
@@ -570,39 +636,31 @@ impl<'a> Nd<'a> {
         } else {
             self.start_ref(start)?
         };
-        self.walk_ref(start, path, f, depth)
+        let mut w = RefWalk::new(Held::default(), path, f, 0)?;
+        self.walk_ref(start, &mut w)
     }
 
     /// The walk's loop in ref mode, from `cur` (Linux link_path_walk
-    /// without LOOKUP_RCU)
-    fn walk_ref(
-        &self,
-        mut cur: Path,
-        path: &[u8],
-        f: LookupFlags,
-        depth: usize,
-    ) -> Result<Path, KernelError> {
-        let mut next = next_comp(path);
-        while let Some((name, rest)) = next {
-            next = next_comp(rest);
+    /// without LOOKUP_RCU, then lookup_last): a symlink's body is walked
+    /// from the link stack, the link held meanwhile
+    fn walk_ref(&self, mut cur: Path, w: &mut RefWalk<'_>) -> Result<Path, KernelError> {
+        while let Some(c) = w.next() {
             may_lookup(self.cred(), &cur.dentry)?;
-            cur = match name {
-                b"." => cur,
+            let d = match w.name(&c) {
+                b"." => None,
                 b".." => {
-                    let p = follow_dotdot(cur, self.root()?, f)?;
+                    cur = follow_dotdot(cur, self.root()?, w.f)?;
                     self.recheck()?;
-                    p
+                    None
                 }
-                _ => {
-                    let d = lookup_slow(&cur.dentry, name)?;
-                    match self.step(cur, d, rest, f, depth)? {
-                        Walked::On(p) => p,
-                        Walked::Done(p) => return Ok(p),
-                    }
-                }
+                name => Some(lookup_slow(&cur.dentry, name)?),
             };
+            w.advance(&c);
+            if let Some(d) = d {
+                cur = self.step(cur, d, c.last, w)?;
+            }
         }
-        self.finish(cur, f)
+        self.finish(cur, w.f)
     }
 
     /// The end of a walk: LOOKUP_DIRECTORY's check (Linux
@@ -614,64 +672,45 @@ impl<'a> Nd<'a> {
         Ok(p)
     }
 
-    /// step_into in ref mode: onto `d`, found in `cur`, with `rest` to
-    /// walk after it: what is mounted on it crossed, a symlink to follow
-    /// followed (its walk is the rest of this one)
+    /// step_into in ref mode: onto `d`, found in `cur`: what is mounted
+    /// on it crossed, a symlink to follow picked (`last`: the walk's
+    /// last component); where the walk goes on
     fn step(
         &self,
         cur: Path,
         d: DentryRef,
-        rest: &[u8],
-        f: LookupFlags,
-        depth: usize,
-    ) -> Result<Walked, KernelError> {
-        let last = next_comp(rest).is_none();
-        let child = step_mounts(Path::new(cur.mnt.clone(), d), f)?;
-        if (!last || f.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
-            self.pick_link(&cur, &child, last, f)?;
-            return self
-                .get_link(&cur, &child, rest, f, depth)
-                .map(Walked::Done);
+        last: bool,
+        w: &mut RefWalk<'_>,
+    ) -> Result<Path, KernelError> {
+        let child = step_mounts(Path::new(cur.mnt.clone(), d), w.f)?;
+        if (!last || w.f.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
+            return self.pick_link(cur, child, last, w);
         }
-        Ok(Walked::On(child))
+        Ok(child)
     }
 
     /// Go on in ref mode from where an RCU walk left RCU mode (Linux:
-    /// the same loop after try_to_unlazy), with the rest of the name it
-    /// handed over and the symlinks it followed counted; a rest that
-    /// ends in a slash asks for a directory (a body's trailing slash:
-    /// lookup_last)
+    /// the same loop after try_to_unlazy), with the link stack and the
+    /// rest of the name it handed over and the symlinks it followed
+    /// counted
     fn unlazied(&self, l: Lazy<'_>) -> Result<Path, KernelError> {
         let Lazy {
             to,
-            text,
-            mut f,
+            stack,
+            user,
+            f,
             depth,
         } = l;
-        // A link stack's bodies and the path's rest in one text, the
-        // links put after the copy (ref mode: no guard held)
-        let own;
-        let text = match text {
-            rcu::Rest::Path(p) => p,
-            rcu::Rest::Links { held, from, user } => {
-                own = held.text(from, user)?;
-                own.as_slice()
-            }
-        };
-        if text.ends_with(b"/") {
-            f.follow = true;
-            f.directory = true;
-        }
-        // The component the walk stopped at, and what follows it
-        let comp = || next_comp(text).ok_or(ECHILD);
-        let (cur, d, rest) = match to {
-            To::Done(p) => return self.finish(p, f),
-            To::Comp(cur) => return self.walk_ref(cur, text, f, depth),
-            To::Link { cur, link } => return self.get_link(&cur, &link, text, f, depth),
+        let mut w = RefWalk::new(stack, user, f, depth)?;
+        let cur = match to {
+            To::Done(p) => return self.finish(p, w.f),
+            To::Comp(cur) => cur,
+            To::Link { cur, link, last } => self.get_link(cur, link, last, &mut w)?,
             To::Lookup(cur) => {
-                let (name, rest) = comp()?;
-                let d = lookup_slow(&cur.dentry, name)?;
-                (cur, d, rest)
+                let c = w.next().ok_or(ECHILD)?;
+                let d = lookup_slow(&cur.dentry, w.name(&c))?;
+                w.advance(&c);
+                self.step(cur, d, c.last, &mut w)?
             }
             To::Child {
                 cur,
@@ -679,10 +718,11 @@ impl<'a> Nd<'a> {
                 dots: true,
                 ..
             } => {
-                let (_, rest) = comp()?;
-                let p = step_mounts(Path::new(cur.mnt.clone(), child), f)?;
+                let c = w.next().ok_or(ECHILD)?;
+                w.advance(&c);
+                let p = step_mounts(Path::new(cur.mnt.clone(), child), w.f)?;
                 self.recheck()?;
-                return self.walk_ref(p, rest, f, depth);
+                p
             }
             To::Child {
                 cur,
@@ -690,25 +730,41 @@ impl<'a> Nd<'a> {
                 reval,
                 dots: false,
             } => {
-                let (name, rest) = comp()?;
+                let c = w.next().ok_or(ECHILD)?;
                 let d = match reval {
-                    Some(s) => lookup_fast_ref(&cur.dentry, child, name, s)?,
+                    Some(s) => lookup_fast_ref(&cur.dentry, child, w.name(&c), s)?,
                     None => child,
                 };
-                (cur, d, rest)
+                w.advance(&c);
+                self.step(cur, d, c.last, &mut w)?
             }
         };
-        match self.step(cur, d, rest, f, depth)? {
-            Walked::On(p) => self.walk_ref(p, rest, f, depth),
-            Walked::Done(p) => Ok(p),
+        self.walk_ref(cur, &mut w)
+    }
+
+    /// pick_link in ref mode: symlink `link` found in `dir` counted
+    /// (reserve_stack: MAX_SYMLINK_DEPTH links in all, ELOOP) and
+    /// checked ([`Nd::may_pick`]), then followed ([`Nd::get_link`])
+    fn pick_link(
+        &self,
+        dir: Path,
+        link: Path,
+        last: bool,
+        w: &mut RefWalk<'_>,
+    ) -> Result<Path, KernelError> {
+        if w.total >= MAX_SYMLINK_DEPTH {
+            return Err(KernelError::TooManySymlinks);
         }
+        w.total += 1;
+        self.may_pick(&dir, &link, last, w.f)?;
+        self.get_link(dir, link, last, w)
     }
 
     /// pick_link's checks of symlink `link` found in `dir`:
     /// fs.protected_symlinks for the trailing link only (`last`:
     /// WALK_TRAILING), then RESOLVE_NO_SYMLINKS or a nosymfollow mount
     /// (LOOKUP_NO_SYMLINKS / MNT_NOSYMFOLLOW on the link's mount)
-    fn pick_link(
+    fn may_pick(
         &self,
         dir: &Path,
         link: &Path,
@@ -725,51 +781,52 @@ impl<'a> Nd<'a> {
         Ok(())
     }
 
-    /// The rest of pick_link, in ref mode: continue the walk through
-    /// symlink `link` found in `dir`, with the components `rest` still
-    /// to resolve after it (its atime touched, its ->get_link)
+    /// The rest of pick_link, in ref mode: symlink `link` found in
+    /// `dir` (counted and checked) is followed: its atime touched, its
+    /// body (the inode's `i_link`, else ->get_link) pushed on the link
+    /// stack with the link held, walked next; an absolute body starts
+    /// at the root (nd_jump_root), a magic link at its object
+    /// (nd_jump_link); a body of slashes alone, or a jump, pushes
+    /// nothing (all_done). Where the walk goes on.
     fn get_link(
         &self,
-        dir: &Path,
-        link: &Path,
-        rest: &[u8],
-        f: LookupFlags,
-        depth: usize,
+        dir: Path,
+        link: Path,
+        last: bool,
+        w: &mut RefWalk<'_>,
     ) -> Result<Path, KernelError> {
         let inode = link.get_inode().ok_or(KernelError::NotFound)?;
-        let got = link_body(&inode)?;
         inode.touch_atime(&link.mnt);
-        let mut path = match got {
-            // A magic link: the walk goes on from its object
-            Link::Jump(p) => {
-                self.may_jump(dir, &p, f)?;
-                return self.walk_on(p, rest, f, depth);
-            }
-            Link::Text(t) => t,
+        let body = match inode.i_link() {
+            Some(_) => None,
+            None => match inode.i_op.get_link(&inode, false)? {
+                Link::Jump(p) => {
+                    self.may_jump(&dir, &p, w.f)?;
+                    return Ok(p);
+                }
+                Link::Text(t) => Some(t),
+            },
         };
-        if path.starts_with(b"/") {
-            self.jump_root(dir, f)?;
+        let mut fr = HeldFrame {
+            link,
+            body,
+            inode: Some(inode),
+            pos: 0,
+            tail_empty: last,
+        };
+        let b = fr.bytes();
+        let abs = b.starts_with(b"/");
+        let skip = b.iter().position(|&c| c != b'/').unwrap_or(b.len());
+        let mut cur = dir;
+        if abs {
+            fr.pos = skip;
+            self.jump_root(&cur, w.f)?;
+            cur = self.root()?.clone();
         }
-        // `rest` is empty or starts at a slash: the walk goes on through it
-        path.extend_from_slice(rest);
-        self.walk(Start::path(dir), &path, f, depth + 1)
-    }
-
-    /// Go on from a magic link's object `p` with what followed the link:
-    /// a component after a non-directory is ENOTDIR, as is a trailing
-    /// slash
-    fn walk_on(
-        &self,
-        p: Path,
-        rest: &[u8],
-        mut f: LookupFlags,
-        depth: usize,
-    ) -> Result<Path, KernelError> {
-        let from = rest.iter().position(|&c| c != b'/').unwrap_or(rest.len());
-        if from == rest.len() && !rest.is_empty() {
-            f.directory = true;
+        if !fr.rest().is_empty() {
+            w.stack.push(fr)?;
         }
-        self.walk(Start::path(&p), &rest[from..], f, depth + 1)
+        Ok(cur)
     }
 
     /// Walk all but the last component of `path` from `start` (Linux
@@ -841,7 +898,7 @@ impl<'a> Nd<'a> {
                 follow: false,
                 ..f.resolve()
             };
-            let found = match self.walk(Start::path(&dir), &p.name, nofollow, 0) {
+            let found = match self.walk(Start::path(&dir), &p.name, nofollow) {
                 Ok(f) => f,
                 Err(KernelError::NotFound) => return Ok(CreateAt::Name(p)),
                 Err(e) => return Err(e),
