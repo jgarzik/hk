@@ -595,7 +595,7 @@ mod tests {
             state: TaskState::Sleeping,
             traced: false,
             stopped: false,
-            cred: Cred::ROOT,
+            cred: Cred::root(),
 
             kthread: false,
             exiting: false,

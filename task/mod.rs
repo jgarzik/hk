@@ -190,6 +190,48 @@ pub struct Cred {
     /// reference, pointed at a new uid's by `set_cred_ucounts` before a
     /// uid change is committed
     pub ucounts: UcountsRef,
+    /// Its deferred release once a task stops publishing it (Linux
+    /// cred->rcu, put_cred_rcu): [`TaskCred`]'s retired references
+    /// go through `put_rcu`
+    pub rcu: CredRcu,
+}
+
+/// A [`Cred`]'s `RcuPuts`: a copy gets a fresh one, and it takes no
+/// part in comparison or printing
+#[derive(Default)]
+pub struct CredRcu(crate::sync::rcu::RcuPuts);
+
+impl CredRcu {
+    pub const fn new() -> Self {
+        Self(crate::sync::rcu::RcuPuts::new())
+    }
+}
+
+impl Clone for CredRcu {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for CredRcu {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CredRcu {}
+
+impl core::fmt::Debug for CredRcu {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CredRcu")
+    }
+}
+
+// SAFETY: a field of Cred named for this use only (CredRcu.0)
+unsafe impl crate::sync::rcu::HasRcuPuts for Cred {
+    fn rcu_puts(&self) -> &crate::sync::rcu::RcuPuts {
+        &self.rcu.0
+    }
 }
 
 /// Supplementary group list (Linux struct group_info): sorted and
@@ -225,44 +267,50 @@ impl GroupInfo {
 
 impl Cred {
     /// Root credentials (uid=0, gid=0, full capabilities)
-    pub const ROOT: Self = Self {
-        uid: 0,
-        gid: 0,
-        suid: 0,
-        sgid: 0,
-        euid: 0,
-        egid: 0,
-        fsuid: 0,
-        fsgid: 0,
-        cap_inheritable: CAP_FULL_SET,
-        cap_permitted: CAP_FULL_SET,
-        cap_effective: CAP_FULL_SET,
-        cap_bset: CAP_FULL_SET,
-        cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
-        groups: GroupInfo::EMPTY,
-        ucounts: UcountsRef::INIT,
-    };
+    pub const fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            suid: 0,
+            sgid: 0,
+            euid: 0,
+            egid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            cap_inheritable: CAP_FULL_SET,
+            cap_permitted: CAP_FULL_SET,
+            cap_effective: CAP_FULL_SET,
+            cap_bset: CAP_FULL_SET,
+            cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
+            groups: GroupInfo::EMPTY,
+            ucounts: UcountsRef::INIT,
+            rcu: CredRcu::new(),
+        }
+    }
 
     /// No privileges at all (overflow uid/gid 65534, no capabilities,
     /// empty bounding set): what a context without a task gets, so a
     /// missing task never runs privileged
-    pub const NOBODY: Self = Self {
-        uid: 65534,
-        gid: 65534,
-        suid: 65534,
-        sgid: 65534,
-        euid: 65534,
-        egid: 65534,
-        fsuid: 65534,
-        fsgid: 65534,
-        cap_inheritable: CAP_EMPTY_SET,
-        cap_permitted: CAP_EMPTY_SET,
-        cap_effective: CAP_EMPTY_SET,
-        cap_bset: CAP_EMPTY_SET,
-        cap_ambient: CAP_EMPTY_SET,
-        groups: GroupInfo::EMPTY,
-        ucounts: UcountsRef::INIT,
-    };
+    pub const fn nobody() -> Self {
+        Self {
+            uid: 65534,
+            gid: 65534,
+            suid: 65534,
+            sgid: 65534,
+            euid: 65534,
+            egid: 65534,
+            fsuid: 65534,
+            fsgid: 65534,
+            cap_inheritable: CAP_EMPTY_SET,
+            cap_permitted: CAP_EMPTY_SET,
+            cap_effective: CAP_EMPTY_SET,
+            cap_bset: CAP_EMPTY_SET,
+            cap_ambient: CAP_EMPTY_SET,
+            groups: GroupInfo::EMPTY,
+            ucounts: UcountsRef::INIT,
+            rcu: CredRcu::new(),
+        }
+    }
 
     /// Create credentials for a specific user/group
     ///
@@ -294,6 +342,7 @@ impl Cred {
             cap_ambient: CAP_EMPTY_SET,
             groups: GroupInfo::EMPTY,
             ucounts: UcountsRef::INIT,
+            rcu: CredRcu::new(),
         }
     }
 
@@ -307,7 +356,7 @@ impl Cred {
 
 impl Default for Cred {
     fn default() -> Self {
-        Self::ROOT
+        Self::root()
     }
 }
 
@@ -1268,11 +1317,21 @@ impl<T> OwnCell<T> {
 }
 
 /// The credentials of the boot task (no allocation)
-static INIT_CRED: Cred = Cred::ROOT;
+static INIT_CRED: Cred = Cred::root();
 
-/// A task's credentials pointer: an `Arc<Cred>` turned raw, or the boot
-/// task's static `INIT_CRED`; the rules of [`OwnCell`] with TASKLIST
-/// in place of `alloc_lock`
+/// A task's credentials pointer (Linux task->real_cred / cred, `__rcu`):
+/// an `Arc<Cred>` turned raw, or the boot task's static `INIT_CRED`.
+/// Only the task itself replaces it (or its creator before it first
+/// runs: Linux commit_creds' rcu_assign_pointer), publishing with
+/// Release; the replaced reference is dropped a grace period later
+/// (`put_rcu`, Linux put_cred_rcu), so a reader under an RCU read
+/// guard (Linux __task_cred) or the task itself (current_cred) reads
+/// a live set.
+///
+/// # Invariants
+/// The pointer is `INIT_CRED` or an `Arc::into_raw` whose count the
+/// cell holds; a replaced one is handed to `put_rcu`, never dropped at
+/// once.
 struct TaskCred(AtomicPtr<Cred>);
 
 impl TaskCred {
@@ -1288,42 +1347,60 @@ impl TaskCred {
         core::ptr::eq(p, &raw const INIT_CRED)
     }
 
-    /// # Safety
-    /// The caller is the task itself, or holds TASKLIST.
-    unsafe fn get(&self) -> Cred {
-        // SAFETY: the pointer is live (see above)
-        unsafe { (*self.0.load(Ordering::Acquire)).clone() }
+    /// The credentials, valid while `g` is held (Linux __task_cred:
+    /// rcu_dereference)
+    fn read<'a>(&'a self, _g: &'a crate::sync::rcu::RcuReadGuard) -> &'a Cred {
+        // SAFETY: a version published here stays allocated a grace
+        // period after it is replaced (type invariant: put_rcu), so
+        // until `_g` drops; the cell itself (borrowed for 'a) holds the
+        // current one
+        unsafe { &*self.0.load(Ordering::Acquire) }
     }
 
+    /// The credentials, read by the task itself (Linux current_cred:
+    /// rcu_dereference_protected, no reader lock)
+    ///
     /// # Safety
-    /// As [`TaskCred::get`].
-    unsafe fn ucounts(&self) -> UcountsRef {
-        // SAFETY: the pointer is live (see above)
-        unsafe { (*self.0.load(Ordering::Acquire)).ucounts.clone() }
+    /// The caller is the task itself (the only writer), and drops the
+    /// borrow before it replaces them.
+    unsafe fn own(&self) -> &Cred {
+        // SAFETY: no one else replaces the version loaded (see above)
+        unsafe { &*self.0.load(Ordering::Relaxed) }
     }
 
-    /// # Safety
-    /// As [`TaskCred::get`].
-    unsafe fn arc(&self) -> Arc<Cred> {
-        let p = self.0.load(Ordering::Acquire);
+    /// A reference to the credentials (Linux get_task_cred)
+    fn arc(&self) -> Arc<Cred> {
+        let g = crate::sync::rcu::read_lock();
+        let p = core::ptr::from_ref(self.read(&g));
         if Self::is_static(p) {
             // The boot task's static set: no caller can fail here
             return arc_nofail(INIT_CRED.clone());
         }
-        // SAFETY: `p` came from Arc::into_raw and holds a count
+        // SAFETY: `p` came from Arc::into_raw and is live under `g`
+        // with a count held (the cell's, or one put_rcu drops after
+        // `g`), so the count is nonzero
         unsafe {
             Arc::increment_strong_count(p);
             Arc::from_raw(p)
         }
     }
 
+    /// Publish `new` (Linux commit_creds' rcu_assign_pointer); the old
+    /// reference goes through `put_rcu`
+    ///
     /// # Safety
-    /// TASKLIST is held, and the caller is the task itself or it has
-    /// not run yet.
-    unsafe fn replace(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+    /// The caller is the task itself, or the task has not run yet.
+    unsafe fn replace(&self, new: Arc<Cred>) {
         let old = self.0.swap(Arc::into_raw(new).cast_mut(), Ordering::AcqRel);
-        // SAFETY: from Arc::into_raw unless static
-        (!Self::is_static(old)).then(|| unsafe { Arc::from_raw(old) })
+        if Self::is_static(old) {
+            return;
+        }
+        // SAFETY: from Arc::into_raw, the cell's count (invariant)
+        let old = unsafe { Arc::from_raw(old) };
+        // At the start of boot no other CPU runs a reader
+        if crate::sync::rcu::can_queue() {
+            crate::sync::rcu::put_rcu(old);
+        }
     }
 }
 
@@ -1884,31 +1961,27 @@ impl Task {
         self.seccomp_mode.load(Ordering::Relaxed)
     }
 
-    /// The task's credentials, copied
-    ///
-    /// # Safety
-    /// The caller is the task itself, or holds TASKLIST.
-    pub unsafe fn cred(&self) -> Cred {
-        // SAFETY: see above
-        unsafe { self.cred.get() }
+    /// The task's credentials, valid while `g` is held (Linux
+    /// __task_cred under rcu_read_lock)
+    pub fn cred_rcu<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> &'a Cred {
+        self.cred.read(g)
+    }
+
+    /// The task's credentials, copied (under an RCU read guard)
+    pub fn cred(&self) -> Cred {
+        self.cred_rcu(&crate::sync::rcu::read_lock()).clone()
     }
 
     /// A reference to its real uid's counters (Linux task_ucounts)
-    ///
-    /// # Safety
-    /// As [`Task::cred`].
-    pub unsafe fn ucounts(&self) -> UcountsRef {
-        // SAFETY: see above
-        unsafe { self.cred.ucounts() }
+    pub fn ucounts(&self) -> UcountsRef {
+        self.cred_rcu(&crate::sync::rcu::read_lock())
+            .ucounts
+            .clone()
     }
 
-    /// A reference to the task's credentials
-    ///
-    /// # Safety
-    /// As [`Task::cred`].
-    pub unsafe fn cred_arc(&self) -> Arc<Cred> {
-        // SAFETY: see above
-        unsafe { self.cred.arc() }
+    /// A reference to the task's credentials (Linux get_task_cred)
+    pub fn cred_arc(&self) -> Arc<Cred> {
+        self.cred.arc()
     }
 
     /// The credentials its own checks use: an override in force, else
@@ -1920,8 +1993,7 @@ impl Task {
         // SAFETY: the task itself (see above)
         match unsafe { self.cred_override.arc() } {
             Some(c) => c,
-            // SAFETY: as above
-            None => unsafe { self.cred.arc() },
+            None => self.cred.arc(),
         }
     }
 
@@ -1933,8 +2005,8 @@ impl Task {
         // SAFETY: the task itself (see above)
         match unsafe { self.cred_override.arc() } {
             Some(c) => (*c).clone(),
-            // SAFETY: as above
-            None => unsafe { self.cred.get() },
+            // SAFETY: the task itself, borrowed only for the copy
+            None => unsafe { self.cred.own() }.clone(),
         }
     }
 
@@ -1946,13 +2018,12 @@ impl Task {
         }
     }
 
-    /// Install new credentials, returning the old ones (dropped by the
-    /// caller after TASKLIST)
+    /// Install new credentials (Linux commit_creds' rcu_assign_pointer):
+    /// the old reference is dropped a grace period later (put_cred_rcu)
     ///
     /// # Safety
-    /// The caller holds TASKLIST and is the task itself, or the task
-    /// has not run yet.
-    pub unsafe fn set_cred(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+    /// The caller is the task itself, or the task has not run yet.
+    pub unsafe fn set_cred(&self, new: Arc<Cred>) {
         // SAFETY: see above
         unsafe { self.cred.replace(new) }
     }

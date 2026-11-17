@@ -3039,18 +3039,15 @@ fn traced_signal(
 
 /// `sig` as the tracer of `t` gives it: SI_USER from the tracer's
 /// thread and uid (Linux ptrace_signal: task_pid_vnr(current->parent)
-/// and task_uid under rcu_read_lock; TASKLIST read here for the uid,
-/// another task's credentials)
+/// and task_uid under rcu_read_lock)
 fn tracer_info(t: &Task, sig: Signal) -> SigInfo {
     let (pid, uid) = {
-        let table = TASKLIST.read();
-        let tr = table.view(t).and_then(|v| v.tracer());
         let g = crate::sync::rcu::read_lock();
-        let pid = tr.map_or(0, |tr| tr.pid_nr_ns(t.pid_ns(), &g));
-        let uid = tr.and_then(|tr| table.view(tr)).map(|v| v.cred_arc().uid);
-        (pid, uid)
+        t.tracer(&g).map_or((0, 0), |tr| {
+            (tr.pid_nr_ns(t.pid_ns(), &g), tr.cred_rcu(&g).uid)
+        })
     };
-    SigInfo::kill(sig, si_code::SI_USER, pid as i32, uid.unwrap_or(0))
+    SigInfo::kill(sig, si_code::SI_USER, pid as i32, uid)
 }
 
 /// Signal work on the way back to user mode (Linux

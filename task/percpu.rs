@@ -733,27 +733,24 @@ unsafe fn view_mut<'a>(table: &'a GlobalTaskTable, task: &'a Task) -> TaskViewMu
     TaskViewMut { task, inner, table }
 }
 
-/// Credentials of a task, read under TASKLIST (the views borrow it)
+/// Credentials of a listed task (read under RCU: `Task::cred`)
 macro_rules! owner_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
             /// Its credentials, copied
             pub fn cred(&self) -> Cred {
-                // SAFETY: TASKLIST is held (the view borrows it)
-                unsafe { self.task.cred() }
+                self.task.cred()
             }
 
             /// A reference to its credentials
             pub fn cred_arc(&self) -> Arc<Cred> {
-                // SAFETY: as above
-                unsafe { self.task.cred_arc() }
+                self.task.cred_arc()
             }
 
             /// A reference to its real uid's counters (Linux
             /// task_ucounts)
             pub fn ucounts(&self) -> crate::task::UcountsRef {
-                // SAFETY: as above
-                unsafe { self.task.ucounts() }
+                self.task.ucounts()
             }
         }
     };
@@ -839,14 +836,6 @@ impl TaskViewMut<'_> {
         self.task
             .ptracer
             .set(p.map_or(core::ptr::null(), core::ptr::from_ref));
-    }
-
-    /// Install credentials; the old ones go after TASKLIST. Only the
-    /// task itself (commit_creds), or its creator before it runs.
-    pub fn set_cred(&mut self, c: Arc<Cred>) -> Option<Arc<Cred>> {
-        // SAFETY: TASKLIST held mutably; callers are the owner or the
-        // creator (see above)
-        unsafe { self.task.set_cred(c) }
     }
 }
 
@@ -1669,7 +1658,7 @@ fn create_kernel_task(
     let tid = thread_pid.as_ref().map_or(0, |p| Tid::from(p.nr()));
     let pid = tid;
 
-    let cred = try_arc(Cred::ROOT)?;
+    let cred = try_arc(Cred::root())?;
     let sig = crate::signal::TaskSignalState::new();
     let stack = crate::mm::vmstack::alloc().ok_or(KernelError::OutOfMemory)?;
     let stack_top = stack.top();
@@ -1879,7 +1868,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
         config.kstack_top,
         cpu_id,
         &crate::util::cpumask::CpuSet::all(),
-        arc_nofail(Cred::ROOT),
+        arc_nofail(Cred::root()),
         Some(mm),
         // comm after the init binary, /bin/init (Linux names init after
         // the file it execs)
@@ -5270,10 +5259,9 @@ pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
     Ok(caller_pid)
 }
 
-/// Implementation of commit_creds - updates both per-CPU cache and TASKLIST
-///
-/// Like Linux's commit_creds() - atomically updates both storage locations
-/// so context switch will restore the correct credentials.
+/// commit_creds' switch (Linux kernel/cred.c commit_creds): the new set
+/// is published under no lock (rcu_assign_pointer), the old one dropped
+/// a grace period later (put_cred_rcu); others read it under RCU
 pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     let me = current();
     if me.tid() == 0 {
@@ -5281,8 +5269,7 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     }
     // Its own credentials, not an override in force (Linux commit_creds
     // replaces real_cred and cred together)
-    // SAFETY: the task itself
-    let old = unsafe { Task::cred(&me) };
+    let old = Task::cred(&me);
 
     // Changing euid/egid/fsuid/fsgid makes the task non-dumpable
     // (suid_dumpable, default 0), so a less-privileged identity can't ptrace
@@ -5294,27 +5281,23 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
         || old.fsuid != new.fsuid
         || old.fsgid != new.fsgid
         || gains_caps;
-
-    // Under TASKLIST: other tasks read our credentials under it; the
-    // old ones are freed after it (only memory)
-    let old = {
-        let mut table = TASKLIST.write();
-        table.view_mut(&me).and_then(|mut t| {
-            // SAFETY: the task itself
-            if ids_changed && let Some(mm) = unsafe { me.task.mm() } {
-                // On the mm: every thread sharing it (Linux set_dumpable(
-                // task->mm))
-                mm.set_dumpable(crate::task::dumpable::SUID_DUMP_DISABLE);
-            }
-            // Its parent no longer signals it at death (Linux
-            // commit_creds)
-            if ids_changed {
-                t.pdeath_signal = None;
-            }
-            t.set_cred(new)
-        })
-    };
     drop(old);
+    if ids_changed {
+        // SAFETY: the task itself
+        if let Some(mm) = unsafe { me.task.mm() } {
+            // On the mm: every thread sharing it (Linux set_dumpable(
+            // task->mm))
+            mm.set_dumpable(crate::task::dumpable::SUID_DUMP_DISABLE);
+        }
+        // Its parent no longer signals it at death (Linux commit_creds:
+        // pdeath_signal = 0 before the new set is published); a
+        // TaskInner field, written under TASKLIST
+        if let Some(mut t) = TASKLIST.write().view_mut(&me) {
+            t.pdeath_signal = None;
+        }
+    }
+    // SAFETY: the task itself
+    unsafe { me.task.set_cred(new) };
 }
 
 /// Task `t` (the caller itself) moves to user namespace `new` (Linux

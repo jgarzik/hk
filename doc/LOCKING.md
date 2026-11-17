@@ -1300,7 +1300,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 |----------|------|---------|
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: an intrusive `ArcList` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, found by tid through the pid hash (`Pid.task`, an `RcuPtr` set and cleared under the write lock, read under it or an RCU read guard) |
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
-| `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
+| `Task.cred` | `Arc<Cred>` (raw, `TaskCred`) | Credentials (Linux real_cred/cred, `__rcu`): replaced only by the task, published with Release, the old reference dropped a grace period later (`put_rcu`); read by the task lock-free, by others under an RCU read guard (Credential Handling) |
 | `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
 | `Task.real_parent` | `RcuPtr<Task>` | The real parent, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
 | `Task.ptracer` | `RcuPtr<Task>` | The tracer while traced, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
@@ -1387,11 +1387,14 @@ thread timer's settime and sample, Linux posix_cpu_clock_get,
 cpu_timer_task_rcu) and a timer's SIGEV_THREAD_ID check
 (good_sigevent) find the task so, F_SETOWN takes any hashed pid
 (f_setown: find_vpid) and F_GETOWN tests a thread or process owner's
-task the same way. What they then read of another task's
-`TaskInner` (credentials for a permission check, its signal handlers,
-its group's threads) is still under TASKLIST's read lock, so kill,
-tkill, tgkill, rt_sigqueueinfo, F_GETOWN of a group and a timer's
-signal find the task in that hold (BUGS.md); Linux takes
+task the same way. A permission check reads the target's credentials
+in the same guard or after it (`Task::cred_rcu`, Linux __task_cred):
+tkill and tgkill find and check their thread under RCU (Linux
+do_send_specific), as do prlimit and the sched_* / setpriority /
+ioprio targets. What a send then reads of another task's `TaskInner`
+(its signal handlers, its group's threads) is still under TASKLIST's
+read lock, so kill, rt_sigqueueinfo, every send, F_GETOWN of a group
+and a timer's signal find the task in that hold (BUGS.md); Linux takes
 tasklist_lock for these too only where it walks a group or a parent
 link (__kill_pgrp_info, send_sigio to a group, setpgid, ptrace
 attach and checks, wait, the PRIO_PGRP / IOPRIO_WHO_PGRP walks), as
@@ -1441,8 +1444,8 @@ TASKLIST (`Task::tracer_locked`, the views' `tracer`/`traced_by`) or
 under an RCU read guard (`Task::tracer`, Linux pid_alive(p) ?
 ptrace_parent(p): /proc status TracerPid, numbered through the
 tracer's thread pid, `Task::pid_nr_ns`); ptrace_signal's SI_USER
-info reads it, the tracer's thread number and uid under TASKLIST
-(another task's credentials, BUGS.md). `real_parent` (`Task.real_parent`, an
+info reads it, the tracer's thread number and uid under one RCU
+read guard (Linux ptrace_signal). `real_parent` (`Task.real_parent`, an
 `RcuPtr`, Linux real_parent) holds no reference: it is set, under the
 write lock, only to a listed task (fork, `adopt`, exec's leader
 change keeps the old leader's), and a task's children are handed on
@@ -1596,7 +1599,7 @@ mm or the new with the new (Linux exec_mmap, __set_task_comm). Order:
 TASKLIST (and PIDMAP_LOCK) before alloc_lock, alloc_lock before
 `Task.sig`; nothing else is taken under it (no TASKLIST, no `Files`,
 no sleeping lock). `cred` keeps its own scheme (Linux RCU): lock-free
-for the task, TASKLIST for others.
+for the task, an RCU read guard for others.
 
 #### Locking Rules
 
@@ -1609,9 +1612,7 @@ for the task, TASKLIST for others.
    `Task` under TASKLIST) are `take()`n or `replace()`d under the lock
    and dropped after it: their last reference can close sockets (TCP
    release may sleep in SO_LINGER: sleeping under a spin lock) or tear
-   down a network namespace (RTNL, a sleeping lock). `Arc<Cred>` is the
-   exception: replacing it under the lock (commit_creds) frees only
-   memory and at most takes the `UCOUNTS` leaf. A reaped task's list
+   down a network namespace (RTNL, a sleeping lock). A reaped task's list
    reference and a replaced group or session `Pid` reference are
    queued under the lock (`kfree_rcu`, `put_rcu`: no release there)
    and dropped in `rcuc/N` a grace period later (task lifetime).
@@ -1627,10 +1628,18 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
 1. **Reference-counted** - `Task.cred` holds an `Arc<Cred>` (as a raw
    pointer; the boot task points at a static root `Cred`)
 2. **Copy-on-write** - modifications use prepare/commit
-3. **Owner rule** - the task reads its own credentials lock-free
-   (`current().cred()`, Linux current_cred); other tasks read them under
-   TASKLIST; only the task itself replaces them (`commit_creds`, under
-   TASKLIST), so a lock-free owner read never races a writer
+3. **Owner rule, RCU** - only the task itself replaces its
+   credentials (`commit_creds`, or its creator before it first runs),
+   under no lock: the new set is published with Release (Linux
+   rcu_assign_pointer) and the old reference handed to `put_rcu` on
+   the `Cred`'s `RcuPuts` (`Cred.rcu`; Linux put_cred_rcu: a set
+   shared by threads may be retired by several within one grace
+   period), dropped in `rcuc/N` (only memory and the `UCOUNTS` leaf).
+   The task reads its own lock-free (`current().cred()`, Linux
+   current_cred); others read them under an RCU read guard
+   (`Task::cred_rcu`, Linux __task_cred; `Task::cred`, `cred_arc` and
+   `ucounts` copy or count them under one: get_task_cred), whether
+   they hold TASKLIST or not
 4. **Override** - `Task.cred_override` (Linux task->cred apart from
    real_cred) is touched by the task alone, no lock: `override_creds`
    installs an `Arc<Cred>` its own checks use (`current().cred()`)
@@ -1649,7 +1658,7 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
    (info->ucounts) and an io_uring ring
    and its registered buffers (Linux ctx->user) hold their own
    reference, taken from the receiver's or creator's credentials (a
-   task's under TASKLIST or by itself, `task_ucounts`). Root's is the
+   task's under RCU or by itself, `task_ucounts`). Root's is the
    static `INIT_UCOUNTS` (Linux init_ucounts). `UCOUNTS` (IrqSpinlock
    leaf, Linux ucounts_lock: a last reference may go in any context)
    is the table by uid of weak references: `alloc_ucounts` looks up,
@@ -1661,9 +1670,10 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
 
 **Credential APIs (like Linux):**
 - `prepare_creds()` - Clone current credentials, return mutable copy
-- `commit_creds(new)` - swap `Task.cred` under TASKLIST; the old
-  `Arc<Cred>` is dropped after the lock (frees memory and may drop a
-  last `Ucounts` reference: `UCOUNTS`, a leaf)
+- `commit_creds(new)` - publish `Task.cred` under no lock (clearing
+  the dumpable bit on the mm and, under TASKLIST's write lock, the
+  `pdeath_signal` first when the ids change); the old `Arc<Cred>` goes
+  through `put_rcu`
 - `copy_creds(flags, parent)` - For fork/clone: share Arc (CLONE_THREAD) or deep copy
 
 #### Exec vs. Credential Checks (Linux cred_guard_mutex, exec_update_lock)
@@ -1727,7 +1737,7 @@ boot task `INIT_TASK` (Linux init_task: tid 0, root, never in
 TASKLIST), so current is never missing. Read lock-free through it:
 `tid`, `pid`, the hot atomics (`seccomp_mode`,
 `flags`, `thread_flags`, accounting, `tls`), `cred` (others read it
-under TASKLIST) and the alloc_lock fields but `io_context` (Linux
+under RCU) and the alloc_lock fields but `io_context` (Linux
 current->mm/files/fs/nsproxy/comm: only the task itself changes them,
 or its creator before it first runs, under its alloc_lock; other tasks
 read them under it). The current task's users call `current().mm()`,
@@ -1751,12 +1761,11 @@ from `Task.se`.
 | `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.jobctl` (group stop state), `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
 | RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
-| RCU (`cred`) | Credentials | lock-free for the task, TASKLIST for others |
+| RCU (`cred`, put_cred_rcu) | Credentials | `Task.cred` (`TaskCred`): lock-free for the task, an RCU read guard for others, the old set through `put_rcu` |
 
 Remaining differences: the `task_struct` fields Linux leaves to the
 task itself or to siglock (scheduling policy, prctl state, robust
-list, seccomp filter) are `TaskInner` fields under TASKLIST, and
-`cred` has no RCU (TASKLIST stands in for it).
+list, seccomp filter) are `TaskInner` fields under TASKLIST.
 
 ### 3.1.3 Task State Invariants
 

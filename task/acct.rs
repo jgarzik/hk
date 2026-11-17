@@ -417,8 +417,7 @@ fn get_task_info(t: &Task) -> TaskInfo {
     // Its name (NUL-terminated, Linux get_task_comm)
     let comm = t.task_lock().comm();
 
-    // SAFETY: TASKLIST is held
-    let cred = unsafe { t.cred() };
+    let cred = t.cred();
     let (uid, gid) = (cred.uid, cred.gid);
 
     // Calculate elapsed time using t.start_time (monotonic ns since boot)

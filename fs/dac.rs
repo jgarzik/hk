@@ -654,7 +654,7 @@ mod tests {
         let a = access_cred(&c);
         assert_eq!((a.fsuid, a.fsgid), (1000, 1000));
         assert!(!a.cap_effective.has(CAP_DAC_OVERRIDE));
-        let r = access_cred(&Cred::ROOT);
+        let r = access_cred(&Cred::root());
         assert!(r.cap_effective.has(CAP_DAC_OVERRIDE));
     }
 }

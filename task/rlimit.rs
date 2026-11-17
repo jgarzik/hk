@@ -302,13 +302,13 @@ fn check_prlimit_permission(target: &Task) -> KernelResult<()> {
         return Ok(());
     }
     let me = current_cred();
-    let t = crate::task::percpu::TASKLIST
-        .read()
-        .view(target)
-        .map(|t| t.cred())
-        .ok_or(KernelError::NoProcess)?;
-    let id_match = [t.uid, t.euid, t.suid].iter().all(|&u| u == me.uid)
-        && [t.gid, t.egid, t.sgid].iter().all(|&g| g == me.gid);
+    // __task_cred under rcu_read_lock (Linux)
+    let id_match = {
+        let g = crate::sync::rcu::read_lock();
+        let t = target.cred_rcu(&g);
+        [t.uid, t.euid, t.suid].iter().all(|&u| u == me.uid)
+            && [t.gid, t.egid, t.sgid].iter().all(|&g| g == me.gid)
+    };
     if !id_match && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
         return Err(KernelError::NotPermitted);
     }

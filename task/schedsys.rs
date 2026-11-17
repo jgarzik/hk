@@ -125,11 +125,13 @@ fn set_one_prio(
     let Some(cur_nice) = super::percpu::lookup_task_nice(t) else {
         return error;
     };
-    let target = super::percpu::TASKLIST.read().view(t).map(|v| v.cred());
-    let Some(c) = target else {
-        return error;
+    // Linux set_one_prio: __task_cred under rcu_read_lock
+    let owner = {
+        let g = crate::sync::rcu::read_lock();
+        let c = t.cred_rcu(&g);
+        c.uid == caller_euid || c.euid == caller_euid
     };
-    if c.uid != caller_euid && c.euid != caller_euid && !capable(CAP_SYS_NICE) {
+    if !owner && !capable(CAP_SYS_NICE) {
         return Err(KernelError::NotPermitted);
     }
     // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
@@ -286,23 +288,18 @@ fn check_setscheduler(
     }
     let reset = policy & SCHED_RESET_ON_FORK != 0;
     let policy = policy & !SCHED_RESET_ON_FORK;
-    // One snapshot of the task (Linux reads p's fields under its locks)
-    let snap = super::percpu::TASKLIST.read().view(t).map(|v| {
-        let se = &v.task.se;
-        // One setting of the parameters (one load)
-        let p = se.params();
-        (
-            v.cred(),
-            p.policy(),
-            se.reset_on_fork(),
-            i32::from(p.rt_priority()),
-            p.nice(),
-        )
-    });
-    let Some((c, cur, cur_reset, cur_prio, nice)) = snap else {
-        return Err(KernelError::NoProcess);
+    // One setting of the parameters (one load)
+    let se = &t.se;
+    let p = se.params();
+    let (cur, cur_reset) = (p.policy(), se.reset_on_fork());
+    let (cur_prio, nice) = (i32::from(p.rt_priority()), p.nice());
+    // Linux check_same_owner: __task_cred under rcu_read_lock
+    let owner = {
+        let g = crate::sync::rcu::read_lock();
+        let c = t.cred_rcu(&g);
+        c.uid == euid || c.euid == euid
     };
-    if c.uid != euid && c.euid != euid {
+    if !owner {
         return Err(KernelError::NotPermitted);
     }
     if cur_reset && !reset {
@@ -528,12 +525,12 @@ pub fn sys_sched_setaffinity(pid: i64, cpusetsize: u64, mask_ptr: UserPtr<u8>) -
     // Linux sched_setaffinity: the caller's own tasks (check_same_owner:
     // its euid is their uid or euid) or CAP_SYS_NICE
     let euid = super::percpu::current_cred().euid;
-    let owner = super::percpu::TASKLIST
-        .read()
-        .view(&t)
-        .map(|t| t.cred())
-        .map(|c| c.uid == euid || c.euid == euid);
-    if !owner.ok_or(KernelError::NoProcess)? && !super::capable(super::CAP_SYS_NICE) {
+    let owner = {
+        let g = crate::sync::rcu::read_lock();
+        let c = t.cred_rcu(&g);
+        c.uid == euid || c.euid == euid
+    };
+    if !owner && !super::capable(super::CAP_SYS_NICE) {
         return Err(KernelError::NotPermitted);
     }
 
@@ -620,11 +617,10 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
             let tid =
                 super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
             let t = super::percpu::find_task(tid).ok_or(KernelError::NoProcess)?;
-            match ioprio_owner_ok(&t) {
-                None => Err(KernelError::NoProcess),
-                Some(false) => Err(KernelError::NotPermitted),
-                Some(true) => super::set_task_ioprio(&t, ioprio),
+            if !ioprio_owner_ok(&t) {
+                return Err(KernelError::NotPermitted);
             }
+            super::set_task_ioprio(&t, ioprio)
         }
         IOPRIO_WHO_PGRP => {
             // Set ioprio for all processes in a process group
@@ -636,11 +632,13 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
             // it); ESRCH if none was left
             let mut found = false;
             for t in &super::percpu::pgrp_tasks(pgid) {
-                match ioprio_owner_ok(t) {
-                    None => continue,
-                    Some(false) => return Err(KernelError::NotPermitted),
-                    Some(true) => super::set_task_ioprio(t, ioprio)?,
+                if super::percpu::TASKLIST.read().view(t).is_none() {
+                    continue;
                 }
+                if !ioprio_owner_ok(t) {
+                    return Err(KernelError::NotPermitted);
+                }
+                super::set_task_ioprio(t, ioprio)?;
                 found = true;
             }
             if found {
@@ -660,14 +658,15 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
 
 /// May the caller change task `t`'s I/O priority (Linux
 /// set_task_ioprio): its uid is the caller's euid or uid, or the caller
-/// has CAP_SYS_NICE; None once `t` is reaped
-fn ioprio_owner_ok(t: &Task) -> Option<bool> {
+/// has CAP_SYS_NICE; its credentials read under RCU (__task_cred)
+fn ioprio_owner_ok(t: &Task) -> bool {
     let me = super::percpu::current_cred();
-    let ok = super::percpu::TASKLIST
-        .read()
-        .view(t)
-        .map(|t| t.cred().uid == me.euid || t.cred().uid == me.uid)?;
-    Some(ok || super::capable(super::CAP_SYS_NICE))
+    let ok = {
+        let g = crate::sync::rcu::read_lock();
+        let tc = t.cred_rcu(&g);
+        tc.uid == me.euid || tc.uid == me.uid
+    };
+    ok || super::capable(super::CAP_SYS_NICE)
 }
 
 /// sys_ioprio_get - get I/O scheduling class and priority
