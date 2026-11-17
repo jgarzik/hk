@@ -8,6 +8,12 @@
 //!   (Linux fat_subdirs, counting "." and ".."; the root's + 2), kept by
 //!   mkdir, rmdir and a rename across directories, and the same when
 //!   read again after a remount.
+//! - VFAT_TIMES: FAT's times (Linux fs/fat/misc.c): the root's are 0;
+//!   a new file's mtime is now in 2 s steps with ctime the same and its
+//!   atime the day; utimensat truncates the same way (ctime follows
+//!   mtime); a rename keeps the moved file's times; all of it reads the
+//!   same after a remount, and a time_offset=60 mount shows the stored
+//!   local times an hour earlier
 //! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
 //!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
 //!   and on hk its cluster stays allocated. Linux frees it: the refused
@@ -19,8 +25,9 @@ use crate::harness::T;
 use crate::helpers::{find_blkdev, host_mode};
 use crate::proc::sysfs::each_entry;
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount, sys_open,
-    sys_pread64, sys_pwrite64, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink,
+    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, Timespec, sys_clock_gettime, sys_close, sys_mkdir,
+    sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_rename, sys_rmdir, sys_stat, sys_umount2,
+    sys_unlink, sys_utimensat, sys_write,
 };
 
 const MNT: &[u8] = b"/tmp/vdk\0";
@@ -154,6 +161,7 @@ pub fn run_tests() {
     }
     dotdot(&mut t, dev);
     nlink(dev);
+    times(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -318,5 +326,103 @@ fn bad_dir(dev: &[u8]) {
     t.ok(b"restore", poke(dev, off, &saved), 0);
     t.eq(b"mount restored", mount(dev), 0);
     t.eq(b"rmdir", sys_rmdir(bad.as_ptr()), 0);
+    t.done();
+}
+
+/// (atime, mtime, ctime) of `p` as (seconds, nanoseconds)
+fn stimes(p: &[u8]) -> [(i64, i64); 3] {
+    let mut st = Stat::default();
+    sys_stat(p.as_ptr(), &mut st);
+    [
+        (st.st_atime, st.st_atime_nsec as i64),
+        (st.st_mtime, st.st_mtime_nsec as i64),
+        (st.st_ctime, st.st_ctime_nsec as i64),
+    ]
+}
+
+/// Mount the vfat of `dev` on MNT with options `opts`
+fn mount_with(dev: &[u8], opts: &[u8]) -> i64 {
+    sys_mount(
+        dev.as_ptr(),
+        MNT.as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        opts.as_ptr() as u64,
+    )
+}
+
+/// VFAT_TIMES on TD/F, renamed TD/G
+fn times(dev: &[u8]) {
+    const DAY: i64 = 86_400;
+    let mut t = T::new(b"VFAT_TIMES");
+    let (d, f, g) = (b"/tmp/vdk/TD\0", b"/tmp/vdk/TD/F\0", b"/tmp/vdk/TD/G\0");
+    let root = stimes(MNT);
+    t.ok(b"root times 0", root == [(0, 0); 3], root[1].0);
+    t.eq(b"mkdir", sys_mkdir(d.as_ptr(), 0o755), 0);
+    let mut now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(0, &mut now);
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    if fd >= 0 {
+        sys_write(fd as u64, b"x".as_ptr(), 1);
+        sys_close(fd as u64);
+    }
+    let [a, m, c] = stimes(f);
+    t.ok(b"mtime 2 s", m.0 % 2 == 0 && m.1 == 0, m.1);
+    t.ok(
+        b"mtime now",
+        (m.0 - now.tv_sec).abs() <= 3,
+        m.0 - now.tv_sec,
+    );
+    t.ok(b"ctime is mtime", c == m, c.0);
+    t.ok(b"atime the day", a.0 % DAY == 0 && a.1 == 0, a.0 % DAY);
+    let [_, dm, dc] = stimes(d);
+    t.ok(
+        b"dir mtime 2 s",
+        dm.0 % 2 == 0 && dm.1 == 0 && dc == dm,
+        dm.1,
+    );
+    let ts = [
+        Timespec {
+            tv_sec: 1_600_000_123,
+            tv_nsec: 500_000_000,
+        },
+        Timespec {
+            tv_sec: 1_500_000_001,
+            tv_nsec: 700_000_000,
+        },
+    ];
+    t.eq(
+        b"utimensat",
+        sys_utimensat(-100, f.as_ptr(), ts.as_ptr(), 0),
+        0,
+    );
+    let set = [(1_599_955_200, 0), (1_500_000_000, 0), (1_500_000_000, 0)];
+    let got = stimes(f);
+    t.ok(b"utimensat truncated", got == set, got[1].0);
+    t.eq(b"rename", sys_rename(f.as_ptr(), g.as_ptr()), 0);
+    let got = stimes(g);
+    t.ok(b"rename keeps", got == set, got[1].0);
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"remount", mount(dev), 0);
+    let got = stimes(g);
+    t.ok(b"kept on disk", got == set, got[1].0);
+    let [_, dm2, _] = stimes(d);
+    t.ok(b"dir kept", dm2.0 % 2 == 0 && dm2.0 >= dm.0, dm2.0);
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(
+        b"time_offset=60",
+        mount_with(dev, b"iocharset=cp437,time_offset=60\0"),
+        0,
+    );
+    let [_, om, _] = stimes(g);
+    t.eq(b"an hour earlier", om.0, 1_500_000_000 - 3600);
+    t.eq(b"umount 3", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
+    sys_unlink(g.as_ptr());
+    sys_rmdir(d.as_ptr());
     t.done();
 }

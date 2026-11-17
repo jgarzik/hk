@@ -27,7 +27,9 @@ use crate::util::pod::{FromBytes, IntoBytes};
 use super::dentry::Dentry;
 use super::file::{DirContext, DirEntry as VfsDirEntry, File, FileOps, RwFlags};
 use super::icache;
-use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, Timespec};
+use super::inode::{
+    AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, TimeUpdate, Timespec,
+};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
@@ -37,6 +39,7 @@ use crate::util::kalloc::try_arc;
 
 mod cache;
 mod direct;
+mod fattime;
 
 // ============================================================================
 // VFAT file pages (Linux fat_aops: fat_read_folio, fat_writepages)
@@ -197,17 +200,8 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
 
 /// Record the file's size in its directory entry
 fn update_size(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
-    let d = get_inode_data(inode)?;
-    if d.parent_cluster == 0 || inode.get_nlink() == 0 {
-        return Ok(());
-    }
-    update_dir_entry_by_short_name(
-        sb_data,
-        d.parent_cluster,
-        &d.short_name,
-        d.start_cluster,
-        inode.get_size() as u32,
-    )
+    // Linux: the inode marked dirty, __fat_write_inode at writeback
+    write_inode_sb(inode, sb_data)
 }
 
 /// Write to a vfat file (Linux fat_write_begin/end over
@@ -654,6 +648,11 @@ pub struct VfatOpts {
     pub fmask: u16,
     pub dmask: u16,
     pub cs: Charset,
+    /// tz=UTC or time_offset= given (Linux tz_set)
+    pub tz_set: bool,
+    /// Minutes the entries' local time is ahead of UTC (Linux
+    /// time_offset)
+    pub time_offset: i32,
 }
 
 impl VfatOpts {
@@ -665,6 +664,11 @@ impl VfatOpts {
 
     fn dir_mode(&self) -> InodeMode {
         InodeMode::directory(0o777 & !self.dmask)
+    }
+
+    /// The entries' offset from UTC in seconds (Linux fat_tz_offset)
+    fn tz(&self) -> i64 {
+        fattime::tz_offset(self.tz_set, self.time_offset)
     }
 
     /// Parse the mount data (Linux fat_parse_param): uid/gid default to
@@ -681,6 +685,8 @@ impl VfatOpts {
             fmask: umask,
             dmask: umask,
             cs: Charset::Latin1,
+            tz_set: false,
+            time_offset: 0,
         };
         let bad = KernelError::InvalidArgument;
         let num = |v: &[u8]| {
@@ -714,8 +720,18 @@ impl VfatOpts {
                 b"shortname" if matches!(v, b"lower" | b"win95" | b"winnt" | b"mixed") => {}
                 b"quiet" | b"showexec" | b"debug" | b"sys_immutable" | b"flush" | b"usefree"
                 | b"nocase" | b"discard" | b"dos1xfloppy" | b"rodir" | b"nonumtail"
-                | b"uni_xlate" | b"allow_utime" | b"errors" | b"check" | b"tz" | b"time_offset"
-                | b"nfs" => {}
+                | b"uni_xlate" | b"allow_utime" | b"errors" | b"check" | b"nfs" => {}
+                // Linux fat_parse_param: tz= takes only UTC
+                b"tz" if v == b"UTC" => (o.tz_set, o.time_offset) = (true, 0),
+                // Minutes, within a day either way
+                b"time_offset" => {
+                    let n = core::str::from_utf8(v)
+                        .ok()
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .filter(|n| (-24 * 60..=24 * 60).contains(n))
+                        .ok_or(bad)?;
+                    (o.tz_set, o.time_offset) = (true, n);
+                }
                 _ => return Err(bad),
             }
         }
@@ -838,6 +854,8 @@ pub struct VfatInodeData {
     /// Clusters the file has (Linux i_blocks in clusters): the size's
     /// when read from disk, then counted as clusters are added and freed
     pub clusters: u32,
+    /// Creation time (Linux i_crtime), written back with the entry
+    pub crtime: Timespec,
 }
 
 /// A vfat inode's `Inode.private`: its data, changed in place (a
@@ -1190,6 +1208,129 @@ fn extend_cluster_chain(
 // Directory Entry Parsing
 // ============================================================================
 
+/// A short entry's times as on disk (Linux msdos_dir_entry time, date,
+/// adate, ctime, cdate, ctime_cs)
+#[derive(Clone, Copy, Default)]
+pub struct EntryTimes {
+    pub time: u16,
+    pub date: u16,
+    pub adate: u16,
+    pub ctime: u16,
+    pub cdate: u16,
+    pub cs: u8,
+}
+
+impl EntryTimes {
+    /// Those of entry `d`
+    fn of(d: &VfatDirEntry) -> Self {
+        Self {
+            time: d.write_time,
+            date: d.write_date,
+            adate: d.access_date,
+            ctime: d.create_time,
+            cdate: d.create_date,
+            cs: d.create_time_tenth,
+        }
+    }
+
+    /// A new entry's, all `ts` (Linux vfat_build_slots,
+    /// fat_alloc_new_dir)
+    fn at(off: i64, ts: Timespec) -> Self {
+        let (time, date, cs) = fattime::unix2fat(off, ts);
+        Self {
+            time,
+            date,
+            adate: date,
+            ctime: time,
+            cdate: date,
+            cs,
+        }
+    }
+
+    /// An inode's (Linux __fat_write_inode: mtime, atime, i_crtime)
+    fn of_inode(off: i64, inode: &Inode, crtime: Timespec) -> Self {
+        let (time, date, _) = fattime::unix2fat(off, inode.mtime());
+        let (_, adate, _) = fattime::unix2fat(off, inode.atime());
+        let (ctime, cdate, cs) = fattime::unix2fat(off, crtime);
+        Self {
+            time,
+            date,
+            adate,
+            ctime,
+            cdate,
+            cs,
+        }
+    }
+
+    /// Into the raw short entry `b`
+    fn put(&self, b: &mut [u8; 32]) {
+        b[13] = self.cs;
+        b[14..16].copy_from_slice(&self.ctime.to_le_bytes());
+        b[16..18].copy_from_slice(&self.cdate.to_le_bytes());
+        b[18..20].copy_from_slice(&self.adate.to_le_bytes());
+        b[22..24].copy_from_slice(&self.time.to_le_bytes());
+        b[24..26].copy_from_slice(&self.date.to_le_bytes());
+    }
+}
+
+/// Linux fat_fill_inode's times: mtime and ctime from the entry's time
+/// and date, atime from its access date; the creation time, returned
+fn fill_times(inode: &Inode, off: i64, t: &EntryTimes) -> Timespec {
+    let m = fattime::fat2unix(off, t.time, t.date, 0);
+    inode.set_mtime(m);
+    inode.set_ctime(m);
+    inode.set_atime(fattime::fat2unix(off, 0, t.adate, 0));
+    fattime::fat2unix(off, t.ctime, t.cdate, t.cs)
+}
+
+/// The root (it has no entry; Linux MSDOS_ROOT_INO)
+fn is_root(inode: &Inode) -> bool {
+    get_inode_data(inode).is_ok_and(|d| d.parent_cluster == 0)
+}
+
+/// Linux fat_truncate_time: atime to the day, mtime to 2 s and ctime
+/// with it, from `now` (else the current time); the root's stay 0
+fn fat_truncate_time(inode: &Inode, now: Option<Timespec>, atime: bool, cmtime: bool) {
+    if is_root(inode) {
+        return;
+    }
+    let Some(off) = opts_of(inode).map(|o| o.tz()) else {
+        return;
+    };
+    let now = now.unwrap_or_else(|| crate::time::TIMEKEEPER.current_time());
+    if atime {
+        inode.set_atime(fattime::trunc_atime(off, now));
+    }
+    if cmtime {
+        let m = fattime::trunc_2secs(now);
+        inode.set_mtime(m);
+        inode.set_ctime(m);
+    }
+}
+
+/// Linux __fat_write_inode: size (0 for a directory), first cluster and
+/// times into the inode's entry; nothing for the root or an inode with
+/// no entry left (unlinked)
+fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
+    let sb = inode.superblock().ok_or(KernelError::Io)?;
+    write_inode_sb(inode, &get_sb_data(&sb)?)
+}
+
+/// [`fat_write_inode`] with the superblock's data at hand
+fn write_inode_sb(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
+    let d = get_inode_data(inode)?;
+    if d.parent_cluster == 0 || inode.get_nlink() == 0 {
+        return Ok(());
+    }
+    let off = entry_offset(sb_data, d.parent_cluster, &d.short_name)?;
+    let mut b = [0u8; 32];
+    read_bytes(&sb_data.bdev, off, &mut b)?;
+    let size = if d.is_dir { 0 } else { inode.get_size() as u32 };
+    entry_set_extent(&mut b, d.start_cluster, size);
+    EntryTimes::of_inode(sb_data.opts.tz(), inode, d.crtime).put(&mut b);
+    write_bytes(&sb_data.bdev, off, &b)
+}
+
 /// Parsed directory entry with long name support
 #[derive(Clone)]
 pub struct ParsedDirEntry {
@@ -1206,6 +1347,8 @@ pub struct ParsedDirEntry {
     /// Index of the short entry's 32-byte slot in the directory (its
     /// stable readdir position, like Linux fat_readdir's cpos)
     pub slot: u64,
+    /// Its times
+    pub times: EntryTimes,
 }
 
 impl ParsedDirEntry {
@@ -1413,6 +1556,7 @@ fn read_directory_entries(
                     start_cluster,
                     file_size: dirent.file_size,
                     slot: (ci * entries_per_cluster + i) as u64,
+                    times: EntryTimes::of(&dirent),
                 })?;
             }
         }
@@ -1662,6 +1806,7 @@ fn create_dir_entry_with_lfn(
     attributes: u8,
     start_cluster: u32,
     file_size: u32,
+    times: &EntryTimes,
 ) -> Result<[u8; 11], KernelError> {
     // Get existing short names to avoid collisions
     let existing_entries = read_directory_entries(sb_data, parent_cluster)?;
@@ -1727,6 +1872,7 @@ fn create_dir_entry_with_lfn(
 
     // File size at 28-31
     short_bytes[28..32].copy_from_slice(&file_size.to_le_bytes());
+    times.put(&mut short_bytes);
 
     write_raw_dir_entry(sb_data, parent_cluster, short_entry_index, &short_bytes)?;
 
@@ -1938,6 +2084,41 @@ impl InodeOps for VfatInodeOps {
         true
     }
 
+    /// Linux fat_update_time: the times truncated to FAT's
+    /// (fat_truncate_time), the entry written; nothing for the root
+    fn update_time(&self, inode: &Inode, what: TimeUpdate, _now: Timespec) {
+        if is_root(inode) {
+            return;
+        }
+        let atime = what == TimeUpdate::Atime;
+        fat_truncate_time(inode, None, atime, !atime);
+        let _ = fat_write_inode(inode);
+    }
+
+    /// Linux fat_setattr's times: atime to the day, mtime to 2 s with
+    /// ctime the same; a ctime alone is dropped (ctime and mtime share
+    /// the entry's field); the entry written
+    fn setattr_times(
+        &self,
+        inode: &Inode,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+        _ctime: Option<Timespec>,
+    ) {
+        if let Some(t) = atime {
+            fat_truncate_time(inode, Some(t), true, false);
+        }
+        if let Some(t) = mtime {
+            fat_truncate_time(inode, Some(t), false, true);
+        }
+        let _ = fat_write_inode(inode);
+    }
+
+    /// Linux fat_setattr's mark_inode_dirty
+    fn setattr_done(&self, inode: &Inode) {
+        let _ = fat_write_inode(inode);
+    }
+
     /// The preferred I/O size is the cluster size (Linux fat_getattr)
     fn getattr(&self, inode: &Inode) -> super::inode::InodeAttr {
         let mut a = super::inode::generic_fillattr(inode);
@@ -1996,7 +2177,9 @@ impl InodeOps for VfatInodeOps {
         let file_size = 0u32;
         let parent_cluster = dir_inode_data.start_cluster;
 
-        // Create directory entry (function returns the generated short name)
+        // Linux vfat_create: the entry's times all now (vfat_add_entry)
+        let ts = crate::time::TIMEKEEPER.current_time();
+        let et = EntryTimes::at(sb_data.opts.tz(), ts);
         let short_name = create_dir_entry_with_lfn(
             &sb_data,
             parent_cluster,
@@ -2004,6 +2187,7 @@ impl InodeOps for VfatInodeOps {
             attr::ARCHIVE,
             start_cluster,
             file_size,
+            &et,
         )?;
         // Linux vfat_create: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail: a negative
@@ -2025,6 +2209,7 @@ impl InodeOps for VfatInodeOps {
         inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
         inode.inc_iversion();
 
+        let crtime = fill_times(&inode, sb_data.opts.tz(), &et);
         inode.set_private(new_private(VfatInodeData {
             start_cluster,
             file_size,
@@ -2033,10 +2218,12 @@ impl InodeOps for VfatInodeOps {
             short_name,
             mmu_private: 0,
             clusters: 0,
+            crtime,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-        // The directory's mtime and ctime
-        dir.touch_mc();
+        // vfat_add_entry: the directory's mtime and ctime are `ts`
+        fat_truncate_time(dir, Some(ts), false, true);
+        write_inode_sb(dir, &sb_data)?;
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2071,6 +2258,10 @@ impl InodeOps for VfatInodeOps {
         let zeros = crate::util::kmem::try_vec(cluster_size, 0u8)?;
         write_bytes(&sb_data.bdev, cluster_offset, &zeros)?;
 
+        // Linux vfat_mkdir: the new entries' times all now
+        let ts = crate::time::TIMEKEEPER.current_time();
+        let et = EntryTimes::at(sb_data.opts.tz(), ts);
+
         // Create . entry (points to self)
         let mut dot_entry = [0u8; 32];
         dot_entry[0..8].copy_from_slice(b".       ");
@@ -2078,6 +2269,7 @@ impl InodeOps for VfatInodeOps {
         dot_entry[11] = attr::DIRECTORY;
         dot_entry[20..22].copy_from_slice(&((new_cluster >> 16) as u16).to_le_bytes());
         dot_entry[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
+        et.put(&mut dot_entry);
         write_bytes(&sb_data.bdev, cluster_offset, &dot_entry)?;
 
         // Create .. entry (points to parent: Linux fat_alloc_new_dir,
@@ -2090,6 +2282,7 @@ impl InodeOps for VfatInodeOps {
         let up = logstart(&sb_data, parent_cluster);
         dotdot_entry[20..22].copy_from_slice(&((up >> 16) as u16).to_le_bytes());
         dotdot_entry[26..28].copy_from_slice(&(up as u16).to_le_bytes());
+        et.put(&mut dotdot_entry);
         write_bytes(&sb_data.bdev, cluster_offset + 32, &dotdot_entry)?;
 
         // Create entry in parent (function returns the generated short name)
@@ -2100,6 +2293,7 @@ impl InodeOps for VfatInodeOps {
             attr::DIRECTORY,
             new_cluster,
             0, // Directories have size 0 in FAT
+            &et,
         )?;
         // Linux vfat_mkdir: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail
@@ -2123,6 +2317,7 @@ impl InodeOps for VfatInodeOps {
         // Linux vfat_mkdir: set_nlink(inode, 2)
         inode.nlink.store(2, core::sync::atomic::Ordering::Relaxed);
 
+        let crtime = fill_times(&inode, sb_data.opts.tz(), &et);
         inode.set_private(new_private(VfatInodeData {
             start_cluster: new_cluster,
             file_size: 0,
@@ -2131,10 +2326,12 @@ impl InodeOps for VfatInodeOps {
             short_name,
             mmu_private: 0,
             clusters: 0,
+            crtime,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-        // The directory's mtime and ctime
-        dir.touch_mc();
+        // vfat_add_entry: the directory's mtime and ctime are `ts`
+        fat_truncate_time(dir, Some(ts), false, true);
+        write_inode_sb(dir, &sb_data)?;
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2176,8 +2373,12 @@ impl InodeOps for VfatInodeOps {
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
         d.set_d_time(dir.iversion());
+        // fat_remove_entries: the directory's atime, mtime and ctime now;
+        // the victim's too (vfat_unlink / vfat_rmdir), in memory only
+        fat_truncate_time(dir, None, true, true);
+        let _ = write_inode_sb(dir, &sb_data);
         if let Some(i) = d.get_inode() {
-            super::libfs::simple_link_times(dir, &i);
+            fat_truncate_time(&i, None, true, true);
         }
         dir_sync(&sb, &sb_data)
     }
@@ -2235,8 +2436,12 @@ impl InodeOps for VfatInodeOps {
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
         d.set_d_time(dir.iversion());
+        // fat_remove_entries: the directory's atime, mtime and ctime now;
+        // the victim's too (vfat_unlink / vfat_rmdir), in memory only
+        fat_truncate_time(dir, None, true, true);
+        let _ = write_inode_sb(dir, &sb_data);
         if let Some(i) = d.get_inode() {
-            super::libfs::simple_link_times(dir, &i);
+            fat_truncate_time(&i, None, true, true);
         }
         dir_sync(&sb, &sb_data)
     }
@@ -2341,6 +2546,8 @@ impl InodeOps for VfatInodeOps {
         let (od, nd) = (get_inode_data(old_dir)?, get_inode_data(new_dir)?);
         let (op, np) = (od.start_cluster, nd.start_cluster);
 
+        // Linux vfat_rename: ts = current_time(old_dir)
+        let ts = crate::time::TIMEKEEPER.current_time();
         // vfat_find(old_dir): the source's entry
         let old_entries = read_directory_entries(&sb_data, op)?;
         let old_entry = old_entries
@@ -2384,7 +2591,12 @@ impl InodeOps for VfatInodeOps {
                 } else {
                     attr::ARCHIVE
                 };
-                create_dir_entry_with_lfn(&sb_data, np, new_name, a, 0, 0)?
+                let et = EntryTimes::at(sb_data.opts.tz(), ts);
+                let short = create_dir_entry_with_lfn(&sb_data, np, new_name, a, 0, 0, &et)?;
+                // vfat_add_entry: the new directory's mtime and ctime
+                fat_truncate_time(new_dir, Some(ts), false, true);
+                let _ = write_inode_sb(new_dir, &sb_data);
+                short
             }
         };
         new_dir.inc_iversion();
@@ -2407,7 +2619,8 @@ impl InodeOps for VfatInodeOps {
                 }
                 None => (old_entry.start_cluster, old_entry.file_size),
             };
-            write_entry(&sb_data, np, &new_short, old_entry.attr, start, size)
+            let e = &old_entry;
+            write_entry(&sb_data, np, &new_short, e.attr, (start, size), &e.times)
         };
         if let Err(e) = sync_ipos() {
             unwind.inode(None);
@@ -2431,7 +2644,12 @@ impl InodeOps for VfatInodeOps {
             return Err(e);
         }
         old_dir.inc_iversion();
+        // fat_remove_entries: atime, mtime, ctime now; then
+        // vfat_update_dir_metadata: mtime and ctime `ts`, written
+        fat_truncate_time(old_dir, None, true, true);
         old_dir.inc_iversion();
+        fat_truncate_time(old_dir, Some(ts), false, true);
+        let _ = write_inode_sb(old_dir, &sb_data);
 
         // The replaced object loses its name (drop_nlink): its clusters
         // go with its inode, or now if none is cached
@@ -2441,9 +2659,6 @@ impl InodeOps for VfatInodeOps {
                 None if t.start_cluster != 0 => free_cluster_chain(&sb_data, t.start_cluster)?,
                 None => {}
             }
-        }
-        if let Some(i) = &old_inode {
-            super::libfs::simple_rename_timestamp(old_dir, new_dir, i, new_inode.as_deref());
         }
         dir_sync(&sb, &sb_data)
     }
@@ -2512,14 +2727,15 @@ fn write_entry(
     parent: u32,
     short: &[u8; 11],
     attr: u8,
-    start: u32,
-    size: u32,
+    (start, size): (u32, u32),
+    times: &EntryTimes,
 ) -> Result<(), KernelError> {
     let off = entry_offset(sb_data, parent, short)?;
     let mut b = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut b)?;
     b[11] = attr;
     entry_set_extent(&mut b, start, size);
+    times.put(&mut b);
     write_bytes(&sb_data.bdev, off, &b)
 }
 
@@ -2569,7 +2785,14 @@ impl Unwind<'_> {
                 }
                 if corrupt.is_some() {
                     let s = &t.short_name;
-                    let r = write_entry(self.sb_data, self.new_dir, s, t.attr, start, size);
+                    let r = write_entry(
+                        self.sb_data,
+                        self.new_dir,
+                        s,
+                        t.attr,
+                        (start, size),
+                        &t.times,
+                    );
                     failed |= r.is_err();
                 }
             }
@@ -2708,7 +2931,9 @@ fn create_inode_for_entry(
         .nlink
         .store(nlink, core::sync::atomic::Ordering::Relaxed);
 
+    let crtime = fill_times(&inode, o.tz(), &entry.times);
     inode.set_private(new_private(VfatInodeData {
+        crtime,
         start_cluster: entry.start_cluster,
         file_size: entry.file_size,
         is_dir: entry.is_dir(),
@@ -3090,6 +3315,7 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         short_name: [b' '; 11], // Root has no short name
         mmu_private: 0,
         clusters: 0,
+        crtime: Timespec::ZERO,
     })?);
 
     // Names match without case or trailing dots (Linux setup's
