@@ -766,7 +766,7 @@ static VFAT_CI_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::Den
     d_hash: Some(vfat_hashi),
     d_compare: Some(vfat_cmpi),
     d_revalidate: Some(vfat_revalidate_ci),
-    d_prune: None,
+    ..crate::fs::dentry::DentryOps::NONE
 };
 
 /// Linux vfat_revalidate_ci: ECHILD in an RCU walk (every vfat name is

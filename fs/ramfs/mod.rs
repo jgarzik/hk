@@ -1188,14 +1188,29 @@ pub(crate) fn ramfs_mount(
     crate::fs::superblock::get_tree_nodev(fc, &RAMFS_SUPER_OPS, |sb| fill_root(sb, mode, 0, 0))
 }
 
+/// ramfs's, tmpfs's and devtmpfs's dentry operations (Linux
+/// simple_dentry_operations, which simple_lookup gives each dentry)
+static SIMPLE_DENTRY_OPS: super::dentry::DentryOps = super::dentry::DentryOps {
+    d_delete: Some(always_delete_dentry),
+    ..super::dentry::DentryOps::NONE
+};
+
+/// Linux always_delete_dentry: a negative dentry goes at its last put
+/// (the positive ones are pinned, `d_persistent`)
+fn always_delete_dentry(_: &Dentry) -> bool {
+    true
+}
+
 /// Give a new superblock its root directory (Linux ramfs_fill_super,
-/// shmem_fill_super: d_make_root of a new directory inode)
+/// shmem_fill_super: d_make_root of a new directory inode), its
+/// dentries simple_dentry_operations
 pub(crate) fn fill_root(
     sb: &Arc<SuperBlock>,
     mode: u16,
     uid: Uid,
     gid: Gid,
 ) -> Result<(), KernelError> {
+    sb.set_d_op(&SIMPLE_DENTRY_OPS);
     let inode = new_inode(
         sb,
         Kind::Dir,

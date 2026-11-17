@@ -168,6 +168,12 @@ pub struct DentryOps {
     /// drop glue may be read (`IFree`); ECHILD where that is not
     /// enough, and the walk asks again in ref mode.
     pub d_revalidate: Option<RevalidateFn>,
+    /// A dentry no one holds any more is killed, not kept cached (Linux
+    /// d_delete, asked by retain_dentry at the last dput: ramfs's
+    /// always_delete_dentry). Asked only of a negative one: every
+    /// filesystem here with one pins its positive dentries
+    /// (`SuperOps::d_persistent`, Linux d_make_persistent's reference)
+    pub d_delete: Option<fn(&Dentry) -> bool>,
     /// Called as the dentry is killed, before its memory's grace period
     /// starts (Linux d_prune): no reference is left or can be taken
     pub d_prune: Option<fn(&Dentry)>,
@@ -186,6 +192,7 @@ impl DentryOps {
         d_hash: None,
         d_compare: None,
         d_revalidate: None,
+        d_delete: None,
         d_prune: None,
     };
 }
@@ -1267,6 +1274,12 @@ impl Drop for DentryRef {
     /// deepest one (an open descriptor) may be as deep as the caller
     /// could make it
     fn drop(&mut self) {
+        // Linux dput's retain_dentry: the last holder of a hashed
+        // dentry its filesystem keeps no unused copy of takes it out of
+        // the tree, so this put kills it
+        if Self::count(self) == TREE_REFS + 1 && !self.d_unhashed() && self.unretained() {
+            d_delete_unused(self);
+        }
         let mut d = self.0;
         loop {
             // SAFETY: a reference held (the caller's, or the parent's
@@ -1314,6 +1327,27 @@ unsafe impl RefPtr for DentryRef {
         unsafe { &*p }.d_count.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the reference just taken, never null
         Self(unsafe { NonNull::new_unchecked(p.cast_mut()) })
+    }
+}
+
+impl Dentry {
+    /// Negative, and its filesystem keeps no unused one (Linux
+    /// retain_dentry false: d_op->d_delete)
+    fn unretained(&self) -> bool {
+        self.is_negative() && self.d_op.and_then(|o| o.d_delete).is_some_and(|f| f(self))
+    }
+}
+
+/// The caller is the last holder of `d`, hashed, which its filesystem
+/// keeps no unused copy of (`Dentry::unretained`): it leaves the tree
+/// if it is still unused and negative, decided under its parent's
+/// d_lock and its own (`prune_one`, Linux dput -> lock_for_kill ->
+/// __dentry_kill), the tree's references put after the locks; the
+/// caller's put then kills it. A DentryRef of a hashed dentry is never
+/// put under a d_lock.
+fn d_delete_unused(d: &DentryRef) {
+    if let Some(parent) = d.get_parent() {
+        prune_one(&parent, d, true);
     }
 }
 

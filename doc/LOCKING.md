@@ -2965,9 +2965,16 @@ stores to the dentry's lock word.
 
 A dentry is held through `DentryRef` (Linux dget/dput on d_lockref):
 the tree's two references, each child's `d_parent`, and every
-holder's. The last put kills it (`dentry_kill`, Linux __dentry_kill:
-its inode and parent let go there, the parents it alone held in a
-loop, as Linux dput) and frees its memory a grace period later
+holder's. The last holder's put of a hashed negative dentry whose
+filesystem keeps none unused (`DentryOps::d_delete`: ramfs, tmpfs,
+devtmpfs; Linux retain_dentry and always_delete_dentry) first takes
+it out of the tree as the shrinker does (`d_delete_unused` ->
+`prune_one`: the parent's d_lock, then its own, both written; the
+tree's references put after them), so no reference to a hashed dentry
+is put under a d_lock. The last put kills it (`dentry_kill`, Linux
+__dentry_kill: its inode and parent let go there, the parents it
+alone held in a loop, as Linux dput) and frees its memory a grace
+period later
 (`call_rcu`, Linux dentry_free's __d_free), leaving `d_parent` in
 place: an RCU reader may follow `d_parent` and read `d_name` of a
 dentry it holds no reference to, and takes one with

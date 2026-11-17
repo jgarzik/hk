@@ -252,10 +252,9 @@ fn start_path(start: Start<'_>) -> Result<Path, KernelError> {
 
 /// Child `name` of directory `parent`: the dcache, else the file system
 /// (the new dentry is cached). A cached negative dentry is ENOENT; a
-/// miss is cached as one (Linux d_add(dentry, NULL)) only on in-memory
-/// filesystems (ramfs, devtmpfs), where a name is its exact bytes:
-/// procfs and cgroupfs compute their entries behind the dcache, and
-/// vfat matches other spellings (case, trailing dots). Permission is
+/// miss caches none: ramfs's would go at once (Linux simple_lookup's
+/// d_add(dentry, NULL), then dput: always_delete_dentry), procfs keeps
+/// none, and vfat's and kernfs's are not kept (BUGS.md). Permission is
 /// the caller's business.
 pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
     // No file system here has longer names (Linux simple_lookup and the
@@ -271,20 +270,8 @@ pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelEr
         };
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    match dir.i_op.lookup(&dir, name) {
-        Ok(inode) => Dentry::alloc(parent, name, Some(inode)),
-        Err(KernelError::NotFound) => {
-            let in_memory = dir
-                .superblock()
-                .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_IN_MEMORY);
-            if in_memory {
-                // A negative dentry is only a cache: none on ENOMEM
-                let _ = Dentry::alloc(parent, name, None);
-            }
-            Err(KernelError::NotFound)
-        }
-        Err(e) => Err(e),
-    }
+    let inode = dir.i_op.lookup(&dir, name)?;
+    Dentry::alloc(parent, name, Some(inode))
 }
 
 /// The dcache's child `name` of `parent` if it is still valid (Linux
