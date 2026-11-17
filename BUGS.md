@@ -697,10 +697,17 @@ waiting).
 - RENAME_WHITEOUT is EINVAL everywhere; Linux tmpfs makes whiteouts
   (shmem_whiteout).
 - vfat lacks RENAME_EXCHANGE (Linux vfat_rename_exchange).
-- vfat rename onto an existing name removes the target's entry before
-  adding the new one (`fs/vfat/mod.rs` rename); Linux vfat_rename reuses
-  the target's slot (vfat_find, then overwrites it), so a failed add
-  cannot leave a positive target dentry for a name gone on disk.
+
+## vfat gaps
+
+**Location**: `fs/vfat/mod.rs`
+
+- mkdir writes the root's first cluster into a root child's ".."
+  entry; Linux (and the FAT spec) write 0 there (i_logstart of the
+  root), as rename's `logstart` does.
+- No directory link counts: Linux counts subdirectories (mkdir and
+  rmdir inc_nlink/drop_nlink the parent, a cross-directory rename of a
+  directory drop_nlink(old_dir) / inc_nlink(new_dir)).
 
 ## Kernel heap (slab) gaps
 

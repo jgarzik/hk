@@ -1717,42 +1717,39 @@ fn update_dir_entry_by_short_name(
     new_start_cluster: u32,
     new_size: u32,
 ) -> Result<(), KernelError> {
+    let off = entry_offset(sb_data, parent_cluster, short_name)?;
+    let mut buf = [0u8; 32];
+    read_bytes(&sb_data.bdev, off, &mut buf)?;
+    buf[20..22].copy_from_slice(&((new_start_cluster >> 16) as u16).to_le_bytes());
+    buf[26..28].copy_from_slice(&(new_start_cluster as u16).to_le_bytes());
+    buf[28..32].copy_from_slice(&new_size.to_le_bytes());
+    write_bytes(&sb_data.bdev, off, &buf)
+}
+
+/// The disk offset of the short entry `short_name` in the directory at
+/// `parent_cluster` (Linux i_pos), ENOENT if it has none
+fn entry_offset(
+    sb_data: &VfatSbData,
+    parent_cluster: u32,
+    short_name: &[u8; 11],
+) -> Result<u64, KernelError> {
     let chain = read_cluster_chain(sb_data, parent_cluster)?;
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
-
-    // Search for the entry by short name
     for &cluster in chain.iter() {
         let cluster_offset = cluster_to_offset(sb_data, cluster);
-
         for i in 0..entries_per_cluster {
             let entry_offset = cluster_offset + (i as u64 * 32);
             let mut buf = [0u8; 32];
             read_bytes(&sb_data.bdev, entry_offset, &mut buf)?;
-
-            // Skip free/deleted entries
-            if buf[0] == END_MARKER || buf[0] == DELETED_MARKER {
+            // Free, deleted and long-name entries are not it
+            if buf[0] == END_MARKER || buf[0] == DELETED_MARKER || buf[11] == attr::LONG_NAME {
                 continue;
             }
-
-            // Skip LFN entries
-            if buf[11] == attr::LONG_NAME {
-                continue;
-            }
-
-            // Check if this matches our short name exactly
             if &buf[0..11] == short_name {
-                // Update start cluster high (offset 20-21)
-                buf[20..22].copy_from_slice(&((new_start_cluster >> 16) as u16).to_le_bytes());
-                // Update start cluster low (offset 26-27)
-                buf[26..28].copy_from_slice(&(new_start_cluster as u16).to_le_bytes());
-                // Update size field (offset 28-31)
-                buf[28..32].copy_from_slice(&new_size.to_le_bytes());
-                write_bytes(&sb_data.bdev, entry_offset, &buf)?;
-                return Ok(());
+                return Ok(entry_offset);
             }
         }
     }
-
     Err(KernelError::NotFound)
 }
 
@@ -2283,82 +2280,242 @@ impl InodeOps for VfatInodeOps {
 
         let sb = old_dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        let old_dir_data = get_inode_data(old_dir)?;
-        let new_dir_data = get_inode_data(new_dir)?;
+        let (od, nd) = (get_inode_data(old_dir)?, get_inode_data(new_dir)?);
+        let (op, np) = (od.start_cluster, nd.start_cluster);
 
-        // Find the source entry
-        let old_entries = read_directory_entries(&sb_data, old_dir_data.start_cluster)?;
+        // vfat_find(old_dir): the source's entry
+        let old_entries = read_directory_entries(&sb_data, op)?;
         let old_entry = old_entries
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(old_name))
             .ok_or(KernelError::NotFound)?
             .clone();
-
-        // Check if target already exists
-        let new_entries = read_directory_entries(&sb_data, new_dir_data.start_cluster)?;
-        if let Some(existing) = new_entries
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(new_name))
-        {
-            // Target exists - delete it (FAT replaces existing)
-            if existing.is_dir() != old_entry.is_dir() {
-                // Can't replace file with dir or vice versa
-                return Err(KernelError::InvalidArgument);
-            }
-            if existing.is_dir() {
-                // Check if target dir is empty
-                let child_entries = read_directory_entries(&sb_data, existing.start_cluster)?;
-                for child in &child_entries {
-                    if child.name != "." && child.name != ".." {
-                        return Err(KernelError::DirectoryNotEmpty);
-                    }
-                }
-            }
-            // Delete existing entry (its clusters as for unlink)
-            let existing_cluster =
-                delete_dir_entry(&sb_data, new_dir_data.start_cluster, new_name)?;
-            drop_link(
-                &sb,
-                &sb_data,
-                new_dir_data.start_cluster,
-                existing,
-                existing_cluster,
-            )?;
-        }
-
-        // Create new entry with old entry's data
-        let attr_byte = if old_entry.is_dir() {
-            attr::DIRECTORY
+        let old_inode = cached(&sb, op, &old_entry.short_name);
+        // A directory moved to another one: its ".." entry
+        // (vfat_get_dotdot_de)
+        let is_dir = old_entry.is_dir();
+        let dotdot = if op != np && is_dir {
+            Some(dotdot_offset(&sb_data, old_entry.start_cluster)?)
         } else {
-            attr::ARCHIVE
+            None
         };
-        let new_short = create_dir_entry_with_lfn(
-            &sb_data,
-            new_dir_data.start_cluster,
-            new_name,
-            attr_byte,
-            old_entry.start_cluster,
-            old_entry.file_size,
-        )?;
-        // Linux vfat_rename: inode_inc_iversion(new_dir) once the new
-        // entry is there, before the old one's removal can fail
+
+        // The target's slot is reused (fat_detach of its inode), else a
+        // new entry is added (vfat_add_entry, no cluster yet)
+        let new_entries = read_directory_entries(&sb_data, np)?;
+        let existing = new_entries
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(new_name));
+        let mut new_inode = None;
+        let new_short = match existing {
+            Some(t) => {
+                if t.is_dir() != is_dir {
+                    return Err(KernelError::InvalidArgument);
+                }
+                if is_dir {
+                    dir_empty(&sb_data, t.start_cluster)?;
+                }
+                new_inode = cached(&sb, np, &t.short_name);
+                if let Some(i) = &new_inode {
+                    icache::remove_inode_hash(i);
+                }
+                t.short_name
+            }
+            None => {
+                let a = if is_dir {
+                    attr::DIRECTORY
+                } else {
+                    attr::ARCHIVE
+                };
+                create_dir_entry_with_lfn(&sb_data, np, new_name, a, 0, 0)?
+            }
+        };
         new_dir.inc_iversion();
 
-        // Delete old entry (don't free clusters - they belong to new entry now)
-        delete_dir_entry(&sb_data, old_dir_data.start_cluster, old_name)?;
-        // fat_remove_entries: inode_inc_iversion(old_dir)
+        // fat_detach + fat_attach: the moved object's inode at the new
+        // entry, then written there (vfat_sync_ipos)
+        if let Some(i) = &old_inode {
+            attach(i, np, new_short)?;
+        }
+        let (start, size) = match &old_inode {
+            Some(i) => (get_inode_data(i)?.start_cluster, i.get_size() as u32),
+            None => (old_entry.start_cluster, old_entry.file_size),
+        };
+        let unwind = Unwind {
+            sb_data: &sb_data,
+            new_dir: np,
+            new_name,
+            old: (&old_inode, op, old_entry.short_name),
+            target: existing.map(|t| (&new_inode, t)),
+        };
+        if let Err(e) = write_entry(&sb_data, np, &new_short, old_entry.attr, start, size) {
+            unwind.inode(None);
+            return Err(e);
+        }
+        if let Some(off) = dotdot {
+            // vfat_update_dotdot_de: the parent is new_dir now
+            if let Err(e) = set_start(&sb_data, off, logstart(&sb_data, np)) {
+                unwind.dotdot(dotdot, op);
+                return Err(e);
+            }
+        }
+        // fat_remove_entries(old_dir) and its inode_inc_iversion, then
+        // vfat_update_dir_metadata's
+        if let Err(e) = delete_dir_entry(&sb_data, op, old_name) {
+            unwind.dotdot(dotdot, op);
+            return Err(e);
+        }
+        old_dir.inc_iversion();
         old_dir.inc_iversion();
 
-        // The moved object keeps its inode (Linux fat_detach + fat_attach)
-        if let Some(inode) = cached(&sb, old_dir_data.start_cluster, &old_entry.short_name) {
-            let mut d = get_inode_data(&inode)?;
-            d.parent_cluster = new_dir_data.start_cluster;
-            d.short_name = new_short;
-            // The entry has moved on disk: the inode follows
-            set_inode_data(&inode, d)?;
-            icache::rehash(&inode, ikey(new_dir_data.start_cluster, &new_short));
+        // The replaced object loses its name (drop_nlink): its clusters
+        // go with its inode, or now if none is cached
+        if let Some(t) = existing {
+            match &new_inode {
+                Some(i) => i.nlink.store(0, core::sync::atomic::Ordering::Release),
+                None if t.start_cluster != 0 => free_cluster_chain(&sb_data, t.start_cluster)?,
+                None => {}
+            }
         }
         dir_sync(&sb, &sb_data)
+    }
+}
+
+/// Point `inode` at the entry `short` of the directory at `parent`
+/// (Linux fat_detach + fat_attach): its data and its inode-cache key
+fn attach(inode: &InodeRef, parent: u32, short: [u8; 11]) -> Result<(), KernelError> {
+    let mut d = get_inode_data(inode)?;
+    d.parent_cluster = parent;
+    d.short_name = short;
+    set_inode_data(inode, d)?;
+    icache::rehash(inode, ikey(parent, &short));
+    Ok(())
+}
+
+/// ENOTEMPTY unless the directory at `cluster` holds only "." and ".."
+/// (Linux fat_dir_empty)
+fn dir_empty(sb_data: &VfatSbData, cluster: u32) -> Result<(), KernelError> {
+    let entries = read_directory_entries(sb_data, cluster)?;
+    if entries.iter().any(|c| c.name != "." && c.name != "..") {
+        return Err(KernelError::DirectoryNotEmpty);
+    }
+    Ok(())
+}
+
+/// The disk offset of the ".." entry of the directory at `cluster`
+/// (Linux fat_get_dotdot_entry: EIO if it is not there)
+fn dotdot_offset(sb_data: &VfatSbData, cluster: u32) -> Result<u64, KernelError> {
+    if !is_valid_cluster(cluster) {
+        return Err(KernelError::Io);
+    }
+    let off = cluster_to_offset(sb_data, cluster) + 32;
+    let mut b = [0u8; 32];
+    read_bytes(&sb_data.bdev, off, &mut b)?;
+    if &b[0..11] != b"..         " || b[11] & attr::DIRECTORY == 0 {
+        return Err(KernelError::Io);
+    }
+    Ok(off)
+}
+
+/// A directory's first cluster as its subdirectories' ".." holds it
+/// (Linux i_logstart: 0 for the root)
+fn logstart(sb_data: &VfatSbData, cluster: u32) -> u32 {
+    if cluster == sb_data.root_cluster {
+        0
+    } else {
+        cluster
+    }
+}
+
+/// Set the first cluster of the entry at disk offset `off` (Linux
+/// fat_set_start)
+fn set_start(sb_data: &VfatSbData, off: u64, start: u32) -> Result<(), KernelError> {
+    let mut b = [0u8; 32];
+    read_bytes(&sb_data.bdev, off, &mut b)?;
+    b[20..22].copy_from_slice(&((start >> 16) as u16).to_le_bytes());
+    b[26..28].copy_from_slice(&(start as u16).to_le_bytes());
+    write_bytes(&sb_data.bdev, off, &b)
+}
+
+/// Write an object's attributes, first cluster and size into the entry
+/// `short` of the directory at `parent` (Linux __fat_write_inode at the
+/// inode's i_pos)
+fn write_entry(
+    sb_data: &VfatSbData,
+    parent: u32,
+    short: &[u8; 11],
+    attr: u8,
+    start: u32,
+    size: u32,
+) -> Result<(), KernelError> {
+    let off = entry_offset(sb_data, parent, short)?;
+    let mut b = [0u8; 32];
+    read_bytes(&sb_data.bdev, off, &mut b)?;
+    b[11] = attr;
+    b[20..22].copy_from_slice(&((start >> 16) as u16).to_le_bytes());
+    b[26..28].copy_from_slice(&(start as u16).to_le_bytes());
+    b[28..32].copy_from_slice(&size.to_le_bytes());
+    write_bytes(&sb_data.bdev, off, &b)
+}
+
+/// What a failed rename puts back (Linux vfat_rename's error_dotdot and
+/// error_inode)
+struct Unwind<'a> {
+    sb_data: &'a VfatSbData,
+    new_dir: u32,
+    new_name: &'a str,
+    /// The moved object's inode, its old directory and entry
+    old: (&'a Option<InodeRef>, u32, [u8; 11]),
+    /// The replaced object: its inode and entry
+    target: Option<(&'a Option<InodeRef>, &'a ParsedDirEntry)>,
+}
+
+impl Unwind<'_> {
+    /// error_dotdot: the data cluster may be shared now (serious
+    /// corruption): ".." back to the old parent, then as `inode`
+    fn dotdot(&self, dotdot: Option<u64>, old_parent: u32) {
+        let mut failed = false;
+        if let Some(off) = dotdot {
+            let back = logstart(self.sb_data, old_parent);
+            failed |= set_start(self.sb_data, off, back).is_err();
+        }
+        self.inode(Some(failed));
+    }
+
+    /// error_inode: the moved inode back at its old entry; the replaced
+    /// one back at its own (its entry rewritten after a corruption), or
+    /// the added entry removed. `corrupt`: after error_dotdot, with
+    /// whether a step failed so far; a failure then is reported
+    /// (fat_fs_error)
+    fn inode(&self, corrupt: Option<bool>) {
+        let (old_inode, op, old_short) = self.old;
+        if let Some(i) = old_inode {
+            let _ = attach(i, op, old_short);
+        }
+        let mut failed = corrupt.unwrap_or(false);
+        match self.target {
+            Some((ni, t)) => {
+                let (mut start, mut size) = (t.start_cluster, t.file_size);
+                if let Some(i) = ni {
+                    let _ = attach(i, self.new_dir, t.short_name);
+                    if let Ok(d) = get_inode_data(i) {
+                        (start, size) = (d.start_cluster, i.get_size() as u32);
+                    }
+                }
+                if corrupt.is_some() {
+                    let s = &t.short_name;
+                    let r = write_entry(self.sb_data, self.new_dir, s, t.attr, start, size);
+                    failed |= r.is_err();
+                }
+            }
+            None => {
+                let r = delete_dir_entry(self.sb_data, self.new_dir, self.new_name);
+                failed |= corrupt.is_some() && r.is_err();
+            }
+        }
+        if corrupt.is_some() && failed {
+            crate::printkln!("FAT-fs: vfat_rename: Filesystem corrupted");
+        }
     }
 }
 

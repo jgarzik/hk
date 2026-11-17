@@ -16,12 +16,20 @@
 //!   LOOKUP_CREATE, LOOKUP_RENAME_TARGET), so the new entry is named
 //!   as the caller spelled it; a name made in the directory is found
 //!   after a failed lookup of it.
+//! - VFAT_RENAME_OVER: a rename onto an existing name replaces it
+//!   (Linux vfat_rename reuses the target's entry): a file over a file
+//!   (the name then has the moved file's inode and contents, the
+//!   replaced one stays readable through an open descriptor), a
+//!   directory over an empty directory in another directory, ENOTEMPTY
+//!   over a non-empty one; after a remount the names and contents are
+//!   as left.
 
 use crate::harness::T;
-use crate::helpers::find_blkdev;
+use crate::helpers::{find_blkdev, read_file};
 use hk_syscall::{
-    O_CREAT, O_PATH, O_WRONLY, Stat, sys_chdir, sys_close, sys_getcwd, sys_mkdir, sys_mount,
-    sys_open, sys_openat2, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink,
+    O_CREAT, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_chdir, sys_close, sys_getcwd,
+    sys_mkdir, sys_mount, sys_open, sys_openat2, sys_pread64, sys_readlink, sys_rename, sys_rmdir,
+    sys_stat, sys_umount2, sys_unlink, sys_write,
 };
 
 const DIR: &[u8] = b"/tmp/vci\0";
@@ -46,8 +54,9 @@ pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
     sys_mkdir(DIR.as_ptr(), 0o755);
     let mut p = [0u8; 48];
+    let path = dev_.path(&mut p);
     let r = sys_mount(
-        dev_.path(&mut p).as_ptr(),
+        path.as_ptr(),
         DIR.as_ptr(),
         b"vfat\0".as_ptr(),
         0,
@@ -66,6 +75,7 @@ pub fn run_tests() {
         sys_chdir(b"/\0".as_ptr());
         sys_rmdir(b"/tmp/vci/dir\0".as_ptr());
     }
+    rename_over(path);
     sys_umount2(DIR.as_ptr(), 0);
     sys_rmdir(DIR.as_ptr());
     t.done();
@@ -187,5 +197,106 @@ fn cached() {
     t.eq(b"cached dir", open_cached(b"/tmp/vci/dir\0"), EAGAIN);
     t.ok(b"stat nosuch", dev(b"/tmp/vci/nosuch\0") == 0, 0);
     t.eq(b"failed name", open_cached(b"/tmp/vci/nosuch\0"), EAGAIN);
+    t.done();
+}
+
+/// Make `path` hold `data`
+fn put(path: &[u8], data: &[u8]) -> i64 {
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if fd < 0 {
+        return fd;
+    }
+    let r = sys_write(fd as u64, data.as_ptr(), data.len() as u64);
+    sys_close(fd as u64);
+    r
+}
+
+/// `path` holds exactly `want`
+fn holds(path: &[u8], want: &[u8]) -> bool {
+    let mut b = [0u8; 16];
+    let n = read_file(path, &mut b);
+    n == want.len() as i64 && &b[..want.len()] == want
+}
+
+/// st_ino of `p`, or 0
+fn ino(p: &[u8]) -> u64 {
+    let mut st = Stat::default();
+    if sys_stat(p.as_ptr(), &mut st) == 0 {
+        st.st_ino
+    } else {
+        0
+    }
+}
+
+/// stat(`p`)'s result
+fn stat_r(p: &[u8]) -> i64 {
+    sys_stat(p.as_ptr(), &mut Stat::default())
+}
+
+const RO: &[u8] = b"/tmp/vci/ro\0";
+const P1: &[u8] = b"/tmp/vci/ro/p1\0";
+const P2: &[u8] = b"/tmp/vci/ro/p2\0";
+const RA: &[u8] = b"/tmp/vci/ro/a\0";
+const RB: &[u8] = b"/tmp/vci/ro/b\0";
+const SUB: &[u8] = b"/tmp/vci/ro/p1/sub\0";
+const SUB_F: &[u8] = b"/tmp/vci/ro/p1/sub/f\0";
+const TGT: &[u8] = b"/tmp/vci/ro/p2/tgt\0";
+const TGT_F: &[u8] = b"/tmp/vci/ro/p2/tgt/f\0";
+const FULL: &[u8] = b"/tmp/vci/ro/p2/full\0";
+const FULL_X: &[u8] = b"/tmp/vci/ro/p2/full/x\0";
+
+/// VFAT_RENAME_OVER on the vfat mounted at DIR from device `dev`
+fn rename_over(dev: &[u8]) {
+    const ENOENT: i64 = -2;
+    const ENOTEMPTY: i64 = -39;
+    let mut t = T::new(b"VFAT_RENAME_OVER");
+    for d in [RO, P1, P2] {
+        sys_mkdir(d.as_ptr(), 0o755);
+    }
+    t.eq(b"put a", put(RA, b"AAA"), 3);
+    t.eq(b"put b", put(RB, b"BBBBB"), 5);
+    let ia = ino(RA);
+    let fd = sys_open(RB.as_ptr(), O_RDONLY, 0);
+    t.ok(b"open b", fd >= 0, fd);
+    t.eq(b"rename a b", sys_rename(RA.as_ptr(), RB.as_ptr()), 0);
+    t.eq(b"a gone", stat_r(RA), ENOENT);
+    t.ok(b"b holds a's", holds(RB, b"AAA"), 0);
+    t.ok(b"b is a's inode", ia != 0 && ino(RB) == ia, ino(RB) as i64);
+    if fd >= 0 {
+        let mut b = [0u8; 8];
+        let n = sys_pread64(fd as i32, b.as_mut_ptr(), b.len() as u64, 0);
+        t.ok(b"replaced readable", n == 5 && &b[..5] == b"BBBBB", n);
+        sys_close(fd as u64);
+    }
+    t.eq(b"mkdir sub", sys_mkdir(SUB.as_ptr(), 0o755), 0);
+    t.eq(b"put sub/f", put(SUB_F, b"SUB"), 3);
+    t.eq(b"mkdir tgt", sys_mkdir(TGT.as_ptr(), 0o755), 0);
+    t.eq(b"mkdir full", sys_mkdir(FULL.as_ptr(), 0o755), 0);
+    t.eq(b"put full/x", put(FULL_X, b"X"), 1);
+    t.eq(b"rename sub tgt", sys_rename(SUB.as_ptr(), TGT.as_ptr()), 0);
+    t.eq(b"sub gone", stat_r(SUB), ENOENT);
+    t.ok(b"tgt/f", holds(TGT_F, b"SUB"), 0);
+    let r = sys_rename(TGT.as_ptr(), FULL.as_ptr());
+    t.eq(b"over non-empty", r, ENOTEMPTY);
+    // The disk as left, through a new superblock
+    t.eq(b"umount", sys_umount2(DIR.as_ptr(), 0), 0);
+    let r = sys_mount(
+        dev.as_ptr(),
+        DIR.as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    );
+    t.eq(b"remount", r, 0);
+    t.ok(b"b after remount", holds(RB, b"AAA"), 0);
+    t.eq(b"a still gone", stat_r(RA), ENOENT);
+    t.ok(b"tgt/f after remount", holds(TGT_F, b"SUB"), 0);
+    t.eq(b"sub still gone", stat_r(SUB), ENOENT);
+    for f in [RB, TGT_F, FULL_X] {
+        sys_unlink(f.as_ptr());
+    }
+    for d in [TGT, FULL, P1, P2, RO] {
+        sys_rmdir(d.as_ptr());
+    }
     t.done();
 }
