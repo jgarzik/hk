@@ -223,7 +223,7 @@ impl Write for Line {
 }
 
 /// What /proc/net/tcp shows of a connection beyond its addresses (Linux
-/// get_tcp4_sock's READ_ONCE reads), published in the socket's `Snap`
+/// get_tcp4_sock's reads), computed under the socket lock
 #[derive(Clone, Copy, Default)]
 pub(super) struct ProcView {
     /// Linux timer_active: 1 retransmit, 4 zero-window probe, 2
@@ -272,18 +272,26 @@ impl ProcView {
     }
 }
 
-/// A listener or connection line, from the socket's published values
-/// (no socket lock: Linux reads them with READ_ONCE)
+/// A listener or connection line, its values read in one hold of the
+/// socket lock (Linux get_tcp4_sock reads the live fields racily; hk
+/// owns the socket to read them, process context, nothing held)
 fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
     let a = s.inet.get();
     let ino = s.sk.ino.load(Ordering::Relaxed);
     let uid = s.sk.cred.euid;
-    let state = s.state();
-    let v = s.snap.proc_view();
+    let (state, v, rcvq, sndq) = {
+        let g = s.lock_sock();
+        (
+            g.cb.state,
+            ProcView::of(&g.cb),
+            g.cb.rcvq_len(),
+            g.cb.sndq_len(),
+        )
+    };
     let rxq = if state == TcpState::Listen {
         s.queue.lock().as_ref().map_or(0, |q| q.ready.len())
     } else {
-        s.snap.rcvq.load(Ordering::Acquire)
+        rcvq
     };
     let when = if v.tr == 0 {
         0
@@ -300,7 +308,7 @@ fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
         raw(a.daddr),
         a.dport,
         state.linux(),
-        s.snap.sndq.load(Ordering::Acquire),
+        sndq,
         rxq,
         v.tr,
         ticks(when),
@@ -320,7 +328,7 @@ fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
 }
 
 /// A TIME_WAIT line (Linux get_timewait4_sock)
-fn tw_line(m: &mut SeqBuf, i: usize, tw: &super::timewait::TimeWait, now: u64) {
+fn tw_line(i: usize, tw: &super::timewait::TimeWait, now: u64) -> Line {
     let t = &tw.tuple;
     let mut l = Line::new();
     let _ = write!(
@@ -343,34 +351,67 @@ fn tw_line(m: &mut SeqBuf, i: usize, tw: &super::timewait::TimeWait, now: u64) {
         3,
         0
     );
-    l.put(m);
+    l
 }
 
-/// `/proc/net/tcp` of `net`: listeners, then
-/// connections and TIME_WAIT entries, generated under RCU into a
-/// `SeqBuf` (Linux tcp4_seq_show over the hash walk)
+/// One /proc/net/tcp entry, gathered under RCU: a socket (its line made
+/// after, under its lock) or a TIME_WAIT line
+enum Entry {
+    Sock(usize, alloc::sync::Arc<super::TcpSock>),
+    Tw(Line),
+}
+
+/// `/proc/net/tcp` of `net`: listeners, then connections and TIME_WAIT
+/// entries (Linux tcp4_seq_show over the hash walk). The walk is under
+/// RCU, which cannot sleep: it takes references (counted first, room
+/// made with RCU dropped, entries past the room left out as raced),
+/// then each socket's line is made under its socket lock.
 pub fn proc_net_tcp(net: &crate::net::NetNamespace) -> Vec<u8> {
+    let c = core::cell::Cell::new(0usize);
+    {
+        let inc = || c.set(c.get() + 1);
+        let g = crate::sync::rcu::read_lock();
+        net.tcp.walk_rcu(&g, |_| inc(), |_| inc(), |_| inc());
+    }
+    let mut n = c.get();
+    let mut v: Vec<Entry> = Vec::new();
+    if v.try_reserve_exact(n).is_err() {
+        n = 0;
+    }
+    let now = now_ms();
+    {
+        let i = core::cell::Cell::new(0);
+        let v = core::cell::RefCell::new(&mut v);
+        let sk = |s: &super::TcpSock| {
+            let mut v = v.borrow_mut();
+            if v.len() < n
+                && let Some(a) = s.me.upgrade()
+            {
+                v.push(Entry::Sock(i.get(), a));
+                i.set(i.get() + 1);
+            }
+        };
+        let g = crate::sync::rcu::read_lock();
+        net.tcp.walk_rcu(&g, sk, sk, |t| {
+            let mut v = v.borrow_mut();
+            if v.len() < n {
+                v.push(Entry::Tw(tw_line(i.get(), t, now)));
+                i.set(i.get() + 1);
+            }
+        });
+    }
     seq::generate(|m| {
         let mut l = Line::new();
         let _ = l.write_str(
             "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
         );
         l.put(m);
-        let now = now_ms();
-        let i = core::cell::Cell::new(0);
-        let next = || {
-            let n = i.get();
-            i.set(n + 1);
-            n
-        };
-        let g = crate::sync::rcu::read_lock();
-        let m = core::cell::RefCell::new(m);
-        net.tcp.walk_rcu(
-            &g,
-            |s| sock_line(&mut m.borrow_mut(), next(), s, now),
-            |s| sock_line(&mut m.borrow_mut(), next(), s, now),
-            |t| tw_line(&mut m.borrow_mut(), next(), t, now),
-        );
+        for e in &v {
+            match e {
+                Entry::Sock(i, s) => sock_line(m, *i, s, now),
+                Entry::Tw(l) => l.put(m),
+            }
+        }
     })
 }
 

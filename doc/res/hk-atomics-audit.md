@@ -66,21 +66,6 @@ argued / published copy of locked state.
   `waitqueue_active` fast path; drop the global counter (re-check the hash
   instead). LOCKING.md VFS section.
 
-### 10. `TcpSock.snap`: a full published copy of the control block — (e)(c)
-- Where: `net/tcp/mod.rs` `Snap`, `Snap::store` (end of every locked step),
-  `Snap::proc_view`.
-- Wrong: every segment processed recomputes `info::ProcView::of` and stores a
-  large set of fields (spanning cache lines) that only `/proc/net/tcp`
-  reads; poll/wait readers combine `state` and queue sizes from different
-  steps anyway. A second source of truth for TCP state.
-- Linux: no copy. `tcp_poll` READ_ONCEs the real fields (`sk_state`,
-  `rcv_nxt`, `copied_seq`, `write_seq`, `snd_una`); `get_tcp4_sock` reads the
-  live socket racily.
-- Fix: keep only the fields with lockless readers (state, rcvq, sndq,
-  writable, snd_una/snd_max) as Relaxed/Release atomics written where they
-  change; compute the /proc view on demand (briefly taking the socket's
-  slock, or racy reads of the live fields). Update the LOCKING.md table row.
-
 ### 11. Pipe: published ring indices and counts outside the mutex — (e)(b)(a)
 - Where: `io/pipe.rs` `Pipe.head`/`tail`/`max_usage` (copied by
   `PipeGuard::publish` on every unlock), `occupancy`, `ring_full`;
