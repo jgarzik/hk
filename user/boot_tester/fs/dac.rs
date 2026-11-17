@@ -9,7 +9,8 @@
 //! another user's symlink in a sticky world-writable directory
 //! (EACCES), hard-linking a file one may not read and write (EPERM), an
 //! O_CREAT open of another user's existing FIFO or regular file there
-//! (EACCES)
+//! (EACCES); such a symlink crossed on the way to another name is
+//! followed whatever the knob (Linux checks the trailing link only)
 
 use crate::harness::fail_num;
 use crate::helpers::{print, print_num, println};
@@ -719,6 +720,9 @@ fn protected() {
         b"/tmp/dac/prot/f\0".as_ptr(),
         b"/tmp/dac/plain/lnk\0".as_ptr(),
     );
+    // A third user's link to a directory in the sticky one
+    sys_symlink(b"/tmp/dac/plain\0".as_ptr(), b"/tmp/dac/prot/ld\0".as_ptr());
+    hk_syscall::sys_lchown(b"/tmp/dac/prot/ld\0".as_ptr(), OTHER, OTHER);
     mkfile(b"/tmp/dac/hl_src\0", b"y", 0o600, 0);
     for (v, name) in [(0u8, &b"DAC_PROTECTED_OFF"[..]), (1, b"DAC_PROTECTED_ON")] {
         if !set_protected(v) {
@@ -777,5 +781,12 @@ fn t_protected(name: &[u8]) -> u64 {
         0o666,
     ));
     bad += chk(name, b"O_CREAT via link", r, if on { EACCES } else { 0 });
+    // Only the trailing link is checked (Linux pick_link's WALK_TRAILING):
+    // one crossed on the way is followed, the same one last is not
+    let dir = O_RDONLY | O_DIRECTORY;
+    let r = closed(sys_open(b"/tmp/dac/prot/ld/.\0".as_ptr(), dir, 0));
+    bad += chk(name, b"link crossed", r, 0);
+    let r = closed(sys_open(b"/tmp/dac/prot/ld/\0".as_ptr(), dir, 0));
+    bad += chk(name, b"link last", r, if on { EACCES } else { 0 });
     bad
 }

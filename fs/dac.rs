@@ -507,7 +507,8 @@ pub static PROTECTED_CTLS: &[crate::sysctl::Ctl] = &[
 const S_IWOTH: u16 = 0o002;
 const S_IWGRP: u16 = 0o020;
 
-/// Following symlink `link` found in `dir` (Linux may_follow_link): with
+/// Following symlink `link` found in `dir` as the last component of a
+/// walk (Linux may_follow_link, under WALK_TRAILING only): with
 /// fs.protected_symlinks, a link in a sticky world-writable directory
 /// is followed only by its owner or when the directory's owner owns it
 /// (EACCES)

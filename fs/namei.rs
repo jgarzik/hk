@@ -372,7 +372,7 @@ impl Nd {
             let child = step_mounts(Path::new(cur.mnt.clone(), d), f)?;
             let last = next.is_none();
             if (!last || f.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
-                return self.follow_link(&cur, &child, rest, f, depth);
+                return self.follow_link(&cur, &child, rest, last, f, depth);
             }
             cur = child;
         }
@@ -383,20 +383,23 @@ impl Nd {
     }
 
     /// Continue a walk through symlink `link` found in `dir`, with the
-    /// components `rest` still to resolve after it (Linux pick_link)
+    /// components `rest` still to resolve after it (Linux pick_link);
+    /// `last`: no component follows it (WALK_TRAILING)
     fn follow_link(
         &self,
         dir: &Path,
         link: &Path,
         rest: &[u8],
+        last: bool,
         f: LookupFlags,
         depth: usize,
     ) -> Result<Path, KernelError> {
         let inode = link.get_inode().ok_or(KernelError::NotFound)?;
-        // fs.protected_symlinks first, then RESOLVE_NO_SYMLINKS or a
-        // nosymfollow mount (Linux pick_link: may_follow_link, then
-        // LOOKUP_NO_SYMLINKS / MNT_NOSYMFOLLOW on the link's mount)
-        if let Some(d) = dir.dentry.get_inode() {
+        // fs.protected_symlinks for the trailing link only, then
+        // RESOLVE_NO_SYMLINKS or a nosymfollow mount (Linux pick_link:
+        // may_follow_link under WALK_TRAILING, then LOOKUP_NO_SYMLINKS /
+        // MNT_NOSYMFOLLOW on the link's mount)
+        if last && let Some(d) = dir.dentry.get_inode() {
             super::dac::may_follow_link(&self.c, &d, &inode)?;
         }
         if f.no_symlinks || link.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
