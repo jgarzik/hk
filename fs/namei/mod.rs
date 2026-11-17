@@ -421,11 +421,12 @@ impl<'p> RefWalk<'p> {
         })
     }
 
-    /// The current text, and whether nothing follows it below
-    fn text(&self) -> (&[u8], bool) {
+    /// The current text, and whether nothing follows it below; ECHILD
+    /// for a level whose body cannot be read ([`HeldFrame::rest`])
+    fn text(&self) -> Result<(&[u8], bool), KernelError> {
         match self.stack.top() {
-            Some(fr) => (fr.rest(), fr.tail_empty),
-            None => (self.user, true),
+            Some(fr) => Ok((fr.rest()?, fr.tail_empty)),
+            None => Ok((self.user, true)),
         }
     }
 
@@ -433,14 +434,14 @@ impl<'p> RefWalk<'p> {
     /// link_path_walk: put_link, then the saved name below); a slash
     /// after a body's last component asks for a directory, through a
     /// final symlink (lookup_last)
-    fn next(&mut self) -> Option<Comp> {
+    fn next(&mut self) -> Result<Option<Comp>, KernelError> {
         loop {
-            let (t, tail_empty) = self.text();
+            let (t, tail_empty) = self.text()?;
             let Some((name, after)) = next_comp(t) else {
                 if self.stack.pop() {
                     continue;
                 }
-                return None;
+                return Ok(None);
             };
             let at = t.len() - name.len() - after.len();
             let end = t.len() - after.len();
@@ -449,13 +450,13 @@ impl<'p> RefWalk<'p> {
                 self.f.follow = true;
                 self.f.directory = true;
             }
-            return Some(Comp { at, end, last });
+            return Ok(Some(Comp { at, end, last }));
         }
     }
 
     /// The name of `c`
-    fn name(&self, c: &Comp) -> &[u8] {
-        &self.text().0[c.at..c.end]
+    fn name(&self, c: &Comp) -> Result<&[u8], KernelError> {
+        Ok(&self.text()?.0[c.at..c.end])
     }
 
     /// Past `c`
@@ -675,9 +676,9 @@ impl<'a> Nd<'a> {
     /// without LOOKUP_RCU, then lookup_last): a symlink's body is walked
     /// from the link stack, the link held meanwhile
     fn walk_ref(&self, mut cur: Path, w: &mut RefWalk<'_>) -> Result<Path, KernelError> {
-        while let Some(c) = w.next() {
+        while let Some(c) = w.next()? {
             may_lookup(self.cred(), &cur.dentry)?;
-            let d = match w.name(&c) {
+            let d = match w.name(&c)? {
                 b"." => None,
                 b".." => {
                     cur = follow_dotdot(cur, self.root()?, w.f)?;
@@ -738,8 +739,8 @@ impl<'a> Nd<'a> {
             To::Comp(cur) => cur,
             To::Link { cur, link, last } => self.get_link(cur, link, last, &mut w)?,
             To::Lookup(cur) => {
-                let c = w.next().ok_or(ECHILD)?;
-                let d = lookup_slow(&cur.dentry, w.name(&c), w.f)?;
+                let c = w.next()?.ok_or(ECHILD)?;
+                let d = lookup_slow(&cur.dentry, w.name(&c)?, w.f)?;
                 w.advance(&c);
                 self.step(cur, d, c.last, &mut w)?
             }
@@ -749,7 +750,7 @@ impl<'a> Nd<'a> {
                 dots: true,
                 ..
             } => {
-                let c = w.next().ok_or(ECHILD)?;
+                let c = w.next()?.ok_or(ECHILD)?;
                 w.advance(&c);
                 let p = step_mounts(Path::new(cur.mnt.clone(), child), w.f)?;
                 self.recheck()?;
@@ -761,9 +762,9 @@ impl<'a> Nd<'a> {
                 reval,
                 dots: false,
             } => {
-                let c = w.next().ok_or(ECHILD)?;
+                let c = w.next()?.ok_or(ECHILD)?;
                 let d = match reval {
-                    Some(s) => lookup_fast_ref(&cur.dentry, child, w.name(&c), s, w.f)?,
+                    Some(s) => lookup_fast_ref(&cur.dentry, child, w.name(&c)?, s, w.f)?,
                     None => child,
                 };
                 w.advance(&c);
@@ -845,7 +846,7 @@ impl<'a> Nd<'a> {
             pos: 0,
             tail_empty: last,
         };
-        let b = fr.bytes();
+        let b = fr.bytes()?;
         let abs = b.starts_with(b"/");
         let skip = b.iter().position(|&c| c != b'/').unwrap_or(b.len());
         let mut cur = dir;
@@ -854,7 +855,7 @@ impl<'a> Nd<'a> {
             self.jump_root(&cur, w.f)?;
             cur = self.root()?.clone();
         }
-        if !fr.rest().is_empty() {
+        if !fr.rest()?.is_empty() {
             w.stack.push(fr)?;
         }
         Ok(cur)
@@ -1393,6 +1394,37 @@ mod tests {
         assert!(!a.d_unhashed());
         let _ = lookup_fast_ref(&r, a.clone(), b"x", Ok(false), f);
         assert!(a.d_unhashed());
+    }
+
+    /// A link-stack level whose body cannot be read (no body, an inode
+    /// with no `i_link`; a position past its end) fails the walk with
+    /// ECHILD, never walks on as if the body were empty: the name below
+    /// it is not reached
+    #[test]
+    fn unreadable_body_is_echild() {
+        let m = crate::fs::mount::test_mnt();
+        let frame = |body: Option<&[u8]>, inode: Option<InodeRef>, pos| HeldFrame {
+            link: Path::new(m.clone(), m.root.clone()),
+            body: body.map(<[u8]>::to_vec),
+            inode,
+            pos,
+            tail_empty: false,
+        };
+        for fr in [
+            frame(None, Some(inode(VALID)), 0),
+            frame(None, None, 0),
+            frame(Some(b"ab"), None, 3),
+        ] {
+            let mut stack = Held::default();
+            stack.push(fr).unwrap();
+            let mut w = RefWalk {
+                stack,
+                user: b"x",
+                f: LookupFlags::default(),
+                total: 0,
+            };
+            assert_eq!(w.next().err(), Some(ECHILD));
+        }
     }
 
     #[test]

@@ -211,17 +211,20 @@ pub(super) struct HeldFrame {
 }
 
 impl HeldFrame {
-    pub(super) fn bytes(&self) -> &[u8] {
+    /// The body: what ->get_link made, else the link inode's `i_link`;
+    /// ECHILD for a level with neither (one [`HeldFrame::prepare`] did
+    /// not take), never an empty body, which would walk a shorter name
+    pub(super) fn bytes(&self) -> Result<&[u8], KernelError> {
         match (&self.body, &self.inode) {
-            (Some(b), _) => b,
-            (None, Some(i)) => i.i_link().unwrap_or(&[]),
-            (None, None) => &[],
+            (Some(b), _) => Ok(b),
+            (None, Some(i)) => i.i_link().ok_or(ECHILD),
+            (None, None) => Err(ECHILD),
         }
     }
 
-    /// The body from where the walk stands in it
-    pub(super) fn rest(&self) -> &[u8] {
-        self.bytes().get(self.pos..).unwrap_or(&[])
+    /// The body from where the walk stands in it; ECHILD past its end
+    pub(super) fn rest(&self) -> Result<&[u8], KernelError> {
+        self.bytes()?.get(self.pos..).ok_or(ECHILD)
     }
 
     /// An RCU walk's level in ref mode: the held link's inode, whose
