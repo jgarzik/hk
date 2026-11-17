@@ -3138,7 +3138,10 @@ writing; the lookup reads it with the find under that lock held for
 reading); cgroupfs's (`Cgroup.rev`: bumped under the `children` or
 `subsys` lock held for writing as a child or a controller's files come
 or go; the lookup reads it, Acquire, before it looks, so a change after
-the read leaves the stamp stale). Asked by an RCU walk (`LookupBits::RCU`,
+the read leaves the stamp stale). A positive cgroupfs dentry is
+checked in ref mode only (kernfs_dop_revalidate's active, parent and
+name checks: `still_there`): the cgroup's `dead` flag, the parent's
+`children` and the cgroup's `subsys` each taken for reading, alone. Asked by an RCU walk (`LookupBits::RCU`,
 Linux LOOKUP_RCU; and a permission check's MAY_NOT_BLOCK) the dentry,
 directory and inode are borrowed under the guard with no reference and may be
 torn down already: the answer may read only fields with no drop glue

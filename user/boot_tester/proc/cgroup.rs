@@ -32,7 +32,9 @@ pub fn run_tests() {
 /// (Linux cgrp_dfl_root): a name that failed in one (a negative dentry,
 /// kept while its directory's revision stands: kernfs_iop_lookup,
 /// kernfs_dop_revalidate) is found once the other makes it, its control
-/// files too
+/// files too; a cgroup removed through one is gone from the other
+/// (kernfs_dop_revalidate: its node is no longer active), though that
+/// one cached it
 fn two_mounts() {
     let mut t = T::new(b"CGROUPFS_TWO_MOUNTS");
     let (a, b) = (b"/tmp/cga\0", b"/tmp/cgb\0");
@@ -67,7 +69,9 @@ fn two_mounts_cases(t: &mut T) {
     );
     t.eq(b"found in b", sys_stat(bx, &mut st), 0);
     t.eq(b"its file in b", sys_stat(bp, &mut st), 0);
-    sys_rmdir(b"/tmp/cga/tm2\0".as_ptr());
+    t.eq(b"rmdir in a", sys_rmdir(b"/tmp/cga/tm2\0".as_ptr()), 0);
+    t.eq(b"gone from b", sys_stat(bx, &mut st), ENOENT);
+    t.eq(b"its file gone", sys_stat(bp, &mut st), ENOENT);
 }
 
 /// Mount cgroupfs at /sys/fs/cgroup (sysfs's mount point)

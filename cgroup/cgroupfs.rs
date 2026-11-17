@@ -804,8 +804,9 @@ static CGROUPFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOp
 
 /// Linux kernfs_dop_revalidate: ECHILD in an RCU walk; a negative
 /// dentry is valid while its directory's revision is the one its
-/// lookup saw (kernfs_dir_changed); a positive one stays (a removed
-/// cgroup's leaves the tree at its rmdir)
+/// lookup saw (kernfs_dir_changed); a positive one while its node is
+/// active and still that directory's child of that name
+/// ([`still_there`])
 fn cgroupfs_revalidate(
     dir: &Inode,
     d: &Dentry,
@@ -815,10 +816,41 @@ fn cgroupfs_revalidate(
     if flags.contains(crate::fs::dentry::LookupBits::RCU) {
         return Err(KernelError::NoChild);
     }
-    if inode.is_some() {
-        return Ok(true);
+    match inode {
+        Some(i) => Ok(still_there(dir, d, i)),
+        None => Ok(cgroup_of(dir).is_none_or(|c| c.rev() == d.d_time())),
     }
-    Ok(cgroup_of(dir).is_none_or(|c| c.rev() == d.d_time()))
+}
+
+/// kernfs_dop_revalidate's checks of a positive cgroupfs dentry `d` of
+/// `inode` in `dir`: its cgroup is not removed (kernfs_active: an
+/// rmdir through another mount, which keeps its own dentries, leaves
+/// this one stale), and it is still `dir`'s entry of that name: a
+/// child cgroup that parent's child by the dentry's name, a control
+/// file its own directory's, a controller's file while the controller
+/// is enabled there (Linux css_clear_dir removes its nodes)
+fn still_there(dir: &Inode, d: &Dentry, inode: &Inode) -> bool {
+    let Some(p) = inode.get_private() else {
+        return false;
+    };
+    let Some(data) = p.as_any().downcast_ref::<CgroupfsInodeData>() else {
+        return false;
+    };
+    let (Some(cg), Some(parent)) = (data.cgroup(), cgroup_of(dir)) else {
+        return false;
+    };
+    if cg.is_dead() {
+        return false;
+    }
+    match data {
+        CgroupfsInodeData::Directory { .. } => parent
+            .lookup_child(&d.name())
+            .is_some_and(|c| Arc::ptr_eq(&c, &cg)),
+        CgroupfsInodeData::ControlFile { .. } => Arc::ptr_eq(&parent, &cg),
+        CgroupfsInodeData::SubsysFile { controller, .. } => {
+            Arc::ptr_eq(&parent, &cg) && cg.css(*controller).is_some()
+        }
+    }
 }
 
 /// The root directory, the root cgroup's

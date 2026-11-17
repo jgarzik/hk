@@ -678,10 +678,6 @@ waiting).
 
 **Location**: `fs/namei/`
 
-- cgroupfs's ref-mode d_revalidate keeps every positive dentry;
-  Linux kernfs_dop_revalidate also checks the node is active and still
-  that parent's child of that name (a removed cgroup's dentry goes at
-  its rmdir in hk).
 - tracefs is kernfs-based and revalidates as kernfs (ECHILD under
   LOOKUP_RCU, `kernfs::vfs::KERNFS_DOPS`); Linux tracefs_d_revalidate
   answers in RCU mode (stale only for a freed eventfs entry), so
