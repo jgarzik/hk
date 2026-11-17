@@ -941,11 +941,12 @@ pub struct Task {
     pub thread_node: crate::util::list::Link,
     thread_owner: crate::util::list::Owner,
     /// A group leader's place on its process group's `Pid.pgrp` (Linux
-    /// pid_links[PIDTYPE_PGID]; under TASKLIST)
-    pub pgrp_link: crate::util::list::Link,
+    /// pid_links[PIDTYPE_PGID]: changed under TASKLIST's write lock,
+    /// read under it or RCU)
+    pub pgrp_link: crate::util::rcuhlist::HNode,
     /// A group leader's place on its session's `Pid.session` (Linux
-    /// pid_links[PIDTYPE_SID]; under TASKLIST)
-    pub session_link: crate::util::list::Link,
+    /// pid_links[PIDTYPE_SID]), likewise
+    pub session_link: crate::util::rcuhlist::HNode,
     /// The real parent (Linux real_parent): the task whose `children`
     /// list holds this one's group leader; null for init and kernel
     /// threads. No reference: valid while this task is listed (type
@@ -971,12 +972,17 @@ pub struct Task {
     /// Releases the task list's reference a grace period after it is
     /// unlisted (type invariant)
     rcu: crate::sync::rcu::RcuHead,
+    /// The group and session lists' references, dropped a grace period
+    /// after the task leaves a list (`put_rcu`; it may leave and join
+    /// lists several times within one: setpgid)
+    rcu_puts: crate::sync::rcu::RcuPuts,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner>>,
 }
 
 crate::rcu_head!(Task, rcu);
+crate::rcu_puts!(Task, rcu_puts);
 
 /// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner {
@@ -1711,13 +1717,14 @@ impl Task {
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
             thread_owner: crate::util::list::Owner::new(),
-            pgrp_link: crate::util::list::Link::new(),
-            session_link: crate::util::list::Link::new(),
+            pgrp_link: crate::util::rcuhlist::HNode::new(),
+            session_link: crate::util::rcuhlist::HNode::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
             ptracer: crate::sync::rcu::RcuPtr::null(),
             pgrp: crate::sync::rcu::RcuLockedArc::none(),
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
+            rcu_puts: crate::sync::rcu::RcuPuts::new(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1781,13 +1788,14 @@ impl Task {
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
             thread_owner: crate::util::list::Owner::new(),
-            pgrp_link: crate::util::list::Link::new(),
-            session_link: crate::util::list::Link::new(),
+            pgrp_link: crate::util::rcuhlist::HNode::new(),
+            session_link: crate::util::rcuhlist::HNode::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
             ptracer: crate::sync::rcu::RcuPtr::null(),
             pgrp: crate::sync::rcu::RcuLockedArc::none(),
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
+            rcu_puts: crate::sync::rcu::RcuPuts::new(),
             inner: TableCell::new(None),
         }
     }

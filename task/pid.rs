@@ -28,9 +28,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::ns::{Namespace, PidNamespace};
 use crate::sync::spin::Mutex;
-use crate::task::TableCell;
-use crate::task::percpu::{PgrpLink, SessionLink};
-use crate::util::list::List;
+use crate::task::percpu::{GlobalTaskTable, PgrpLink, SessionLink};
+use crate::util::rcuhlist::RcuHList;
 
 /// Ids per bitmap page (Linux BITS_PER_PAGE)
 const PER_PAGE: u32 = 4096 * 8;
@@ -71,14 +70,16 @@ pub struct Pid {
     task: crate::sync::rcu::RcuPtr<crate::task::Task>,
     /// The process group whose id this is: its member processes'
     /// group leaders (Linux pid->tasks[PIDTYPE_PGID]; links
-    /// `Task.pgrp_link`), changed under TASKLIST's write lock and
-    /// walked under its read lock. Every thread of a member holds a
-    /// reference to this `Pid` (`TaskInner.pgrp`), so it outlives its
-    /// group.
-    pub(crate) pgrp: TableCell<List<PgrpLink>>,
+    /// `Task.pgrp_link`, a reference each, released a grace period
+    /// after the leader leaves it), changed under TASKLIST's write lock
+    /// and walked under it or an RCU read guard ([`Pid::pgrp_task`],
+    /// Linux pid_task(pid, PIDTYPE_PGID)). Every thread of a member
+    /// holds a reference to this `Pid` (`Task.pgrp`), so it outlives
+    /// its group.
+    pub(crate) pgrp: RcuHList<PgrpLink, GlobalTaskTable>,
     /// The session whose id this is, likewise (Linux
     /// pid->tasks[PIDTYPE_SID]; links `Task.session_link`)
-    pub(crate) session: TableCell<List<SessionLink>>,
+    pub(crate) session: RcuHList<SessionLink, GlobalTaskTable>,
     /// pidfd pollers of the task it names (Linux wait_pidfd): woken
     /// under TASKLIST when it exits and when it is released
     pub wait_pidfd: crate::sync::waitqueue::WaitQueue,
@@ -145,6 +146,16 @@ impl Pid {
     /// yet attached, or released, is false
     pub fn has_task(&self) -> bool {
         !self.task.as_ptr().is_null()
+    }
+
+    /// A group leader of the process group it names, no reference
+    /// taken (Linux pid_task(pid, PIDTYPE_PGID) under rcu_read_lock):
+    /// it stays allocated while `g` is held
+    pub fn pgrp_task<'a>(
+        &'a self,
+        g: &'a crate::sync::rcu::RcuReadGuard,
+    ) -> Option<&'a crate::task::Task> {
+        self.pgrp.iter(g).next()
     }
 
     /// The task it names, no reference taken (Linux pid_task(pid,
@@ -410,8 +421,8 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
         task: crate::sync::rcu::RcuPtr::null(),
-        pgrp: TableCell::new(List::new()),
-        session: TableCell::new(List::new()),
+        pgrp: RcuHList::new(),
+        session: RcuHList::new(),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(true),
@@ -554,8 +565,8 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
             pid: AtomicPtr::new(core::ptr::null_mut()),
         }]),
         task: crate::sync::rcu::RcuPtr::null(),
-        pgrp: TableCell::new(List::new()),
-        session: TableCell::new(List::new()),
+        pgrp: RcuHList::new(),
+        session: RcuHList::new(),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(false),

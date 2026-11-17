@@ -651,8 +651,8 @@ pub struct GlobalTaskTable {
 }
 
 crate::adapter!(TasksAdapter, Task, tasks_link);
-crate::adapter!(pub PgrpLink, Task, pgrp_link);
-crate::adapter!(pub SessionLink, Task, session_link);
+crate::hadapter!(pub PgrpLink, Task, pgrp_link);
+crate::hadapter!(pub SessionLink, Task, session_link);
 
 /// A new reference to a task that lives in an `Arc` (every task but the
 /// boot task does: the table and run queues hold `TaskRef`s); one
@@ -1259,7 +1259,7 @@ impl GlobalTaskTable {
         &'a self,
         pg: &'a crate::task::pid::Pid,
     ) -> impl Iterator<Item = TaskView<'a>> + 'a {
-        pg.pgrp.access(self).iter().map(move |t| view(self, t))
+        pg.pgrp.iter_locked(self).map(move |t| view(self, t.item()))
     }
 
     /// The group leaders in session `s` (Linux do_each_pid_task(s,
@@ -1268,7 +1268,9 @@ impl GlobalTaskTable {
         &'a self,
         s: &'a crate::task::pid::Pid,
     ) -> impl Iterator<Item = TaskView<'a>> + 'a {
-        s.session.access(self).iter().map(move |t| view(self, t))
+        s.session
+            .iter_locked(self)
+            .map(move |t| view(self, t.item()))
     }
 
     /// The threads of every process in group `pg` (Linux
@@ -1309,12 +1311,9 @@ impl GlobalTaskTable {
             return;
         };
         self.inner_mut_of(t).pids_linked = true;
-        // SAFETY: `t` stays live while in the table and leaves these
-        // lists before it (`remove`)
-        unsafe {
-            pg.pgrp.access_mut(self).push_back(t);
-            s.session.access_mut(self).push_back(t);
-        }
+        // Each list holds a reference (Linux hlist_add_head_rcu)
+        pg.pgrp.add_head(task_ref(t), self);
+        s.session.add_head(task_ref(t), self);
     }
 
     /// Take `t` off its process group's and session's lists (Linux
@@ -1325,11 +1324,13 @@ impl GlobalTaskTable {
             return;
         }
         if let (Some(pg), Some(s)) = (t.pgrp.get_protected(self), t.session.get_protected(self)) {
-            // SAFETY: linked means on both lists
-            unsafe {
-                pg.pgrp.access_mut(self).remove(t);
-                s.session.access_mut(self).remove(t);
-            }
+            // RCU readers may stand on it: the lists' references go a
+            // grace period later (Linux hlist_del_rcu; the task outlives
+            // them by its own rule)
+            let (p, q) = (pg.pgrp.del_init(t, self), s.session.del_init(t, self));
+            debug_assert!(p.is_some() && q.is_some(), "linked: on both lists");
+            p.into_iter().for_each(|r| r.defer_put());
+            q.into_iter().for_each(|r| r.defer_put());
         }
     }
 
@@ -1337,7 +1338,7 @@ impl GlobalTaskTable {
     /// pid, none heads or belongs to the group or session it names
     /// (Linux detach_pid -> free_pid when every pid type's list is empty)
     fn release_unused(&self, p: &crate::task::pid::Pid) {
-        if !p.has_task() && p.pgrp.access(self).is_empty() && p.session.access(self).is_empty() {
+        if !p.has_task() && p.pgrp.is_empty() && p.session.is_empty() {
             p.release_numbers();
         }
     }

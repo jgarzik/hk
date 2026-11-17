@@ -187,7 +187,9 @@ fn owner_nr(o: &Owner) -> i32 {
             let g = crate::sync::rcu::read_lock();
             pid.task(&g).is_some_and(|t| t.tid() == t.pid)
         }
-        PidType::Pgrp => TASKLIST.read().pgrp(pid).next().is_some(),
+        // Under RCU: a leader is on the group's list (Linux
+        // pid_task(pid, PIDTYPE_PGID))
+        PidType::Pgrp => pid.pgrp_task(&crate::sync::rcu::read_lock()).is_some(),
     };
     if live { pid.vnr() as i32 } else { 0 }
 }
