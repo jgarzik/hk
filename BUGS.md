@@ -1142,6 +1142,14 @@ Tag = roadmap phase (doc/ROADMAP.md).
     pressure: a forced charge for an empty queue, or the window or
     retransmit timer after a drop, may not restart it.
 
+14. **FD_ALLOC_SCALE flake on Linux** (`check-linux`, under host load):
+    `FD_ALLOC_SCALE:FAIL 5`: the batch of dup()s at ~33000 descriptors
+    took 4x or more the batch at ~2000 on the reference Linux; uncached
+    reruns pass. The ratio of two wall-clock timings
+    (`user/boot_tester/io/fd_scale.rs` `batch_ns`, best of three) is
+    taken minutes apart in time and absorbs host contention; interleave
+    the low and high batches, or compare more tries.
+
 ## Kernel stack frames
 
 **Location**: `task/fork.rs`, others named below
