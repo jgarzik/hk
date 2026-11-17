@@ -1040,6 +1040,7 @@ Each `PerCpu` (per-CPU data) contains:
 pub interrupt_depth: AtomicU32,   // Nesting depth of interrupts
 pub irq_user: AtomicBool,         // The interrupt came from user mode (3.5)
 pub preempt_count: AtomicU32,     // Preemption disable count
+pub fpsimd_last_state: AtomicPtr<UserFpsimdState>, // arm64: user FP state bound to the registers (rule 7)
 ```
 
 Each `Task` carries `thread_flags` (Linux TIF_*): TIF_NEED_RESCHED is
@@ -1131,21 +1132,34 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    its TLS and GS base are saved by its switch-out, which may still be
    finishing on another CPU.
 
-7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
-   lock is involved; the state always lives with the task it belongs to:
-   - x86-64: the kernel is soft-float and never touches x87/XMM/YMM, so a
-     task's user FP state stays in the registers while it is in the kernel.
-     `context_switch` XSAVEs (or FXSAVEs) it into an area on the outgoing
-     task's kernel stack and XRSTORs it when that task runs again; a fork
-     child gets the parent's state just below its pt_regs
-     (`SchedArch::clone_child_fpu`), loaded by `ret_from_fork`.
-   - aarch64: the kernel uses NEON, so every exception entry (EL0 and EL1)
-     saves q0-q31/FPCR/FPSR in its trap frame and restores them on exit;
-     the EL0 frame (the task's pt_regs, rule 6) holds the user FP state.
-     `__switch_to_asm` preserves d8-d15.
-   Signal frames, fork and execve read/write the state in these places;
-   nothing may use user FP registers between a context switch's save and
-   the task's next return to user mode except through them.
+7. **User FP/SIMD state stays in the registers while its task is in the
+   kernel** - the kernel never touches them (x86-64 soft-float, arm64
+   general-regs-only), so no exception entry saves them; no lock is
+   involved:
+   - x86-64: `context_switch` XSAVEs (or FXSAVEs) the outgoing task's
+     state into an area on its kernel stack and XRSTORs it when that task
+     runs again (eager); a fork child gets the parent's state just below
+     its pt_regs (`SchedArch::clone_child_fpu`), loaded by
+     `ret_from_fork`.
+   - aarch64 (Linux fpsimd.c, lazy restore): the switch saves the
+     outgoing task's registers through this CPU's binding
+     `fpsimd_last_state` (its `Task.thread`) unless its
+     TIF_FOREIGN_FPSTATE says they are not its own, and sets the incoming
+     task's TIF_FOREIGN_FPSTATE unless the binding names its state and
+     its `fpsimd_cpu` names this CPU (`fpsimd::thread_switch`, interrupts
+     off under the rq lock, before `make_current`: `current` is still
+     the outgoing task, as in Linux __switch_to). The
+     return to user mode loads a foreign state and binds it to the CPU
+     (`exit_to_user_mode_work`). Signal delivery, rt_sigreturn and fork
+     first save and unbind the live registers
+     (`save_and_flush_current_state`), exec zeroes the state
+     (`flush_thread`); from then until the return to user mode the
+     memory copy is the task's state. Each claims the CPU's FP context
+     with preemption disabled (Linux get_cpu_fpsimd_context, PREEMPT_RT
+     form: hk has no softirqs and no kernel-mode NEON);
+     `fpsimd_last_state` is this CPU's alone, written and read under it.
+     A new task's `fpsimd_cpu` names no CPU, so a reused task address
+     never matches a stale `fpsimd_last_state`.
 
 8. **Dead tasks are freed by the next task (Linux finish_task_switch)** -
    `exit_current` cannot free the kernel stack it runs on, nor the

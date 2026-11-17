@@ -106,6 +106,18 @@ pub use aarch64::percpu::{
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::ptrace;
 
+// A task's arch thread state and its switch, fork, exec and return to
+// user mode work (Linux thread_struct, __switch_to, arch_dup_task_struct,
+// flush_thread, arch_exit_to_user_mode_work)
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::fpsimd::{
+    EXIT_WORK, ThreadStruct, dup_thread, exit_to_user_mode_work, flush_thread, thread_switch,
+};
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::process::{
+    EXIT_WORK, ThreadStruct, dup_thread, exit_to_user_mode_work, flush_thread, thread_switch,
+};
+
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::ptrace;
 

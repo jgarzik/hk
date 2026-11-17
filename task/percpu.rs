@@ -2935,6 +2935,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         )
     })?;
     child_task.se.stack.set(stack);
+    // The parent's thread state (Linux arch_dup_task_struct): arm64 its
+    // user FP/SIMD state
+    // SAFETY: our child, not yet on a run queue
+    unsafe { crate::arch::dup_thread(&child_task) };
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
@@ -3853,6 +3857,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
     });
 
     let next = rq.pick_next();
+    // The arch thread state while `current` is still the outgoing task
+    // (Linux __switch_to: fpsimd_thread_switch)
+    // SAFETY: interrupts off (the rq lock), the switch to `next`, a task
+    // of this run queue (alive while it holds it, not running), follows
+    unsafe { crate::arch::thread_switch(&*next) };
     // SAFETY: a task of this run queue, alive while it holds it
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(&mut rq, unsafe { &*next });
     rq.curr = next;
@@ -3967,6 +3976,11 @@ fn context_switch_locked(
     if prev.se.on_rq() {
         rq.update_curr(crate::time::monotonic_ns());
     }
+    // The arch thread state while `current` is still `prev` (Linux
+    // __switch_to: fpsimd_thread_switch)
+    // SAFETY: interrupts off (the rq lock), the switch to `n` (not
+    // running) follows
+    unsafe { crate::arch::thread_switch(n) };
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(&mut rq, n);
     rq.curr = next;
     rq.prev = prev;
@@ -5756,6 +5770,11 @@ pub fn try_schedule() {
     }
     let mut rq = sched.lock.lock();
     let next = rq.pick_next();
+    // The arch thread state while `current` is still the outgoing task
+    // (Linux __switch_to: fpsimd_thread_switch)
+    // SAFETY: interrupts off (the rq lock), the switch to `next`, a task
+    // of this run queue (alive while it holds it, not running), follows
+    unsafe { crate::arch::thread_switch(&*next) };
     // SAFETY: a task of this run queue, alive while it holds it
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(&mut rq, unsafe { &*next });
     rq.curr = next;

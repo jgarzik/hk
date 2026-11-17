@@ -16,7 +16,9 @@
 //!   place; `do_signal` puts the old one back;
 //! - TIF_NOTIFY_RESUME: work queued for the return: callbacks queued
 //!   with `Twa::Resume` (`task_work_run`: a file's deferred release),
-//!   CPU-time timers the tick found due (`cpu_timer::run`).
+//!   CPU-time timers the tick found due (`cpu_timer::run`);
+//! - the arch's (`arch::EXIT_WORK`): arm64 TIF_FOREIGN_FPSTATE, the
+//!   task's FP/SIMD state to load (`arch::exit_to_user_mode_work`).
 //!
 //! So a task spinning in user mode still takes SIGKILL or a handler
 //! (the next tick or a kick IPI interrupts it, and the interrupt returns
@@ -28,7 +30,8 @@ use crate::arch::{CpuOps, CurrentArch, UserFrame};
 use crate::task::tif;
 
 /// Work for the return to user mode (Linux EXIT_TO_USER_MODE_WORK)
-const EXIT_WORK: u32 = tif::NEED_RESCHED | SIGNAL_WORK | tif::NOTIFY_RESUME;
+const EXIT_WORK: u32 =
+    tif::NEED_RESCHED | SIGNAL_WORK | tif::NOTIFY_RESUME | crate::arch::EXIT_WORK;
 
 /// Work `do_signal` handles (queued callbacks first, Linux get_signal)
 const SIGNAL_WORK: u32 = tif::SIGPENDING | tif::RESTORE_SIGMASK | tif::NOTIFY_SIGNAL;
@@ -58,6 +61,8 @@ pub fn exit_to_user_mode(regs: &UserFrame) {
             // CPU-time timers the tick found due (cpu_timer)
             crate::time::cpu_timer::run();
         }
+        // Linux arch_exit_to_user_mode_work
+        crate::arch::exit_to_user_mode_work(work);
         CurrentArch::disable_interrupts();
     }
     check_user_return();

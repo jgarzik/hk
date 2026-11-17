@@ -78,8 +78,6 @@ pub struct Aarch64TaskContext {
     pub lr: u64,
     /// Stack pointer
     pub sp: u64,
-    /// Callee-saved FP registers d8-d15 (AAPCS64)
-    pub d8_d15: [u64; 8],
 }
 
 impl Aarch64TaskContext {
@@ -157,9 +155,10 @@ extern "C" fn kernel_thread_exit(_status: i64) {
 /// Entry point for cloned threads/processes (Linux ret_from_fork)
 ///
 /// The initial "return" target of a clone/fork child's first switch: SP
-/// is its pt_regs (a copy of the parent's syscall frame, x0 = 0, the
-/// FP/SIMD state included) at the top of its kernel stack. The switch
-/// loaded its address space and TLS register.
+/// is its pt_regs (a copy of the parent's syscall frame, x0 = 0) at the
+/// top of its kernel stack. The switch loaded its address space and TLS
+/// register; its FP/SIMD state is loaded on its way out
+/// (`fpsimd::exit_to_user_mode_work`).
 #[unsafe(naked)]
 pub extern "C" fn clone_child_entry() -> ! {
     core::arch::naked_asm!(

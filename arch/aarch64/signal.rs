@@ -19,8 +19,8 @@
 //! }                             <- handler's sp
 //! ```
 //!
-//! The FP/SIMD registers come from (and rt_sigreturn writes them back to)
-//! the task's EL0 trap frame, where they live while it is in the kernel.
+//! The FP/SIMD record comes from (and rt_sigreturn writes it back to) the
+//! task's saved FP/SIMD state (`fpsimd`), saved from the registers first.
 
 use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{
@@ -28,7 +28,9 @@ use crate::signal::{
 };
 use crate::uaccess::{access_ok, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
-use crate::util::pod::{FromBytes, IntoBytes};
+use crate::util::pod::{FromBytes, IntoBytes, Pod};
+
+use super::fpsimd::UserFpsimdState;
 
 // =============================================================================
 // Signal Context (sigcontext)
@@ -143,21 +145,24 @@ struct CtxHead {
 }
 crate::pod!(CtxHead { magic, size });
 
-/// FP/SIMD record (struct fpsimd_context)
+/// FP/SIMD record (struct fpsimd_context): `FpsimdHead`, then the vector
+/// registers
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FpsimdContext {
+    head: FpsimdHead,
+    vregs: [u128; 32],
+}
+
+/// The FP/SIMD record up to its vector registers
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FpsimdHead {
     head: CtxHead,
     fpsr: u32,
     fpcr: u32,
-    vregs: [u128; 32],
 }
-crate::pod!(FpsimdContext {
-    head,
-    fpsr,
-    fpcr,
-    vregs
-});
+crate::pod!(FpsimdHead { head, fpsr, fpcr });
 
 /// Fault syndrome record (struct esr_context)
 #[repr(C)]
@@ -211,14 +216,16 @@ const PSTATE_SS: u64 = 1 << 21;
 /// PSTATE.BTYPE: the branch type of the last indirect branch (BTI)
 const PSTATE_BTYPE: u64 = 3 << 10;
 
-/// Set up signal frame on user stack
+/// Set up signal frame on user stack (Linux setup_rt_frame)
 ///
 /// This function:
-/// 1. Calculates frame location on the user stack or the alternate one
+/// 1. Saves the live FP/SIMD registers into the task (they are written
+///    to the frame from there)
+/// 2. Calculates frame location on the user stack or the alternate one
 ///    `alt` (Linux get_sigframe)
-/// 2. Builds siginfo and ucontext (with the FP/SIMD record) from saved registers
-/// 3. Writes frame to user memory
-/// 4. Redirects the task's pt_regs (`regs`) to the handler
+/// 3. Writes the ucontext (`setup_sigframe`) and siginfo to user memory
+/// 4. Redirects the task's pt_regs (`uframe`) to the handler
+///    (`setup_return`)
 ///
 /// On aarch64:
 /// - x0 = signal number
@@ -228,6 +235,7 @@ const PSTATE_BTYPE: u64 = 3 << 10;
 /// - x30 (LR) = restorer trampoline
 /// - PC = handler
 ///
+/// The handler starts with the interrupted code's FP/SIMD registers.
 /// Returns Ok(()) on success, Err(errno) on failure.
 pub fn setup_rt_frame(
     sig: Signal,
@@ -238,14 +246,7 @@ pub fn setup_rt_frame(
     alt: &AltStack,
     uframe: &crate::arch::UserFrame,
 ) -> KernelResult<()> {
-    // A copy, written back once the handler frame is in place
-    let mut r = uframe.get();
-    let regs = &mut r;
-    // The interrupted user context (the task's pt_regs)
-    let user_elr = regs.elr;
-    let user_spsr = regs.spsr;
-    let user_sp = regs.sp;
-    let user_regs = regs.x;
+    super::fpsimd::save_and_flush_current_state();
 
     // Get handler address
     let SigHandler::Handler(handler) = action.handler else {
@@ -267,24 +268,59 @@ pub fn setup_rt_frame(
         page
     };
 
-    let (record_addr, frame_addr) = get_sigframe(user_sp, action, alt)?;
+    let (record_addr, frame_addr) = get_sigframe(uframe.sp(), action, alt)?;
+    setup_sigframe(frame_addr, record_addr, blocked, trap, alt, uframe)?;
+    let info_addr = frame_addr + core::mem::offset_of!(RtSigFrame, info) as u64;
+    if copy_to_user(info_addr, info.to_user().as_bytes()).is_err() {
+        return Err(KernelError::BadAddress);
+    }
+    setup_return(sig, handler, restorer, frame_addr, record_addr, uframe);
+    Ok(())
+}
+
+/// The ucontext of the frame at `frame_addr` (Linux setup_sigframe and
+/// setup_rt_frame's uc_flags, uc_link, altstack) from the interrupted
+/// registers in `uframe` and the task's saved FP/SIMD state, then the
+/// other `__reserved` records and the frame record at `record_addr`
+fn setup_sigframe(
+    frame_addr: u64,
+    record_addr: u64,
+    blocked: SigSet,
+    trap: &Trap,
+    alt: &AltStack,
+    uframe: &crate::arch::UserFrame,
+) -> KernelResult<()> {
+    // SAFETY: loads from the frame, nothing called
+    let (regs, sp, pc, pstate) = unsafe { uframe.with(|r| (r.x, r.sp, r.elr, r.spsr)) };
+    // Frame record for unwinders: {x29, x30} of the interrupted code
+    let record = [regs[29], regs[30]];
+    if copy_to_user(record_addr, record.as_bytes()).is_err() {
+        return Err(KernelError::BadAddress);
+    }
+    let uc = UContext {
+        uc_stack: alt.save(),
+        uc_sigmask: blocked,
+        uc_mcontext: SigContext {
+            // The last fault's FAR (Linux thread.fault_address)
+            fault_address: trap.addr,
+            regs,
+            sp,
+            pc,
+            pstate,
+            _pad: 0,
+        },
+        ..FromBytes::zeroed()
+    };
+    let uc_addr = frame_addr + core::mem::offset_of!(RtSigFrame, uc) as u64;
+    if copy_to_user(uc_addr, uc.as_bytes()).is_err() {
+        return Err(KernelError::BadAddress);
+    }
 
     // __reserved: the FP/SIMD record of the interrupted code, an
     // esr_context for faults, then the terminating null record
-    let fpsimd = FpsimdContext {
-        head: CtxHead {
-            magic: FPSIMD_MAGIC,
-            size: FPSIMD_SIZE as u32,
-        },
-        fpsr: regs.fpsr,
-        fpcr: regs.fpcr,
-        vregs: regs.v,
-    };
     let reserved_addr = frame_addr + RESERVED_OFFSET as u64;
+    preserve_fpsimd_context(reserved_addr)?;
     let mut end = reserved_addr + FPSIMD_SIZE as u64;
-    if copy_to_user(reserved_addr, fpsimd.as_bytes()).is_err() {
-        return Err(KernelError::BadAddress);
-    }
     if trap.error != 0 {
         let esr = EsrContext {
             head: CtxHead {
@@ -301,57 +337,61 @@ pub fn setup_rt_frame(
     if copy_to_user(end, CtxHead::default().as_bytes()).is_err() {
         return Err(KernelError::BadAddress);
     }
+    Ok(())
+}
 
-    // Frame record for unwinders: {x29, x30} of the interrupted code
-    let record = [user_regs[29], user_regs[30]];
-    if copy_to_user(record_addr, record.as_bytes()).is_err() {
-        return Err(KernelError::BadAddress);
-    }
-
-    // Build the frame header (siginfo + ucontext up to __reserved)
-    let fault_address = trap.addr;
-    let frame = RtSigFrame {
-        info: info.to_user(),
-        uc: UContext {
-            uc_stack: alt.save(),
-            uc_sigmask: blocked,
-            uc_mcontext: SigContext {
-                // The last fault's FAR (Linux thread.fault_address)
-                fault_address,
-                regs: user_regs,
-                sp: user_sp,
-                pc: user_elr,
-                pstate: user_spsr,
-                _pad: 0,
+/// The fpsimd_context record at `addr` from the task's saved FP/SIMD
+/// state (Linux preserve_fpsimd_context; `setup_rt_frame` saved it)
+fn preserve_fpsimd_context(addr: u64) -> KernelResult<()> {
+    let vregs = addr + core::mem::offset_of!(FpsimdContext, vregs) as u64;
+    let write = |st: &UserFpsimdState| {
+        let head = FpsimdHead {
+            head: CtxHead {
+                magic: FPSIMD_MAGIC,
+                size: FPSIMD_SIZE as u32,
             },
-            ..FromBytes::zeroed()
-        },
+            fpsr: st.fpsr,
+            fpcr: st.fpcr,
+        };
+        copy_to_user(addr, head.as_bytes()).is_ok()
+            && copy_to_user(vregs, st.vregs.as_bytes()).is_ok()
     };
-    if copy_to_user(frame_addr, frame.as_bytes()).is_err() {
+    // SAFETY: `write` only reads the state
+    if !unsafe { super::fpsimd::with_current_state(write) } {
         return Err(KernelError::BadAddress);
     }
+    Ok(())
+}
 
-    // Calculate addresses of info and ucontext within the frame
+/// Redirect the return to user mode to `handler` (Linux setup_return),
+/// its frame at `frame_addr`
+fn setup_return(
+    sig: Signal,
+    handler: u64,
+    restorer: u64,
+    frame_addr: u64,
+    record_addr: u64,
+    uframe: &crate::arch::UserFrame,
+) {
     let info_addr = frame_addr + core::mem::offset_of!(RtSigFrame, info) as u64;
     let uc_addr = frame_addr + core::mem::offset_of!(RtSigFrame, uc) as u64;
-
-    // Redirect the return to user mode to the handler (Linux
-    // setup_return)
-    regs.sp = frame_addr;
-    regs.elr = handler;
-    // The handler is not entered by an indirect branch (Linux
-    // setup_return clears BTYPE)
-    regs.spsr &= !PSTATE_BTYPE;
-    regs.x[0] = u64::from(sig.nr()); // x0 = signal number
-    regs.x[1] = info_addr; // x1 = &siginfo
-    regs.x[2] = uc_addr; // x2 = &ucontext
-    regs.x[29] = record_addr; // x29 = frame record
-    regs.x[30] = restorer; // x30 (LR) = restorer
-    // Clear other argument registers for security
-    regs.x[3..8].fill(0);
-    uframe.set(r);
-
-    Ok(())
+    // SAFETY: stores to the frame, nothing called
+    unsafe {
+        uframe.with(|regs| {
+            regs.sp = frame_addr;
+            regs.elr = handler;
+            // The handler is not entered by an indirect branch (Linux
+            // setup_return clears BTYPE)
+            regs.spsr &= !PSTATE_BTYPE;
+            regs.x[0] = u64::from(sig.nr()); // x0 = signal number
+            regs.x[1] = info_addr; // x1 = &siginfo
+            regs.x[2] = uc_addr; // x2 = &ucontext
+            regs.x[29] = record_addr; // x29 = frame record
+            regs.x[30] = restorer; // x30 (LR) = restorer
+            // Clear other argument registers for security
+            regs.x[3..8].fill(0);
+        })
+    };
 }
 
 /// Where a handler frame for `action` goes when `sp` is interrupted
@@ -381,9 +421,9 @@ fn read_user<T: FromBytes>(addr: u64) -> Option<T> {
 }
 
 /// Walk the `__reserved` records at `addr` (Linux parse_user_sigframe):
-/// returns the FP/SIMD record, which must be present; ESR records are
-/// skipped; anything else is a bad frame.
-fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
+/// returns the FP/SIMD record's address, which must be present; ESR
+/// records are skipped; anything else is a bad frame.
+fn parse_reserved(addr: u64) -> Option<u64> {
     let mut off = 0usize;
     let mut fpsimd = None;
     while off + 8 <= RESERVED_SIZE {
@@ -396,7 +436,7 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
                 if off + size > RESERVED_SIZE {
                     return None;
                 }
-                fpsimd = Some(read_user::<FpsimdContext>(at)?);
+                fpsimd = Some(at);
             }
             ESR_MAGIC if size == 16 => {}
             _ => return None,
@@ -406,21 +446,36 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
     None
 }
 
+/// The FP/SIMD state of the record at `addr` (Linux read_fpsimd_context)
+fn read_fpsimd_context(addr: u64) -> Option<UserFpsimdState> {
+    let head: FpsimdHead = read_user(addr)?;
+    let mut st = UserFpsimdState::ZERO;
+    st.fpsr = head.fpsr;
+    st.fpcr = head.fpcr;
+    let vregs = addr + core::mem::offset_of!(FpsimdContext, vregs) as u64;
+    let n = core::mem::size_of_val(&st.vregs);
+    crate::uaccess::copy_from_user(st.vregs.as_bytes_mut(), vregs, n).ok()?;
+    Some(st)
+}
+
 /// Restore context from signal frame (sys_rt_sigreturn)
 ///
 /// This function:
 /// 1. Reads the UContext from user stack
 /// 2. Restores blocked signal mask
-/// 3. Restores all saved registers and the FP/SIMD record to the task's
-///    pt_regs
+/// 3. Restores all saved registers to the task's pt_regs and the FP/SIMD
+///    record to its saved FP/SIMD state, the live registers discarded
 ///
 /// Returns the value that should be in x0 (return value),
 /// or error code if restore fails.
-// Never inlined: its frame holds the copied signal frame (~1.9 KiB),
-// which inlined into the syscall dispatch, and that into the exception
-// entry, every syscall would carry on a 16 KiB stack
+// Never inlined: its frame holds the FP/SIMD record and a copy of the
+// pt_regs, which inlined into the syscall dispatch, and that into the
+// exception entry, every syscall would carry
 #[inline(never)]
 pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
+    // The handler's live FP/SIMD registers are replaced (Linux
+    // restore_sigframe: fpsimd_save_and_flush_current_state)
+    super::fpsimd::save_and_flush_current_state();
     let frame = crate::task::percpu::current_pt_regs();
     // A copy, written back once the whole context is restored
     let mut r = frame.get();
@@ -449,7 +504,9 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
     else {
         return Err(crate::signal::sigreturn_badframe());
     };
-    let Some(fpsimd) = parse_reserved(frame_addr + RESERVED_OFFSET as u64) else {
+    let Some(fpsimd) =
+        parse_reserved(frame_addr + RESERVED_OFFSET as u64).and_then(read_fpsimd_context)
+    else {
         return Err(crate::signal::sigreturn_badframe());
     };
     let Some(uss) =
@@ -466,9 +523,7 @@ pub fn sys_rt_sigreturn() -> crate::util::error::KernelResult<i64> {
 
     // Everything goes back into the pt_regs the syscall returns through
     // (Linux restore_sigframe)
-    tf.fpsr = fpsimd.fpsr;
-    tf.fpcr = fpsimd.fpcr;
-    tf.v = fpsimd.vregs;
+    super::fpsimd::update_current_state(&fpsimd);
     tf.elr = sc.pc;
     // Return to EL0t only, with interrupts unmasked
     tf.spsr = sc.pstate & PSTATE_USER_MASK;

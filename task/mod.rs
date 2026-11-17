@@ -729,6 +729,10 @@ pub mod tif {
     /// mode (Linux TIF_SINGLESTEP; set and cleared by the tracer while
     /// the task is stopped)
     pub const SINGLESTEP: u32 = 1 << 6;
+    /// arm64: this CPU's FP/SIMD registers do not hold the task's user
+    /// state; it is loaded on the way back to user mode (Linux
+    /// TIF_FOREIGN_FPSTATE; `arch::aarch64::fpsimd`)
+    pub const FOREIGN_FPSTATE: u32 = 1 << 7;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -837,6 +841,10 @@ pub struct Task {
     /// thread.gsbase; 0 on arm64), saved at switch-out and loaded at
     /// switch-in like `tls`; inherited by a fork child, 0 after exec
     pub gsbase: AtomicU64,
+    /// Arch thread state (Linux thread_struct): arm64 the user FP/SIMD
+    /// state while it is not live in a CPU's registers; its own access
+    /// rules (`arch::ThreadStruct`)
+    pub thread: crate::arch::ThreadStruct,
     /// Seccomp mode (0 = DISABLED, 1 = STRICT, 2 = FILTER), set by the
     /// task itself; read at every syscall entry
     pub seccomp_mode: AtomicU8,
@@ -1638,7 +1646,9 @@ impl Task {
             kstack_top,
             start_time: AtomicU64::new(now),
             flags: AtomicU32::new(flags),
-            thread_flags: AtomicU32::new(0),
+            // No CPU's registers hold its user state (Linux copy_thread:
+            // fpsimd_flush_task_state)
+            thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
             cpu: AtomicU32::new(cpu),
             wake_cpu: AtomicU32::new(cpu),
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
@@ -1651,6 +1661,7 @@ impl Task {
             pi_lock: crate::sync::IrqSpinlock::new(()),
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            thread: crate::arch::ThreadStruct::new(),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
             sig: crate::sync::InstanceCell::new(sig),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
@@ -1711,7 +1722,9 @@ impl Task {
             kstack_top,
             start_time: AtomicU64::new(0),
             flags: AtomicU32::new(pf::KTHREAD | pf::NO_SETAFFINITY),
-            thread_flags: AtomicU32::new(0),
+            // Its registers hold no user state (Linux init_task:
+            // _TIF_FOREIGN_FPSTATE)
+            thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
             cpu: AtomicU32::new(0),
             wake_cpu: AtomicU32::new(0),
             cpus_mask: crate::util::cpumask::CpuMask::new(),
@@ -1724,6 +1737,7 @@ impl Task {
             pi_lock: crate::sync::IrqSpinlock::new(()),
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            thread: crate::arch::ThreadStruct::new(),
             seccomp_mode: AtomicU8::new(0),
             sig: crate::sync::InstanceCell::new(TaskSignalState::boot()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),

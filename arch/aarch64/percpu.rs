@@ -59,6 +59,12 @@ pub struct PerCpu {
 
     /// Preemption count - tracks nested critical sections
     pub preempt_count: AtomicU32,
+
+    /// The user FP/SIMD state bound to this CPU's registers (Linux
+    /// fpsimd_last_state.st; null none): written and read only by this
+    /// CPU with its FP context claimed or interrupts off; followed only
+    /// while the running task's registers are live (`fpsimd`)
+    pub fpsimd_last_state: AtomicPtr<super::fpsimd::UserFpsimdState>,
 }
 
 const _: () = assert!(core::mem::offset_of!(PerCpu, overflow_stack) == 8);
@@ -79,6 +85,7 @@ impl PerCpu {
             interrupt_depth: AtomicU32::new(0),
             irq_user: AtomicBool::new(false),
             preempt_count: AtomicU32::new(0),
+            fpsimd_last_state: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -95,6 +102,8 @@ impl PerCpu {
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.irq_user.store(false, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
+        self.fpsimd_last_state
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
     }
 
     /// This CPU's address, for TPIDR_EL1 (only ever read through as

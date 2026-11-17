@@ -1233,6 +1233,9 @@ where
     // close-on-exec descriptors: whoever sees one of them close (EOF on
     // a pipe) sees the exec, and its setpgid is EACCES
     percpu::current().clear_flag(crate::task::pf::FORKNOEXEC);
+    // The new image's thread state (Linux flush_thread): arm64 zero
+    // FP/SIMD registers
+    crate::arch::flush_thread();
 
     // Private fd table without the close-on-exec descriptors (Linux
     // begin_new_exec: unshare_files, then do_close_on_exec)
