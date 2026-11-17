@@ -252,9 +252,10 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
-    /// chown set the owner (`uid`) and/or the group (`gid`), under
-    /// i_rwsem (Linux ->setattr seeing ATTR_UID / ATTR_GID: tracefs
-    /// pins them). Default nothing.
+    /// chown is about to set the owner (`uid`) and/or the group (`gid`),
+    /// under i_rwsem, before it does (Linux ->setattr seeing ATTR_UID /
+    /// ATTR_GID ahead of simple_setattr: tracefs pins them). Default
+    /// nothing.
     fn setattr_ids(&self, inode: &Inode, uid: bool, gid: bool) {
         let _ = (inode, uid, gid);
     }
