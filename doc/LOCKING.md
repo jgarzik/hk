@@ -3486,7 +3486,11 @@ and goes on in ref mode from there; the root is held by the lookup
 sequence moved, the walk is ECHILD and the lookup is done again in
 ref mode from its start (a new `Nd`: path_init's sequences sampled
 again). What a failed legitimize took is put after the guard
-(`Puts`, Linux terminate_walk): a put may be the last. A
+(`Puts`, Linux terminate_walk): a put may be the last. Its slots are
+fixed by role, as terminate_walk's set (the walk's place, the symlink
+being picked, a mount taken without its dentry, try_to_unlazy_next's
+child), each filled at most once since every fill ends the walk; a
+second fill panics in every build rather than drop under the guard. A
 RESOLVE_CACHED walk (Linux LOOKUP_CACHED) may not leave RCU mode but
 at its end (complete_walk), so it is EAGAIN where Linux's is: the
 retry's `Nd::new` refuses LOOKUP_CACHED without LOOKUP_RCU. No lock

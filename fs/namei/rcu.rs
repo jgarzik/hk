@@ -66,23 +66,57 @@ impl<'g> RcuPath<'g> {
 /// What a failed legitimize took, put by the caller after the RCU
 /// guard (Linux terminate_walk's path_put after leave_rcu): a put may
 /// be the last, which kills a dentry or tears a mount down
+///
+/// One slot per role, as Linux's terminate_walk puts a fixed set: the
+/// walk's own place (nd->path), the symlink being picked (the link
+/// stack; the RCU walk never stacks one, since `pick_link_rcu` leaves
+/// RCU mode with it), a mount whose dentry could not be taken
+/// (legitimize_mnt's put), and try_to_unlazy_next's child. Each is
+/// filled at most once: every fill is on a path that ends the RCU walk
+/// with an error (`?` up to `walk_rcu`), and of the two legitimizes
+/// one walk step may run (`pick_link_rcu`: the link's, then the
+/// place's), the first fills a slot only if it fails and so ends the
+/// step before the second. A second fill would drop a value under the
+/// guard; it panics instead (`put`), in every build.
 #[derive(Default)]
 pub(super) struct Puts {
-    paths: [Option<Path>; 2],
+    path: Option<Path>,
+    link: Option<Path>,
     mnt: Option<MountRef>,
     dentry: Option<DentryRef>,
 }
 
+/// Which of `Puts`' path slots a legitimize's leftover goes to
+#[derive(Clone, Copy)]
+enum Role {
+    /// nd->path: where the walk stood
+    Path,
+    /// The link stack's top: the symlink being picked
+    Link,
+}
+
+/// Fill a `Puts` slot, empty by construction (`Puts`)
+fn put<T>(slot: &mut Option<T>, v: T) {
+    assert!(slot.is_none(), "namei: a Puts slot filled twice");
+    *slot = Some(v);
+}
+
 impl Puts {
-    fn path(&mut self, p: Path) {
-        let slot = self.paths.iter_mut().find(|s| s.is_none());
-        debug_assert!(
-            slot.is_some(),
-            "namei: more paths to put than an unlazy takes"
-        );
-        if let Some(s) = slot {
-            *s = Some(p);
+    fn path(&mut self, r: Role, p: Path) {
+        match r {
+            Role::Path => put(&mut self.path, p),
+            Role::Link => put(&mut self.link, p),
         }
+    }
+
+    fn mnt(&mut self, m: Option<MountRef>) {
+        if let Some(m) = m {
+            put(&mut self.mnt, m);
+        }
+    }
+
+    fn dentry(&mut self, d: DentryRef) {
+        put(&mut self.dentry, d);
     }
 }
 
@@ -120,22 +154,29 @@ pub(super) enum Lazy<'p> {
 
 /// __legitimize_path: references to `mnt` and `d` if MOUNT_LOCK's
 /// sequence is still `m_seq` and `d`'s `d_seq` still `seq`; what it
-/// took anyway goes to `puts`
-fn legitimize_path(mnt: &Mount, d: &Dentry, seq: u32, m_seq: u32, puts: &mut Puts) -> Option<Path> {
+/// took anyway goes to `puts`, a path to its slot for `r`
+fn legitimize_path(
+    mnt: &Mount,
+    d: &Dentry,
+    seq: u32,
+    m_seq: u32,
+    puts: &mut Puts,
+    r: Role,
+) -> Option<Path> {
     let mnt = match MountRef::legitimize(mnt, m_seq) {
         Ok(m) => m,
-        Err(put) => {
-            puts.mnt = put;
+        Err(m) => {
+            puts.mnt(m);
             return None;
         }
     };
     let Some(dr) = DentryRef::try_get(d) else {
-        puts.mnt = Some(mnt);
+        puts.mnt(Some(mnt));
         return None;
     };
     let p = Path::new(mnt, dr);
     if d.d_seq_retry(seq) {
-        puts.path(p);
+        puts.path(r, p);
         return None;
     }
     Some(p)
@@ -187,7 +228,7 @@ impl Nd {
                 // may_lookup): a hard error stands, ECHILD asks again
                 let at = self.try_to_unlazy(&cur, f.cached, puts)?;
                 if e != ECHILD {
-                    puts.path(at);
+                    puts.path(Role::Path, at);
                     return Err(e);
                 }
                 return Ok(Lazy::Comp(at, p));
@@ -477,7 +518,7 @@ impl Nd {
         if f.cached {
             return Err(ECHILD);
         }
-        let link = legitimize_path(mnt, link, seq, self.m_seq, puts).ok_or(ECHILD)?;
+        let link = legitimize_path(mnt, link, seq, self.m_seq, puts, Role::Link).ok_or(ECHILD)?;
         match self.try_to_unlazy(cur, false, puts) {
             Ok(at) => Ok(Lazy::Link {
                 cur: at,
@@ -485,7 +526,7 @@ impl Nd {
                 rest,
             }),
             Err(e) => {
-                puts.path(link);
+                puts.path(Role::Link, link);
                 Err(e)
             }
         }
@@ -504,7 +545,7 @@ impl Nd {
         if cached {
             return Err(ECHILD);
         }
-        legitimize_path(cur.mnt, cur.dentry, cur.seq, self.m_seq, puts).ok_or(ECHILD)
+        legitimize_path(cur.mnt, cur.dentry, cur.seq, self.m_seq, puts, Role::Path).ok_or(ECHILD)
     }
 
     /// try_to_unlazy_next: [`Nd::try_to_unlazy`] and a reference to
@@ -523,23 +564,23 @@ impl Nd {
         }
         let mnt = match MountRef::legitimize(cur.mnt, self.m_seq) {
             Ok(m) => m,
-            Err(put) => {
-                puts.mnt = put;
+            Err(m) => {
+                puts.mnt(m);
                 return Err(ECHILD);
             }
         };
         let Some(d) = DentryRef::try_get(cur.dentry) else {
-            puts.mnt = Some(mnt);
+            puts.mnt(Some(mnt));
             return Err(ECHILD);
         };
         let at = Path::new(mnt, d);
         let Some(c) = DentryRef::try_get(child) else {
-            puts.path(at);
+            puts.path(Role::Path, at);
             return Err(ECHILD);
         };
         if child.d_seq_retry(seq) {
-            puts.path(at);
-            puts.dentry = Some(c);
+            puts.path(Role::Path, at);
+            puts.dentry(c);
             return Err(ECHILD);
         }
         Ok((at, c))
@@ -583,10 +624,10 @@ mod tests {
             let seq = a.d_seq_begin();
             let mut puts = Puts::default();
             let g = crate::sync::rcu::read_lock();
-            let p = legitimize_path(&m, &a, seq, m_seq, &mut puts);
+            let p = legitimize_path(&m, &a, seq, m_seq, &mut puts, Role::Path);
             drop(g);
             if let Some(p) = p {
-                assert!(puts.paths.iter().all(Option::is_none) && puts.mnt.is_none());
+                assert!(puts.path.is_none() && puts.mnt.is_none());
                 got = Some((p, m_seq, seq));
                 break;
             }
@@ -599,7 +640,7 @@ mod tests {
         let t = Dentry::prealloc(&m.root, b"b").unwrap();
         d_move(&a, &t);
         let g = crate::sync::rcu::read_lock();
-        assert!(legitimize_path(&m, &a, seq, m_seq, &mut puts).is_none());
+        assert!(legitimize_path(&m, &a, seq, m_seq, &mut puts, Role::Path).is_none());
         drop(g);
         drop(puts);
         assert_eq!(DentryRef::count(&a), n);
@@ -607,9 +648,9 @@ mod tests {
         let seq = a.d_seq_begin();
         let g = crate::sync::rcu::read_lock();
         let stale = m_seq.wrapping_sub(2);
-        assert!(legitimize_path(&m, &a, seq, stale, &mut puts).is_none());
+        assert!(legitimize_path(&m, &a, seq, stale, &mut puts, Role::Path).is_none());
         drop(g);
-        assert!(puts.paths.iter().all(Option::is_none) && puts.mnt.is_none());
+        assert!(puts.path.is_none() && puts.mnt.is_none());
         assert_eq!(DentryRef::count(&a), n);
     }
 }
