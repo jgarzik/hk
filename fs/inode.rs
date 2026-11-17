@@ -874,53 +874,57 @@ impl Inode {
     /// # Safety
     /// `p` is valid for writes of an `Inode`, unshared.
     unsafe fn init_at(p: *mut Self, i: InodeInit) {
-        macro_rules! w {
-            ($f:ident, $v:expr) => {
-                // SAFETY: `p` is valid for writes of an `Inode` (the
-                // caller's contract); a field write drops nothing
-                unsafe { (&raw mut (*p).$f).write($v) }
+        // Each field written once, and every field: the pattern names
+        // the same list without `..`, so a field missed or named twice
+        // fails to build
+        macro_rules! init {
+            ($($f:ident: $v:expr),* $(,)?) => {
+                $(
+                    // SAFETY: `p` is valid for writes of an `Inode` (the
+                    // caller's contract); a field write drops nothing
+                    unsafe { (&raw mut (*p).$f).write($v) };
+                )*
+                let _ = |i: &Self| {
+                    let Self { $($f: _),* } = i;
+                };
             };
         }
         let t = i.mtime;
-        w!(i_free, IFree::new());
-        w!(i_weak, AtomicPtr::new(core::ptr::null_mut()));
-        w!(ino, i.ino);
-        w!(mode, AtomicU16::new(i.mode.0));
-        w!(uid, AtomicU32::new(i.uid));
-        w!(gid, AtomicU32::new(i.gid));
-        w!(size, AtomicU64::new(i.size));
-        w!(nlink, AtomicU32::new(1));
-        w!(i_generation, i.i_generation);
-        w!(i_flags, core::sync::atomic::AtomicU32::new(0));
-        w!(rdev, i.rdev);
-        w!(atime, InodeTime::new(t));
-        w!(mtime, InodeTime::new(t));
-        w!(ctime, InodeTime::new(t));
-        w!(sb, ManuallyDrop::new(i.sb));
-        w!(i_op, i.i_op);
-        w!(i_rwsem, RwSem::new(()));
-        w!(i_dio_count, AtomicU32::new(0));
-        w!(private, ManuallyDrop::new(RwLock::new(None)));
-        w!(i_pipe, ManuallyDrop::new(Mutex::new(None)));
-        w!(
-            i_data,
-            ManuallyDrop::new(crate::mm::filemap::AddressSpace::new())
-        );
-        w!(
-            fsnotify,
-            ManuallyDrop::new(crate::io::inotify::Marks::default())
-        );
-        w!(i_dirty, core::sync::atomic::AtomicBool::new(false));
-        w!(i_io_list, list::Link::new());
-        w!(i_io_on, core::sync::atomic::AtomicU8::new(0));
-        w!(i_wb, ManuallyDrop::new(spin::Once::new()));
-        w!(i_writecount, core::sync::atomic::AtomicI32::new(0));
-        w!(i_flctx, ManuallyDrop::new(super::locks::FileLockCtx::new()));
-        w!(i_hash, AtomicU64::new(0));
-        w!(i_hash_node, list::Link::new());
-        w!(i_sequence, crate::task::futex::KeySeq::new());
-        w!(i_sb_list, list::Link::new());
-        w!(i_dentry, Mutex::new(list::List::new()));
+        init! {
+            i_free: IFree::new(),
+            i_weak: AtomicPtr::new(core::ptr::null_mut()),
+            ino: i.ino,
+            mode: AtomicU16::new(i.mode.0),
+            uid: AtomicU32::new(i.uid),
+            gid: AtomicU32::new(i.gid),
+            size: AtomicU64::new(i.size),
+            nlink: AtomicU32::new(1),
+            i_generation: i.i_generation,
+            i_flags: core::sync::atomic::AtomicU32::new(0),
+            rdev: i.rdev,
+            atime: InodeTime::new(t),
+            mtime: InodeTime::new(t),
+            ctime: InodeTime::new(t),
+            sb: ManuallyDrop::new(i.sb),
+            i_op: i.i_op,
+            i_rwsem: RwSem::new(()),
+            i_dio_count: AtomicU32::new(0),
+            private: ManuallyDrop::new(RwLock::new(None)),
+            i_pipe: ManuallyDrop::new(Mutex::new(None)),
+            i_data: ManuallyDrop::new(crate::mm::filemap::AddressSpace::new()),
+            fsnotify: ManuallyDrop::new(crate::io::inotify::Marks::default()),
+            i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_io_list: list::Link::new(),
+            i_io_on: core::sync::atomic::AtomicU8::new(0),
+            i_wb: ManuallyDrop::new(spin::Once::new()),
+            i_writecount: core::sync::atomic::AtomicI32::new(0),
+            i_flctx: ManuallyDrop::new(super::locks::FileLockCtx::new()),
+            i_hash: AtomicU64::new(0),
+            i_hash_node: list::Link::new(),
+            i_sequence: crate::task::futex::KeySeq::new(),
+            i_sb_list: list::Link::new(),
+            i_dentry: Mutex::new(list::List::new()),
+        }
     }
 
     fn iflag(&self, f: u32) -> bool {
@@ -1544,21 +1548,65 @@ unsafe fn destroy_inode(i: *mut Inode) {
     unsafe { drop_field(&raw mut (*i).sb) };
 }
 
-/// (`no_glue`) Every other field of `Inode` has no drop glue: nothing
-/// but `destroy_inode` writes an inode before its free (a field added
-/// with glue fails here; make it `ManuallyDrop` and drop it there)
+/// (`no_glue`) Every field of `Inode` but `IFree` has no drop glue:
+/// nothing but `destroy_inode` writes an inode before its free. Checked
+/// per field, on the field's own type; the pattern names every field
+/// (no `..`), so a field added fails to build until it is listed here.
+/// One with glue fails the assertion: make it `ManuallyDrop` and drop
+/// it in `destroy_inode`.
 const _: () = {
-    use core::mem::needs_drop;
-    assert!(!needs_drop::<InodeId>() && !needs_drop::<AtomicU16>());
-    assert!(!needs_drop::<AtomicU32>() && !needs_drop::<AtomicU64>());
-    assert!(!needs_drop::<DevId>() && !needs_drop::<InodeTime>());
-    assert!(!needs_drop::<&'static dyn InodeOps>() && !needs_drop::<RwSem>());
-    assert!(!needs_drop::<core::sync::atomic::AtomicBool>());
-    assert!(!needs_drop::<core::sync::atomic::AtomicU8>());
-    assert!(!needs_drop::<core::sync::atomic::AtomicI32>());
-    assert!(!needs_drop::<list::Link>() && !needs_drop::<crate::task::futex::KeySeq>());
-    assert!(!needs_drop::<Mutex<list::List<super::dentry::AliasA>>>());
-    assert!(!needs_drop::<AtomicPtr<Inode>>());
+    /// No drop glue in the type `f` points at
+    const fn glue_free<T>(_: *const T) -> bool {
+        !core::mem::needs_drop::<T>()
+    }
+    macro_rules! no_glue {
+        ($($f:ident),* $(,)?) => {
+            let u = core::mem::MaybeUninit::<Inode>::uninit();
+            let p = u.as_ptr();
+            $(
+                // SAFETY: a field place of `u`, named, never read
+                let f = unsafe { &raw const (*p).$f };
+                assert!(glue_free(f), concat!("Inode.", stringify!($f), " has drop glue"));
+            )*
+            let _ = |i: &Inode| {
+                let Inode { i_free: _, $($f: _),* } = i;
+            };
+        };
+    }
+    no_glue!(
+        i_weak,
+        ino,
+        mode,
+        uid,
+        gid,
+        size,
+        nlink,
+        i_generation,
+        i_flags,
+        rdev,
+        atime,
+        mtime,
+        ctime,
+        sb,
+        i_op,
+        i_rwsem,
+        i_dio_count,
+        private,
+        i_pipe,
+        i_data,
+        fsnotify,
+        i_dirty,
+        i_io_list,
+        i_io_on,
+        i_wb,
+        i_writecount,
+        i_flctx,
+        i_hash,
+        i_hash_node,
+        i_sequence,
+        i_sb_list,
+        i_dentry,
+    );
 };
 
 /// The inode's memory, a grace period after its teardown (Linux

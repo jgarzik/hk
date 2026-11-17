@@ -182,8 +182,11 @@ the other shape: RCU readers reach it with no reference (a dentry's
 the memory is deferred (the inode's own `Weak`, dropped by the
 callback). `Inode` has no `Drop`; each field with drop glue is
 `ManuallyDrop` and dropped by `IFree`'s drop through a raw-pointer
-place before the free is queued, and a compile-time check keeps every
-other field glue-free. The one remaining `&mut Inode`, the transient
+place before the free is queued. Compile-time checks name every field
+(an exhaustive pattern, no `..`): `no_glue` asserts `needs_drop` false
+on each other field's own type, and `Inode::init_at`, which builds the
+inode in place before `assume_init`, writes each field exactly once,
+so a field added fails the build until both are updated. The one remaining `&mut Inode`, the transient
 one std `Arc::drop_slow` makes to run the drop glue, writes no byte an
 RCU reader reads: readers read only atomics, `ino`, `i_op` and other
 fields with no drop glue, and the glue's only step is `IFree`'s drop,
