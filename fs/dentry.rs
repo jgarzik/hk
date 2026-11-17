@@ -1025,6 +1025,17 @@ impl Dentry {
     pub fn num_children(&self) -> usize {
         self.d_lock.read().children.len()
     }
+
+    /// Its `n`th positive child, counted from the first (Linux
+    /// scan_positives from the head of d_children): found and taken
+    /// under its d_lock, where lookups take theirs. A removed child is
+    /// off the list, so the first positive one is also the next one
+    /// after the last removed (Linux find_next_child).
+    pub fn nth_positive_child(&self, n: usize) -> Option<DentryRef> {
+        let dl = self.d_lock.read();
+        let c = dl.children.iter().filter(|c| !c.is_negative()).nth(n)?;
+        DentryRef::try_get(c)
+    }
 }
 
 /// Link `d`, just made positive (its d_lock `dl`, written, holds the

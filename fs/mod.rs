@@ -34,6 +34,7 @@ pub mod icache;
 pub mod io;
 pub mod iov;
 pub mod iov_iter;
+pub mod libfs;
 pub mod link;
 pub mod locks;
 pub mod misc;
@@ -52,6 +53,7 @@ pub mod kernfs;
 pub mod nullfs;
 pub mod proc;
 pub mod ramfs;
+pub mod tracefs;
 pub mod vfat;
 
 // Re-exports for convenience

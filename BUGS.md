@@ -674,16 +674,21 @@ F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
 
-## tracefs is kernfs-based
+## tracefs gaps
 
-**Location**: `trace.rs`, `fs/kernfs/`
+**Location**: `fs/tracefs.rs`, `fs/libfs.rs`
 
-hk's tracefs files are kernfs nodes, added and removed beside the
-dcache; Linux tracefs creates each file's dentry itself
-(tracefs_create_file under the parent's inode lock) and removes it with
-simple_recursive_removal. So hk's `tracefs_d_revalidate` calls a
-positive dentry stale once its node is removed and a negative one once
-the directory's `KNode.rev` moves, where Linux needs neither check.
+- `libfs::dcache_readdir` keeps no cursor dentry between getdents
+  calls (Linux d_alloc_cursor in dcache_dir_open): a position counts
+  positive children from the first, so an entry removed between two
+  calls shifts the later ones back by one.
+- No owner propagation: a file's uid and gid are its directory's when
+  made; Linux tracefs_permission / tracefs_getattr give each inode the
+  instance root's (or the mount root's) uid and gid unless chown set
+  its own (set_tracefs_inode_owner, TRACEFS_UID_PERM_SET), and a
+  uid=/gid= remount resets every inode (tracefs_apply_options).
+- No instances/ directory (tracefs_create_instance_dir: mkdir/rmdir of
+  trace instances), so nothing removes a tracefs entry at run time.
 
 ## renameat2 flag gaps
 

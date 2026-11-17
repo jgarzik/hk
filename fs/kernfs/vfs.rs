@@ -77,10 +77,8 @@ pub fn knode(inode: &Inode) -> Option<Arc<KNode>> {
     knode_rcu(inode).map(|k| k.0.clone())
 }
 
-/// The node behind `inode`, borrowed: RCU-readable data (Linux
-/// inode->i_private, the node freed after a grace period), so an RCU
-/// walk's d_revalidate may read it (its atomics) with no reference
-pub fn knode_rcu(inode: &Inode) -> Option<&KfInode> {
+/// The node behind `inode`, borrowed (Linux inode->i_private)
+fn knode_rcu(inode: &Inode) -> Option<&KfInode> {
     inode.private_rcu()?.as_any().downcast_ref::<KfInode>()
 }
 

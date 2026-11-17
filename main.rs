@@ -338,7 +338,9 @@ pub(crate) fn kmain() -> ! {
     fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
-    // tracefs (Linux tracefs_init, a core initcall; trace files, fs_initcall)
+    // tracefs (Linux tracefs_init, a core initcall), then the trace
+    // files (tracer_init_tracefs, event_trace_init: fs initcalls)
+    fs::tracefs::init();
     trace::init();
     // sock_init, a core initcall after kernel/'s (ksysfs)
     pseudo_init(&fs::pseudo::SOCKFS);

@@ -16,9 +16,15 @@
 //!   mode=, uid=, gid= sets them on the one shared superblock and
 //!   /proc/mounts shows them; an unknown option is EINVAL since Linux
 //!   6.10 (the new mount API; ignored before)
+//! - TRACEFS_RESOLVE_CACHED: a looked-up file resolves with
+//!   RESOLVE_CACHED, a name never looked up is EAGAIN
+//! - TRACEFS_READDIR: getdents lists the root's `trace` (DT_REG) and
+//!   `events` (DT_DIR), and events/'s `enable` (Linux dcache_readdir;
+//!   eventfs's on Linux)
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::{host_mode, linux_at_least, msleep, read_file, skip};
+use crate::proc::sysfs::each_entry;
 use hk_syscall::{
     LinuxStatFs, O_DIRECT, O_DIRECTORY, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_close,
     sys_mkdir, sys_mount, sys_open, sys_openat2, sys_pread64, sys_stat, sys_statfs, sys_umount2,
@@ -46,6 +52,7 @@ pub fn run_tests() {
         skip(b"TRACEFS_EVENTS", b"host kernel without tracefs");
         skip(b"TRACEFS_OPTS", b"host kernel without tracefs");
         skip(b"TRACEFS_RESOLVE_CACHED", b"host kernel without tracefs");
+        skip(b"TRACEFS_READDIR", b"host kernel without tracefs");
         return;
     }
     report_r(b"TRACEFS_TRACE", mounted(r));
@@ -56,6 +63,7 @@ pub fn run_tests() {
         report_r(b"TRACEFS_EVENTS", r);
         report_r(b"TRACEFS_OPTS", opts());
         report_r(b"TRACEFS_RESOLVE_CACHED", cached());
+        report_r(b"TRACEFS_READDIR", readdir());
         sys_umount2(MP.as_ptr(), 0);
     }
 }
@@ -290,4 +298,20 @@ fn events() -> R {
         )?;
     }
     Ok(())
+}
+
+/// Whether directory `dir` lists `name` with d_type `ty`
+fn lists(dir: &[u8], name: &'static [u8], ty: u8) -> R {
+    let mut seen = false;
+    let n = each_entry(dir, &mut |e, t| seen |= e == name && t == ty);
+    check(b"getdents", n > 0, n)?;
+    check(name, seen, n)
+}
+
+fn readdir() -> R {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    lists(MP, b"trace", DT_REG)?;
+    lists(MP, b"events", DT_DIR)?;
+    lists(b"/sys/kernel/tracing/events\0", b"enable", DT_REG)
 }

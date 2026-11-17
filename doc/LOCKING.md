@@ -3200,12 +3200,7 @@ Linux LOOKUP_RCU; and a permission check's MAY_NOT_BLOCK) the dentry,
 directory and inode are borrowed under the guard with no reference and may be
 torn down already: the answer may read only fields with no drop glue
 and take nothing that sleeps, else it is ECHILD; kernfs, cgroupfs and
-vfat (Linux kernfs_dop_revalidate, vfat_revalidate_ci) always are.
-tracefs answers (Linux tracefs_d_revalidate) from the kernfs node behind
-the inode and the directory's (`kernfs::vfs::knode_rcu`: RCU-readable
-inode data, `Inode::private_rcu`, the node's `Arc` dropped by
-`i_callback` a grace period after the teardown), reading only its
-atomics (removal state, `KNode.rev`) and the dentry's `d_time`. procfs
+vfat (Linux kernfs_dop_revalidate, vfat_revalidate_ci) always are. procfs
 answers from `ProcRcu` (`Inode::private_rcu`, Linux proc_inode's pid
 put by ->free_inode: set before the inode is visible, dropped by
 `i_callback` a grace period after the teardown): the task through its
@@ -3325,6 +3320,21 @@ unhashes it under the parent's and child's d_locks; the inode it took
 is released (`inotify::d_iput`, which queues allocated events; Linux
 dentry_unlink_inode's fsnotify_inoderemove and iput) after both are
 dropped. No dentry's last reference is dropped under a d_lock.
+
+#### libfs / tracefs (fs/libfs.rs, fs/tracefs.rs; Linux fs/libfs.c, fs/tracefs)
+
+tracefs's entries are its dentries (Linux simple_lookup, d_make_persistent):
+`libfs::simple_create` makes one under the parent's `i_rwsem` (lookup,
+dentry allocation, inode, instantiation: Linux simple_start_creating ..
+simple_done_creating), `libfs::simple_recursive_removal` takes a subtree
+away holding one directory's `i_rwsem` at a time going down, and going
+up the victim's parent's, taken after the victim's is released, across
+`d_invalidate` (-> NAMESPACE_SEM for a mountpoint) and its callback
+(Linux __simple_recursive_removal). `libfs::dcache_readdir` reads the
+directory's children list under its d_lock, one entry at a time, under
+the getdents shared `i_rwsem`. `PinnedFs` (a filesystem's kernel mount
+and hold count; Linux pin_fs_lock) is a spin leaf: the mount is made
+and put with it released.
 
 #### kernfs / sysfs (fs/kernfs/, fs/kernfs/sysfs.rs; Linux fs/kernfs)
 
@@ -4570,14 +4580,15 @@ systems and serializes enabling: the `events/.../enable` stores and
 `trace_event=` (applied as each system registers) set the flags under
 it, allocating the rings first (once, a `Once` per CPU; Linux
 tracing_update_buffers); registration makes the system's tracefs
-directories under it (order: `EVENT_MUTEX` -> `KERNFS_RWSEM`; an enable
-store runs under its node's active reference, then takes
-`EVENT_MUTEX`; no tracefs node is ever removed). tracefs's `trace` file (kernfs, /sys/kernel/
-tracing) copies each ring out under its lock into a buffer allocated
-before taking it, one CPU at a time, and formats with no lock held; an
-O_TRUNC open for writing (Linux tracing_open) empties each ring under
-its lock, one CPU at a time, from the kernfs open hook (under the
-node's active reference, no other lock).
+directories under it (order: `EVENT_MUTEX` -> the tracefs directory's
+`i_rwsem`, `fs::libfs` 3.3; an enable file's write, under that file's
+`i_rwsem` like every regular file's, takes `EVENT_MUTEX`; no tracefs
+entry is ever removed). tracefs's `trace` file (`fs::tracefs`,
+/sys/kernel/tracing) copies each ring out under its lock into a buffer
+allocated before taking it, one CPU at a time, and formats with no lock
+held; an O_TRUNC open for writing (Linux tracing_open) empties each
+ring under its lock, one CPU at a time, from the file's open (no other
+lock).
 
 ### 3.7 Signal Infrastructure
 

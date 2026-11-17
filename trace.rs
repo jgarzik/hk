@@ -1,5 +1,6 @@
-//! Trace ring buffer and tracefs (Linux kernel/trace: ring_buffer.c,
-//! trace.c's `trace` file; fs/tracefs)
+//! Trace ring buffer and its tracefs files (Linux kernel/trace:
+//! ring_buffer.c, trace.c's `trace` file, trace_events.c's enable
+//! files; the filesystem is `fs::tracefs`)
 //!
 //! Trace events (`emit`) are formatted at the call into a per-CPU ring
 //! of records, overwriting the oldest when full (Linux's default
@@ -26,10 +27,11 @@
 //! formats with no lock held. `EVENT_MUTEX` (sleeping, Linux
 //! event_mutex) holds the registered systems and serializes enabling,
 //! which allocates the rings under it; an event's flag is an atomic
-//! the emitters read lock-free.
+//! the emitters read lock-free. A system's tracefs directories are made
+//! under it (`EVENT_MUTEX` -> the tracefs directory's i_rwsem); an
+//! enable file's write takes it under that file's i_rwsem.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,12 +39,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Once;
 
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
-use crate::fs::inode::{InodeMode, InodeOps, InodeRef};
-use crate::fs::kernfs::{self, Attr, BinAttr, KNode, SysBuf, sysfs};
-use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
+use crate::fs::dentry::DentryRef;
+use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::libfs;
+use crate::fs::tracefs::{self, TraceFops};
 use crate::sync::{IrqSpinlock, Mutex};
-use crate::util::kalloc::{arc_nofail, try_arc};
+use crate::util::kalloc::arc_nofail;
 use crate::util::kmem::try_vec;
 
 /// Bytes of each CPU's ring
@@ -52,9 +54,6 @@ const TEXT_MAX: usize = 256;
 /// Record header: length u16, pid u32, timestamp u64, comm [u8; 16];
 /// the text ("event: ...") follows
 const HDR: usize = 2 + 4 + 8 + 16;
-
-/// Linux TRACEFS_MAGIC
-pub const TRACEFS_MAGIC: u64 = 0x7472_6163;
 
 /// A CPU's ring of records (Linux ring_buffer_per_cpu): bytes from
 /// `head` (oldest) for `used`, wrapping
@@ -237,12 +236,14 @@ pub fn register_system(sys: &'static TraceSystem) {
     }
     systems.push(sys);
     if let Some(events) = EVENTS_DIR.get()
-        && let Ok(d) = events.create_dir(sys.name.as_bytes(), 0o755)
+        && let Ok(d) = tracefs::create_dir(sys.name.as_bytes(), Some(events))
     {
-        let _ = d.create_file(b"enable", 0o640, arc_nofail(SystemEnable(sys)));
+        let f = arc_nofail(SystemEnable(sys));
+        let _ = tracefs::create_file(b"enable", 0o640, Some(&d), f);
         for &ev in sys.events {
-            if let Ok(e) = d.create_dir(ev.name.as_bytes(), 0o755) {
-                let _ = e.create_file(b"enable", 0o640, arc_nofail(EventEnable(ev)));
+            if let Ok(e) = tracefs::create_dir(ev.name.as_bytes(), Some(&d)) {
+                let f = arc_nofail(EventEnable(ev));
+                let _ = tracefs::create_file(b"enable", 0o640, Some(&e), f);
             }
         }
     }
@@ -262,6 +263,17 @@ fn parse_enable(data: &[u8]) -> Result<bool, KernelError> {
     }
 }
 
+/// The value an enable file's write gives (Linux kstrtoul_from_user:
+/// the write's first bytes, as many as a long's digits can need, then
+/// parsed) and the write's length, all of it taken once applied
+fn enable_write(from: &mut IovSource<'_>) -> Result<(bool, usize), KernelError> {
+    let len = from.len();
+    let mut buf = [0u8; 1 + 64 + 1];
+    let n = len.min(buf.len());
+    from.copy_from_full(&mut buf[..n])?;
+    Ok((parse_enable(&buf[..n])?, len))
+}
+
 /// '0' all off, '1' all on, 'X' mixed (Linux system_enable_read)
 fn enable_char<'a>(events: impl Iterator<Item = &'a TraceEvent>) -> u8 {
     let mut set = 0u8;
@@ -274,36 +286,42 @@ fn enable_char<'a>(events: impl Iterator<Item = &'a TraceEvent>) -> u8 {
 /// events/<system>/<event>/enable (Linux event_enable_fops)
 struct EventEnable(&'static TraceEvent);
 
-impl Attr for EventEnable {
-    fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
-        out.bytes(if self.0.enabled() { b"1\n" } else { b"0\n" });
-        Ok(())
+impl TraceFops for EventEnable {
+    /// Linux event_enable_read
+    fn read(&self, to: &mut IovDest<'_>, pos: &mut u64) -> Result<usize, KernelError> {
+        let s: &[u8] = if self.0.enabled() { b"1\n" } else { b"0\n" };
+        libfs::simple_read_from_buffer(to, pos, s)
     }
 
-    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
-        let on = parse_enable(data)?;
+    /// Linux event_enable_write
+    fn write(&self, from: &mut IovSource<'_>, pos: &mut u64) -> Result<usize, KernelError> {
+        let (on, n) = enable_write(from)?;
         let _g = EVENT_MUTEX.lock();
         enable_event(self.0, on)?;
-        Ok(data.len())
+        *pos += n as u64;
+        Ok(n)
     }
 }
 
 /// events/<system>/enable (Linux system_enable_fops)
 struct SystemEnable(&'static TraceSystem);
 
-impl Attr for SystemEnable {
-    fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
-        out.bytes(&[enable_char(self.0.events.iter().copied()), b'\n']);
-        Ok(())
+impl TraceFops for SystemEnable {
+    /// Linux system_enable_read
+    fn read(&self, to: &mut IovDest<'_>, pos: &mut u64) -> Result<usize, KernelError> {
+        let s = [enable_char(self.0.events.iter().copied()), b'\n'];
+        libfs::simple_read_from_buffer(to, pos, &s)
     }
 
-    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
-        let on = parse_enable(data)?;
+    /// Linux system_enable_write
+    fn write(&self, from: &mut IovSource<'_>, pos: &mut u64) -> Result<usize, KernelError> {
+        let (on, n) = enable_write(from)?;
         let _g = EVENT_MUTEX.lock();
         for &ev in self.0.events {
             enable_event(ev, on)?;
         }
-        Ok(data.len())
+        *pos += n as u64;
+        Ok(n)
     }
 }
 
@@ -311,26 +329,27 @@ impl Attr for SystemEnable {
 /// system_enable_fops, dir->subsystem NULL)
 struct AllEnable;
 
-impl Attr for AllEnable {
-    fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
+impl TraceFops for AllEnable {
+    fn read(&self, to: &mut IovDest<'_>, pos: &mut u64) -> Result<usize, KernelError> {
         let systems = EVENT_MUTEX.lock();
         let c = enable_char(systems.iter().flat_map(|s| s.events.iter().copied()));
-        out.bytes(&[c, b'\n']);
-        Ok(())
+        drop(systems);
+        libfs::simple_read_from_buffer(to, pos, &[c, b'\n'])
     }
 
-    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
-        let on = parse_enable(data)?;
+    fn write(&self, from: &mut IovSource<'_>, pos: &mut u64) -> Result<usize, KernelError> {
+        let (on, n) = enable_write(from)?;
         let systems = EVENT_MUTEX.lock();
         for ev in systems.iter().flat_map(|s| s.events.iter()) {
             enable_event(ev, on)?;
         }
-        Ok(data.len())
+        *pos += n as u64;
+        Ok(n)
     }
 }
 
 /// tracefs's events directory
-static EVENTS_DIR: Once<Arc<KNode>> = Once::new();
+static EVENTS_DIR: Once<DentryRef> = Once::new();
 
 /// A writer into a fixed buffer that cuts what does not fit
 struct Cut<'a> {
@@ -427,7 +446,7 @@ fn trace_text() -> Result<Vec<u8>, KernelError> {
             .map_err(|_| KernelError::OutOfMemory)?;
         copies.push((cpu, b));
     }
-    let mut out = kernfs::SysBuf::default();
+    let mut out = Out(Vec::new());
     let _ = write!(
         out,
         "# tracer: nop\n#\n# entries-in-buffer/entries-written: {}/{}   #P:{}\n#\n\
@@ -460,36 +479,27 @@ fn trace_text() -> Result<Vec<u8>, KernelError> {
             r.ts / 1_000_000_000,
             r.ts % 1_000_000_000 / 1000
         );
-        out.bytes(r.text);
-        out.bytes(b"\n");
+        out.0.extend_from_slice(r.text);
+        out.0.push(b'\n');
         pos[i] += l;
     }
     Ok(out.0)
 }
 
-/// /sys/kernel/tracing/trace (Linux tracing_fops, read side)
+/// The `trace` file's text as it grows (formatting cannot fail)
+struct Out(Vec<u8>);
+
+impl Write for Out {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// /sys/kernel/tracing/trace (Linux tracing_fops)
 struct TraceFile;
 
-impl BinAttr for TraceFile {
-    /// Linux shows the trace files with size 0
-    fn size(&self) -> u64 {
-        0
-    }
-
-    fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let t = trace_text()?;
-        let start = usize::try_from(off).map_or(t.len(), |o| o.min(t.len()));
-        let n = buf.len().min(t.len() - start);
-        buf[..n].copy_from_slice(&t[start..start + n]);
-        Ok(n)
-    }
-
-    /// Writes are accepted and dropped (Linux tracing_write_stub), so
-    /// `echo > trace` clears through its O_TRUNC open
-    fn write(&self, _off: u64, data: &[u8]) -> Result<usize, KernelError> {
-        Ok(data.len())
-    }
-
+impl TraceFops for TraceFile {
     /// Linux tracing_open: an open for writing with O_TRUNC empties
     /// every CPU's ring (tracing_reset_online_cpus)
     fn open(&self, writable: bool, flags: u32) -> Result<(), KernelError> {
@@ -497,6 +507,17 @@ impl BinAttr for TraceFile {
             reset();
         }
         Ok(())
+    }
+
+    /// The text from `*pos` on (Linux seq_read of the trace iterator)
+    fn read(&self, to: &mut IovDest<'_>, pos: &mut u64) -> Result<usize, KernelError> {
+        libfs::simple_read_from_buffer(to, pos, &trace_text()?)
+    }
+
+    /// Writes are accepted and dropped (Linux tracing_write_stub), so
+    /// `echo > trace` clears through its O_TRUNC open
+    fn write(&self, from: &mut IovSource<'_>, _pos: &mut u64) -> Result<usize, KernelError> {
+        Ok(from.len())
     }
 }
 
@@ -513,199 +534,20 @@ fn reset() {
     }
 }
 
-static ROOT: Once<Arc<KNode>> = Once::new();
-
-fn root() -> &'static Arc<KNode> {
-    ROOT.call_once(KNode::new_root)
-}
-
-struct TracefsSops;
-
-impl SuperOps for TracefsSops {
-    fn alloc_inode(
-        &self,
-        _sb: &Arc<SuperBlock>,
-        _mode: InodeMode,
-        _i_op: &'static dyn InodeOps,
-    ) -> Result<InodeRef, KernelError> {
-        Err(KernelError::OperationNotSupported)
-    }
-
-    fn statfs(&self, _sb: &SuperBlock) -> Result<StatFs, KernelError> {
-        Ok({
-            StatFs {
-                f_type: TRACEFS_MAGIC,
-                f_bsize: 4096,
-                f_namelen: 255,
-                ..StatFs::default()
-            }
-        })
-    }
-
-    /// Linux tracefs_parse_param + tracefs_apply_options(remount): uid=,
-    /// gid=, mode= (octal) set the root's, only those given; any other
-    /// option is EINVAL (vfs_parse_fs_param: "Unknown parameter")
-    fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
-        let o = parse_opts(data)?;
-        let root = sb
-            .get_root()
-            .and_then(|r| r.get_inode())
-            .ok_or(KernelError::Io)?;
-        if let Some(m) = o.mode {
-            root.set_mode_perm(m);
-        }
-        if let Some(u) = o.uid {
-            root.set_uid(u);
-        }
-        if let Some(g) = o.gid {
-            root.set_gid(g);
-        }
-        Ok(())
-    }
-
-    /// Linux tracefs_show_options: uid, gid when not 0, mode when not
-    /// the default
-    fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
-        let Some(root) = sb.get_root().and_then(|r| r.get_inode()) else {
-            return;
-        };
-        let mut s = alloc::string::String::new();
-        if root.uid() != 0 {
-            let _ = write!(s, ",uid={}", root.uid());
-        }
-        if root.gid() != 0 {
-            let _ = write!(s, ",gid={}", root.gid());
-        }
-        let mode = root.mode().perm();
-        if mode != TRACEFS_DEFAULT_MODE {
-            let _ = write!(s, ",mode={mode:o}");
-        }
-        out.extend_from_slice(s.as_bytes());
-    }
-}
-
-/// The root's mode without a mode= option (Linux TRACEFS_DEFAULT_MODE)
-const TRACEFS_DEFAULT_MODE: u16 = 0o700;
-
-/// tracefs's mount options (Linux tracefs_fs_info: each set if given)
-#[derive(Default)]
-struct TraceOpts {
-    uid: Option<u32>,
-    gid: Option<u32>,
-    mode: Option<u16>,
-}
-
-/// Linux tracefs_param_specs (fsparam_uid, fsparam_gid, fsparam_u32oct)
-fn parse_opts(data: &[u8]) -> Result<TraceOpts, KernelError> {
-    let mut o = TraceOpts::default();
-    let num = |v: &[u8], radix: u32| {
-        core::str::from_utf8(v)
-            .ok()
-            .and_then(|s| u32::from_str_radix(s, radix).ok())
-            .ok_or(KernelError::InvalidArgument)
-    };
-    let data = data.split(|&c| c == 0).next().unwrap_or(b"");
-    for w in data.split(|&c| c == b',').filter(|w| !w.is_empty()) {
-        if crate::fs::superblock::sb_flag_word(w) {
-            continue;
-        }
-        let (k, v) = match w.iter().position(|&c| c == b'=') {
-            Some(i) => (&w[..i], &w[i + 1..]),
-            None => return Err(KernelError::InvalidArgument),
-        };
-        match k {
-            b"uid" => o.uid = Some(num(v, 10)?),
-            b"gid" => o.gid = Some(num(v, 10)?),
-            b"mode" => o.mode = Some((num(v, 8)? & 0o7777) as u16),
-            _ => return Err(KernelError::InvalidArgument),
-        }
-    }
-    Ok(o)
-}
-
-static TRACEFS_SOPS: TracefsSops = TracefsSops;
-
-/// tracefs's dentry operations (Linux tracefs_dentry_operations)
-static TRACEFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
-    d_revalidate: Some(tracefs_d_revalidate),
-    d_delete: Some(tracefs_d_delete),
-    ..crate::fs::dentry::DentryOps::NONE
-};
-
-/// Linux tracefs_d_revalidate: answered in an RCU walk too, from what
-/// it may read there (the node behind the inode, RCU-readable). Linux
-/// calls a dentry stale only for a freed eventfs entry, since a removed
-/// tracefs file's dentry goes with it (simple_recursive_removal); hk's
-/// nodes live in kernfs and leave without touching dentries, so a
-/// positive one is stale once its node is removed, and a negative one
-/// (kept only while held: `tracefs_d_delete`) once its directory's
-/// revision moved (nodes come beside the dcache, not through it)
-fn tracefs_d_revalidate(
-    dir: &crate::fs::inode::Inode,
-    d: &Dentry,
-    inode: Option<&crate::fs::inode::Inode>,
-    _: crate::fs::dentry::LookupBits,
-) -> Result<bool, KernelError> {
-    use kernfs::vfs::knode_rcu;
-    Ok(match inode {
-        Some(i) => knode_rcu(i).is_some_and(|k| !k.0.removed()),
-        None => knode_rcu(dir).is_none_or(|p| p.0.rev() == d.d_time()),
-    })
-}
-
-/// Linux tracefs_d_delete: a dentry with no eventfs data goes at its
-/// last put (hk has no eventfs dentries)
-fn tracefs_d_delete(_: &Dentry) -> bool {
-    true
-}
-
-/// One superblock for every mount (Linux tracefs_get_tree:
-/// get_tree_single, then the options applied, tracefs_reconfigure)
-fn mount(
-    fc: &crate::fs::superblock::FsContext<'_>,
-) -> Result<crate::fs::superblock::SbLocked, KernelError> {
-    let sb = crate::fs::superblock::get_tree_single(fc, &TRACEFS_SOPS, |sb| {
-        sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
-        sb.set_d_op(&TRACEFS_DOPS);
-        let ri = kernfs::vfs::inode(sb, root())?;
-        // Linux tracefs_fill_super: tracefs_apply_options(sb, false)
-        ri.set_mode_perm(TRACEFS_DEFAULT_MODE);
-        sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
-            ri,
-            Arc::downgrade(sb),
-        ))?);
-        Ok(())
-    })?;
-    sb.s_op.remount(&sb, fc.data)?;
-    Ok(sb)
-}
-
-pub static TRACEFS_TYPE: FileSystemType = FileSystemType {
-    name: "tracefs",
-    fs_flags: fs_flags::FS_PSEUDO,
-    mount,
-    kill_sb: crate::fs::superblock::kill_anon_super,
-    file_ops: &kernfs::vfs::KERNFS_FOPS,
-    next: crate::fs::superblock::FsNext::new(None),
-    fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
-};
-
-/// Linux tracefs_init (the type, /sys/kernel/tracing to mount it on),
-/// tracer_init_tracefs (the `trace` file) and event_trace_init (the
-/// events directory); the rings now if `trace_event=` asks for events
-/// (Linux setup_trace_event expands the ring buffer)
+/// Linux tracer_init_tracefs (the `trace` file) and event_trace_init
+/// (the events directory); the rings now if `trace_event=` asks for
+/// events (Linux setup_trace_event expands the ring buffer)
 pub fn init() {
     if boot_events().next().is_some() {
         let _g = EVENT_MUTEX.lock();
         let _ = update_buffers();
     }
-    let _ = root().create_bin(b"trace", 0o640, arc_nofail(TraceFile));
-    if let Ok(events) = root().create_dir(b"events", 0o755) {
-        let _ = events.create_file(b"enable", 0o640, arc_nofail(AllEnable));
+    let _ = tracefs::create_file(b"trace", 0o640, None, arc_nofail(TraceFile));
+    if let Ok(events) = tracefs::create_dir(b"events", None) {
+        let f = arc_nofail(AllEnable);
+        let _ = tracefs::create_file(b"enable", 0o640, Some(&events), f);
         EVENTS_DIR.call_once(|| events);
     }
-    sysfs::mount_point(&sysfs::top_dir(b"kernel"), b"tracing");
-    crate::fs::superblock::register_filesystem(&TRACEFS_TYPE).expect("tracefs type");
 }
 
 #[cfg(test)]
