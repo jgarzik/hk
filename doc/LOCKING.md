@@ -726,7 +726,7 @@ SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fa_lock,
     list under RCU, any context but hardirq, spin locks held or not:
     `fa` (read) → FOwner.st (IrqRwLock, read) → TASKLIST (read; a
     pgrp owner's group walked under it, each send in place) →
-    Task.sig → shared_pending, its entry GFP_ATOMIC (3.7 rule 5)
+    Task.sig → SignalStruct.shared, its entry GFP_ATOMIC (3.7 rule 5)
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem, INODE_HASH_LOCK
@@ -1620,7 +1620,7 @@ for the task, an RCU read guard for others.
 3. **The tick reads no TASKLIST** - wakeups and timers use `Task` fields only
 4. **Nothing is released under TASKLIST or an alloc_lock** - a task's
    shared resources (`files`, `fs`, `nsproxy`, `io_context`, `mm`
-   under alloc_lock; `sighand`/`signal`, `seccomp_filter`, a reaped
+   under alloc_lock; `sighand`, `seccomp_filter`, a reaped
    `Task` under TASKLIST) are `take()`n or `replace()`d under the lock
    and dropped after it: their last reference can close sockets (TCP
    release may sleep in SO_LINGER: sleeping under a spin lock) or tear
@@ -4372,8 +4372,8 @@ state patterns.
 | `SigHand.users` | `TableCell<u32>` (TASKLIST) | Tasks whose `Task.sighand` it is, changed with that field (Linux sighand->count): exec copies a table with more than one (unshare_sighand) |
 | `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack; a ptrace stop: `jobctl` (TRACED, PTRACE_FROZEN, LISTENING), `ptrace_code`, `last_siginfo` (3.1.3) (Linux siglock's per-task part: jobctl, exit_code, last_siginfo) |
 | `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under `Task.sig` | Pending-signal flag |
-| `SignalStruct.jobctl` | `spin::Mutex<stop::GroupStop>`, thread context only (not IRQ-safe), one group's at a time; reached through the group's `SignalStruct` (a task's `cpu_group`, or `TaskInner.signal` under TASKLIST) | Job-control state (Linux siglock's group part: signal->flags' SIGNAL_STOP_*/SIGNAL_CLD_*, group_stop_count, group_exit_code as the stop's signal). Taken after TASKLIST (read or write, when held) and before any thread's `Task.sig`; a thread's stop bits (`jobctl` STOP_PENDING, STOP_CONSUME, STOPPED, TRAP_STOP, TRAP_NOTIFY, TRAPPING) change with both held, and are read under either. Holders: a stop signal's or SIGCONT's send, across its prepare (every thread's `Task.sig` in turn, the shared set's flush), queue, thread choice and wakeups (Linux prepare_signal/complete_signal under siglock); do_signal_stop (TASKLIST read for the thread walk, each thread's `Task.sig` in turn); a ptrace trap's entry (`ptrace_stop_why`); PTRACE_INTERRUPT (TASKLIST read); `zap_threads`; `exit_participate` (PF_EXITING set under it, Linux exit_signals); a group exit's start (`SignalStruct::start_exit`, Linux SIGNAL_GROUP_EXIT set under siglock; TASKLIST held or not, no `Task.sig`), so a stop signal's or SIGCONT's send, which checks for one under it before its prepare, is dropped by an exit begun before it (Linux prepare_signal) and seen by one begun after; the tracer's attach and unlink (TASKLIST write); a clone's insert (`join_group_stop`, TASKLIST write); wait (`take_stopped`, `take_continued`, TASKLIST read); a stop notice's code. Dropped before any parent is notified (a SIGCHLD send takes no group lock); wakeups under it are allowed. Entries a stop signal or SIGCONT flushes go to the caller's `SigPending`, dropped with no signal lock held (a timer's entry goes back to its timer) |
-| `SignalStruct.shared` | `spin::Mutex<GroupPending>`, reached through `TaskSignalState.shared_pending` (the task's `Arc<SignalStruct>`); a flush on SIG_IGN (`flush_group_signal`) takes it alone, through the group's `SignalStruct` | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target), and the forks in progress (`GroupPending.multiprocess`, Linux signal->multiprocess): a fork links its boxed `ForkDelay` node under `Task.sig` -> `shared` at its start (`fork_signals_begin`, with its ERESTARTNOINTR check of the caller's pending signals under the same `Task.sig`), a send of a `PidType::Pgid` signal records it in every node in the hold that queues it, and the child's attach (`install_fork_signal`, TASKLIST write) unlinks the node (`shared` alone under TASKLIST) and ORs its set into the child's group set (the child's `shared`, after the parent's is dropped); a failed fork unlinks it as it returns, no other lock held |
+| `SignalStruct.jobctl` | `spin::Mutex<stop::GroupStop>`, thread context only (not IRQ-safe), one group's at a time; reached through the group's `SignalStruct` (a task's `cpu_group`, Linux task->signal: set in the TASKLIST section that lists it, fixed for its life) | Job-control state (Linux siglock's group part: signal->flags' SIGNAL_STOP_*/SIGNAL_CLD_*, group_stop_count, group_exit_code as the stop's signal). Taken after TASKLIST (read or write, when held) and before any thread's `Task.sig`; a thread's stop bits (`jobctl` STOP_PENDING, STOP_CONSUME, STOPPED, TRAP_STOP, TRAP_NOTIFY, TRAPPING) change with both held, and are read under either. Holders: a stop signal's or SIGCONT's send, across its prepare (every thread's `Task.sig` in turn, the shared set's flush), queue, thread choice and wakeups (Linux prepare_signal/complete_signal under siglock); do_signal_stop (TASKLIST read for the thread walk, each thread's `Task.sig` in turn); a ptrace trap's entry (`ptrace_stop_why`); PTRACE_INTERRUPT (TASKLIST read); `zap_threads`; `exit_participate` (PF_EXITING set under it, Linux exit_signals); a group exit's start (`SignalStruct::start_exit`, Linux SIGNAL_GROUP_EXIT set under siglock; TASKLIST held or not, no `Task.sig`), so a stop signal's or SIGCONT's send, which checks for one under it before its prepare, is dropped by an exit begun before it (Linux prepare_signal) and seen by one begun after; the tracer's attach and unlink (TASKLIST write); a clone's insert (`join_group_stop`, TASKLIST write); wait (`take_stopped`, `take_continued`, TASKLIST read); a stop notice's code. Dropped before any parent is notified (a SIGCHLD send takes no group lock); wakeups under it are allowed. Entries a stop signal or SIGCONT flushes go to the caller's `SigPending`, dropped with no signal lock held (a timer's entry goes back to its timer) |
+| `SignalStruct.shared` | `spin::Mutex<GroupPending>`, reached through a task's `cpu_group` (`signal::group_pending`, Linux t->signal->shared_pending); a flush on SIG_IGN (`flush_group_signal`) takes it alone | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target), and the forks in progress (`GroupPending.multiprocess`, Linux signal->multiprocess): a fork links its boxed `ForkDelay` node under `Task.sig` -> `shared` at its start (`fork_signals_begin`, with its ERESTARTNOINTR check of the caller's pending signals under the same `Task.sig`), a send of a `PidType::Pgid` signal records it in every node in the hold that queues it, and the child's attach (`install_fork_signal`, TASKLIST write) unlinks the node (`shared` alone under TASKLIST) and ORs its set into the child's group set (the child's `shared`, after the parent's is dropped); a failed fork unlinks it as it returns, no other lock held |
 | `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (64 entries, `Signal::idx`) | Signal handler table |
 | `SigHand.update` | sleeping `sync::Mutex<()>`, thread context only (never from IRQ) | rt_sigaction's install of an action and the pending flush or timer requeue it makes, as one step for the table's other sigactions (Linux siglock held across do_sigaction). Outermost of the signal locks: taken with no lock held, before TASKLIST, `Task.sig`, `SignalStruct.shared`, `SignalStruct.posix_timers` and `SigHand.action`; never nested with itself (one lockdep class) |
@@ -4431,9 +4431,13 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    one (EAGAIN). TASKLIST may be held around it (a child's notice,
    Linux do_notify_parent under tasklist_lock). A dequeue unlinks its
    entry under the lock and the caller frees it (`Dequeued::info`)
-   after; an exiting task's sets are swapped out under TASKLIST and
-   `Task.sig` and freed after both, and an exiting task (PF_EXITING,
-   read under `Task.sig`) gets no entries, so none outlives that flush.
+   after; an exiting task's private set is taken under `Task.sig` with
+   PF_EXITING set (`exit_participate`, Linux exit_signals:
+   sigqueue_dequeue_pending) and freed after, and an exiting task
+   (PF_EXITING, read under `Task.sig`) gets no private entries, so none
+   outlives that flush. A zombie keeps its blocked mask and the rest of
+   its `Task.sig`; the group's set stays in its `SignalStruct` until the
+   struct goes with the last task naming it.
    Senders run in thread context, never from hardirq; every step of a
    send takes only spin locks and allocates GFP_ATOMIC, so a sender may
    hold spin locks (SIGIO from a socket wakeup under its locks, as in
@@ -4501,9 +4505,9 @@ child_sighand = parent_sighand.clone();  // Same Arc<SigHand>
 
 **With CLONE_THREAD:**
 ```rust
-// Also share pending signals (thread group)
-// Both reach the group's pending set through the same Arc<SignalStruct>
-child.shared_pending = SharedPending(Some(signal.clone()));
+// Also share pending signals (thread group): both reach the group's
+// pending set through the same Arc<SignalStruct> (Task.cpu_group)
+child.set_cpu_group(&signal);
 ```
 
 #### Syscall Patterns
@@ -4590,9 +4594,10 @@ de_thread, exit_group does not.
   `install_fork_signal` set up its signal state (`zap_new_thread`): the
   state is set before a zap takes TASKLIST, so either the zap saw the
   new thread or the clone sees the state.
-- The zombie leader keeps its `SignalStruct` until reaped (the group's
-  status); the reaper reads it under TASKLIST and releases the Task
-  after dropping it.
+- Every task keeps its `SignalStruct` (`cpu_group`, Linux task->signal)
+  for its life; a zombie leader's gives the group's status to the
+  reaper. A task gives its CPU time to it in the TASKLIST write section
+  that takes it off its thread list (`unhash`, Linux __exit_signal).
 - A leader is reported to its parent once (Linux exit_notify /
   release_task under tasklist_lock): the leader decides in the TASKLIST
   write section that makes it a zombie (`exit_notify`), each untraced

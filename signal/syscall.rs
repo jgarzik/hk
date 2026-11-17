@@ -180,9 +180,10 @@ pub fn sys_rt_sigpending(set: UserPtr<u64>, sigsetsize: u64) -> KernelResult<()>
     if sigsetsize != 8 || set.is_null() {
         return Err(KernelError::InvalidArgument);
     }
-    let pending = with_task_signal_state(&current(), |state| {
+    let me = current();
+    let pending = with_task_signal_state(&me, |state| {
         // Combine private and shared pending
-        let shared = state.shared_pending.lock();
+        let shared = crate::signal::group_pending(&me);
         state.pending.signal.union(&shared.signal).bits()
     })
     .ok_or(KernelError::NoProcess)?;

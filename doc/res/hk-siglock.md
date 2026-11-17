@@ -78,7 +78,7 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
 |---|---|---|---|
 | `TaskInner.sighand` | TASKLIST, cleared at exit (`exit_task_signal`) | `task->sighand` `__rcu`, siglock + tasklist write | `Task.sighand: RcuLockedArc<SigHand, GlobalTaskTable>`, cleared at release under TASKLIST write + its siglock; `lock_task_sighand` |
 | `SigHand.users` | TASKLIST | `sighand->count` refcount | unchanged (TASKLIST write is held by every writer) |
-| `TaskInner.signal` | TASKLIST, cleared at exit for threads | `task->signal`, fixed | `Task.cpu_group` is it (fixed); drop the TaskInner copy |
+| `TaskInner.signal` | gone (2b) | `task->signal`, fixed | `Task.cpu_group` is it (fixed) |
 | leader `TaskInner.threads` | TASKLIST | `signal->thread_head`: tasklist write + siglock | moves into `SignalStruct`, a cell needing both proofs to change, either to walk |
 | `TaskInner.ptrace` | TASKLIST | tasklist write; racy read under siglock | atomic (Relaxed load = Linux's racy read) |
 | `Task.sig` (blocked, pending, altstack, ptrace jobctl, last_siginfo) | per-task spin Mutex | siglock | nested under siglock first; folded into siglock-owned state last |
@@ -122,10 +122,14 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
 2. [x] sighand set in the section that lists the child and cleared at
    release (`unhash`, Linux __exit_signal), not at exit: a zombie keeps
    its handlers.
-2b. [ ] the per-task flush at release too (Linux __exit_signal's
-   flush_sigqueue; hk swaps `Task.sig` at exit, so a zombie leader
-   loses its group-pending link); then `group_task` goes (Linux takes
-   the leader), group pending reached through `Task.cpu_group`.
+2b. [x] `Task.sig` no longer swapped at exit: only the private queue
+   goes, in exit_signals under PF_EXITING (the reference tree's
+   sigqueue_dequeue_pending); a zombie keeps its mask, its group's
+   set stays. `TaskInner.signal` dropped (`Task.cpu_group` is
+   task->signal); group pending reached through it; dead CPU time
+   added at release (`unhash`). `group_task` gone: a group signal goes
+   to the task found (a zombie leader included), a child's notice to
+   the parent thread (Linux __group_send_sig_info(tsk->parent)).
 3. [ ] thread list into `SignalStruct` (`SigCell` + TASKLIST); walks in
    signal/ move from TASKLIST to siglock (complete_signal, zap_threads,
    stop::prepare, do_signal_stop).

@@ -371,7 +371,7 @@ pub fn run() {
     }
     // From the kernel to the process (Linux SEND_SIG_PRIV)
     for s in itimer_sig.into_iter().chain([rlimit_sig]).flatten() {
-        let _ = crate::signal::group_send_sig_info(&me, s, crate::signal::SendInfo::Kernel);
+        let _ = crate::signal::send_group_signal(&me, s, crate::signal::SendInfo::Kernel);
     }
 }
 

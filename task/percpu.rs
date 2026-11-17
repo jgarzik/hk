@@ -785,6 +785,12 @@ tracer_reads!(TaskViewMut);
 macro_rules! relation_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
+            /// Its thread group's signal struct (Linux task->signal;
+            /// none for a kernel thread)
+            pub fn signal(&self) -> Option<&Arc<crate::signal::SignalStruct>> {
+                self.task.cpu_group()
+            }
+
             /// A reference to its signal handlers (none before fork
             /// attaches them or once it is released)
             pub fn sighand(&self) -> Option<Arc<crate::signal::SigHand>> {
@@ -1205,6 +1211,11 @@ impl GlobalTaskTable {
             .and_then(|i| i.user_ns.as_ref())
         {
             u.active_put();
+        }
+        // Its CPU time stays its group's (Linux __exit_signal, with the
+        // thread list's unlink above in this section)
+        if let Some(s) = t.cpu_group() {
+            s.add_dead_times(crate::task::cputime::task_cputime(&t));
         }
         // Its handlers go (Linux __exit_signal from release_task, under
         // siglock): a zombie keeps them until here. The reference taken
@@ -2119,7 +2130,7 @@ fn wait_zombie(table: &mut GlobalTaskTable, w: &Wait) -> Option<(WaitReport, Unh
         return Some((report, unhash_thread(table, tid, z)));
     }
     // The reaper's cutime/cstime
-    if let Some(s) = table.view(&current()).and_then(|t| t.signal.clone()) {
+    if let Some(s) = current().cpu_group().cloned() {
         s.add_child_times((report.2, report.3));
     }
     let gone = reap_locked(table, tid);
@@ -2147,7 +2158,7 @@ fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> WaitReport {
         crate::task::cputime::task_cputime_adjusted(z.task)
     };
     if z.leader
-        && let Some(s) = &z.signal
+        && let Some(s) = z.signal()
     {
         let (cu, cs) = s.child_times();
         utime = utime.saturating_add(cu);
@@ -2225,11 +2236,6 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     if let (Some(me), Some(l)) = (&me, &old) {
         let (mi, li) = me.inner().access_pair_mut(l.inner(), &mut *table);
         let pids = if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
-            // The old leader's CPU time stays the group's (Linux
-            // release_task -> __exit_signal)
-            if let Some(s) = &li.signal {
-                s.add_dead_times(crate::task::cputime::task_cputime(l));
-            }
             core::mem::swap(&mut mi.thread_pid, &mut li.thread_pid);
             (mi.thread_pid.clone(), li.thread_pid.clone())
         } else {
@@ -2296,8 +2302,8 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
 
 /// The wait status a zombie leader reports (Linux wait_task_zombie):
 /// the group's exit status after a group exit, else its own
-fn group_status(t: &TaskInner, own: i32) -> i32 {
-    match t.signal.as_ref().map(|s| s.group_exit()) {
+fn group_status(t: &TaskView<'_>, own: i32) -> i32 {
+    match t.signal().map(|s| s.group_exit()) {
         Some(crate::signal::GroupExit::Exit(code)) => code,
         _ => own,
     }
@@ -2382,7 +2388,7 @@ pub fn wait_jobctl(
         {
             return None;
         }
-        let s = t.signal.as_ref()?;
+        let s = t.signal()?;
         let uid = t.cred_arc().uid;
         if child
             && !traced
@@ -3322,7 +3328,7 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
         if v.thread_pid.as_ref().map(|p| p.level) != level {
             break;
         }
-        if v.signal.as_ref().is_some_and(|s| s.subreaper(table))
+        if v.signal().is_some_and(|s| s.subreaper(table))
             && let Some(r) = live_thread(table, t.pid)
         {
             return Some(r);
@@ -3478,10 +3484,7 @@ fn detach_zombie(table: &mut GlobalTaskTable, me: &Task) -> Option<Unhashed> {
     } else if ppid != me.pid {
         (Some(Zombie::Detached(tid)), false)
     } else {
-        (
-            None,
-            crate::signal::notify::ignoring_children(table, me.pid),
-        )
+        (None, crate::signal::notify::ignoring_children(table, me))
     };
     if let Some(mut v) = table.get_mut(tid) {
         crate::task::ptrace::ptrace_unlink(&mut v);
@@ -3718,11 +3721,6 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // exit_task_work)
         crate::task::task_work::exit_task_work();
         forget_original_parent();
-        // Its signal state goes once its tracees and children are dealt
-        // with: whether the process ignores SIGCHLD decides the fate of
-        // a zombie tracee of its own (Linux keeps sighand until
-        // __exit_signal, in release_task)
-        crate::signal::exit_task_signal(&current());
         // Out of its cgroup while still running, before it is a zombie
         // a waiting parent may reap at once (Linux do_exit: cgroup_exit
         // before exit_notify); TASKLIST is not held
@@ -5006,7 +5004,7 @@ pub fn children_times() -> (u64, u64) {
     let table = TASKLIST.read();
     table
         .view(&current())
-        .and_then(|t| t.signal.clone())
+        .and_then(|t| t.signal().cloned())
         .map_or((0, 0), |s| s.child_times())
 }
 

@@ -131,7 +131,7 @@ use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
 use crate::ns::NsProxy;
 use crate::seccomp::SeccompFilter;
-use crate::signal::{SigHand, SignalStruct, TaskSignalState};
+use crate::signal::{SigHand, TaskSignalState};
 
 use crate::sync::spin::Mutex;
 
@@ -915,9 +915,10 @@ pub struct Task {
     /// timer on this thread's clock: a hint for the tick (`cpu_timer`;
     /// Linux posix_cputimers' expiry cache)
     pub cpu_next: [AtomicU64; 3],
-    /// Its thread group's SignalStruct, set once when the task gets it
-    /// (never changes): the tick and the accounting reach the group's
-    /// CPU timer state through it without TASKLIST
+    /// Its thread group's SignalStruct (Linux task->signal), set once
+    /// when the task gets it, in the TASKLIST section that lists it,
+    /// and fixed for the task's life: the group's pending set, limits,
+    /// timers and exit state are reached through it with no TASKLIST
     cpu_group: spin::Once<Arc<crate::signal::SignalStruct>>,
     /// Voluntary context switches (task yielded or slept)
     pub nvcsw: AtomicU64,
@@ -1045,9 +1046,6 @@ pub struct TaskInner {
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
-    /// Thread-group signal state (shared when CLONE_THREAD)
-    signal: Option<Arc<SignalStruct>>,
-
     /// SysV semaphore undo list (shared when CLONE_SYSVSEM)
     sysvsem: Option<Arc<SemUndoList>>,
 
@@ -1138,7 +1136,6 @@ impl TaskInner {
             pgd,
             clear_child_tid: 0,
             set_child_tid: 0,
-            signal: None,
             sysvsem: None,
             robust_list: 0,
             prctl: PrctlState::default(),
@@ -1153,21 +1150,6 @@ impl TaskInner {
             ptrace_message: 0,
             ptrace_options: 0,
         }
-    }
-
-    /// Its thread group's signal state (none once it is reaped)
-    pub fn signal(&self) -> Option<&Arc<SignalStruct>> {
-        self.signal.as_ref()
-    }
-
-    /// Install thread-group signal state `s`
-    pub fn set_signal(&mut self, s: Arc<SignalStruct>) {
-        self.signal = Some(s);
-    }
-
-    /// Detach its thread group's signal state
-    pub fn take_signal(&mut self) -> Option<Arc<SignalStruct>> {
-        self.signal.take()
     }
 
     /// Its process identifier (None for the idle tasks)

@@ -79,7 +79,6 @@ struct Snap {
     seccomp: u8,
     blocked: u64,
     pending: u64,
-    shared: Option<crate::signal::SharedPending>,
     sighand: Option<Arc<crate::signal::SigHand>>,
     signal: Option<Arc<crate::signal::SignalStruct>>,
     fs: Option<Arc<crate::fs::FsStruct>>,
@@ -128,12 +127,11 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         let a = t.task.task_lock();
         (a.comm(), a.fs().cloned(), a.files().cloned())
     };
-    let (blocked, pending, shared, traced, stopped) = {
+    let (blocked, pending, traced, stopped) = {
         let s = t.task.sig.lock();
         (
             s.blocked.0,
             s.pending.signal.0,
-            s.shared_pending.clone(),
             s.traced(),
             s.jobctl & crate::signal::jobctl::STOPPED != 0,
         )
@@ -190,7 +188,6 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         seccomp: t.task.seccomp_mode(),
         blocked,
         pending,
-        shared: Some(shared),
         sighand: t.sighand(),
         signal: t.signal().cloned(),
         fs,
@@ -242,7 +239,7 @@ fn ign_cgt(s: &Snap) -> (u64, u64) {
 
 /// Pending signals shared by the thread group
 fn shd_pnd(s: &Snap) -> u64 {
-    s.shared.as_ref().map_or(0, |p| p.lock().signal.0)
+    s.signal.as_ref().map_or(0, |g| g.shared_set().0)
 }
 
 /// The fd table's size (Linux max_fds)
@@ -621,7 +618,6 @@ mod tests {
             seccomp: 0,
             blocked: 1 << 1,
             pending: 0,
-            shared: None,
             sighand: None,
             signal: None,
             fs: None,

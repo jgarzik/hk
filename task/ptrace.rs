@@ -771,7 +771,7 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64
         };
         let info = signal::with_task_signal_state(&task, |s| {
             if shared {
-                s.shared_pending.lock().nth(n)
+                signal::group_pending(&task).nth(n)
             } else {
                 s.pending.nth(n)
             }

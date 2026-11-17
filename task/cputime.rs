@@ -83,11 +83,12 @@ fn account_system_time(p: &Task, cputime: u64) {
 }
 
 /// Thread group `pid`'s CPU time, TASKLIST held (Linux
-/// thread_group_cputime): its threads gone (their SignalStruct sums)
-/// plus those still holding the SignalStruct. Only the caller's own
-/// running slice is charged first: other threads' runtime is as of
-/// their last tick or switch. A thread that left gave its time to the
-/// struct when it lost it, so none counts twice.
+/// thread_group_cputime): its threads released (their SignalStruct
+/// sums) plus those still listed. Only the caller's own running slice
+/// is charged first: other threads' runtime is as of their last tick
+/// or switch. A thread gives its time to the struct in the section
+/// that takes it off the thread list (Linux __exit_signal), so none
+/// counts twice.
 pub fn thread_group_cputime(table: &GlobalTaskTable, pid: Pid) -> TaskCputime {
     group_cputime(table, pid).0
 }
@@ -101,7 +102,7 @@ fn group_cputime(table: &GlobalTaskTable, pid: Pid) -> (TaskCputime, Option<Arc<
     let mut sig = None;
     let mut sum = TaskCputime::default();
     for t in table.threads(pid) {
-        let Some(s) = &t.signal else {
+        let Some(s) = t.signal() else {
             continue;
         };
         sig.get_or_insert_with(|| s.clone());

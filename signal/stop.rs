@@ -239,7 +239,7 @@ pub fn prepare(
                 trap_notify(v.task, &mut s);
             }
         }
-        v.task.set_sigpending(s.has_deliverable_signals());
+        super::recalc_sigpending_tsk(v.task, &s);
     }
     sig_struct.shared.lock().flush_mask_into(&flush, gone);
     if !stop {
@@ -428,25 +428,32 @@ pub fn notify_cld() {
 }
 
 /// The current thread starts its exit with PF_EXITING (Linux
-/// exit_signals) under its group lock and Task.sig: a group stop it was
-/// to join counts it as stopped, and one it completes is told to the
-/// parent
+/// exit_signals) under its group lock and Task.sig: its private pending
+/// signals go (sigqueue_dequeue_pending: nothing is queued for it once
+/// PF_EXITING is set, `drops`), freed after the locks; a group stop it
+/// was to join counts it as stopped, and one it completes is told to
+/// the parent
 pub fn exit_participate() {
     let me = crate::task::percpu::current();
     let Some(sig_struct) = me.cpu_group().cloned() else {
         me.set_flag(crate::task::pf::EXITING);
+        let _gone = core::mem::take(&mut me.sig.lock().pending);
         return;
     };
     let table = crate::task::percpu::TASKLIST.read();
-    let notify = {
+    let (notify, gone) = {
         let mut g = sig_struct.jobctl.lock();
         let mut s = me.sig.lock();
         me.set_flag(crate::task::pf::EXITING);
-        s.jobctl & STOP_PENDING != 0 && participate(&mut g, &mut s)
+        let gone = core::mem::take(&mut s.pending);
+        let notify = s.jobctl & STOP_PENDING != 0 && participate(&mut g, &mut s);
+        (notify, gone)
     };
     if notify {
         super::notify::notify_parent_cldstop(&table, &me, false, Why::Stopped);
     }
+    drop(table);
+    drop(gone);
 }
 
 /// The wait report of group `s`'s completed stop (Linux
@@ -576,5 +583,5 @@ pub fn join_group_stop(parent: &Task, child: &Task) {
     }
     let mut s = child.sig.lock();
     set_pending(child, &mut s, mask | STOP_PENDING);
-    child.set_sigpending(s.has_deliverable_signals());
+    super::recalc_sigpending_tsk(child, &s);
 }

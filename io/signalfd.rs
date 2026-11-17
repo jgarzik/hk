@@ -164,8 +164,9 @@ impl Signalfd {
     /// Check if any monitored signals are pending
     fn has_pending_signals(&self) -> bool {
         let mask = self.inner.lock().mask;
-        with_task_signal_state(&current(), |state| {
-            let shared = state.shared_pending.lock();
+        let me = current();
+        with_task_signal_state(&me, |state| {
+            let shared = crate::signal::group_pending(&me);
             let pending = state.pending.signal.union(&shared.signal);
             pending.intersect(&mask).any()
         })

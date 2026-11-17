@@ -81,17 +81,15 @@ pub fn notify_parent_cldstop(
     // As the receiver's namespace numbers it (Linux task_pid_nr_ns(tsk,
     // task_active_pid_ns(parent)))
     let info = chld_info(table, &tsk, why.code(), status, parent.pid_ns());
-    if !quiet
-        && let Some(info) = info
-        && let Some(to) = super::group_task(table, table.get(parent.pid))
-    {
-        // Linux send_signal_locked(SIGCHLD, .., PIDTYPE_TGID); SIGCHLD
-        // flushes nothing
+    if !quiet && let Some(info) = info {
+        // To the parent thread, for its group (Linux
+        // __group_send_sig_info(SIGCHLD, .., parent): send_signal_locked
+        // PIDTYPE_TGID); SIGCHLD flushes nothing
         let mut gone = super::SigPending::new();
         let info = SendInfo::Info(info);
         let _ = super::send_task_in(
             table,
-            &to,
+            &parent,
             SIGCHLD,
             info,
             super::PidType::Tgid,
@@ -117,16 +115,14 @@ fn chld_code(status: i32) -> (i32, i32) {
     }
 }
 
-/// Who is told of zombie `z`: its tracer, else its real parent
-/// (`_parent`), through `to`, the thread of that process a group signal
-/// is checked against; the signal (its exit signal, or SIGCHLD to a
+/// Who is told of zombie `z`: its tracer, else its real parent (`to`,
+/// that thread, for its process: Linux __group_send_sig_info to
+/// tsk->parent); the signal (its exit signal, or SIGCHLD to a
 /// tracer that is not the parent, to a thread, or to an image that did
 /// not ask for it; None: none) and whether it is released at once
 /// (autoreap)
 struct Rcv {
-    /// Kept only so its last reference, if this is it, goes after
-    /// TASKLIST
-    _parent: TaskRef,
+    /// Kept so its last reference, if this is it, goes after TASKLIST
     to: TaskRef,
     sig: Option<Signal>,
     autoreap: bool,
@@ -191,31 +187,24 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     if sig != Some(SIGCHLD) && t.parent_exec_id() != crate::task::self_exec_id(&parent) {
         sig = Some(SIGCHLD);
     }
-    let to = super::group_task(table, table.get(parent.pid))?;
     let (sig, autoreap) = if traced {
         (sig, false)
     } else {
-        disposition(table, &to, sig)
+        disposition(table, &parent, sig)
     };
     Some(Rcv {
-        _parent: parent,
-        to,
+        to: parent,
         sig,
         autoreap,
     })
 }
 
-/// What untraced child notice `sig` to the process `to` is a thread of
-/// does, by that process's SIGCHLD action (Linux do_notify_parent:
-/// psig, the handlers its threads share; not a thread's own, which an
-/// exited one no longer has): the signal sent (None: none) and
-/// autoreap. A parent that ignores SIGCHLD or set SA_NOCLDWAIT does not
+/// What untraced child notice `sig` to the parent thread `to` does, by
+/// its process's SIGCHLD action (Linux do_notify_parent: psig =
+/// tsk->parent->sighand, the handlers its threads share): the signal
+/// sent (None: none) and autoreap. A parent that ignores SIGCHLD or set SA_NOCLDWAIT does not
 /// wait for the child; one that ignores it gets no signal.
-fn disposition(
-    table: &GlobalTaskTable,
-    to: &TaskRef,
-    sig: Option<Signal>,
-) -> (Option<Signal>, bool) {
+fn disposition(table: &GlobalTaskTable, to: &Task, sig: Option<Signal>) -> (Option<Signal>, bool) {
     if sig != Some(SIGCHLD) {
         return (sig, false);
     }
@@ -229,12 +218,11 @@ fn disposition(
     }
 }
 
-/// The process `pid` reaps its children itself: it ignores SIGCHLD or
-/// set SA_NOCLDWAIT (Linux ignoring_children, by its SIGCHLD action as
-/// [`disposition`] reads it)
-pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool {
-    super::group_task(table, table.get(pid))
-        .is_some_and(|to| disposition(table, &to, Some(SIGCHLD)).1)
+/// The process of task `t` reaps its children itself: it ignores
+/// SIGCHLD or set SA_NOCLDWAIT (Linux ignoring_children(t->sighand), by
+/// its SIGCHLD action as [`disposition`] reads it)
+pub fn ignoring_children(table: &GlobalTaskTable, t: &Task) -> bool {
+    disposition(table, t, Some(SIGCHLD)).1
 }
 
 /// What [`notify`] did: the parent is to release the zombie now
@@ -312,14 +300,14 @@ fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) 
     let crate::task::TaskState::Zombie(own) = t.state() else {
         return None;
     };
-    let status = match t.signal().map(|s| s.group_exit()) {
+    let status = match t.task.cpu_group().map(|s| s.group_exit()) {
         Some(super::GroupExit::Exit(code)) => code,
         _ => own,
     };
     // Its raw samples and its group's exited threads' (Linux
     // do_notify_parent: task_cputime + signal->utime/stime)
     let mut c = crate::task::cputime::task_cputime(t.task);
-    if let Some(s) = t.signal() {
+    if let Some(s) = t.task.cpu_group() {
         c = c + s.dead_times();
     }
     let (utime, stime) = (c.utime, c.stime);

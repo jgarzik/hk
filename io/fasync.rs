@@ -20,7 +20,7 @@
 //! entry's `fa` (IrqRwLock). [`kill_fasync`] walks it under RCU, in any
 //! context but hardirq and under any spin locks, holding each entry's
 //! `fa` and its owner's `FOwner.st` (IrqRwLock) read across the send:
-//! then the signal locks (TASKLIST read, Task.sig, shared_pending), the
+//! then the signal locks (TASKLIST read, Task.sig, SignalStruct.shared), the
 //! queue entry allocated GFP_ATOMIC (doc/LOCKING.md 3.7). A process
 //! group owner's processes are walked under that TASKLIST read hold,
 //! each sent to in place, as Linux send_sigio: nothing else allocates.
@@ -35,7 +35,7 @@ use crate::io::poll::{
 };
 use crate::mm::page_alloc::Gfp;
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
-use crate::signal::{SIGIO, SIGURG, SendInfo, Signal, group_task, send_sig_info_in, valid_signal};
+use crate::signal::{SIGIO, SIGURG, SendInfo, Signal, send_sig_info_in, valid_signal};
 
 use crate::sync::IrqRwLock;
 use crate::sync::rcu::RcuHead;
@@ -446,17 +446,14 @@ fn sigio_perm(o: &Owner, t: &TaskView<'_>) -> bool {
         || o.uid == cred.uid
 }
 
-/// What a SIGIO to task `t` reaches, if the setter may signal it: the
-/// thread itself for a thread owner, else its process (Linux
-/// send_sigio_to_task's do_send_sig_info to the task, by reference)
-fn sigio_target(table: &GlobalTaskTable, o: &Owner, t: &TaskView<'_>) -> Option<TaskRef> {
+/// Task `t`, the receiver of a SIGIO (for it or its process, Linux
+/// send_sigio_to_task's do_send_sig_info to the task pid_task found),
+/// if the setter may signal it
+fn sigio_target(o: &Owner, t: &TaskView<'_>) -> Option<TaskRef> {
     if !sigio_perm(o, t) {
         return None;
     }
-    match o.kind {
-        PidType::Tid => Some(crate::task::percpu::task_ref(t.task)),
-        _ => group_task(table, Some(*t)),
-    }
+    Some(crate::task::percpu::task_ref(t.task))
 }
 
 /// Linux send_sigio_to_task: the chosen signal with its POLL info, or
@@ -515,13 +512,13 @@ fn send_sigio(o: &Owner, fd: i32, reason: i32) {
     match o.kind {
         PidType::Tid | PidType::Tgid => {
             let v = table.pid_tid(pid).and_then(|tid| table.get(tid));
-            if let Some(t) = v.and_then(|v| sigio_target(&table, o, &v)) {
+            if let Some(t) = v.and_then(|v| sigio_target(o, &v)) {
                 sigio_to_task(&table, o, &t, fd, reason, &mut gone);
             }
         }
         PidType::Pgrp => {
             for v in table.pgrp(pid) {
-                if let Some(t) = sigio_target(&table, o, &v) {
+                if let Some(t) = sigio_target(o, &v) {
                     sigio_to_task(&table, o, &t, fd, reason, &mut gone);
                 }
             }
