@@ -772,6 +772,20 @@ impl<'a> Nd<'a> {
             let l = self.walk_rcu(start, abs, path, f)?;
             return self.unlazied(l);
         }
+        self.walk_ref_from(start, abs, path, f)
+    }
+
+    /// A walk in ref mode from its start (Linux link_path_walk without
+    /// LOOKUP_RCU); out of line, as [`Nd::unlazied`], so that their
+    /// frames are not under the RCU walk's
+    #[inline(never)]
+    fn walk_ref_from(
+        &self,
+        start: Start<'_>,
+        abs: bool,
+        path: &[u8],
+        f: LookupFlags,
+    ) -> Result<Path, KernelError> {
         let start = if abs {
             self.root()?.clone()
         } else {
@@ -834,6 +848,7 @@ impl<'a> Nd<'a> {
     /// the same loop after try_to_unlazy), with the link stack and the
     /// rest of the name it handed over and the symlinks it followed
     /// counted
+    #[inline(never)]
     fn unlazied(&self, l: Lazy<'_>) -> Result<Path, KernelError> {
         let Lazy {
             to,
