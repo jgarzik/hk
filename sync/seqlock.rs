@@ -32,9 +32,18 @@ impl SeqCount {
     /// write_seqcount_begin): the counter goes odd before any of the
     /// writer's stores (smp_wmb after the increment)
     pub fn write(&self) -> SeqCountGuard<'_> {
-        self.seq.fetch_add(1, Ordering::Relaxed);
+        // Its writers are serialized by their lock: a plain increment
+        // (Linux s->sequence++), no locked RMW
+        self.bump(1, Ordering::Relaxed);
         fence(Ordering::Release);
         SeqCountGuard(self)
+    }
+
+    /// Add `n` as the one writer (under the writers' lock): a load and
+    /// a store, the store `ord`
+    fn bump(&self, n: u32, ord: Ordering) {
+        self.seq
+            .store(self.seq.load(Ordering::Relaxed).wrapping_add(n), ord);
     }
 
     /// Begin a lockless read (Linux read_seqcount_begin): waits out a
@@ -61,7 +70,7 @@ impl Drop for SeqCountGuard<'_> {
     /// Linux write_seqcount_end: the writer's stores before the counter
     /// goes even (smp_wmb, then the increment)
     fn drop(&mut self) {
-        self.0.seq.fetch_add(1, Ordering::Release);
+        self.0.bump(1, Ordering::Release);
     }
 }
 
