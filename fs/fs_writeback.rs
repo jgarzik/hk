@@ -234,9 +234,13 @@ fn wb_writeback(
 }
 
 /// Write back every dirty inode of `sb`, then its device's cache
-/// (Linux sync_filesystem: sync_inodes_sb + sync_blockdev). The first
-/// error is returned after the rest were tried.
+/// (Linux sync_filesystem: sync_inodes_sb + sync_blockdev); nothing
+/// for a read-only one (a read-only remount wrote it back first). The
+/// first error is returned after the rest were tried.
 pub fn writeback_sb(sb: &SuperBlock) -> Result<(), KernelError> {
+    if sb.rdonly() {
+        return Ok(());
+    }
     let Some(b) = sb.bdev() else {
         return Ok(());
     };

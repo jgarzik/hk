@@ -154,22 +154,7 @@ fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), Ke
         return Err(KernelError::NotPermitted);
     }
     let _s = m.sb.s_umount.write();
-    // Read-only first (EBUSY changes nothing), then the filesystem's
-    // options; their error undoes the switch (Linux reconfigure_super:
-    // sb_prepare_remount_readonly, ->reconfigure, cancel on error)
-    let was_ro = m.sb.rdonly();
-    if flags & ms::RDONLY != 0 {
-        m.sb.make_rdonly()?;
-    }
-    if let Err(e) = m.sb.s_op.remount(&m.sb, data) {
-        if !was_ro && m.sb.rdonly() {
-            m.sb.make_rdwr();
-        }
-        return Err(e);
-    }
-    if flags & ms::RDONLY == 0 {
-        m.sb.make_rdwr();
-    }
+    super::superblock::reconfigure_super(&m.sb, flags & ms::RDONLY != 0, data)?;
     m.sb.set_sync_flags(sb_sync_flags(flags));
     m.set_flags(remount_flags(flags, m.flags()))?;
     // Linux set_mount_attributes: touch_mnt_namespace (the caller's

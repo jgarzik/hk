@@ -30,6 +30,10 @@
 //!   fat_setattr: mark_inode_dirty); fsync writes its entry (Linux
 //!   fat_file_fsync -> sync_inode_metadata -> fat_write_inode): the
 //!   device then holds the new date and time
+//! - VFAT_REMOUNT_RO: a read-only remount writes the dirty inodes
+//!   back first (Linux fat_reconfigure: sync_filesystem): utimensat
+//!   just before it is in the entry on the device right after it, and
+//!   a sync of the read-only filesystem changes nothing
 //! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
 //!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
 //!   and on hk its cluster stays allocated. Linux frees it: the refused
@@ -46,7 +50,8 @@ use hk_syscall::{
     MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROT_READ, PROT_WRITE, Stat,
     Timespec, UTIME_OMIT, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mmap,
     sys_mount, sys_munmap, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_rename, sys_rmdir,
-    sys_sched_yield, sys_stat, sys_umount2, sys_unlink, sys_utimensat, sys_wait4, sys_write,
+    sys_sched_yield, sys_stat, sys_sync, sys_umount2, sys_unlink, sys_utimensat, sys_wait4,
+    sys_write,
 };
 
 const MNT: &[u8] = b"/tmp/vdk\0";
@@ -185,6 +190,7 @@ pub fn run_tests() {
     unlink_race(dev);
     dir_grow(dev);
     fsync_times(dev);
+    remount_ro(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -739,6 +745,77 @@ fn fsync_times(dev: &[u8]) {
             t.ok(b"entry", false, 0);
         }
     }
+    sys_unlink(f.as_ptr());
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
+    t.done();
+}
+
+/// Set `p`'s atime and mtime to `s` seconds
+fn utimes(p: &[u8], s: i64) -> i64 {
+    let ts = [
+        Timespec {
+            tv_sec: s,
+            tv_nsec: 0,
+        },
+        Timespec {
+            tv_sec: s,
+            tv_nsec: 0,
+        },
+    ];
+    sys_utimensat(-100, p.as_ptr(), ts.as_ptr(), 0)
+}
+
+/// The (time, date) of root entry `short` on the device
+fn disk_time(dev: &[u8], short: &[u8; 11]) -> (i64, i64) {
+    let e = Fat::open(dev).and_then(|d| d.find(d.root, short));
+    e.map_or((-1, -1), |e| {
+        let u16_at = |o: usize| i64::from(u16::from_le_bytes([e[o], e[o + 1]]));
+        (u16_at(22), u16_at(24))
+    })
+}
+
+/// VFAT_REMOUNT_RO on RO in the root, mounted tz=UTC
+fn remount_ro(dev: &[u8]) {
+    const MS_RDONLY: u64 = 1;
+    const MS_REMOUNT: u64 = 32;
+    // 2017-07-14 02:40:00 UTC, then 2020-09-13 12:26:40 UTC
+    const OLD: (i64, i64) = (2 << 11 | 40 << 5, 37 << 9 | 7 << 5 | 14);
+    const NEW: (i64, i64) = (12 << 11 | 26 << 5 | 20, 40 << 9 | 9 << 5 | 13);
+    let mut t = T::new(b"VFAT_REMOUNT_RO");
+    let (f, short) = (b"/tmp/vdk/RO\0", b"RO         ");
+    let opts = b"iocharset=cp437,tz=UTC\0";
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount tz=UTC", mount_with(dev, opts), 0);
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    t.eq(b"utimensat old", utimes(f, 1_500_000_000), 0);
+    sys_sync();
+    t.ok(
+        b"old on disk",
+        disk_time(dev, short) == OLD,
+        disk_time(dev, short).0,
+    );
+    t.eq(b"utimensat new", utimes(f, 1_600_000_000), 0);
+    let remount = |fl: u64| {
+        sys_mount(
+            dev.as_ptr(),
+            MNT.as_ptr(),
+            core::ptr::null(),
+            MS_REMOUNT | fl,
+            opts.as_ptr() as u64,
+        )
+    };
+    t.eq(b"remount ro", remount(MS_RDONLY), 0);
+    let got = disk_time(dev, short);
+    t.ok(b"written by the remount", got == NEW, got.0);
+    sys_sync();
+    let got = disk_time(dev, short);
+    t.ok(b"kept after sync", got == NEW, got.0);
+    t.eq(b"remount rw", remount(0), 0);
     sys_unlink(f.as_ptr());
     t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
     t.eq(b"mount again", mount(dev), 0);

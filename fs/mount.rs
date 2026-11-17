@@ -721,7 +721,8 @@ impl Mount {
             core::hint::spin_loop();
         }
         fence(Ordering::Acquire);
-        if self.is_readonly() {
+        // Linux mnt_is_readonly: a read-only remount in progress too
+        if self.sb.readonly_or_remounting() || self.is_readonly() {
             self.mnt_writers.add(-1);
             return Err(KernelError::ReadOnlyFs);
         }
@@ -1887,8 +1888,12 @@ pub fn do_umount(mount: MountRef, flags: i32) -> Result<(), KernelError> {
         }
     }
     if is_root && !detach {
+        // Linux do_umount_root: a reconfigure to read-only, no options
         let _s = mount.sb.s_umount.write();
-        return mount.sb.make_rdonly();
+        if mount.sb.rdonly() {
+            return Ok(());
+        }
+        return super::superblock::reconfigure_super(&mount.sb, true, &[]);
     }
     {
         let mut ns = namespace_lock();

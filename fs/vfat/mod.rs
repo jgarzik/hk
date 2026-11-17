@@ -3092,6 +3092,14 @@ impl SuperOps for VfatSuperOps {
         fat_write_inode(inode)
     }
 
+    /// Linux fat_reconfigure: what is dirty is written back first
+    /// (sync_filesystem, its error ignored), before a switch to
+    /// read-only; the options are kept
+    fn remount(&self, sb: &SuperBlock, _data: &[u8]) -> Result<(), KernelError> {
+        let _ = super::fs_writeback::writeback_sb(sb);
+        Ok(())
+    }
+
     /// Its filesystem data goes (Linux fat_put_super: the sbi freed)
     fn put_super(&self, sb: &SuperBlock) {
         let sbi = sb.private.write().take();

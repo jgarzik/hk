@@ -9,7 +9,7 @@ use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::list::{Adapter, Link, WeakList};
 use ::core::mem::ManuallyDrop;
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync;
 
@@ -638,6 +638,31 @@ fn set_bdev_super(sb: &SuperBlock, dev: u32) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Change `sb` to read-only or read-write with the options `data`
+/// (Linux reconfigure_super; the caller holds s_umount for writing):
+/// going read-only refuses writers first (EBUSY while any holds write
+/// access, nothing changed), then the filesystem's ->reconfigure runs
+/// (vfat's writes what is dirty back: Linux fat_reconfigure's
+/// sync_filesystem, while SB_RDONLY is still clear), then the flag
+/// changes. An error from ->reconfigure changes nothing.
+pub fn reconfigure_super(sb: &SuperBlock, ro: bool, data: &[u8]) -> Result<(), KernelError> {
+    let was_ro = sb.rdonly();
+    if ro && !was_ro {
+        sb.prepare_remount_ro()?;
+    } else if !ro && was_ro {
+        // Linux sb_start_ro_state_change: writers stay refused until
+        // the change ends
+        sb.s_readonly_remount.store(true, Ordering::SeqCst);
+    }
+    let r = sb.s_op.remount(sb, data);
+    if r.is_ok() {
+        sb.set_rdonly(ro);
+    }
+    // Linux sb_end_ro_state_change
+    sb.s_readonly_remount.store(false, Ordering::SeqCst);
+    r
+}
+
 /// What every filesystem's shutdown does (Linux generic_shutdown_super),
 /// under s_umount held for writing, which it releases: inotify watches
 /// get IN_UNMOUNT and go (fsnotify_sb_delete), the dentry tree is
@@ -1018,6 +1043,10 @@ pub struct SuperBlock {
     /// files), and the WRITE_HOLD bit (see get_write); writes through a
     /// mount count on the mount
     s_writers: AtomicU64,
+    /// A read-only state change is in progress (Linux
+    /// s_readonly_remount): writers are refused, as on a read-only
+    /// file system, from the holders' check until the change ends
+    s_readonly_remount: AtomicBool,
     /// Its mounts (Linux s_mounts, through `Mount.mnt_instance`), for a
     /// read-only remount to hold their writers: a spin leaf, added to
     /// under MOUNT_LOCK; a mount leaves it in its teardown
@@ -1104,6 +1133,7 @@ impl SuperBlock {
             s_active: AtomicU32::new(1),
             s_d_op: spin::Once::new(),
             s_writers: AtomicU64::new(0),
+            s_readonly_remount: AtomicBool::new(false),
             s_mounts: Mutex::new(WeakList::new()),
             next_ino: crate::util::id_batch::IdBatch::new(),
             s_dev: AtomicU32::new(0),
@@ -1224,7 +1254,7 @@ impl SuperBlock {
     /// returned guard drops. Writes through a mount count on the mount
     /// instead (`Mount::want_write`), as Linux.
     pub fn want_write(self: &Arc<Self>) -> Result<WriteAccess, KernelError> {
-        get_write(&self.s_writers, || self.rdonly())?;
+        get_write(&self.s_writers, || self.readonly_or_remounting())?;
         Ok(WriteAccess {
             sb: Some(self.clone()),
             mnt: None,
@@ -1247,16 +1277,19 @@ impl SuperBlock {
         self.s_mounts.lock().iter().any(|e| e.get().is_live())
     }
 
-    /// Make the file system read-only (Linux sb_prepare_remount_readonly,
-    /// then SB_RDONLY): under MOUNT_LOCK every writable mount of it, and
-    /// its mountless writers, are held; with no writer anywhere it goes
-    /// read-only before the holds are released, else EBUSY and nothing
-    /// changed (no window where a writer sees a read-only file system
-    /// that then stays writable)
-    pub fn make_rdonly(&self) -> Result<(), KernelError> {
-        if self.rdonly() {
-            return Ok(());
-        }
+    /// Read-only, or a read-only state change in progress (Linux
+    /// mnt_is_readonly's superblock part: s_readonly_remount, then
+    /// sb_rdonly)
+    pub fn readonly_or_remounting(&self) -> bool {
+        self.s_readonly_remount.load(Ordering::SeqCst) || self.rdonly()
+    }
+
+    /// Refuse writers for a read-only remount (Linux
+    /// sb_prepare_remount_readonly): under MOUNT_LOCK every writable
+    /// mount of it, and its mountless writers, are held; with no writer
+    /// anywhere the change starts (`s_readonly_remount`) before the
+    /// holds are released, else EBUSY and nothing changed
+    fn prepare_remount_ro(&self) -> Result<(), KernelError> {
         // Linux walks sb->s_mounts under lock_mount_hash: no reference
         // is taken (a mount in its teardown has no writers and waits for
         // s_mounts to unlink it), and the writable set cannot change
@@ -1274,7 +1307,7 @@ impl SuperBlock {
             free &= m.hold_writers();
         }
         if free {
-            self.s_flags.fetch_or(SB_RDONLY, Ordering::SeqCst);
+            self.s_readonly_remount.store(true, Ordering::SeqCst);
         }
         for m in rw() {
             m.unhold_writers();
@@ -1283,9 +1316,13 @@ impl SuperBlock {
         if free { Ok(()) } else { Err(KernelError::Busy) }
     }
 
-    /// Make the file system read-write
-    pub fn make_rdwr(&self) {
-        self.s_flags.fetch_and(!SB_RDONLY, Ordering::SeqCst);
+    /// Set or clear SB_RDONLY
+    fn set_rdonly(&self, ro: bool) {
+        if ro {
+            self.s_flags.fetch_or(SB_RDONLY, Ordering::SeqCst);
+        } else {
+            self.s_flags.fetch_and(!SB_RDONLY, Ordering::SeqCst);
+        }
     }
 
     /// Set the root dentry
