@@ -702,13 +702,6 @@ with RAM; what is missing: no shrinker (caches give back empty slabs
 beyond two each, but nothing asks them under pressure), no slab
 merging, poisoning or red zones.
 
-SLAB_TYPESAFE_BY_RCU caches (`mm/slab.rs` `KmemCache::typesafe_by_rcu`,
-the filp cache) queue one RCU head per cache for a batch of emptied
-slabs (`RcuSlabs`, under `KmemCache.rcu`), where Linux queues one per
-slab in `struct slab` (rcu_free_slab): hk's 64-byte `Page` has no room
-for an `RcuHead`, so a slab emptied after the batch's head was queued
-waits for the next grace period.
-
 Objects are built fallibly (`util/kalloc.rs` try_box/try_arc, ENOMEM) and
 buffers sized from outside through `kmem`; the `*_nofail` calls (boot
 setup, NOFAIL paths) and plain `Vec`/`String` growth bounded by a sysctl

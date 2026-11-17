@@ -13,8 +13,10 @@
 //! the page allocator), full ones on no list.
 //!
 //! A SLAB_TYPESAFE_BY_RCU cache (`KmemCache::typesafe_by_rcu`) returns
-//! its empty slabs to the page allocator only a grace period after they
-//! emptied (Linux free_slab's call_rcu): a freed object is reused at
+//! each empty slab to the page allocator only a grace period after it
+//! left the cache's lists (Linux free_slab's call_rcu, on an `RcuHead`
+//! in the slab's head struct page over its list links, free list and
+//! counts: `Page::slab_rcu_head`): a freed object is reused at
 //! once, but its memory stays an object of the cache while an RCU
 //! reader may still hold its address. Its constructor (Linux ctor) sets
 //! the type-stable part of each object when its slab is made; the cache
@@ -23,17 +25,15 @@
 //!
 //! Locking: per-CPU array (interrupts off) → `list_lock` (`IrqSpinlock`)
 //! → page allocator (per-CPU list, `Zone.lock`); empty slabs are given
-//! back after `list_lock` is dropped, through `rcu` (`IrqSpinlock`
-//! leaf, never held across anything) for a type-stable cache. Everything
-//! is IRQ-safe. A CPU without per-CPU data yet allocates and frees under
-//! `list_lock`.
+//! back after `list_lock` is dropped (queued to RCU, with no lock held,
+//! for a type-stable cache). Everything is IRQ-safe. A CPU without
+//! per-CPU data yet allocates and frees under `list_lock`.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mm::page::{PG_SLAB, Page};
 use crate::mm::page_alloc::{Gfp, this_cpu};
-use crate::sync::rcu::RcuHead;
 use crate::sync::{IrqSpinlock, local_irq_restore, local_irq_save};
 
 /// Largest per-CPU array
@@ -51,6 +51,8 @@ pub trait SlabPages: Sync {
     fn free(&self, base: usize, order: u32);
     /// The struct page of the block at `base`
     fn page(&self, base: usize) -> &Page;
+    /// The block whose first struct page is `pg` (Linux slab_address)
+    fn base(&self, pg: &Page) -> usize;
 }
 
 /// One CPU's free objects (Linux array_cache)
@@ -85,21 +87,6 @@ struct Lists {
     active: usize,
 }
 
-/// Empty slabs of a type-stable cache waiting for a grace period (Linux
-/// free_slab's call_rcu(&slab->rcu_head)), each list linked through its
-/// head pages' `next`. Linux queues each slab on the rcu_head in its
-/// struct slab; a struct page here has no room for one, so the cache
-/// queues one head (`KmemCache.rcu_head`) at a time: its callback frees
-/// `waiting`, and slabs emptied after it was queued (`next`) wait for
-/// the grace period it then queues.
-struct RcuSlabs {
-    waiting: usize,
-    next: usize,
-    /// The head is queued, or its callback runs and queues it again
-    /// when `next` has slabs
-    queued: bool,
-}
-
 /// Cache flag: memory stays type-stable for a grace period (Linux
 /// SLAB_TYPESAFE_BY_RCU)
 const SLAB_TYPESAFE_BY_RCU: u32 = 1;
@@ -127,9 +114,6 @@ pub struct KmemCache {
     /// Each CPU's object cache, in its per-CPU area
     cpu: &'static crate::cpu::PerCpu<CpuCell>,
     list_lock: IrqSpinlock<Lists>,
-    /// Empty slabs on their way back (type-stable caches)
-    rcu: IrqSpinlock<RcuSlabs>,
-    rcu_head: RcuHead,
     /// Slabs allocated, until given back (meminfo Slab)
     nr_slabs: AtomicUsize,
 }
@@ -191,12 +175,6 @@ impl KmemCache {
                 nr_empty: 0,
                 active: 0,
             }),
-            rcu: IrqSpinlock::new(RcuSlabs {
-                waiting: 0,
-                next: 0,
-                queued: false,
-            }),
-            rcu_head: RcuHead::new(),
             nr_slabs: AtomicUsize::new(0),
         }
     }
@@ -211,8 +189,8 @@ impl KmemCache {
     /// its user keeps out of the part readers rely on.
     ///
     /// # Safety
-    /// The cache is never dropped (a `static`): its grace-period callback
-    /// reaches it. `ctor` may be called on any fresh object of it.
+    /// The cache is never dropped (a `static`): its slabs' grace-period
+    /// callbacks reach it. `ctor` may be called on any fresh object of it.
     pub const unsafe fn typesafe_by_rcu(
         name: &'static str,
         size: usize,
@@ -390,73 +368,52 @@ impl KmemCache {
         true
     }
 
-    /// Give an empty slab back (Linux discard_slab): to the page
-    /// allocator, a grace period later for a type-stable cache (no
-    /// list_lock held)
+    /// Give an empty slab, off every list, back (Linux discard_slab ->
+    /// free_slab): to the page allocator, a grace period later for a
+    /// type-stable cache (no list_lock held)
     fn discard(&self, base: usize) {
         if self.flags & SLAB_TYPESAFE_BY_RCU == 0 {
             self.release(base);
             return;
         }
-        let mut r = self.rcu.lock();
-        self.head(base).next.store(r.next as u64, Ordering::Relaxed);
-        r.next = base;
-        if r.queued {
-            return;
-        }
-        r.queued = true;
-        r.waiting = core::mem::take(&mut r.next);
-        drop(r);
-        self.queue_gp();
+        self.free_rcu(base);
     }
 
-    /// Run `rcu_free` a grace period from now (Linux call_rcu)
+    /// Queue the slab's `rcu_free_slab` (Linux call_rcu(&slab->rcu_head))
     #[cfg(not(test))]
-    fn queue_gp(&self) {
-        /// The callback
-        ///
-        /// # Safety
-        /// `p` is the cache queued with it, never dropped.
-        unsafe fn free(p: *const ()) {
-            // SAFETY: the caller's contract
-            unsafe { &*p.cast::<KmemCache>() }.rcu_free();
-        }
+    fn free_rcu(&self, base: usize) {
         if !crate::sync::rcu::can_queue() {
             // Early boot: no other CPU runs a reader yet
-            self.rcu_free();
+            self.release(base);
             return;
         }
-        // SAFETY: the cache, and with it its head, is never dropped
-        // (`typesafe_by_rcu`'s contract); the head is queued by one
-        // caller at a time (`RcuSlabs.queued`), and `free` neither sleeps
-        // nor cares which CPU runs it
+        let pg = self.head(base);
+        // SAFETY: an empty slab off every list (`shrink_one`), the
+        // caller's alone; its links, free list and counts stay untouched
+        // until `rcu_free_slab`
+        let h = unsafe { pg.slab_rcu_head() };
+        // SAFETY: the head is in the slab's struct page, which stays (the
+        // memory map is never freed), and `rcu_free_slab` gets that page
+        // of a slab of this cache, never dropped (`typesafe_by_rcu`'s
+        // contract); it neither sleeps nor cares which CPU runs it
         unsafe {
-            crate::sync::rcu::call_rcu(&self.rcu_head, free, core::ptr::from_ref(self).cast());
+            crate::sync::rcu::call_rcu(h, rcu_free_slab, core::ptr::from_ref(pg).cast());
         }
     }
 
-    /// Host tests end the grace period themselves (`rcu_free`)
+    /// Host tests queue the slab for their own grace period
+    /// (`tests::grace_period`)
     #[cfg(test)]
-    fn queue_gp(&self) {}
-
-    /// A grace period is over (Linux rcu_free_slab): the slabs it covers
-    /// go back, and the ones emptied since wait for another
-    fn rcu_free(&self) {
-        let (mut base, again) = {
-            let mut r = self.rcu.lock();
-            let w = core::mem::take(&mut r.waiting);
-            r.waiting = core::mem::take(&mut r.next);
-            r.queued = r.waiting != 0;
-            (w, r.queued)
-        };
-        if again {
-            self.queue_gp();
-        }
-        while base != 0 {
-            let next = self.head(base).next.load(Ordering::Relaxed) as usize;
-            self.release(base);
-            base = next;
-        }
+    fn free_rcu(&self, base: usize) {
+        let pg = self.head(base);
+        // SAFETY: an empty slab off every list (`shrink_one`), the
+        // caller's alone, untouched until `grace_period` runs
+        // `rcu_free_slab` on it
+        let _ = unsafe { pg.slab_rcu_head() };
+        tests::GP
+            .lock()
+            .unwrap()
+            .push(core::ptr::from_ref(pg) as usize);
     }
 
     /// Give an empty slab to the page allocator (Linux __free_slab)
@@ -588,6 +545,23 @@ impl KmemCache {
 // off; everything else is atomics or under list_lock
 unsafe impl Sync for KmemCache {}
 
+/// A slab's grace period is over (Linux rcu_free_slab): give it to the
+/// page allocator
+///
+/// # Safety
+/// `p` is the head struct page of a slab whose `free_rcu` queued it, and
+/// its head's callback runs now.
+unsafe fn rcu_free_slab(p: *const ()) {
+    // SAFETY: a struct page (the caller's contract), never freed
+    let pg = unsafe { &*p.cast::<Page>() };
+    // SAFETY: a slab page's `mapping` is its cache (`grow`), never
+    // dropped (`typesafe_by_rcu`'s contract)
+    let c = unsafe { &*(pg.mapping.load(Ordering::Relaxed) as *const KmemCache) };
+    // SAFETY: its head's callback runs: on no list, never used again
+    unsafe { pg.slab_rcu_end() };
+    c.release(c.src.base(pg));
+}
+
 // ============================================================================
 // Slabs from the page allocator
 // ============================================================================
@@ -637,6 +611,11 @@ impl SlabPages for KernelPages {
     fn page(&self, base: usize) -> &Page {
         let pa = crate::arch::virt_to_phys(base as u64);
         crate::mm::page::phys_to_page(pa).expect("slab: no struct page")
+    }
+
+    fn base(&self, pg: &Page) -> usize {
+        let pfn = crate::mm::page::page_to_pfn(pg);
+        crate::arch::phys_to_virt(pfn << crate::mm::page::PAGE_SHIFT) as usize
     }
 }
 
@@ -892,6 +871,32 @@ pub mod tests {
         fn page(&self, base: usize) -> &Page {
             self.pages.lock().unwrap()[&base]
         }
+        fn base(&self, pg: &Page) -> usize {
+            let m = self.pages.lock().unwrap();
+            *m.iter().find(|(_, p)| core::ptr::eq(**p, pg)).unwrap().0
+        }
+    }
+
+    /// Slab frees queued (head struct pages), waiting for `grace_period`
+    pub static GP: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// End a grace period for `c`: run its slab frees queued so far
+    fn grace_period(c: &KmemCache) {
+        let mine: Vec<usize> = {
+            let mut q = GP.lock().unwrap();
+            let (mine, rest) = q.drain(..).partition(|&p| {
+                // SAFETY: a struct page queued by `free_rcu` (leaked,
+                // never freed)
+                let pg = unsafe { &*(p as *const Page) };
+                pg.mapping.load(Ordering::Relaxed) == core::ptr::from_ref(c) as u64
+            });
+            *q = rest;
+            mine
+        };
+        for p in mine {
+            // SAFETY: queued by `free_rcu`, taken off the queue once
+            unsafe { rcu_free_slab(p as *const ()) };
+        }
     }
 
     fn cpus() -> &'static crate::cpu::PerCpu<CpuCell> {
@@ -964,43 +969,33 @@ pub mod tests {
         }
     }
 
-    /// Slabs on a type-stable cache's list from `b`
-    fn listed(c: &KmemCache, mut b: usize) -> usize {
-        let mut n = 0;
-        while b != 0 {
-            n += 1;
-            b = c.head(b).next.load(Ordering::Relaxed) as usize;
-        }
-        n
-    }
-
     /// Empty slabs go back to the pages only once a grace period ends,
-    /// and one emptied after it was queued waits for the next
+    /// each on its own: a slab emptied after another's free was queued
+    /// goes back after the same one grace period (Linux: an rcu_head per
+    /// slab)
     #[test]
     fn typesafe_slabs_wait_for_gp() {
         let (c, src) = typesafe();
         let v: Vec<usize> = (0..400).map(|_| c.alloc() as usize).collect();
         let slabs = src.live.load(Ordering::Relaxed);
         let bytes = c.bytes();
-        for o in v {
+        let (a, b) = v.split_at(v.len() / 2);
+        for &o in a {
+            c.free(o as *mut u8);
+        }
+        // Slabs emptied after the first ones were queued
+        for &o in b {
             c.free(o as *mut u8);
         }
         assert_eq!(src.live.load(Ordering::Relaxed), slabs, "none back yet");
         assert_eq!(c.bytes(), bytes, "counted until given back");
-        let (w, n, q) = {
-            let r = c.rcu.lock();
-            (listed(c, r.waiting), listed(c, r.next), r.queued)
-        };
-        assert!(q && w == 1 && n > 0, "{w} {n}");
-        c.rcu_free();
-        assert_eq!(src.live.load(Ordering::Relaxed), slabs - 1);
-        assert!(c.rcu.lock().queued, "the next grace period is queued");
-        c.rcu_free();
+        grace_period(c);
         let left = src.live.load(Ordering::Relaxed);
-        assert_eq!(left, slabs - 1 - n);
-        assert!(left <= KEEP_EMPTY + 2, "{left} of {slabs}");
-        let r = c.rcu.lock();
-        assert!(!r.queued && r.waiting == 0 && r.next == 0);
+        assert!(
+            left <= KEEP_EMPTY + 2,
+            "{left} of {slabs} after one grace period"
+        );
+        assert_eq!(c.bytes(), left * c.slab_bytes());
     }
 
     #[test]

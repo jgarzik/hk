@@ -553,13 +553,18 @@ impl<T> RcuPtr<T> {
 /// by the one queueing that claimed the head (`next` from `IDLE` to
 /// null), before it is linked under its list's lock, and read only by
 /// the `rcuc/N` that took it off under that lock, before it sets `next`
-/// back to `IDLE` (Release; a claim is an Acquire).
+/// back to `IDLE` (Release; a claim is an Acquire); `arg` likewise.
+/// Every field is a plain word with no padding and no niche left
+/// uninitialized, so a head may lie over integer fields a user reads
+/// again after its callback (a slab's struct page, `Page::slab_rcu_head`).
 pub struct RcuHead {
     next: AtomicPtr<RcuHead>,
     /// The `GP_SEQ` value it waits for (rcu_seq_snap when queued)
     gp: AtomicU64,
-    /// What to run, on what (an object reference taken by the queueing)
-    func: UnsafeCell<Option<(RcuFn, *const ())>>,
+    /// What to run
+    func: UnsafeCell<Option<RcuFn>>,
+    /// On what (an object reference taken by the queueing)
+    arg: UnsafeCell<*const ()>,
 }
 
 // SAFETY: `func` is touched only by the claimant, then by the runner,
@@ -583,7 +588,20 @@ impl RcuHead {
             next: AtomicPtr::new(IDLE),
             gp: AtomicU64::new(0),
             func: UnsafeCell::new(None),
+            arg: UnsafeCell::new(core::ptr::null()),
         }
+    }
+
+    /// Set what its callback runs
+    ///
+    /// # Safety
+    /// The caller claimed the head (`next` from `IDLE` to null) and has
+    /// not linked it yet.
+    unsafe fn set(&self, func: RcuFn, arg: *const ()) {
+        // SAFETY: claimed by the caller: only it writes (type invariant)
+        unsafe { *self.func.get() = Some(func) };
+        // SAFETY: as above
+        unsafe { *self.arg.get() = arg };
     }
 }
 
@@ -742,8 +760,8 @@ pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
         )
         .is_ok();
     assert!(claimed, "call_rcu: head already queued");
-    // SAFETY: claimed: only this queueing writes it (type invariant)
-    unsafe { *h.func.get() = Some((func, arg)) };
+    // SAFETY: claimed just now, not linked yet
+    unsafe { h.set(func, arg) };
     let d = RDP.this();
     let (want, ask) = {
         let mut l = d.cbs.lock();
@@ -953,10 +971,12 @@ fn do_batch(d: &RcuData) {
         // SAFETY: the claimant wrote it before queueing; this runner
         // took the head off under the lock (type invariant)
         let f = unsafe { (*h.func.get()).take() };
+        // SAFETY: as above
+        let arg = unsafe { *h.arg.get() };
         // INVARIANT: on no list again; `h` is not touched after this
         // (the callback may free it)
         h.next.store(IDLE, Ordering::Release);
-        if let Some((func, arg)) = f {
+        if let Some(func) = f {
             // SAFETY: call_rcu's contract: a grace period has passed
             // since it was queued, preemption is off
             unsafe { func(arg) };
@@ -1038,8 +1058,8 @@ fn barrier_entrain(cpu: u32) {
             )
             .is_ok();
         assert!(claimed, "rcu_barrier: barrier head queued");
-        // SAFETY: claimed just now (type invariant)
-        unsafe { *h.func.get() = Some((barrier_cb, core::ptr::null())) };
+        // SAFETY: claimed just now, not linked yet
+        unsafe { h.set(barrier_cb, core::ptr::null()) };
         // The last one's grace period, or none if all were taken off
         // to run: then it is ready at once
         // SAFETY: the tail is a queued head (CbList invariant)

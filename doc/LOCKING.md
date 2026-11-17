@@ -676,9 +676,8 @@ Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
     slab per-CPU array (IRQs off) → KmemCache.list_lock (IrqSpinlock)
     → per-CPU page list lock (IrqSpinlock, one at a time) → Zone.lock
-    (IrqSpinlock leaf); KmemCache.rcu (IrqSpinlock leaf, after
-    list_lock is dropped; its call_rcu after it is dropped);
-    3.2 Heap Allocator, Frame Allocator
+    (IrqSpinlock leaf); a type-stable cache's call_rcu after
+    list_lock is dropped; 3.2 Heap Allocator, Frame Allocator
 
 Kernel mappings (3.2 Kernel Page Tables): vmalloc FLUSH (sleeping;
     held across the allocation area's TLB flush) → vmalloc AREA (spin
@@ -2514,14 +2513,14 @@ layout in `doc/MEMORY.md`
   new slab is allocated with no `list_lock` held. A CPU without per-CPU
   data yet uses `list_lock` directly.
 - A SLAB_TYPESAFE_BY_RCU cache (`KmemCache::typesafe_by_rcu`; the file
-  cache `FILP_CACHE`, Linux filp_cache) gives its empty slabs back only
-  a grace period after they emptied (Linux free_slab's call_rcu): they
-  go on `KmemCache.rcu` (`IrqSpinlock` leaf, taken after `list_lock` is
-  dropped, any context), whose one `RcuHead` is queued after the unlock
-  (`RcuSlabs.queued`: one queuer at a time); its callback (`rcuc/N`,
-  preemption off) frees the slabs it covers to the page allocator and
-  queues the head again for slabs emptied meanwhile (Linux queues an
-  rcu_head per slab, in struct slab; a struct page here has no room).
+  cache `FILP_CACHE`, Linux filp_cache) gives each empty slab back only
+  a grace period after it left the lists (Linux free_slab's call_rcu):
+  once `list_lock` is dropped, any context, the slab's own `RcuHead`,
+  made over its head struct page's list links, free list and counts
+  (`Page::slab_rcu_head`, Linux struct slab's rcu_head union: no one
+  else's once the slab is off its lists), is queued; its callback
+  (`rcu_free_slab`, `rcuc/N`, preemption off, no lock) gives the slab to
+  the page allocator.
   Objects are reused at once: an RCU reader that loaded an object's
   address touches only its constructed, type-stable part (for a file,
   its count), which the cache never writes (the free-list link is at

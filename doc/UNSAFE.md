@@ -48,6 +48,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | red-black tree `RbTree` / `RbTreeNodeReservation` (`util/rbtree.rs`, Linux rb_root) | owning container of preallocated nodes |
 | intrusive red-black tree `RbRoot` / `RbNode` / `RbCursorMut` over a `ListPtr` (`util/rbtree.rs`, Linux rb_node embedded, `skb->rbnode`) | owning intrusive container, membership checked |
 | RCU callback head `RcuHead` / `HasRcuHead`, `call_rcu` (`sync/rcu.rs`, Linux rcu_head) | embedded queue node, claimed once |
+| slab RCU head `Page::slab_rcu_head` / `slab_rcu_end` (`mm/page.rs`, Linux struct slab's rcu_head in a union with slab_list, freelist and counters) | `RcuHead` over struct page fields dead once the slab is off its lists (layout const-asserted; a head has no uninitialized byte), zeroed back by its callback |
 | RCU pointers `RcuArc`, `RcuLockedArc` (nullable, writers proven by a `UniqueOwner`), `RcuPtr` (no ownership, unsafe read) (`sync/rcu.rs`, Linux `__rcu`) | published pointer, old version released after a grace period |
 | dentry reference `DentryRef` (`fs/dentry.rs`, Linux dget/dput on d_lockref), mount reference `MountRef` (`fs/mntput.rs`, Linux mntget/mntput on mnt_pcp) | counted pointer, last put deferred (RCU free, queued teardown) |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
