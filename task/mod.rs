@@ -698,10 +698,10 @@ pub mod tif {
 ///   itself without a lock (all but `io_context`) and by others under
 ///   its `alloc_lock` ([`Task::task_lock`]), changed under it by the
 ///   task (or its creator before it runs; `io_context` by anyone);
-/// - the relations RCU readers follow (`real_parent`, `pgrp`,
-///   `session`; Linux real_parent, signal->pids[PIDTYPE_PGID,
-///   PIDTYPE_SID]): written under TASKLIST's write lock, read under
-///   it or under an RCU read guard;
+/// - the relations RCU readers follow (`real_parent`, `ptracer`,
+///   `pgrp`, `session`; Linux real_parent, parent,
+///   signal->pids[PIDTYPE_PGID, PIDTYPE_SID]): written under
+///   TASKLIST's write lock, read under it or under an RCU read guard;
 /// - everything else ([`TaskInner`]), read and written only under
 ///   TASKLIST, through the table's views (`GlobalTaskTable::get` etc.).
 ///
@@ -717,6 +717,13 @@ pub mod tif {
 /// a listed task (fork, `adopt`, exec's leader change), and a task's
 /// children are handed on before it leaves the list
 /// (forget_original_parent; `remove` clears any left).
+/// `ptracer` is null or, whenever this task is in the task list, names
+/// a task in it: it is set only under TASKLIST's write lock, while
+/// this task is listed (or joins the list in that section), to a
+/// listed task that is not exiting (the attaching tracer itself,
+/// current; PTRACE_TRACEME's real parent, refused once PF_EXITING;
+/// CLONE_PTRACE's creator's tracer), and a tracer detaches every
+/// tracee before it leaves the list (exit_ptrace, after PF_EXITING).
 pub struct Task {
     /// Thread ID: the root number of its `thread_pid`; changes only when
     /// a non-leader execs and takes its leader's (exchange_tids)
@@ -896,6 +903,13 @@ pub struct Task {
     /// invariant), read under TASKLIST ([`Task::parent_locked`]) or an
     /// RCU read guard ([`Task::parent`]), written under its write lock
     real_parent: crate::sync::rcu::RcuPtr<Task>,
+    /// The tracer while traced, else null (Linux task->parent while
+    /// ptraced, ptrace_parent()): a task pointer, never a number, so a
+    /// recycled tid never names it. No reference: valid while this task
+    /// is listed (type invariant), read under TASKLIST
+    /// ([`Task::tracer_locked`]) or an RCU read guard
+    /// ([`Task::tracer`]), written under its write lock
+    ptracer: crate::sync::rcu::RcuPtr<Task>,
     /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
     /// PIDTYPE_SID]): the same in every thread of the group, the only
     /// record of its group and session; none for kernel threads and
@@ -1027,10 +1041,6 @@ pub struct TaskInner {
     /// 0 = not traced, non-zero = traced with flags
     ptrace: u32,
 
-    /// The tracer (Linux task->parent while traced): a task reference,
-    /// so a recycled number never names it (under TASKLIST)
-    ptracer: Option<alloc::sync::Weak<Task>>,
-
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
@@ -1079,7 +1089,6 @@ impl TaskInner {
             iopl_emul: 0,
             leader: true,
             ptrace: 0,
-            ptracer: None,
             children: crate::util::list::ArcList::new(),
             in_children: false,
             threads: crate::util::list::OwnedList::new(),
@@ -1628,6 +1637,7 @@ impl Task {
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
+            ptracer: crate::sync::rcu::RcuPtr::null(),
             pgrp: crate::sync::rcu::RcuLockedArc::none(),
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
@@ -1697,6 +1707,7 @@ impl Task {
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
+            ptracer: crate::sync::rcu::RcuPtr::null(),
             pgrp: crate::sync::rcu::RcuLockedArc::none(),
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
@@ -1768,6 +1779,41 @@ impl Task {
         self.real_parent.as_ptr()
     }
 
+    /// Its tracer, none if it is not traced or has left the task list
+    /// (Linux pid_alive(p) ? ptrace_parent(p), under rcu_read_lock); no
+    /// reference taken: the tracer stays allocated while `g` is held
+    pub fn tracer<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> Option<&'a Task> {
+        let _ = g;
+        if !self.tasks_link.is_linked() {
+            return None;
+        }
+        // SAFETY: it was listed within `g`'s section, so its tracer at
+        // any later point was listed then too (type invariant: set only
+        // to a listed task while it is listed, cleared before that task
+        // leaves the list, never set once it leaves) and leaves memory
+        // no sooner than a grace period after it leaves the list, which
+        // `g` keeps from ending for 'a
+        unsafe { self.ptracer.get() }
+    }
+
+    /// Its tracer, TASKLIST held (Linux task->parent of a ptraced task
+    /// under tasklist_lock); none if not traced or no longer listed
+    pub fn tracer_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+        let _ = table;
+        if !self.tasks_link.is_linked() {
+            return None;
+        }
+        // SAFETY: listed, and `table` borrowed for 'a keeps it so and
+        // keeps its tracer listed for 'a too (type invariant), held by
+        // the list's reference
+        unsafe { self.ptracer.get() }
+    }
+
+    /// Its tracer's address, to compare only (null: not traced)
+    pub fn tracer_ptr(&self) -> *const Task {
+        self.ptracer.as_ptr()
+    }
+
     /// Its process as `ns` numbers it, 0 if not visible there or once
     /// its group is released (Linux task_tgid_nr_ns:
     /// pid_nr_ns(rcu_dereference(signal->pids[PIDTYPE_TGID]))), under
@@ -1784,6 +1830,22 @@ impl Task {
             None if ns.level == 0 => self.pid as u32,
             None => 0,
         }
+    }
+
+    /// Its thread as `ns` numbers it, 0 if not visible there or once it
+    /// has left the task list (Linux task_pid_nr_ns), under `g`: its
+    /// tid's `Pid`, if that still names it
+    pub fn pid_nr_ns(
+        &self,
+        ns: &crate::ns::PidNamespace,
+        g: &crate::sync::rcu::RcuReadGuard,
+    ) -> u32 {
+        let Ok(nr) = u32::try_from(self.tid()) else {
+            return 0;
+        };
+        crate::task::pid::find_pid_ns(&crate::ns::INIT_PID_NS, nr, g)
+            .filter(|p| p.task(g).is_some_and(|t| core::ptr::eq(t, self)))
+            .map_or(0, |p| p.nr_ns(ns))
     }
 
     /// Its process group (root number), 0 for none (Linux

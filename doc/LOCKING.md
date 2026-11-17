@@ -1303,6 +1303,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 | `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
 | `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
 | `Task.real_parent` | `RcuPtr<Task>` | The real parent, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
+| `Task.ptracer` | `RcuPtr<Task>` | The tracer while traced, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
 | `Task.pgrp`, `Task.session` | `RcuLockedArc<Pid, GlobalTaskTable>` | Group and session links: written under TASKLIST's write lock (old reference `put_rcu`), read under it or an RCU read guard |
 
 **Pids** (`task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
@@ -1426,7 +1427,22 @@ sees it exit only once the namespace is empty.
 **Relations** (under TASKLIST's write lock to change, read lock to
 walk): `real_parent` and `ptracer` are task pointers, never numbers,
 so a recycled tid cannot inherit a parent or tracer link. `ptracer`
-is a `Weak` in `TaskInner`. `real_parent` (`Task.real_parent`, an
+(`Task.ptracer`, an `RcuPtr`, Linux task->parent while ptraced) holds
+no reference: it is set, under the write lock, only while the tracee
+is listed (or joins the list in that section) and only to a listed
+tracer not on its way out (PTRACE_ATTACH and PTRACE_SEIZE by the
+caller; PTRACE_TRACEME to the real parent, refused once the parent
+has PF_EXITING, Linux ptrace_traceme; CLONE_PTRACE copies the
+creator's link in the write section that lists the child, Linux
+ptrace_init_task), and cleared by `ptrace_unlink`, which an exiting
+tracer runs for every tracee (exit_ptrace, after PF_EXITING, before
+it leaves the list), so a listed task's tracer is listed. Read under
+TASKLIST (`Task::tracer_locked`, the views' `tracer`/`traced_by`) or
+under an RCU read guard (`Task::tracer`, Linux pid_alive(p) ?
+ptrace_parent(p): /proc status TracerPid, numbered through the
+tracer's thread pid, `Task::pid_nr_ns`); ptrace_signal's SI_USER
+info reads it, the tracer's thread number and uid under TASKLIST
+(another task's credentials, BUGS.md). `real_parent` (`Task.real_parent`, an
 `RcuPtr`, Linux real_parent) holds no reference: it is set, under the
 write lock, only to a listed task (fork, `adopt`, exec's leader
 change keeps the old leader's), and a task's children are handed on
@@ -1522,8 +1538,8 @@ off (3.5); `prev_cputime`, in the
 task and in its SignalStruct, is an IrqSpinlock leaf (Linux
 prev_cputime.lock) held only by `cputime_adjust` (times, getrusage,
 wait's rusage, /proc/<pid>/stat), under TASKLIST or not); `cred` (below); the
-alloc_lock fields; the RCU-read relations (`real_parent`, `pgrp`,
-`session`: written under TASKLIST's write lock, read under it or an
+alloc_lock fields; the RCU-read relations (`real_parent`, `ptracer`,
+`pgrp`, `session`: written under TASKLIST's write lock, read under it or an
 RCU read guard, above); and
 the rest, `TaskInner`, in a `TableCell` (`sync::LockedBy` owned by
 `GlobalTaskTable`): a borrow of the locked table is the key, `&table`
@@ -1734,7 +1750,7 @@ from `Task.se`.
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
 | `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.jobctl` (group stop state), `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
-| RCU (`real_parent`, `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, task and pid lifetime) | Lockless parent, group and session reads; task lookup by pid | `Task.real_parent` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
+| RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
 | RCU (`cred`) | Credentials | lock-free for the task, TASKLIST for others |
 
 Remaining differences: the `task_struct` fields Linux leaves to the

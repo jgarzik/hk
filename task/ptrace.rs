@@ -286,19 +286,27 @@ fn ptrace_traceme() -> KernelResult<i64> {
     let me = percpu::current();
 
     let mut table = TASKLIST.write();
-    let mut task = table.view_mut(&me).ok_or(KernelError::NoProcess)?;
-
-    // Already being traced?
-    if task.ptrace != 0 {
-        return Err(KernelError::NotPermitted);
+    let parent = {
+        let task = table.view(&me).ok_or(KernelError::NoProcess)?;
+        // Already being traced?
+        if task.ptrace != 0 {
+            return Err(KernelError::NotPermitted);
+        }
+        // Not to a parent on its way out, which may have detached its
+        // tracees already (Linux ptrace_traceme: real_parent PF_EXITING
+        // leaves it untraced, still 0)
+        task.real_parent()
+            .filter(|p| !p.has_flag(crate::task::pf::EXITING))
+            .map(percpu::task_ref)
+    };
+    if let Some(p) = &parent
+        && let Some(mut task) = table.view_mut(&me)
+    {
+        // The parent becomes the tracer
+        task.ptrace = PT_PTRACED;
+        task.set_tracer(Some(&**p));
     }
-
-    // Set up tracing - parent becomes tracer
-    task.ptrace = PT_PTRACED;
-    task.ptracer = task
-        .real_parent()
-        .map(|p| alloc::sync::Arc::downgrade(&percpu::task_ref(p)));
-
+    drop(table);
     Ok(0)
 }
 
@@ -334,11 +342,10 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
             return Err(KernelError::NotPermitted);
         }
 
-        // Set up tracing
+        // Set up tracing: the caller, running, is listed and not
+        // exiting (Linux ptrace_link to current)
         target.ptrace = PT_PTRACED;
-        target.ptracer = Some(alloc::sync::Arc::downgrade(&percpu::task_ref(
-            &percpu::current(),
-        )));
+        target.set_tracer(Some(&*percpu::current()));
 
         // SIGSTOP to stop it, in the section that attached (Linux
         // ptrace_attach: send_signal_locked(SIGSTOP, SEND_SIG_PRIV)
@@ -418,9 +425,7 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> KernelResult<i64> {
 
         // Set up tracing with SEIZED flag
         target.ptrace = PT_PTRACED | PT_SEIZED;
-        target.ptracer = Some(alloc::sync::Arc::downgrade(&percpu::task_ref(
-            &percpu::current(),
-        )));
+        target.set_tracer(Some(&*percpu::current()));
         target.ptrace_options = options;
         // A task in a group stop re-traps for its tracer
         signal::stop::attach_stopped(&task);
@@ -1026,7 +1031,7 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo, sig: Signal) -> Option<S
 /// 0) none, a detach's the one PTRACE_DETACH gave
 pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
     t.ptrace = 0;
-    t.ptracer = None;
+    t.set_tracer(None);
     t.ptrace_options = 0;
     t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
     signal::stop::unlink(t.task);

@@ -761,20 +761,20 @@ macro_rules! owner_reads {
 owner_reads!(TaskView);
 owner_reads!(TaskViewMut);
 
-/// Tracer links of a task, read under TASKLIST (the views borrow it)
+/// Tracer links of a task, read under TASKLIST (the views borrow it;
+/// Linux task->parent of a ptraced task under tasklist_lock)
 macro_rules! tracer_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
-            /// Its tracer, if it is traced and the tracer lives
-            pub fn tracer(&self) -> Option<TaskRef> {
-                self.ptracer.as_ref().and_then(|w| w.upgrade())
+            /// Its tracer, if it is traced (no reference taken: listed
+            /// while the table is borrowed)
+            pub fn tracer(&self) -> Option<&'a Task> {
+                self.task.tracer_locked(self.table)
             }
 
             /// Traced by `t` (pointer identity: never a recycled number)
             pub fn traced_by(&self, t: &Task) -> bool {
-                self.ptracer
-                    .as_ref()
-                    .is_some_and(|w| core::ptr::eq(w.as_ptr(), t))
+                core::ptr::eq(self.task.tracer_ptr(), t)
             }
         }
     };
@@ -829,6 +829,18 @@ relation_reads!(TaskView);
 relation_reads!(TaskViewMut);
 
 impl TaskViewMut<'_> {
+    /// Its tracer becomes `p` (Linux __ptrace_link, __ptrace_unlink:
+    /// under tasklist_lock's write lock, which the view holds); `p` is
+    /// listed and not exiting, and the task is listed or joins the list
+    /// in this write section (the `Task` invariant)
+    pub fn set_tracer(&mut self, p: Option<&Task>) {
+        debug_assert!(p.is_none_or(|p| p.tasks_link.is_linked()));
+        // INVARIANT: the callers', under the write lock
+        self.task
+            .ptracer
+            .set(p.map_or(core::ptr::null(), core::ptr::from_ref));
+    }
+
     /// Install credentials; the old ones go after TASKLIST. Only the
     /// task itself (commit_creds), or its creator before it runs.
     pub fn set_cred(&mut self, c: Arc<Cred>) -> Option<Arc<Cred>> {
@@ -2567,8 +2579,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_personality,
         parent_seccomp_mode,
         parent_seccomp_filter,
-        parent_ptrace,
-        parent_ptracer,
         parent_parent_exec_id,
         parent_leader_exit_signal,
         parent_iopl_emul,
@@ -2597,8 +2607,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.personality,
             parent.task.seccomp_mode(),
             parent.seccomp_filter.clone(),
-            parent.ptrace,
-            parent.ptracer.clone(),
             parent.parent_exec_id,
             leader_exit,
             parent.iopl_emul,
@@ -2800,26 +2808,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         iopl_emul: parent_iopl_emul,
         // Copied like the rest of task->flags (Linux dup_task_struct)
         leader: config.flags & CLONE_THREAD == 0,
-        // Ptrace state: inherited if CLONE_PTRACE is set and parent is traced
-        // CLONE_UNTRACED prevents forced inheritance even when tracer requests it
-        ptrace: if config.flags & CLONE_UNTRACED != 0 {
-            // CLONE_UNTRACED: child is never traced, even if parent is
-            0
-        } else if config.flags & CLONE_PTRACE != 0 && parent_ptrace != 0 {
-            // CLONE_PTRACE: if parent is being traced, child inherits tracing
-            // with the same tracer
-            parent_ptrace
-        } else {
-            // Normal case: child is not traced initially
-            0
-        },
-        ptracer: if config.flags & CLONE_UNTRACED != 0 {
-            None
-        } else if config.flags & CLONE_PTRACE != 0 {
-            parent_ptracer
-        } else {
-            None
-        },
+        // Untraced until listed: CLONE_PTRACE links it in the write
+        // section that lists it (below)
         ..crate::task::TaskInner::new(Some(child_thread_pid.clone()), TaskState::Ready, child_pgd)
     };
     let child_task = Task::new(
@@ -2925,6 +2915,21 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         new_pid.attached();
+        // CLONE_PTRACE: traced as the caller is now, by its tracer
+        // (Linux ptrace_init_task under tasklist_lock: never a tracer
+        // that has detached its tracees on its way out)
+        if config.flags & (CLONE_PTRACE | CLONE_UNTRACED) == CLONE_PTRACE {
+            let cur = table
+                .view(&me)
+                .filter(|v| v.ptrace != 0)
+                .and_then(|v| Some((v.ptrace, task_ref(v.tracer()?))));
+            if let Some((pt, tr)) = cur
+                && let Some(mut c) = table.view_mut(&child_task)
+            {
+                c.ptrace = pt;
+                c.set_tracer(Some(&tr));
+            }
+        }
         // A new thread joins a group stop in progress or in effect
         // (Linux copy_process: task_join_group_stop under siglock)
         if config.flags & CLONE_THREAD != 0 {

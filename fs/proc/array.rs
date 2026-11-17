@@ -3,9 +3,9 @@
 //! / environ_read)
 //!
 //! Pids are numbered in the pid namespace of the procfs read (Linux
-//! proc_pid_ns): translated under TASKLIST from the `Pid`s of the task,
-//! its leader, parent, tracer, group and session, which TASKLIST keeps
-//! listed meanwhile.
+//! proc_pid_ns): the task's and its leader's `Pid`s under TASKLIST,
+//! which keeps them listed meanwhile; its parent, tracer, group and
+//! session under RCU, as Linux reads them.
 //!
 //! Locking: the task's fields are copied under TASKLIST, which is
 //! dropped before anything else is taken; then, one at a time and never
@@ -22,7 +22,7 @@ use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_
 use crate::ns::PidNamespace;
 use crate::ns::pid::MAX_PID_NS_LEVEL;
 use crate::task::percpu::{TASKLIST, TaskRef};
-use crate::task::{Cred, Pid, Task, TaskKind, TaskState, Tid};
+use crate::task::{Cred, Pid, Task, TaskKind, TaskState};
 
 /// Linux PF_KTHREAD / PF_EXITING (stat field 9)
 const PF_EXITING: u64 = 0x0000_0004;
@@ -95,15 +95,6 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let pid = task.tid();
     let threads = table.threads(pid).count() as u64;
     let nr = |p: Option<&crate::task::pid::Pid>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));
-    // A listed task's process (by its root number) in `ns`
-    let task_nr = |root: Tid| {
-        u64::from(nr(
-            table
-                .get(root)
-                .and_then(|x| x.fields().thread_pid().map(|p| &**p)),
-            ns,
-        ))
-    };
     let me = t.thread_pid().map(|p| &**p);
     // A task the namespace cannot see is not shown there (Linux reaches
     // it only through a lookup in that namespace); then its levels from
@@ -118,7 +109,12 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let g = crate::sync::rcu::read_lock();
     let (pg, se) = (t.task.pgrp.read(&g), t.task.session.read(&g));
     let ppid = t.task.parent(&g).map_or(0, |p| p.tgid_nr_ns(ns, &g));
-    let tracer = t.tracer().map_or(0, |x| task_nr(x.tid()));
+    // Its tracer's thread, under RCU (Linux task_state: ptrace_parent,
+    // task_pid_nr_ns)
+    let tracer = t
+        .task
+        .tracer(&g)
+        .map_or(0, |x| Pid::from(x.pid_nr_ns(ns, &g)));
     let mut ns_ids = [[0u32; 4]; LEVELS];
     let mut levels = 0;
     if let Some(p) = me {

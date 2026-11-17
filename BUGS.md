@@ -1164,16 +1164,13 @@ ntp_update_frequency).
   tkill, tgkill and rt_sigqueueinfo (`signal/mod.rs`
   `kill_pid_info_type`, `signal/syscall.rs` `user_thread_send`), the
   sched_* / setpriority / ioprio / prlimit permission checks, a POSIX
-  timer's signal (`send_timer_sigqueue`) and F_GETOWN of a group
-  (`io/fasync.rs` `owner_nr`) take TASKLIST's read lock after (or
-  for) the pid lookup. Linux reads `__task_cred` under RCU (creds
-  freed by put_cred_rcu), reaches the handlers through
+  timer's signal (`send_timer_sigqueue`), F_GETOWN of a group
+  (`io/fasync.rs` `owner_nr`) and ptrace_signal's SI_USER uid
+  (`signal/mod.rs` `tracer_info`) take TASKLIST's read lock after
+  (or for) the pid or tracer lookup. Linux reads `__task_cred` under
+  RCU (creds freed by put_cred_rcu), reaches the handlers through
   lock_task_sighand (RCU, then siglock) and reads
   pid->tasks[PIDTYPE_PGID] under RCU (pid_task).
-- **The ptracer link is a `Weak` under TASKLIST**: `task/mod.rs`
-  `TaskInner` `ptracer`, read by /proc status TracerPid among others;
-  Linux reads `ptrace_parent()` (`rcu_dereference(task->parent)`)
-  under RCU.
 - **Inodes are counted by `Arc`, not `i_count` + `iput`**: `fs/inode.rs`
   `IFree`; the last put runs the teardown from the `Arc`'s drop glue,
   so std `Arc::drop_slow` makes a transient `&mut Inode` while RCU

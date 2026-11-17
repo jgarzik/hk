@@ -24,6 +24,9 @@
 //!   PTRACE_SINGLESTEP runs one instruction of a tight loop and stops
 //!   with SIGTRAP, si_code TRAP_TRACE, si_addr the next instruction
 //!   (x86-64 TF, arm64 MDSCR_EL1.SS / SPSR.SS)
+//! - PTRACE_TRACER_SIPID: a signal a tracer thread (not its process's
+//!   leader) gives with PTRACE_CONT arrives as SI_USER from that
+//!   thread's tid (Linux ptrace_signal: task_pid_vnr(current->parent))
 
 use crate::harness::T;
 use hk_syscall::{
@@ -48,6 +51,7 @@ pub fn run_tests() {
     test_unknown_request();
     test_resume_sig_eio();
     test_singlestep();
+    test_tracer_sipid();
 }
 
 /// A traced child that stops itself with SIGSTOP, its kill's syscall
@@ -341,6 +345,130 @@ fn test_stop_kill() {
     let mut st = 0i32;
     t.eq(b"wait", sys_wait4(pid, &mut st, 0, 0), pid);
     t.eq(b"killed", (st & 0x7f) as i64, SIGKILL as i64);
+    t.done();
+}
+
+/// The SIGUSR1 handler's si_pid in the tracee (0 until it runs)
+static SIPID: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+#[repr(C, align(16))]
+struct TracerStack([u8; 16384]);
+static mut TRACER_STACK: TracerStack = TracerStack([0; 16384]);
+static mut TRACER_CTID: u32 = 0;
+
+extern "C" fn on_usr1_info(_sig: i32, info: *const i32, _ctx: u64) {
+    // siginfo: si_pid after si_signo, si_errno, si_code and padding
+    // SAFETY: the kernel's siginfo for this delivery
+    let pid = unsafe { core::ptr::read_volatile(info.add(4)) };
+    SIPID.store(
+        i64::from(pid as u32) | 1 << 32,
+        core::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// The tracee: a SA_SIGINFO SIGUSR1 handler, a byte on `ready`, then
+/// sleep until the handler ran; its si_pid goes out on `ready` too
+fn sipid_tracee(ready: i32) -> ! {
+    const SA_SIGINFO: u64 = 4;
+    #[repr(C)]
+    struct SigAction {
+        handler: u64,
+        flags: u64,
+        restorer: u64,
+        mask: u64,
+    }
+    let act = SigAction {
+        handler: on_usr1_info as *const () as u64,
+        flags: SA_SIGINFO | hk_syscall::SA_RESTORER,
+        restorer: crate::signal::signals::restorer_addr(),
+        mask: 0,
+    };
+    hk_syscall::sys_rt_sigaction(10, &act as *const SigAction as u64, 0, 8);
+    // Unblocked (an earlier test may leave it blocked)
+    let usr1 = 1u64 << 9;
+    hk_syscall::sys_rt_sigprocmask(1, &usr1 as *const u64 as u64, 0, 8);
+    let b = 1u8;
+    hk_syscall::sys_write(ready as u64, &b, 1);
+    while SIPID.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+        hk_syscall::sys_pause();
+    }
+    let pid = SIPID.load(core::sync::atomic::Ordering::SeqCst) as u32 as i32;
+    hk_syscall::sys_write(ready as u64, (&pid as *const i32).cast(), 4);
+    sys_exit(0);
+}
+
+/// The tracer thread (arg: tracee pid << 32 | pipe read end): attach,
+/// see the SIGSTOP stop, continue with SIGUSR1, then stay attached
+/// until the tracee reports the si_pid it got (the tracee reads its
+/// tracer as it takes the signal); its exit code is the check
+extern "C" fn sipid_tracer(arg: u64) -> ! {
+    const PTRACE_ATTACH: i64 = 16;
+    const WALL: i32 = 0x4000_0000;
+    let (pid, rd) = ((arg >> 32) as i64, (arg & 0xffff_ffff) as u64);
+    let mut st = 0i32;
+    let mut code = 0u64;
+    if sys_ptrace(PTRACE_ATTACH, pid, 0, 0) != 0 {
+        code = 1;
+    } else if sys_wait4(pid, &mut st, WALL, 0) != pid || st & 0xff != 0x7f {
+        code = 2;
+    } else if sys_ptrace(PTRACE_CONT, pid, 0, 10) != 0 {
+        code = 3;
+    } else {
+        let mut got = 0i32;
+        let n = hk_syscall::sys_read(rd, (&mut got as *mut i32).cast(), 4);
+        if n != 4 {
+            code = 4;
+        } else if i64::from(got) != hk_syscall::sys_gettid() {
+            code = match i64::from(got) {
+                0 => 7,
+                p if p == sys_getpid() => 5,
+                _ => 6,
+            };
+        }
+    }
+    SIPID.store(code as i64, core::sync::atomic::Ordering::SeqCst);
+    sys_exit(0);
+}
+
+/// In a forked process: the tracee child, then the tracer thread; the
+/// process's exit status is the tracer's check code (0: si_pid was the
+/// tracer thread's tid; 5: it was the process's pid)
+fn sipid_process() -> ! {
+    let mut p = [0i32; 2];
+    if hk_syscall::sys_pipe2(p.as_mut_ptr(), 0) != 0 {
+        sys_exit(10);
+    }
+    let c = sys_fork();
+    if c == 0 {
+        sipid_tracee(p[1]);
+    }
+    let mut b = 0u8;
+    if hk_syscall::sys_read(p[0] as u64, &mut b, 1) != 1 {
+        sys_exit(11);
+    }
+    let top = unsafe { (&raw mut TRACER_STACK as *mut u8).add(16384) as u64 };
+    unsafe { core::ptr::write_volatile(&raw mut TRACER_CTID, 1) };
+    let arg = ((c as u64) << 32) | p[0] as u64;
+    let tid =
+        unsafe { crate::mm::fork_mm::spawn_thread(top, sipid_tracer, arg, &raw mut TRACER_CTID) };
+    if tid <= 0 || !crate::mm::fork_mm::join(&raw mut TRACER_CTID) {
+        sys_exit(12);
+    }
+    let code = SIPID.load(core::sync::atomic::Ordering::SeqCst);
+    let mut st = 0i32;
+    sys_wait4(c, &mut st, 0, 0);
+    sys_exit(code as u64);
+}
+
+fn test_tracer_sipid() {
+    let mut t = T::new(b"PTRACE_TRACER_SIPID");
+    let pid = sys_fork();
+    if pid == 0 {
+        sipid_process();
+    }
+    let mut st = 0i32;
+    t.eq(b"wait", sys_wait4(pid, &mut st, 0, 0), pid);
+    t.eq(b"status", st as i64, 0);
     t.done();
 }
 

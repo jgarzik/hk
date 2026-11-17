@@ -50,7 +50,10 @@ pub fn notify_parent_cldstop(
         return;
     };
     let (tsk, parent) = if for_ptracer {
-        (crate::task::percpu::task_ref(t), v.tracer())
+        (
+            crate::task::percpu::task_ref(t),
+            v.tracer().map(crate::task::percpu::task_ref),
+        )
     } else {
         let Some(l) = table.get(t.pid) else {
             return;
@@ -163,7 +166,7 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let real = t.real_parent().map(crate::task::percpu::task_ref);
     let tracer = match z {
         Zombie::Detached(_) => None,
-        _ => t.tracer(),
+        _ => t.tracer().map(crate::task::percpu::task_ref),
     };
     let traced = tracer.is_some();
     let parent = tracer.or(real.clone())?;
