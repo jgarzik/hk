@@ -674,6 +674,17 @@ F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
 
+## tracefs is kernfs-based
+
+**Location**: `trace.rs`, `fs/kernfs/`
+
+hk's tracefs files are kernfs nodes, added and removed beside the
+dcache; Linux tracefs creates each file's dentry itself
+(tracefs_create_file under the parent's inode lock) and removes it with
+simple_recursive_removal. So hk's `tracefs_d_revalidate` calls a
+positive dentry stale once its node is removed and a negative one once
+the directory's `KNode.rev` moves, where Linux needs neither check.
+
 ## renameat2 flag gaps
 
 **Location**: `fs/ramfs/`, `fs/vfat/mod.rs`
@@ -1136,6 +1147,13 @@ Tag = roadmap phase (doc/ROADMAP.md).
     so it fails now and then (+72 kB seen twice, +152 kB once on an x86
     debug-assertions boot) with no leak. Measure a quieter quantity or a
     bound above the noise.
+
+15. **arm64 release stack low near 6.8 kB**: `check-arm` reports about
+    6840 bytes left (deepest thread the isolated BLK test child), down
+    from about 7400; it moves about 700 bytes between builds of
+    near-identical code (frames such as `syscall_enter_from_user_mode`
+    and `msdos_partition` split out or merge). Find the deepest call
+    chain and shrink its largest frames.
 
 ## DRM dumb buffers are the boot framebuffer only
 
