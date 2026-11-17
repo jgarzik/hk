@@ -1297,7 +1297,7 @@ serializes wakers (3.1), the siglock of its handler table owns its signal state
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: an intrusive `ArcList` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, found by tid through the pid hash (`Pid.task`, an `RcuPtr` set and cleared under the write lock, read under it or an RCU read guard) |
+| `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: the intrusive `RcuList` `TASKS` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, changed only under the write lock (list_add_tail_rcu, list_del_rcu: the reference goes a grace period after the unlink, `RcuUnlinked::defer`), walked under TASKLIST (`GlobalTaskTable::iter`) or an RCU read guard (`percpu::for_each_task_rcu`, Linux for_each_process_thread under rcu_read_lock: PRIO_USER's set/getpriority, whose per-task work takes only spin locks); found by tid through the pid hash (`Pid.task`, an `RcuPtr` set and cleared under the write lock, read under it or an RCU read guard) |
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw, `TaskCred`) | Credentials (Linux real_cred/cred, `__rcu`): replaced only by the task, published with Release, the old reference dropped a grace period later (`put_rcu`); read by the task lock-free, by others under an RCU read guard (Credential Handling) |
 | `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
@@ -1773,7 +1773,7 @@ from `Task.se`.
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
 | `sighand->siglock` | Signal state, handlers | `SigHand.siglock` with the per-task state it owns (`Task.sig`), `SignalStruct.jobctl` (group stop state) and `SignalStruct.shared` (owned too), `SignalStruct.ignored_timers`, the action table (the siglock's own data; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
-| RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHListBare`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
+| RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, the task list, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHListBare`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
 | RCU (`cred`, put_cred_rcu) | Credentials | `Task.cred` (`TaskCred`): lock-free for the task, an RCU read guard for others, the old set through `put_rcu` |
 
 Remaining differences: the `task_struct` fields Linux leaves to the

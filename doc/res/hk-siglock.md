@@ -218,7 +218,7 @@ Also in this series:
   bare hlist nodes; a task is freed a grace period after release,
   after detach_pid). Needs a non-owning RCU chain (writers under
   TASKLIST, readers' validity from task lifetime, as `RcuPtr`).
-- [ ] PRIO_USER (`task/schedsys.rs` `tasks_of_user`) walks every task
+- [x] PRIO_USER (`task/schedsys.rs` `tasks_of_user`) walks every task
   under TASKLIST into a vector; Linux walks for_each_process_thread
   under rcu_read_lock alone. Needs the task list
   (`GlobalTaskTable.tasks`) RCU-readable (Linux list_add_tail_rcu /

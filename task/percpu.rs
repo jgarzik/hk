@@ -646,8 +646,27 @@ pub type TaskRef = Arc<Task>;
 /// the views below, which borrow the locked list: `get`/`iter` read them
 /// (shared lock), `get_mut`/`iter_mut` write them (exclusive lock).
 pub struct GlobalTaskTable {
-    /// Every task in the table, holding a reference each
-    tasks: crate::util::list::ArcList<TasksAdapter>,
+    /// Its list is [`TASKS`], reached without TASKLIST by RCU walkers
+    _list: (),
+}
+
+/// Every task in the table, holding a reference each (Linux
+/// init_task.tasks): changed only under TASKLIST's write lock (the
+/// table's `&mut self` methods: `insert`, `unhash`), walked under
+/// TASKLIST (`GlobalTaskTable::iter`) or an RCU read guard
+/// ([`for_each_task_rcu`], Linux for_each_process_thread under
+/// rcu_read_lock; list_add_tail_rcu, list_del_rcu); a task leaves it a
+/// grace period before its list reference goes (`RcuUnlinked::defer`)
+static TASKS: crate::util::rculist::RcuList<TasksAdapter> = crate::util::rculist::RcuList::new();
+
+/// Every task in the task list, under RCU (`g`; Linux
+/// for_each_process_thread under rcu_read_lock): one listed or
+/// unlisted meanwhile may or may not be seen; each stays allocated for
+/// the guard's life
+pub fn for_each_task_rcu<'a>(
+    g: &'a crate::sync::rcu::RcuReadGuard,
+) -> impl Iterator<Item = &'a Task> + 'a {
+    TASKS.iter(g)
 }
 
 crate::adapter!(TasksAdapter, Task, tasks_link);
@@ -877,9 +896,7 @@ unsafe impl crate::sync::UniqueOwner for GlobalTaskTable {}
 
 impl GlobalTaskTable {
     const fn new() -> Self {
-        Self {
-            tasks: crate::util::list::ArcList::new(),
-        }
+        Self { _list: () }
     }
 
     /// Task `tid`, found through the pid hash (root namespace); the
@@ -1044,15 +1061,19 @@ impl GlobalTaskTable {
 
     /// Every task
     pub fn iter(&self) -> impl Iterator<Item = TaskView<'_>> {
-        self.tasks.iter().map(|t| view(self, t))
+        // SAFETY: TASKLIST is held (`&self`), and every remover of TASKS
+        // holds its write lock
+        unsafe { TASKS.iter_locked() }.map(|t| view(self, t))
     }
 
     /// Every task, writable
     pub fn iter_mut(&mut self) -> impl Iterator<Item = TaskViewMut<'_>> {
         let me = &*self;
+        // SAFETY: as in `iter`
+        let all = unsafe { TASKS.iter_locked() };
         // SAFETY: `me` comes from `&mut self`; the list holds each task
         // once, so each view is handed out once
-        me.tasks.iter().map(|t| unsafe { view_mut(me, t) })
+        all.map(|t| unsafe { view_mut(me, t) })
     }
 
     /// The first task `f` accepts
@@ -1145,7 +1166,7 @@ impl GlobalTaskTable {
         if let Some(p) = &thread_pid {
             p.set_task(Some(&task), self);
         }
-        self.tasks.push_back(task.clone());
+        TASKS.push_back(task.clone());
         self.attach_pids(&task);
     }
 
@@ -1265,11 +1286,12 @@ impl GlobalTaskTable {
             h.leave(&t, None, self, &g);
         }
         // SAFETY: listed (the caller's)
-        let listed = unsafe { self.tasks.remove(&t) };
+        let listed = unsafe { TASKS.remove(&t) };
         // The list's reference goes a grace period later (Linux
-        // release_task -> put_task_struct_rcu_user): an RCU reader that
-        // reached it through a pid or a parent link may still read it
-        crate::sync::rcu::kfree_rcu(listed);
+        // list_del_rcu, release_task -> put_task_struct_rcu_user): an RCU
+        // reader that reached it through the list, a pid or a parent
+        // link may still read it
+        listed.defer();
     }
 
     /// A task leaves the list with no children (Linux: exit hands them
@@ -1478,11 +1500,11 @@ impl GlobalTaskTable {
 
     /// Number of tasks, zombies included
     pub fn len(&self) -> usize {
-        self.tasks.len()
+        TASKS.count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
+        TASKS.is_empty()
     }
 }
 

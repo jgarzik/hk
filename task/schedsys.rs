@@ -69,11 +69,16 @@ pub fn sys_getpriority(which: i32, who: i32) -> KernelResult<i64> {
     // 20 - nice (range 1-40) to avoid negative return values; of a
     // group, the highest (Linux: the largest 20 - nice)
     // 0 is the calling thread (Linux: current)
+    let nice = |t: &Task| super::percpu::lookup_task_nice(t).map(|n| i64::from(20 - n));
+    if which == PRIO_USER {
+        let mut best = None;
+        for_each_user_task(who, |t| best = best.max(nice(t)));
+        return best.ok_or(KernelError::NoProcess);
+    }
     let tasks = prio_tasks(which, who)?;
     tasks
         .iter()
-        .filter_map(|t| super::percpu::lookup_task_nice(t))
-        .map(|n| i64::from(20 - n))
+        .filter_map(|t| nice(t))
         .max()
         .ok_or(KernelError::NoProcess)
 }
@@ -81,7 +86,7 @@ pub fn sys_getpriority(which: i32, who: i32) -> KernelResult<i64> {
 /// The threads `which` and `who` name for getpriority/setpriority (the
 /// caller's numbers, 0 the caller's own): EINVAL for a bad `which`
 fn prio_tasks(which: i32, who: u64) -> KernelResult<alloc::vec::Vec<TaskRef>> {
-    use super::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
+    use super::{PRIO_PGRP, PRIO_PROCESS};
     Ok(match which {
         PRIO_PROCESS => {
             let tid = super::pid::from_vnr_or(who, current_tid()).ok_or(KernelError::NoProcess)?;
@@ -92,23 +97,28 @@ fn prio_tasks(which: i32, who: u64) -> KernelResult<alloc::vec::Vec<TaskRef>> {
                 .ok_or(KernelError::NoProcess)?;
             super::percpu::pgrp_tasks(pgid)
         }
-        PRIO_USER => tasks_of_user(who),
         _ => return Err(KernelError::InvalidArgument),
     })
 }
 
-/// The threads whose real uid is `who` (0: the caller's), for PRIO_USER
-/// (Linux for_each_process_thread with uid_eq(task_uid(p), uid))
-fn tasks_of_user(who: u64) -> alloc::vec::Vec<TaskRef> {
+/// Run `f` on each thread whose real uid is `who` (0: the caller's) and
+/// that the caller's pid namespace numbers, for PRIO_USER: the task
+/// list walked under RCU alone (Linux set/getpriority:
+/// for_each_process_thread under rcu_read_lock, uid_eq(task_uid(p),
+/// uid) && task_pid_vnr(p)); `f` takes only spin locks
+fn for_each_user_task(who: u64, mut f: impl FnMut(&Task)) {
     let uid = if who == 0 {
         super::percpu::current_cred().uid
     } else {
         who as super::Uid
     };
-    super::percpu::GlobalTaskTable::collect_tasks(|_, t| {
-        (!t.task.has_flag(super::pf::KTHREAD) && t.cred().uid == uid)
-            .then(|| super::percpu::task_ref(t.task))
-    })
+    let ns = super::percpu::current_pid_ns();
+    let g = crate::sync::rcu::read_lock();
+    for t in super::percpu::for_each_task_rcu(&g) {
+        if t.cred_rcu(&g).uid == uid && t.pid_nr_ns(ns, &g) != 0 {
+            f(t);
+        }
+    }
 }
 
 /// Set task `t`'s nice value (Linux set_one_prio): EPERM unless the
@@ -178,8 +188,12 @@ pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> KernelResult<()> {
 
     // Every thread named (Linux set_one_prio each): the first success
     // clears ESRCH, an error stays
-    let tasks = prio_tasks(which, who)?;
     let mut ret = Err(KernelError::NoProcess);
+    if which == PRIO_USER {
+        for_each_user_task(who, |t| ret = set_one_prio(t, niceval, caller_euid, ret));
+        return ret;
+    }
+    let tasks = prio_tasks(which, who)?;
     for t in &tasks {
         ret = set_one_prio(t, niceval, caller_euid, ret);
     }
