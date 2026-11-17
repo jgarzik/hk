@@ -5,12 +5,20 @@
 //!   kernel switches tasks) with distinct values in every SIMD register,
 //!   MXCSR/x87 control word (x86) or FPCR/FPSR (arm64); all must survive.
 //!   On x86 with AVX enabled by the OS the upper YMM halves are checked too.
+//! - FPU_SAMECPU: like FPU_CTXSW with both processes on one CPU, each
+//!   yielding and sleeping with its own values in every register.
+//! - FPU_MIGRATE: a process moves itself from CPU to CPU (sched_setaffinity)
+//!   with live SIMD values, alone and then with a process on every CPU
+//!   using its own; its registers follow it.
 //! - FPU_FORK: a fork() child inherits the parent's SIMD registers.
+//! - FPU_EXEC: a program execve'd with live SIMD values starts with the
+//!   initial FP state (boot_tester2 fpzero).
 //! - FPU_SIGNAL: a signal handler that clobbers every SIMD register does not
 //!   corrupt the interrupted code; the frame holds the interrupted FP state
 //!   (Linux layout: x86 fpstate / arm64 fpsimd_context) and rt_sigreturn
 //!   restores it from the frame (an edit made by the handler takes effect).
-//!   On x86 the handler starts with the default MXCSR (0x1f80).
+//!   On x86 the handler starts with the default MXCSR (0x1f80). The
+//!   handler yields after its clobber (its state is saved by a switch).
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -37,6 +45,24 @@ const SYS_READ: u64 = 63;
 const SYS_WRITE: u64 = 64;
 #[cfg(target_arch = "aarch64")]
 const SYS_KILL: u64 = 129;
+
+/// Syscall numbers of the scheduling and exec tests
+#[cfg(target_arch = "x86_64")]
+mod nr {
+    pub const GETPID: u64 = 39;
+    pub const YIELD: u64 = 24;
+    pub const NANOSLEEP: u64 = 35;
+    pub const SETAFFINITY: u64 = 203;
+    pub const EXECVE: u64 = 59;
+}
+#[cfg(target_arch = "aarch64")]
+mod nr {
+    pub const GETPID: u64 = 172;
+    pub const YIELD: u64 = 124;
+    pub const NANOSLEEP: u64 = 101;
+    pub const SETAFFINITY: u64 = 122;
+    pub const EXECVE: u64 = 221;
+}
 
 /// Non-default control state: x86 MXCSR (all exceptions masked, round toward
 /// zero, FTZ) / arm64 FPCR (round toward +inf, FZ)
@@ -118,20 +144,19 @@ impl FpImage {
     }
 }
 
-/// Load `inp` into the FP/SIMD registers, do two syscalls `nr1(a1, b, 1)`
-/// and `nr2(a2, b, 1)`, then store the registers into `out`. Returns the
-/// second syscall's result.
+/// Two syscalls, each `[nr, arg0, arg1, arg2]`
+type Calls = [[u64; 4]; 2];
+
+/// The `Calls` of `nr1(a1, b, 1)` then `nr2(a2, b, 1)`
+fn calls(nr1: u64, a1: u64, nr2: u64, a2: u64, b: u64) -> Calls {
+    [[nr1, a1, b, 1], [nr2, a2, b, 1]]
+}
+
+/// Load `inp` into the FP/SIMD registers, do the two syscalls `c`, then
+/// store the registers into `out`. Returns the second syscall's result.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn fp_roundtrip(
-    inp: &FpImage,
-    out: &mut FpImage,
-    nr1: u64,
-    a1: u64,
-    nr2: u64,
-    a2: u64,
-    b: u64,
-) -> i64 {
+fn fp_roundtrip(inp: &FpImage, out: &mut FpImage, c: &Calls) -> i64 {
     let ret: i64;
     unsafe {
         core::arch::asm!(
@@ -155,15 +180,15 @@ fn fp_roundtrip(
             "fninit",
             "fldcw [{i} + 264]",
             "fild qword ptr [{i} + 272]",
-            "mov rax, {nr1}",
-            "mov rdi, {a1}",
-            "mov rsi, {buf}",
-            "mov edx, 1",
+            "mov rax, [{c}]",
+            "mov rdi, [{c} + 8]",
+            "mov rsi, [{c} + 16]",
+            "mov rdx, [{c} + 24]",
             "syscall",
-            "mov rax, {nr2}",
-            "mov rdi, {a2}",
-            "mov rsi, {buf}",
-            "mov edx, 1",
+            "mov rax, [{c} + 32]",
+            "mov rdi, [{c} + 40]",
+            "mov rsi, [{c} + 48]",
+            "mov rdx, [{c} + 56]",
             "syscall",
             "movdqu [{o} + 0], xmm0",
             "movdqu [{o} + 16], xmm1",
@@ -191,11 +216,7 @@ fn fp_roundtrip(
             "mov dword ptr [{o} + 280], 0",
             i = in(reg) inp as *const FpImage,
             o = in(reg) out as *mut FpImage,
-            buf = in(reg) b,
-            nr1 = in(reg) nr1,
-            a1 = in(reg) a1,
-            nr2 = in(reg) nr2,
-            a2 = in(reg) a2,
+            c = in(reg) c.as_ptr(),
             out("rax") ret,
             out("rdi") _, out("rsi") _, out("rdx") _, out("rcx") _, out("r11") _,
             out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
@@ -211,15 +232,7 @@ fn fp_roundtrip(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn fp_roundtrip(
-    inp: &FpImage,
-    out: &mut FpImage,
-    nr1: u64,
-    a1: u64,
-    nr2: u64,
-    a2: u64,
-    b: u64,
-) -> i64 {
+fn fp_roundtrip(inp: &FpImage, out: &mut FpImage, c: &Calls) -> i64 {
     let ret: i64;
     let fpcr: u64;
     let fpsr: u64;
@@ -245,15 +258,13 @@ fn fp_roundtrip(
             "msr fpcr, x0",
             "ldr x0, [{i}, #520]",
             "msr fpsr, x0",
-            "mov x8, {nr1}",
-            "mov x0, {a1}",
-            "mov x1, {buf}",
-            "mov x2, #1",
+            "ldr x8, [{c}]",
+            "ldp x0, x1, [{c}, #8]",
+            "ldr x2, [{c}, #24]",
             "svc #0",
-            "mov x8, {nr2}",
-            "mov x0, {a2}",
-            "mov x1, {buf}",
-            "mov x2, #1",
+            "ldr x8, [{c}, #32]",
+            "ldp x0, x1, [{c}, #40]",
+            "ldr x2, [{c}, #56]",
             "svc #0",
             "stp q0, q1, [{o}, #0]",
             "stp q2, q3, [{o}, #32]",
@@ -278,11 +289,7 @@ fn fp_roundtrip(
             "msr fpsr, xzr",
             i = in(reg) inp as *const FpImage,
             o = in(reg) out as *mut FpImage,
-            buf = in(reg) b,
-            nr1 = in(reg) nr1,
-            a1 = in(reg) a1,
-            nr2 = in(reg) nr2,
-            a2 = in(reg) a2,
+            c = in(reg) c.as_ptr(),
             fpcr = out(reg) fpcr,
             fpsr = out(reg) fpsr,
             out("x0") ret,
@@ -392,7 +399,10 @@ fn ymm_roundtrip(
 /// Run all FP/SIMD tests
 pub fn run_tests() {
     test_fpu_ctxsw();
+    test_fpu_samecpu();
+    test_fpu_migrate();
     test_fpu_fork();
+    test_fpu_exec();
     test_fpu_signal();
 }
 
@@ -412,7 +422,8 @@ fn pingpong_side(tag: u64, first_write: bool, rfd: u64, wfd: u64) -> u64 {
     for iter in 0..PINGPONG_ITERS {
         let inp = FpImage::pattern(tag, iter);
         let mut out = FpImage::zero();
-        let r = fp_roundtrip(&inp, &mut out, nr1, a1, nr2, a2, buf.as_mut_ptr() as u64);
+        let c = calls(nr1, a1, nr2, a2, buf.as_mut_ptr() as u64);
+        let r = fp_roundtrip(&inp, &mut out, &c);
         if r != 1 {
             return 200;
         }
@@ -479,6 +490,195 @@ fn test_fpu_ctxsw() {
     }
 }
 
+/// The first 64 CPUs this task may run on, as a mask
+fn cpus() -> u64 {
+    let mut m = [0u64; 16];
+    if hk_syscall::sys_sched_getaffinity(0, 128, m.as_mut_ptr()) <= 0 {
+        return 0;
+    }
+    m[0]
+}
+
+/// Pin this task to the CPUs in `mask`
+fn pin(mask: u64) -> bool {
+    hk_syscall::sys_sched_setaffinity(0, 8, &mask) == 0
+}
+
+/// The exit status of child `pid` (255 if it did not exit)
+fn reap(pid: i64) -> u64 {
+    let mut status: i32 = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+    if status & 0x7f == 0 {
+        ((status >> 8) & 0xff) as u64
+    } else {
+        255
+    }
+}
+
+/// `iters` rounds of: load the `tag` values, yield, sleep `ns`, check
+/// them. Returns 0 or 1 + the bad register (200: a syscall failed).
+fn sleeper(tag: u64, iters: u64, ns: i64) -> u64 {
+    let ts = [0i64, ns];
+    for iter in 0..iters {
+        let inp = FpImage::pattern(tag, iter);
+        let mut out = FpImage::zero();
+        let c = [
+            [nr::YIELD, 0, 0, 0],
+            [nr::NANOSLEEP, ts.as_ptr() as u64, 0, 0],
+        ];
+        if fp_roundtrip(&inp, &mut out, &c) != 0 {
+            return 200;
+        }
+        if let Some(k) = inp.diff(&out) {
+            return 1 + k as u64;
+        }
+    }
+    0
+}
+
+/// Test: two processes sharing one CPU keep their FP/SIMD registers
+fn test_fpu_samecpu() {
+    let all = cpus();
+    if all == 0 || !pin(1 << all.trailing_zeros()) {
+        println(b"FPU_SAMECPU:FAIL: affinity");
+        return;
+    }
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        sys_exit(sleeper(0x44, PINGPONG_ITERS, 100_000));
+    }
+    let bad = sleeper(0x21, PINGPONG_ITERS, 100_000);
+    pin(all);
+    if pid < 0 {
+        println(b"FPU_SAMECPU:FAIL: fork");
+        return;
+    }
+    let child_bad = reap(pid);
+    if bad == 0 && child_bad == 0 {
+        pass(b"FPU_SAMECPU");
+    } else {
+        print(b"FPU_SAMECPU:FAIL: parent reg ");
+        print_num(bad as i64);
+        print(b" child reg ");
+        print_num(child_bad as i64);
+        println(b"");
+    }
+}
+
+/// `iters` rounds of: load the `tag` values, move to the next CPU of
+/// `all`, sleep, check them. Returns 0 or 1 + the bad register (200: a
+/// syscall failed).
+fn migrator(tag: u64, all: u64, iters: u64) -> u64 {
+    let ts = [0i64, 50_000];
+    let mut cpu = 0;
+    for iter in 0..iters {
+        cpu = (cpu + 1) % 64;
+        while all & (1 << cpu) == 0 {
+            cpu = (cpu + 1) % 64;
+        }
+        let mask: u64 = 1 << cpu;
+        let inp = FpImage::pattern(tag, iter);
+        let mut out = FpImage::zero();
+        let c = [
+            [nr::SETAFFINITY, 0, 8, &mask as *const u64 as u64],
+            [nr::NANOSLEEP, ts.as_ptr() as u64, 0, 0],
+        ];
+        if fp_roundtrip(&inp, &mut out, &c) != 0 {
+            return 200;
+        }
+        if let Some(k) = inp.diff(&out) {
+            return 1 + k as u64;
+        }
+    }
+    0
+}
+
+/// Test: FP/SIMD registers follow a task from CPU to CPU, with the CPUs
+/// idle and then busy with other tasks' FP/SIMD values
+fn test_fpu_migrate() {
+    let all = cpus();
+    if all == 0 {
+        println(b"FPU_MIGRATE:FAIL: affinity");
+        return;
+    }
+    let alone = migrator(0x6a, all, PINGPONG_ITERS);
+    // One process pinned to each CPU (up to 8), each with its own values
+    let mut kids = [0i64; 8];
+    let mut n = 0;
+    for cpu in 0..64u64 {
+        if all & (1 << cpu) == 0 || n == kids.len() {
+            continue;
+        }
+        let pid = hk_syscall::sys_fork();
+        if pid == 0 {
+            if !pin(1 << cpu) {
+                sys_exit(201);
+            }
+            sys_exit(sleeper(0x80 + cpu, 2 * PINGPONG_ITERS, 50_000));
+        }
+        kids[n] = pid;
+        n += 1;
+    }
+    let busy = migrator(0x6b, all, PINGPONG_ITERS);
+    pin(all);
+    let mut kid_bad = 0;
+    for &pid in &kids[..n] {
+        let b = if pid < 0 { 202 } else { reap(pid) };
+        if kid_bad == 0 {
+            kid_bad = b;
+        }
+    }
+    if alone == 0 && busy == 0 && kid_bad == 0 {
+        pass(b"FPU_MIGRATE");
+    } else {
+        print(b"FPU_MIGRATE:FAIL: alone reg ");
+        print_num(alone as i64);
+        print(b" busy reg ");
+        print_num(busy as i64);
+        print(b" pinned reg ");
+        print_num(kid_bad as i64);
+        println(b"");
+    }
+}
+
+/// Test: a program execve'd with live FP/SIMD values starts with the
+/// initial FP state
+fn test_fpu_exec() {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        let path = b"/bin/boot_tester2\0";
+        let argv: [*const u8; 3] = [
+            b"boot_tester2\0".as_ptr(),
+            b"fpzero\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let inp = FpImage::pattern(0x3e, 1);
+        let mut out = FpImage::zero();
+        let c = [
+            [nr::GETPID, 0, 0, 0],
+            [
+                nr::EXECVE,
+                path.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp.as_ptr() as u64,
+            ],
+        ];
+        fp_roundtrip(&inp, &mut out, &c);
+        sys_exit(100);
+    }
+    if pid < 0 {
+        println(b"FPU_EXEC:FAIL: fork");
+        return;
+    }
+    let bad = reap(pid);
+    if bad == 0 {
+        pass(b"FPU_EXEC");
+    } else {
+        fail_num(b"FPU_EXEC:FAIL: bad word ", bad as i64);
+    }
+}
+
 /// Test: a fork() child inherits the parent's FP/SIMD registers
 fn test_fpu_fork() {
     #[cfg(target_arch = "x86_64")]
@@ -497,7 +697,7 @@ fn test_fpu_fork() {
     #[cfg(target_arch = "x86_64")]
     let _ = SIGCHLD;
     // clone's second argument (child stack) must be 0
-    let pid = fp_roundtrip(&inp, &mut out, nr1, 0, SYS_FORK, a2, 0);
+    let pid = fp_roundtrip(&inp, &mut out, &calls(nr1, 0, SYS_FORK, a2, 0));
     let bad = inp.diff(&out);
     if pid == 0 {
         sys_exit(bad.map(|k| 1 + k as u64).unwrap_or(0));
@@ -546,9 +746,9 @@ fn clobber_fp() {
     let mut sink = FpImage::zero();
     // getpid twice: no blocking, just executes the clobber
     #[cfg(target_arch = "x86_64")]
-    fp_roundtrip(&junk, &mut sink, 39, 0, 39, 0, 0);
+    fp_roundtrip(&junk, &mut sink, &calls(39, 0, 39, 0, 0));
     #[cfg(target_arch = "aarch64")]
-    fp_roundtrip(&junk, &mut sink, 172, 0, 172, 0, 0);
+    fp_roundtrip(&junk, &mut sink, &calls(172, 0, 172, 0, 0));
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -613,6 +813,9 @@ extern "C" fn fpu_sig_handler(_signo: i32, _info: *mut u8, uc: *mut u8) {
     let ctrl = read_fp_ctrl();
     let err = unsafe { frame_fp_check_edit(uc) };
     clobber_fp();
+    // The clobbered values are saved by the switch, rt_sigreturn's frame
+    // replaces them
+    hk_syscall::sys_sched_yield();
     unsafe {
         core::ptr::write_volatile(&raw mut SIG_HANDLER_CTRL, ctrl);
         core::ptr::write_volatile(&raw mut SIG_FRAME_ERR, err);
@@ -645,7 +848,11 @@ fn test_fpu_signal() {
     let nr1 = 39;
     #[cfg(target_arch = "aarch64")]
     let nr1 = 172;
-    let r = fp_roundtrip(&inp, &mut out, nr1, 0, SYS_KILL, pid, SIGUSR1 as u64);
+    let r = fp_roundtrip(
+        &inp,
+        &mut out,
+        &calls(nr1, 0, SYS_KILL, pid, SIGUSR1 as u64),
+    );
     let dfl: [u64; 4] = [SIG_DFL, 0, 0, 0];
     sys_rt_sigaction(SIGUSR1, dfl.as_ptr() as u64, 0, 8);
 
