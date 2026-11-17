@@ -31,9 +31,7 @@ use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::siginfo::Layout;
-use crate::signal::{
-    SigFields, SigInfo, SigSet, Signal, UNMASKABLE_SIGNALS, with_task_signal_state,
-};
+use crate::signal::{SigFields, SigInfo, SigSet, Signal, UNMASKABLE_SIGNALS};
 use crate::sync::IrqSpinlock;
 use crate::task::percpu::current;
 use crate::util::pod::IntoBytes;
@@ -165,9 +163,9 @@ impl Signalfd {
     fn has_pending_signals(&self) -> bool {
         let mask = self.inner.lock().mask;
         let me = current();
-        with_task_signal_state(&me, |state| {
-            let shared = crate::signal::group_pending(&me);
-            let pending = state.pending.signal.union(&shared.signal);
+        crate::signal::with_task_sig_group(&me, |state, group| {
+            let shared = group.map_or(SigSet::EMPTY, |p| p.signal);
+            let pending = state.pending.signal.union(&shared);
             pending.intersect(&mask).any()
         })
         .unwrap_or(false)

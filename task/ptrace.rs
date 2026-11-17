@@ -606,7 +606,7 @@ fn ptrace_interrupt(target_pid: Pid) -> KernelResult<i64> {
         return Err(KernelError::Io);
     };
     let sg = signal::lock_sighand_in(&task, &table).ok_or(KernelError::Io)?;
-    let _g = sig_struct.jobctl.lock();
+    let _g = sig_struct.jobctl(&sg);
     let mut s = signal::sig_of(&task, &sg);
     if signal::stop::set_pending(&task, &mut s, TRAP_STOP) {
         let listening = s.jobctl & LISTENING != 0;
@@ -799,9 +799,9 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> KernelResult<i64
         let Some(n) = off.checked_add(i) else {
             break;
         };
-        let info = signal::with_task_signal_state(&task, |s| {
+        let info = signal::with_task_sig_group(&task, |s, group| {
             if shared {
-                signal::group_pending(&task).nth(n)
+                group.and_then(|p| p.nth(n))
             } else {
                 s.pending.nth(n)
             }
@@ -913,7 +913,7 @@ pub fn ptrace_stop_why(
             return (None, info);
         };
         let sig_struct = me.cpu_group().cloned();
-        let mut g = sig_struct.as_ref().map(|s| s.jobctl.lock());
+        let mut g = sig_struct.as_ref().map(|s| s.jobctl(&sg));
         let mut s = signal::sig_of(&me, &sg);
         // Untraced, or killed: no stop (Linux: !current->ptrace ||
         // __fatal_signal_pending)

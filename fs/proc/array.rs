@@ -79,6 +79,8 @@ struct Snap {
     seccomp: u8,
     blocked: u64,
     pending: u64,
+    /// The group's pending set (Linux task_sig: shared_pending)
+    shared: u64,
     sighand: Option<Arc<crate::signal::SigHand>>,
     signal: Option<Arc<crate::signal::SignalStruct>>,
     fs: Option<Arc<crate::fs::FsStruct>>,
@@ -125,7 +127,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         let a = t.task.task_lock();
         (a.comm(), a.fs().cloned(), a.files().cloned())
     };
-    let (blocked, pending, traced, stopped) = crate::signal::proc_sig(&table, t.task);
+    let (blocked, pending, shared, traced, stopped) = crate::signal::proc_sig(&table, t.task);
     // The whole thread group's CPU time (Linux do_task_stat with whole:
     // thread_group_cputime_adjusted)
     let (utime, stime) = crate::task::cputime::thread_group_cputime_adjusted(&table, pid);
@@ -178,6 +180,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         seccomp: t.task.seccomp_mode(),
         blocked,
         pending,
+        shared,
         sighand: t.sighand(),
         signal: t.signal().cloned(),
         fs,
@@ -229,7 +232,7 @@ fn ign_cgt(s: &Snap) -> (u64, u64) {
 
 /// Pending signals shared by the thread group
 fn shd_pnd(s: &Snap) -> u64 {
-    s.signal.as_ref().map_or(0, |g| g.shared_set().0)
+    s.shared
 }
 
 /// The fd table's size (Linux max_fds)
@@ -608,6 +611,7 @@ mod tests {
             seccomp: 0,
             blocked: 1 << 1,
             pending: 0,
+            shared: 0,
             sighand: None,
             signal: None,
             fs: None,

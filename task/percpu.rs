@@ -2432,14 +2432,16 @@ pub fn wait_jobctl(
         }
         let s = t.signal()?;
         let uid = t.cred_arc().uid;
+        // Under its siglock (Linux wait_task_stopped/continued)
+        let g = crate::signal::lock_sighand_in(t.task, &table)?;
         if child
             && !traced
             && wflags & WUNTRACED != 0
-            && let Some(code) = crate::signal::stop::take_stopped(s, wnowait)
+            && let Some(code) = crate::signal::stop::take_stopped(&g, s, wnowait)
         {
             return Some((t.task.tid(), t.task.pid, JobReport::Stopped(code), uid));
         }
-        (wflags & WCONTINUED != 0 && crate::signal::stop::take_continued(s, wnowait))
+        (wflags & WCONTINUED != 0 && crate::signal::stop::take_continued(&g, s, wnowait))
             .then(|| (t.task.tid(), t.task.pid, JobReport::Continued, uid))
     })?;
     let times = rusage_both(&table, pid);
@@ -3684,7 +3686,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // zero, does the group-level exit work (Linux do_exit:
         // group_dead = atomic_dec_and_test(&signal->live))
         let group_dead = crate::signal::get_task_signal_struct(&current())
-            .is_none_or(|s| s.thread_exiting(status));
+            .is_none_or(|s| s.thread_exiting(&current(), status));
 
         // Nothing reaps orphans or keeps userspace going without the
         // global init: its death is fatal, and loud (Linux do_exit:

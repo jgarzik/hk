@@ -181,10 +181,10 @@ pub fn sys_rt_sigpending(set: UserPtr<u64>, sigsetsize: u64) -> KernelResult<()>
         return Err(KernelError::InvalidArgument);
     }
     let me = current();
-    let pending = with_task_signal_state(&me, |state| {
+    let pending = crate::signal::with_task_sig_group(&me, |state, group| {
         // Combine private and shared pending
-        let shared = crate::signal::group_pending(&me);
-        state.pending.signal.union(&shared.signal).bits()
+        let shared = group.map_or(SigSet::EMPTY, |p| p.signal);
+        state.pending.signal.union(&shared).bits()
     })
     .ok_or(KernelError::NoProcess)?;
     // Written after the signal state is unlocked

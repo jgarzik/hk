@@ -200,7 +200,9 @@ made under siglock as Linux's.
    - [x] `Task.sig`: `sync::InstanceCell` owned by the task's table,
      moved with `Task.sighand`; `with_sig`'s retarget walks the thread
      list under siglock.
-   - [ ] `SignalStruct.jobctl`, `shared`.
+   - [x] `SignalStruct.jobctl`, `shared`: `InstanceCell`s owned with the
+     thread list; group exit starts under siglock (do_group_exit,
+     synchronize_group_exit).
    - [ ] `SigHand.action`.
    - [ ] `SigHand.update` gone; ignored POSIX timers on a siglock-owned
      list (Linux ignored_posix_timers).

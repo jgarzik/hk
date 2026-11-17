@@ -69,7 +69,10 @@ pub fn notify_parent_cldstop(
     let status = match why {
         Why::Continued => super::SIGCONT.nr() as i32,
         Why::Stopped => {
-            let code = tsk.cpu_group().map_or(0, |s| super::stop::stop_code(s));
+            let code = tsk
+                .cpu_group()
+                .zip(super::lock_sighand_in(&tsk, table))
+                .map_or(0, |(s, g)| super::stop::stop_code(&g, s));
             (code & 0x7f) as i32
         }
         Why::Trapped => super::lock_sighand_in(&tsk, table)
