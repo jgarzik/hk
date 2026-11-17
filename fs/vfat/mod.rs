@@ -988,33 +988,82 @@ fn cluster_to_offset(sb_data: &VfatSbData, cluster: u32) -> u64 {
     sb_data.data_start_sector * u64::from(sb_data.bytes_per_sector) + data_offset
 }
 
-/// Read a cluster chain starting from a cluster
-/// The clusters of the chain at `start_cluster` (0: none). As Linux
-/// fat_get_cluster, a corrupt chain is EIO: an entry that is free, bad
-/// or past the last cluster, or a chain longer than the filesystem has
-/// clusters (a cycle)
+/// The clusters of the chain at `start` (0: none), one at a time, the
+/// FAT read as it goes by `fat` (Linux fat_get_cluster's walk over
+/// fat_ent_read): EIO, ending the walk, for a cluster mid-chain that
+/// is free, bad or past the last one (`max_cluster`), or a chain longer
+/// than any file or directory may be (a loop: Linux bounds the walk by
+/// s_maxbytes >> cluster_bits, 4 GiB here)
+struct Chain<F> {
+    fat: F,
+    max_cluster: u32,
+    /// The next cluster to yield, as read (None: the walk is over)
+    next: Option<u32>,
+    /// The one before it, whose FAT entry gives the next (None: `next`
+    /// is the first)
+    prev: Option<u32>,
+    /// Clusters left before the chain is a loop
+    left: u64,
+}
+
+impl<F: FnMut(u32) -> Result<u32, KernelError>> Chain<F> {
+    fn with(fat: F, max_cluster: u32, cluster_size: u32, start: u32) -> Self {
+        Self {
+            fat,
+            max_cluster,
+            next: (start != 0).then_some(start),
+            prev: None,
+            left: u64::from(max_cluster).min((1u64 << 32) / u64::from(cluster_size) + 1),
+        }
+    }
+}
+
+/// The chain at `start` of `sb_data`'s FAT
+fn fat_chain(
+    sb_data: &VfatSbData,
+    start: u32,
+) -> Chain<impl FnMut(u32) -> Result<u32, KernelError> + '_> {
+    Chain::with(
+        move |c| get_fat_entry(sb_data, c),
+        sb_data.max_cluster,
+        sb_data.cluster_size,
+        start,
+    )
+}
+
+impl<F: FnMut(u32) -> Result<u32, KernelError>> Iterator for Chain<F> {
+    type Item = Result<u32, KernelError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(p) = self.prev.take() {
+            match (self.fat)(p) {
+                Ok(n) => self.next = (!is_end_of_chain(n)).then_some(n),
+                Err(e) => {
+                    self.next = None;
+                    return Some(Err(e));
+                }
+            }
+        }
+        let c = self.next.take()?;
+        // A free (0), reserved, bad or out-of-range entry is corruption
+        if !(2..self.max_cluster).contains(&c) || self.left == 0 {
+            return Some(Err(KernelError::Io));
+        }
+        self.left -= 1;
+        self.prev = Some(c);
+        Some(Ok(c))
+    }
+}
+
+/// The clusters of the chain at `start_cluster` (0: none), a corrupt
+/// chain EIO as `Chain` finds it; the vector grows fallibly
 fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u32>, KernelError> {
     let mut chain = Vec::new();
-    if start_cluster == 0 {
-        return Ok(chain);
-    }
-    // No file or directory is longer than 4 GiB (s_maxbytes): a longer
-    // chain is a loop (Linux bounds the walk by s_maxbytes >>
-    // cluster_bits), and the vector never outgrows that
-    let max_len =
-        (sb_data.max_cluster as usize).min((1usize << 32) / sb_data.cluster_size as usize + 1);
-    let mut cluster = start_cluster;
-    loop {
-        if !(2..sb_data.max_cluster).contains(&cluster) || chain.len() >= max_len {
-            return Err(KernelError::Io);
-        }
+    for c in fat_chain(sb_data, start_cluster) {
         chain.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
-        chain.push(cluster);
-        cluster = get_fat_entry(sb_data, cluster)?;
-        if is_end_of_chain(cluster) {
-            return Ok(chain);
-        }
+        chain.push(c?);
     }
+    Ok(chain)
 }
 
 // ============================================================================
@@ -1474,6 +1523,8 @@ impl Lfn {
 struct Slot<'a> {
     /// Its disk offset (a short entry's i_pos)
     off: u64,
+    /// The cluster holding it
+    cluster: u32,
     /// Its index in the directory
     idx: u64,
     b: &'a [u8; 32],
@@ -1481,9 +1532,8 @@ struct Slot<'a> {
 
 /// Walk the slots of the directory at `start` (0: none), a cluster
 /// read at a time (Linux fat_get_entry through the directory's
-/// buffers), the chain followed as it goes: `f` ends the walk with
-/// Break. None: the chain ended first. A corrupt chain is EIO as in
-/// `read_cluster_chain`.
+/// buffers), the chain followed as it goes (`Chain`, EIO if corrupt):
+/// `f` ends the walk with Break. None: the chain ended first.
 fn dir_walk<B>(
     sb_data: &VfatSbData,
     start: u32,
@@ -1494,20 +1544,15 @@ fn dir_walk<B>(
     }
     let cs = sb_data.cluster_size as usize;
     let per = cs as u64 / 32;
-    // `read_cluster_chain`'s bound: a longer chain is a loop
-    let max_len = u64::from(sb_data.max_cluster).min((1u64 << 32) / cs as u64 + 1);
     let mut buf = crate::util::kmem::try_vec(cs, 0u8)?;
-    let mut c = start;
-    for ci in 0..max_len {
-        if !(2..sb_data.max_cluster).contains(&c) {
-            return Err(KernelError::Io);
-        }
+    for (ci, c) in (0u64..).zip(fat_chain(sb_data, start)) {
+        let c = c?;
         let base = cluster_to_offset(sb_data, c);
         read_bytes(&sb_data.bdev, base, &mut buf)?;
-        for (i, b) in buf.as_chunks::<32>().0.iter().enumerate() {
-            let i = i as u64;
+        for (i, b) in (0u64..).zip(buf.as_chunks::<32>().0) {
             let s = Slot {
                 off: base + i * 32,
+                cluster: c,
                 idx: ci * per + i,
                 b,
             };
@@ -1515,12 +1560,8 @@ fn dir_walk<B>(
                 return Ok(Some(r));
             }
         }
-        c = get_fat_entry(sb_data, c)?;
-        if is_end_of_chain(c) {
-            return Ok(None);
-        }
     }
-    Err(KernelError::Io)
+    Ok(None)
 }
 
 /// Directory short entries in the directory at `cluster`, "." and ".."
@@ -1772,9 +1813,7 @@ fn find_free_dir_slots(
     let mut last = dir_cluster;
     let per = u64::from(sb_data.cluster_size) / 32;
     let found = dir_walk(sb_data, dir_cluster, |s| {
-        if s.idx % per == 0 {
-            last = cluster_of(sb_data, s.off);
-        }
+        last = s.cluster;
         if s.b[0] == END_MARKER || s.b[0] == DELETED_MARKER {
             run.push(s.off);
             if run.len() == n {
@@ -1803,12 +1842,6 @@ fn find_free_dir_slots(
         run.extend((0..take as u64).map(|i| base + i * 32));
     }
     Ok(run)
-}
-
-/// The cluster holding disk offset `off` of the data region
-fn cluster_of(sb_data: &VfatSbData, off: u64) -> u32 {
-    let data = sb_data.data_start_sector * u64::from(sb_data.bytes_per_sector);
-    ((off - data) / u64::from(sb_data.cluster_size)) as u32 + 2
 }
 
 /// A new directory entry: its name, attributes, first cluster and
@@ -3374,6 +3407,41 @@ pub static VFAT_TYPE: FileSystemType = FileSystemType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clusters a chain walk yields over the FAT `fat` (index =
+    /// cluster), then whether it ended in EIO
+    fn walk(fat: &[u32], start: u32) -> (Vec<u32>, bool) {
+        let mut got = Vec::new();
+        let max = fat.len() as u32;
+        for c in Chain::with(|c| Ok(fat[c as usize]), max, 4096, start) {
+            match c {
+                Ok(c) => got.push(c),
+                Err(_) => return (got, true),
+            }
+        }
+        (got, false)
+    }
+
+    /// Linux fat_get_cluster: a chain ends at an end-of-chain mark; one
+    /// that reaches a free, reserved or out-of-range cluster, or loops,
+    /// is EIO (never a quiet end, which would let a later allocation
+    /// cross-link the free cluster)
+    #[test]
+    fn chain_walk() {
+        const EOC: u32 = 0x0FFF_FFFF;
+        assert_eq!(walk(&[0, 0, 3, 4, EOC], 2), (vec![2, 3, 4], false));
+        assert_eq!(walk(&[0, 0, EOC], 0), (vec![], false));
+        // 3's entry is free (0) mid-chain: EIO after 3
+        assert_eq!(walk(&[0, 0, 3, 0, 0], 2), (vec![2, 3], true));
+        assert_eq!(walk(&[0, 0, 0, 0], 2), (vec![2], true));
+        assert_eq!(walk(&[0, 0, 1, 0], 2), (vec![2], true));
+        assert_eq!(walk(&[0, 0, 9, 0], 2), (vec![2], true));
+        assert_eq!(walk(&[0, 0, FAT_BAD, 0], 2), (vec![2], true));
+        // A loop: EIO once more clusters than the FAT has were walked
+        assert!(walk(&[0, 0, 3, 2], 2).1);
+        // A bad start
+        assert_eq!(walk(&[0, 0, EOC], 1), (vec![], true));
+    }
 
     /// Short names never start with a space; a base of only dots and
     /// spaces before the last dot makes the whole name the base (Linux
