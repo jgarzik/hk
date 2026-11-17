@@ -216,7 +216,7 @@ fn direct_write(
         let at = pos + n as u64;
         if at > inode.get_size() {
             inode.set_size(at);
-            crate::fs::fs_writeback::mark_inode_dirty(inode);
+            crate::fs::fs_writeback::mark_inode_dirty_pages(inode);
             // The data is on the disk: its count is returned whatever
             // the directory entry's update does (Linux
             // generic_file_direct_write: mark_inode_dirty cannot fail)

@@ -2395,7 +2395,7 @@ impl InodeOps for VfatInodeOps {
                 let _ = write_failed(inode, &sb_data);
                 return Err(e);
             }
-            super::fs_writeback::mark_inode_dirty(inode);
+            super::fs_writeback::mark_inode_dirty_pages(inode);
             inode.set_size(length);
         }
         update_size(inode, &sb_data)
@@ -3007,7 +3007,7 @@ impl FileOps for VfatFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        super::fs_writeback::writeback_inode(&inode)?;
+        super::fs_writeback::write_inode_now(&inode)?;
         crate::block::blkdev::sync_blockdev(&sb_data.bdev)?;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }

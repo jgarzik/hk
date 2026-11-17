@@ -579,7 +579,7 @@ pub fn dirty_page(m: &AddressSpace, phys: u64) {
     // A reference unless its last went (Linux __mark_inode_dirty skips
     // an I_FREEING inode)
     if let Some(inode) = m.host().and_then(Inode::igrab) {
-        crate::fs::fs_writeback::mark_inode_dirty(&inode);
+        crate::fs::fs_writeback::mark_inode_dirty_pages(&inode);
     }
 }
 

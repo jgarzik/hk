@@ -414,7 +414,7 @@ pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), Kern
         filemap::put_page(phys);
         done += n;
     }
-    crate::fs::fs_writeback::mark_inode_dirty(&b.bd_inode);
+    crate::fs::fs_writeback::mark_inode_dirty_pages(&b.bd_inode);
     Ok(())
 }
 

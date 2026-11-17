@@ -1,7 +1,9 @@
 //! Writing back dirty inodes (Linux fs/fs-writeback.c, fs/sync.c)
 //!
-//! An inode whose page cache gets a dirty page is marked dirty once
-//! (`Inode.i_dirty`, Linux I_DIRTY_PAGES) and put at the tail of its
+//! An inode whose page cache gets a dirty page (Linux I_DIRTY_PAGES),
+//! or whose metadata changed (`mark_inode_dirty`, Linux I_DIRTY_SYNC:
+//! `Inode.i_dirty_inode`, written by its filesystem's ->write_inode),
+//! is queued once (`Inode.i_dirty`) at the tail of its
 //! device's `b_dirty` list (`BdiWriteback`, Linux wb->b_dirty) through
 //! its embedded `Inode.i_io_list`. The lists hold no reference (Linux):
 //! an inode's last reference evicts it, dirty or not, and its eviction
@@ -14,8 +16,10 @@
 //! to `b_io` (Linux queue_io / move_expired_inodes: those dirtied at or
 //! before a cutoff, of one superblock for a sync, oldest first), then
 //! writes them one at a time: each is taken off `b_io` under the list
-//! lock, marked clean, and written (`filemap::write_and_wait`) with the
-//! lock released, so a page dirtied meanwhile puts it back on `b_dirty`.
+//! lock, marked clean, and written (`write_inode_now`: its pages, then
+//! its metadata if marked, Linux __writeback_single_inode) with the
+//! lock released, so a page or metadata dirtied meanwhile puts it back
+//! on `b_dirty`.
 //! Passes over one device's lists are serialized by its sleeping
 //! `BdiWriteback.pass` (Linux runs them one at a time on the wb's work
 //! list). There is no `b_more_io`: an inode is always written whole
@@ -27,9 +31,11 @@
 //! its own cache (the block device's inode is on the same lists).
 //!
 //! Locking: `BdiWriteback.list_lock` is a spin leaf, thread context
-//! only; `mark_inode_dirty` may run under a page lock (the fault path),
-//! never under a spinlock. Writing sleeps (block I/O) with no spinlock
-//! held, under `BdiWriteback.pass`.
+//! only; `mark_inode_dirty_pages` may run under a page lock (the fault
+//! path), never under a spinlock; `mark_inode_dirty` where its caller
+//! holds a reference and may sleep (it may put one). Writing sleeps
+//! (block I/O) with no spinlock held, under `BdiWriteback.pass` (its
+//! ->write_inode too: pass -> what that takes, vfat's `ipos`).
 
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
@@ -64,8 +70,38 @@ fn inode_to_wb(inode: &Inode) -> Option<Arc<BdiWriteback>> {
 /// periodic writeback if nothing was queued (its mapping notes when it
 /// became dirty). An inode with no device to write to stays marked and
 /// unqueued (Linux noop_backing_dev_info).
-pub fn mark_inode_dirty(inode: &InodeRef) {
-    if !inode.i_data.aops().can_dirty() || inode.i_dirty.swap(true, Ordering::AcqRel) {
+pub fn mark_inode_dirty_pages(inode: &InodeRef) {
+    if !inode.i_data.aops().can_dirty() {
+        return;
+    }
+    queue(inode);
+}
+
+/// `inode`'s metadata changed (Linux mark_inode_dirty: I_DIRTY_SYNC,
+/// as generic_update_time for times): its filesystem's ->write_inode
+/// writes it at the next writeback, fsync, sync, unmount or the
+/// write-back before its eviction. Queued as `mark_inode_dirty_pages`,
+/// noting when (Linux dirtied_when) if it was not queued; an inode in
+/// its teardown is left (Linux skips I_FREEING). The caller holds a
+/// reference.
+pub fn mark_inode_dirty(inode: &Inode) {
+    if inode.i_dirty_inode.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(i) = inode.igrab() else {
+        return;
+    };
+    if !i.i_dirty.load(Ordering::Acquire) {
+        i.i_data
+            .dirtied_when
+            .store(crate::time::monotonic_ns(), Ordering::Release);
+    }
+    queue(&i);
+}
+
+/// Queue `inode` on its device's `b_dirty` unless queued (`i_dirty`)
+fn queue(inode: &InodeRef) {
+    if inode.i_dirty.swap(true, Ordering::AcqRel) {
         return;
     }
     // Its wb, found once (Linux inode->i_wb)
@@ -112,11 +148,28 @@ pub(super) fn inode_io_list_del(inode: &Inode) {
     }
 }
 
-/// Write back one inode's dirty pages (Linux writeback_single_inode,
-/// for fsync and the dirty limits). The inode stays queued (`i_dirty`
-/// is that membership): the next pass finds it clean.
+/// Write back one inode's dirty pages (for the dirty limits: Linux
+/// balance_dirty_pages writes pages only). The inode stays queued
+/// (`i_dirty` is that membership): the next pass finds it clean.
 pub fn writeback_inode(inode: &Inode) -> Result<(), KernelError> {
     crate::mm::filemap::write_and_wait(inode)
+}
+
+/// Write back one inode whole (Linux write_inode_now /
+/// __writeback_single_inode): its dirty pages, then, if marked, its
+/// metadata through its filesystem's ->write_inode, the mark cleared
+/// first so a change meanwhile marks it again. For fsync, a pass and
+/// the write-back before an eviction. The first error is returned
+/// after both were tried.
+pub fn write_inode_now(inode: &Inode) -> Result<(), KernelError> {
+    let r = crate::mm::filemap::write_and_wait(inode);
+    if !inode.i_dirty_inode.swap(false, Ordering::AcqRel) {
+        return r;
+    }
+    let Some(sb) = inode.superblock() else {
+        return r;
+    };
+    r.and(sb.s_op.write_inode(inode))
 }
 
 /// Its pages became dirty at or before `cutoff` (monotonic ns)
@@ -169,7 +222,7 @@ fn wb_writeback(
         let Some(inode) = inode else {
             continue;
         };
-        if let Err(e) = writeback_inode(&inode)
+        if let Err(e) = write_inode_now(&inode)
             && err.is_ok()
         {
             err = Err(e);

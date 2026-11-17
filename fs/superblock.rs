@@ -31,6 +31,14 @@ pub trait SuperOps: Send + Sync {
     /// Called when inode is no longer referenced
     fn drop_inode(&self, _inode: &Inode) {}
 
+    /// Write a dirty inode's metadata (Linux ->write_inode): called by
+    /// writeback, fsync and the write-back before an eviction, after
+    /// its pages, for an inode `mark_inode_dirty` marked. Default
+    /// nothing (no metadata of its own on a device).
+    fn write_inode(&self, _inode: &Inode) -> Result<(), KernelError> {
+        Ok(())
+    }
+
     /// The filesystem's own teardown, after its inodes are evicted
     /// (Linux ->put_super, from generic_shutdown_super)
     fn put_super(&self, _sb: &SuperBlock) {}

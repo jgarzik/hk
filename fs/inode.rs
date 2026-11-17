@@ -766,7 +766,7 @@ unsafe fn iput_final(p: NonNull<Inode>, l: MutexGuard<'_, ILocked>) {
         i.set_state(&l, I_WILL_FREE);
         core::mem::drop(l);
         if i.i_dirty.load(Ordering::Acquire) {
-            let _ = crate::mm::filemap::write_and_wait(i);
+            let _ = super::fs_writeback::write_inode_now(i);
         }
         let l = i.i_lock.lock();
         i.i_state
@@ -1000,10 +1000,14 @@ pub struct Inode {
     /// The inotify watches on it (Linux i_fsnotify_marks)
     pub fsnotify: ManuallyDrop<crate::io::inotify::Marks>,
 
-    /// Queued on its device's writeback lists (Linux I_DIRTY_PAGES;
-    /// fs_writeback): set by `mark_inode_dirty`, cleared under the
-    /// list lock by the pass that takes it off `b_io`
+    /// Queued on its device's writeback lists (fs_writeback): set by
+    /// `mark_inode_dirty_pages` and `mark_inode_dirty`, cleared under
+    /// the list lock by the pass that takes it off `b_io`
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
+    /// Its metadata awaits its filesystem's `write_inode` (Linux
+    /// I_DIRTY_SYNC | I_DIRTY_DATASYNC): set by `mark_inode_dirty`,
+    /// cleared by the writer just before it calls `write_inode`
+    pub(crate) i_dirty_inode: core::sync::atomic::AtomicBool,
     /// On its device's `b_dirty` or `b_io` (Linux i_io_list, under the
     /// wb's list_lock), which hold no reference to it: its eviction takes
     /// it off (Linux evict's inode_io_list_del)
@@ -1304,6 +1308,7 @@ impl Inode {
             i_data: ManuallyDrop::new(crate::mm::filemap::AddressSpace::new()),
             fsnotify: ManuallyDrop::new(crate::io::inotify::Marks::default()),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_dirty_inode: core::sync::atomic::AtomicBool::new(false),
             i_io_list: list::Link::new(),
             i_io_on: core::sync::atomic::AtomicU8::new(0),
             i_wb: ManuallyDrop::new(spin::Once::new()),
@@ -2037,6 +2042,7 @@ const _: () = {
         i_data,
         fsnotify,
         i_dirty,
+        i_dirty_inode,
         i_io_list,
         i_io_on,
         i_wb,
