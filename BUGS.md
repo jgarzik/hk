@@ -674,15 +674,6 @@ F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
 
-## Path walk gaps
-
-**Location**: `fs/namei/`
-
-- tracefs is kernfs-based and revalidates as kernfs (ECHILD under
-  LOOKUP_RCU, `kernfs::vfs::KERNFS_DOPS`); Linux tracefs_d_revalidate
-  answers in RCU mode (stale only for a freed eventfs entry), so
-  RESOLVE_CACHED through tracefs is EAGAIN on hk only.
-
 ## renameat2 flag gaps
 
 **Location**: `fs/ramfs/`, `fs/vfat/mod.rs`

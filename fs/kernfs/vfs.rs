@@ -72,8 +72,14 @@ fn sb_ns(inode: &Inode) -> u64 {
 
 /// The node behind `inode`
 pub fn knode(inode: &Inode) -> Option<Arc<KNode>> {
-    let p = inode.get_private()?;
-    Some(p.as_any().downcast_ref::<KfInode>()?.0.clone())
+    knode_rcu(inode).map(|k| k.0.clone())
+}
+
+/// The node behind `inode`, borrowed: RCU-readable data (Linux
+/// inode->i_private, the node freed after a grace period), so an RCU
+/// walk's d_revalidate may read it (its atomics) with no reference
+pub fn knode_rcu(inode: &Inode) -> Option<&KfInode> {
+    inode.private_rcu()?.as_any().downcast_ref::<KfInode>()
 }
 
 /// A new inode for `kn` on `sb` (Linux kernfs_init_inode)
@@ -95,7 +101,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, Kernel
         Arc::downgrade(sb),
         &KERNFS_IOPS,
     ))?;
-    i.set_private(try_arc(KfInode(kn.clone()))?);
+    i.set_private_rcu(try_arc(KfInode(kn.clone()))?);
     let saved = *kn.iattr.lock();
     if let Some(a) = saved {
         i.set_mode_perm(a.perm);

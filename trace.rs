@@ -625,6 +625,40 @@ fn parse_opts(data: &[u8]) -> Result<TraceOpts, KernelError> {
 
 static TRACEFS_SOPS: TracefsSops = TracefsSops;
 
+/// tracefs's dentry operations (Linux tracefs_dentry_operations)
+static TRACEFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_revalidate: Some(tracefs_d_revalidate),
+    d_delete: Some(tracefs_d_delete),
+    ..crate::fs::dentry::DentryOps::NONE
+};
+
+/// Linux tracefs_d_revalidate: answered in an RCU walk too, from what
+/// it may read there (the node behind the inode, RCU-readable). Linux
+/// calls a dentry stale only for a freed eventfs entry, since a removed
+/// tracefs file's dentry goes with it (simple_recursive_removal); hk's
+/// nodes live in kernfs and leave without touching dentries, so a
+/// positive one is stale once its node is removed, and a negative one
+/// (kept only while held: `tracefs_d_delete`) once its directory's
+/// revision moved (nodes come beside the dcache, not through it)
+fn tracefs_d_revalidate(
+    dir: &crate::fs::inode::Inode,
+    d: &Dentry,
+    inode: Option<&crate::fs::inode::Inode>,
+    _: crate::fs::dentry::LookupBits,
+) -> Result<bool, KernelError> {
+    use kernfs::vfs::knode_rcu;
+    Ok(match inode {
+        Some(i) => knode_rcu(i).is_some_and(|k| !k.0.removed()),
+        None => knode_rcu(dir).is_none_or(|p| p.0.rev() == d.d_time()),
+    })
+}
+
+/// Linux tracefs_d_delete: a dentry with no eventfs data goes at its
+/// last put (hk has no eventfs dentries)
+fn tracefs_d_delete(_: &Dentry) -> bool {
+    true
+}
+
 /// One superblock for every mount (Linux tracefs_get_tree:
 /// get_tree_single, then the options applied, tracefs_reconfigure)
 fn mount(
@@ -632,7 +666,7 @@ fn mount(
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     let sb = crate::fs::superblock::get_tree_single(fc, &TRACEFS_SOPS, |sb| {
         sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
-        sb.set_d_op(&kernfs::vfs::KERNFS_DOPS);
+        sb.set_d_op(&TRACEFS_DOPS);
         let ri = kernfs::vfs::inode(sb, root())?;
         // Linux tracefs_fill_super: tracefs_apply_options(sb, false)
         ri.set_mode_perm(TRACEFS_DEFAULT_MODE);

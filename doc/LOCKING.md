@@ -3146,7 +3146,12 @@ Linux LOOKUP_RCU; and a permission check's MAY_NOT_BLOCK) the dentry,
 directory and inode are borrowed under the guard with no reference and may be
 torn down already: the answer may read only fields with no drop glue
 and take nothing that sleeps, else it is ECHILD; kernfs, cgroupfs and
-vfat (Linux kernfs_dop_revalidate, vfat_revalidate_ci) always are. procfs
+vfat (Linux kernfs_dop_revalidate, vfat_revalidate_ci) always are.
+tracefs answers (Linux tracefs_d_revalidate) from the kernfs node behind
+the inode and the directory's (`kernfs::vfs::knode_rcu`: RCU-readable
+inode data, `Inode::private_rcu`, the node's `Arc` dropped by
+`i_callback` a grace period after the teardown), reading only its
+atomics (removal state, `KNode.rev`) and the dentry's `d_time`. procfs
 answers from `ProcRcu` (`Inode::private_rcu`, Linux proc_inode's pid
 put by ->free_inode: set before the inode is visible, dropped by
 `i_callback` a grace period after the teardown): the task through its

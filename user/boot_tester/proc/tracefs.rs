@@ -20,8 +20,9 @@
 use crate::harness::{R, check, report_r};
 use crate::helpers::{host_mode, linux_at_least, msleep, read_file, skip};
 use hk_syscall::{
-    LinuxStatFs, O_DIRECT, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount,
-    sys_open, sys_pread64, sys_stat, sys_statfs, sys_umount2, sys_write,
+    LinuxStatFs, O_DIRECT, O_DIRECTORY, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_close,
+    sys_mkdir, sys_mount, sys_open, sys_openat2, sys_pread64, sys_stat, sys_statfs, sys_umount2,
+    sys_write,
 };
 
 const MP: &[u8] = b"/sys/kernel/tracing\0";
@@ -44,6 +45,7 @@ pub fn run_tests() {
         skip(b"TRACEFS_TRUNC", b"host kernel without tracefs");
         skip(b"TRACEFS_EVENTS", b"host kernel without tracefs");
         skip(b"TRACEFS_OPTS", b"host kernel without tracefs");
+        skip(b"TRACEFS_RESOLVE_CACHED", b"host kernel without tracefs");
         return;
     }
     report_r(b"TRACEFS_TRACE", mounted(r));
@@ -53,8 +55,39 @@ pub fn run_tests() {
         write_str(EV, b"0");
         report_r(b"TRACEFS_EVENTS", r);
         report_r(b"TRACEFS_OPTS", opts());
+        report_r(b"TRACEFS_RESOLVE_CACHED", cached());
         sys_umount2(MP.as_ptr(), 0);
     }
+}
+
+/// openat2(`dfd`, `p`, O_PATH, RESOLVE_CACHED)
+fn open_cached(dfd: i32, p: &[u8]) -> i64 {
+    const RESOLVE_CACHED: u64 = 0x20;
+    let mut how = [0u8; 24];
+    how[..8].copy_from_slice(&u64::from(O_PATH).to_ne_bytes());
+    how[16..].copy_from_slice(&RESOLVE_CACHED.to_ne_bytes());
+    let r = sys_openat2(dfd, p.as_ptr(), how.as_ptr(), how.len());
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    r
+}
+
+/// RESOLVE_CACHED below the tracefs root (Linux tracefs_d_revalidate
+/// answers in RCU mode): a file the dcache holds opens; a name never
+/// looked up is EAGAIN
+fn cached() -> R {
+    const EAGAIN: i64 = -11;
+    let dfd = sys_open(MP.as_ptr(), O_PATH | O_DIRECTORY, 0);
+    check(b"open root", dfd >= 0, dfd)?;
+    let mut st = Stat::default();
+    let r = sys_stat(TRACE.as_ptr(), &mut st);
+    let fd = open_cached(dfd as i32, b"trace\0");
+    let miss = open_cached(dfd as i32, b"nosuch\0");
+    sys_close(dfd as u64);
+    check(b"warm", r == 0, r)?;
+    check(b"cached file", fd >= 0, fd)?;
+    check(b"never looked up", miss == EAGAIN, miss)
 }
 
 /// A second tracefs mount at /tmp/tr2 with options `data`
