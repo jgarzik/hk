@@ -67,8 +67,8 @@ fn inode_to_wb(inode: &Inode) -> Option<Arc<BdiWriteback>> {
 
 /// `inode` has a new dirty page (Linux __mark_inode_dirty(I_DIRTY_PAGES)):
 /// the first time, queue it on its device's `b_dirty` and arm the
-/// periodic writeback if nothing was queued (its mapping notes when it
-/// became dirty). An inode with no device to write to stays marked and
+/// periodic writeback if nothing was queued (noting when it went
+/// dirty). An inode with no device to write to stays marked and
 /// unqueued (Linux noop_backing_dev_info).
 pub fn mark_inode_dirty_pages(inode: &InodeRef) {
     if !inode.i_data.aops().can_dirty() {
@@ -91,19 +91,20 @@ pub fn mark_inode_dirty(inode: &Inode) {
     let Some(i) = inode.igrab() else {
         return;
     };
-    if !i.i_dirty.load(Ordering::Acquire) {
-        i.i_data
-            .dirtied_when
-            .store(crate::time::monotonic_ns(), Ordering::Release);
-    }
     queue(&i);
 }
 
-/// Queue `inode` on its device's `b_dirty` unless queued (`i_dirty`)
+/// Queue `inode` on its device's `b_dirty` unless queued (`i_dirty`),
+/// noting when it went dirty (Linux __mark_inode_dirty: dirtied_when
+/// only as the inode as a whole goes from clean to dirty, so a page or
+/// metadata dirtied while it waits never delays its expiry)
 fn queue(inode: &InodeRef) {
     if inode.i_dirty.swap(true, Ordering::AcqRel) {
         return;
     }
+    inode
+        .dirtied_when
+        .store(crate::time::monotonic_ns(), Ordering::Release);
     // Its wb, found once (Linux inode->i_wb)
     let wb = match inode.i_wb.get() {
         Some(wb) => wb.clone(),
@@ -172,9 +173,9 @@ pub fn write_inode_now(inode: &Inode) -> Result<(), KernelError> {
     r.and(sb.s_op.write_inode(inode))
 }
 
-/// Its pages became dirty at or before `cutoff` (monotonic ns)
+/// It went dirty at or before `cutoff` (monotonic ns)
 fn expired(inode: &Inode, cutoff: u64) -> bool {
-    inode.i_data.dirtied_when.load(Ordering::Acquire) <= cutoff
+    inode.dirtied_when.load(Ordering::Acquire) <= cutoff
 }
 
 /// One pass over `wb` (Linux wb_writeback): the inodes dirtied at or

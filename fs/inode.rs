@@ -992,6 +992,10 @@ pub struct Inode {
     /// `mark_inode_dirty_pages` and `mark_inode_dirty`, cleared under
     /// the list lock by the pass that takes it off `b_io`
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
+    /// When it went from clean to dirty (`i_dirty` set), monotonic ns
+    /// (Linux dirtied_when): stored before it is queued, read under the
+    /// list lock by the periodic writeback (vm.dirty_expire_centisecs)
+    pub(crate) dirtied_when: AtomicU64,
     /// Its metadata awaits its filesystem's `write_inode` (Linux
     /// I_DIRTY_SYNC | I_DIRTY_DATASYNC): set by `mark_inode_dirty`,
     /// cleared by the writer just before it calls `write_inode`
@@ -1296,6 +1300,7 @@ impl Inode {
             i_data: ManuallyDrop::new(crate::mm::filemap::AddressSpace::new()),
             fsnotify: ManuallyDrop::new(crate::io::inotify::Marks::default()),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
+            dirtied_when: AtomicU64::new(0),
             i_dirty_inode: core::sync::atomic::AtomicBool::new(false),
             i_io_list: list::Link::new(),
             i_io_on: core::sync::atomic::AtomicU8::new(0),
@@ -2048,6 +2053,7 @@ const _: () = {
         i_data,
         fsnotify,
         i_dirty,
+        dirtied_when,
         i_dirty_inode,
         i_io_list,
         i_io_on,

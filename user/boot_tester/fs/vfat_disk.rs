@@ -34,6 +34,11 @@
 //!   back first (Linux fat_reconfigure: sync_filesystem): utimensat
 //!   just before it is in the entry on the device right after it, and
 //!   a sync of the read-only filesystem changes nothing
+//! - VFAT_DIRTY_EXPIRE: an inode's dirtied time is when it as a whole
+//!   went dirty (Linux __mark_inode_dirty: dirtied_when only if it was
+//!   clean): a size change waits in memory while its pages are written
+//!   (sync_file_range) and dirtied again and again, and the periodic
+//!   writeback still writes its entry once it expires
 //! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
 //!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
 //!   and on hk its cluster stays allocated. Linux frees it: the refused
@@ -191,6 +196,7 @@ pub fn run_tests() {
     dir_grow(dev);
     fsync_times(dev);
     remount_ro(dev);
+    dirty_expire(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -819,5 +825,69 @@ fn remount_ro(dev: &[u8]) {
     sys_unlink(f.as_ptr());
     t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
     t.eq(b"mount again", mount(dev), 0);
+    t.done();
+}
+
+/// Write `v` to sysctl file `p`, the old value (up to 16 bytes) kept
+/// in `old`; its length
+fn sysctl_swap(p: &[u8], v: &[u8], old: &mut [u8; 16]) -> i64 {
+    let n = crate::helpers::read_file(p, old);
+    let fd = sys_open(p.as_ptr(), O_WRONLY, 0);
+    if fd >= 0 {
+        sys_write(fd as u64, v.as_ptr(), v.len() as u64);
+        sys_close(fd as u64);
+    }
+    n
+}
+
+/// The size in root entry `short` on the device
+fn disk_size(dev: &[u8], short: &[u8; 11]) -> i64 {
+    let e = Fat::open(dev).and_then(|d| d.find(d.root, short));
+    e.map_or(-1, |e| {
+        i64::from(u32::from_le_bytes([e[28], e[29], e[30], e[31]]))
+    })
+}
+
+/// VFAT_DIRTY_EXPIRE on DX in the root: expiry 1 s, writeback every
+/// 0.5 s, its page rewritten every 0.1 s for up to 10 s
+fn dirty_expire(dev: &[u8]) {
+    use hk_syscall::sys_sync_file_range;
+    let mut t = T::new(b"VFAT_DIRTY_EXPIRE");
+    let (f, short) = (b"/tmp/vdk/DX\0", b"DX         ");
+    let exp = b"/proc/sys/vm/dirty_expire_centisecs\0";
+    let wb = b"/proc/sys/vm/dirty_writeback_centisecs\0";
+    let (mut old_exp, mut old_wb) = ([0u8; 16], [0u8; 16]);
+    let ne = sysctl_swap(exp, b"100", &mut old_exp);
+    let nw = sysctl_swap(wb, b"50", &mut old_wb);
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    sys_sync();
+    t.eq(b"empty on disk", disk_size(dev, short), 0);
+    t.eq(b"write", sys_pwrite64(fd as i32, b"x".as_ptr(), 1, 0), 1);
+    let mut got = -1;
+    for _ in 0..100 {
+        // SYNC_FILE_RANGE_WAIT_BEFORE | WRITE | WAIT_AFTER: the pages
+        // only, the inode stays dirty
+        sys_sync_file_range(fd as i32, 0, 0, 7);
+        sys_pwrite64(fd as i32, b"y".as_ptr(), 1, 0);
+        crate::helpers::msleep(100);
+        got = disk_size(dev, short);
+        if got == 1 {
+            break;
+        }
+    }
+    t.eq(b"size written back", got, 1);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    sys_unlink(f.as_ptr());
+    if ne > 0 {
+        let mut d = [0u8; 16];
+        sysctl_swap(exp, &old_exp[..ne as usize], &mut d);
+    }
+    if nw > 0 {
+        let mut d = [0u8; 16];
+        sysctl_swap(wb, &old_wb[..nw as usize], &mut d);
+    }
     t.done();
 }
