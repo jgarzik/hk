@@ -145,6 +145,148 @@ impl<T, A: UniqueOwner, B: UniqueOwner> LockedByEither<T, A, B> {
     }
 }
 
+/// An object with a lock of its own that data elsewhere belongs to
+/// (Linux sighand->siglock: a task's signal state and its group's
+/// thread list are under the siglock of the table the task names), the
+/// instance named at run time ([`InstanceGuard`], [`LockedByBoth`])
+///
+/// # Safety
+/// `instance_lock` returns the same lock, owned by `self`, for its
+/// whole life (implement it with [`instance_lock!`](crate::instance_lock)).
+pub unsafe trait InstanceLock {
+    fn instance_lock(&self) -> &crate::sync::spin::Mutex<()>;
+}
+
+/// Implement [`InstanceLock`] for a type through its field `$field`
+#[macro_export]
+macro_rules! instance_lock {
+    ($t:ty, $field:ident) => {
+        // SAFETY: a field of the object, fixed for its life
+        unsafe impl $crate::sync::InstanceLock for $t {
+            fn instance_lock(&self) -> &$crate::sync::spin::Mutex<()> {
+                &self.$field
+            }
+        }
+    };
+}
+
+/// `owner`'s [`InstanceLock`] held until dropped: the proof a
+/// [`LockedByBoth`] cell owned by that instance checks
+///
+/// # Invariants
+/// `_g` holds `owner.instance_lock()`.
+#[must_use]
+pub struct InstanceGuard<'a, B: InstanceLock> {
+    owner: &'a B,
+    _g: crate::sync::spin::MutexGuard<'a, ()>,
+}
+
+impl<'a, B: InstanceLock> InstanceGuard<'a, B> {
+    /// Take `b`'s lock
+    pub fn lock(b: &'a B) -> Self {
+        // INVARIANT: the lock taken is `b`'s own
+        Self {
+            owner: b,
+            _g: b.instance_lock().lock(),
+        }
+    }
+
+    /// The instance whose lock is held
+    pub fn owner(&self) -> &'a B {
+        self.owner
+    }
+}
+
+/// A `T` changed under two locks, a unique one (`A`) and one instance
+/// of a lock of many (`B`, its owner named in the cell), and read under
+/// either (Linux signal->thread_head: tasklist_lock and the group's
+/// siglock): `&A` or a guard of the owner gives `&T`; `&mut A` and a
+/// guard of the owner, borrowed mutably, give `&mut T`. The owner is
+/// checked at run time (RfL `LockedBy`'s owner check).
+///
+/// # Invariants
+/// `data` is read only under a shared borrow of the one `A` or while
+/// the current thread holds the lock of the instance `owner` names (an
+/// [`InstanceGuard`] of it borrowed), and written only under a mutable
+/// borrow of `A` with such a guard borrowed mutably. `owner` is null
+/// until set, and changes only under a mutable borrow of `A` with the
+/// old owner's guard (if any) borrowed mutably.
+pub struct LockedByBoth<T, A: UniqueOwner, B: InstanceLock> {
+    owner: core::sync::atomic::AtomicPtr<B>,
+    data: UnsafeCell<T>,
+    _owners: PhantomData<fn(&A)>,
+}
+
+// SAFETY: shared access hands `&T` to the threads borrowing `A` or
+// holding the owner's lock (T: Sync), `&mut T` to the one thread doing
+// both mutably (T: Send); the owner is an address only compared
+unsafe impl<T: Send + Sync, A: UniqueOwner, B: InstanceLock> Sync for LockedByBoth<T, A, B> {}
+// SAFETY: as above; the owner pointer is never dereferenced
+unsafe impl<T: Send, A: UniqueOwner, B: InstanceLock> Send for LockedByBoth<T, A, B> {}
+
+impl<T, A: UniqueOwner, B: InstanceLock> LockedByBoth<T, A, B> {
+    /// Owned by no instance yet
+    pub const fn new(v: T) -> Self {
+        // INVARIANT: no owner
+        Self {
+            owner: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            data: UnsafeCell::new(v),
+            _owners: PhantomData,
+        }
+    }
+
+    /// `g` holds the owner's lock
+    fn owned_by(&self, g: &InstanceGuard<'_, B>) -> bool {
+        let o = self.owner.load(core::sync::atomic::Ordering::Acquire);
+        core::ptr::eq(o, g.owner())
+    }
+
+    /// The data, under a shared borrow of `A`
+    pub fn access_a<'a>(&'a self, _a: &'a A) -> &'a T {
+        // SAFETY: the one `A` is borrowed shared for 'a, so no `&mut T`
+        // (which needs it borrowed mutably) is live meanwhile (type
+        // invariant)
+        unsafe { &*self.data.get() }
+    }
+
+    /// The data, under the owner's lock (panics for another instance's
+    /// guard)
+    pub fn access_b<'a>(&'a self, g: &'a InstanceGuard<'_, B>) -> &'a T {
+        assert!(self.owned_by(g), "LockedByBoth: not the owner's lock");
+        // SAFETY: the owner's lock is held for 'a (`g`); a writer needs
+        // it too, borrowed mutably, and it cannot change owner without
+        // that (type invariant)
+        unsafe { &*self.data.get() }
+    }
+
+    /// The data, under a mutable borrow of `A` and the owner's lock
+    /// (panics for another instance's guard)
+    pub fn access_mut<'a>(&'a self, _a: &'a mut A, g: &'a mut InstanceGuard<'_, B>) -> &'a mut T {
+        assert!(self.owned_by(g), "LockedByBoth: not the owner's lock");
+        // SAFETY: `A` is borrowed mutably (no `access_a`) and the
+        // owner's lock is held with its guard borrowed mutably (no
+        // `access_b` on this thread, none on another) for 'a
+        unsafe { &mut *self.data.get() }
+    }
+
+    /// Hand the cell to instance `new`, under a mutable borrow of `A`
+    /// and the current owner's guard (any guard while it has none);
+    /// panics for another instance's guard
+    pub fn set_owner(&self, _a: &mut A, g: &mut InstanceGuard<'_, B>, new: &B) {
+        let o = self.owner.load(core::sync::atomic::Ordering::Acquire);
+        assert!(
+            o.is_null() || core::ptr::eq(o, g.owner()),
+            "LockedByBoth: not the owner's lock"
+        );
+        // INVARIANT: changed with `A` and the old owner's guard borrowed
+        // mutably, so no access under either is live
+        self.owner.store(
+            core::ptr::from_ref(new).cast_mut(),
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
 /// A `Copy` value owned by one of many instances of a lock (a timer's
 /// expiry, owned by whichever per-CPU base it is on): the owner is not
 /// unique, so the caller proves it holds the right one (RfL `LockedBy`
@@ -234,6 +376,46 @@ mod tests {
         *c.access_mut(&mut a, &mut b) += 1;
         assert_eq!(*c.access_a(&a), 2);
         assert_eq!(*c.access_b(&b), 2);
+    }
+
+    struct Inst {
+        lock: crate::sync::spin::Mutex<()>,
+    }
+    crate::instance_lock!(Inst, lock);
+
+    fn inst() -> Inst {
+        Inst {
+            lock: crate::sync::spin::Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn both_owner_checked() {
+        let mut a = Owner;
+        let (x, y) = (inst(), inst());
+        let c = LockedByBoth::<u32, Owner, Inst>::new(1);
+        let mut gx = InstanceGuard::lock(&x);
+        c.set_owner(&mut a, &mut gx, &x);
+        *c.access_mut(&mut a, &mut gx) += 1;
+        assert_eq!(*c.access_b(&gx), 2);
+        assert_eq!(*c.access_a(&a), 2);
+        c.set_owner(&mut a, &mut gx, &y);
+        drop(gx);
+        let gy = InstanceGuard::lock(&y);
+        assert_eq!(*c.access_b(&gy), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "not the owner's lock")]
+    fn both_other_instance_panics() {
+        let mut a = Owner;
+        let (x, y) = (inst(), inst());
+        let c = LockedByBoth::<u32, Owner, Inst>::new(1);
+        let mut gx = InstanceGuard::lock(&x);
+        c.set_owner(&mut a, &mut gx, &x);
+        drop(gx);
+        let gy = InstanceGuard::lock(&y);
+        let _ = c.access_b(&gy);
     }
 
     #[test]

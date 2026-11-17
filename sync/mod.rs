@@ -27,7 +27,9 @@ pub mod spin;
 
 pub use irqflags::{IrqFlags, irqs_disabled, local_irq_restore, local_irq_save};
 pub use irqspin::{IrqRwLock, IrqRwReadGuard, IrqRwWriteGuard, IrqSpinlock, IrqSpinlockGuard};
-pub use locked_by::{LockedBy, LockedByEither, LockedCell, UniqueOwner};
+pub use locked_by::{
+    InstanceGuard, InstanceLock, LockedBy, LockedByBoth, LockedByEither, LockedCell, UniqueOwner,
+};
 pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};

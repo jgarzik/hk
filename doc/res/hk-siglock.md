@@ -79,7 +79,7 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
 | `TaskInner.sighand` | TASKLIST, cleared at exit (`exit_task_signal`) | `task->sighand` `__rcu`, siglock + tasklist write | `Task.sighand: RcuLockedArc<SigHand, GlobalTaskTable>`, cleared at release under TASKLIST write + its siglock; `lock_task_sighand` |
 | `SigHand.users` | TASKLIST | `sighand->count` refcount | unchanged (TASKLIST write is held by every writer) |
 | `TaskInner.signal` | gone (2b) | `task->signal`, fixed | `Task.cpu_group` is it (fixed) |
-| leader `TaskInner.threads` | TASKLIST | `signal->thread_head`: tasklist write + siglock | moves into `SignalStruct`, a cell needing both proofs to change, either to walk |
+| leader `TaskInner.threads` | `SignalStruct.threads` (3) | `signal->thread_head`: tasklist write + siglock | done |
 | `TaskInner.ptrace` | TASKLIST | tasklist write; racy read under siglock | atomic (Relaxed load = Linux's racy read) |
 | `Task.sig` (blocked, pending, altstack, ptrace jobctl, last_siginfo) | per-task spin Mutex | siglock | nested under siglock first; folded into siglock-owned state last |
 | `SignalStruct.jobctl` (group stop) | spin Mutex after TASKLIST | siglock | as above |
@@ -130,9 +130,12 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
    added at release (`unhash`). `group_task` gone: a group signal goes
    to the task found (a zombie leader included), a child's notice to
    the parent thread (Linux __group_send_sig_info(tsk->parent)).
-3. [ ] thread list into `SignalStruct` (`SigCell` + TASKLIST); walks in
-   signal/ move from TASKLIST to siglock (complete_signal, zap_threads,
-   stop::prepare, do_signal_stop).
+3. [x] thread list into `SignalStruct.threads` (`sync::LockedByBoth`:
+   TASKLIST write + the owner table's siglock to change, either to
+   walk; `SigGuard` = `InstanceGuard<SigHand>`); a send holds the
+   receiver's siglock; complete_signal, zap_threads, stop::prepare,
+   do_signal_stop walk under it (TASKLIST still held for ptrace flags
+   until step 4). CLONE_THREAD/CLONE_SIGHAND flag checks first.
 4. [ ] `TaskInner.ptrace` atomic; sender numbering under RCU; the send
    (`send_task`) under `lock_task_sighand`: kill, tkill, tgkill,
    rt_sigqueueinfo, pidfd_send_signal, POSIX timer signals off

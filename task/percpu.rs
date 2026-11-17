@@ -787,7 +787,7 @@ macro_rules! relation_reads {
         impl<'a> $t<'a> {
             /// Its thread group's signal struct (Linux task->signal;
             /// none for a kernel thread)
-            pub fn signal(&self) -> Option<&Arc<crate::signal::SignalStruct>> {
+            pub fn signal(&self) -> Option<&'a Arc<crate::signal::SignalStruct>> {
                 self.task.cpu_group()
             }
 
@@ -1100,15 +1100,16 @@ impl GlobalTaskTable {
     /// (Linux forget_original_parent: for_each_thread, t->real_parent)
     fn set_parents(&mut self, l: &Task, p: &Task) {
         l.set_parent(Some(p), self);
-        let mut cur = self.inner_mut_of(l).threads.front();
+        let mut cur = self.first_thread(l.pid);
         while let Some(t) = cur {
             t.set_parent(Some(p), self);
-            cur = self.inner_mut_of(l).threads.next(&t);
+            cur = self.next_thread(l.pid, &t);
         }
     }
 
     /// Add a task (fork, kernel thread creation); it has a pid. It joins
-    /// its group leader's threads (a new process leads its own).
+    /// its group's thread list where it gets its group
+    /// (`install_fork_signal`, `init_task_signal`).
     pub fn insert(&mut self, task: TaskRef) {
         let thread_pid = task.inner().access(self).as_ref().and_then(|i| {
             // Its credentials' user namespace is active while it is
@@ -1125,39 +1126,54 @@ impl GlobalTaskTable {
         }
         self.tasks.push_back(task.clone());
         self.attach_pids(&task);
-        let leader = if task.tid() == task.pid {
-            Some(task.clone())
-        } else {
-            self.task(task.pid)
-        };
-        if let Some(l) = leader {
-            self.inner_mut_of(&l).threads.push_back(task);
-        }
     }
 
-    /// The threads of process `pid` (its leader's thread group)
+    /// Process `pid`'s thread list (Linux signal->thread_head, read under
+    /// tasklist_lock); None for a task with no group (a kernel thread,
+    /// the global init before it gets one), its own only thread
+    fn thread_list(
+        &self,
+        pid: Pid,
+    ) -> Option<&crate::util::list::OwnedList<crate::task::ThreadNode>> {
+        Some(self.get(pid)?.signal()?.threads.access_a(self))
+    }
+
+    /// The threads of process `pid` (Linux for_each_thread under
+    /// tasklist_lock)
     pub fn threads(&self, pid: Pid) -> impl Iterator<Item = TaskView<'_>> {
-        self.get(pid)
-            .map(move |l| l.fields().threads.iter().map(move |t| view(self, t)))
-            .into_iter()
-            .flatten()
+        let list = self.thread_list(pid);
+        let mut cur = match list {
+            Some(l) => l.first(),
+            None => self.get(pid).map(|v| v.task),
+        };
+        core::iter::from_fn(move || {
+            let t = cur?;
+            cur = list.and_then(|l| l.next_ref(t));
+            Some(view(self, t))
+        })
     }
 
-    /// The first thread of process `pid` (its leader's thread list)
+    /// The first thread of process `pid`
     pub fn first_thread(&self, pid: Pid) -> Option<TaskRef> {
-        self.get(pid)?.fields().threads.front()
+        match self.thread_list(pid) {
+            Some(l) => l.front(),
+            None => self.task(pid),
+        }
     }
 
     /// The thread after `t` in process `pid`'s list (Linux next_thread);
     /// None at the end or if `t` is not on it
     pub fn next_thread(&self, pid: Pid, t: &Task) -> Option<TaskRef> {
-        self.get(pid)?.fields().threads.next(t)
+        self.thread_list(pid)?.next(t)
     }
 
-    /// Take `t` off its leader's thread group
-    fn unlink_thread(&mut self, t: &Task) {
-        let Some(l) = self.task(t.pid) else { return };
-        drop(self.inner_mut_of(&l).threads.remove(t));
+    /// Take `t` off its group's thread list, under TASKLIST's write lock
+    /// and its table's siglock `g` (Linux __unhash_process:
+    /// list_del_rcu(&p->thread_node))
+    fn unlink_thread(&mut self, t: &Task, g: &mut crate::signal::SigGuard<'_>) {
+        if let Some(s) = t.cpu_group() {
+            drop(s.threads.access_mut(self, g).remove(t));
+        }
     }
 
     /// Remove task `tid`; the caller drops it after unlocking (nothing
@@ -1180,7 +1196,6 @@ impl GlobalTaskTable {
         let t = t.clone();
         self.unlink_child(&t);
         self.orphan_children(&t);
-        self.unlink_thread(&t);
         self.detach_pids(&t);
         let thread_pid = t
             .inner()
@@ -1212,16 +1227,18 @@ impl GlobalTaskTable {
         {
             u.active_put();
         }
-        // Its CPU time stays its group's (Linux __exit_signal, with the
-        // thread list's unlink above in this section)
-        if let Some(s) = t.cpu_group() {
-            s.add_dead_times(crate::task::cputime::task_cputime(&t));
-        }
-        // Its handlers go (Linux __exit_signal from release_task, under
-        // siglock): a zombie keeps them until here. The reference taken
-        // to do it is not the last (the cell's goes through put_rcu)
+        // Off its group's thread list, its CPU time given to the group,
+        // and its handlers gone, under its table's siglock (Linux
+        // __exit_signal from release_task): a zombie keeps them until
+        // here. The reference taken to do it is not the last (the
+        // cell's goes through put_rcu)
         if let Some(h) = t.sighand.get_protected(self) {
-            h.leave(&t, None, self);
+            let mut g = crate::signal::SigGuard::lock(&h);
+            self.unlink_thread(&t, &mut g);
+            if let Some(s) = t.cpu_group() {
+                s.add_dead_times(crate::task::cputime::task_cputime(&t));
+            }
+            h.leave(&t, None, self, &g);
         }
         // SAFETY: listed (the caller's)
         let listed = unsafe { self.tasks.remove(&t) };
@@ -1251,10 +1268,10 @@ impl GlobalTaskTable {
             drop(unsafe { self.inner_mut_of(t).children.remove(&c) });
             self.inner_mut_of(&c).in_children = false;
             c.set_parent(None, self);
-            let mut cur = self.inner_mut_of(&c).threads.front();
+            let mut cur = self.first_thread(c.pid);
             while let Some(th) = cur {
                 th.set_parent(None, self);
-                cur = self.inner_mut_of(&c).threads.next(&th);
+                cur = self.next_thread(c.pid, &th);
             }
         }
     }
@@ -1396,7 +1413,7 @@ impl GlobalTaskTable {
         let before = l.pgrp.get_protected(self);
         let before_s = l.session.get_protected(self);
         self.detach_pids(&l);
-        let mut cur = self.inner_mut_of(&l).threads.front();
+        let mut cur = self.first_thread(pid);
         while let Some(t) = cur {
             debug_assert!(
                 t.pgrp.as_ptr() == Self::pid_ptr(&before),
@@ -1412,7 +1429,7 @@ impl GlobalTaskTable {
                 );
                 t.session.replace(Some(s.clone()), self).defer_put();
             }
-            cur = self.inner_mut_of(&l).threads.next(&t);
+            cur = self.next_thread(pid, &t);
         }
         self.attach_pids(&l);
         // The group or session it left may be gone (setpgid, setsid)
@@ -2186,12 +2203,12 @@ pub fn exec_waits(me: &Task) -> bool {
 pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     let (tgid, tid) = (caller.pid, caller.tid());
     // Room made before the write lock (nothing allocates under
-    // TASKLIST): each thread of the group may be both a removed zombie
-    // and a reference on the old thread list; again if the group grew
+    // TASKLIST): each thread of the group may be a removed zombie;
+    // again if the group grew
     let mut room = TASKLIST.read().threads(tgid).count();
     let (mut zombies, mut gone, mut table) = loop {
         let zombies: Vec<TaskRef> = Vec::with_capacity(room);
-        let gone: Vec<TaskRef> = Vec::with_capacity(2 * room);
+        let gone: Vec<TaskRef> = Vec::with_capacity(room);
         let table = TASKLIST.write();
         let n = table.threads(tgid).count();
         if n <= room {
@@ -2214,17 +2231,6 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
         if t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)) {
             zombies.push(task_ref(t.task));
         }
-    }
-    // The thread group moves to the caller: it is the only live thread
-    // (Linux de_thread leaves only the exec'ing thread); the old list's
-    // references go after TASKLIST
-    let mut old_threads = crate::util::list::OwnedList::new();
-    if let Some(l) = table.task(ltid) {
-        let li = table.inner_mut_of(&l);
-        core::mem::swap(&mut li.threads, &mut old_threads);
-    }
-    while let Some(t) = old_threads.front() {
-        gone.extend(old_threads.remove(&t));
     }
     // exchange_tids first (Linux de_thread: the caller takes the
     // leader's tid and pid, the old leader its own, then release_task of
@@ -2279,9 +2285,9 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     }
     // The new leader takes the old one's place among its parent's
     // children (tracer and parent links are task references: nothing
-    // else names the old tid) and leads the group
+    // else names the old tid) and leads the group; the zombies left
+    // its thread list as they were unhashed (Linux release_task)
     table.link_child(&me);
-    table.inner_mut_of(&me).threads.push_back(me.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;
         // Linux de_thread: the new leader's exit signal is SIGCHLD

@@ -937,8 +937,9 @@ pub struct Task {
     /// Its place in its real parent's `children` (Linux sibling; under
     /// TASKLIST)
     pub sibling: crate::util::list::Link,
-    /// Its place in its group leader's `threads` (Linux thread_node;
-    /// under TASKLIST), and that list's mark
+    /// Its place in its group's `SignalStruct.threads` (Linux
+    /// thread_node; under TASKLIST and that group's siglock), and that
+    /// list's mark
     pub thread_node: crate::util::list::Link,
     thread_owner: crate::util::list::Owner,
     /// A group leader's place on its process group's `Pid.pgrp` (Linux
@@ -1107,11 +1108,6 @@ pub struct TaskInner {
     /// leaders are)
     in_children: bool,
 
-    /// A leader's thread group, itself included (Linux
-    /// signal->thread_head; links `thread_node`), one strong reference
-    /// each, until a thread leaves the task list (under TASKLIST)
-    threads: crate::util::list::OwnedList<ThreadNode>,
-
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     ptrace_message: u64,
 
@@ -1146,7 +1142,6 @@ impl TaskInner {
             ptrace: 0,
             children: crate::util::list::ArcList::new(),
             in_children: false,
-            threads: crate::util::list::OwnedList::new(),
             ptrace_message: 0,
             ptrace_options: 0,
         }

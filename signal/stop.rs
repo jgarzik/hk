@@ -15,12 +15,16 @@
 //!
 //! Locking (doc/LOCKING.md 3.7): the group state is under
 //! `SignalStruct.jobctl` (Linux siglock's group part), taken after
-//! TASKLIST and before any thread's `Task.sig`, which holds the
-//! thread's own bits (`TaskSignalState::jobctl`); a stop bit of a
-//! thread is changed with both held.
+//! TASKLIST and the group's siglock (when held: a send, do_signal_stop,
+//! which walk the thread list under it) and before any thread's
+//! `Task.sig`, which holds the thread's own bits
+//! (`TaskSignalState::jobctl`); a stop bit of a thread is changed with
+//! both held.
 
 use super::jobctl::*;
-use super::{SIGCONT, SIGSTOP, SIGTRAP, SigPending, SigSet, Signal, SignalStruct, TaskSignalState};
+use super::{
+    SIGCONT, SIGSTOP, SIGTRAP, SigGuard, SigPending, SigSet, Signal, SignalStruct, TaskSignalState,
+};
 use crate::sync::spin::MutexGuard;
 use crate::task::Task;
 use crate::task::percpu::{GlobalTaskTable, WakeMode};
@@ -200,22 +204,26 @@ fn trap_notify(t: &Task, s: &mut TaskSignalState) {
     ptrace_signal_wake_up(t, s, listening);
 }
 
-/// `t` (TASKLIST held: the view) is traced with PTRACE_SEIZE
-fn seized(v: &crate::task::percpu::TaskView<'_>) -> bool {
-    v.ptrace() & crate::task::ptrace::PT_SEIZED != 0
+/// `t` is traced with PTRACE_SEIZE, TASKLIST held (`table`)
+fn seized(table: &GlobalTaskTable, t: &Task) -> bool {
+    table
+        .view(t)
+        .is_some_and(|v| v.ptrace() & crate::task::ptrace::PT_SEIZED != 0)
 }
 
 /// The process-wide effects of a stop signal or SIGCONT sent to the
-/// group `tgid` whose state `g` is (Linux prepare_signal), TASKLIST
-/// held: a stop signal drops every pending SIGCONT; SIGCONT drops every
-/// pending stop signal, ends the group stop, continues stopped threads
-/// and leaves the parent's notice to the first of them. The signal
-/// itself is then queued (or ignored) as any other.
+/// group `sig_struct` whose state `j` is (Linux prepare_signal), its
+/// threads walked under its table's siglock `g`, TASKLIST held for
+/// their ptrace flags: a stop signal drops every pending SIGCONT;
+/// SIGCONT drops every pending stop signal, ends the group stop,
+/// continues stopped threads and leaves the parent's notice to the
+/// first of them. The signal itself is then queued (or ignored) as any
+/// other.
 pub fn prepare(
     table: &GlobalTaskTable,
+    g: &SigGuard<'_>,
     sig_struct: &SignalStruct,
-    g: &mut Group<'_>,
-    tgid: crate::task::Pid,
+    j: &mut Group<'_>,
     sig: Signal,
     gone: &mut SigPending,
 ) {
@@ -225,37 +233,37 @@ pub fn prepare(
     } else {
         super::STOP_SIGNALS
     };
-    for v in table.threads(tgid) {
-        let mut s = v.task.sig.lock();
+    for t in sig_struct.threads(g) {
+        let mut s = t.sig.lock();
         s.pending.flush_mask_into(&flush, gone);
         if !stop {
             clear_pending(&mut s, STOP_PENDING);
-            if !seized(&v) {
+            if !seized(table, t) {
                 if s.jobctl & STOPPED != 0 {
                     s.jobctl &= !STOPPED;
-                    crate::task::percpu::try_to_wake_up(v.task, WakeMode::Any);
+                    crate::task::percpu::try_to_wake_up(t, WakeMode::Any);
                 }
             } else {
-                trap_notify(v.task, &mut s);
+                trap_notify(t, &mut s);
             }
         }
-        super::recalc_sigpending_tsk(v.task, &s);
+        super::recalc_sigpending_tsk(t, &s);
     }
     sig_struct.shared.lock().flush_mask_into(&flush, gone);
     if !stop {
         // Stopped: CLD_CONTINUED; in the middle of a stop: as if it had
         // completed and the continue's notice were lost (Linux)
-        let why = if g.flags & flags::STOP_STOPPED != 0 {
+        let why = if j.flags & flags::STOP_STOPPED != 0 {
             flags::CLD_CONTINUED
-        } else if g.count != 0 {
+        } else if j.count != 0 {
             flags::CLD_STOPPED
         } else {
             0
         };
         if why != 0 {
-            g.set_stop_flags(why | flags::STOP_CONTINUED);
-            g.count = 0;
-            g.code = 0;
+            j.set_stop_flags(why | flags::STOP_CONTINUED);
+            j.count = 0;
+            j.code = 0;
         }
     }
 }
@@ -282,6 +290,12 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
         return false;
     };
     let traced = mv.ptrace() != 0;
+    // The thread walk under the group's siglock (Linux do_signal_stop
+    // under siglock), TASKLIST read for the ptrace flags
+    let Some(h) = me.sighand.protected(&table) else {
+        return false;
+    };
+    let sg = SigGuard::lock(h);
     let mut g = sig_struct.jobctl.lock();
     let mut s = me.sig.lock();
     if s.jobctl & STOP_PENDING == 0 {
@@ -302,17 +316,17 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
             g.count += 1;
         }
         drop(s);
-        for v in table.threads(me.pid) {
-            if me.is(v.task) {
+        for t in sig_struct.threads(&sg) {
+            if me.is(t) {
                 continue;
             }
-            let mut ts = v.task.sig.lock();
-            if ts.jobctl & STOPPED == 0 && set_pending(v.task, &mut ts, signr.nr() | gstop) {
+            let mut ts = t.sig.lock();
+            if ts.jobctl & STOPPED == 0 && set_pending(t, &mut ts, signr.nr() | gstop) {
                 g.count += 1;
-                if !seized(&v) {
-                    signal_wake_up(v.task, &mut ts, false);
+                if !seized(&table, t) {
+                    signal_wake_up(t, &mut ts, false);
                 } else {
-                    trap_notify(v.task, &mut ts);
+                    trap_notify(t, &mut ts);
                 }
             }
         }
@@ -329,6 +343,8 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
     set_current_state(SleepState::Killable);
     drop(s);
     drop(g);
+    // Dropped before the parent's notice, which takes its siglock
+    drop(sg);
     if notify {
         super::notify::notify_parent_cldstop(&table, &me, false, Why::Stopped);
     }

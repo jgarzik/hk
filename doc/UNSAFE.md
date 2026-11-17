@@ -56,6 +56,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
 | hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h) | owning intrusive containers, membership checked |
 | RCU hash chain `RcuHList` / `HNode` / `RcuHRef` (`util/rcuhlist.rs`, Linux hlist_*_rcu), writers proven by a `UniqueOwner` | owning intrusive chain, membership checked, release after a grace period |
+| data under a unique lock and one instance of a lock of many, `LockedByBoth` with `InstanceLock` / `InstanceGuard` (`sync/locked_by.rs`, Linux signal->thread_head under tasklist_lock and siglock; RfL `LockedBy` owner check) | cell checked against its owner instance at run time |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.
