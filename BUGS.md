@@ -1129,13 +1129,13 @@ Tag = roadmap phase (doc/ROADMAP.md).
     host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
     the socket is an active connect (no listener-side code involved).
 
-11. **STACK near-overflow flake** (arm64, once in three local
-    `check-arm` runs): `STACK:FAIL kernel stack nearly overflowed: 4016
-    of 16384 bytes left (need 4096)`, reported by
-    `task/percpu.rs` `check_stack_usage` for a task that exited around
-    the FAULT_INJECT tests. Some path comes within 80 bytes of the
-    margin; the check does not say which. Find the deep path (a
-    per-task high-water site, Linux stack_trace_max) and shrink it.
+11. **arm64 stack margin with debug assertions**: a `check-arm` boot
+    of a kernel built with debug assertions
+    (`KERNEL_FEATURES='--config profile.release.debug-assertions=true'`)
+    reports `STACK:FAIL` at about 3860 of 16384 bytes left (need 4096);
+    release kernels stay near 7000-7500 (`task/percpu.rs`
+    `check_stack_usage` names the task of each new low). Find the
+    path the assertions deepen (objdump frame sizes) and shrink it.
 
 12. **FORK_PGRP_SIGNAL flake** (hk x86, once in three local `check`
     runs): `FORK_PGRP_SIGNAL:FAIL got 11`: in round 1 a child forked
@@ -1152,6 +1152,12 @@ Tag = roadmap phase (doc/ROADMAP.md).
     every tcp_mem limit at 4 pages. A connection stalled under memory
     pressure: a forced charge for an empty queue, or the window or
     retransmit timer after a drop, may not restart it.
+
+14. **MM_LIFE_FORK_EXEC_OBJS bound inside its noise**: Slab over 300
+    fork+exec moves from about -270 to +50 kB run to run (x86, 15
+    instrumented runs); the test's 64 kB bound sits inside that spread,
+    so it fails now and then (+72 kB seen twice) with no leak. Measure
+    a quieter quantity or a bound above the noise.
 
 ## DRM dumb buffers are the boot framebuffer only
 

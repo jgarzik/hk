@@ -189,7 +189,10 @@ place before the free is queued. Compile-time checks name every field
 (an exhaustive pattern, no `..`): `no_glue` asserts `needs_drop` false
 on each other field's own type, and `Inode::init_at`, which builds the
 inode in place before `assume_init`, writes each field exactly once,
-so a field added fails the build until both are updated. The one remaining `&mut Inode`, the transient
+so a field added fails the build until both are updated. `SignalStruct::alloc` (signal/mod.rs) builds the signal
+struct in place the same way (`try_arc_uninit`, an `init_at` writing
+each field once under an exhaustive pattern, then `assume_init`), so
+its large cells are never copied through the stack. The one remaining `&mut Inode`, the transient
 one std `Arc::drop_slow` makes to run the drop glue, writes no byte an
 RCU reader reads: readers read only atomics, `ino`, `i_op` and other
 fields with no drop glue, and the glue's only step is `IFree`'s drop,
