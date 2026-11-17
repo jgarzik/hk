@@ -681,6 +681,18 @@ waiting).
 - No instances/ directory (tracefs_create_instance_dir: mkdir/rmdir of
   trace instances), so nothing removes a tracefs entry at run time.
 
+## No buffer heads
+
+**Location**: `fs/vfat/mod.rs` (`write_inode_sb`, `VfatSbData.ipos`), `fs/blkdev_ops.rs`
+
+Filesystem metadata goes through the block device's page cache by copy
+(`filemap::read`, `bdev_write_meta`); there is no buffer head to pin a
+block and patch it in place. So vfat's write_inode holds its `ipos`
+lock (a sleeping mutex) across the entry's read, patch and write, where
+Linux __fat_write_inode reads the block with sb_bread, then patches the
+pinned buffer under the inode_hash_lock spinlock after rechecking
+i_pos, and marks it dirty.
+
 ## renameat2 flag gaps
 
 **Location**: `fs/ramfs/`, `fs/vfat/mod.rs`
