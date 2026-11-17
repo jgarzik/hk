@@ -27,7 +27,7 @@ use self::rcu::{Held, HeldFrame, Lazy, To};
 use crate::fs::File;
 use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, permission_as};
-use crate::fs::dentry::{Dentry, DentryRef, d_invalidate};
+use crate::fs::dentry::{Dentry, DentryRef, LookupBits, d_invalidate};
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use crate::fs::fsstruct::FsStruct;
 use crate::fs::inode::{Inode, Link};
@@ -100,6 +100,14 @@ impl LookupFlags {
             follow: at & AT_SYMLINK_NOFOLLOW == 0,
             ..Self::open()
         }
+    }
+
+    /// What a d_revalidate sees of them (Linux nd->flags)
+    pub fn bits(&self) -> LookupBits {
+        let mut b = LookupBits::empty();
+        b.set(LookupBits::FOLLOW, self.follow);
+        b.set(LookupBits::DIRECTORY, self.directory);
+        b
     }
 
     /// Scoped to the start (Linux LOOKUP_IS_SCOPED)
@@ -250,52 +258,73 @@ fn start_path(start: Start<'_>) -> Result<Path, KernelError> {
     }
 }
 
-/// Child `name` of directory `parent`: the dcache, else the file system
-/// (the new dentry is cached). A cached negative dentry is ENOENT; a
-/// miss caches none: ramfs's would go at once (Linux simple_lookup's
-/// d_add(dentry, NULL), then dput: always_delete_dentry), procfs keeps
-/// none, and vfat's and kernfs's are not kept (BUGS.md). Permission is
-/// the caller's business.
-pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
+/// Child `name` of directory `parent` (Linux lookup_one_qstr_excl,
+/// lookup_slow's d_alloc + ->lookup), for a lookup with `flags`: the
+/// dcache, else the file system (the new dentry is cached). A cached
+/// negative dentry is ENOENT; a miss caches one where the file system
+/// keeps it (`InodeOps::lookup_neg`: vfat, kernfs, cgroupfs; one
+/// killed at its last put, as ramfs's always_delete_dentry, is gone at
+/// once), else none (procfs). Permission is the caller's business.
+pub fn lookup_one(
+    parent: &DentryRef,
+    name: &[u8],
+    flags: LookupBits,
+) -> Result<DentryRef, KernelError> {
     // No file system here has longer names (Linux simple_lookup and the
     // disk file systems' lookups: ENAMETOOLONG)
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    if let Some(child) = cached(parent, name)? {
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    if let Some(child) = cached(parent, &dir, name, flags)? {
         return if child.is_negative() {
             Err(KernelError::NotFound)
         } else {
             Ok(child)
         };
     }
-    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let inode = dir.i_op.lookup(&dir, name)?;
-    Dentry::alloc(parent, name, Some(inode))
+    let found = dir.i_op.lookup_neg(&dir, name)?;
+    // Stamped before it is hashed (Linux vfat_d_version_set,
+    // kernfs_set_rev before d_splice_alias)
+    let d = Dentry::prealloc(parent, name)?;
+    d.set_d_time(found.d_time);
+    let d = Dentry::add(parent, d, found.inode);
+    if d.is_negative() {
+        return Err(KernelError::NotFound);
+    }
+    Ok(d)
 }
 
-/// The dcache's child `name` of `parent` if it is still valid (Linux
-/// lookup_dcache): a stale one is invalidated and None, a revalidation
-/// error returned
-fn cached(parent: &DentryRef, name: &[u8]) -> Result<Option<DentryRef>, KernelError> {
+/// The dcache's child `name` of `parent` (whose inode is `dir`) if it
+/// is still valid for a lookup with `flags` (Linux lookup_dcache): a
+/// stale one is invalidated and None, a revalidation error returned
+fn cached(
+    parent: &DentryRef,
+    dir: &Inode,
+    name: &[u8],
+    flags: LookupBits,
+) -> Result<Option<DentryRef>, KernelError> {
     match parent.lookup_child(name) {
-        Some(child) => d_revalidate(child, None),
+        Some(child) => d_revalidate(dir, child, None, flags),
         None => Ok(None),
     }
 }
 
 /// Linux d_revalidate in ref mode and its callers' handling (`status
-/// <= 0`): `child` if valid; if stale, that dentry invalidated
-/// (d_invalidate) and None; an error returned, nothing invalidated.
-/// `rcu`: what an RCU walk's revalidation said (Linux lookup_fast: a
-/// stale or failed answer stands, ECHILD asks again in ref mode).
+/// <= 0`): `child` of directory `dir` if valid for a lookup with
+/// `flags`; if stale, that dentry invalidated (d_invalidate) and None;
+/// an error returned, nothing invalidated. `rcu`: what an RCU walk's
+/// revalidation said (Linux lookup_fast: a stale or failed answer
+/// stands, ECHILD asks again in ref mode).
 fn d_revalidate(
+    dir: &Inode,
     child: DentryRef,
     rcu: Option<Result<bool, KernelError>>,
+    flags: LookupBits,
 ) -> Result<Option<DentryRef>, KernelError> {
     // Positive or negative: its filesystem's d_revalidate sees both
     let valid = match rcu {
-        Some(Err(ECHILD)) | None => child.revalidate(child.get_inode().as_deref(), false),
+        Some(Err(ECHILD)) | None => child.revalidate(dir, child.get_inode().as_deref(), flags),
         Some(s) => s,
     }?;
     if valid {
@@ -311,20 +340,20 @@ pub const NAME_MAX: usize = 255;
 /// Path-walk lookup (Linux lookup_fast + lookup_slow): a dcache hit
 /// needs no lock; a miss asks the file system under the directory's
 /// shared inode lock, so it cannot race a create/unlink/rename there
-fn lookup_slow(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
+fn lookup_slow(parent: &DentryRef, name: &[u8], f: LookupFlags) -> Result<DentryRef, KernelError> {
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    if let Some(child) = cached(parent, name)? {
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    if let Some(child) = cached(parent, &dir, name, f.bits())? {
         return if child.is_negative() {
             Err(KernelError::NotFound)
         } else {
             Ok(child)
         };
     }
-    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let _lock = dir.lock_shared();
-    lookup_one(parent, name)
+    lookup_one(parent, name, f.bits())
 }
 
 /// The ref-mode half of lookup_fast after try_to_unlazy_next: `child`,
@@ -337,12 +366,14 @@ fn lookup_fast_ref(
     child: DentryRef,
     name: &[u8],
     rcu: Result<bool, KernelError>,
+    f: LookupFlags,
 ) -> Result<DentryRef, KernelError> {
-    match d_revalidate(child, Some(rcu))? {
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    match d_revalidate(&dir, child, Some(rcu), f.bits())? {
         // A valid negative entry: Linux step_into's ENOENT
         Some(c) if c.is_negative() => Err(KernelError::NotFound),
         Some(c) => Ok(c),
-        None => lookup_slow(parent, name),
+        None => lookup_slow(parent, name, f),
     }
 }
 
@@ -629,7 +660,8 @@ impl<'a> Nd<'a> {
             return Err(KernelError::CrossDevice);
         }
         if self.rcu.get() {
-            return self.walk_rcu(start, abs, path, f);
+            let l = self.walk_rcu(start, abs, path, f)?;
+            return self.unlazied(l);
         }
         let start = if abs {
             self.root()?.clone()
@@ -653,7 +685,7 @@ impl<'a> Nd<'a> {
                     self.recheck()?;
                     None
                 }
-                name => Some(lookup_slow(&cur.dentry, name)?),
+                name => Some(lookup_slow(&cur.dentry, name, w.f)?),
             };
             w.advance(&c);
             if let Some(d) = d {
@@ -708,7 +740,7 @@ impl<'a> Nd<'a> {
             To::Link { cur, link, last } => self.get_link(cur, link, last, &mut w)?,
             To::Lookup(cur) => {
                 let c = w.next().ok_or(ECHILD)?;
-                let d = lookup_slow(&cur.dentry, w.name(&c))?;
+                let d = lookup_slow(&cur.dentry, w.name(&c), w.f)?;
                 w.advance(&c);
                 self.step(cur, d, c.last, &mut w)?
             }
@@ -732,7 +764,7 @@ impl<'a> Nd<'a> {
             } => {
                 let c = w.next().ok_or(ECHILD)?;
                 let d = match reval {
-                    Some(s) => lookup_fast_ref(&cur.dentry, child, w.name(&c), s)?,
+                    Some(s) => lookup_fast_ref(&cur.dentry, child, w.name(&c), s, w.f)?,
                     None => child,
                 };
                 w.advance(&c);
@@ -1021,7 +1053,7 @@ pub fn create_entry(
     let w = p.mnt.want_write();
     let _dir_lock = dir.lock();
     (|| {
-        if lookup_one(parent, name).is_ok() {
+        if lookup_one(parent, name, LookupBits::CREATE | LookupBits::EXCL).is_ok() {
             return Err(KernelError::AlreadyExists);
         }
         if p.slash {
@@ -1049,7 +1081,7 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
     let c = crate::fs::dac::cred();
     let _dir_lock = dir.lock();
     (|| {
-        let victim = lookup_one(parent, name)?;
+        let victim = lookup_one(parent, name, LookupBits::empty())?;
         let inode = victim.get_inode().ok_or(KernelError::NotFound)?;
         if p.slash && !isdir {
             return Err(if inode.mode().is_dir() {
@@ -1281,7 +1313,7 @@ mod tests {
 
     /// The test filesystem's d_revalidate: by inode number; a negative
     /// dentry is stale
-    fn reval(_: &Dentry, i: Option<&Inode>, _: bool) -> Result<bool, KernelError> {
+    fn reval(_: &Inode, _: &Dentry, i: Option<&Inode>, _: LookupBits) -> Result<bool, KernelError> {
         match i.map(|i| i.ino) {
             None | Some(STALE) => Ok(false),
             Some(BROKEN) => Err(KernelError::Io),
@@ -1311,7 +1343,12 @@ mod tests {
     fn negative_is_revalidated() {
         let r = root();
         let n = Dentry::alloc(&r, b"n", None).unwrap();
-        assert!(cached(&r, b"n").unwrap().is_none());
+        let dir = r.get_inode().unwrap();
+        assert!(
+            cached(&r, &dir, b"n", LookupBits::empty())
+                .unwrap()
+                .is_none()
+        );
         assert!(n.d_unhashed() && r.lookup_child(b"n").is_none());
     }
 
@@ -1323,7 +1360,7 @@ mod tests {
         let a = Dentry::alloc(&r, b"x", Some(inode(STALE))).unwrap();
         drop(r.remove_child(b"x"));
         let b = Dentry::alloc(&r, b"x", Some(inode(VALID))).unwrap();
-        let d = lookup_fast_ref(&r, a, b"x", Err(ECHILD)).unwrap();
+        let d = lookup_fast_ref(&r, a, b"x", Err(ECHILD), LookupFlags::default()).unwrap();
         assert!(DentryRef::ptr_eq(&d, &b) && !b.d_unhashed());
     }
 
@@ -1332,7 +1369,12 @@ mod tests {
     fn stale_is_dropped() {
         let r = root();
         let a = Dentry::alloc(&r, b"x", Some(inode(STALE))).unwrap();
-        assert!(cached(&r, b"x").unwrap().is_none());
+        let dir = r.get_inode().unwrap();
+        assert!(
+            cached(&r, &dir, b"x", LookupBits::empty())
+                .unwrap()
+                .is_none()
+        );
         assert!(a.d_unhashed() && r.lookup_child(b"x").is_none());
     }
 
@@ -1343,11 +1385,14 @@ mod tests {
     fn reval_error_returned() {
         let r = root();
         let a = Dentry::alloc(&r, b"x", Some(inode(BROKEN))).unwrap();
-        let e = lookup_fast_ref(&r, a.clone(), b"x", Err(ECHILD));
+        let f = LookupFlags::default();
+        let e = lookup_fast_ref(&r, a.clone(), b"x", Err(ECHILD), f);
         assert_eq!(e.err(), Some(KernelError::Io));
-        assert_eq!(cached(&r, b"x").err(), Some(KernelError::Io));
+        let dir = r.get_inode().unwrap();
+        let c = cached(&r, &dir, b"x", LookupBits::empty());
+        assert_eq!(c.err(), Some(KernelError::Io));
         assert!(!a.d_unhashed());
-        let _ = lookup_fast_ref(&r, a.clone(), b"x", Ok(false));
+        let _ = lookup_fast_ref(&r, a.clone(), b"x", Ok(false), f);
         assert!(a.d_unhashed());
     }
 

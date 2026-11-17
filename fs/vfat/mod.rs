@@ -771,17 +771,28 @@ static VFAT_CI_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::Den
 
 /// Linux vfat_revalidate_ci: ECHILD in an RCU walk (every vfat name is
 /// asked again in ref mode); a positive dentry stays; a negative one
-/// is looked up again (Linux keeps one while its directory's version
-/// stands, vfat_revalidate_shortname: hk keeps no version)
+/// is dropped for a lookup with no flags or one that creates (so a new
+/// entry takes the spelling the caller gave: LOOKUP_CREATE,
+/// LOOKUP_RENAME_TARGET), else kept while its directory's version is
+/// the one its lookup saw (vfat_revalidate_shortname, `d_time`: Linux
+/// d_fsdata)
 fn vfat_revalidate_ci(
-    _: &crate::fs::dentry::Dentry,
+    dir: &Inode,
+    d: &crate::fs::dentry::Dentry,
     inode: Option<&Inode>,
-    rcu: bool,
+    flags: crate::fs::dentry::LookupBits,
 ) -> Result<bool, KernelError> {
-    if rcu {
+    use crate::fs::dentry::LookupBits;
+    if flags.contains(LookupBits::RCU) {
         return Err(KernelError::NoChild);
     }
-    Ok(inode.is_some())
+    if inode.is_some() {
+        return Ok(true);
+    }
+    if flags.is_empty() || flags.intersects(LookupBits::CREATE | LookupBits::RENAME_TARGET) {
+        return Ok(false);
+    }
+    Ok(dir.iversion() == d.d_time())
 }
 
 /// A name for a new entry (Linux vfat_create_shortname /
@@ -1851,6 +1862,24 @@ fn delete_dir_entry(
 pub struct VfatInodeOps;
 
 impl InodeOps for VfatInodeOps {
+    /// Linux vfat_lookup: a missing name is a negative dentry stamped
+    /// with the directory's version (vfat_d_version_set, under the
+    /// directory's i_rwsem: no entry changes meanwhile)
+    fn lookup_neg(&self, dir: &Inode, name: &[u8]) -> Result<super::inode::Found, KernelError> {
+        let version = dir.iversion();
+        match self.lookup(dir, name) {
+            Ok(i) => Ok(super::inode::Found {
+                inode: Some(i),
+                d_time: 0,
+            }),
+            Err(KernelError::NotFound) => Ok(super::inode::Found {
+                inode: None,
+                d_time: version,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let name = &user_name(dir, name, KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
@@ -1960,6 +1989,7 @@ impl InodeOps for VfatInodeOps {
             &VFAT_INODE_OPS,
         ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
+        inode.inc_iversion();
 
         inode.set_private(new_private(VfatInodeData {
             start_cluster,
@@ -1971,6 +2001,8 @@ impl InodeOps for VfatInodeOps {
             clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
+        // Linux vfat_create: inode_inc_iversion(dir)
+        dir.inc_iversion();
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2047,6 +2079,7 @@ impl InodeOps for VfatInodeOps {
             &VFAT_INODE_OPS,
         ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
+        inode.inc_iversion();
 
         inode.set_private(new_private(VfatInodeData {
             start_cluster: new_cluster,
@@ -2058,6 +2091,8 @@ impl InodeOps for VfatInodeOps {
             clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
+        // Linux vfat_mkdir: inode_inc_iversion(dir)
+        dir.inc_iversion();
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2086,6 +2121,8 @@ impl InodeOps for VfatInodeOps {
         // Delete the directory entry; its clusters go now, or with the
         // last reference to its inode (Linux fat_unlink + fat_evict_inode)
         let start_cluster = delete_dir_entry(&sb_data, dir_inode_data.start_cluster, name)?;
+        // Linux fat_remove_entries: inode_inc_iversion(dir)
+        dir.inc_iversion();
         drop_link(
             &sb,
             &sb_data,
@@ -2127,6 +2164,8 @@ impl InodeOps for VfatInodeOps {
 
         // Delete the directory entry (clusters as for unlink)
         let start_cluster = delete_dir_entry(&sb_data, dir_inode_data.start_cluster, name)?;
+        // Linux fat_remove_entries: inode_inc_iversion(dir)
+        dir.inc_iversion();
         drop_link(
             &sb,
             &sb_data,
@@ -2294,6 +2333,10 @@ impl InodeOps for VfatInodeOps {
 
         // Delete old entry (don't free clusters - they belong to new entry now)
         delete_dir_entry(&sb_data, old_dir_data.start_cluster, old_name)?;
+        // Linux vfat_rename: both directories' versions move on
+        // (inode_inc_iversion(new_dir), fat_remove_entries' of old_dir)
+        new_dir.inc_iversion();
+        old_dir.inc_iversion();
 
         // The moved object keeps its inode (Linux fat_detach + fat_attach)
         if let Some(inode) = cached(&sb, old_dir_data.start_cluster, &old_entry.short_name) {
@@ -2413,6 +2456,7 @@ fn create_inode_for_entry(
         &VFAT_INODE_OPS,
     ))?;
     inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
+    inode.inc_iversion();
 
     inode.set_private(new_private(VfatInodeData {
         start_cluster: entry.start_cluster,
@@ -2780,6 +2824,8 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
     root_inode
         .i_data
         .set_aops(&VFAT_FILE_AOPS, Some(&root_inode));
+    // Linux fat_fill_inode: inode_inc_iversion
+    root_inode.inc_iversion();
 
     root_inode.set_private(new_private(VfatInodeData {
         start_cluster: boot_sector.root_cluster,

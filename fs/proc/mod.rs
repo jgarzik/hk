@@ -2804,11 +2804,16 @@ static PROC_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::Dentry
 /// task's current owner (pid_update_inode). An RCU walk is answered
 /// from what the inode keeps for it, ECHILD where Linux's is
 /// (`revalidate_rcu`).
-fn proc_revalidate(_: &Dentry, inode: Option<&Inode>, rcu: bool) -> Result<bool, KernelError> {
+fn proc_revalidate(
+    _: &Inode,
+    _: &Dentry,
+    inode: Option<&Inode>,
+    flags: crate::fs::dentry::LookupBits,
+) -> Result<bool, KernelError> {
     let Some(inode) = inode else {
         return Ok(false);
     };
-    if rcu {
+    if flags.contains(crate::fs::dentry::LookupBits::RCU) {
         return revalidate_rcu(inode);
     }
     Ok(revalidate_ref(inode))

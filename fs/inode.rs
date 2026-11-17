@@ -173,10 +173,33 @@ pub enum Link {
     Jump(super::Path),
 }
 
+/// What a directory's lookup found (Linux ->lookup's d_splice_alias
+/// of the dentry it was given, with its d_time / d_fsdata set first)
+pub struct Found {
+    /// The inode; None: no such name, kept as a negative dentry
+    pub inode: Option<Arc<Inode>>,
+    /// The new dentry's `d_time`, what the filesystem's d_revalidate
+    /// checks (vfat's directory version, kernfs's revision)
+    pub d_time: u64,
+}
+
 /// Inode operations trait - filesystem-specific behavior
 pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError>;
+
+    /// [`InodeOps::lookup`] as the dcache asks it (Linux ->lookup): a
+    /// filesystem that keeps negative dentries (one its d_revalidate
+    /// can tell is stale) answers a missing name with `inode` None,
+    /// both stamped with `d_time`. Default: `lookup`, ENOENT caching
+    /// nothing (Linux procfs's ERR_PTR(-ENOENT); a negative dentry
+    /// killed at its last put, ramfs's always_delete_dentry).
+    fn lookup_neg(&self, dir: &Inode, name: &[u8]) -> Result<Found, KernelError> {
+        Ok(Found {
+            inode: Some(self.lookup(dir, name)?),
+            d_time: 0,
+        })
+    }
 
     /// A directory that is permanently empty (Linux is_empty_dir_inode:
     /// make_empty_dir_inode's operations), so a mount on it hides
@@ -187,7 +210,7 @@ pub trait InodeOps: Send + Sync {
 
     /// Access check for `mask` (MAY_* bits) by `cred` (Linux
     /// ->permission). With MAY_NOT_BLOCK an RCU walk asks, as for
-    /// `DentryOps::d_revalidate`'s `rcu`. Default: generic_permission (mode bits plus
+    /// `DentryOps::d_revalidate`'s LOOKUP_RCU. Default: generic_permission (mode bits plus
     /// capability overrides); /proc/sys overrides it with sysctl_perm.
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         super::dac::generic_permission(cred, inode, mask)
@@ -276,7 +299,7 @@ pub trait InodeOps: Send + Sync {
     /// jumps to (nd_jump_link), which RESOLVE_NO_MAGICLINKS refuses
     /// (ELOOP) and a scoped walk never takes (EXDEV). With `rcu` an RCU
     /// walk asks (Linux get_link with a NULL dentry): `inode` is
-    /// borrowed as for `DentryOps::d_revalidate`'s `rcu`, nothing may
+    /// borrowed as for `DentryOps::d_revalidate`'s LOOKUP_RCU, nothing may
     /// sleep, and
     /// ECHILD sends the walk to ref mode to ask again. Default: ECHILD
     /// in RCU mode, else the text `readlink` gives; procfs's fd, cwd,
@@ -578,6 +601,11 @@ pub struct Inode {
     /// file handle's object from a later one that reuses the number;
     /// set by the filesystem before the inode is shared, then fixed
     pub i_generation: u32,
+
+    /// Change counter (Linux i_version, inode_inc_iversion): bumped by
+    /// a filesystem that keeps one when the inode changes (vfat: a
+    /// directory's entries, under its i_rwsem), read with no lock
+    i_version: AtomicU64,
 
     /// `iflags::*` bits (Linux i_flags' S_DEAD, S_SWAPFILE, and
     /// i_state's I_LINKABLE): each set or cleared under the lock its
@@ -909,6 +937,7 @@ impl Inode {
             size: AtomicU64::new(i.size),
             nlink: AtomicU32::new(1),
             i_generation: i.i_generation,
+            i_version: AtomicU64::new(0),
             i_flags: core::sync::atomic::AtomicU32::new(0),
             rdev: i.rdev,
             atime: InodeTime::new(t),
@@ -960,6 +989,16 @@ impl Inode {
     /// with the memory
     pub fn private_rcu(&self) -> Option<&dyn InodeData> {
         self.i_private_rcu.get().map(|a| &**a)
+    }
+
+    /// Its change counter (Linux inode_query_iversion)
+    pub fn iversion(&self) -> u64 {
+        self.i_version.load(Ordering::Acquire)
+    }
+
+    /// Count a change (Linux inode_inc_iversion)
+    pub fn inc_iversion(&self) {
+        self.i_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The symlink's target, if it is kept in the inode (Linux
@@ -1624,6 +1663,7 @@ const _: () = {
         size,
         nlink,
         i_generation,
+        i_version,
         i_flags,
         rdev,
         atime,

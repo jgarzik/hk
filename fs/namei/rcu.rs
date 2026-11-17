@@ -31,7 +31,7 @@
 use super::{ECHILD, LookupFlags, Nd, Start, next_comp};
 use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, MAY_NOT_BLOCK, may_follow_link, permission_as};
-use crate::fs::dentry::{__d_lookup_rcu, Dentry, DentryRef};
+use crate::fs::dentry::{__d_lookup_rcu, Dentry, DentryRef, LookupBits};
 use crate::fs::fsstruct::PathRcu;
 use crate::fs::inode::{Inode, Link};
 use crate::fs::mount::{
@@ -601,18 +601,20 @@ struct PickRcu<'g> {
 
 impl Nd<'_> {
     /// path_init, link_path_walk and complete_walk from `start` (the
-    /// root if `abs`) in RCU mode, going on in ref mode where it must;
-    /// ECHILD if it could not leave RCU mode (the caller walks again in
-    /// ref mode). The root and the cwd are read under the fs_struct's
-    /// sequence with no reference, a held start borrowed (Linux
-    /// path_init under LOOKUP_RCU).
-    pub(super) fn walk_rcu(
+    /// root if `abs`) in RCU mode: where the walk goes on in ref mode
+    /// ([`Nd::unlazied`], called by the caller once this frame is gone:
+    /// the ref walk may go deep); ECHILD if it could not leave RCU mode
+    /// (the caller walks again in ref mode). The root and the cwd are
+    /// read under the fs_struct's sequence with no reference, a held
+    /// start borrowed (Linux path_init under LOOKUP_RCU).
+    #[inline(never)]
+    pub(super) fn walk_rcu<'p>(
         &self,
         start: Start<'_>,
         abs: bool,
-        path: &[u8],
+        path: &'p [u8],
         f: LookupFlags,
-    ) -> Result<Path, KernelError> {
+    ) -> Result<Lazy<'p>, KernelError> {
         let fs = self.fs();
         // Boot code with no fs_struct: the namespace's root, held
         // file_open_root's root, held by the caller (ND_ROOT_PRESET)
@@ -656,7 +658,7 @@ impl Nd<'_> {
         self.rcu.set(false);
         drop(puts);
         drop(boot);
-        self.unlazied(r?)
+        r
     }
 
     /// link_path_walk under LOOKUP_RCU: every component that the dcache
@@ -853,7 +855,9 @@ impl Nd<'_> {
         // but "valid" is handled in ref mode (Linux lookup_fast:
         // try_to_unlazy_next, then d_invalidate if stale, the error if
         // one, ref-mode d_revalidate if ECHILD)
-        let status = child.revalidate(inode, true);
+        // `cur` is a directory may_lookup let through
+        let dir = cur.inode.ok_or(ECHILD)?;
+        let status = child.revalidate(dir, inode, LookupBits::RCU | f.bits());
         if status != Ok(true) {
             let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
             return Ok(Step::Lazy(To::Child {

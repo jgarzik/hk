@@ -2921,6 +2921,7 @@ pub struct Dentry {
     d_sib: Link, d_sib_owner: Owner, // Parent's children (its d_lock)
     d_hash: Link,               // Hash bucket (its bit lock); linked = hashed
     d_hkey: AtomicU64,          // Hash key (parent's d_lock, before hashing)
+    d_time: AtomicU64,          // Linux d_time: set by its lookup before hashing, read lock-free
     d_name: DNameSlot,          // Linux d_name; d_lock (write) + d_seq, read lock-free
     d_alias: Link,              // Its inode's i_dentry (that lock)
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
@@ -3121,11 +3122,18 @@ take it again), and nothing else is taken under it.
 
 A cached child, positive or negative, is revalidated by its
 filesystem's dentry operation (`DentryOps::d_revalidate` through
-`Dentry::revalidate`, Linux d_revalidate) after its d_lock is
+`Dentry::revalidate`, Linux d_revalidate(dir, name, dentry, flags):
+the directory's inode and the lookup's `LookupBits`) after its d_lock is
 released, inside whatever i_rwsem the walk holds: procfs's takes the
-task's task_lock and its fd table lock. Asked by an RCU walk (`rcu`,
-Linux LOOKUP_RCU; and a permission check's MAY_NOT_BLOCK) the dentry
-and inode are borrowed under the guard with no reference and may be
+task's task_lock and its fd table lock. A negative dentry a filesystem
+keeps (`InodeOps::lookup_neg`, Linux ->lookup's d_splice_alias(NULL))
+is stamped (`Dentry.d_time`, a plain atomic) before it is hashed with
+what its d_revalidate compares, read under the lock the lookup holds:
+vfat's directory version (`Inode.i_version`, Linux i_version: bumped
+by an entry's add or removal under the directory's i_rwsem held for
+writing; the lookup holds it shared). Asked by an RCU walk (`LookupBits::RCU`,
+Linux LOOKUP_RCU; and a permission check's MAY_NOT_BLOCK) the dentry,
+directory and inode are borrowed under the guard with no reference and may be
 torn down already: the answer may read only fields with no drop glue
 and take nothing that sleeps, else it is ECHILD; kernfs, cgroupfs and
 vfat (Linux kernfs_dop_revalidate, vfat_revalidate_ci) always are. procfs

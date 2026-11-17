@@ -43,7 +43,9 @@ fn create_in(
     let w = mnt.want_write();
     let _dir_lock = dir.lock();
     (|| {
-        if let Ok(d) = lookup_one(parent, name) {
+        // Linux lookup_open: d_revalidate with the open's intent
+        let intent = super::dentry::LookupBits::OPEN | super::dentry::LookupBits::CREATE;
+        if let Ok(d) = lookup_one(parent, name, intent) {
             return Ok((d, false));
         }
         let _w = w?;

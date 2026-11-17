@@ -177,11 +177,12 @@ pub static KERNFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::Dentry
 /// revision stands: hk caches no kernfs negative entry); a removed
 /// node's dentry is stale (the node is the inode data)
 fn kernfs_revalidate(
+    _: &Inode,
     _: &crate::fs::dentry::Dentry,
     inode: Option<&Inode>,
-    rcu: bool,
+    flags: crate::fs::dentry::LookupBits,
 ) -> Result<bool, KernelError> {
-    if rcu {
+    if flags.contains(crate::fs::dentry::LookupBits::RCU) {
         return Err(KernelError::NoChild);
     }
     Ok(inode.and_then(knode).is_some_and(|kn| !kn.removed()))

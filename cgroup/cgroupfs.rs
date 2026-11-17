@@ -782,8 +782,13 @@ static CGROUPFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOp
 /// dentry is looked up again (Linux keeps one while its directory's
 /// revision stands: hk caches no cgroupfs negative entry); a positive
 /// one stays (a removed cgroup's leaves the tree at its rmdir)
-fn cgroupfs_revalidate(_: &Dentry, inode: Option<&Inode>, rcu: bool) -> Result<bool, KernelError> {
-    if rcu {
+fn cgroupfs_revalidate(
+    _: &Inode,
+    _: &Dentry,
+    inode: Option<&Inode>,
+    flags: crate::fs::dentry::LookupBits,
+) -> Result<bool, KernelError> {
+    if flags.contains(crate::fs::dentry::LookupBits::RCU) {
         return Err(KernelError::NoChild);
     }
     Ok(inode.is_some())

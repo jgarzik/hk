@@ -678,12 +678,11 @@ waiting).
 
 **Location**: `fs/namei/`
 
-- vfat and kernfs/cgroupfs cache no negative dentry at lookup
-  (`namei::lookup_one`); Linux's vfat_lookup and kernfs_iop_lookup do
-  (d_splice_alias(NULL)) and keep it valid while the directory's
-  version (vfat_d_version) or revision (kernfs_dir_changed) stands.
-  hk's ref-mode d_revalidate (`vfat_revalidate_ci`,
-  `kernfs_revalidate`, `cgroupfs_revalidate`) calls a negative one
+- kernfs/cgroupfs cache no negative dentry at lookup
+  (`InodeOps::lookup_neg` not given); Linux kernfs_iop_lookup does
+  (d_splice_alias(NULL)) and keeps it valid while the directory's
+  revision (kernfs_dir_changed) stands. hk's ref-mode d_revalidate
+  (`kernfs_revalidate`, `cgroupfs_revalidate`) calls a negative one
   stale every time: same answers, one more lookup.
 - cgroupfs's ref-mode d_revalidate keeps every positive dentry;
   Linux kernfs_dop_revalidate also checks the node is active and still

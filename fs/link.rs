@@ -5,7 +5,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::dentry::{Dentry, d_exchange, d_move};
+use crate::fs::dentry::{Dentry, LookupBits, d_exchange, d_move};
 use crate::fs::namei::{
     Last, Parent, create_entry, delete_entry, filename_create, filename_lookup, filename_parentat,
     getname,
@@ -393,9 +393,13 @@ type Side<'a> = (&'a Parent, &'a Arc<Inode>);
 fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelError> {
     let ((op, oname), odir) = ((&old.0.dir, old.0.name.as_slice()), old.1);
     let ((np, nname), ndir) = ((&new.0.dir, new.0.name.as_slice()), new.1);
-    let src = lookup_one(op, oname)?;
+    // Linux __start_renaming: the target looked up with
+    // LOOKUP_RENAME_TARGET (and LOOKUP_EXCL for RENAME_NOREPLACE)
+    let src = lookup_one(op, oname, LookupBits::empty())?;
     let sinode = src.get_inode().ok_or(KernelError::NotFound)?;
-    let dst = lookup_one(np, nname)
+    let mut tflags = LookupBits::RENAME_TARGET;
+    tflags.set(LookupBits::EXCL, flags & RENAME_NOREPLACE != 0);
+    let dst = lookup_one(np, nname, tflags)
         .ok()
         .filter(|d| d.get_inode().is_some());
     let dinode = dst.as_ref().and_then(|d| d.get_inode());

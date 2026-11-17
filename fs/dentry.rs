@@ -160,13 +160,15 @@ pub struct DentryOps {
     pub d_hash: Option<fn(&[u8]) -> u64>,
     /// The cached name `stored` is `name` (Linux d_compare)
     pub d_compare: Option<CompareFn>,
-    /// A cached dentry, positive or negative (`inode` None), is still
-    /// good for the walk (Linux d_revalidate): Ok(false) drops it and
-    /// the walk looks the name up again. With `rcu` (LOOKUP_RCU) an RCU
-    /// walk asks: the dentry and `inode` are borrowed with no
-    /// reference and may be torn down already, so only fields with no
-    /// drop glue may be read (`IFree`); ECHILD where that is not
-    /// enough, and the walk asks again in ref mode.
+    /// A cached dentry in directory `dir`, positive or negative
+    /// (`inode` None), is still good for the lookup whose flags are
+    /// given (Linux d_revalidate(dir, name, dentry, flags)): Ok(false)
+    /// drops it and the name is looked up again. With
+    /// [`LookupBits::RCU`] an RCU walk asks: the dentry, `dir` and
+    /// `inode` are borrowed with no reference and may be torn down
+    /// already, so only fields with no drop glue may be read (`IFree`);
+    /// ECHILD where that is not enough, and the walk asks again in ref
+    /// mode.
     pub d_revalidate: Option<RevalidateFn>,
     /// A dentry no one holds any more is killed, not kept cached (Linux
     /// d_delete, asked by retain_dentry at the last dput: ramfs's
@@ -182,9 +184,32 @@ pub struct DentryOps {
 /// [`DentryOps::d_compare`]: the cached name `stored` is `name`
 pub type CompareFn = fn(stored: &[u8], name: &[u8]) -> bool;
 
-/// [`DentryOps::d_revalidate`]: the dentry, its inode as the caller
-/// read it (None: negative), LOOKUP_RCU
-pub type RevalidateFn = fn(&Dentry, Option<&Inode>, bool) -> Result<bool, KernelError>;
+/// [`DentryOps::d_revalidate`]: the directory, the dentry, its inode
+/// as the caller read it (None: negative), the lookup's flags
+pub type RevalidateFn =
+    fn(&Inode, &Dentry, Option<&Inode>, LookupBits) -> Result<bool, KernelError>;
+
+bitflags::bitflags! {
+    /// What a d_revalidate learns of the lookup asking (Linux nd->flags
+    /// and the lookup_one_qstr_excl flags: their LOOKUP_* values)
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LookupBits: u32 {
+        /// Follow a final symlink
+        const FOLLOW = 1 << 0;
+        /// The result must be a directory
+        const DIRECTORY = 1 << 1;
+        /// An RCU walk asks (no reference held)
+        const RCU = 1 << 8;
+        /// An open's last component
+        const OPEN = 1 << 16;
+        /// An object is to be created there
+        const CREATE = 1 << 17;
+        /// It must not exist
+        const EXCL = 1 << 18;
+        /// A rename's target
+        const RENAME_TARGET = 1 << 19;
+    }
+}
 
 impl DentryOps {
     /// No operation set (Linux's defaults), for `..DentryOps::NONE`
@@ -471,6 +496,10 @@ pub struct Dentry {
     d_hash: Link,
     /// The key it was hashed under (`d_key`)
     d_hkey: AtomicU64,
+    /// What its filesystem's d_revalidate checks (Linux d_time, vfat's
+    /// d_fsdata version): set by the lookup that made it before it is
+    /// hashed ([`Dentry::set_d_time`]), read with no lock
+    d_time: AtomicU64,
     /// On its inode's `i_dentry` (Linux d_u.d_alias)
     d_alias: Link,
 
@@ -526,6 +555,7 @@ impl Dentry {
             d_sib_owner: Owner::new(),
             d_hash: Link::new(),
             d_hkey: AtomicU64::new(0),
+            d_time: AtomicU64::new(0),
             d_alias: Link::new(),
             d_name: DNameSlot::new(name),
             d_lock: RwLock::new(DentryInner {
@@ -820,14 +850,30 @@ impl Dentry {
     }
 
     /// Its filesystem's d_revalidate, else valid (Linux d_revalidate
-    /// without DCACHE_OP_REVALIDATE): `inode` is its inode as the
-    /// caller read it, None for a negative dentry; `rcu` as
-    /// [`DentryOps::d_revalidate`]
-    pub fn revalidate(&self, inode: Option<&Inode>, rcu: bool) -> Result<bool, KernelError> {
+    /// without DCACHE_OP_REVALIDATE): in directory `dir`, `inode` its
+    /// inode as the caller read it, None for a negative dentry;
+    /// `flags` as [`DentryOps::d_revalidate`]
+    pub fn revalidate(
+        &self,
+        dir: &Inode,
+        inode: Option<&Inode>,
+        flags: LookupBits,
+    ) -> Result<bool, KernelError> {
         match self.d_op.and_then(|o| o.d_revalidate) {
-            Some(f) => f(self, inode, rcu),
+            Some(f) => f(dir, self, inode, flags),
             None => Ok(true),
         }
+    }
+
+    /// What its d_revalidate checks (Linux d_time)
+    pub fn d_time(&self) -> u64 {
+        self.d_time.load(Relaxed)
+    }
+
+    /// Set what its d_revalidate checks, before it is hashed (a
+    /// lookup's new dentry) or under the directory's lock
+    pub fn set_d_time(&self, t: u64) {
+        self.d_time.store(t, Relaxed);
     }
 
     /// Check if this is a negative (failed lookup) dentry

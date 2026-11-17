@@ -1479,7 +1479,8 @@ pub fn ramfs_mkpath_with_timestamp(
     for component in path.split(|&c| c == b'/').filter(|s| !s.is_empty()) {
         // An existing component, found by the file system (the dcache
         // may hold a negative dentry or none): must be a directory
-        if let Ok(child) = super::namei::lookup_one(&current, component) {
+        let none = super::dentry::LookupBits::empty();
+        if let Ok(child) = super::namei::lookup_one(&current, component, none) {
             if child.get_inode().is_some_and(|i| !i.mode().is_dir()) {
                 return Err(KernelError::NotDirectory);
             }

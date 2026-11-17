@@ -10,12 +10,18 @@
 //!   ref mode (Linux vfat_revalidate_ci: ECHILD under LOOKUP_RCU), so
 //!   openat2 RESOLVE_CACHED through vfat is EAGAIN, for a cached name
 //!   and for one that failed.
+//! - VFAT_NEG_DENTRY: a failed lookup leaves a negative dentry (Linux
+//!   vfat_lookup, kept while the directory's version stands), which a
+//!   create or rename target in another case drops (vfat_revalidate_ci:
+//!   LOOKUP_CREATE, LOOKUP_RENAME_TARGET), so the new entry is named
+//!   as the caller spelled it; a name made in the directory is found
+//!   after a failed lookup of it.
 
 use crate::harness::T;
 use crate::helpers::find_blkdev;
 use hk_syscall::{
-    O_PATH, Stat, sys_chdir, sys_close, sys_getcwd, sys_mkdir, sys_mount, sys_openat2, sys_rmdir,
-    sys_stat, sys_umount2,
+    O_CREAT, O_PATH, O_WRONLY, Stat, sys_chdir, sys_close, sys_getcwd, sys_mkdir, sys_mount,
+    sys_open, sys_openat2, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink,
 };
 
 const DIR: &[u8] = b"/tmp/vci\0";
@@ -56,6 +62,7 @@ pub fn run_tests() {
     if t.eq(b"mkdir", sys_mkdir(b"/tmp/vci/dir\0".as_ptr(), 0o755), 0) {
         check(&mut t);
         cached();
+        negative();
         sys_chdir(b"/\0".as_ptr());
         sys_rmdir(b"/tmp/vci/dir\0".as_ptr());
     }
@@ -102,6 +109,75 @@ fn open_cached(p: &[u8]) -> i64 {
         sys_close(r as u64);
     }
     r
+}
+
+/// readlink(/proc/self/fd/`fd`) is `want` (NUL-terminated)
+fn fd_is(fd: i64, want: &[u8]) -> bool {
+    let mut p = *b"/proc/self/fd/\0\0\0\0";
+    let mut n = 14;
+    if fd >= 10 {
+        p[n] = b'0' + (fd / 10 % 10) as u8;
+        n += 1;
+    }
+    p[n] = b'0' + (fd % 10) as u8;
+    let mut buf = [0u8; 64];
+    let r = sys_readlink(p.as_ptr(), buf.as_mut_ptr(), buf.len() as u64);
+    let w = &want[..want.len() - 1];
+    r == w.len() as i64 && &buf[..w.len()] == w
+}
+
+fn negative() {
+    const ENOENT: i64 = -2;
+    let mut t = T::new(b"VFAT_NEG_DENTRY");
+    let mut st = Stat::default();
+    t.eq(
+        b"miss",
+        sys_stat(b"/tmp/vci/dir/foo\0".as_ptr(), &mut st),
+        ENOENT,
+    );
+    t.eq(
+        b"miss again",
+        sys_stat(b"/tmp/vci/dir/fOo\0".as_ptr(), &mut st),
+        ENOENT,
+    );
+    let fd = sys_open(b"/tmp/vci/dir/FOO\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if t.ok(b"create FOO", fd >= 0, fd) {
+        t.ok(b"named FOO", fd_is(fd, b"/tmp/vci/dir/FOO\0"), 0);
+        sys_close(fd as u64);
+    }
+    t.eq(
+        b"found as foo",
+        sys_stat(b"/tmp/vci/dir/foo\0".as_ptr(), &mut st),
+        0,
+    );
+    t.eq(b"unlink", sys_unlink(b"/tmp/vci/dir/foo\0".as_ptr()), 0);
+    t.eq(
+        b"gone",
+        sys_stat(b"/tmp/vci/dir/Foo\0".as_ptr(), &mut st),
+        ENOENT,
+    );
+    t.eq(
+        b"miss bar",
+        sys_stat(b"/tmp/vci/dir/bar\0".as_ptr(), &mut st),
+        ENOENT,
+    );
+    t.eq(
+        b"mkdir sub",
+        sys_mkdir(b"/tmp/vci/dir/sub\0".as_ptr(), 0o755),
+        0,
+    );
+    let r = sys_rename(
+        b"/tmp/vci/dir/sub\0".as_ptr(),
+        b"/tmp/vci/dir/BAR\0".as_ptr(),
+    );
+    t.eq(b"rename to BAR", r, 0);
+    let fd = sys_open(b"/tmp/vci/dir/bar\0".as_ptr(), O_PATH, 0);
+    if t.ok(b"open bar", fd >= 0, fd) {
+        t.ok(b"named BAR", fd_is(fd, b"/tmp/vci/dir/BAR\0"), 0);
+        sys_close(fd as u64);
+    }
+    sys_rmdir(b"/tmp/vci/dir/bar\0".as_ptr());
+    t.done();
 }
 
 fn cached() {
