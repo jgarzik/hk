@@ -189,9 +189,16 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
         }
         (pid, t.and_then(|t| t.signal().cloned()))
     };
-    // Linux cpu_clock_sample_group(start=false)
-    let sig = sig.ok_or(KernelError::InvalidArgument)?;
-    Ok(sample.pick(&group_sample(&sig, tgid)))
+    // Linux cpu_clock_sample_group(start=false); a kernel thread (no
+    // SignalStruct here; Linux gives it one) is its threads' sum
+    let c = match sig {
+        Some(sig) => group_sample(&sig, tgid),
+        None => {
+            let table = percpu::TASKLIST.read();
+            crate::task::cputime::thread_group_cputime(&table, tgid)
+        }
+    };
+    Ok(sample.pick(&c))
 }
 
 /// clock_nanosleep on a process CPU clock (Linux posix_cpu_nsleep): a

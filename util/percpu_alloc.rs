@@ -124,6 +124,17 @@ impl PcpSlot {
         unsafe { &(*a.chunks[c].load(Ordering::Acquire))[i] }
     }
 
+    /// CPU `cpu`'s word, for a user that keeps a value rather than a
+    /// count in it (`util::id_batch`); None past the table
+    pub fn word(&self, cpu: usize) -> Option<&AtomicIsize> {
+        (cpu < areas().len()).then(|| self.part(cpu))
+    }
+
+    /// The number of per-CPU words (possible CPUs)
+    pub fn nr_words() -> usize {
+        areas().len()
+    }
+
     /// Add `n` to this CPU's word (Linux this_cpu_add: no lock prefix
     /// when the word is its own; a CPU past the table shares the first's
     /// and adds atomically)

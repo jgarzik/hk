@@ -555,6 +555,11 @@ impl PosixTimer {
     /// since it was queued; an interval timer rearms here, its missed
     /// periods into si_overrun
     fn deliver_locked(&self, info: &mut crate::signal::SigInfo) -> bool {
+        // A CPU clock is read before `inner` (its sample takes TASKLIST
+        // and a run-queue lock: LOCKING.md, CPU-time timers)
+        let cpu_now = self
+            .cpu
+            .map(|c| crate::time::cpu_timer::sample_now(c, crate::task::percpu::current_pid()));
         let (rearm, value) = {
             let mut i = self.inner.lock();
             if i.signal_seq != i.sigqueue_seq {
@@ -563,11 +568,8 @@ impl PosixTimer {
             if i.interval_ns == 0 || !i.requeue {
                 return true;
             }
-            let now = match self.cpu {
-                Some(c) => {
-                    crate::time::cpu_timer::sample_now(c, crate::task::percpu::current_pid())
-                        .unwrap_or(i.expires_ns)
-                }
+            let now = match cpu_now {
+                Some(s) => s.unwrap_or(i.expires_ns),
                 None => i.clock.now(),
             };
             let (missed, next) = forward_now(i.expires_ns, i.interval_ns, now);
@@ -1225,10 +1227,9 @@ pub fn sys_timer_settime(
     // A thread CPU clock whose thread is gone: ESRCH (Linux
     // posix_cpu_timer_set finds no task)
     if let Some(crate::time::cpu_timer::CpuClock {
-        thread: Some(t),
-        sample,
+        thread: Some(t), ..
     }) = timer.cpu
-        && crate::time::cpu_timer::thread_sample(t, sample).is_none()
+        && crate::task::percpu::TASKLIST.read().get(t).is_none()
     {
         return Err(KernelError::NoProcess);
     }

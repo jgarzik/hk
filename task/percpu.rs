@@ -3538,6 +3538,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
     let sched = current_percpu_sched().expect("No scheduler");
     let mut rq = sched.lock.lock();
+    // Its last slice (Linux do_task_dead -> __schedule -> put_prev_task
+    // -> update_curr): its runtime, its group's running CPU-timer totals
+    // and rt bandwidth
+    rq.update_curr(crate::time::monotonic_ns());
 
     // Off the run queue for good; its stack, mm and the run queue's
     // reference go once this CPU runs something else
@@ -3659,10 +3663,14 @@ fn context_switch_locked(
     }
     // SAFETY: a task of this run queue, alive while it holds it
     let n = unsafe { &*next };
-    // The outgoing task's runtime up to now (Linux put_prev_task ->
-    // update_curr); the incoming one's counts from `make_current`
-    // (set_next_entity): its time off the CPU is nobody's
-    rq.update_curr(crate::time::monotonic_ns());
+    // The outgoing task's runtime up to now if it stays on the run
+    // queue (Linux put_prev_entity: `if (prev->on_rq) update_curr`; a
+    // sleeper was charged as it left, in deactivate); the incoming one's
+    // counts from `make_current` (set_next_entity): its time off the CPU
+    // is nobody's
+    if prev.se.on_rq() {
+        rq.update_curr(crate::time::monotonic_ns());
+    }
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
     rq.curr = next;
     rq.prev = prev;
@@ -4363,10 +4371,12 @@ pub fn scheduler_tick() {
     crate::task::cputime::account_process_tick(&me, CurrentArch::irq_from_user());
     let resched = match me.se.class() {
         Class::Stop => false,
-        Class::Rt => {
+        // Under the rq lock (Linux scheduler_tick -> task_tick_rt)
+        Class::Rt => this_sched().is_some_and(|s| {
+            let mut rq = s.lock.lock();
             let rr = me.se.policy() == crate::task::SCHED_RR && me.se.rr_tick();
-            rr | this_sched().is_some_and(|s| s.lock.lock().rt_tick(now))
-        }
+            rr | rq.rt_tick(now)
+        }),
         // A used-up slice (new deadline) lets EEVDF pick again (Linux
         // task_tick_fair -> update_deadline)
         Class::Fair => this_sched().is_some_and(|s| {
@@ -4760,8 +4770,7 @@ pub type Times = (u64, u64);
 /// stopped, continued or ptrace-stopped child, wait_task_stopped and
 /// wait_task_continued)
 pub fn rusage_both(table: &GlobalTaskTable, pid: Pid) -> Times {
-    let (u, s) = crate::task::cputime::thread_group_cputime_adjusted(table, pid);
-    let sig = table.threads(pid).find_map(|t| t.signal.clone());
+    let ((u, s), sig) = crate::task::cputime::group_adjusted(table, pid);
     let (cu, cs) = sig.map_or((0, 0), |g| g.child_times());
     (u.saturating_add(cu), s.saturating_add(cs))
 }

@@ -190,10 +190,12 @@ pub(crate) fn kmain() -> ! {
         // Every possible CPU's per-CPU area, before anything sizes
         // per-CPU data by the CPU count (Linux setup_per_cpu_areas from
         // the possible map prefilled from the MADT/DT): each enabled CPU
-        // listed, plus one in case the list leaves out the boot CPU (the
+        // listed, plus the boot CPU if the list leaves it out (the
         // bring-up loop then numbers every entry as an AP)
-        let listed = acpi_info.cpus.iter().filter(|c| c.enabled).count();
-        crate::cpu::setup_areas((listed + 1) as u32);
+        let me = CurrentArch::current_hw_cpu_id();
+        let en = || acpi_info.cpus.iter().filter(|c| c.enabled);
+        let bsp_missing = !en().any(|c| c.hw_cpu_id == me);
+        crate::cpu::setup_areas((en().count() + usize::from(bsp_missing)) as u32);
 
         // Initialize power management from ACPI/device tree
         if let Some(power_info) = &acpi_info.power_info {

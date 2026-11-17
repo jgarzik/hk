@@ -177,9 +177,18 @@ pub fn task_cputime_adjusted(t: &Task) -> (u64, u64) {
 /// Thread group `pid`'s (utime, stime), adjusted, TASKLIST held (Linux
 /// thread_group_cputime_adjusted)
 pub fn thread_group_cputime_adjusted(table: &GlobalTaskTable, pid: Pid) -> (u64, u64) {
+    group_adjusted(table, pid).0
+}
+
+/// [`thread_group_cputime_adjusted`], with the group's SignalStruct
+/// found on the way
+pub fn group_adjusted(
+    table: &GlobalTaskTable,
+    pid: Pid,
+) -> ((u64, u64), Option<Arc<SignalStruct>>) {
     match group_cputime(table, pid) {
-        (c, Some(s)) => cputime_adjust(&c, &s.prev_cputime),
-        (c, None) => (c.utime, c.stime),
+        (c, Some(s)) => (cputime_adjust(&c, &s.prev_cputime), Some(s)),
+        (c, None) => ((c.utime, c.stime), None),
     }
 }
 

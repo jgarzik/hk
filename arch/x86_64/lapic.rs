@@ -364,9 +364,12 @@ pub fn in_service(vector: u8) -> bool {
 
 /// Get the current CPU's APIC ID
 pub fn current_apic_id() -> u8 {
-    LAPIC
-        .get()
-        .map_or(0, |r| ((r.read32(LAPIC_ID as usize) >> 24) & 0xFF) as u8)
+    match LAPIC.get() {
+        Some(r) => ((r.read32(LAPIC_ID as usize) >> 24) & 0xFF) as u8,
+        // Before the LAPIC is mapped: the initial APIC id (CPUID.1
+        // EBX[31:24], Linux's early boot_cpu_physical_apicid source)
+        None => (super::msr::cpuid(1, 0).1 >> 24) as u8,
+    }
 }
 
 /// Calibrate LAPIC timer and start periodic interrupts on BSP

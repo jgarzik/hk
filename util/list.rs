@@ -722,7 +722,7 @@ static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
 
 crate::percpu! {
     /// Each CPU's last [`OwnedList`] id handed out
-    static OWNER_LAST: AtomicU64 = AtomicU64::new(0);
+    static OWNER_LAST: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
 }
 
 /// A [`PtrList`] of counted references (`P`, an `Arc` by default)
