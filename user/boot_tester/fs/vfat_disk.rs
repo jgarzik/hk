@@ -26,6 +26,10 @@
 //!   directory's free slots at its end starts there and goes on into a
 //!   new cluster (Linux fat_add_entries): after a remount it is found,
 //!   with no end-of-directory slot before it
+//! - VFAT_FSYNC_TIMES: utimensat marks the inode dirty (Linux
+//!   fat_setattr: mark_inode_dirty); fsync writes its entry (Linux
+//!   fat_file_fsync -> sync_inode_metadata -> fat_write_inode): the
+//!   device then holds the new date and time
 //! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
 //!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
 //!   and on hk its cluster stays allocated. Linux frees it: the refused
@@ -37,6 +41,7 @@ use crate::harness::T;
 use crate::helpers::{find_blkdev, host_mode};
 use crate::proc::sysfs::each_entry;
 use core::sync::atomic::{AtomicI32, Ordering};
+use hk_syscall::sys_fsync;
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROT_READ, PROT_WRITE, Stat,
     Timespec, UTIME_OMIT, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mmap,
@@ -179,6 +184,7 @@ pub fn run_tests() {
     atime_ro(dev);
     unlink_race(dev);
     dir_grow(dev);
+    fsync_times(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -682,5 +688,59 @@ fn dir_grow(dev: &[u8]) {
         sys_unlink(grow_path(n, &mut path).as_ptr());
     }
     t.eq(b"rmdir", sys_rmdir(gd.as_ptr()), 0);
+    t.done();
+}
+
+/// VFAT_FSYNC_TIMES on FS in the root, mounted tz=UTC
+fn fsync_times(dev: &[u8]) {
+    let mut t = T::new(b"VFAT_FSYNC_TIMES");
+    let f = b"/tmp/vdk/FS\0";
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(
+        b"mount tz=UTC",
+        mount_with(dev, b"iocharset=cp437,tz=UTC\0"),
+        0,
+    );
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    // 2017-07-14 02:40:00 UTC (atime 00:00 that day)
+    let ts = [
+        Timespec {
+            tv_sec: 1_499_990_400,
+            tv_nsec: 0,
+        },
+        Timespec {
+            tv_sec: 1_500_000_000,
+            tv_nsec: 0,
+        },
+    ];
+    t.eq(
+        b"utimensat",
+        sys_utimensat(-100, f.as_ptr(), ts.as_ptr(), 0),
+        0,
+    );
+    if fd >= 0 {
+        t.eq(b"fsync", sys_fsync(fd as i32), 0);
+        sys_close(fd as u64);
+    }
+    // FAT date (year - 1980) << 9 | month << 5 | day; time h << 11 |
+    // m << 5 | s / 2
+    const DATE: u16 = 37 << 9 | 7 << 5 | 14;
+    const TIME: u16 = 2 << 11 | 40 << 5;
+    let e = Fat::open(dev).and_then(|d| d.find(d.root, b"FS         "));
+    let u16_at = |e: &Ent, o: usize| u16::from_le_bytes([e[o], e[o + 1]]);
+    match e {
+        Some(e) => {
+            t.eq(b"time", i64::from(u16_at(&e, 22)), i64::from(TIME));
+            t.eq(b"date", i64::from(u16_at(&e, 24)), i64::from(DATE));
+            t.eq(b"adate", i64::from(u16_at(&e, 18)), i64::from(DATE));
+        }
+        None => {
+            t.ok(b"entry", false, 0);
+        }
+    }
+    sys_unlink(f.as_ptr());
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
     t.done();
 }

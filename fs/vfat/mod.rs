@@ -183,16 +183,17 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
             v.d.lock().start_cluster = first;
             v.cache.lock().set_start(first);
         })?;
-        write_inode_sb(inode, sb_data)?;
+        super::fs_writeback::mark_inode_dirty(inode);
     }
     // Linux fat_chain_add: i_blocks counts them
     with_vi(inode, |v| v.d.lock().clusters = need as u32)
 }
 
-/// Record the file's size in its directory entry
-fn update_size(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
-    // Linux: the inode marked dirty, __fat_write_inode at writeback
-    write_inode_sb(inode, sb_data)
+/// The file's size changed: its entry follows at write-back (Linux
+/// mark_inode_dirty, __fat_write_inode at writeback)
+fn update_size(inode: &Inode, _sb_data: &VfatSbData) -> Result<(), KernelError> {
+    super::fs_writeback::mark_inode_dirty(inode);
+    Ok(())
 }
 
 /// Write to a vfat file (Linux fat_write_begin/end over
@@ -1311,9 +1312,11 @@ fn fat_truncate_time(inode: &Inode, now: Option<Timespec>, atime: bool, cmtime: 
     }
 }
 
-/// Linux __fat_write_inode: size (0 for a directory), first cluster and
-/// times into the inode's entry; nothing for the root or an inode with
-/// no entry left (unlinked)
+/// Linux fat_write_inode / __fat_write_inode (->write_inode, from
+/// writeback, fsync, sync, unmount and the write-back before an
+/// eviction): size (0 for a directory), first cluster and times into
+/// the inode's entry; nothing for the root or an inode with no entry
+/// left (unlinked)
 fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
     let sb = inode.superblock().ok_or(KernelError::Io)?;
     write_inode_sb(inode, &get_sb_data(&sb)?)
@@ -1998,19 +2001,21 @@ impl InodeOps for VfatInodeOps {
     }
 
     /// Linux fat_update_time: the times truncated to FAT's
-    /// (fat_truncate_time), the entry written; nothing for the root
+    /// (fat_truncate_time), the inode marked dirty (__mark_inode_dirty
+    /// with I_DIRTY_SYNC: its entry written back later); nothing for the
+    /// root
     fn update_time(&self, inode: &Inode, what: TimeUpdate, _now: Timespec) {
         if is_root(inode) {
             return;
         }
         let atime = what == TimeUpdate::Atime;
         fat_truncate_time(inode, None, atime, !atime);
-        let _ = fat_write_inode(inode);
+        super::fs_writeback::mark_inode_dirty(inode);
     }
 
     /// Linux fat_setattr's end: atime to the day, mtime to 2 s with
     /// ctime the same; a ctime alone is dropped (ctime and mtime share
-    /// the entry's field); the entry written once
+    /// the entry's field); then mark_inode_dirty
     fn setattr(
         &self,
         inode: &Inode,
@@ -2024,7 +2029,7 @@ impl InodeOps for VfatInodeOps {
         if let Some(t) = mtime {
             fat_truncate_time(inode, Some(t), false, true);
         }
-        let _ = fat_write_inode(inode);
+        super::fs_writeback::mark_inode_dirty(inode);
     }
 
     /// The preferred I/O size is the cluster size (Linux fat_getattr)
@@ -2098,6 +2103,13 @@ impl InodeOps for VfatInodeOps {
             &et,
         )?;
         let i_pos = *offs.last().ok_or(KernelError::Io)?;
+        // vfat_add_entry: the slots synced on a dirsync mount
+        // (fat_add_entries), then the directory's mtime and ctime are
+        // `ts`, the directory written or marked dirty: no error once
+        // the entry is there
+        dir_sync(&sb, &sb_data)?;
+        fat_truncate_time(dir, Some(ts), false, true);
+        dir_changed(dir, &sb, &sb_data);
         // Linux vfat_create: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail: a negative
         // dentry of the name is stale from here on
@@ -2131,10 +2143,6 @@ impl InodeOps for VfatInodeOps {
             i_pos,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-        // vfat_add_entry: the directory's mtime and ctime are `ts`
-        fat_truncate_time(dir, Some(ts), false, true);
-        write_inode_sb(dir, &sb_data)?;
-        dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
 
@@ -2207,6 +2215,10 @@ impl InodeOps for VfatInodeOps {
             &et,
         )?;
         let i_pos = *offs.last().ok_or(KernelError::Io)?;
+        // vfat_add_entry, as for create
+        dir_sync(&sb, &sb_data)?;
+        fat_truncate_time(dir, Some(ts), false, true);
+        dir_changed(dir, &sb, &sb_data);
         // Linux vfat_mkdir: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail
         dir.inc_iversion();
@@ -2242,10 +2254,6 @@ impl InodeOps for VfatInodeOps {
             i_pos,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-        // vfat_add_entry: the directory's mtime and ctime are `ts`
-        fat_truncate_time(dir, Some(ts), false, true);
-        write_inode_sb(dir, &sb_data)?;
-        dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
 
@@ -2283,7 +2291,7 @@ impl InodeOps for VfatInodeOps {
         // fat_remove_entries: the directory's atime, mtime and ctime now;
         // the victim's too (vfat_unlink / vfat_rmdir), in memory only
         fat_truncate_time(dir, None, true, true);
-        let _ = write_inode_sb(dir, &sb_data);
+        dir_changed(dir, &sb, &sb_data);
         if let Some(i) = d.get_inode() {
             fat_truncate_time(&i, None, true, true);
         }
@@ -2339,7 +2347,7 @@ impl InodeOps for VfatInodeOps {
         // fat_remove_entries: the directory's atime, mtime and ctime now;
         // the victim's too (vfat_unlink / vfat_rmdir), in memory only
         fat_truncate_time(dir, None, true, true);
-        let _ = write_inode_sb(dir, &sb_data);
+        dir_changed(dir, &sb, &sb_data);
         if let Some(i) = d.get_inode() {
             fat_truncate_time(&i, None, true, true);
         }
@@ -2508,7 +2516,7 @@ impl InodeOps for VfatInodeOps {
                 added = made.1;
                 // vfat_add_entry: the new directory's mtime and ctime
                 fat_truncate_time(new_dir, Some(ts), false, true);
-                let _ = write_inode_sb(new_dir, &sb_data);
+                dir_changed(new_dir, &sb, &sb_data);
                 (made.0, *added.last().ok_or(KernelError::Io)?)
             }
         };
@@ -2565,7 +2573,7 @@ impl InodeOps for VfatInodeOps {
         fat_truncate_time(old_dir, None, true, true);
         old_dir.inc_iversion();
         fat_truncate_time(old_dir, Some(ts), false, true);
-        let _ = write_inode_sb(old_dir, &sb_data);
+        dir_changed(old_dir, &sb, &sb_data);
 
         // The replaced object loses its name (drop_nlink): its clusters
         // go with its inode, or now if none is cached
@@ -2760,6 +2768,18 @@ fn dir_sync(sb: &SuperBlock, sb_data: &VfatSbData) -> Result<(), KernelError> {
         return Ok(());
     }
     crate::block::blkdev::sync_blockdev(&sb_data.bdev)
+}
+
+/// A directory's entries or times changed (Linux vfat_add_entry,
+/// fat_remove_entries, vfat_update_dir_metadata): on a dirsync mount
+/// its entry is written now, its error ignored (fat_sync_inode's
+/// (void)), else it is marked dirty
+fn dir_changed(dir: &Inode, sb: &SuperBlock, sb_data: &VfatSbData) {
+    if sb.dirsync() {
+        let _ = write_inode_sb(dir, sb_data);
+    } else {
+        super::fs_writeback::mark_inode_dirty(dir);
+    }
 }
 
 /// Inode cache key of the entry `short` in the directory at `parent`
@@ -3067,6 +3087,11 @@ pub static VFAT_FILE_OPS: VfatFileOps = VfatFileOps;
 pub struct VfatSuperOps;
 
 impl SuperOps for VfatSuperOps {
+    /// Linux fat_write_inode
+    fn write_inode(&self, inode: &Inode) -> Result<(), KernelError> {
+        fat_write_inode(inode)
+    }
+
     /// Its filesystem data goes (Linux fat_put_super: the sbi freed)
     fn put_super(&self, sb: &SuperBlock) {
         let sbi = sb.private.write().take();
