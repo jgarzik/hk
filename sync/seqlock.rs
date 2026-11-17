@@ -57,6 +57,13 @@ impl SeqCount {
         }
     }
 
+    /// Begin a lockless read without waiting out a writer (Linux
+    /// raw_seqcount_begin): an odd count comes back even, so a read that
+    /// began inside a write section fails its `read_retry`
+    pub fn raw_begin(&self) -> u32 {
+        self.seq.load(Ordering::Acquire) & !1
+    }
+
     /// The read since `start` raced a writer and must be repeated (Linux
     /// read_seqcount_retry: smp_rmb, then the counter)
     pub fn read_retry(&self, start: u32) -> bool {

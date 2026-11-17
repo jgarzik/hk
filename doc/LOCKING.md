@@ -2894,6 +2894,20 @@ hlist_bl_lock). A walk
 that misses during a rename (`lookup_cached`/`cached` without the
 directory lock) is fine: lookup_slow rechecks under i_rwsem.
 
+`__d_lookup_rcu` (Linux __d_lookup_rcu, for the RCU path walk) takes
+no lock, no reference and stores nothing: under the caller's RCU read
+guard it walks the bucket and reads each candidate's parent, key,
+name and `DCACHE_UNHASHED` after a raw `d_seq` sample (Linux
+raw_seqcount_begin: a writer is not waited for; its odd count fails
+the caller's check), returning the hit with that value; with the
+parent's `DentryOps` the name is read whole (the sample checked)
+before `d_compare` runs (Linux __d_lookup_rcu_op_compare). The caller
+confirms what it read with `Dentry::d_seq_retry` and turns the
+borrowed dentry into a reference with `DentryRef::try_get` (Linux
+lockref_get_not_dead), checking the seq after (Linux
+legitimize_path); a reference that then fails the check is dropped
+after the guard (a last put may sleep: Linux terminate_walk).
+
 A name (`fs::name::DName`, Linux qstr over d_shortname or an
 external_name) is inline below `DNAME_INLINE_LEN` (40) bytes, else a
 refcounted `Arc<ExternalName>` allocated, fallibly, when the dentry is
