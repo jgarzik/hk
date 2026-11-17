@@ -35,13 +35,6 @@ argued / published copy of locked state.
   shared dentries.
 - Fix: RCU-walk for dcache (its own phase).
 
-### 5. Page allocator boot-only fields as atomics — (a)
-- Where: `mm/page_alloc.rs` `Zone.map`, `start`, `end`, `managed`,
-  `sections`, `batch`, `high` (set at boot, atomics rather than set-once,
-  rule 5). The counts and the drain lock are done.
-- Fix: set-once (`Once` or the constructor) where boot order allows.
-
-
 
 ## Checked and judged legitimate (f)
 
@@ -76,11 +69,8 @@ argued / published copy of locked state.
 LOCKING.md §5.4 rules 10-12 (single writers, per-CPU areas, no published
 copies) and the primitives behind them (`percpu!` areas, queued spin and
 rwlocks, `cpu::LocalWord`) are in place, and `sync::LockedCell` (a cell
-owned by one of many instances of a lock, first used by the timer
-bases and the run queues (`SchedEntity.rq`). Still to do: its zone
-users. Each atomic field's doc
+owned by one of many instances of a lock: the timer bases, and the
+run queues' `SchedEntity.rq`). Each atomic field's doc
 comment names its lockless reader and Linux equivalent (rule 7); a field
 "under lock X" with no lockless reader is a bug to fix. Remaining phases
-by blast radius: 4-6 and 15/21 (scheduler, allocator, syscall path),
-then 7-14 and 19-20 (RCU, VFS, net, mm hot paths), then 10-12, 16-18
-and 22 (published copies, flag locks).
+by blast radius: 3 and 13 (VFS, mm hot paths), then 22.

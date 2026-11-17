@@ -1767,8 +1767,19 @@ pub struct Zone {
   drain (debug builds assert they do not pass `Gfp::RECLAIM`). A CPU
   without
   per-CPU data yet (coming up, or the boot CPU early) never touches a
-  per-CPU list: it allocates and frees under `Zone.lock`. A list's page
+  per-CPU list: it allocates and frees under `Zone.lock`, as every CPU
+  does until the lists are sized. A list's page
   count is an atomic beside its lock (statistics read it lock-free).
+- Set once at boot, before any allocation, single CPU: the zone's span
+  (`Zone.span`: struct page base, pfn range, section checks; Linux
+  zone_start_pfn / spanned_pages) in `init`, and the per-CPU lists'
+  batch and high (`Zone.pcp_size`, Linux pcp->batch / pcp->high) in
+  `setup_pcp` at the end of the boot handover (`init_done`). Both are
+  `spin::Once` (a second set panics); before the sizes exist no CPU
+  uses its list (Linux boot_pageset: high 0, batch 1, the same).
+  `Zone.managed` (Linux managed_pages) grows at boot and when reserved
+  boot memory is given up (`free_reserved`), under `Zone.lock` (a load
+  and a store), read lock-free for statistics and list sizing.
 - Both are IRQ-safe: allocating or freeing in interrupt context cannot
   deadlock against an interrupted allocator (policy is still no
   allocation in IRQ context).
