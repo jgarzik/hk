@@ -86,7 +86,7 @@ pub fn sys_getcwd(buf: UserPtr<u8>, size: u64) -> KernelResult<usize> {
     // Linux getcwd: ENOENT for a removed directory; one outside the
     // root (a chroot escape, a detached mount) is "(unreachable)..."
     let pwd = fs.get_pwd();
-    if pwd.dentry.is_unhashed() {
+    if pwd.dentry.d_unlinked() {
         return Err(KernelError::NotFound);
     }
     let root = crate::fs::namei::nd_root()?;

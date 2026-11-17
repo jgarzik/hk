@@ -123,9 +123,10 @@ impl Link {
             .is_ok()
     }
 
-    /// On a hash chain (`util::hlist_bl`; read under its lock)
-    #[cfg(test)]
-    pub(super) fn is_hashed(&self) -> bool {
+    /// On a hash chain (`util::hlist_bl`; Linux !hlist_bl_unhashed):
+    /// exact under the chain's lock, else a lockless snapshot that the
+    /// caller confirms by other means (a dentry's `d_seq`)
+    pub fn is_hashed(&self) -> bool {
         self.prev.load(Relaxed) != UNLINKED
     }
 

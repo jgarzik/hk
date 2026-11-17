@@ -46,6 +46,14 @@ impl SeqCount {
             .store(self.seq.load(Ordering::Relaxed).wrapping_add(n), ord);
     }
 
+    /// Make every read begun before now repeat, without a write section
+    /// (Linux write_seqcount_invalidate: smp_wmb, then +2), under the
+    /// writers' lock: the writer's earlier stores come first
+    pub fn invalidate(&self) {
+        fence(Ordering::Release);
+        self.bump(2, Ordering::Relaxed);
+    }
+
     /// Begin a lockless read (Linux read_seqcount_begin): waits out a
     /// writer
     pub fn read_begin(&self) -> u32 {

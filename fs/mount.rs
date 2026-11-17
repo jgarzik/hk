@@ -2456,7 +2456,7 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
     if new.mnt.flags() & MNT_LOCKED != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    if new.dentry.is_unhashed() {
+    if new.dentry.d_unlinked() {
         return Err(KernelError::NotFound);
     }
     if MountRef::ptr_eq(&new.mnt, &root.mnt) || MountRef::ptr_eq(&put_old.mnt, &root.mnt) {

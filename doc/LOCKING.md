@@ -2781,8 +2781,10 @@ pub struct Dentry {
     d_count: AtomicUsize,       // DentryRef count (Linux d_lockref.count)
     d_parent: AtomicPtr<Dentry>, // A reference (Linux d_parent); d_lock
     d_rcu: RcuHead,             // The free after a grace period
+    d_seq: SeqCount,            // Linux d_seq; writers hold d_lock (write)
+    d_flags: AtomicU32,         // DCACHE_MOUNTED; d_lock (write), read lock-free
     d_sib: Link, d_sib_owner: Owner, // Parent's children (its d_lock)
-    d_hash: Link,               // Hash bucket (its bit lock)
+    d_hash: Link,               // Hash bucket (its bit lock); linked = hashed
     d_hkey: AtomicU64, d_hparent: AtomicUsize, // Hash key, parent (parent's d_lock)
     d_name: RwLock<DName>,      // Leaf; changed by d_move/d_exchange
     d_alias: Link,              // Its inode's i_dentry (that lock)
@@ -2792,9 +2794,26 @@ pub struct Dentry {
 struct DentryInner {
     inode: Option<Arc<Inode>>,
     children: OwnedList<SibAdapter, DentryRef>, // Linux d_children
-    flags: DentryFlags,
 }
 ```
+
+`d_seq` (Linux d_seq, a `SeqCount`) is written only under the
+dentry's d_lock held for writing: a write section (plain increments,
+1.4.1) surrounds setting or clearing its inode (`add`: Linux
+__d_instantiate / __d_add; `d_delete` and `dentry_kill`: Linux
+dentry_unlink_inode) and a move's parent and name change (`__d_move`,
+both dentries' sections nested inside all four d_locks); leaving the
+tree (`__d_drop`, the one helper for every unhook) moves it on by two
+(Linux write_seqcount_invalidate). `d_flags` (Linux d_flags) bits are
+changed with plain stores under the d_lock held for writing and read
+with no lock (Acquire, Linux READ_ONCE): `is_mountpoint`. A dentry is
+hashed (Linux !d_unhashed: `d_hash` linked, `Link::is_hashed`) exactly
+while it is in the tree; every hash and unhash holds its d_lock for
+writing, so `d_unhashed` is exact under it and otherwise a lockless
+snapshot (an RCU reader confirms it by `d_seq`). A root, a pseudo
+filesystem's dentry and an O_TMPFILE file's are never hashed;
+`d_unlinked` (unhashed and not a root, Linux d_unlinked) is what
+d_path's " (deleted)", getcwd and pivot_root test.
 
 A dentry is held through `DentryRef` (Linux dget/dput on d_lockref):
 the tree's two references, each child's `d_parent`, and every
@@ -2834,7 +2853,7 @@ preempt count and lockdep, one class) -> `d_name` (leaf).
 no d_lock: it walks the bucket once under an RCU read guard with no
 lock, and checks a candidate whose key and parent address match under
 the candidate's own d_lock (read; Linux spin_lock(&dentry->d_lock)):
-still a child of the parent, not unhashed, the name matching (a
+still a child of the parent, hashed, the name matching (a
 filesystem's `DentryOps`, Linux d_hash/d_compare, hash and compare
 where names match more than their bytes: vfat, without case or
 trailing dots; no lock of their own), then takes its reference there
@@ -2844,9 +2863,8 @@ count under that child's d_lock (write), see every lookup's
 reference. That is sound: dentries are freed a grace period after
 their last put and published with Release stores; the key and parent
 address are atomics; the name is read under `d_name`, which only
-d_move/d_exchange write, with the dentry unhashed (every unhook sets
-`unhashed` under the dentry's d_lock first, as Linux __d_move's
-__d_drop under it). A walk standing on a dentry a rename moves to
+d_move/d_exchange write, with the dentry unhashed under its d_lock
+(Linux __d_move's ___d_drop under it). A walk standing on a dentry a rename moves to
 another bucket follows it there and may miss; only d_move/d_exchange
 rehash, under RENAME_LOCK, so `d_lookup` repeats a miss while
 RENAME_LOCK's sequence moved (read_seqbegin / read_seqretry, as
@@ -2871,8 +2889,13 @@ an ENOMEM comes before any change.
 
 A rename moves the dentry itself (`d_move`, `d_exchange`) under the
 global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
-`i_rwsem` held by the caller; each step takes one `d_lock` at a time
-(parent, then the moved or replaced child). The
+`i_rwsem` held by the caller, as Linux __d_move: both parents'
+d_locks (the one that is an ancestor of the other first, `d_ancestor`;
+otherwise the target's parent first; one when they are the same), then
+the moved dentry's, then the target's, all held for the whole switch,
+inside both dentries' `d_seq` write sections; whoever else takes two
+d_locks takes a parent before its child, so this order meets no cycle.
+Nothing is allocated or dropped last under them. The
 write guard keeps the lock's sequence odd, which scoped walks check.
 `is_subdir`, `dentry_path` and `d_path` read parents and names as
 Linux does (read_seqbegin_or_lock, `SeqLock::read_or_lock`): a first
@@ -3207,7 +3230,7 @@ m_start), which umount excludes. A put clears an MNT_EXPIRE mark
    nothing above held)
 4. mount::MOUNT_LOCK (attach_mnt / detach_mnt / umount_tree; Mount::alloc)
 5. MntNamespace.root (read/write)
-6. Dentry.d_lock (DentryInner.flags: DCACHE_MOUNTED, with the mountpoint)
+6. Dentry.d_lock (d_flags: DCACHE_MOUNTED, with the mountpoint)
 ```
 Every mount, bind, MS_MOVE and pivot_root locks its target with
 `lock_mount` (Linux do_lock_mount): where to mount (`where_to_mount`:
