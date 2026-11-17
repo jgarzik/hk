@@ -144,20 +144,6 @@ argued / published copy of locked state.
 - Fix: read through the struct pid under RCU (or TASKLIST read where already
   held); delete the mirrors.
 
-### 18. Softnet `busy` and NAPI `sched`/`disable`: flags emulating a lock / state word — (d)(b)
-- Where: `net/core/dev.rs` `Softnet.busy` (`process_backlog` `swap(true)`
-  trylock), `has_work`; `Napi.sched`, `Napi.disable`, `napi_schedule`,
-  `napi_complete_done`, `napi_disable`.
-- Wrong: `busy` is an unnamed trylock (no lockdep, wake-up hand-off argued
-  in prose). NAPI state is two separate booleans; there is no MISSED state,
-  so a `napi_schedule` during the poll is lost unless every driver re-checks
-  its causes after completing.
-- Linux: `process_backlog` is the per-CPU backlog NAPI, serialized by
-  `NAPI_STATE_SCHED`; one `napi->state` word with `cmpxchg` transitions
-  (SCHED, MISSED, DISABLE).
-- Fix: single NAPI state word with Linux's transitions (including MISSED);
-  run the backlog as a NAPI instance so `busy` disappears.
-
 ### 22. Inode identity bits as unrelated atomics — (b), low
 - Where: `fs/inode.rs` `Inode.mode`, `uid`, `gid` (chown/chmod write them
   separately), `dead`, `i_swapfile`, `i_linkable`.

@@ -31,7 +31,10 @@
 //!   never allocates.
 //! - `Softnet.backlog`: an `SkbQueue` (its spin lock, Linux
 //!   input_pkt_queue.lock), thread context only, leaf; skbs taken off
-//!   under it are dropped after.
+//!   under it are dropped after. The backlog is polled as its own NAPI
+//!   (Linux sd->backlog), whose SCHED changes under this lock.
+//! - `Napi.state`: SCHED/MISSED/DISABLE in one word, compare-and-swap
+//!   transitions as Linux's.
 //! - `PTYPE_BASE`: an RCU list of static `PacketType`s (Linux ptype_base),
 //!   added to at boot, read under RCU; the handler is copied out and
 //!   called after the guard is dropped.
@@ -43,7 +46,7 @@
 use crate::util::kalloc::arc_nofail;
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::RwLock;
 use crate::util::list::{ArcList, Link};
@@ -162,14 +165,23 @@ pub trait NapiPoll: Send + Sync {
     fn poll(&self, napi: &Napi, budget: usize) -> usize;
 }
 
+/// NAPI state bits (Linux NAPI_STATE_*)
+mod st {
+    /// Scheduled: on a poll list or being polled; owned by whoever set
+    /// it (Linux NAPI_STATE_SCHED)
+    pub const SCHED: u32 = 1;
+    /// A schedule came while scheduled: poll again rather than complete
+    /// (Linux NAPI_STATE_MISSED)
+    pub const MISSED: u32 = 2;
+    /// `napi_disable` waits: no new schedule, the poll loop completes it
+    /// (Linux NAPI_STATE_DISABLE)
+    pub const DISABLE: u32 = 4;
+}
+
 /// NAPI context (Linux struct napi_struct)
 pub struct Napi {
-    /// Scheduled: on a poll list or being polled (held by
-    /// `napi_disable` while disabled, so it cannot be scheduled)
-    sched: AtomicBool,
-    /// `napi_disable` waits: the softnet loop completes it instead of
-    /// polling it again (Linux NAPI_STATE_DISABLE)
-    disable: AtomicBool,
+    /// `st` bits, changed by compare-and-swap (Linux napi->state)
+    state: AtomicU32,
     /// Packets per poll
     weight: usize,
     /// The driver (weak: the driver owns the Napi)
@@ -187,8 +199,7 @@ impl Napi {
     pub fn new(weight: usize) -> Arc<Self> {
         // Driver probe has no failure path
         arc_nofail(Self {
-            sched: AtomicBool::new(false),
-            disable: AtomicBool::new(false),
+            state: AtomicU32::new(0),
             weight: weight.clamp(1, NAPI_POLL_WEIGHT),
             poller: Once::new(),
             polls: AtomicU64::new(0),
@@ -203,7 +214,11 @@ impl Napi {
 
     /// True while scheduled or being polled
     pub fn is_scheduled(&self) -> bool {
-        self.sched.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & st::SCHED != 0
+    }
+
+    fn disable_pending(&self) -> bool {
+        self.state.load(Ordering::Acquire) & st::DISABLE != 0
     }
 
     fn poll(&self, budget: usize) -> usize {
@@ -217,6 +232,14 @@ impl Napi {
                 0
             }
         }
+    }
+
+    /// Apply `f` to the state until the compare-and-swap takes (Linux's
+    /// try_cmpxchg loops); returns the old state, or None if `f` declines
+    fn update(&self, f: impl Fn(u32) -> Option<u32>) -> Option<u32> {
+        self.state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, f)
+            .ok()
     }
 }
 
@@ -235,45 +258,91 @@ pub fn netif_napi_del(napi: &Arc<Napi>) {
     );
 }
 
-/// Schedule `napi` for polling on this CPU's softnet thread
-///
-/// IRQ-safe (Linux `napi_schedule`). The caller (an ISR) has masked the
-/// device's interrupts; the poll routine re-enables them on completion.
-pub fn napi_schedule(napi: &Arc<Napi>) {
-    if napi.sched.swap(true, Ordering::AcqRel) {
-        return; // already scheduled
+/// Claim `napi` for a poll (Linux napi_schedule_prep): true if the
+/// caller set SCHED and must queue it; while it is already scheduled
+/// MISSED is set instead, so the running poll goes round again; never
+/// while a disable is pending
+fn napi_schedule_prep(napi: &Napi) -> bool {
+    napi.update(prep_next).is_some_and(|v| v & st::SCHED == 0)
+}
+
+/// napi_schedule_prep's new state from `v`: None while disabling
+fn prep_next(v: u32) -> Option<u32> {
+    if v & st::DISABLE != 0 {
+        return None;
     }
+    let missed = if v & st::SCHED != 0 { st::MISSED } else { 0 };
+    Some(v | st::SCHED | missed)
+}
+
+/// napi_complete_done's new state from `v`: SCHED kept if MISSED
+fn complete_next(v: u32) -> u32 {
+    let keep = if v & st::MISSED != 0 { st::SCHED } else { 0 };
+    (v & !(st::SCHED | st::MISSED)) | keep
+}
+
+/// Queue `napi`, whose SCHED the caller set, on this CPU's poll list
+/// (Linux ____napi_schedule)
+fn napi_queue(napi: &Arc<Napi>) {
     let sd = this_softnet();
     sd.poll_list.lock().push_back(Arc::clone(napi));
     sd.wq.wake_all();
 }
 
-/// Mark a NAPI poll complete (called by the driver's poll when it did less
-/// than its budget, before re-enabling device interrupts)
+/// Schedule `napi` for polling on this CPU's softnet thread
 ///
-/// A full barrier (SeqCst RMW, like Linux's cmpxchg): an ISR that found
-/// the NAPI still scheduled (its `napi_schedule` was a no-op) recorded
-/// its causes before that, so the driver's re-check of pending causes
-/// after this call sees them.
+/// IRQ-safe (Linux `napi_schedule`). The caller (an ISR) has masked the
+/// device's interrupts; the poll routine re-enables them on completion.
+pub fn napi_schedule(napi: &Arc<Napi>) {
+    if napi_schedule_prep(napi) {
+        napi_queue(napi);
+    }
+}
+
+/// Mark a NAPI poll complete (Linux napi_complete_done; called by the
+/// driver's poll when it did less than its budget): true if done, and
+/// the driver re-enables its interrupts; false if a schedule came
+/// during the poll (MISSED): it stays scheduled, queued again, and the
+/// driver leaves its interrupts masked. A full barrier (the
+/// compare-and-swap, as Linux's cmpxchg): causes recorded before an
+/// ISR's schedule are seen by the driver's re-check after this.
 pub fn napi_complete_done(napi: &Napi, _work_done: usize) -> bool {
-    napi.sched.swap(false, Ordering::SeqCst);
+    let old = napi
+        .state
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            debug_assert!(v & st::SCHED != 0, "napi_complete_done: not scheduled");
+            Some(complete_next(v))
+        })
+        .unwrap_or(0);
+    if old & st::MISSED != 0 {
+        // Linux __napi_schedule: the poll loop holds the reference the
+        // poll list gave up and puts it back when the poll returns
+        this_softnet()
+            .requeue
+            .store(core::ptr::from_ref(napi).cast_mut(), Ordering::Relaxed);
+        return false;
+    }
     true
 }
 
 /// Stop polling `napi` (Linux napi_disable; process context, may
-/// sleep): waits for a scheduled or running poll to complete, then
-/// holds `sched` so it cannot be scheduled again until `napi_enable`
+/// sleep): no new schedule from here (DISABLE), a scheduled or running
+/// poll is waited out, then SCHED is held until `napi_enable`
 pub fn napi_disable(napi: &Napi) {
-    napi.disable.store(true, Ordering::SeqCst);
-    while napi.sched.swap(true, Ordering::SeqCst) {
+    napi.state.fetch_or(st::DISABLE, Ordering::SeqCst);
+    while napi
+        .update(|v| (v & st::SCHED == 0).then_some(v | st::SCHED))
+        .is_none()
+    {
         napi_wait();
     }
-    napi.disable.store(false, Ordering::SeqCst);
+    napi.state.fetch_and(!st::DISABLE, Ordering::SeqCst);
 }
 
 /// Allow `napi` to be scheduled again (Linux napi_enable)
 pub fn napi_enable(napi: &Napi) {
-    napi.sched.store(false, Ordering::SeqCst);
+    napi.state
+        .fetch_and(!(st::SCHED | st::MISSED), Ordering::SeqCst);
 }
 
 /// Back off while a poll finishes
@@ -294,11 +363,16 @@ struct Softnet {
     /// Packets queued by netif_rx (Linux input_pkt_queue; thread
     /// context only)
     backlog: SkbQueue<Box<SkBuff>>,
+    /// The backlog's NAPI (Linux sd->backlog): scheduled by the netif_rx
+    /// that finds the queue empty, completed by the poll that empties
+    /// it, both under the queue's lock; made on first use
+    backlog_napi: Once<Arc<Napi>>,
+    /// The NAPI this CPU's poll completed with MISSED (Linux
+    /// __napi_schedule from napi_complete_done): put back on the list by
+    /// the poll loop that holds it; this CPU's poller alone
+    requeue: core::sync::atomic::AtomicPtr<Napi>,
     /// The softnet thread sleeps here
     wq: WaitQueue,
-    /// Set while a task processes this CPU's backlog (softnet thread or an
-    /// inline flush): keeps the per-CPU processing single-threaded
-    busy: AtomicBool,
     /// Its `softnet/N` thread (Linux the CPU's ksoftirqd)
     thread: Once<Arc<KThread>>,
     /// Packets processed (Linux softnet_stat "processed")
@@ -314,8 +388,9 @@ impl Softnet {
         Self {
             poll_list: IrqSpinlock::new(ArcList::new()),
             backlog: SkbQueue::new(),
+            backlog_napi: Once::new(),
+            requeue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             wq: WaitQueue::new(),
-            busy: AtomicBool::new(false),
             thread: Once::new(),
             processed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -323,15 +398,37 @@ impl Softnet {
         }
     }
 
-    /// Separate statements: the poll_list IrqSpinlock guard of a
-    /// `a.lock().x() || b.lock().y()` chain would live across the
-    /// backlog lock. A backlog held `busy` by an inline flush is not
-    /// this thread's work (it would only spin): the flusher wakes it
-    /// when it leaves packets behind.
+    /// A NAPI to poll (the backlog's among them)
     fn has_work(&self) -> bool {
-        let napi = !self.poll_list.lock().is_empty();
-        let backlog = !self.busy.load(Ordering::Acquire) && !self.backlog.lock().is_empty();
-        napi || backlog
+        !self.poll_list.lock().is_empty()
+    }
+
+    /// The backlog's NAPI, polled by [`process_backlog`] for CPU `cpu`
+    fn backlog_napi(&'static self, cpu: u32) -> &'static Arc<Napi> {
+        self.backlog_napi.call_once(|| {
+            let n = Napi::new(NAPI_POLL_WEIGHT);
+            let p: Arc<dyn NapiPoll> = arc_nofail(Backlog(cpu));
+            // The poller lives as long as the per-CPU Softnet
+            n.poller.call_once(|| Arc::downgrade(&p));
+            core::mem::forget(p);
+            n
+        })
+    }
+
+    /// Poll `napi` once with `quota`; true if it stays scheduled (used
+    /// its quota, or completed with MISSED): the caller puts it back
+    fn poll_one(&self, napi: &Arc<Napi>, quota: usize) -> (usize, bool) {
+        self.requeue.store(core::ptr::null_mut(), Ordering::Relaxed);
+        let work = napi.poll(quota);
+        if work < quota {
+            let again = core::ptr::eq(self.requeue.load(Ordering::Relaxed), Arc::as_ptr(napi));
+            return (work, again);
+        }
+        if napi.disable_pending() {
+            // napi_disable waits: complete it (Linux __napi_poll)
+            return (work, !napi_complete_done(napi, work));
+        }
+        (work, true)
     }
 }
 
@@ -374,28 +471,18 @@ fn softnet_thread(cpu: usize) {
         sd.wq.wait_event(|| sd.has_work());
         let mut budget = NETDEV_BUDGET;
 
-        // NAPI devices, round-robin, `weight` packets each
+        // NAPI contexts, the backlog's among them, round-robin,
+        // `weight` packets each (Linux net_rx_action)
         while budget > 0 {
             let Some(napi) = sd.poll_list.lock().pop_front() else {
                 break;
             };
-            let quota = napi.weight.min(budget);
-            let work = napi.poll(quota);
+            let (work, again) = sd.poll_one(&napi, napi.weight.min(budget));
             budget = budget.saturating_sub(work);
-            if work >= quota {
-                if napi.disable.load(Ordering::SeqCst) {
-                    // napi_disable waits: complete it (Linux __napi_poll)
-                    napi_complete_done(&napi, work);
-                } else {
-                    // Not completed: keep polling it (sched stays set)
-                    sd.poll_list.lock().push_back(napi);
-                }
+            if again {
+                // Still scheduled (SCHED held): keep polling it
+                sd.poll_list.lock().push_back(napi);
             }
-        }
-
-        // netif_rx backlog (Linux process_backlog)
-        if budget > 0 {
-            budget -= process_backlog(sd, budget.min(NAPI_POLL_WEIGHT));
         }
 
         if budget == 0 {
@@ -410,20 +497,36 @@ fn softnet_thread(cpu: usize) {
     }
 }
 
-/// Deliver up to `quota` backlog packets; returns how many
-fn process_backlog(sd: &Softnet, quota: usize) -> usize {
-    if sd.busy.swap(true, Ordering::Acquire) {
-        return 0;
+/// The poller of CPU `.0`'s backlog NAPI
+struct Backlog(u32);
+
+impl NapiPoll for Backlog {
+    fn poll(&self, napi: &Napi, budget: usize) -> usize {
+        process_backlog(SOFTNET.get(self.0), napi, budget)
     }
+}
+
+/// Deliver up to `quota` backlog packets (Linux process_backlog); the
+/// poll that empties the queue completes the NAPI under the queue's
+/// lock, so the next netif_rx schedules it again
+fn process_backlog(sd: &Softnet, napi: &Napi, quota: usize) -> usize {
     let mut done = 0;
     while done < quota {
-        let Some(skb) = sd.backlog.dequeue() else {
-            break;
+        let skb = {
+            let mut q = sd.backlog.lock();
+            match q.pop_front() {
+                Some(skb) => skb,
+                None => {
+                    // Linux: napi->state &= NAPIF_STATE_THREADED, under
+                    // the queue lock (only netif_rx sets SCHED, under it)
+                    napi.state.fetch_and(!st::SCHED, Ordering::Release);
+                    return done;
+                }
+            }
         };
         netif_receive_skb(skb);
         done += 1;
     }
-    sd.busy.store(false, Ordering::Release);
     done
 }
 
@@ -441,7 +544,8 @@ pub fn netif_rx(skb: Box<SkBuff>) -> bool {
     crate::task::percpu::current()
         .rx_cpu
         .store(cpu, Ordering::Relaxed);
-    {
+    let napi = sd.backlog_napi(cpu);
+    let sched = {
         let mut q = sd.backlog.lock();
         if q.len() >= NETDEV_MAX_BACKLOG {
             drop(q);
@@ -452,8 +556,14 @@ pub fn netif_rx(skb: Box<SkBuff>) -> bool {
             return false;
         }
         q.push_back(skb);
+        // Linux enqueue_to_backlog: SCHED set under the queue lock
+        napi.state.fetch_or(st::SCHED, Ordering::AcqRel) & st::SCHED == 0
+    };
+    if sched {
+        // Queued on its own CPU's list (Linux napi_schedule_rps)
+        sd.poll_list.lock().push_back(Arc::clone(napi));
+        sd.wq.wake_all();
     }
-    sd.wq.wake_all();
     true
 }
 
@@ -479,23 +589,36 @@ pub fn netif_rx_flush_local() {
         cpu => cpu,
     };
     let sd = SOFTNET.get(cpu);
+    let napi = sd.backlog_napi(cpu);
+    // Taken off the poll list, it is ours to poll (Linux net_rx_action
+    // splices the list); one being polled already is the thread's
+    let mine = Arc::as_ptr(napi);
+    let Some(napi) = sd.poll_list.lock().remove_first(|n| core::ptr::eq(n, mine)) else {
+        return;
+    };
     // On the IRQ stack, atomic, allocating GFP_ATOMIC (Linux runs these
     // pending softirqs at local_bh_enable through do_softirq_own_stack):
     // a receive path nested in a deep task path (an exit closing TCP
     // sockets over lo) does not add to the task's stack
+    let mut again = false;
     crate::irq_stack::run_softirq(|| {
-        crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
+        again = crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
             let mut budget = NETDEV_BUDGET;
-            while budget > 0 && !sd.backlog.lock().is_empty() {
-                let n = process_backlog(sd, budget.min(NAPI_POLL_WEIGHT));
-                if n == 0 {
-                    break;
+            loop {
+                let n = process_backlog(sd, &napi, budget.min(NAPI_POLL_WEIGHT));
+                if !napi.is_scheduled() {
+                    return false;
                 }
-                budget -= n;
+                budget = budget.saturating_sub(n);
+                if budget == 0 {
+                    return true;
+                }
             }
         });
     });
-    if !sd.backlog.lock().is_empty() {
+    if again {
+        // Budget spent: the rest is the thread's
+        sd.poll_list.lock().push_back(napi);
         sd.wq.wake_all();
     }
 }
@@ -574,4 +697,29 @@ pub fn softnet_stats(cpu: usize) -> Option<(u64, u64, u64)> {
         sd.dropped.load(Ordering::Relaxed),
         sd.time_squeeze.load(Ordering::Relaxed),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_during_poll_is_missed() {
+        // Idle -> scheduled by the first prep
+        let v = prep_next(0).unwrap();
+        assert_eq!(v, st::SCHED);
+        // A second schedule while polled: MISSED, no new owner
+        let v2 = prep_next(v).unwrap();
+        assert_eq!(v2, st::SCHED | st::MISSED);
+        // Completion with MISSED keeps it scheduled, clears MISSED
+        assert_eq!(complete_next(v2), st::SCHED);
+        // A plain completion leaves it idle
+        assert_eq!(complete_next(st::SCHED), 0);
+    }
+
+    #[test]
+    fn no_schedule_while_disabling() {
+        assert_eq!(prep_next(st::DISABLE), None);
+        assert_eq!(prep_next(st::DISABLE | st::SCHED), None);
+    }
 }

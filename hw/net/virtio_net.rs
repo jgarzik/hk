@@ -330,8 +330,9 @@ impl NapiPoll for VirtioNet {
             net::dev::netif_receive_skb(skb);
         }
 
-        if work < budget {
-            napi_complete_done(napi, work);
+        // Linux virtqueue_napi_complete: re-check only if done (a MISSED
+        // completion polls again)
+        if work < budget && napi_complete_done(napi, work) {
             // A closed device keeps RX interrupts suppressed
             if self.rearm() {
                 self.rx_cb.disable();

@@ -540,11 +540,10 @@ impl NapiPoll for E1000 {
             net::dev::netif_receive_skb(skb);
         }
 
-        if work < budget {
-            napi_complete_done(napi, work);
-            if self.rearm() {
-                napi_schedule(&self.napi);
-            }
+        // Interrupts back on only if done (Linux e1000_clean: a MISSED
+        // completion polls again with them masked)
+        if work < budget && napi_complete_done(napi, work) && self.rearm() {
+            napi_schedule(&self.napi);
         }
         work
     }
