@@ -250,13 +250,27 @@ impl OpenAt<'_> {
             Self::Root(r) => filename_lookup_from(Some(r.clone()), path, lf),
         }
     }
+
+    /// [`OpenAt::lookup`] in one try, its walks starting in RCU mode if
+    /// `rcu` (Linux path_openat's path_init + link_path_walk, with or
+    /// without LOOKUP_RCU); the caller retries on ECHILD (`open_target`)
+    fn lookup_try(self, path: &[u8], lf: LookupFlags, rcu: bool) -> Result<Path, KernelError> {
+        let start = self.start(path, lf)?;
+        if path.is_empty() {
+            return filename_lookup_from(start, path, lf);
+        }
+        let s = start.as_ref();
+        Nd::new(s, lf, rcu)?.lookup(s, path, lf)
+    }
 }
 
 /// Resolve the open target: an existing file, or (O_CREAT) a newly
 /// created one; the bool says it was created by this call. Walked in
 /// RCU mode first, again in ref mode if that is ECHILD (Linux
 /// do_filp_open's retry of path_openat), which comes before anything
-/// is created.
+/// is created; the only RCU-to-ref retry, as every walk below is one
+/// try in the mode given. (Linux's third try, LOOKUP_REVAL on ESTALE,
+/// has no case here: no walk returns ESTALE.)
 fn open_target(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), KernelError> {
     match open_target_nd(at, path, op, true) {
         Err(KernelError::NoChild) => open_target_nd(at, path, op, false),
@@ -273,12 +287,12 @@ fn open_target_nd(
 ) -> Result<(Path, bool), KernelError> {
     let (flags, lf) = (op.flags, op.lookup);
     if flags & O_CREAT == 0 {
-        return Ok((at.lookup(path, lf)?, false));
+        return Ok((at.lookup_try(path, lf, rcu)?, false));
     }
     // O_CREAT|O_EMPTYPATH of an empty name: dirfd's own file; there is
     // no last name, so no parent's sticky check (Linux nd->dir_mode is 0)
     if path.is_empty() {
-        return creat_existing(at.lookup(path, lf)?, flags);
+        return creat_existing(at.lookup_try(path, lf, rcu)?, flags);
     }
     // O_CREAT (Linux open_last_lookups): the parent is walked, then a
     // last name of "/", "." or ".." (a directory) or one with a trailing

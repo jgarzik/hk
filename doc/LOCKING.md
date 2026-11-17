@@ -3450,8 +3450,9 @@ ENOENT: a rename may have taken the directory out of the subtree.
 
 **RCU path walk** (`fs/namei/rcu.rs`; Linux LOOKUP_RCU,
 link_path_walk, lookup_fast, step_into, try_to_unlazy): every lookup
-(`path_lookupat`, `filename_parentat`, an open's `open_target`) first
-walks under one RCU read guard, which disables preemption: nothing in
+(`path_lookupat`, `filename_parentat`, an open's `open_target`: each
+the one place its RCU-to-ref retry happens, every walk under it one
+try in the mode given) first walks under one RCU read guard, which disables preemption: nothing in
 it sleeps, takes a sleeping lock, allocates or drops a reference, and
 it stores to no shared dentry, inode or lock word. Its place
 (`RcuPath`: mount, dentry, inode, `d_seq` value, no references) moves
