@@ -94,6 +94,7 @@ fn run(rootfd: i32) {
     report_r(b"RESOLVE_NO_MAGICLINKS", no_magiclinks(rootfd));
     report_r(b"RESOLVE_NO_SYMLINKS", cases(rootfd, &NO_SYMLINKS_CASES));
     report_r(b"RESOLVE_CACHED", cached(rootfd));
+    report_r(b"RESOLVE_CACHED_SYMLINK", cached_symlink(rootfd));
 }
 
 /// "/tmp/rs/root/<p>\0" in `b`
@@ -493,6 +494,40 @@ const NO_SYMLINKS_CASES: [Case; 16] = [
         No(ELOOP),
     ),
 ];
+
+/// RESOLVE_CACHED through symlinks whose bodies the inode keeps (Linux
+/// pick_link in RCU mode: tmpfs's i_link; ramfs's page, cached): once
+/// followed a clock tick after its creation (relatime: an atime still
+/// to update leaves RCU mode, EAGAIN) a link resolves from the dcache
+/// alone, on ramfs and on tmpfs, a body ending in a slash included
+fn cached_symlink(rootfd: i32) -> R {
+    let mut b = [0u8; 128];
+    let r = sys_symlink(b"etc/passwd\0".as_ptr(), at(&mut b, b"freshlink").as_ptr());
+    check(b"symlink", r == 0, r)?;
+    // A later clock tick than the links' creation, then each followed
+    crate::helpers::msleep(30);
+    let cases: [(&[u8], u32, Want); 4] = [
+        (b"freshlink\0", 0, At(b"etc/passwd\0")),
+        (b"relsym\0", 0, At(b"etc/passwd\0")),
+        (b"reletc/passwd\0", 0, At(b"etc/passwd\0")),
+        (b"mnt/self\0", O_DIRECTORY, At(b"mnt\0")),
+    ];
+    for (p, fl, _) in cases {
+        let fd = sys_openat(rootfd, p.as_ptr(), O_PATH | fl, 0);
+        check(b"warm", fd >= 0, fd)?;
+        sys_close(fd as u64);
+    }
+    for (p, fl, w) in cases {
+        let fd = open2(rootfd, p, u64::from(O_PATH | fl), 0, CACHED);
+        check(b"cached through link", fd >= 0, fd)?;
+        check(
+            b"cached through link: same file",
+            id(fd) == want_id(rootfd, w),
+            0,
+        )?;
+    }
+    Ok(())
+}
 
 /// RESOLVE_CACHED: a path the dcache holds opens; a name never looked
 /// up is EAGAIN, and stays so after a failed lookup (ramfs keeps no

@@ -152,10 +152,6 @@ pub struct RamfsInodeData {
     /// Children (for directories) - maps name to inode
     pub children: RwSem<Children>,
 
-    /// Symlink target (symlinks only - stored inline, not in page cache)
-    /// Symlinks are typically small, so inline storage is more efficient.
-    pub symlink_target: Option<FileName>,
-
     /// Extended attributes (name -> value)
     pub xattrs: Xattrs,
 
@@ -336,7 +332,6 @@ impl RamfsInodeData {
     pub fn new_file() -> Self {
         Self {
             children: RwSem::new(Children::new()),
-            symlink_target: None,
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
@@ -347,22 +342,15 @@ impl RamfsInodeData {
     pub fn new_dir() -> Self {
         Self {
             children: RwSem::new(Children::new()),
-            symlink_target: None,
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
         }
     }
 
-    /// Create symlink data (target stored inline)
-    pub fn new_symlink(target: FileName) -> Self {
-        Self {
-            children: RwSem::new(Children::new()),
-            symlink_target: Some(target),
-            xattrs: Xattrs::default(),
-            xattr_pool: spin::Once::new(),
-            xattr_bytes: AtomicU64::new(0),
-        }
+    /// Symlink data (the target is the inode's `i_link`)
+    pub fn new_symlink() -> Self {
+        Self::new_dir()
     }
 }
 
@@ -583,29 +571,18 @@ impl InodeOps for RamfsInodeOps {
         }
     }
 
+    /// The target, kept in the inode (Linux shmem_symlink's i_link)
     fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
-        // Must be a symlink
-        if !inode.mode().is_symlink() {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        // Symlink target is stored inline
-        ramfs_data
-            .symlink_target
-            .clone()
-            .map(FileName::into_vec)
+        inode
+            .i_link()
+            .map(<[u8]>::to_vec)
             .ok_or(KernelError::InvalidArgument)
     }
 
     fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        // S_IFLNK | 0777, the target inline (not in the page cache)
+        // S_IFLNK | 0777, the target in the inode (Linux tmpfs keeps a
+        // short one there, i_link, a long one in a page; here all, as
+        // nothing in hk pages a symlink out)
         let (uid, gid, mode) = super::dac::init_owner(dir, InodeMode::symlink());
         let kind = Kind::Symlink(FileName::from(target));
         add_new(dir, name, kind, mode, uid, gid, current_time())
@@ -1311,7 +1288,11 @@ fn new_inode(
             file_mapping(sb, &inode);
         }
         Kind::Dir => inode.set_private(try_arc(RamfsInodeData::new_dir())?),
-        Kind::Symlink(t) => inode.set_private(try_arc(RamfsInodeData::new_symlink(t))?),
+        Kind::Symlink(t) => {
+            // Before the inode is visible (Linux inode_set_cached_link)
+            inode.set_link(t.into_vec().into_boxed_slice());
+            inode.set_private(try_arc(RamfsInodeData::new_symlink())?);
+        }
         // Devices use the block or char layer, no ramfs data
         Kind::Dev(_) => {}
     }
@@ -1447,12 +1428,10 @@ fn fill_pages(inode: &Inode, content: &[u8]) -> Result<(), KernelError> {
 /// hard-linked initramfs entry brings after its first name was made
 pub fn ramfs_fill_file(inode: &Inode, content: &[u8]) -> Result<(), KernelError> {
     let private = inode.get_private().ok_or(KernelError::Io)?;
-    let data = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<RamfsInodeData>()
-        .ok_or(KernelError::Io)?;
-    if data.symlink_target.is_some() || inode.mode().is_dir() {
+    if private.as_any().downcast_ref::<RamfsInodeData>().is_none() {
+        return Err(KernelError::Io);
+    }
+    if inode.mode().is_symlink() || inode.mode().is_dir() {
         return Err(KernelError::InvalidArgument);
     }
     fill_pages(inode, content)?;

@@ -130,9 +130,13 @@ pub fn sys_readlinkat(
     }
     // e.g. /proc/<pid>/exe: EACCES, ENOENT (Linux returns the get_link
     // error)
-    let target = match inode.i_op.readlink(&inode) {
-        Err(KernelError::OperationNotSupported) => return Err(KernelError::InvalidArgument),
-        r => r?,
+    // A target kept in the inode first (Linux vfs_readlink: i_link)
+    let target = match inode.i_link() {
+        Some(l) => l.to_vec(),
+        None => match inode.i_op.readlink(&inode) {
+            Err(KernelError::OperationNotSupported) => return Err(KernelError::InvalidArgument),
+            r => r?,
+        },
     };
     let n = target.len().min(bufsiz as usize);
     UserSlice::new(buf.addr(), bufsiz as usize)

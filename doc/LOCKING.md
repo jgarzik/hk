@@ -2802,7 +2802,10 @@ no reference (a dentry's `d_inode`) may read it until its guard ends,
 a torn-down one included, but only its fields with no drop glue
 (atomics, `ino`, `i_op`; Linux's RCU walk reads i_mode, i_uid, i_op
 the same way), never one a teardown releases (`private`, `i_data`,
-`sb`). No lock is added.
+`sb`). A symlink's `i_link` (Linux inode->i_link) is set once before
+the inode is visible (`set_link`, a `spin::Once`) and dropped only by
+`i_callback`, a grace period after the teardown, so an RCU walk reads
+it too. No lock is added.
 
 **Superblock inode lists** (`fs/inode.rs`; Linux s_inodes,
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
@@ -3493,7 +3496,18 @@ sampled before the child's is checked, MOUNT_LOCK's sequence checked
 after a climb or at the root, and `path_connected` (`is_subdir`, under
 RENAME_LOCK's sequence) for a bind mount; the root, beneath, a no-xdev
 climb or a disconnected parent is ECHILD, and the ref walk gives the
-answer. Where it must leave RCU mode (a miss, a symlink's body, a
+answer. A symlink is followed in RCU mode (Linux pick_link under
+LOOKUP_RCU): its body is the inode's `i_link`, or what ->get_link
+gives when asked with `rcu` (Linux get_link(NULL dentry): nothing that
+sleeps; ECHILD otherwise), pushed on the walk's own stack (two levels
+in place, more allocated GFP_ATOMIC; Linux nd->stack), an absolute
+one moving the walk to the root it read at its start; an atime to
+update, an ECHILD body or a failed stack allocation leaves RCU mode
+there with the link held (legitimize_path, as legitimize_links). The
+rest of the name it hands to ref mode is copied into one buffer under
+the guard (GFP_ATOMIC; ECHILD if that fails), the bodies being valid
+only for the guard (the ref walk's own form: a body with what follows
+it), so no link stays held. Where it must leave RCU mode (a miss, a
 revalidation or permission check that said ECHILD) it
 takes references to where it stands (`try_to_unlazy`,
 `try_to_unlazy_next` for a child too, `legitimize_path`:

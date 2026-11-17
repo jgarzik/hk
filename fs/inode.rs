@@ -282,12 +282,19 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
-    /// Follow symlink `inode` (Linux ->get_link): its text, or for a
-    /// magic link the object it jumps to (nd_jump_link), which
-    /// RESOLVE_NO_MAGICLINKS refuses (ELOOP) and a scoped walk never
-    /// takes (EXDEV). Default: the text `readlink` gives; procfs's fd,
-    /// cwd, root, exe and namespace links jump.
-    fn get_link(&self, inode: &Inode) -> Result<Link, KernelError> {
+    /// Follow symlink `inode` (Linux ->get_link; never asked of one
+    /// with an `i_link`): its text, or for a magic link the object it
+    /// jumps to (nd_jump_link), which RESOLVE_NO_MAGICLINKS refuses
+    /// (ELOOP) and a scoped walk never takes (EXDEV). With `rcu` an RCU
+    /// walk asks (Linux get_link with a NULL dentry): `inode` is
+    /// borrowed as for `revalidate`'s `rcu`, nothing may sleep, and
+    /// ECHILD sends the walk to ref mode to ask again. Default: ECHILD
+    /// in RCU mode, else the text `readlink` gives; procfs's fd, cwd,
+    /// root, exe and namespace links jump.
+    fn get_link(&self, inode: &Inode, rcu: bool) -> Result<Link, KernelError> {
+        if rcu {
+            return Err(KernelError::NoChild);
+        }
         Ok(Link::Text(self.readlink(inode)?))
     }
 
@@ -667,6 +674,12 @@ pub struct Inode {
     /// On its superblock's `s_inodes` (Linux i_sb_list), from
     /// [`Inode::alloc`] to its eviction
     pub(super) i_sb_list: list::Link,
+    /// A symlink's target, set before the inode is visible and fixed
+    /// from then on (Linux i_link, inode_set_cached_link: tmpfs's
+    /// short symlinks, procfs's fixed ones), so an RCU walk follows it
+    /// with no reference; freed with the inode's memory, a grace period
+    /// after its teardown (Linux ->free_inode: `i_callback`)
+    i_link: ManuallyDrop<spin::Once<alloc::boxed::Box<[u8]>>>,
     /// Its dentries (Linux i_dentry, under i_lock): every live dentry
     /// whose inode it is, linked through `Dentry.d_alias`; a spin lock
     /// taken before any d_lock (`fs::dentry`)
@@ -923,8 +936,24 @@ impl Inode {
             i_hash_node: list::Link::new(),
             i_sequence: crate::task::futex::KeySeq::new(),
             i_sb_list: list::Link::new(),
+            i_link: ManuallyDrop::new(spin::Once::new()),
             i_dentry: Mutex::new(list::List::new()),
         }
+    }
+
+    /// Give a new symlink its target (Linux inode_set_cached_link),
+    /// before the inode is visible to any lookup; once
+    pub fn set_link(&self, target: alloc::boxed::Box<[u8]>) {
+        let mut t = Some(target);
+        self.i_link.call_once(|| t.take().expect("inode: set_link"));
+        debug_assert!(t.is_none(), "inode: a symlink's target set twice");
+    }
+
+    /// The symlink's target, if it is kept in the inode (Linux
+    /// inode->i_link): readable by any borrower of the inode, an RCU
+    /// walk's too, since it is fixed and freed only with the memory
+    pub fn i_link(&self) -> Option<&[u8]> {
+        self.i_link.get().map(|b| &**b)
     }
 
     fn iflag(&self, f: u32) -> bool {
@@ -1605,17 +1634,23 @@ const _: () = {
         i_hash_node,
         i_sequence,
         i_sb_list,
+        i_link,
         i_dentry,
     );
 };
 
 /// The inode's memory, a grace period after its teardown (Linux
-/// i_callback -> free_inode_nonrcu): the `Weak` it kept, whose drop
-/// frees the block once the `Arc`'s own is gone; nothing else
+/// i_callback -> ->free_inode): a symlink's `i_link`, then the `Weak`
+/// it kept, whose drop frees the block once the `Arc`'s own is gone
 ///
 /// # Safety
 /// `p` is an inode's `IFree::me`, taken back once.
 unsafe fn i_callback(p: *const ()) {
+    let i = p.cast::<Inode>().cast_mut();
+    // SAFETY: the inode's memory, which the `Weak` below still keeps;
+    // its teardown left `i_link` alone and no reader stands on it a
+    // grace period later; dropped once, here
+    unsafe { drop_field(&raw mut (*i).i_link) };
     // SAFETY: the `Weak` `Inode::alloc` leaked (`IFree` invariant)
     drop(unsafe { Weak::from_raw(p.cast::<Inode>()) });
 }

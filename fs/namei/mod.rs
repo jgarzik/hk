@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, OnceCell};
 
-use self::rcu::Lazy;
+use self::rcu::{Lazy, To};
 
 use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, permission_as};
@@ -353,6 +353,15 @@ fn lookup_fast_ref(
     }
 }
 
+/// A symlink's body in ref mode (Linux pick_link: the inode's i_link,
+/// else ->get_link)
+fn link_body(inode: &Inode) -> Result<Link, KernelError> {
+    match inode.i_link() {
+        Some(l) => Ok(Link::Text(l.to_vec())),
+        None => inode.i_op.get_link(inode, false),
+    }
+}
+
 /// What a ref-mode step gives: the walk goes on from it, or it was a
 /// symlink whose walk ended the lookup
 enum Walked {
@@ -531,8 +540,8 @@ impl<'a> Nd<'a> {
 
     /// link_path_walk + lookup_last from `start` (the root for an
     /// absolute path): in RCU mode while the lookup is still in it
-    /// (depth 0: RCU mode is left before any symlink's body), else in
-    /// ref mode
+    /// (only its first walk: the RCU walk follows symlinks on its own
+    /// stack, and a later walk starts in ref mode), else in ref mode
     fn walk(
         &self,
         start: Start<'_>,
@@ -630,35 +639,51 @@ impl<'a> Nd<'a> {
     }
 
     /// Go on in ref mode from where an RCU walk left RCU mode (Linux:
-    /// the same loop after try_to_unlazy)
-    fn unlazied(&self, l: Lazy<'_>, f: LookupFlags) -> Result<Path, KernelError> {
-        let (cur, d, rest) = match l {
-            Lazy::Done(p) => return self.finish(p, f),
-            Lazy::Comp(cur, path) => return self.walk_ref(cur, path, f, 0),
-            Lazy::Link { cur, link, rest } => return self.get_link(&cur, &link, rest, f, 0),
-            Lazy::Lookup(cur, name, rest) => {
+    /// the same loop after try_to_unlazy), with the rest of the name it
+    /// handed over and the symlinks it followed counted; a rest that
+    /// ends in a slash asks for a directory (a body's trailing slash:
+    /// lookup_last)
+    fn unlazied(&self, l: Lazy<'_>) -> Result<Path, KernelError> {
+        let Lazy {
+            to,
+            text,
+            mut f,
+            depth,
+        } = l;
+        let text = text.bytes();
+        if text.ends_with(b"/") {
+            f.follow = true;
+            f.directory = true;
+        }
+        // The component the walk stopped at, and what follows it
+        let comp = || next_comp(text).ok_or(ECHILD);
+        let (cur, d, rest) = match to {
+            To::Done(p) => return self.finish(p, f),
+            To::Comp(cur) => return self.walk_ref(cur, text, f, depth),
+            To::Link { cur, link } => return self.get_link(&cur, &link, text, f, depth),
+            To::Lookup(cur) => {
+                let (name, rest) = comp()?;
                 let d = lookup_slow(&cur.dentry, name)?;
                 (cur, d, rest)
             }
-            Lazy::Child {
+            To::Child {
                 cur,
                 child,
-                rest,
                 dots: true,
                 ..
             } => {
+                let (_, rest) = comp()?;
                 let p = step_mounts(Path::new(cur.mnt.clone(), child), f)?;
                 self.recheck()?;
-                return self.walk_ref(p, rest, f, 0);
+                return self.walk_ref(p, rest, f, depth);
             }
-            Lazy::Child {
+            To::Child {
                 cur,
                 child,
-                name,
-                rest,
                 reval,
                 dots: false,
             } => {
+                let (name, rest) = comp()?;
                 let d = match reval {
                     Some(s) => lookup_fast_ref(&cur.dentry, child, name, s)?,
                     None => child,
@@ -666,8 +691,8 @@ impl<'a> Nd<'a> {
                 (cur, d, rest)
             }
         };
-        match self.step(cur, d, rest, f, 0)? {
-            Walked::On(p) => self.walk_ref(p, rest, f, 0),
+        match self.step(cur, d, rest, f, depth)? {
+            Walked::On(p) => self.walk_ref(p, rest, f, depth),
             Walked::Done(p) => Ok(p),
         }
     }
@@ -705,7 +730,7 @@ impl<'a> Nd<'a> {
         depth: usize,
     ) -> Result<Path, KernelError> {
         let inode = link.get_inode().ok_or(KernelError::NotFound)?;
-        let got = inode.i_op.get_link(&inode)?;
+        let got = link_body(&inode)?;
         inode.touch_atime(&link.mnt);
         let mut path = match got {
             // A magic link: the walk goes on from its object
@@ -823,7 +848,7 @@ impl<'a> Nd<'a> {
             if f.no_symlinks || found.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
                 return Err(KernelError::TooManySymlinks);
             }
-            let got = inode.i_op.get_link(&inode)?;
+            let got = link_body(&inode)?;
             inode.touch_atime(&found.mnt);
             let target = match got {
                 Link::Jump(o) => {

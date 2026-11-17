@@ -691,10 +691,6 @@ waiting).
 **Location**: `fs/namei/`, `fs/inode.rs` (`InodeOps::get_link`),
 `fs/proc/mod.rs`
 
-- No RCU ->get_link (Linux inode->i_link, get_link(NULL dentry)): the
-  RCU walk leaves RCU mode at every symlink it follows, and a
-  RESOLVE_CACHED walk through a symlink is EAGAIN where Linux tmpfs's
-  fast symlinks resolve.
 - procfs's revalidate and permission are ECHILD in an RCU walk (its
   inode data is not RCU-readable); Linux's pid_revalidate and
   proc_pid_permission run there, so /proc/<pid> walks leave RCU mode

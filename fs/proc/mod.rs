@@ -453,8 +453,13 @@ impl InodeOps for ProcfsInodeOps {
     /// proc_fd_access_allowed: proc_fd_link, proc_cwd_link,
     /// proc_root_link, proc_exe_link; proc_ns_get_link: ns_get_path);
     /// /proc/self and the fixed links are text
-    fn get_link(&self, inode: &Inode) -> Result<crate::fs::inode::Link, KernelError> {
+    fn get_link(&self, inode: &Inode, rcu: bool) -> Result<crate::fs::inode::Link, KernelError> {
         use crate::fs::inode::Link;
+        // The inode data is not RCU-readable: ref mode (Linux
+        // proc_pid_get_link and proc_ns_get_link are ECHILD there too)
+        if rcu {
+            return Err(KernelError::NoChild);
+        }
         enum J {
             Fd(ProcPid, i32),
             Pid(ProcPid, PidLinkKind),
@@ -2380,6 +2385,11 @@ fn mk_inode(
         Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
+    // A fixed symlink's target in the inode (Linux proc_symlink's
+    // de->data as i_link, simple_get_link)
+    if let ProcfsInodeData::FixedLink(t) = &data {
+        inode.set_link(t.to_vec().into_boxed_slice());
+    }
     inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
     Ok(inode)
 }
