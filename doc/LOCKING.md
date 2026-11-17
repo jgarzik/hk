@@ -2884,7 +2884,17 @@ Linux). Adding or dropping a child (`add`, `d_delete`,
 `remove_child`) looks up under the parent's d_lock (write) with
 `d_lookup_locked`: one walk under the bucket lock, exact, since every
 hash writer holds it (Linux __d_add and d_alloc_parallel decide under
-hlist_bl_lock). A walk
+hlist_bl_lock). `__d_lookup_rcu` (Linux __d_lookup_rcu, for the RCU
+path walk) takes no lock and no reference and stores nothing: under
+the caller's RCU read guard it walks the bucket and reads each
+candidate's parent, key, name and hashed state after a raw `d_seq`
+sample (Linux raw_seqcount_begin, `SeqCount::raw_begin`: an odd count
+comes back even and fails the later check), the name read whole and
+checked against the sample before a filesystem's `d_compare` runs
+(Linux __d_lookup_rcu_op_compare); it returns the hit with the sample,
+which the caller checks (`Dentry::d_seq_retry`) before trusting what
+it read and again after taking a reference (`DentryRef::try_get`;
+Linux legitimize_path). A walk
 that misses during a rename (`lookup_cached`/`cached` without the
 directory lock) is fine: lookup_slow rechecks under i_rwsem.
 

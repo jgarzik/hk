@@ -254,6 +254,67 @@ fn __d_lookup(parent: &Dentry, name: &[u8]) -> Option<DentryRef> {
     found
 }
 
+/// The child `name` of `parent` for an RCU path walk (Linux
+/// __d_lookup_rcu): one walk of the bucket under `g` taking no lock
+/// and no reference, storing nothing. Each candidate is read after a
+/// raw `d_seq` sample (a writer is not waited out: its odd count fails
+/// the caller's check): parent, key, name, then hashed (checked after
+/// the compare, as Linux: it may have been unhashed after the sample
+/// was read). With the parent's `DentryOps` the name is read whole
+/// first (a `d_seq` retry repeats the candidate), then compared (Linux
+/// __d_lookup_rcu_op_compare). The `d_seq` value comes back with the
+/// hit: the caller confirms anything it read of it with
+/// [`Dentry::d_seq_retry`] before using it, and takes a reference with
+/// [`DentryRef::try_get`] then checks the seq again (Linux
+/// legitimize_path; a reference that then fails is dropped after the
+/// guard, as terminate_walk). May miss while a rename moves a dentry
+/// the walk stands on: the caller checks RENAME_LOCK's sequence (Linux
+/// path walk's r_seq) or falls back to `d_lookup`.
+pub fn __d_lookup_rcu<'g>(
+    parent: &Dentry,
+    name: &[u8],
+    g: &'g RcuReadGuard,
+) -> Option<(&'g Dentry, u32)> {
+    let key = d_key(parent, name_hash_in(parent, name));
+    let mut seq = 0;
+    let d = d_hash(key).find_rcu(g, |c| match parent.d_op {
+        None => {
+            let s = c.d_seq.raw_begin();
+            if !core::ptr::eq(c.parent_ptr(), parent)
+                || c.d_hkey.load(Relaxed) != key
+                || !c.d_name.read(g, |n| n == name)
+                || c.d_unhashed()
+            {
+                return false;
+            }
+            seq = s;
+            true
+        }
+        Some(op) => loop {
+            let s = c.d_seq.raw_begin();
+            if !core::ptr::eq(c.parent_ptr(), parent)
+                || c.d_unhashed()
+                || c.d_hkey.load(Relaxed) != key
+            {
+                return false;
+            }
+            // A consistent name for d_compare: checked against the
+            // sample before the compare
+            let hit = c.d_name.read(g, |n| {
+                (!c.d_seq.read_retry(s)).then(|| (op.d_compare)(n, name))
+            });
+            match hit {
+                Some(h) => {
+                    seq = s;
+                    return h;
+                }
+                None => core::hint::spin_loop(),
+            }
+        },
+    })?;
+    Some((d, seq))
+}
+
 /// The child `name` of `parent` (Linux d_lookup): [`__d_lookup`],
 /// repeated while a rename raced a miss (read_seqbegin / read_seqretry
 /// on RENAME_LOCK). The caller holds no d_lock: a rename takes them
@@ -728,6 +789,19 @@ impl Dentry {
         let v = self.d_flags.load(Relaxed);
         let v = if on { v | f } else { v & !f };
         self.d_flags.store(v, Ordering::Release);
+    }
+
+    /// Begin reading what an RCU walk reads of it (Linux
+    /// read_seqcount_begin(&dentry->d_seq)): waits out a writer
+    pub fn d_seq_begin(&self) -> u32 {
+        self.d_seq.read_begin()
+    }
+
+    /// What was read of it since `seq` may have changed (Linux
+    /// read_seqcount_retry(&dentry->d_seq, seq)): an RCU walk repeats or
+    /// leaves RCU mode (try_to_unlazy)
+    pub fn d_seq_retry(&self, seq: u32) -> bool {
+        self.d_seq.read_retry(seq)
     }
 
     /// Begin a change an RCU walk must notice (Linux
@@ -1794,6 +1868,38 @@ mod tests {
         let c = r.lookup_child(b"a").unwrap();
         assert!(c.is_negative() && c.get_inode().is_none() && c.d_seq.read_retry(s));
         assert_eq!(Arc::strong_count(&i), n - 1);
+    }
+
+    /// The RCU walk's lookup takes no reference: it finds a child (long
+    /// names too) with a `d_seq` value that holds until a move or drop,
+    /// misses an unhashed one, and the reference taken after it is
+    /// counted (Linux __d_lookup_rcu, legitimize_path)
+    #[test]
+    fn lookup_rcu_seq() {
+        let r = DentryRef::new(Dentry::new_root(inode(), Weak::new())).unwrap();
+        let a = Dentry::alloc(&r, b"a", Some(inode())).unwrap();
+        let long = [b'l'; 90];
+        let l = Dentry::alloc(&r, &long, Some(inode())).unwrap();
+        let n = DentryRef::count(&a);
+        let g = crate::sync::rcu::read_lock();
+        let (c, seq) = __d_lookup_rcu(&r, b"a", &g).unwrap();
+        assert!(core::ptr::eq(c, DentryRef::as_ptr(&a)) && !c.d_seq_retry(seq));
+        assert!(c.d_inode_rcu(&g).is_some() && DentryRef::count(&a) == n);
+        assert!(__d_lookup_rcu(&r, &long, &g).is_some_and(|(c, _)| core::ptr::eq(c, &*l)));
+        assert!(__d_lookup_rcu(&r, b"b", &g).is_none());
+        let got = DentryRef::try_get(c).filter(|_| !c.d_seq_retry(seq));
+        drop(g);
+        assert!(got.is_some_and(|d| DentryRef::ptr_eq(&d, &a)));
+        let t = Dentry::prealloc(&r, b"b").unwrap();
+        d_move(&a, &t);
+        assert!(a.d_seq_retry(seq) && a.d_seq_begin() != seq);
+        let g = crate::sync::rcu::read_lock();
+        assert!(__d_lookup_rcu(&r, b"a", &g).is_none());
+        assert!(__d_lookup_rcu(&r, b"b", &g).is_some_and(|(c, _)| core::ptr::eq(c, &*a)));
+        drop(g);
+        r.remove_child(b"b");
+        let g = crate::sync::rcu::read_lock();
+        assert!(__d_lookup_rcu(&r, b"b", &g).is_none());
     }
 
     /// A real exchange swaps names and parents

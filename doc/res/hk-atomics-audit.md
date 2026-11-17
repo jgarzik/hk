@@ -30,12 +30,22 @@ argued / published copy of locked state.
 ## Findings
 
 ### 3. Dentry reads store to shared lock words — (c)
-- Where: `fs/dentry.rs` `Dentry.d_lock`, `Dentry.d_name` (RwLocks): every
-  path component's read lock writes the lock word, so popular
-  directories become contended lines.
+- Where: `fs/dentry.rs` `d_lookup` (`__d_lookup` takes each candidate's
+  `Dentry.d_lock` for reading, as Linux's non-RCU lookup does) and the
+  path walk built on it (`fs/namei.rs` `cached`, `lookup_cached`): every
+  path component's read lock and reference count write shared words,
+  so popular directories become contended lines.
 - Linux: path walk is RCU-walk with the `d_seq` seqcount, no stores to
   shared dentries.
-- Fix: RCU-walk for dcache (its own phase).
+- Done (stage 1): inode memory freed a grace period after its teardown
+  (`fs/inode.rs` `IFree`, Linux destroy_inode / i_callback);
+  `Dentry.d_seq`; `d_inode`, `d_flags`, `d_name` readable with no lock
+  (`d_inode_rcu`, `Inode::igrab`, `DNameSlot`); `get_inode`,
+  `is_negative`, `d_unhashed`, `is_mountpoint`, `name` take no lock;
+  `__d_lookup_rcu`, `d_seq_begin`/`d_seq_retry`, `DentryRef::try_get`.
+- Left (stage 2): the LOOKUP_RCU walk itself (Linux path_init /
+  lookup_fast / step_into in RCU mode, try_to_unlazy, legitimize_links,
+  permission checks with MAY_NOT_BLOCK).
 
 
 ## Checked and judged legitimate (f)
@@ -75,4 +85,4 @@ owned by one of many instances of a lock: the timer bases, and the
 run queues' `SchedEntity.rq`). Each atomic field's doc
 comment names its lockless reader and Linux equivalent (rule 7); a field
 "under lock X" with no lockless reader is a bug to fix. Remaining: 3
-(dcache RCU-walk, its own phase).
+(dcache RCU-walk stage 2, its own phase).
