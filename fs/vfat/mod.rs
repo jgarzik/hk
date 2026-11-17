@@ -1377,7 +1377,7 @@ fn write_inode_sb(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError
     let off = d.i_pos;
     let mut b = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut b)?;
-    let ((start, size), times) = inode_entry(inode, sb_data)?;
+    let ((start, size), times) = inode_entry(inode, &d, sb_data);
     entry_set_extent(&mut b, start, size);
     times.put(&mut b);
     write_bytes(&sb_data.bdev, off, &b)
@@ -1608,6 +1608,53 @@ fn parse_short(s: &Slot<'_>, lfn: &mut Lfn, lfn_slots: usize) -> ParsedDirEntry 
     }
 }
 
+/// The most slots an entry takes: its long-name ones and its short one
+const MAX_SLOTS: usize = MAX_LFN_SLOTS + 1;
+
+/// The free slots a directory walk saw, for a new entry (Linux
+/// fat_add_entries' first stage, here in the walk that read the
+/// entries): where the first free run of each length up to
+/// `MAX_SLOTS` starts, the free run reaching the end of the walk, and
+/// the walk's clusters (a slot's index to its disk offset)
+#[derive(Default)]
+struct FreeSlots {
+    first: [Option<u64>; MAX_SLOTS],
+    /// The current free run: its first slot and length
+    run: Option<(u64, u64)>,
+    clusters: Vec<u32>,
+}
+
+impl FreeSlots {
+    /// Note slot `s`, the walk's next (`per` slots a cluster)
+    fn see(&mut self, s: &Slot<'_>, per: u64) -> Result<(), KernelError> {
+        if s.idx.is_multiple_of(per) {
+            self.clusters
+                .try_reserve(1)
+                .map_err(|_| KernelError::OutOfMemory)?;
+            self.clusters.push(s.cluster);
+        }
+        if s.b[0] != END_MARKER && s.b[0] != DELETED_MARKER {
+            self.run = None;
+            return Ok(());
+        }
+        let (start, len) = self.run.get_or_insert((s.idx, 0));
+        *len += 1;
+        if let Some(f) = usize::try_from(*len - 1)
+            .ok()
+            .and_then(|i| self.first.get_mut(i))
+            && f.is_none()
+        {
+            *f = Some(*start);
+        }
+        Ok(())
+    }
+
+    /// A run of every length is known: the walk need not go on
+    fn full(&self) -> bool {
+        self.first[MAX_SLOTS - 1].is_some()
+    }
+}
+
 /// The entries of the directory at `start_cluster`, "." and ".." and
 /// volume labels left out, each with its disk offset; the list grows
 /// fallibly (ENOMEM), a directory being as large as its disk says
@@ -1615,14 +1662,49 @@ fn read_directory_entries(
     sb_data: &VfatSbData,
     start_cluster: u32,
 ) -> Result<Vec<ParsedDirEntry>, KernelError> {
+    read_dir(sb_data, start_cluster, None)
+}
+
+/// [`read_directory_entries`] and, in the same walk, the directory's
+/// free slots for a new entry
+fn scan_dir(
+    sb_data: &VfatSbData,
+    start_cluster: u32,
+) -> Result<(Vec<ParsedDirEntry>, FreeSlots), KernelError> {
+    let mut free = FreeSlots::default();
+    let entries = read_dir(sb_data, start_cluster, Some(&mut free))?;
+    Ok((entries, free))
+}
+
+/// Read the entries up to the end-of-directory slot; with `free`, go
+/// on past it while free runs are still to be found
+fn read_dir(
+    sb_data: &VfatSbData,
+    start_cluster: u32,
+    mut free: Option<&mut FreeSlots>,
+) -> Result<Vec<ParsedDirEntry>, KernelError> {
+    let per = u64::from(sb_data.cluster_size) / 32;
     let mut entries = crate::util::kmem::KVec::new();
     let mut lfn = Lfn::default();
     // Long-name slots gathered since the last other one
     let mut run = 0;
+    // The end-of-directory slot was seen: no entry follows
+    let mut end = false;
     dir_walk(sb_data, start_cluster, |s| {
+        if let Some(f) = free.as_deref_mut() {
+            f.see(s, per)?;
+        }
+        if s.b[0] == END_MARKER {
+            end = true;
+        }
+        if end {
+            return Ok(match free.as_deref() {
+                Some(f) if !f.full() => ControlFlow::Continue(()),
+                _ => ControlFlow::Break(()),
+            });
+        }
         let attr = s.b[11];
         match s.b[0] {
-            END_MARKER => return Ok(ControlFlow::Break(())),
             DELETED_MARKER => {
                 lfn.clear();
                 run = 0;
@@ -1797,40 +1879,47 @@ fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
     entries
 }
 
-/// The disk offsets of `n` consecutive free slots of the directory at
-/// `dir_cluster` (Linux fat_add_entries: free slots found by
-/// fat_get_entry, else the free slots at its end and new clusters,
-/// fat_add_new_entries), in directory order. New clusters
-/// come zeroed (`allocate_cluster`): their slots are all free and the
-/// first ends the directory.
+/// The disk offsets of `n` consecutive free slots of a directory whose
+/// walk saw `free` (Linux fat_add_entries: the first free run long
+/// enough, else the free run at its end and new clusters,
+/// fat_add_new_entries), in directory order. New clusters come zeroed
+/// (`allocate_cluster`): their slots are all free and the first ends
+/// the directory.
 fn find_free_dir_slots(
     sb_data: &VfatSbData,
-    dir_cluster: u32,
+    free: &FreeSlots,
     n: usize,
 ) -> Result<Vec<u64>, KernelError> {
+    if n == 0 || n > MAX_SLOTS {
+        return Err(KernelError::InvalidArgument);
+    }
+    let per = u64::from(sb_data.cluster_size) / 32;
+    let off = |idx: u64| {
+        let c = usize::try_from(idx / per)
+            .ok()
+            .and_then(|i| free.clusters.get(i))
+            .ok_or(KernelError::Io)?;
+        Ok::<_, KernelError>(cluster_to_offset(sb_data, *c) + idx % per * 32)
+    };
     let mut run = Vec::new();
     run.try_reserve(n).map_err(|_| KernelError::OutOfMemory)?;
-    let mut last = dir_cluster;
-    let per = u64::from(sb_data.cluster_size) / 32;
-    let found = dir_walk(sb_data, dir_cluster, |s| {
-        last = s.cluster;
-        if s.b[0] == END_MARKER || s.b[0] == DELETED_MARKER {
-            run.push(s.off);
-            if run.len() == n {
-                return Ok(ControlFlow::Break(()));
-            }
-        } else {
-            run.clear();
+    if let Some(start) = free.first[n - 1] {
+        for i in start..start + n as u64 {
+            run.push(off(i)?);
         }
-        Ok(ControlFlow::Continue(()))
-    })?;
-    if found.is_some() {
         return Ok(run);
     }
-    // Not enough room: the free run reaching the directory's end (its
-    // end-of-directory slots among them, which must not stay before
-    // the entry) continues into new clusters, only the slots still
-    // needed allocated (Linux fat_add_entries: fat_add_new_entries)
+    // Not enough room (the walk went to the end): the free run reaching
+    // the directory's end (its end-of-directory slots among them, which
+    // must not stay before the entry) continues into new clusters, only
+    // the slots still needed allocated (Linux fat_add_entries:
+    // fat_add_new_entries)
+    if let Some((start, len)) = free.run {
+        for i in start..start + len {
+            run.push(off(i)?);
+        }
+    }
+    let last = *free.clusters.last().ok_or(KernelError::Io)?;
     let more = (n - run.len()).div_ceil(per as usize);
     let mut c = extend_cluster_chain(sb_data, last, more)?;
     for k in 0..more {
@@ -1853,8 +1942,9 @@ struct NewEntry<'a> {
     ts: Timespec,
 }
 
-/// Add entry `e` to the directory at `parent_cluster` whose entries are
-/// `existing` (Linux vfat_build_slots + fat_add_entries): its long-name
+/// Add entry `e` to a directory whose walk (`scan_dir`) saw the entries
+/// `existing` and the free slots `free` (Linux vfat_build_slots +
+/// fat_add_entries): its long-name
 /// slots (unless the name is its own 8.3 form) then its short one; on
 /// a dirsync mount they are synced, and removed again if that fails
 /// (fat_add_entries' error_remove). The short name and the slots' disk
@@ -1862,8 +1952,8 @@ struct NewEntry<'a> {
 fn fat_add_entries(
     sb_data: &VfatSbData,
     dirsync: bool,
-    parent_cluster: u32,
     existing: &[ParsedDirEntry],
+    free: &FreeSlots,
     e: &NewEntry<'_>,
 ) -> Result<([u8; 11], Vec<u64>), KernelError> {
     let name = e.name;
@@ -1891,7 +1981,7 @@ fn fat_add_entries(
 
     // The LFN entries and the short one (any new cluster allocated
     // before `ipos`, which is never held with the FAT lock)
-    let offs = find_free_dir_slots(sb_data, parent_cluster, lfn_entries.len() + 1)?;
+    let offs = find_free_dir_slots(sb_data, free, lfn_entries.len() + 1)?;
     let i_pos = *offs.last().ok_or(KernelError::Io)?;
 
     let mut short_bytes = [0u8; 32];
@@ -2166,8 +2256,8 @@ impl InodeOps for VfatInodeOps {
             return Err(KernelError::NotDirectory);
         }
 
-        // Check if file already exists
-        let entries = read_directory_entries(&sb_data, dir_inode_data.start_cluster)?;
+        // Check if file already exists (the walk finds free slots too)
+        let (entries, free) = scan_dir(&sb_data, dir_inode_data.start_cluster)?;
         for entry in &entries {
             if entry.name.eq_ignore_ascii_case(name) {
                 return Err(KernelError::AlreadyExists);
@@ -2188,7 +2278,7 @@ impl InodeOps for VfatInodeOps {
             extent: (start_cluster, file_size),
             ts,
         };
-        let (short_name, offs) = vfat_add_entry(dir, &sb, &sb_data, parent_cluster, &entries, &e)?;
+        let (short_name, offs) = vfat_add_entry(dir, &sb, &sb_data, &entries, &free, &e)?;
         let i_pos = *offs.last().ok_or(KernelError::Io)?;
         // Linux vfat_create: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail: a negative
@@ -2237,8 +2327,9 @@ impl InodeOps for VfatInodeOps {
             return Err(KernelError::NotDirectory);
         }
 
-        // Check if directory already exists
-        let entries = read_directory_entries(&sb_data, dir_inode_data.start_cluster)?;
+        // Check if directory already exists (the walk finds free slots
+        // too)
+        let (entries, free) = scan_dir(&sb_data, dir_inode_data.start_cluster)?;
         for entry in &entries {
             if entry.name.eq_ignore_ascii_case(name) {
                 return Err(KernelError::AlreadyExists);
@@ -2257,15 +2348,14 @@ impl InodeOps for VfatInodeOps {
             extent: (new_cluster, 0),
             ts,
         };
-        let (short_name, offs) =
-            match vfat_add_entry(dir, &sb, &sb_data, parent_cluster, &entries, &e) {
-                Ok(m) => m,
-                Err(e) => {
-                    // Linux vfat_mkdir: out_free
-                    let _ = free_cluster_chain(&sb_data, new_cluster);
-                    return Err(e);
-                }
-            };
+        let (short_name, offs) = match vfat_add_entry(dir, &sb, &sb_data, &entries, &free, &e) {
+            Ok(m) => m,
+            Err(e) => {
+                // Linux vfat_mkdir: out_free
+                let _ = free_cluster_chain(&sb_data, new_cluster);
+                return Err(e);
+            }
+        };
         let i_pos = *offs.last().ok_or(KernelError::Io)?;
         // Linux vfat_mkdir: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail
@@ -2517,7 +2607,7 @@ impl InodeOps for VfatInodeOps {
 
         // The target's slot is reused (fat_detach of its inode), else a
         // new entry is added (vfat_add_entry, no cluster yet)
-        let new_entries = read_directory_entries(&sb_data, np)?;
+        let (new_entries, free) = scan_dir(&sb_data, np)?;
         let existing = new_entries
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(new_name));
@@ -2550,7 +2640,7 @@ impl InodeOps for VfatInodeOps {
                     extent: (0, 0),
                     ts,
                 };
-                let made = vfat_add_entry(new_dir, &sb, &sb_data, np, &new_entries, &e)?;
+                let made = vfat_add_entry(new_dir, &sb, &sb_data, &new_entries, &free, &e)?;
                 added = made.1;
                 (made.0, *added.last().ok_or(KernelError::Io)?)
             }
@@ -2577,7 +2667,7 @@ impl InodeOps for VfatInodeOps {
             let (ext, times) = match &old_inode {
                 Some(i) => {
                     attach(i, &sb_data, np, new_short, new_ipos)?;
-                    inode_entry(i, &sb_data)?
+                    inode_entry(i, &get_inode_data(i)?, &sb_data)
                 }
                 None => ((e.start_cluster, e.file_size), e.times),
             };
@@ -2726,16 +2816,13 @@ fn write_entry(
     write_bytes(&sb_data.bdev, off, &b)
 }
 
-/// What `inode`'s entry holds of it (Linux __fat_write_inode): its
-/// first cluster and size (0 for a directory), and its times
-fn inode_entry(
-    inode: &Inode,
-    sb_data: &VfatSbData,
-) -> Result<((u32, u32), EntryTimes), KernelError> {
-    let d = get_inode_data(inode)?;
+/// What `inode`'s entry holds of it, `d` its data (Linux
+/// __fat_write_inode): its first cluster and size (0 for a directory),
+/// and its times
+fn inode_entry(inode: &Inode, d: &VfatInodeData, sb_data: &VfatSbData) -> ((u32, u32), EntryTimes) {
     let size = if d.is_dir { 0 } else { inode.get_size() as u32 };
     let times = EntryTimes::of_inode(sb_data.opts.tz(), inode, d.crtime);
-    Ok(((d.start_cluster, size), times))
+    ((d.start_cluster, size), times)
 }
 
 /// What a failed rename puts back (Linux vfat_rename's error_dotdot and
@@ -2784,8 +2871,8 @@ impl Unwind<'_> {
                 let mut ent = ((t.start_cluster, t.file_size), t.times);
                 if let Some(i) = ni {
                     let _ = attach(i, self.sb_data, self.new_dir, t.short_name, self.new_ipos);
-                    if let Ok(e) = inode_entry(i, self.sb_data) {
-                        ent = e;
+                    if let Ok(d) = get_inode_data(i) {
+                        ent = inode_entry(i, &d, self.sb_data);
                     }
                 }
                 if corrupt.is_some() {
@@ -2840,18 +2927,18 @@ fn dir_update(
     }
 }
 
-/// Linux vfat_add_entry: `e` added to `dir` (at `parent`, whose entries
-/// are `existing`: `fat_add_entries`), then the directory's end of
-/// change at `e`'s time
+/// Linux vfat_add_entry: `e` added to `dir`, whose walk saw `existing`
+/// and `free` (`fat_add_entries`), then the directory's end of change
+/// at `e`'s time
 fn vfat_add_entry(
     dir: &Inode,
     sb: &SuperBlock,
     sb_data: &VfatSbData,
-    parent: u32,
     existing: &[ParsedDirEntry],
+    free: &FreeSlots,
     e: &NewEntry<'_>,
 ) -> Result<([u8; 11], Vec<u64>), KernelError> {
-    let made = fat_add_entries(sb_data, sb.dirsync(), parent, existing, e)?;
+    let made = fat_add_entries(sb_data, sb.dirsync(), existing, free, e)?;
     dir_update(dir, sb, sb_data, Some(e.ts), false);
     Ok(made)
 }
