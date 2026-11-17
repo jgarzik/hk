@@ -3333,8 +3333,10 @@ up the victim's parent's, taken after the victim's is released, across
 (Linux __simple_recursive_removal). `libfs::dcache_readdir` reads the
 directory's children list under its d_lock, one entry at a time, under
 the getdents shared `i_rwsem`. `PinnedFs` (a filesystem's kernel mount
-and hold count; Linux pin_fs_lock) is a spin leaf: the mount is made
-and put with it released.
+and hold count; Linux pin_fs_lock) is a spin leaf, thread context only
+(never taken in IRQ context, so no IRQ class): the check, the
+install and the count are one hold; the mount is made and put with it
+released.
 tracefs's mount options (`FsInfo`, Linux tracefs_fs_info) are a spin
 leaf, replaced by a mount or remount and read by show_options; the
 owner an inode takes from the root (Linux set_tracefs_inode_owner) is

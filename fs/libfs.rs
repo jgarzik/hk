@@ -206,20 +206,26 @@ fn kern_mount(ty: &'static FileSystemType) -> Result<MountRef, KernelError> {
 }
 
 /// Hold `ty`'s kernel mount, made if no one holds it (Linux
-/// simple_pin_fs: made with the lock released, a racing maker's put);
-/// a reference to it for the caller's use. Each hold is given back with
-/// [`simple_release_fs`].
+/// simple_pin_fs); a reference to it for the caller's use. The check,
+/// the mount's install and the count are one lock section; the lock is
+/// dropped only to make the mount, and a racing maker's is put after
+/// it. Each hold is given back with [`simple_release_fs`].
 pub fn simple_pin_fs(ty: &'static FileSystemType, p: &PinnedFs) -> Result<MountRef, KernelError> {
-    let none = p.0.lock().0.is_none();
-    let mut made = if none { Some(kern_mount(ty)?) } else { None };
+    let mut made = None;
     let mut g = p.0.lock();
     if g.0.is_none() {
-        g.0 = made.take();
+        drop(g);
+        made = Some(kern_mount(ty)?);
+        g = p.0.lock();
+        if g.0.is_none() {
+            g.0 = made.take();
+        }
     }
     g.1 += 1;
     let m = g.0.clone();
     drop(g);
     drop(made);
+    // Installed above if it was not there: always set here
     m.ok_or(KernelError::Io)
 }
 
