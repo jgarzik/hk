@@ -555,10 +555,7 @@ pub fn stop_applies(sig: Signal) -> bool {
         return true;
     }
     let me = crate::task::percpu::current();
-    let pg = crate::task::percpu::TASKLIST
-        .read()
-        .view(&me)
-        .and_then(|v| v.pgrp().cloned());
+    let pg = me.pgrp.get(&crate::sync::rcu::read_lock());
     pg.is_none_or(|pg| !crate::task::percpu::pgrp_orphaned(&pg))
 }
 

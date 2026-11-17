@@ -48,6 +48,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | red-black tree `RbTree` / `RbTreeNodeReservation` (`util/rbtree.rs`, Linux rb_root) | owning container of preallocated nodes |
 | intrusive red-black tree `RbRoot` / `RbNode` / `RbCursorMut` over a `ListPtr` (`util/rbtree.rs`, Linux rb_node embedded, `skb->rbnode`) | owning intrusive container, membership checked |
 | RCU callback head `RcuHead` / `HasRcuHead`, `call_rcu` (`sync/rcu.rs`, Linux rcu_head) | embedded queue node, claimed once |
+| RCU pointers `RcuArc`, `RcuLockedArc` (nullable, writers proven by a `UniqueOwner`), `RcuPtr` (no ownership, unsafe read) (`sync/rcu.rs`, Linux `__rcu`) | published pointer, old version released after a grace period |
 | dentry reference `DentryRef` (`fs/dentry.rs`, Linux dget/dput on d_lockref), mount reference `MountRef` (`fs/mntput.rs`, Linux mntget/mntput on mnt_pcp) | counted pointer, last put deferred (RCU free, queued teardown) |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
 | RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
@@ -162,7 +163,8 @@ line when the file is clean, and never add it to a new file
 ### 12. Deferred release (RCU)
 
 An object that RCU readers reach without a reference (an `RcuList` or
-`RcuHList` entry, an `RcuArc` version) is released only after a grace
+`RcuHList` entry, an `RcuArc`/`RcuLockedArc` version, a task reached
+through `RcuPtr`) is released only after a grace
 period: the container's reference goes through `RcuUnlinked`,
 `RcuHRef` or `RcuRetired` (`defer`: `call_rcu`/`kfree_rcu`/`put_rcu`). That
 reference may be the last, so the object's `Drop`, and every drop it

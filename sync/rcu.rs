@@ -55,8 +55,8 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
-use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
+use crate::sync::{IrqSpinlock, UniqueOwner};
 use crate::util::cpumask::{CpuMask, CpuSet};
 
 #[cfg(not(test))]
@@ -361,12 +361,175 @@ impl<T: HasRcuHead + Send + Sync> RcuRetired<T> {
     }
 }
 
+impl<T: HasRcuPuts + Send + Sync> RcuRetired<T> {
+    /// Release it after a grace period without waiting, for an object
+    /// whose references may be retired several times within one grace
+    /// period ([`put_rcu`]'s rules)
+    pub fn defer_put(mut self) {
+        if let Some(a) = self.0.take() {
+            put_rcu(a);
+        }
+    }
+}
+
 impl<T> Drop for RcuRetired<T> {
     fn drop(&mut self) {
         if let Some(a) = self.0.take() {
             synchronize();
             drop(a);
         }
+    }
+}
+
+/// An RCU-protected `Option<Arc<T>>` whose updaters hold the lock that
+/// owns `O` (Linux a `__rcu` pointer that may be NULL, written by
+/// rcu_assign_pointer under its lock: signal->pids[] under
+/// tasklist_lock). Readers borrow the current version under an
+/// [`RcuReadGuard`] (rcu_dereference) or under a borrow of `O`
+/// (rcu_dereference_protected); [`replace`](Self::replace), under a
+/// mutable borrow of `O`, hands the old version back as [`RcuRetired`],
+/// released a grace period later.
+///
+/// # Invariants
+/// `ptr` is null or the `Arc::into_raw` of the current version, which
+/// the cell owns; a version taken out leaves only as an `RcuRetired`.
+pub struct RcuLockedArc<T, O: UniqueOwner> {
+    ptr: AtomicPtr<T>,
+    _owner: PhantomData<fn(&O)>,
+}
+
+// SAFETY: an `Arc<T>` moves between threads and is shared through it
+unsafe impl<T: Send + Sync, O: UniqueOwner> Send for RcuLockedArc<T, O> {}
+// SAFETY: as above
+unsafe impl<T: Send + Sync, O: UniqueOwner> Sync for RcuLockedArc<T, O> {}
+
+impl<T, O: UniqueOwner> RcuLockedArc<T, O> {
+    /// Holding nothing
+    pub const fn none() -> Self {
+        // INVARIANT: null
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+            _owner: PhantomData,
+        }
+    }
+
+    /// Holding `v`
+    pub fn new(v: Option<Arc<T>>) -> Self {
+        // INVARIANT: the cell owns the reference `into_raw` leaks
+        Self {
+            ptr: AtomicPtr::new(v.map_or(core::ptr::null_mut(), |a| Arc::into_raw(a).cast_mut())),
+            _owner: PhantomData,
+        }
+    }
+
+    /// The current version, valid while `g` is held (Linux
+    /// rcu_dereference)
+    pub fn read<'a>(&'a self, _g: &'a RcuReadGuard) -> Option<&'a T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a version the cell owns (type invariant); one
+        // taken out since stays allocated until a grace period after
+        // (`RcuRetired`), which `_g` keeps from ending while 'a lasts
+        unsafe { p.as_ref() }
+    }
+
+    /// The current version, valid while `O` is borrowed (Linux
+    /// rcu_dereference_protected)
+    pub fn protected<'a>(&'a self, _o: &'a O) -> Option<&'a T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a version the cell owns (type invariant); a
+        // replace needs `&mut O`, which cannot coexist with `_o`, so it
+        // stays the cell's for 'a
+        unsafe { p.as_ref() }
+    }
+
+    /// A reference to the current version (Linux get_pid(rcu_dereference()))
+    pub fn get(&self, g: &RcuReadGuard) -> Option<Arc<T>> {
+        self.read(g).map(Self::counted)
+    }
+
+    /// A reference to the current version, `O` borrowed
+    pub fn get_protected(&self, o: &O) -> Option<Arc<T>> {
+        self.protected(o).map(Self::counted)
+    }
+
+    /// A new reference to `v`, a version borrowed from the cell
+    fn counted(v: &T) -> Arc<T> {
+        let p = core::ptr::from_ref(v);
+        // SAFETY: `v` is borrowed from a version the cell owns or
+        // retired (`read`, `protected`), an `Arc::into_raw` still
+        // allocated, so its count is live
+        unsafe {
+            Arc::increment_strong_count(p);
+            Arc::from_raw(p)
+        }
+    }
+
+    /// The current version's address, to compare only (Linux
+    /// rcu_access_pointer); null for none
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.load(Ordering::Relaxed)
+    }
+
+    /// Publish `new` (Linux rcu_assign_pointer under the lock); the old
+    /// version comes back, released after a grace period
+    pub fn replace(&self, new: Option<Arc<T>>, _o: &mut O) -> RcuRetired<T> {
+        let new = new.map_or(core::ptr::null_mut(), |a| Arc::into_raw(a).cast_mut());
+        // INVARIANT: the cell owns `new`; the old leaves as RcuRetired
+        let old = self.ptr.swap(new, Ordering::AcqRel);
+        // SAFETY: null or a version the swap took out of the cell, whose
+        // one owner this is (type invariant)
+        RcuRetired((!old.is_null()).then(|| unsafe { Arc::from_raw(old) }))
+    }
+}
+
+impl<T, O: UniqueOwner> Drop for RcuLockedArc<T, O> {
+    fn drop(&mut self) {
+        let p = *self.ptr.get_mut();
+        if !p.is_null() {
+            // SAFETY: no reader borrows `self` any more (`&mut`), so the
+            // current version has its one owner here (type invariant)
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
+/// An RCU-protected pointer that owns nothing (Linux a `__rcu` pointer
+/// to an object its own owner frees a grace period after no reader can
+/// reach it any more: task->real_parent). Storing is safe; a read
+/// borrows the target only on the caller's argument that it is still
+/// allocated.
+pub struct RcuPtr<T> {
+    ptr: AtomicPtr<T>,
+}
+
+impl<T> RcuPtr<T> {
+    /// Naming nothing
+    pub const fn null() -> Self {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Name `p` (null: nothing) (Linux rcu_assign_pointer): what the
+    /// target's fields held before is seen by a reader that finds it
+    pub fn set(&self, p: *const T) {
+        self.ptr.store(p.cast_mut(), Ordering::Release);
+    }
+
+    /// The target's address, to compare only (Linux
+    /// rcu_access_pointer); null for none
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.load(Ordering::Relaxed)
+    }
+
+    /// The target, if any (Linux rcu_dereference)
+    ///
+    /// # Safety
+    /// The target, whichever this loads, stays allocated for 'a.
+    pub unsafe fn get<'a>(&self) -> Option<&'a T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a target allocated for 'a (the caller)
+        unsafe { p.as_ref() }
     }
 }
 

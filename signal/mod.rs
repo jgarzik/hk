@@ -2123,7 +2123,7 @@ pub fn kill_own_pgrp(
     let mut gone = SigPending::new();
     let table = TASKLIST.read();
     let me = crate::task::percpu::current();
-    let pg = table.view(&me).and_then(|t| t.fields().pgrp());
+    let pg = table.view(&me).and_then(|t| t.pgrp());
     let pg = pg.ok_or(KernelError::NoProcess)?;
     pgrp_send(&table, pg, sig, info, &check, &mut gone)
 }
@@ -2551,11 +2551,15 @@ pub struct SignalStruct {
     /// made with the SignalStruct, so setitimer cannot fail
     pub itimers: crate::time::posix_timer::ITimers,
     /// The group leader's struct pid (Linux signal->pids[PIDTYPE_TGID]),
-    /// whom ITIMER_REAL signals: set under TASKLIST's write lock when
-    /// the group's first task is attached (fork, the global init), read
-    /// under its read lock. An exec by another thread keeps it (that
+    /// whom ITIMER_REAL signals and by which getppid and /proc number
+    /// a parent: set under TASKLIST's write lock when the group's first
+    /// task is attached (fork, the global init), cleared there when the
+    /// group is released (its leader's `remove`, Linux __unhash_process
+    /// detach_pid(PIDTYPE_TGID)), the reference dropped a grace period
+    /// later; read under RCU. An exec by another thread keeps it (that
     /// thread takes the leader's pid, exchange_tids).
-    leader_pid: crate::task::TableCell<Option<Arc<crate::task::pid::Pid>>>,
+    pub leader_pid:
+        crate::sync::rcu::RcuLockedArc<crate::task::pid::Pid, crate::task::percpu::GlobalTaskTable>,
     /// Threads not yet exiting (Linux signal->live): +1 at each
     /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
     /// takes it to 0 is the group's last (group_dead)
@@ -2700,11 +2704,6 @@ impl SignalStruct {
         s
     }
 
-    /// The group leader's pid, ITIMER_REAL's target (takes TASKLIST)
-    pub fn leader_pid(&self) -> Option<Arc<crate::task::pid::Pid>> {
-        self.leader_pid.access(&TASKLIST.read()).clone()
-    }
-
     /// Its group's first task, with pid `pid`, is being attached
     /// (TASKLIST held for writing)
     fn set_leader_pid(
@@ -2712,7 +2711,7 @@ impl SignalStruct {
         table: &mut crate::task::percpu::GlobalTaskTable,
         pid: Option<Arc<crate::task::pid::Pid>>,
     ) {
-        *self.leader_pid.access_mut(table) = pid;
+        self.leader_pid.replace(pid, table).defer_put();
     }
 
     /// # Safety
@@ -2727,7 +2726,7 @@ impl SignalStruct {
             posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
             // SAFETY: the caller's promise
             itimers: unsafe { crate::time::posix_timer::ITimers::new() },
-            leader_pid: crate::task::TableCell::new(None),
+            leader_pid: crate::sync::rcu::RcuLockedArc::none(),
             live: AtomicU32::new(1),
             dead_times: [const { AtomicU64::new(0) }; 3],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],

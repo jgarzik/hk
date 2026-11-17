@@ -94,21 +94,30 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let t = table.view(task)?;
     let pid = task.tid();
     let threads = table.threads(pid).count() as u64;
-    let nr = |p: Option<&Arc<crate::task::pid::Pid>>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));
+    let nr = |p: Option<&crate::task::pid::Pid>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));
     // A listed task's process (by its root number) in `ns`
     let task_nr = |root: Tid| {
         u64::from(nr(
-            table.get(root).and_then(|x| x.fields().thread_pid()),
+            table
+                .get(root)
+                .and_then(|x| x.fields().thread_pid().map(|p| &**p)),
             ns,
         ))
     };
-    let me = t.thread_pid();
+    let me = t.thread_pid().map(|p| &**p);
     // A task the namespace cannot see is not shown there (Linux reaches
     // it only through a lookup in that namespace); then its levels from
     // `ns` down are the namespaces of its own chain
     me?.nr_in(ns)?;
-    let leader = table.get(t.task.pid).and_then(|l| l.fields().thread_pid());
-    let (pg, se) = (t.pgrp(), t.session());
+    let leader = table
+        .get(t.task.pid)
+        .and_then(|l| l.fields().thread_pid().map(|p| &**p));
+    // Group, session and parent read under RCU (Linux do_task_stat,
+    // task_state: task_pgrp_nr_ns, task_session_nr_ns, pid_alive(p) ?
+    // task_tgid_nr_ns(rcu_dereference(p->real_parent)) : 0)
+    let g = crate::sync::rcu::read_lock();
+    let (pg, se) = (t.task.pgrp.read(&g), t.task.session.read(&g));
+    let ppid = t.task.parent(&g).map_or(0, |p| p.tgid_nr_ns(ns, &g));
     let tracer = t.tracer().map_or(0, |x| task_nr(x.tid()));
     let mut ns_ids = [[0u32; 4]; LEVELS];
     let mut levels = 0;
@@ -141,7 +150,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     Some(Snap {
         pid: u64::from(nr(me, ns)),
         tgid: u64::from(nr(leader, ns)),
-        ppid: task_nr(t.ppid()),
+        ppid: u64::from(ppid),
         pgid: u64::from(nr(pg, ns)),
         sid: u64::from(nr(se, ns)),
         ns_ids,

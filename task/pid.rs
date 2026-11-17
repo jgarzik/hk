@@ -83,7 +83,15 @@ pub struct Pid {
     /// (`release_numbers`, Linux free_pid) or it is dropped; changed
     /// under PIDMAP_LOCK, which orders it
     hashed: AtomicBool,
+    /// References a task's group or session link dropped (Linux
+    /// delayed_put_pid): RCU readers of `Task.pgrp`/`session` may still
+    /// see it, so the drop waits a grace period (`put_rcu`); several
+    /// threads' references may go in one. Its drop may so run in
+    /// `rcuc/N`, preemption off (`release_numbers`: spin leaves only).
+    puts: crate::sync::rcu::RcuPuts,
 }
+
+crate::rcu_puts!(Pid, puts);
 
 impl Pid {
     /// The global number (root namespace): the tid
@@ -354,6 +362,7 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(true),
+        puts: crate::sync::rcu::RcuPuts::new(),
     })?;
     let _g = PIDMAP_LOCK.lock();
     for u in pid.numbers.iter() {
@@ -467,6 +476,7 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(false),
+        puts: crate::sync::rcu::RcuPuts::new(),
     })
 });
 

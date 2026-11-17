@@ -662,6 +662,7 @@ pub fn task_ref(t: &Task) -> TaskRef {
 pub struct TaskView<'a> {
     pub task: &'a Task,
     inner: &'a TaskInner,
+    table: &'a GlobalTaskTable,
 }
 
 impl<'a> TaskView<'a> {
@@ -683,6 +684,7 @@ impl core::ops::Deref for TaskView<'_> {
 pub struct TaskViewMut<'a> {
     pub task: &'a Task,
     inner: &'a mut TaskInner,
+    table: &'a GlobalTaskTable,
 }
 
 impl core::ops::Deref for TaskViewMut<'_> {
@@ -701,7 +703,7 @@ impl core::ops::DerefMut for TaskViewMut<'_> {
 fn view<'a>(table: &'a GlobalTaskTable, task: &'a Task) -> TaskView<'a> {
     let inner = task.inner().access(table);
     let inner = inner.as_ref().expect("task table: boot task");
-    TaskView { task, inner }
+    TaskView { task, inner, table }
 }
 
 /// # Safety
@@ -711,7 +713,7 @@ unsafe fn view_mut<'a>(table: &'a GlobalTaskTable, task: &'a Task) -> TaskViewMu
     // SAFETY: see above
     let inner = unsafe { task.inner().access_mut_unchecked(table) };
     let inner = inner.as_mut().expect("task table: boot task");
-    TaskViewMut { task, inner }
+    TaskViewMut { task, inner, table }
 }
 
 /// Credentials of a task, read under TASKLIST (the views borrow it)
@@ -762,6 +764,52 @@ macro_rules! tracer_reads {
 }
 tracer_reads!(TaskView);
 tracer_reads!(TaskViewMut);
+
+/// Parent, group and session links of a task, read under TASKLIST (the
+/// views borrow it; Linux rcu_dereference_protected under
+/// tasklist_lock)
+macro_rules! relation_reads {
+    ($t:ident) => {
+        impl<'a> $t<'a> {
+            /// Its real parent (no reference taken: listed while the
+            /// table is borrowed)
+            pub fn real_parent(&self) -> Option<&'a Task> {
+                self.task.parent_locked(self.table)
+            }
+
+            /// Its real parent's process (root number), 0 for none
+            /// (Linux task_tgid_nr(real_parent)); read through the
+            /// parent link, no reference taken
+            pub fn ppid(&self) -> Pid {
+                self.real_parent().map_or(0, |p| p.pid)
+            }
+
+            /// Its process group
+            pub fn pgrp(&self) -> Option<&'a crate::task::pid::Pid> {
+                self.task.pgrp.protected(self.table)
+            }
+
+            /// Its session
+            pub fn session(&self) -> Option<&'a crate::task::pid::Pid> {
+                self.task.session.protected(self.table)
+            }
+
+            /// Its process group (root number), 0 for none (Linux
+            /// pid_nr(task_pgrp))
+            pub fn pgid(&self) -> Pid {
+                self.pgrp().map_or(0, |p| Pid::from(p.nr()))
+            }
+
+            /// Its session (root number), 0 for none (Linux
+            /// pid_nr(task_session))
+            pub fn sid(&self) -> Pid {
+                self.session().map_or(0, |p| Pid::from(p.nr()))
+            }
+        }
+    };
+}
+relation_reads!(TaskView);
+relation_reads!(TaskViewMut);
 
 impl TaskViewMut<'_> {
     /// Install credentials; the old ones go after TASKLIST. Only the
@@ -984,10 +1032,10 @@ impl GlobalTaskTable {
     /// Put `child` (a group leader in this list) on its real parent's
     /// `children` (Linux list_add_tail(&p->sibling, &parent->children))
     pub fn link_child(&mut self, child: &TaskRef) {
-        let ci = self.inner_mut_of(child);
-        let Some(parent) = ci.real_parent.as_ref().and_then(|w| w.upgrade()) else {
+        let Some(parent) = child.parent_locked(self).map(task_ref) else {
             return;
         };
+        let ci = self.inner_mut_of(child);
         if ci.in_children {
             return;
         }
@@ -1002,7 +1050,7 @@ impl GlobalTaskTable {
         if !core::mem::take(&mut ci.in_children) {
             return;
         }
-        let Some(parent) = ci.real_parent.as_ref().and_then(|w| w.upgrade()) else {
+        let Some(parent) = child.parent_locked(self).map(task_ref) else {
             return;
         };
         let pi = self.inner_mut_of(&parent);
@@ -1021,17 +1069,17 @@ impl GlobalTaskTable {
         if other_group {
             ci.exit_signal = crate::signal::ExitSignal::SIGCHLD;
         }
-        self.set_parent(child, reaper);
+        self.set_parents(child, reaper);
         self.link_child(child);
     }
 
     /// Every thread of leader `l`'s process gets real parent `p`
     /// (Linux forget_original_parent: for_each_thread, t->real_parent)
-    fn set_parent(&mut self, l: &Task, p: &TaskRef) {
-        self.inner_mut_of(l).real_parent = Some(Arc::downgrade(p));
+    fn set_parents(&mut self, l: &Task, p: &Task) {
+        l.set_parent(Some(p), self);
         let mut cur = self.inner_mut_of(l).threads.front();
         while let Some(t) = cur {
-            self.inner_mut_of(&t).real_parent = Some(Arc::downgrade(p));
+            t.set_parent(Some(p), self);
             cur = self.inner_mut_of(l).threads.next(&t);
         }
     }
@@ -1097,6 +1145,7 @@ impl GlobalTaskTable {
     fn remove_task(&mut self, tid: Tid, release: bool) -> Option<TaskRef> {
         let t = task_ref(self.lookup(tid)?);
         self.unlink_child(&t);
+        self.orphan_children(&t);
         self.unlink_thread(&t);
         self.detach_pids(&t);
         if let Some(inner) = t.inner().access(self)
@@ -1109,6 +1158,9 @@ impl GlobalTaskTable {
         }
         if release {
             self.release_pids(&t);
+            if t.inner().access(self).as_ref().is_some_and(|i| i.leader) {
+                self.detach_group_pids(&t);
+            }
         }
         // Linux release_task: exit_cred_namespaces (atomics only; the
         // namespace itself goes with the task, after the unlock)
@@ -1121,18 +1173,54 @@ impl GlobalTaskTable {
             u.active_put();
         }
         // SAFETY: found through the hash, so on this list
-        drop(unsafe { self.tasks.remove(&t) });
+        let listed = unsafe { self.tasks.remove(&t) };
+        // The list's reference goes a grace period later (Linux
+        // release_task -> put_task_struct_rcu_user): an RCU reader that
+        // reached it through a parent link may still read it
+        crate::sync::rcu::kfree_rcu(listed);
         Some(t)
+    }
+
+    /// Children `t` still has as it leaves the list name no parent
+    /// (Linux has none here: exit hands them on first,
+    /// forget_original_parent): a parent link never outlives its
+    /// target's listing (the `Task` invariant)
+    fn orphan_children(&mut self, t: &Task) {
+        while let Some(c) = self.inner_mut_of(t).children.front().map(task_ref) {
+            // SAFETY: on `t`'s children list
+            drop(unsafe { self.inner_mut_of(t).children.remove(&c) });
+            self.inner_mut_of(&c).in_children = false;
+            c.set_parent(None, self);
+            let mut cur = self.inner_mut_of(&c).threads.front();
+            while let Some(th) = cur {
+                th.set_parent(None, self);
+                cur = self.inner_mut_of(&c).threads.next(&th);
+            }
+        }
+    }
+
+    /// Released leader `t`'s group is gone (Linux __unhash_process with
+    /// group_dead: detach_pid PIDTYPE_TGID, PGID, SID): its group's pid
+    /// and its group and session links clear, the references dropped a
+    /// grace period later (an RCU reader may be on them)
+    fn detach_group_pids(&mut self, t: &Task) {
+        if let Some(s) = t.cpu_group() {
+            s.leader_pid.replace(None, self).defer_put();
+        }
+        t.pgrp.replace(None, self).defer_put();
+        t.session.replace(None, self).defer_put();
     }
 
     /// The numbers of removed task `t` that no task uses any more go
     /// back (Linux free_pid)
     fn release_pids(&self, t: &Task) {
         if let Some(ti) = t.inner().access(self) {
-            for p in [&ti.thread_pid, &ti.pgrp, &ti.session]
-                .into_iter()
-                .flatten()
-            {
+            let pids = [
+                ti.thread_pid.as_deref(),
+                t.pgrp.protected(self),
+                t.session.protected(self),
+            ];
+            for p in pids.into_iter().flatten() {
                 self.release_unused(p);
             }
         }
@@ -1170,14 +1258,16 @@ impl GlobalTaskTable {
     /// setpgid or setsid is not missed); the creator is in this list,
     /// the child not yet
     pub fn inherit_pids(&mut self, child: &Task, parent: &Task) {
-        let Some(pi) = parent.inner().access(self).as_ref() else {
+        if parent.inner().access(self).is_none() {
             return;
-        };
-        let (pg, s) = (pi.pgrp.clone(), pi.session.clone());
-        if let Some(ci) = child.inner().access_mut(self).as_mut() {
-            ci.pgrp = pg;
-            ci.session = s;
         }
+        let (pg, s) = (
+            parent.pgrp.get_protected(self),
+            parent.session.get_protected(self),
+        );
+        // The child had none (not listed yet: nothing to retire)
+        child.pgrp.replace(pg, self).defer_put();
+        child.session.replace(s, self).defer_put();
     }
 
     /// Put group leader `t` on its process group's and session's lists
@@ -1187,10 +1277,11 @@ impl GlobalTaskTable {
         if ti.pids_linked || !ti.leader {
             return;
         }
-        let (Some(pg), Some(s)) = (ti.pgrp.clone(), ti.session.clone()) else {
+        let (Some(pg), Some(s)) = (t.pgrp.get_protected(self), t.session.get_protected(self))
+        else {
             return;
         };
-        ti.pids_linked = true;
+        self.inner_mut_of(t).pids_linked = true;
         // SAFETY: `t` stays live while in the table and leaves these
         // lists before it (`remove`)
         unsafe {
@@ -1206,7 +1297,7 @@ impl GlobalTaskTable {
         if !core::mem::take(&mut ti.pids_linked) {
             return;
         }
-        if let (Some(pg), Some(s)) = (ti.pgrp.clone(), ti.session.clone()) {
+        if let (Some(pg), Some(s)) = (t.pgrp.get_protected(self), t.session.get_protected(self)) {
             // SAFETY: linked means on both lists
             unsafe {
                 pg.pgrp.access_mut(self).remove(t);
@@ -1230,9 +1321,8 @@ impl GlobalTaskTable {
     /// group and session it left come back, for the caller to drop
     /// after TASKLIST (Linux ksys_setsid's pids[] and free_pids).
     /// Nothing is allocated: the threads are walked on the leader's
-    /// list, and each thread's old reference is one of the two returned
-    /// (a process's threads share them), so dropping it here frees
-    /// nothing.
+    /// list; each thread's old reference is dropped a grace period
+    /// later (`put_rcu`: an RCU reader may still be on it).
     #[must_use]
     fn change_pids(
         &mut self,
@@ -1243,25 +1333,24 @@ impl GlobalTaskTable {
         let Some(l) = self.task(pid) else {
             return [None, None];
         };
-        let before = self.inner_mut_of(&l).pgrp.clone();
-        let before_s = self.inner_mut_of(&l).session.clone();
+        let before = l.pgrp.get_protected(self);
+        let before_s = l.session.get_protected(self);
         self.detach_pids(&l);
         let mut cur = self.inner_mut_of(&l).threads.front();
         while let Some(t) = cur {
-            let ti = self.inner_mut_of(&t);
-            let old = ti.pgrp.replace(pg.clone());
             debug_assert!(
-                Self::pid_ptr(&old) == Self::pid_ptr(&before),
+                t.pgrp.as_ptr() == Self::pid_ptr(&before),
                 "threads share a group"
             );
-            drop(old);
+            // RCU readers of the old link may still hold it: dropped a
+            // grace period later (Linux free_pid -> delayed_put_pid)
+            t.pgrp.replace(Some(pg.clone()), self).defer_put();
             if let Some(s) = s {
-                let old = ti.session.replace(s.clone());
                 debug_assert!(
-                    Self::pid_ptr(&old) == Self::pid_ptr(&before_s),
+                    t.session.as_ptr() == Self::pid_ptr(&before_s),
                     "threads share a session"
                 );
-                drop(old);
+                t.session.replace(Some(s.clone()), self).defer_put();
             }
             cur = self.inner_mut_of(&l).threads.next(&t);
         }
@@ -1701,10 +1790,10 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
     let mm = crate::mm::mm_alloc(config.page_table.root_table_phys());
 
     // Create Task entry
+    // The boot group and session, number 0 (Linux init_struct_pid)
+    let pgrp = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid);
+    let session = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid);
     let task_inner = crate::task::TaskInner {
-        // The boot group and session, number 0 (Linux init_struct_pid)
-        pgrp: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid),
-        session: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid),
         user_ns: Some(crate::ns::INIT_USER_NS.clone()),
         exit_signal: crate::signal::ExitSignal::SIGCHLD,
         // Shared resources: set by the caller via init_* functions
@@ -1737,6 +1826,9 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
     // Add to global table, as the root namespace's child reaper
     {
         let mut table = TASKLIST.write();
+        // Not listed yet: nothing to retire
+        task.pgrp.replace(pgrp, &mut table).defer_put();
+        task.session.replace(session, &mut table).defer_put();
         table.insert(task.clone());
         crate::task::pidns::attach_init(&mut table, &task);
     }
@@ -1831,7 +1923,7 @@ pub fn reap_zombie_child_times(
             parent_pid,
             target_pid,
             wflags,
-            pgid: cur_pgid(&table),
+            pgid: current_pgid(),
             ns: crate::task::pid::current_pid_ns(),
         };
         wait_zombie(&mut table, &w)?
@@ -2082,9 +2174,10 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
             if let Some(p) = &li.thread_pid {
                 p.set_task(core::ptr::null());
             }
-            // Its real parent is the old leader's (threads share it)
-            mi.real_parent = li.real_parent.clone();
         }
+        // Its real parent is the old leader's already: threads share it
+        // (fork copies it, `adopt` moves them all)
+        debug_assert!(core::ptr::eq(me.parent_ptr(), l.parent_ptr()));
         l.set_tid(tid);
         // The old leader's RLIMIT_NPROC charge goes with it; the caller
         // keeps its own as the process's
@@ -2133,7 +2226,7 @@ fn group_status(t: &TaskInner, own: i32) -> i32 {
 /// taken under the tracee's Task.sig.
 pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32, Times)> {
     let table = TASKLIST.read();
-    let pgid = cur_pgid(&table);
+    let pgid = current_pgid();
     let (tid, pid, code) = table.iter().find_map(|t| {
         if !(tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid)) {
             return None;
@@ -2190,7 +2283,7 @@ pub fn wait_jobctl(
     }
     let wnowait = wflags & WNOWAIT != 0;
     let table = TASKLIST.read();
-    let pgid = cur_pgid(&table);
+    let pgid = current_pgid();
     let (tid, pid, r, uid) = table.iter().find_map(|t| {
         let child = t.leader && t.ppid() == parent_pid && wait_eligible(t.exit_signal, wflags);
         let traced = tracee_of(&t, parent_pid);
@@ -2242,7 +2335,7 @@ fn tracee_of(t: &TaskView<'_>, tracer_pid: Pid) -> bool {
 /// wait for it is not ECHILD)
 pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
     let table = TASKLIST.read();
-    let pgid = cur_pgid(&table);
+    let pgid = current_pgid();
     table
         .iter()
         .any(|t| tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid))
@@ -2258,7 +2351,7 @@ pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
 ///   - 0: check for any child in same process group
 pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
     let table = TASKLIST.read();
-    let pgid = cur_pgid(&table);
+    let pgid = current_pgid();
 
     table.iter().any(|t| {
         // Must be a child of the parent (a thread-group leader)
@@ -2413,7 +2506,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_seccomp_filter,
         parent_ptrace,
         parent_ptracer,
-        parent_real_parent,
         parent_parent_exec_id,
         parent_leader_exit_signal,
         parent_iopl_emul,
@@ -2444,7 +2536,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.seccomp_filter.clone(),
             parent.ptrace,
             parent.ptracer.clone(),
-            parent.real_parent.clone(),
             parent.parent_exec_id,
             leader_exit,
             parent.iopl_emul,
@@ -2664,13 +2755,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         } else {
             None
         },
-        // CLONE_PARENT/CLONE_THREAD: the caller's real parent (Linux
-        // copy_process)
-        real_parent: if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
-            parent_real_parent
-        } else {
-            Some(Arc::downgrade(&task_ref(&current())))
-        },
         ..crate::task::TaskInner::new(Some(child_thread_pid.clone()), TaskState::Ready, child_pgd)
     };
     let child_task = Task::new(
@@ -2763,12 +2847,15 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
             let cur = table
                 .view(&me)
-                .map(|v| (v.real_parent.clone(), v.parent_exec_id));
+                .map(|v| (v.real_parent().map(task_ref), v.parent_exec_id));
             if let Some((rp, eid)) = cur {
-                let ci = table.inner_mut_of(&child_task);
-                ci.real_parent = rp;
-                ci.parent_exec_id = eid;
+                child_task.set_parent(rp.as_deref(), &mut table);
+                table.inner_mut_of(&child_task).parent_exec_id = eid;
             }
+        } else if table.view(&me).is_some() {
+            // Else the caller (Linux copy_process: p->real_parent =
+            // current), listed
+            child_task.set_parent(Some(&*me), &mut table);
         }
         table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
@@ -3142,13 +3229,13 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
     }
     let v = table.view(me)?;
     let level = v.thread_pid.as_ref().map(|p| p.level);
-    let mut p = v.real_parent.clone();
-    while let Some(t) = p.and_then(|w| w.upgrade()) {
+    let mut p = v.real_parent();
+    while let Some(t) = p {
         // An ancestor gone from the list, or in another pid namespace,
         // ends the walk: the namespace's init adopts (Linux
         // find_new_reaper ends at the child_reaper, by
         // task_pid(reaper)->level)
-        let Some(v) = table.view(&t) else { break };
+        let Some(v) = table.view(t) else { break };
         if v.thread_pid.as_ref().map(|p| p.level) != level {
             break;
         }
@@ -3157,7 +3244,7 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
         {
             return Some(r);
         }
-        p = v.real_parent.clone();
+        p = v.real_parent();
     }
     crate::task::pidns::child_reaper(table, me.pid_ns())
 }
@@ -4615,32 +4702,51 @@ pub fn current_tid() -> Tid {
 
 /// The current task's parent process as its pid namespace numbers it,
 /// 0 for none or one outside it (Linux
-/// task_tgid_vnr(current->real_parent)): read through the parent link
-/// under TASKLIST, which keeps the parent listed, and its number,
-/// while it is translated
+/// task_tgid_vnr(rcu_dereference(current->real_parent))): the parent
+/// link and the parent's group pid read under RCU, no lock, no
+/// reference
 pub fn current_ppid_vnr() -> u32 {
     let me = current();
-    let table = TASKLIST.read();
-    let ppid = table.view(&me).map_or(0, |t| t.ppid());
-    crate::task::pid::nr_ns(ppid, me.task.pid_ns())
+    let g = crate::sync::rcu::read_lock();
+    me.task
+        .parent(&g)
+        .map_or(0, |p| p.tgid_nr_ns(me.task.pid_ns(), &g))
 }
 
 /// The current task's process group (root number), 0 for none (Linux
-/// pid_nr(task_pgrp(current))), under the caller's TASKLIST hold
-pub fn cur_pgid(table: &GlobalTaskTable) -> Pid {
-    table.view(&current()).map_or(0, |t| t.pgid())
+/// pid_nr(task_pgrp(current))), read under RCU
+pub fn current_pgid() -> Pid {
+    current().task.pgid(&crate::sync::rcu::read_lock())
 }
 
-/// The current task's process group (root number), read under
-/// TASKLIST
-pub fn current_pgid() -> Pid {
-    cur_pgid(&TASKLIST.read())
+/// The current task's process group as its pid namespace numbers it, 0
+/// for none or one outside it (Linux pid_vnr(task_pgrp(current))),
+/// read under RCU
+pub fn current_pgid_vnr() -> u32 {
+    let me = current();
+    let g = crate::sync::rcu::read_lock();
+    me.task
+        .pgrp
+        .read(&g)
+        .map_or(0, |p| p.nr_ns(me.task.pid_ns()))
 }
 
 /// The current task's session (root number), 0 for none (Linux
-/// pid_nr(task_session(current))), read under TASKLIST
+/// pid_nr(task_session(current))), read under RCU
 pub fn current_sid() -> Pid {
-    TASKLIST.read().view(&current()).map_or(0, |t| t.sid())
+    current().task.sid(&crate::sync::rcu::read_lock())
+}
+
+/// The current task's session as its pid namespace numbers it, 0 for
+/// none or one outside it (Linux pid_vnr(task_session(current))), read
+/// under RCU
+pub fn current_sid_vnr() -> u32 {
+    let me = current();
+    let g = crate::sync::rcu::read_lock();
+    me.task
+        .session
+        .read(&g)
+        .map_or(0, |p| p.nr_ns(me.task.pid_ns()))
 }
 
 /// Increment minor page fault counter for current task
@@ -4673,26 +4779,26 @@ pub fn pgrp_tasks(pgid: Pid) -> alloc::vec::Vec<TaskRef> {
 /// exited and children of the global init do not count)
 pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
     let table = TASKLIST.read();
-    let same = |a: &Option<Arc<crate::task::pid::Pid>>, b: &crate::task::pid::Pid| {
-        a.as_deref().is_some_and(|a| core::ptr::eq(a, b))
+    let same = |a: Option<&crate::task::pid::Pid>, b: &crate::task::pid::Pid| {
+        a.is_some_and(|a| core::ptr::eq(a, b))
     };
     !table.pgrp(pg).any(|m| {
         if matches!(m.state, crate::task::TaskState::Zombie(_)) {
             return false;
         }
-        let Some(parent) = m.real_parent.as_ref().and_then(|w| w.upgrade()) else {
+        let Some(parent) = m.real_parent() else {
             return false;
         };
         if parent.pid == 1 {
             return false;
         }
-        let Some(p) = table.view(&parent) else {
+        let Some(p) = table.view(parent) else {
             return false;
         };
-        let Some(ms) = m.session.as_deref() else {
+        let Some(ms) = m.session() else {
             return false;
         };
-        !same(&p.pgrp, pg) && same(&p.session, ms)
+        !same(p.pgrp(), pg) && same(p.session(), ms)
     })
 }
 
@@ -4735,7 +4841,7 @@ pub fn current_cred() -> crate::task::Cred {
 /// namespace (Linux pid_vnr(task_pgrp(p))): None if not found
 pub fn lookup_task_pgid(pid: Pid) -> Option<u32> {
     let table = TASKLIST.read();
-    let pg = table.get(pid)?.pgrp.as_ref().map_or(0, |p| p.vnr());
+    let pg = table.get(pid)?.pgrp().map_or(0, |p| p.vnr());
     Some(pg)
 }
 
@@ -4752,7 +4858,7 @@ pub fn pgrp_exists(pgid: Pid) -> bool {
 /// namespace (Linux pid_vnr(task_session(p))): None if not found
 pub fn lookup_task_sid(pid: Pid) -> Option<u32> {
     let table = TASKLIST.read();
-    let s = table.get(pid)?.session.as_ref().map_or(0, |p| p.vnr());
+    let s = table.get(pid)?.session().map_or(0, |p| p.vnr());
     Some(s)
 }
 
@@ -5026,9 +5132,7 @@ fn setpgid_who(
     }
     let p = table.get(pid).ok_or(KernelError::NoProcess)?;
     let child = p
-        .real_parent
-        .as_ref()
-        .and_then(|w| w.upgrade())
+        .real_parent()
         .is_some_and(|parent| parent.pid == caller_pid);
     if !child {
         return Err(KernelError::NoProcess);

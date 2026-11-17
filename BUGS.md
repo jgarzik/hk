@@ -1018,7 +1018,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
 - **Process-wide state per thread** (C): the group and session `Pid`
-  references (`TaskInner.pgrp`/`session`) held by every thread, not
+  references (`Task.pgrp`/`session`) held by every thread, not
   once per process (Linux signal->pids); one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.
 - **`task/percpu.rs` is the largest file** (before C): scheduler core,
@@ -1158,10 +1158,13 @@ ntp_update_frequency).
 
 ## Deviations from Linux's lockless reads (fixing next)
 
-- **Parent and group reads take TASKLIST**: `task/mod.rs`
-  `TaskInner::ppid` / `pgid` / `sid` and their callers (getppid,
-  getpgid, getsid, kill's `Sender::current`, the wait scans) read under
-  TASKLIST's read lock. Linux reads `rcu_dereference(real_parent)` and
-  `signal->pids[]` under RCU, valid because a task and a `struct pid`
-  are freed a grace period after they are unlisted
-  (delayed_put_task_struct, delayed_put_pid).
+- **Task lookup by pid takes TASKLIST**: `task/percpu.rs`
+  `GlobalTaskTable::get` and its callers (getpgid/getsid with a pid,
+  kill and the other pid-addressed syscalls, /proc/<pid>) find the task
+  under TASKLIST's read lock. Linux finds it under RCU
+  (find_task_by_vpid / pid_task over the pid hash, tasks RCU-freed by
+  delayed_put_task_struct) and reads what it needs there.
+- **The ptracer link is a `Weak` under TASKLIST**: `task/mod.rs`
+  `TaskInner` `ptracer`, read by /proc status TracerPid among others;
+  Linux reads `ptrace_parent()` (`rcu_dereference(task->parent)`)
+  under RCU.

@@ -1350,7 +1350,10 @@ fn it_real_fn(t: &HrTimer) {
     if !sig.itimers.real.expire() {
         return;
     }
-    if let Some(pid) = sig.leader_pid() {
+    // A reference taken under RCU, the send after it (it allocates;
+    // Linux sends with sig->pids[PIDTYPE_TGID] read in place)
+    let pid = sig.leader_pid.get(&crate::sync::rcu::read_lock());
+    if let Some(pid) = pid {
         let info = crate::signal::SendInfo::Kernel;
         let _ = crate::signal::kill_pid_info(&pid, SIGALRM, info, |_, _| Ok(()));
     }

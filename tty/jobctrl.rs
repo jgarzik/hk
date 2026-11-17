@@ -64,7 +64,10 @@ impl Ctty {
 fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
     let me = crate::task::percpu::current();
     let t = table.view(&me)?;
-    Some((t.pgrp().cloned()?, t.session().cloned()?))
+    Some((
+        t.task.pgrp.get_protected(table)?,
+        t.task.session.get_protected(table)?,
+    ))
 }
 
 /// The caller's session
@@ -382,8 +385,8 @@ pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
     let in_session = table
         .pgrp(&pg)
         .next()
-        .and_then(|m| m.session().cloned())
-        .is_some_and(|ms| Arc::ptr_eq(&ms, &s));
+        .and_then(|m| m.session())
+        .is_some_and(|ms| core::ptr::eq(ms, Arc::as_ptr(&s)));
     if !in_session {
         return Err(KernelError::NotPermitted);
     }

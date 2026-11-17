@@ -324,8 +324,17 @@ borrows the current version for the guard's lifetime
 publishes a new one (rcu_assign_pointer, Release) and returns the old
 as `RcuRetired`, released after a grace period when it drops
 (synchronize_rcu; it panics in atomic context, where it would wait for
-its own CPU or, with one CPU, not at all). Updaters serialize under
-their own lock. `util::rculist::RcuList` (Linux rculist.h) is an
+its own CPU or, with one CPU, not at all; `defer` and `defer_put`
+release it through `kfree_rcu` / `put_rcu` instead). Updaters
+serialize under their own lock. `RcuLockedArc<T, O>` is the nullable
+form whose lock is typed (Linux a `__rcu` pointer written under a
+named lock: signal->pids[] under tasklist_lock): `read` under a
+guard, `protected` (rcu_dereference_protected) under a borrow of the
+lock's `UniqueOwner` data `O`, `replace` under a mutable borrow of
+it. `RcuPtr<T>` owns nothing (Linux task->real_parent): `set` is
+rcu_assign_pointer, `get` (unsafe) rcu_dereference, valid only on
+the caller's argument that its target is freed a grace period after
+no reader can reach it (`Task::parent`). `util::rculist::RcuList` (Linux rculist.h) is an
 intrusive list of `Arc` (or `&'static`) entries: readers walk it under
 a guard (Acquire loads of `next`; `RcuRef::get` takes a reference to an
 entry found), writers take its own spin leaf (`ends`) and insert at the
@@ -1294,6 +1303,8 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
 | `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
+| `Task.real_parent` | `RcuPtr<Task>` | The real parent, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
+| `Task.pgrp`, `Task.session` | `RcuLockedArc<Pid, GlobalTaskTable>` | Group and session links: written under TASKLIST's write lock (old reference `put_rcu`), read under it or an RCU read guard |
 
 **Pids** (`task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
 number per pid-namespace level. Numbers come from a lock-free bitmap
@@ -1330,7 +1341,9 @@ sessions are named by root numbers or `Arc<Pid>`; numbers are
 translated only at the user boundary: out, a root number to a
 namespace's (`pid::nr_ns`, `vnr`: 0 if not visible) through the hash
 (PIDMAP_LOCK), its owner kept listed by the caller meanwhile (the
-caller's own ids, or TASKLIST held for reading: getppid); in, a
+caller's own ids, or TASKLIST held for reading), or a `Pid` read
+under RCU numbered in place (`Pid::nr_ns`: a parent's group, a group,
+a session); in, a
 caller's number to its `Pid` or root number (`pid::find_vpid`,
 `from_vnr`, `find_pgrp(ns, nr)`: ESRCH if not visible) through the
 hash before TASKLIST is taken, or to its task
@@ -1366,17 +1379,32 @@ own children are handed on and it becomes a zombie, so its parent
 sees it exit only once the namespace is empty.
 
 **Relations** (under TASKLIST's write lock to change, read lock to
-walk): `real_parent` and `ptracer` are task references (`Weak`), never
-numbers, so a recycled tid cannot inherit a parent or tracer link. A
-group leader is on its real parent's `children` (intrusive `ArcList`,
+walk): `real_parent` and `ptracer` are task pointers, never numbers,
+so a recycled tid cannot inherit a parent or tracer link. `ptracer`
+is a `Weak` in `TaskInner`. `real_parent` (`Task.real_parent`, an
+`RcuPtr`, Linux real_parent) holds no reference: it is set, under the
+write lock, only to a listed task (fork, `adopt`, exec's leader
+change keeps the old leader's), and a task's children are handed on
+before it leaves the list (`forget_original_parent`; `remove`
+clears any left, `orphan_children`), so a listed task's parent is
+listed. Read under TASKLIST (`Task::parent_locked`, the views'
+`real_parent`/`ppid`: no count) or under an RCU read guard
+(`Task::parent`, Linux pid_alive(p) ? rcu_dereference(p->real_parent)):
+a task seen listed within the guard has a parent listed at some point
+of it, which therefore leaves memory only after the guard (task
+lifetime, below). A group leader is on its real parent's `children` (intrusive `ArcList`,
 link `Task.sibling`, one strong reference each; Linux only lists
 leaders); `link_child` at fork and exec's leader change, unlinked at
 reap. Every thread of a process has the same `real_parent` (a
 CLONE_THREAD child copies its creator's; `adopt` moves them all, Linux
 forget_original_parent's for_each_thread), and a parent's pid is read
-only through it (`TaskInner::ppid`, Linux task_tgid_nr(real_parent))
-under TASKLIST: getppid, wait, /proc stat, acct. The parent is listed
-while the link is read, so the reference taken frees nothing. An
+only through it: under RCU with no lock by getppid and /proc stat
+(`current_ppid_vnr`; `Task::tgid_nr_ns`, Linux task_tgid_nr_ns: the
+parent's `SignalStruct.leader_pid` read under the same guard, 0 once
+its group is released, numbered in the reader's namespace), under
+TASKLIST by the
+wait scans (`has_children`, `wait_jobctl`, `reapable`: the parent's
+fixed `pid` compared, through the pointer), acct and setpgid. An
 exiting task first detaches its tracees (exit_ptrace), then hands its
 children to another live thread
 of its group, else a live thread of the nearest ancestor process in
@@ -1404,21 +1432,31 @@ them (`TaskInner.pids_linked`), like Linux: linked when inserted
 (fork), by the new leader at exec's `take_leadership`, and after a
 change; unlinked at `remove` (release or reap; a zombie leader stays,
 as in Linux). Every thread holds a reference to its group's and
-session's `Pid` (`TaskInner.pgrp`/`session`, Linux signal->pids), so
-a `Pid` outlives its group even after its own task is gone. They are
-the only record (Linux has no copies): a task's group and session
-numbers are read through them (`TaskInner::pgid`/`sid`, root numbers)
-under TASKLIST, the caller's own taking its read lock
-(`current_pgid`/`current_sid`) or inside a section it holds
-(`cur_pgid`: wait; kill(0) walks the group it reads, `kill_own_pgrp`;
-setpgid checks the caller's session in its write section).
+session's `Pid` (`Task.pgrp`/`session`, `RcuLockedArc`s owned by
+TASKLIST, Linux signal->pids), so a `Pid` outlives its group even
+after its own task is gone. They are the only record (Linux has no
+copies): a task's group and session are read through them, under an
+RCU read guard with no lock for the caller's own (`current_pgid`,
+`current_sid`, their `_vnr` forms: getpgid(0), getsid(0), kill's
+`Sender::current`, the wait scans' own group, the tty
+session-leader check, ioprio/priority PGRP; Linux task_pgrp(current) under
+rcu_read_lock) and /proc stat, or under TASKLIST
+(`RcuLockedArc::protected`, the views' `pgrp`/`session`/`pgid`/`sid`:
+kill(0) walks the group it reads, `kill_own_pgrp`; setpgid checks the
+caller's session in its write section). A replaced reference is
+dropped a grace period later (`RcuRetired::defer_put`: `put_rcu` on
+the `Pid`'s `RcuPuts`, Linux free_pid -> delayed_put_pid), so a reader
+on it keeps it; the `Pid` drop then runs in `rcuc/N` (PIDMAP_LOCK
+taken there, a leaf). A released leader's links (and its group's
+`leader_pid`) are cleared so (`detach_group_pids`, Linux
+__unhash_process with group_dead), after its numbers are given back.
 setpgid and setsid change every thread of the process in one write
 section (`change_pids`, walking the leader's `threads` list: nothing
 is allocated); fork copies the creator's under the same
 write lock that inserts the child. The old group and session `Pid`
-references are handed back and dropped after TASKLIST (Linux
-ksys_setsid's pids[] and free_pids; each thread's own old reference,
-one of those two, is dropped in the section and frees nothing); a group's `Pid` is looked up by number
+are handed back too and dropped after TASKLIST (Linux ksys_setsid's
+pids[] and free_pids; each thread's own old reference goes through
+`put_rcu` in the section); a group's `Pid` is looked up by number
 (`find_pgrp`, PIDMAP_LOCK) before TASKLIST is taken. Group 0, where
 init starts, is `INIT_STRUCT_PID` (Linux init_struct_pid, never
 hashed). kill(-pgrp), kill(0), tty ISIG, F_SETOWN and PRIO_PGRP /
@@ -1428,7 +1466,7 @@ TASKLIST read hold and send to each process in place (Linux
 __kill_pgrp_info, send_sigio under tasklist_lock), allocating nothing
 but each signal's queue entry.
 
-A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
+A `Task` has six kinds of fields: fixed at creation (`tid`, `pid`,
 `pid_ns`, `kind`, `kstack_top`); hot atomics written by the task itself (or its
 creator before it first runs) or under TASKLIST, and read lock-free
 by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
@@ -1439,7 +1477,9 @@ off (3.5); `prev_cputime`, in the
 task and in its SignalStruct, is an IrqSpinlock leaf (Linux
 prev_cputime.lock) held only by `cputime_adjust` (times, getrusage,
 wait's rusage, /proc/<pid>/stat), under TASKLIST or not); `cred` (below); the
-alloc_lock fields; and
+alloc_lock fields; the RCU-read relations (`real_parent`, `pgrp`,
+`session`: written under TASKLIST's write lock, read under it or an
+RCU read guard, above); and
 the rest, `TaskInner`, in a `TableCell` (`sync::LockedBy` owned by
 `GlobalTaskTable`): a borrow of the locked table is the key, `&table`
 reads it and `&mut table` writes it, checked by the compiler (the
@@ -1452,6 +1492,22 @@ or writes its `TaskInner` through `GlobalTaskTable::view` /
 `view_mut`, which return None once the task is off the list (reaped:
 its `tasks_link`, changed only under the write lock, is unlinked); a
 tid is looked up only at the syscall boundary.
+
+**Task lifetime** (Linux rcu_users, put_task_struct_rcu_user,
+delayed_put_task_struct): the task list's reference (`tasks`, one per
+listed task) is dropped through `kfree_rcu` in the write section that
+unlists the task (`remove`; the embedded `Task.rcu` head, queued once:
+a task is unlisted once), so a task leaves memory no sooner than a
+grace period after it leaves the list, and an RCU reader that reached
+it with no reference (a parent link) may read it meanwhile. That
+reference is usually the last, so the task's drop (its `TaskInner`:
+signal and sighand references, `Pid`s; its credentials, cgroup and
+keyring references, its namespace) runs in `rcuc/N` with preemption
+off, and must not sleep (UNSAFE.md rule 12): exit has already taken
+everything that may (mm, files, fs, nsproxy, I/O context, cgroup
+membership, timers; `exit_current`), and what is left frees memory or
+takes only spin leaves (PIDMAP_LOCK, `UCOUNTS`, the key registry,
+`DELAYED_FPUT` through `fput`).
 
 **alloc_lock fields** (Linux task_lock(p), `p->alloc_lock`): `mm`,
 `files`, `fs`, `nsproxy`, `comm`, `mempolicy`, `io_context`.
@@ -1493,7 +1549,10 @@ for the task, TASKLIST for others.
    release may sleep in SO_LINGER: sleeping under a spin lock) or tear
    down a network namespace (RTNL, a sleeping lock). `Arc<Cred>` is the
    exception: replacing it under the lock (commit_creds) frees only
-   memory and at most takes the `UCOUNTS` leaf.
+   memory and at most takes the `UCOUNTS` leaf. A reaped task's list
+   reference and a replaced group or session `Pid` reference are
+   queued under the lock (`kfree_rcu`, `put_rcu`: no release there)
+   and dropped in `rcuc/N` a grace period later (task lifetime).
 5. **PF_EXITING** - `exit_current` sets `pf::EXITING` in `Task.flags`
    before releasing anything; release paths read
    it lock-free via `current_exiting()` (TCP close skips its SO_LINGER
@@ -1629,6 +1688,7 @@ from `Task.se`.
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
 | `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.jobctl` (group stop state), `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
+| RCU (`real_parent`, `signal->pids[]`, task and pid lifetime) | Lockless parent, group and session reads | `Task.real_parent` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the list's task reference through `kfree_rcu`, a dropped `Pid` link through `put_rcu` |
 | RCU (`cred`) | Credentials | lock-free for the task, TASKLIST for others |
 
 Remaining differences: the `task_struct` fields Linux leaves to the
@@ -5203,8 +5263,8 @@ else is taken under it) unless an order is given. "spin" is the
 | `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
 | `Task.wake_q` | task/mod.rs, task/wake_q.rs | atomic pointer | next task on the `WakeQ` it is queued on (Linux task->wake_q): claimed null -> tail by a compare-exchange after a full fence, so a task is on one queue at a time; only that queue's owner links and walks it; the waker clears it before `try_to_wake_up`, which may then queue it again |
 | `SignalStruct.posix_timers` | signal/mod.rs, time/posix_timer.rs | spin Mutex | the thread group's timer_create timers (Linux signal->posix_timers and their posix_timers_hashtable entries): an `RbTree` id -> timer whose nodes are reserved before the lock and freed after it, so nothing allocates or frees under it. timer_create (Linux do_timer_create) takes an id with a placeholder (None, skipped by every lookup) in one hold, makes the timer and copies the id out with the lock dropped, then publishes the timer in a second hold or removes the placeholder on an error; clock_nanosleep's hidden CPU timer is made with its node before the lock and inserted in one hold. Thread context, never under TASKLIST; cpu_timer holds it around arming the group's CPU-timer state and its whole expiry pass (`PosixTimer.inner` of the registry's timers and of the CPU itimers, and `SignalStruct.rlim`, inside); deleted at exec and at the group's last exit (`exec_timers`, `exit_itimers`: timers stopped after the lock) or with the SignalStruct |
-| `SignalStruct.itimers` | signal/mod.rs, time/posix_timer.rs | embedded `PosixTimer`s (their `inner` IrqSpinlocks) | ITIMER_REAL, ITIMER_VIRTUAL and ITIMER_PROF (Linux signal->real_timer, signal->it[]), made with the SignalStruct (fork fails ENOMEM there, setitimer cannot fail); no registry lock: each is reached through the SignalStruct and its state is under its own `inner`. ITIMER_REAL's SOFT hrtimer callback (`it_real_fn`, `ktimers/N`) reaches the SignalStruct by address, so it is cancelled at the group's last exit (`exit_itimers`) and waited out by the SignalStruct's Drop; it takes `inner`, drops it, then reads `leader_pid` under TASKLIST's read lock and sends SIGALRM with nothing held. The CPU itimers are checked by cpu_timer's expiry pass under `posix_timers`, after the registry's timers |
-| `SignalStruct.leader_pid` | signal/mod.rs | `TableCell` (TASKLIST) | the group leader's struct pid (Linux signal->pids[PIDTYPE_TGID]), ITIMER_REAL's target: set under the write lock when the group's first task is attached (`install_fork_signal`, `init_task_signal`); an exec by another thread keeps it (that thread takes the leader's struct pid, exchange_tids); read under the read lock |
+| `SignalStruct.itimers` | signal/mod.rs, time/posix_timer.rs | embedded `PosixTimer`s (their `inner` IrqSpinlocks) | ITIMER_REAL, ITIMER_VIRTUAL and ITIMER_PROF (Linux signal->real_timer, signal->it[]), made with the SignalStruct (fork fails ENOMEM there, setitimer cannot fail); no registry lock: each is reached through the SignalStruct and its state is under its own `inner`. ITIMER_REAL's SOFT hrtimer callback (`it_real_fn`, `ktimers/N`) reaches the SignalStruct by address, so it is cancelled at the group's last exit (`exit_itimers`) and waited out by the SignalStruct's Drop; it takes `inner`, drops it, then takes a reference to `leader_pid` under RCU and sends SIGALRM with nothing held. The CPU itimers are checked by cpu_timer's expiry pass under `posix_timers`, after the registry's timers |
+| `SignalStruct.leader_pid` | signal/mod.rs | `RcuLockedArc` owned by TASKLIST | the group leader's struct pid (Linux signal->pids[PIDTYPE_TGID]), ITIMER_REAL's target and a parent's number for getppid and /proc (`Task::tgid_nr_ns`): set under the write lock when the group's first task is attached (`install_fork_signal`, `init_task_signal`), cleared there when its leader is released (`detach_group_pids`, Linux __unhash_process detach_pid(PIDTYPE_TGID)), the old reference dropped a grace period later (`put_rcu`); an exec by another thread keeps it (that thread takes the leader's struct pid, exchange_tids); read under RCU (`it_real_fn` takes a reference in its read section and sends after it) |
 | `PosixTimer.inner` | time/posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it, at settime and at signal delivery (`deliver_locked`): a sample may take TASKLIST and the target's rq lock (task_sched_runtime) |
 | `PosixTimer.sigq` | time/posix_timer.rs | spin Mutex | a timer_create timer's preallocated signal entry while it is not queued (Linux SIGQUEUE_PREALLOC); leaf, never in hardirq, never with `inner` or a signal lock. The entry is taken out to be queued by `signal::send_timer_sigqueue` with no lock held, and put back when its signal is dequeued (`posix_timer::deliver`, which rearms an interval timer under `inner`), flushed or refused (`reclaim`). A flushed set is dropped wherever its send ran: kill_fasync's F_SETSIG stop signal or SIGCONT drops it under `Fasync.fa` / `FOwner.st` (interrupts off), RCU and the caller's spin locks, so `reclaim` takes `sigq` there as a leaf and puts the timer reference it upgraded through `put_rcu` (Linux posixtimer_putref: kfree_rcu): a timer deleted meanwhile is torn down in `rcuc/N`, its hrtimer idle, never under those locks |
 | CPU-timer state (`time/cpu_timer.rs`): `SignalStruct.cputimer`, `Task.cpu_next` | time/cpu_timer.rs | atomics | the group's running CPU totals (utime, stime, sum_exec_runtime: Linux cputime_atomic, RMWs from every thread's CPU) and expiry hints per PROF/VIRT/SCHED sample, a thread's hints; written by the tick's samples and runtime charges (rq lock, interrupts off) and by `run` in task context. The group totals start (arming a process timer, `arm_group`) and stop (`run` finding nothing armed) only under `posix_timers`; sampling never starts them (Linux cpu_clock_sample_group with start=false for gettime). `run` (TIF_NOTIFY_RESUME on the way to user mode) takes `posix_timers` -> `PosixTimer.inner`, then `SignalStruct.rlim`, and sends signals after dropping them: expired timers go on a local firing list through their embedded `PosixTimer.elist` (Linux collect_timerqueue, no allocation), marked `collected` and `firing` under `inner`; after the lock each is unlinked, `collected` cleared under `inner`, and fired if `firing` is still set (settime and delete clear it). A timer still `collected` is skipped by another thread's pass, so it is never linked twice. The itimers' and RLIMIT_CPU's process signals are kept in locals (one each) |

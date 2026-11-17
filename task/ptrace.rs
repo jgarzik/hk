@@ -295,7 +295,9 @@ fn ptrace_traceme() -> KernelResult<i64> {
 
     // Set up tracing - parent becomes tracer
     task.ptrace = PT_PTRACED;
-    task.ptracer = task.real_parent.clone();
+    task.ptracer = task
+        .real_parent()
+        .map(|p| alloc::sync::Arc::downgrade(&percpu::task_ref(p)));
 
     Ok(0)
 }

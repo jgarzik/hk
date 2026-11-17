@@ -698,8 +698,25 @@ pub mod tif {
 ///   itself without a lock (all but `io_context`) and by others under
 ///   its `alloc_lock` ([`Task::task_lock`]), changed under it by the
 ///   task (or its creator before it runs; `io_context` by anyone);
+/// - the relations RCU readers follow (`real_parent`, `pgrp`,
+///   `session`; Linux real_parent, signal->pids[PIDTYPE_PGID,
+///   PIDTYPE_SID]): written under TASKLIST's write lock, read under
+///   it or under an RCU read guard;
 /// - everything else ([`TaskInner`]), read and written only under
 ///   TASKLIST, through the table's views (`GlobalTaskTable::get` etc.).
+///
+/// # Invariants
+/// A task leaves memory no sooner than a grace period after it leaves
+/// the task list: the list's reference is dropped through `kfree_rcu`
+/// (Linux put_task_struct_rcu_user -> delayed_put_task_struct). That
+/// reference is usually the last, so the task's drop runs in `rcuc/N`
+/// with preemption off: nothing it still holds may sleep to release
+/// (exit took all that may, doc/UNSAFE.md rule 12).
+/// `real_parent` is null or, whenever this task is in the task list,
+/// names a task in it: it changes only under TASKLIST's write lock, to
+/// a listed task (fork, `adopt`, exec's leader change), and a task's
+/// children are handed on before it leaves the list
+/// (forget_original_parent; `remove` clears any left).
 pub struct Task {
     /// Thread ID: the root number of its `thread_pid`; changes only when
     /// a non-leader execs and takes its leader's (exchange_tids)
@@ -873,23 +890,37 @@ pub struct Task {
     /// A group leader's place on its session's `Pid.session` (Linux
     /// pid_links[PIDTYPE_SID]; under TASKLIST)
     pub session_link: crate::util::list::Link,
+    /// The real parent (Linux real_parent): the task whose `children`
+    /// list holds this one's group leader; null for init and kernel
+    /// threads. No reference: valid while this task is listed (type
+    /// invariant), read under TASKLIST ([`Task::parent_locked`]) or an
+    /// RCU read guard ([`Task::parent`]), written under its write lock
+    real_parent: crate::sync::rcu::RcuPtr<Task>,
+    /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
+    /// PIDTYPE_SID]): the same in every thread of the group, the only
+    /// record of its group and session; none for kernel threads and
+    /// once its released leader's group is gone. Replaced under
+    /// TASKLIST's write lock, the old reference dropped a
+    /// grace period later (Linux free_pid -> delayed_put_pid); read
+    /// under its read lock or an RCU read guard
+    pub pgrp: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    pub session: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    /// Releases the task list's reference a grace period after it is
+    /// unlisted (type invariant)
+    rcu: crate::sync::rcu::RcuHead,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner>>,
 }
+
+crate::rcu_head!(Task, rcu);
 
 /// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner {
     /// Its process identifier (Linux thread_pid; None for the idle
     /// tasks, tid 0)
     thread_pid: Option<Arc<pid::Pid>>,
-    /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
-    /// PIDTYPE_SID]): the same in every thread of the group, the only
-    /// record of its group and session ([`TaskInner::pgid`], `sid`);
-    /// None for kernel threads
-    pgrp: Option<Arc<pid::Pid>>,
-    session: Option<Arc<pid::Pid>>,
-    /// A group leader on its `pgrp`'s and `session`'s lists
+    /// A group leader on its `Task.pgrp`'s and `session`'s lists
     pids_linked: bool,
     /// The user namespace of its credentials (Linux
     /// real_cred->user_ns; hk keeps the namespace itself in the
@@ -1000,11 +1031,6 @@ pub struct TaskInner {
     /// so a recycled number never names it (under TASKLIST)
     ptracer: Option<alloc::sync::Weak<Task>>,
 
-    /// The real parent (Linux real_parent): the task whose `children`
-    /// list holds this one; None for init and kernel threads. Weak:
-    /// exit reparents children first (under TASKLIST)
-    real_parent: Option<alloc::sync::Weak<Task>>,
-
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
@@ -1033,8 +1059,6 @@ impl TaskInner {
     pub fn new(thread_pid: Option<Arc<pid::Pid>>, state: TaskState, pgd: u64) -> Self {
         Self {
             thread_pid,
-            pgrp: None,
-            session: None,
             pids_linked: false,
             user_ns: None,
             exit_code: 0,
@@ -1056,7 +1080,6 @@ impl TaskInner {
             leader: true,
             ptrace: 0,
             ptracer: None,
-            real_parent: None,
             children: crate::util::list::ArcList::new(),
             in_children: false,
             threads: crate::util::list::OwnedList::new(),
@@ -1100,43 +1123,9 @@ impl TaskInner {
         self.thread_pid.as_ref()
     }
 
-    /// Its process group (None for kernel threads)
-    pub fn pgrp(&self) -> Option<&Arc<pid::Pid>> {
-        self.pgrp.as_ref()
-    }
-
-    /// Its session (None for kernel threads)
-    pub fn session(&self) -> Option<&Arc<pid::Pid>> {
-        self.session.as_ref()
-    }
-
     /// It is its thread group's leader
     pub fn leader(&self) -> bool {
         self.leader
-    }
-
-    /// Its real parent, if it has one that lives
-    pub fn real_parent(&self) -> Option<percpu::TaskRef> {
-        self.real_parent.as_ref().and_then(|w| w.upgrade())
-    }
-
-    /// Its real parent's process (root number), 0 for none (Linux
-    /// task_tgid_nr(real_parent)); the parent is listed while TASKLIST
-    /// is held, so the reference taken frees nothing
-    pub fn ppid(&self) -> Pid {
-        self.real_parent().map_or(0, |p| p.pid)
-    }
-
-    /// Its process group (root number), 0 for none (Linux
-    /// pid_nr(task_pgrp))
-    pub fn pgid(&self) -> Pid {
-        self.pgrp.as_ref().map_or(0, |p| Pid::from(p.nr()))
-    }
-
-    /// Its session (root number), 0 for none (Linux
-    /// pid_nr(task_session))
-    pub fn sid(&self) -> Pid {
-        self.session.as_ref().map_or(0, |p| Pid::from(p.nr()))
     }
 
     /// Its current state
@@ -1638,6 +1627,10 @@ impl Task {
             thread_owner: crate::util::list::Owner::new(),
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
+            real_parent: crate::sync::rcu::RcuPtr::null(),
+            pgrp: crate::sync::rcu::RcuLockedArc::none(),
+            session: crate::sync::rcu::RcuLockedArc::none(),
+            rcu: crate::sync::rcu::RcuHead::new(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1703,6 +1696,10 @@ impl Task {
             thread_owner: crate::util::list::Owner::new(),
             pgrp_link: crate::util::list::Link::new(),
             session_link: crate::util::list::Link::new(),
+            real_parent: crate::sync::rcu::RcuPtr::null(),
+            pgrp: crate::sync::rcu::RcuLockedArc::none(),
+            session: crate::sync::rcu::RcuLockedArc::none(),
+            rcu: crate::sync::rcu::RcuHead::new(),
             inner: TableCell::new(None),
         }
     }
@@ -1717,6 +1714,81 @@ impl Task {
     #[inline]
     pub fn pid_ns(&self) -> &crate::ns::PidNamespace {
         self.pid_ns.as_deref().unwrap_or(&crate::ns::INIT_PID_NS)
+    }
+
+    /// Its real parent, none once it has left the task list (Linux
+    /// pid_alive(p) ? rcu_dereference(p->real_parent)); no reference
+    /// taken: the parent stays allocated while `g` is held
+    pub fn parent<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> Option<&'a Task> {
+        let _ = g;
+        if !self.tasks_link.is_linked() {
+            return None;
+        }
+        // SAFETY: it was listed within `g`'s section, so its parent at
+        // any later point was listed then too (type invariant: set only
+        // to a listed task while it is listed, never changed once it
+        // leaves) and leaves memory no sooner than a grace period after
+        // it leaves the list, which `g` keeps from ending for 'a
+        unsafe { self.real_parent.get() }
+    }
+
+    /// Its real parent, TASKLIST held (Linux real_parent under
+    /// tasklist_lock); none once it has left the task list
+    pub fn parent_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+        let _ = table;
+        if !self.tasks_link.is_linked() {
+            return None;
+        }
+        // SAFETY: listed, and `table` borrowed for 'a keeps it so: its
+        // parent is listed for 'a too (type invariant), held by the
+        // list's reference
+        unsafe { self.real_parent.get() }
+    }
+
+    /// Its real parent becomes `p` (TASKLIST held for writing: Linux
+    /// rcu_assign_pointer(real_parent) under tasklist_lock); `p` is
+    /// listed (the type invariant)
+    pub fn set_parent(&self, p: Option<&Task>, table: &mut percpu::GlobalTaskTable) {
+        let _ = table;
+        debug_assert!(p.is_none_or(|p| p.tasks_link.is_linked()));
+        // INVARIANT: `p` is listed (the callers'), under the write lock
+        self.real_parent
+            .set(p.map_or(core::ptr::null(), core::ptr::from_ref));
+    }
+
+    /// Its real parent's address, to compare only
+    pub fn parent_ptr(&self) -> *const Task {
+        self.real_parent.as_ptr()
+    }
+
+    /// Its process as `ns` numbers it, 0 if not visible there or once
+    /// its group is released (Linux task_tgid_nr_ns:
+    /// pid_nr_ns(rcu_dereference(signal->pids[PIDTYPE_TGID]))), under
+    /// `g`. A kernel thread (no signal struct) is numbered only in the
+    /// root namespace.
+    pub fn tgid_nr_ns(
+        &self,
+        ns: &crate::ns::PidNamespace,
+        g: &crate::sync::rcu::RcuReadGuard,
+    ) -> u32 {
+        match self.cpu_group() {
+            Some(s) => s.leader_pid.read(g).map_or(0, |p| p.nr_ns(ns)),
+            // A root number, a u32 (pid_max)
+            None if ns.level == 0 => self.pid as u32,
+            None => 0,
+        }
+    }
+
+    /// Its process group (root number), 0 for none (Linux
+    /// pid_nr(task_pgrp)), under `g`
+    pub fn pgid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
+        self.pgrp.read(g).map_or(0, |p| Pid::from(p.nr()))
+    }
+
+    /// Its session (root number), 0 for none (Linux
+    /// pid_nr(task_session)), under `g`
+    pub fn sid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
+        self.session.read(g).map_or(0, |p| Pid::from(p.nr()))
     }
 
     /// Its pid namespace, a counted reference (Linux
