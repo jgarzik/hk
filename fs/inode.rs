@@ -774,6 +774,13 @@ pub fn for_each_sb_inode(sb: &Arc<SuperBlock>, f: &mut dyn FnMut(&Arc<Inode>) ->
 }
 
 impl Inode {
+    /// A reference to an inode borrowed with none (under an RCU read
+    /// guard), unless its last one went and it is being evicted or
+    /// freed (Linux igrab: I_FREEING / I_WILL_FREE)
+    pub fn igrab(&self) -> Option<Arc<Self>> {
+        self.f.upgrade()
+    }
+
     fn wrap(f: InodeInner) -> Self {
         Self {
             f: crate::sync::rcu::RcuFree::new(f),

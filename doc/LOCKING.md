@@ -2785,6 +2785,7 @@ pub struct Dentry {
     d_rcu: RcuHead,             // The free after a grace period
     d_seq: SeqCount,            // RCU-walk changes (its d_lock, write)
     d_flags: AtomicU32,         // DCACHE_MOUNTED/_UNHASHED (its d_lock)
+    d_inode: AtomicPtr<Inode>,  // Its inode reference (its d_lock + d_seq)
     d_sib: Link, d_sib_owner: Owner, // Parent's children (its d_lock)
     d_hash: Link,               // Hash bucket (its bit lock)
     d_hkey: AtomicU64, d_hparent: AtomicUsize, // Hash key, parent (parent's d_lock)
@@ -2794,10 +2795,23 @@ pub struct Dentry {
 }
 
 struct DentryInner {
-    inode: Option<Arc<Inode>>,
     children: OwnedList<SibAdapter, DentryRef>, // Linux d_children
 }
 ```
+
+`d_inode` (Linux d_inode) is the dentry's own inode reference as an
+`Arc::into_raw`, null when negative: set and cleared under its d_lock
+held for writing inside a `d_seq` write section (Release), the
+reference dropped after the locks; read with no lock (Acquire).
+`d_inode_rcu` borrows the inode for an RCU read guard (Linux
+READ_ONCE(dentry->d_inode)): sound because a writer clears the pointer
+before it drops its reference and an inode is freed a grace period
+after its last one (Inode free, above); `get_inode` takes a reference
+from that (Linux igrab, `Inode::igrab`: refused once the last one
+went, which means the dentry turned negative meanwhile), so neither
+writes a lock word. A holder's reference keeps a positive dentry's
+inode in place (`add` fills a negative one, and `d_delete` empties
+one, only when no one else holds it).
 
 `d_flags` (Linux d_flags) holds `DCACHE_MOUNTED` (Linux's) and
 `DCACHE_UNHASHED` (hk's mark for out of the tree, Linux
