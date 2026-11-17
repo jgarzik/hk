@@ -1138,6 +1138,19 @@ Tag = roadmap phase (doc/ROADMAP.md).
     pressure: a forced charge for an empty queue, or the window or
     retransmit timer after a drop, may not restart it.
 
+## Kernel stack frames
+
+**Location**: `arch/aarch64/vectors.S`, `task/fork.rs`, others named below
+
+- Kernel code may use FP/SIMD registers, so every arm64 kernel-entry
+  trap frame saves q0-q31 (the EL1 frame too); Linux builds the kernel
+  general-regs-only, saves user FP state at context switch, and brackets
+  kernel SIMD use with kernel_neon_begin/end.
+- Large frames left: `do_clone` (TaskInner and the clone state live by
+  value; Linux dup_task_struct builds in the allocated task), splice's
+  on-stack page buffers, `setup_rt_frame`, `gen_status`,
+  `munmap_locked`, `link_path_walk_rcu` and `Nd::lazy`.
+
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
