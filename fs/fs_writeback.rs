@@ -157,20 +157,29 @@ pub fn writeback_inode(inode: &Inode) -> Result<(), KernelError> {
 }
 
 /// Write back one inode whole (Linux write_inode_now /
-/// __writeback_single_inode): its dirty pages, then, if marked, its
-/// metadata through its filesystem's ->write_inode, the mark cleared
-/// first so a change meanwhile marks it again. For fsync, a pass and
-/// the write-back before an eviction. The first error is returned
-/// after both were tried.
+/// __writeback_single_inode): its dirty pages, then its metadata
+/// (`sync_inode_metadata`). For fsync, a pass and the write-back before
+/// an eviction. The first error is returned after both were tried.
 pub fn write_inode_now(inode: &Inode) -> Result<(), KernelError> {
     let r = crate::mm::filemap::write_and_wait(inode);
-    if !inode.i_dirty_inode.swap(false, Ordering::AcqRel) {
-        return r;
-    }
+    r.and(sync_inode_metadata(inode))
+}
+
+/// Write `inode`'s metadata if it is marked (Linux sync_inode_metadata,
+/// as __writeback_single_inode after the pages): the mark is cleared
+/// just before its filesystem's ->write_inode is called, so a change
+/// meanwhile marks it again; a failed write leaves it clean, as Linux
+/// (no redirty: requeue_inode only requeues an inode dirtied again).
+/// Waiting for the write to reach the disk is the caller's (Linux
+/// wbc's WB_SYNC_ALL: vfat syncs its device).
+pub fn sync_inode_metadata(inode: &Inode) -> Result<(), KernelError> {
     let Some(sb) = inode.superblock() else {
-        return r;
+        return Ok(());
     };
-    r.and(sb.s_op.write_inode(inode))
+    if !inode.i_dirty_inode.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+    sb.s_op.write_inode(inode)
 }
 
 /// It went dirty at or before `cutoff` (monotonic ns)
