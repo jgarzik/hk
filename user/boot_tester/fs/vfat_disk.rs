@@ -4,11 +4,17 @@
 //! - VFAT_DOTDOT: a directory made in the root has ".." pointing at
 //!   cluster 0 (Linux fat_alloc_new_dir: the root's i_logstart is 0);
 //!   one made below it points at its parent's first cluster.
+//! - VFAT_NLINK: a directory's st_nlink is 2 + its subdirectories
+//!   (Linux fat_subdirs, counting "." and ".."; the root's + 2), kept by
+//!   mkdir, rmdir and a rename across directories, and the same when
+//!   read again after a remount.
 
 use crate::harness::T;
 use crate::helpers::find_blkdev;
+use crate::proc::sysfs::each_entry;
 use hk_syscall::{
-    O_RDONLY, sys_close, sys_mkdir, sys_mount, sys_open, sys_pread64, sys_rmdir, sys_umount2,
+    O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount, sys_open, sys_pread64,
+    sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink,
 };
 
 const MNT: &[u8] = b"/tmp/vdk\0";
@@ -141,6 +147,7 @@ pub fn run_tests() {
         return;
     }
     dotdot(&mut t, dev);
+    nlink(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
     t.done();
@@ -174,4 +181,61 @@ fn dotdot(t: &mut T, dev: &[u8]) {
     t.eq(b"remount", mount(dev), 0);
     sys_rmdir(d2.as_ptr());
     sys_rmdir(d1.as_ptr());
+}
+
+/// st_nlink of `p`, or -1
+fn links(p: &[u8]) -> i64 {
+    let mut st = Stat::default();
+    if sys_stat(p.as_ptr(), &mut st) == 0 {
+        st.st_nlink as i64
+    } else {
+        -1
+    }
+}
+
+/// 2 + the directories `dir` lists
+fn want(dir: &[u8]) -> i64 {
+    const DT_DIR: u8 = 4;
+    let mut n = 2;
+    each_entry(dir, &mut |_, ty| n += i64::from(ty == DT_DIR));
+    n
+}
+
+/// VFAT_NLINK: N with subdirectories a and b and a file f
+fn nlink(dev: &[u8]) {
+    let mut t = T::new(b"VFAT_NLINK");
+    let (n, a, b, f) = (
+        b"/tmp/vdk/N\0",
+        b"/tmp/vdk/N/a\0",
+        b"/tmp/vdk/N/b\0",
+        b"/tmp/vdk/N/f\0",
+    );
+    let moved = b"/tmp/vdk/Nb\0";
+    t.eq(b"mkdir N", sys_mkdir(n.as_ptr(), 0o755), 0);
+    t.eq(b"new dir", links(n), 2);
+    t.eq(b"mkdir a", sys_mkdir(a.as_ptr(), 0o755), 0);
+    t.eq(b"mkdir b", sys_mkdir(b.as_ptr(), 0o755), 0);
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    t.eq(b"N: a, b", links(n), 4);
+    t.eq(b"a", links(a), 2);
+    t.eq(b"f", links(f), 1);
+    t.eq(b"root", links(MNT), want(MNT));
+    t.eq(b"rmdir a", sys_rmdir(a.as_ptr()), 0);
+    t.eq(b"N: b", links(n), 3);
+    t.eq(b"move b out", sys_rename(b.as_ptr(), moved.as_ptr()), 0);
+    t.eq(b"N: none", links(n), 2);
+    t.eq(b"root after move", links(MNT), want(MNT));
+    t.eq(b"mkdir a again", sys_mkdir(a.as_ptr(), 0o755), 0);
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"remount", mount(dev), 0);
+    t.eq(b"N read again", links(n), 3);
+    t.eq(b"root read again", links(MNT), want(MNT));
+    sys_unlink(f.as_ptr());
+    sys_rmdir(a.as_ptr());
+    sys_rmdir(n.as_ptr());
+    sys_rmdir(moved.as_ptr());
+    t.done();
 }

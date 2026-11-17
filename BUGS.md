@@ -698,14 +698,6 @@ waiting).
   (shmem_whiteout).
 - vfat lacks RENAME_EXCHANGE (Linux vfat_rename_exchange).
 
-## vfat gaps
-
-**Location**: `fs/vfat/mod.rs`
-
-- No directory link counts: Linux counts subdirectories (mkdir and
-  rmdir inc_nlink/drop_nlink the parent, a cross-directory rename of a
-  directory drop_nlink(old_dir) / inc_nlink(new_dir)).
-
 ## Kernel heap (slab) gaps
 
 **Location**: `mm/slab.rs`, `mm/heap.rs`

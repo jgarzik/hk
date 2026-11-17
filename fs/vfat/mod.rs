@@ -1321,6 +1321,30 @@ impl Lfn {
 
 /// Read and parse directory entries from a cluster chain; the list
 /// grows fallibly (ENOMEM), a directory being as large as its disk says
+/// Directory short entries in the directory at `cluster`, "." and ".."
+/// included (Linux fat_subdirs: its i_nlink)
+fn fat_subdirs(sb_data: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
+    let chain = read_cluster_chain(sb_data, cluster)?;
+    let per = sb_data.cluster_size as usize / 32;
+    let mut n = 0;
+    for &c in &chain {
+        let off = cluster_to_offset(sb_data, c);
+        for i in 0..per {
+            let mut b = [0u8; 32];
+            read_bytes(&sb_data.bdev, off + i as u64 * 32, &mut b)?;
+            match b[0] {
+                END_MARKER => return Ok(n),
+                DELETED_MARKER => {}
+                // fat_get_short_entry skips long-name slots
+                _ if b[11] & attr::LONG_NAME_MASK == attr::LONG_NAME => {}
+                _ if b[11] & attr::DIRECTORY != 0 => n += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok(n)
+}
+
 fn read_directory_entries(
     sb_data: &VfatSbData,
     start_cluster: u32,
@@ -2068,6 +2092,7 @@ impl InodeOps for VfatInodeOps {
         // Linux vfat_mkdir: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail
         dir.inc_iversion();
+        dir.inc_nlink();
 
         // Create and return the new inode
         let ino = sb.alloc_ino();
@@ -2083,6 +2108,8 @@ impl InodeOps for VfatInodeOps {
         ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
         inode.inc_iversion();
+        // Linux vfat_mkdir: set_nlink(inode, 2)
+        inode.nlink.store(2, core::sync::atomic::Ordering::Relaxed);
 
         inode.set_private(new_private(VfatInodeData {
             start_cluster: new_cluster,
@@ -2171,6 +2198,15 @@ impl InodeOps for VfatInodeOps {
         let start_cluster = delete_dir_entry(&sb_data, dir_inode_data.start_cluster, name)?;
         // Linux fat_remove_entries: inode_inc_iversion(dir)
         dir.inc_iversion();
+        // Linux vfat_rmdir: the parent loses the ".." link
+        if dir.get_nlink() >= 3 {
+            dir.dec_nlink();
+        } else {
+            crate::printkln!(
+                "FAT-fs: parent dir link count too low ({})",
+                dir.get_nlink()
+            );
+        }
         drop_link(
             &sb,
             &sb_data,
@@ -2358,6 +2394,10 @@ impl InodeOps for VfatInodeOps {
             if let Err(e) = set_start(&sb_data, off, logstart(&sb_data, np)) {
                 unwind.dotdot(dotdot, op);
                 return Err(e);
+            }
+            old_dir.dec_nlink();
+            if existing.is_none() {
+                new_dir.inc_nlink();
             }
         }
         // fat_remove_entries(old_dir) and its inode_inc_iversion, then
@@ -2626,6 +2666,11 @@ fn create_inode_for_entry(
     ))?;
     inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
     inode.inc_iversion();
+    // Linux fat_fill_inode: a directory's link count is fat_subdirs
+    if entry.is_dir() {
+        let n = fat_subdirs(&sb_data, entry.start_cluster)?;
+        inode.nlink.store(n, core::sync::atomic::Ordering::Relaxed);
+    }
 
     inode.set_private(new_private(VfatInodeData {
         start_cluster: entry.start_cluster,
@@ -2995,6 +3040,11 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         .set_aops(&VFAT_FILE_AOPS, Some(&root_inode));
     // Linux fat_fill_inode: inode_inc_iversion
     root_inode.inc_iversion();
+    // Linux fat_read_root: fat_subdirs + 2 (the root has no "." or "..")
+    let n = fat_subdirs(&sb_data, boot_sector.root_cluster)? + 2;
+    root_inode
+        .nlink
+        .store(n, core::sync::atomic::Ordering::Relaxed);
 
     root_inode.set_private(new_private(VfatInodeData {
         start_cluster: boot_sector.root_cluster,
