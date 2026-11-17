@@ -133,11 +133,10 @@ el0_32_serror:
  * the FP/SIMD state: fpsr, fpcr (0x110), q0-q31 (0x120..0x320), then
  * orig_x0 and syscallno (0x320, 0x328: written by the Rust handlers).
  *
- * The kernel is compiled with NEON (aarch64-unknown-none), so every
- * exception saves the full FP/SIMD state: on entry from EL0 this is the
- * user's FP state (it lives in this frame while the task is in the kernel,
- * like pt_regs: signal frames, fork and execve read/write it here), on
- * entry from EL1 it is the interrupted kernel code's.
+ * Every exception saves the full FP/SIMD state: on entry from EL0 this
+ * is the user's FP state (it lives in this frame while the task is in
+ * the kernel, like pt_regs: signal frames, fork and execve read/write it
+ * here), on entry from EL1 it is the interrupted kernel code's.
  */
 .set TRAP_FRAME_SIZE, 0x330
 .set TF_FPSR, 0x110

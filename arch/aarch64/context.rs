@@ -78,7 +78,7 @@ pub struct Aarch64TaskContext {
     pub lr: u64,
     /// Stack pointer
     pub sp: u64,
-    /// Callee-saved FP registers d8-d15 (AAPCS64; the kernel uses FP/SIMD)
+    /// Callee-saved FP registers d8-d15 (AAPCS64)
     pub d8_d15: [u64; 8],
 }
 

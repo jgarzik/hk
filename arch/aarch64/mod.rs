@@ -49,7 +49,7 @@ use crate::arch::{
 /// thread.uw.fpsimd_state)
 ///
 /// This captures all general-purpose registers, exception state and the
-/// FP/SIMD registers (the kernel uses NEON, so every exception saves them).
+/// FP/SIMD registers (every exception saves them).
 /// Layout matches the order we push/pop in exception vectors (vectors.S
 /// TRAP_FRAME_SIZE / TF_*). For an exception from EL0 this is the task's
 /// user state, at the top of its kernel stack (`current_pt_regs`): its

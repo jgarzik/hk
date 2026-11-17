@@ -5,7 +5,7 @@ KERNEL = target/$(TARGET)/release/kernel
 KERNEL_DEBUG = target/$(TARGET)/debug/kernel
 
 # ARM64 target
-TARGET_ARM = aarch64-unknown-none
+TARGET_ARM = aarch64-unknown-none-softfloat
 KERNEL_ARM = target/$(TARGET_ARM)/release/kernel
 
 # VFAT test image settings
