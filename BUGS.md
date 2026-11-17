@@ -683,6 +683,9 @@ waiting).
   `Held::text` for the stack an RCU walk hands over); Linux's one
   link_path_walk loop keeps the link stack (nd->stack) in ref mode
   too, the links held until each body is walked.
+- `mount::detach_mounts` drops the dentry between two MOUNT_LOCK
+  sections (so no dentry reference is put under MOUNT_LOCK); Linux
+  __detach_mounts calls d_drop inside one lock_mount_hash section.
 
 ## renameat2 flag gaps
 
