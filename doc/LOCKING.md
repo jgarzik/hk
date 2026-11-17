@@ -2670,7 +2670,8 @@ allocated with the lock dropped:
   sets `FdTable.resize_in_progress` under the lock, drops it,
   allocates the bigger `Fdt` (ENOMEM; EMFILE past fs.nr_open), retakes
   it, moves the descriptors over, clears the flag and frees the old
-  table after the unlock, then wakes `Files.resize_wait` (a wait queue,
+  table (or the new one, if not needed after all) after the unlock,
+  then wakes `Files.resize_wait` (a wait queue,
   woken with no lock held); a task that finds the flag set sleeps
   there (uninterruptible, Linux wait_event), its condition read under
   the lock, and looks again. The allocation is then retried.

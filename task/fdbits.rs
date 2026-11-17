@@ -264,6 +264,7 @@ impl<F: RcuRef> Fdt<F> {
 /// What a table's growth left over, freed after the unlock: the old
 /// bitmaps and the old slots, whose readers' copy is freed a grace
 /// period after the new slots are published (Linux free_fdtable_rcu)
+#[must_use]
 pub struct Spare<F: RcuRef> {
     _bits: Box<[u64]>,
     _slots: Arc<Slots<F>>,
@@ -386,16 +387,17 @@ impl<F: RcuRef> FdTable<F> {
     /// the new table replaces the old; under resize_in_progress nothing
     /// else grew it); what is left over is returned to free after the
     /// unlock, the caller publishing the new slots ([`slots`](Self::slots))
-    /// before it (Linux rcu_assign_pointer(files->fdt, new_fdt))
-    #[must_use]
-    pub fn expand(&mut self, mut new: Fdt<F>) -> Option<Spare<F>> {
+    /// before it (Linux rcu_assign_pointer(files->fdt, new_fdt)). Err:
+    /// `new` is not bigger, handed back unused to free after the unlock
+    /// too (Linux __free_fdtable after spin_unlock)
+    pub fn expand(&mut self, mut new: Fdt<F>) -> Result<Spare<F>, Fdt<F>> {
         if new.max_fds() <= self.max_fds() {
-            return None;
+            return Err(new);
         }
         new.copy_bits_from(&self.fdt);
         let Fdt { fd, bits } = new;
         let old = self.fdt.fd.grow(fd);
-        Some(Spare {
+        Ok(Spare {
             _bits: core::mem::replace(&mut self.fdt.bits, bits),
             _slots: old,
         })
@@ -542,7 +544,7 @@ mod tests {
     /// Grow `t` until it holds descriptor `nr` (as `Files::expand_files`)
     fn grow(t: &mut T, nr: usize) {
         while t.need_expand(nr).unwrap() {
-            assert!(t.expand(Fdt::alloc(nr + 1).unwrap()).is_some());
+            assert!(t.expand(Fdt::alloc(nr + 1).unwrap()).is_ok());
         }
     }
 

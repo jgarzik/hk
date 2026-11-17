@@ -154,11 +154,12 @@ impl Files {
         // Published before the lock is released: a later change is made
         // in the new slots, which a reader still on the old ones sees
         // through its recheck of the table (Linux rcu_assign_pointer)
-        let retired = spare.is_some().then(|| self.slots.replace(t.slots()));
+        let retired = spare.is_ok().then(|| self.slots.replace(t.slots()));
         drop(t);
         if let Some(r) = retired {
             r.defer();
         }
+        // The old table, or the new one unused: freed unlocked
         drop(spare);
         Ok(())
     }
