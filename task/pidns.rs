@@ -149,7 +149,7 @@ fn ns_tasks(ns: &PidNamespace, pid: crate::task::Pid) -> Vec<TaskRef> {
     let mine = |t: &crate::task::percpu::TaskView<'_>| {
         t.task.pid != pid
             && crate::signal::task_live(t)
-            && t.thread_pid.as_ref().is_some_and(|p| p.nr_in(ns).is_some())
+            && t.thread_pid_ref().is_some_and(|p| p.nr_in(ns).is_some())
     };
     let mut v = Vec::new();
     loop {

@@ -1307,6 +1307,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 | `Task.real_parent` | `RcuPtr<Task>` | The real parent, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
 | `Task.ptracer` | `RcuPtr<Task>` | The tracer while traced, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
 | `Task.pgrp`, `Task.session` | `RcuLockedArc<Pid, GlobalTaskTable>` | Group and session links: written under TASKLIST's write lock (old reference `put_rcu`), read under it or an RCU read guard |
+| `Task.thread_pid` | `RcuLockedArc<Pid, GlobalTaskTable>` | Its struct pid (Linux task->thread_pid): set before the task is listed, exchanged by de_thread (`take_leadership`, Linux exchange_tids) and cleared at release (`unhash`, Linux detach_pid PIDTYPE_PID; de_thread's removed threads after their numbers are released) under TASKLIST's write lock, the replaced reference dropped a grace period later; read under TASKLIST or an RCU read guard (`Task::pid_nr_ns`, Linux task_pid_nr_ns: 0 once released). A release pins it for proc_flush_pid (Linux release_task's get_pid) |
 
 **Pids** (`task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
 number per pid-namespace level. Numbers come from a lock-free bitmap
@@ -1347,9 +1348,10 @@ under TASKLIST (`Pid::task_locked`) is listed for the hold.
 A process's pid is its leader's tid; an exec from a non-leader takes
 the leader's tid and `Pid` (`take_leadership`, Linux exchange_tids)
 under TASKLIST (the run queue knows tasks by reference, not by
-number), the two tasks' links exchanged while both are listed and
-before the old leader is unlisted, so the leader's `Pid` names one of
-them at every moment (Linux hlist_replace_rcu). The idle tasks
+number), the two tasks' links and `Task.thread_pid`s exchanged in one
+section while both are listed and before the old leader is unlisted,
+so the leader's `Pid` names one of them at every moment (Linux
+hlist_replace_rcu). The idle tasks
 are tid 0 and, like the boot task, not in TASKLIST.
 
 **Pid namespaces** (Linux task_active_pid_ns, pid_nr_ns, pid_vnr,

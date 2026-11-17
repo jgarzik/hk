@@ -2486,23 +2486,21 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), KernelErro
 /// proc_flush_pid): /proc/<tid>, and the process directory with it
 /// when the task was its leader, /proc/<pid>/task/<tid> otherwise, each
 /// named as that procfs's pid namespace numbers it. TASKLIST not held.
-pub fn proc_flush_pid(t: &crate::task::Task) {
+pub fn proc_flush_pid(
+    t: &crate::task::Task,
+    thread: Option<alloc::sync::Arc<crate::task::pid::Pid>>,
+) {
     use crate::task::percpu::TASKLIST;
-    // Its struct pid and its leader's, whose numbers stay readable after
-    // they are given back; taken under TASKLIST, dropped after it
-    let (thread, leader) = {
+    // Its struct pid (pinned by the release that cleared it) and its
+    // leader's, whose numbers stay readable after they are given back;
+    // taken under TASKLIST, dropped after it
+    let leader = {
         let table = TASKLIST.read();
-        let thread = t
-            .inner()
-            .access(&table)
-            .as_ref()
-            .and_then(|i| i.thread_pid().cloned());
-        let leader = if t.tid() == t.pid {
+        if t.tid() == t.pid {
             None
         } else {
-            table.get(t.pid).and_then(|l| l.thread_pid().cloned())
-        };
-        (thread, leader)
+            table.get(t.pid).and_then(|l| l.thread_pid())
+        }
     };
     let Some(thread) = thread else {
         return;

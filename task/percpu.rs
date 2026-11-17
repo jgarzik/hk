@@ -785,6 +785,17 @@ tracer_reads!(TaskViewMut);
 macro_rules! relation_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
+            /// Its struct pid (Linux task_pid), a counted reference;
+            /// none for an idle task
+            pub fn thread_pid(&self) -> Option<Arc<crate::task::pid::Pid>> {
+                self.task.thread_pid.get_protected(self.table)
+            }
+
+            /// Its struct pid, borrowed while the table is
+            pub fn thread_pid_ref(&self) -> Option<&'a crate::task::pid::Pid> {
+                self.task.thread_pid.protected(self.table)
+            }
+
             /// Its thread group's signal struct (Linux task->signal;
             /// none for a kernel thread)
             pub fn signal(&self) -> Option<&'a Arc<crate::signal::SignalStruct>> {
@@ -1117,7 +1128,7 @@ impl GlobalTaskTable {
             if let Some(u) = &i.user_ns {
                 u.active_get();
             }
-            i.thread_pid.clone()
+            task.thread_pid.get_protected(self)
         });
         // The pid hash names it (Linux attach_pid PIDTYPE_PID), joining
         // the list in this section
@@ -1197,11 +1208,7 @@ impl GlobalTaskTable {
         self.unlink_child(&t);
         self.orphan_children(&t);
         self.detach_pids(&t);
-        let thread_pid = t
-            .inner()
-            .access(self)
-            .as_ref()
-            .and_then(|i| i.thread_pid.clone());
+        let thread_pid = t.thread_pid.get_protected(self);
         if let Some(p) = &thread_pid {
             // Before the list's reference goes (below): an RCU reader
             // of the pid finds the task only while that reference keeps
@@ -1216,6 +1223,13 @@ impl GlobalTaskTable {
             if t.inner().access(self).as_ref().is_some_and(|i| i.leader) {
                 self.detach_group_pids(&t);
             }
+        }
+        // It names no struct pid any more (Linux detach_pid PIDTYPE_PID:
+        // task_pid_nr_ns then reads 0); RCU readers may still be on it.
+        // de_thread's removed threads give theirs up once their numbers
+        // are dealt with (`detach_thread_pid`)
+        if release {
+            self.detach_thread_pid(&t);
         }
         // Linux release_task: exit_cred_namespaces (atomics only; the
         // namespace itself goes with the task, after the unlock)
@@ -1288,12 +1302,18 @@ impl GlobalTaskTable {
         t.session.replace(None, self).defer_put();
     }
 
+    /// Removed task `t` names no struct pid (Linux detach_pid
+    /// PIDTYPE_PID), the reference dropped a grace period later
+    fn detach_thread_pid(&mut self, t: &Task) {
+        t.thread_pid.replace(None, self).defer_put();
+    }
+
     /// The numbers of removed task `t` that no task uses any more go
     /// back (Linux free_pid)
     fn release_pids(&self, t: &Task) {
-        if let Some(ti) = t.inner().access(self) {
+        if t.inner().access(self).is_some() {
             let pids = [
-                ti.thread_pid.as_deref(),
+                t.thread_pid.protected(self),
                 t.pgrp.protected(self),
                 t.session.protected(self),
             ];
@@ -1716,13 +1736,13 @@ fn create_kernel_task(
 
     // In no process group or session (never signalled by group); no
     // exit signal, no user-space resources, never traced
-    let task_inner =
-        crate::task::TaskInner::new(thread_pid, TaskState::Ready, ArchPageTable::kernel_root());
+    let task_inner = crate::task::TaskInner::new(TaskState::Ready, ArchPageTable::kernel_root());
     let task = Task::new(
         tid,
         crate::task::TaskIds {
             pid,
             seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+            thread_pid,
         },
         TaskKind::KernelThread,
         stack_top,
@@ -1902,11 +1922,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
         user_ns: Some(crate::ns::INIT_USER_NS.clone()),
         exit_signal: crate::signal::ExitSignal::SIGCHLD,
         // Shared resources: set by the caller via init_* functions
-        ..crate::task::TaskInner::new(
-            Some(thread_pid),
-            TaskState::Running,
-            config.page_table.root_table_phys(),
-        )
+        ..crate::task::TaskInner::new(TaskState::Running, config.page_table.root_table_phys())
     };
     // The boot-time init task: failure cannot be reported
     let task = arc_nofail(Task::new(
@@ -1914,6 +1930,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
         crate::task::TaskIds {
             pid,
             seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+            thread_pid: Some(thread_pid),
         },
         TaskKind::UserProcess,
         config.kstack_top,
@@ -2240,13 +2257,16 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     let me = table.view(caller).map(|v| task_ref(v.task));
     let old = zombies.iter().find(|t| t.tid() == ltid).cloned();
     if let (Some(me), Some(l)) = (&me, &old) {
-        let (mi, li) = me.inner().access_pair_mut(l.inner(), &mut *table);
-        let pids = if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
-            core::mem::swap(&mut mi.thread_pid, &mut li.thread_pid);
-            (mi.thread_pid.clone(), li.thread_pid.clone())
-        } else {
-            (None, None)
-        };
+        // Each takes the other's struct pid (Linux exchange_tids:
+        // rcu_assign_pointer of thread_pid), the replaced references
+        // dropped a grace period later
+        let (a, b) = (
+            me.thread_pid.get_protected(&table),
+            l.thread_pid.get_protected(&table),
+        );
+        me.thread_pid.replace(b.clone(), &mut table).defer_put();
+        l.thread_pid.replace(a.clone(), &mut table).defer_put();
+        let pids = (b, a);
         // The pid hash names each by its new number (hlist_replace_rcu)
         if let Some(p) = &pids.0 {
             p.set_task(Some(me), &mut table);
@@ -2276,6 +2296,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     let Some(me) = me else {
         for t in &gone[removed..] {
             table.release_pids(t);
+            table.detach_thread_pid(t);
         }
         drop(table);
         return gone;
@@ -2301,6 +2322,7 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     // caller's old one, now the old leader's, and exited threads' own
     for t in &gone[removed..] {
         table.release_pids(t);
+        table.detach_thread_pid(t);
     }
     drop(table);
     gone
@@ -2844,13 +2866,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         leader: config.flags & CLONE_THREAD == 0,
         // Untraced until listed: CLONE_PTRACE links it in the write
         // section that lists it (below)
-        ..crate::task::TaskInner::new(Some(child_thread_pid.clone()), TaskState::Ready, child_pgd)
+        ..crate::task::TaskInner::new(TaskState::Ready, child_pgd)
     };
     let child_task = Task::new(
         child_tid,
         crate::task::TaskIds {
             pid: child_pid,
             seccomp_mode: parent_seccomp_mode,
+            thread_pid: Some(child_thread_pid.clone()),
         },
         TaskKind::UserProcess,
         kstack_top,
@@ -3333,7 +3356,7 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
         return Some(t);
     }
     let v = table.view(me)?;
-    let level = v.thread_pid.as_ref().map(|p| p.level);
+    let level = v.thread_pid_ref().map(|p| p.level);
     let mut p = v.real_parent();
     while let Some(t) = p {
         // An ancestor gone from the list, or in another pid namespace,
@@ -3341,7 +3364,7 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
         // find_new_reaper ends at the child_reaper, by
         // task_pid(reaper)->level)
         let Some(v) = table.view(t) else { break };
-        if v.thread_pid.as_ref().map(|p| p.level) != level {
+        if v.thread_pid_ref().map(|p| p.level) != level {
             break;
         }
         if v.signal().is_some_and(|s| s.subreaper(table))
@@ -3420,7 +3443,9 @@ fn exit_locked(table: &mut GlobalTaskTable, tid: Tid, status: i32) -> Option<Unh
 /// autoreaped
 #[derive(Default)]
 struct Unhashed {
-    thread: Option<TaskRef>,
+    /// The thread and its struct pid, pinned before the release cleared
+    /// it (Linux release_task: get_pid(task_pid(p)) for proc_flush_pid)
+    thread: Option<(TaskRef, Option<Arc<crate::task::pid::Pid>>)>,
     told: Option<Told>,
     gone: Option<Reaped>,
 }
@@ -3429,8 +3454,8 @@ impl Unhashed {
     /// Release what the section took and wake whoever waits (TASKLIST
     /// not held): a tracer or an exec (de_thread) waiting for the thread
     fn finish(self) {
-        if let Some(t) = self.thread {
-            crate::fs::proc::proc_flush_pid(&t);
+        if let Some((t, pid)) = self.thread {
+            crate::fs::proc::proc_flush_pid(&t, pid);
             drop(t);
             crate::task::proc::CHILD_EXIT_WQ.wake_all();
         }
@@ -3461,7 +3486,8 @@ fn tell(table: &mut GlobalTaskTable, z: Option<Zombie>) -> (Option<Told>, Option
 /// release_task); `z`, from [`thread_teller`] in this section, is its
 /// zombie leader's notice if it was the last thread
 fn unhash_thread(table: &mut GlobalTaskTable, tid: Tid, z: Option<Zombie>) -> Unhashed {
-    let thread = table.remove(tid);
+    let pid = table.get(tid).and_then(|v| v.thread_pid());
+    let thread = table.remove(tid).map(|t| (t, pid));
     let (told, gone) = tell(table, z);
     Unhashed { thread, told, gone }
 }
@@ -3535,7 +3561,7 @@ fn traced_zombie(table: &GlobalTaskTable, me: &Task) -> Option<(Tid, Pid, bool, 
 /// under tasklist_lock): it exited, so a poll may now see it readable
 /// ([`pidfd_exited`])
 pub fn notify_pidfd(table: &GlobalTaskTable, tid: Tid) {
-    if let Some(p) = table.get(tid).and_then(|t| t.thread_pid.clone()) {
+    if let Some(p) = table.get(tid).and_then(|t| t.thread_pid()) {
         p.wait_pidfd.wake_poll(u32::from(
             crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
         ));
@@ -3583,16 +3609,18 @@ fn leader_waits(table: &GlobalTaskTable, pid: Pid) -> bool {
 /// under TASKLIST (Linux EXIT_DEAD, then release_task after the lock)
 struct Reaped {
     t: TaskRef,
+    /// Its struct pid, pinned for proc_flush_pid
+    pid: Option<Arc<crate::task::pid::Pid>>,
     ucounts: crate::task::UcountsRef,
 }
 
 /// Take zombie `tid` out of the task list for [`release`]
 fn reap_locked(table: &mut GlobalTaskTable, tid: Tid) -> Option<Reaped> {
-    let ucounts = match table.get(tid) {
-        Some(t) if matches!(t.state, TaskState::Zombie(_)) => t.ucounts(),
+    let (ucounts, pid) = match table.get(tid) {
+        Some(t) if matches!(t.state, TaskState::Zombie(_)) => (t.ucounts(), t.thread_pid()),
         _ => return None,
     };
-    table.remove(tid).map(|t| Reaped { t, ucounts })
+    table.remove(tid).map(|t| Reaped { t, pid, ucounts })
 }
 
 /// Release a zombie leader [`reap_locked`] took (Linux release_task of
@@ -3600,10 +3628,10 @@ fn reap_locked(table: &mut GlobalTaskTable, tid: Tid) -> Option<Reaped> {
 /// parent rechecks; its run queue keeps it if it still runs. TASKLIST
 /// not held.
 fn release(gone: Option<Reaped>) {
-    let Some(Reaped { t, ucounts }) = gone else {
+    let Some(Reaped { t, pid, ucounts }) = gone else {
         return;
     };
-    crate::fs::proc::proc_flush_pid(&t);
+    crate::fs::proc::proc_flush_pid(&t, pid);
     ucounts.dec(crate::task::Ucount::Nproc, 1);
     drop(t);
     crate::task::proc::CHILD_EXIT_WQ.wake_all();
@@ -5260,7 +5288,7 @@ fn setpgid_target(
         return Err(KernelError::NotPermitted);
     }
     if pgid == pid {
-        return l.thread_pid.clone().ok_or(KernelError::NoProcess);
+        return l.thread_pid().ok_or(KernelError::NoProcess);
     }
     let pg = target.ok_or(KernelError::NotPermitted)?;
     match table.pgrp(pg).next() {
@@ -5277,7 +5305,7 @@ pub fn create_session(caller_pid: Pid) -> KernelResult<Pid> {
     let mut table = TASKLIST.write();
     let pid = {
         let l = table.get(caller_pid).ok_or(KernelError::NoProcess)?;
-        let pid = l.thread_pid.clone().ok_or(KernelError::NoProcess)?;
+        let pid = l.thread_pid().ok_or(KernelError::NoProcess)?;
         // A session leader already, or a process group with the
         // caller's id exists (Linux ksys_setsid)
         if l.sid() == caller_pid || table.pgrp(&pid).next().is_some() {

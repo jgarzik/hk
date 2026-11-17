@@ -959,7 +959,7 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
         task.task.set_sigpending(false);
         task.task.set_cpu_group(&s);
     }
-    let pid = table.view(t).and_then(|v| v.thread_pid().cloned());
+    let pid = table.view(t).and_then(|v| v.thread_pid());
     s.set_leader_pid(&mut table, pid);
 }
 
@@ -1260,7 +1260,7 @@ pub fn install_fork_signal(
     // A new process: the child leads it, with its parent's controlling
     // tty (Linux copy_process, under tasklist_lock)
     if !f.share_signal {
-        let pid = table.view(child).and_then(|c| c.thread_pid().cloned());
+        let pid = table.view(child).and_then(|c| c.thread_pid());
         f.signal.set_leader_pid(table, pid);
         let me = crate::task::percpu::current();
         if let Some(ps) = table.view(&me).and_then(|p| p.signal().cloned()) {

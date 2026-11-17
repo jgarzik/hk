@@ -227,7 +227,9 @@ pub(super) fn signal_session_leader(
             if c.tty.is_some_and(|ct| core::ptr::eq(ct, tty)) {
                 c.tty = None;
             }
-            let leads = t.leader() && t.thread_pid().is_some_and(|p| Arc::ptr_eq(p, &s));
+            let leads = t.leader()
+                && t.thread_pid_ref()
+                    .is_some_and(|p| core::ptr::eq(p, Arc::as_ptr(&s)));
             if leads {
                 leader = true;
                 if let Some(pg) = &pgrp {

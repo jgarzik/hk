@@ -94,14 +94,12 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
     let pid = task.tid();
     let threads = table.threads(pid).count() as u64;
     let nr = |p: Option<&crate::task::pid::Pid>, n: &PidNamespace| p.map_or(0, |p| p.nr_ns(n));
-    let me = t.thread_pid().map(|p| &**p);
+    let me = t.thread_pid_ref();
     // A task the namespace cannot see is not shown there (Linux reaches
     // it only through a lookup in that namespace); then its levels from
     // `ns` down are the namespaces of its own chain
     me?.nr_in(ns)?;
-    let leader = table
-        .get(t.task.pid)
-        .and_then(|l| l.fields().thread_pid().map(|p| &**p));
+    let leader = table.get(t.task.pid).and_then(|l| l.thread_pid_ref());
     // Group, session and parent read under RCU (Linux do_task_stat,
     // task_state: task_pgrp_nr_ns, task_session_nr_ns, pid_alive(p) ?
     // task_tgid_nr_ns(rcu_dereference(p->real_parent)) : 0)

@@ -985,6 +985,13 @@ pub struct Task {
     /// the section that lists the task, cleared at release (a zombie
     /// keeps it, Linux __exit_signal).
     pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, percpu::GlobalTaskTable>,
+    /// Its process identifier (Linux task->thread_pid; None for the idle
+    /// tasks, tid 0): set before the task is listed, exchanged by
+    /// de_thread (exchange_tids) and cleared at release (detach_pid)
+    /// under TASKLIST's write lock, the replaced reference dropped a
+    /// grace period later; read under TASKLIST or an RCU read guard
+    /// (task_pid_nr_ns)
+    pub thread_pid: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner>>,
@@ -995,9 +1002,6 @@ crate::rcu_puts!(Task, rcu_puts);
 
 /// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner {
-    /// Its process identifier (Linux thread_pid; None for the idle
-    /// tasks, tid 0)
-    thread_pid: Option<Arc<pid::Pid>>,
     /// A group leader on its `Task.pgrp`'s and `session`'s lists
     pids_linked: bool,
     /// The user namespace of its credentials (Linux
@@ -1119,9 +1123,8 @@ impl TaskInner {
     /// A task in `state` on page table `pgd`: a leader with no exit
     /// signal, nothing shared, not traced; each creation path sets the
     /// rest (struct update)
-    pub fn new(thread_pid: Option<Arc<pid::Pid>>, state: TaskState, pgd: u64) -> Self {
+    pub fn new(state: TaskState, pgd: u64) -> Self {
         Self {
-            thread_pid,
             pids_linked: false,
             user_ns: None,
             exit_code: 0,
@@ -1145,11 +1148,6 @@ impl TaskInner {
             ptrace_message: 0,
             ptrace_options: 0,
         }
-    }
-
-    /// Its process identifier (None for the idle tasks)
-    pub fn thread_pid(&self) -> Option<&Arc<pid::Pid>> {
-        self.thread_pid.as_ref()
     }
 
     /// It is its thread group's leader
@@ -1254,6 +1252,8 @@ crate::owned_adapter!(pub ThreadNode, Task, thread_node, thread_owner);
 pub struct TaskIds {
     pub pid: Pid,
     pub seccomp_mode: u8,
+    /// Its struct pid (None for the idle tasks)
+    pub thread_pid: Option<Arc<pid::Pid>>,
 }
 
 /// An owner field (Linux current->mm, ->files): the owning task reads it
@@ -1629,7 +1629,7 @@ impl Task {
         Self {
             tid: AtomicU64::new(tid),
             pid: ids.pid,
-            pid_ns: inner.thread_pid.as_ref().map(|p| p.ns().clone()),
+            pid_ns: ids.thread_pid.as_ref().map(|p| p.ns().clone()),
             kind,
             kstack_top,
             start_time: AtomicU64::new(now),
@@ -1691,6 +1691,7 @@ impl Task {
             rcu: crate::sync::rcu::RcuHead::new(),
             rcu_puts: crate::sync::rcu::RcuPuts::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
+            thread_pid: crate::sync::rcu::RcuLockedArc::new(ids.thread_pid),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1763,6 +1764,7 @@ impl Task {
             rcu: crate::sync::rcu::RcuHead::new(),
             rcu_puts: crate::sync::rcu::RcuPuts::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
+            thread_pid: crate::sync::rcu::RcuLockedArc::none(),
             inner: TableCell::new(None),
         }
     }
@@ -1885,19 +1887,13 @@ impl Task {
     }
 
     /// Its thread as `ns` numbers it, 0 if not visible there or once it
-    /// has left the task list (Linux task_pid_nr_ns), under `g`: its
-    /// tid's `Pid`, if that still names it
+    /// has left the task list (Linux task_pid_nr_ns), under `g`
     pub fn pid_nr_ns(
         &self,
         ns: &crate::ns::PidNamespace,
         g: &crate::sync::rcu::RcuReadGuard,
     ) -> u32 {
-        let Ok(nr) = u32::try_from(self.tid()) else {
-            return 0;
-        };
-        crate::task::pid::find_pid_ns(&crate::ns::INIT_PID_NS, nr, g)
-            .filter(|p| p.task(g).is_some_and(|t| core::ptr::eq(t, self)))
-            .map_or(0, |p| p.nr_ns(ns))
+        self.thread_pid.read(g).map_or(0, |p| p.nr_ns(ns))
     }
 
     /// Its process group (root number), 0 for none (Linux

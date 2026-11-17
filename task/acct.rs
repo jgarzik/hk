@@ -440,7 +440,7 @@ fn get_task_info(t: &Task) -> TaskInfo {
     let start_time = (realtime_start_ns / 1_000_000_000) as u32;
 
     // Taken under TASKLIST, released after it (3.1.1 rule 4)
-    let pid_of = |p| table.get(p).and_then(|v| v.thread_pid.clone());
+    let pid_of = |p| table.get(p).and_then(|v| v.thread_pid());
     TaskInfo {
         uid,
         gid,

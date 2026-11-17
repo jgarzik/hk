@@ -57,7 +57,7 @@ fn last_pid() -> u32 {
     let table = super::percpu::TASKLIST.read();
     table
         .view(&super::percpu::current())
-        .and_then(|t| t.thread_pid.as_ref().map(|p| p.ns().map.last()))
+        .and_then(|t| t.thread_pid_ref().map(|p| p.ns().map.last()))
         .unwrap_or_else(|| crate::ns::INIT_PID_NS.map.last())
 }
 
