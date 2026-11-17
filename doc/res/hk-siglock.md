@@ -145,3 +145,18 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
    de_thread's zap take only siglock. BUGS.md bullet deleted.
 5. [ ] fold Task.sig, SignalStruct.jobctl/shared, SigHand.action/update
    into siglock-owned `SigCell`s (Linux: one lock). Delete this file.
+
+Also in this series:
+
+- [x] `Task.thread_pid` an RCU pointer (TASKLIST write: creation,
+  exchange_tids, release); `Task::pid_nr_ns` reads it directly.
+- [ ] `Pid.pgrp`/`session` (`task/pid.rs`, `util/rcuhlist.rs`) hold a
+  reference to each listed leader; Linux holds none (pid_links are
+  bare hlist nodes; a task is freed a grace period after release,
+  after detach_pid). Needs a non-owning RCU chain (writers under
+  TASKLIST, readers' validity from task lifetime, as `RcuPtr`).
+- [ ] PRIO_USER (`task/schedsys.rs` `tasks_of_user`) walks every task
+  under TASKLIST into a vector; Linux walks for_each_process_thread
+  under rcu_read_lock alone. Needs the task list
+  (`GlobalTaskTable.tasks`) RCU-readable (Linux list_add_tail_rcu /
+  list_del_rcu of task->tasks).
