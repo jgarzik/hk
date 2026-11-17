@@ -693,6 +693,16 @@ waiting).
 - A dirfd's walk takes the fd table lock and a file reference
   (`path_start`); Linux's fdget looks the fd up under RCU, with no
   reference for an unshared table (no RCU fd table here).
+- Leaving RCU mode inside a symlink body copies the rest of the name
+  (GFP_ATOMIC) and continues in ref mode; Linux keeps the link stack
+  and legitimizes it (legitimize_links) at try_to_unlazy.
+- `file_open_root` (`OpenAt::Root`) resolves absolute bodies and ".."
+  against the task root, not the given root (Linux ND_ROOT_PRESET).
+- /proc/<pid> permission for a task that is gone falls back to the
+  generic check instead of ESRCH (Linux proc_pid_permission).
+- /proc/<pid>/fd and fdinfo directory permission is a ptrace-read
+  check; Linux proc_fd_permission is the generic check or the same
+  thread group.
 
 ## renameat2 flag gaps
 
