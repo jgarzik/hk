@@ -2710,6 +2710,20 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         if child_init {
             crate::task::pidns::attach_init(&mut table, &child_task);
         }
+        // CLONE_PARENT/CLONE_THREAD: the caller's real parent and its
+        // exec id as they are now, under the write lock (Linux
+        // copy_process): a reparent since the snapshot above moved the
+        // caller to its reaper, never to a gone parent
+        if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
+            let cur = table
+                .view(&me)
+                .map(|v| (v.real_parent.clone(), v.parent_exec_id));
+            if let Some((rp, eid)) = cur {
+                let ci = table.inner_mut_of(&child_task);
+                ci.real_parent = rp;
+                ci.parent_exec_id = eid;
+            }
+        }
         table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         // A new thread joins a group stop in progress or in effect
