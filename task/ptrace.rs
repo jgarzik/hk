@@ -1207,7 +1207,7 @@ pub fn may_access_task(t: &Task, fscreds: bool) -> bool {
 
 /// Is `t` a thread of the caller's process (Linux same_thread_group:
 /// the same signal_struct, which a task keeps until it is freed)
-fn same_thread_group(t: &Task) -> bool {
+pub(crate) fn same_thread_group(t: &Task) -> bool {
     let me = percpu::current();
     match (t.cpu_group(), me.cpu_group()) {
         (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(a, b),

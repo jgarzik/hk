@@ -520,7 +520,9 @@ impl InodeOps for ProcfsInodeOps {
                 opts::with(inode, |o| o.pid_permission(&t)).unwrap_or(Ok(()))?;
             }
             Some((Perm::FdDir, p)) => {
-                let same = p.task().is_some_and(|t| same_thread_group(&t));
+                let same = p
+                    .task()
+                    .is_some_and(|t| crate::task::ptrace::same_thread_group(&t));
                 return proc_fd_permission(inode, cred, mask, same);
             }
             // Linux proc_fdinfo_permission: ESRCH for a task that is
@@ -726,7 +728,7 @@ fn permission_rcu(inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelErr
             o.pid_permission(t)?;
         }
         (RcuKind::FdDir, t) => {
-            let same = t.is_some_and(same_thread_group);
+            let same = t.is_some_and(crate::task::ptrace::same_thread_group);
             drop(g);
             return proc_fd_permission(inode, cred, mask, same);
         }
@@ -787,16 +789,6 @@ fn proc_fd_permission(
     match crate::fs::dac::generic_permission(cred, inode, mask) {
         Err(_) if same => Ok(()),
         r => r,
-    }
-}
-
-/// `t` is a thread of the caller's process (Linux same_thread_group:
-/// the same signal_struct, kept until the task is freed)
-fn same_thread_group(t: &crate::task::Task) -> bool {
-    let me = crate::task::percpu::current();
-    match (t.cpu_group(), me.cpu_group()) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-        _ => me.is(t),
     }
 }
 
