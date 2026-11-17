@@ -1362,6 +1362,35 @@ pub fn d_drop_tree(d: &DentryRef) {
     }
 }
 
+/// Take `d` itself out of the tree, unless it left already, then
+/// everything cached below it (Linux d_invalidate: a dentry its
+/// d_revalidate found stale; that dentry, not whatever holds its name
+/// by now). The parent's d_lock, then `d`'s, as for every unhook; a
+/// rename between reading the parent and locking it is seen under the
+/// locks and the parent read again.
+pub fn d_invalidate(d: &DentryRef) {
+    loop {
+        let Some(parent) = d.get_parent() else {
+            return;
+        };
+        let mut p = parent.d_lock.write();
+        let mut dl = d.d_lock.write();
+        if !core::ptr::eq(d.parent_ptr(), DentryRef::as_ptr(&parent)) {
+            continue;
+        }
+        let ours = __d_drop(&mut p, d, &mut dl);
+        drop(dl);
+        drop(p);
+        if ours.is_none() {
+            return;
+        }
+        break;
+    }
+    if !d.is_negative() {
+        d_drop_tree(d);
+    }
+}
+
 /// The child after `d` in `parent` (none if `d` left it)
 fn next_sibling(parent: &Dentry, d: &Dentry) -> Option<DentryRef> {
     parent.d_lock.read().children.next(d)

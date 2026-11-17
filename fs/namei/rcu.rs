@@ -97,7 +97,8 @@ pub(super) enum Lazy<'p> {
     /// lookup_fast's miss of `name`: lookup_slow, then `rest`
     Lookup(Path, &'p [u8], &'p [u8]),
     /// try_to_unlazy_next with `child`, found for `name` in `cur`:
-    /// revalidated in ref mode if `reval`, then stepped into, then
+    /// handled in ref mode as `reval` (what its revalidation under
+    /// LOOKUP_RCU said, if it was not valid), then stepped into, then
     /// `rest`; `dots`: the parent ".." gave (WALK_NOFOLLOW, then
     /// handle_dots' scoped check)
     Child {
@@ -105,7 +106,7 @@ pub(super) enum Lazy<'p> {
         child: DentryRef,
         name: &'p [u8],
         rest: &'p [u8],
-        reval: bool,
+        reval: Option<Result<bool, KernelError>>,
         dots: bool,
     },
     /// pick_link: symlink `link` in `cur`, checked; its body in ref
@@ -267,15 +268,18 @@ impl Nd {
         }
         let inode = child.d_inode_rcu(g);
         // d_revalidate under LOOKUP_RCU (only a positive entry has one,
-        // as in ref mode); anything but "valid" is decided in ref mode
-        if inode.is_some_and(|i| i.i_op.revalidate(i, true) != Ok(true)) {
+        // as in ref mode); anything but "valid" is handled in ref mode
+        // (Linux lookup_fast: try_to_unlazy_next, then d_invalidate if
+        // stale, the error if one, ref-mode d_revalidate if ECHILD)
+        let status = inode.map_or(Ok(true), |i| i.i_op.revalidate(i, true));
+        if status != Ok(true) {
             let (at, c) = self.try_to_unlazy_next(cur, child, seq, f.cached, puts)?;
             return Ok(Some(Lazy::Child {
                 cur: at,
                 child: c,
                 name,
                 rest,
-                reval: true,
+                reval: Some(status),
                 dots: false,
             }));
         }
@@ -310,7 +314,7 @@ impl Nd {
                     child: c,
                     name,
                     rest,
-                    reval: false,
+                    reval: None,
                     dots: flags & WALK_NOFOLLOW != 0,
                 }));
             };

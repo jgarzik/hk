@@ -26,7 +26,7 @@ use self::rcu::Lazy;
 
 use crate::fs::KernelError;
 use crate::fs::dac::{MAY_EXEC, cred, permission_as};
-use crate::fs::dentry::{Dentry, DentryRef};
+use crate::fs::dentry::{Dentry, DentryRef, d_invalidate};
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use crate::fs::inode::{Inode, Link};
 use crate::fs::mount::{
@@ -167,7 +167,7 @@ pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelEr
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    if let Some(child) = cached(parent, name) {
+    if let Some(child) = cached(parent, name)? {
         return if child.is_negative() {
             Err(KernelError::NotFound)
         } else {
@@ -192,16 +192,37 @@ pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelEr
 }
 
 /// The dcache's child `name` of `parent` if it is still valid (Linux
-/// d_revalidate); an invalid one is dropped from the tree
-fn cached(parent: &DentryRef, name: &[u8]) -> Option<DentryRef> {
-    let child = parent.lookup_child(name)?;
-    match child.get_inode() {
-        Some(i) if i.i_op.revalidate(&i, false) != Ok(true) => {
-            parent.remove_child(name);
-            None
-        }
-        _ => Some(child),
+/// lookup_dcache): a stale one is invalidated and None, a revalidation
+/// error returned
+fn cached(parent: &DentryRef, name: &[u8]) -> Result<Option<DentryRef>, KernelError> {
+    match parent.lookup_child(name) {
+        Some(child) => d_revalidate(child, None),
+        None => Ok(None),
     }
+}
+
+/// Linux d_revalidate in ref mode and its callers' handling (`status
+/// <= 0`): `child` if valid; if stale, that dentry invalidated
+/// (d_invalidate) and None; an error returned, nothing invalidated.
+/// `rcu`: what an RCU walk's revalidation said (Linux lookup_fast: a
+/// stale or failed answer stands, ECHILD asks again in ref mode).
+fn d_revalidate(
+    child: DentryRef,
+    rcu: Option<Result<bool, KernelError>>,
+) -> Result<Option<DentryRef>, KernelError> {
+    // Only a positive dentry has a revalidation (its inode's operations)
+    let Some(i) = child.get_inode() else {
+        return Ok(Some(child));
+    };
+    let valid = match rcu {
+        Some(Err(ECHILD)) | None => i.i_op.revalidate(&i, false),
+        Some(s) => s,
+    }?;
+    if valid {
+        return Ok(Some(child));
+    }
+    d_invalidate(&child);
+    Ok(None)
 }
 
 /// Longest name of one path component (Linux NAME_MAX)
@@ -214,7 +235,7 @@ fn lookup_slow(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    if let Some(child) = cached(parent, name) {
+    if let Some(child) = cached(parent, name)? {
         return if child.is_negative() {
             Err(KernelError::NotFound)
         } else {
@@ -227,22 +248,22 @@ fn lookup_slow(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError
 }
 
 /// The ref-mode half of lookup_fast after try_to_unlazy_next: `child`,
-/// found for `name` in `parent` by an RCU walk, revalidated (Linux
-/// d_revalidate without LOOKUP_RCU); an invalid one is dropped and the
-/// name looked up again (d_invalidate, then lookup_slow)
+/// found for `name` in `parent` by an RCU walk whose revalidation said
+/// `rcu` (Linux: ECHILD revalidated again without LOOKUP_RCU); a stale
+/// one is invalidated and the name looked up again (d_invalidate, then
+/// lookup_slow), an error returned
 fn lookup_fast_ref(
     parent: &DentryRef,
     child: DentryRef,
     name: &[u8],
+    rcu: Result<bool, KernelError>,
 ) -> Result<DentryRef, KernelError> {
-    match child.get_inode() {
-        Some(i) if i.i_op.revalidate(&i, false) == Ok(true) => Ok(child),
-        None => Err(KernelError::NotFound),
-        Some(_) => {
-            drop(child);
-            parent.remove_child(name);
-            lookup_slow(parent, name)
-        }
+    if child.is_negative() {
+        return Err(KernelError::NotFound);
+    }
+    match d_revalidate(child, Some(rcu))? {
+        Some(c) => Ok(c),
+        None => lookup_slow(parent, name),
     }
 }
 
@@ -508,10 +529,9 @@ impl Nd {
                 reval,
                 dots: false,
             } => {
-                let d = if reval {
-                    lookup_fast_ref(&cur.dentry, child, name)?
-                } else {
-                    child
+                let d = match reval {
+                    Some(s) => lookup_fast_ref(&cur.dentry, child, name, s)?,
+                    None => child,
                 };
                 (cur, d, rest)
             }
@@ -1012,7 +1032,70 @@ pub fn filename_create(dirfd: i32, path: &[u8], want_dir: bool) -> Result<Parent
 
 #[cfg(test)]
 mod tests {
-    use super::next_comp;
+    use super::*;
+    use crate::fs::inode::{InodeMode, InodeOps, NULL_INODE_OPS, Timespec};
+    use alloc::sync::Weak;
+
+    /// Revalidation says `R`: Ok(false) stale, Err(EIO) an error
+    struct Reval(Result<bool, KernelError>);
+
+    impl InodeOps for Reval {
+        fn lookup(&self, _: &Inode, _: &[u8]) -> Result<Arc<Inode>, KernelError> {
+            Err(KernelError::NotFound)
+        }
+        fn revalidate(&self, _: &Inode, _: bool) -> Result<bool, KernelError> {
+            self.0
+        }
+    }
+
+    static STALE: Reval = Reval(Ok(false));
+    static BROKEN: Reval = Reval(Err(KernelError::Io));
+
+    fn inode(ops: &'static dyn InodeOps) -> Arc<Inode> {
+        let m = InodeMode::directory(0o755);
+        let t = Timespec::from_secs(0);
+        Inode::alloc(Inode::new(1, m, 0, 0, 0, t, Weak::new(), ops)).unwrap()
+    }
+
+    fn root() -> DentryRef {
+        DentryRef::new(Dentry::new_root(inode(&NULL_INODE_OPS), Weak::new())).unwrap()
+    }
+
+    /// A stale child is invalidated itself (Linux d_invalidate(dentry)):
+    /// a dentry that took its name since stays cached, and is the answer
+    #[test]
+    fn stale_invalidates_only_itself() {
+        let r = root();
+        let a = Dentry::alloc(&r, b"x", Some(inode(&STALE))).unwrap();
+        drop(r.remove_child(b"x"));
+        let b = Dentry::alloc(&r, b"x", Some(inode(&NULL_INODE_OPS))).unwrap();
+        let d = lookup_fast_ref(&r, a, b"x", Err(ECHILD)).unwrap();
+        assert!(DentryRef::ptr_eq(&d, &b) && !b.d_unhashed());
+    }
+
+    /// A stale cached child leaves the tree and the name is asked again
+    #[test]
+    fn stale_is_dropped() {
+        let r = root();
+        let a = Dentry::alloc(&r, b"x", Some(inode(&STALE))).unwrap();
+        assert!(cached(&r, b"x").unwrap().is_none());
+        assert!(a.d_unhashed() && r.lookup_child(b"x").is_none());
+    }
+
+    /// A revalidation error is the lookup's (Linux lookup_fast and
+    /// lookup_dcache: ERR_PTR(status)), and the dentry stays cached; an
+    /// RCU walk's stale answer stands without being asked again
+    #[test]
+    fn reval_error_returned() {
+        let r = root();
+        let a = Dentry::alloc(&r, b"x", Some(inode(&BROKEN))).unwrap();
+        let e = lookup_fast_ref(&r, a.clone(), b"x", Err(ECHILD));
+        assert_eq!(e.err(), Some(KernelError::Io));
+        assert_eq!(cached(&r, b"x").err(), Some(KernelError::Io));
+        assert!(!a.d_unhashed());
+        let _ = lookup_fast_ref(&r, a.clone(), b"x", Ok(false));
+        assert!(a.d_unhashed());
+    }
 
     #[test]
     fn components() {

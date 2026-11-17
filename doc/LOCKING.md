@@ -3068,7 +3068,12 @@ check's MAY_NOT_BLOCK) the inode is borrowed under the guard with no
 reference and may be torn down already: the answer may read only
 fields with no drop glue and take nothing that sleeps, else it is
 ECHILD; procfs and kernfs, whose answers need the inode data, always
-are. `sb_permission` reads `Inode.sb` for a write only. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
+are. A stale answer invalidates that dentry (`dentry::d_invalidate`,
+Linux d_invalidate: the parent's d_lock, then its own, as every
+unhook, the parent read again if a rename moved it meanwhile; then
+`d_drop_tree` below it), never whatever holds the name by then; an
+error is the lookup's and invalidates nothing (Linux lookup_fast,
+lookup_dcache, __lookup_slow). `sb_permission` reads `Inode.sb` for a write only. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
 clones the task's and its leader's `Pid` under TASKLIST's read lock
 (dropped after it), then walks the procfs superblocks
 (`iterate_supers_type`: each taken under `SB_LOCK`, then s_umount

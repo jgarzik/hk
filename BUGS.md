@@ -696,6 +696,10 @@ waiting).
   reference (set_root, path_init), legitimizes the root at unlazy
   (legitimize_root, nd->root_seq), and uses fdget and current_cred
   without one.
+- `dentry::d_invalidate` (a stale dentry's drop, `namei::d_revalidate`)
+  leaves mounts on the dropped subtree in place; Linux d_invalidate
+  detaches them (detach_mounts on each mountpoint below), e.g. a mount
+  under a /proc/<pid> directory whose task exited.
 
 ## renameat2 flag gaps
 
