@@ -605,11 +605,15 @@ pub fn netif_rx_flush_local() {
         again = crate::util::kalloc::with_gfp(crate::mm::page_alloc::Gfp::ATOMIC, || {
             let mut budget = NETDEV_BUDGET;
             loop {
-                let n = process_backlog(sd, &napi, budget.min(NAPI_POLL_WEIGHT));
-                if !napi.is_scheduled() {
+                let quota = budget.min(NAPI_POLL_WEIGHT);
+                let n = process_backlog(sd, &napi, quota);
+                // Short: it emptied the queue and gave up SCHED, so the
+                // NAPI is no longer ours (a netif_rx may have queued it
+                // since: never look at its state again)
+                if n < quota {
                     return false;
                 }
-                budget = budget.saturating_sub(n);
+                budget -= n;
                 if budget == 0 {
                     return true;
                 }
