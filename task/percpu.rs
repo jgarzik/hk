@@ -212,20 +212,34 @@ const STACK_MIN_LEFT: usize = 4096;
 /// zeroed, so the untouched bottom shows how deep the task ever went.
 /// An overflow faults in the guard gap below the stack (a "kernel stack
 /// overflow" panic); this reports a path that came close. Reported once.
-fn check_stack_usage(stack: &crate::mm::vmstack::VmStack) {
+fn check_stack_usage(stack: &crate::mm::vmstack::VmStack, task: Option<&Task>) {
+    /// The least left so far (Linux lowest_to_date)
+    static LOWEST: AtomicUsize = AtomicUsize::new(usize::MAX);
     let size = crate::mm::vmstack::THREAD_SIZE;
     // SAFETY: the dead task's stack, mapped while `stack` lives and no
     // longer in use
     let words = unsafe { core::slice::from_raw_parts(stack.base() as *const u64, size / 8) };
     let left = words.iter().position(|&w| w != 0).unwrap_or(words.len()) * 8;
+    let tid = task.map_or(0, Task::tid);
+    // A new lowest is reported with its task (Linux: "%s (%d) used
+    // greatest stack depth: %lu bytes left"), racy as Linux's check
+    if left < LOWEST.load(Ordering::Relaxed) {
+        LOWEST.store(left, Ordering::Relaxed);
+        printkln!(
+            "stack: tid {} used greatest stack depth: {} bytes left",
+            tid,
+            left
+        );
+    }
     if left < STACK_MIN_LEFT {
         static REPORTED: AtomicBool = AtomicBool::new(false);
         if !REPORTED.swap(true, Ordering::Relaxed) {
             printkln!(
-                "STACK:FAIL kernel stack nearly overflowed: {} of {} bytes left (need {})",
+                "STACK:FAIL kernel stack nearly overflowed: {} of {} bytes left (need {}) by tid {}",
                 left,
                 size,
-                STACK_MIN_LEFT
+                STACK_MIN_LEFT,
+                tid
             );
         }
     }
@@ -234,7 +248,7 @@ fn check_stack_usage(stack: &crate::mm::vmstack::VmStack) {
 impl Drop for DeadTask {
     fn drop(&mut self) {
         if let Some(stack) = self.stack.take() {
-            check_stack_usage(&stack);
+            check_stack_usage(&stack, self.task.as_deref());
         }
         // mmdrop: the last reference frees the top-level table
         drop(self.mm.take());
