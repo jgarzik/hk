@@ -553,6 +553,11 @@ pub struct Inode {
     /// The teardown at the last reference and the deferred free
     i_free: IFree,
 
+    /// The inode's own `Weak` (the pointer `IFree` frees), borrowed by
+    /// [`Inode::igrab`]: a copy outside `IFree`, whose bytes only its
+    /// drop touches while it runs
+    i_weak: AtomicPtr<Inode>,
+
     /// Inode number (unique within filesystem)
     pub ino: InodeId,
 
@@ -767,11 +772,12 @@ impl Inode {
     /// it is being torn down or freed (Linux igrab: I_FREEING /
     /// I_WILL_FREE)
     pub fn igrab(&self) -> Option<Arc<Self>> {
-        let me = self.i_free.me.load(Ordering::Acquire);
+        let me = self.i_weak.load(Ordering::Acquire);
         if me.is_null() {
             return None;
         }
-        // SAFETY: the inode's own `Weak` (`IFree` invariant), released
+        // SAFETY: the inode's own `Weak` (`IFree` invariant; `i_weak`
+        // is the same pointer, set before the inode is shared), released
         // only by `i_callback`, a grace period after the teardown: not
         // while `&self` is borrowed (an RCU reader's guard holds it off,
         // and a holder's `Arc` keeps the teardown away). Borrowed here,
@@ -850,8 +856,11 @@ impl Inode {
         // SAFETY: `init_at` wrote every field
         let i = unsafe { a.assume_init() };
         let me = Weak::into_raw(Arc::downgrade(&i)).cast_mut();
-        // INVARIANT: the inode's address, its `Weak` leaked for the free
-        i.i_free.me.store(me, Ordering::Release);
+        // INVARIANT: the inode's address, its `Weak` leaked for the free;
+        // `i_weak` the same pointer, for igrab (both stored before the
+        // inode is shared)
+        i.i_free.me.store(me, Ordering::Relaxed);
+        i.i_weak.store(me, Ordering::Release);
         if let Some(sb) = &sb {
             sb_list_add(sb, &i);
         }
@@ -874,6 +883,7 @@ impl Inode {
         }
         let t = i.mtime;
         w!(i_free, IFree::new());
+        w!(i_weak, AtomicPtr::new(core::ptr::null_mut()));
         w!(ino, i.ino);
         w!(mode, AtomicU16::new(i.mode.0));
         w!(uid, AtomicU32::new(i.uid));
@@ -1414,15 +1424,21 @@ pub struct InodeInit {
 ///
 /// The one `&mut Inode` of the last put, std `Arc::drop_slow` handing
 /// the inode to its drop glue, writes no byte: the glue's only step is
-/// this field's drop, whose `&mut` covers just `me` and `i_rcu`
-/// (atomics and a cell no RCU reader reads). The teardown works through
-/// `me`, a raw pointer to the whole inode: a shared borrow for
-/// eviction, then each `ManuallyDrop` field dropped through its raw
-/// place, all before the free is queued. An RCU reader reads only
-/// fields with no drop glue (atomics, `ino`, `i_op`), which nothing
-/// writes, so it reads them intact until the memory goes. Linux's form,
-/// a counted `i_count` with `iput` as `DentryRef` does for dentries,
-/// would leave no `&mut` at all (BUGS.md).
+/// this field's drop, whose `&mut self` (live, and protected, for the
+/// whole call) covers just `me` and `i_rcu`. No other pointer reaches
+/// those bytes while it lives: they are private to this type, touched
+/// only by `Inode::alloc` before the inode is shared and by this drop
+/// through `self` (`igrab` reads its copy, `Inode::i_weak`). The
+/// teardown works through `me`, a raw pointer to the whole inode: a
+/// shared borrow for eviction, which neither reads nor freezes this
+/// field (all interior mutable: an `AtomicPtr` and an `RcuHead`) and
+/// ends before `self` is used again; then each `ManuallyDrop` field
+/// dropped through its raw place (none overlaps this one); then the free
+/// queued on `self.i_rcu`, borrowed from `self`. An RCU reader reads
+/// only fields with no drop glue (atomics, `ino`, `i_op`, `i_weak`),
+/// which nothing writes, so it reads them intact until the memory goes.
+/// Linux's form, a counted `i_count` with `iput` as `DentryRef` does for
+/// dentries, would leave no `&mut` at all (BUGS.md).
 ///
 /// # Invariants
 /// `me` is null until [`Inode::alloc`] stores the inode's address, a
@@ -1447,18 +1463,25 @@ impl Drop for IFree {
         // Linux iput: the last reference goes where sleeping is allowed
         crate::sync::might_sleep();
         let me = NonNull::new(*self.me.get_mut()).expect("inode: made only by Inode::alloc");
-        // SAFETY: `me` is this inode (type invariant), whose last strong
-        // reference just went: nothing else uses it now, and the borrow
-        // ends before any field is dropped
-        evict(unsafe { me.as_ref() });
-        // SAFETY: as above; evicted, unborrowed, and called once
+        {
+            // SAFETY: `me` is this inode (type invariant), whose last
+            // strong reference just went: nothing else uses it now. The
+            // borrow covers `self`'s bytes but, all interior mutable,
+            // neither reads nor freezes them, `evict` never names
+            // `i_free`, and it ends here, before `self` is used again or
+            // any field is dropped
+            let i = unsafe { me.as_ref() };
+            evict(i);
+        }
+        // SAFETY: as above; evicted, unborrowed, called once; drops no
+        // byte of `self`
         unsafe { destroy_inode(me.as_ptr()) };
         let p = me.as_ptr().cast_const().cast::<()>();
         if crate::sync::rcu::can_queue() {
-            // SAFETY: `i_rcu` is in the inode, whose memory the `Weak`
-            // `i_callback` drops keeps until then; `i_callback` only
-            // drops it, which may happen in any context
-            unsafe { crate::sync::rcu::call_rcu(&(*me.as_ptr()).i_free.i_rcu, i_callback, p) };
+            // SAFETY: `self.i_rcu` is in the inode, whose memory the
+            // `Weak` `i_callback` drops keeps until then; `i_callback`
+            // only drops it, which may happen in any context
+            unsafe { crate::sync::rcu::call_rcu(&self.i_rcu, i_callback, p) };
         } else {
             // SAFETY: no reader can stand on it (host tests; early boot,
             // one CPU, no RCU yet)
@@ -1535,6 +1558,7 @@ const _: () = {
     assert!(!needs_drop::<core::sync::atomic::AtomicI32>());
     assert!(!needs_drop::<list::Link>() && !needs_drop::<crate::task::futex::KeySeq>());
     assert!(!needs_drop::<Mutex<list::List<super::dentry::AliasA>>>());
+    assert!(!needs_drop::<AtomicPtr<Inode>>());
 };
 
 /// The inode's memory, a grace period after its teardown (Linux

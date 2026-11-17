@@ -187,7 +187,14 @@ other field glue-free. The one remaining `&mut Inode`, the transient
 one std `Arc::drop_slow` makes to run the drop glue, writes no byte an
 RCU reader reads: readers read only atomics, `ino`, `i_op` and other
 fields with no drop glue, and the glue's only step is `IFree`'s drop,
-whose own `&mut` covers just its atomics and its `RcuHead`. Linux's
+whose own `&mut self` covers just its `me` and its `RcuHead`. No other
+pointer touches those bytes while that `&mut self` lives (it is
+protected for the whole call): they are private to `IFree`, readers
+use a copy of the pointer (`Inode::i_weak`, for `igrab`), the shared
+`&Inode` the eviction borrows through `me` neither reads nor freezes
+them (all interior mutable) and ends before `self` is used again, the
+`ManuallyDrop` places dropped through `me` lie outside them, and the
+free is queued on `self.i_rcu`, borrowed from `self`. Linux's
 form, a counted `i_count` with an explicit `iput` (as `DentryRef` does
 with `d_count`), removes that transient `&mut` too (BUGS.md).
 
