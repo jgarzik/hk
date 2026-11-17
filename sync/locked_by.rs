@@ -150,20 +150,26 @@ impl<T, A: UniqueOwner, B: UniqueOwner> LockedByEither<T, A, B> {
 /// thread list are under the siglock of the table the task names), the
 /// instance named at run time ([`InstanceGuard`], [`LockedByBoth`])
 ///
+/// The lock may hold data of its own (`Data`: Linux sighand->action
+/// beside siglock), which its guard hands out.
+///
 /// # Safety
 /// `instance_lock` returns the same lock, owned by `self`, for its
 /// whole life (implement it with [`instance_lock!`](crate::instance_lock)).
 pub unsafe trait InstanceLock {
-    fn instance_lock(&self) -> &crate::sync::spin::Mutex<()>;
+    type Data;
+    fn instance_lock(&self) -> &crate::sync::spin::Mutex<Self::Data>;
 }
 
-/// Implement [`InstanceLock`] for a type through its field `$field`
+/// Implement [`InstanceLock`] for a type through its field `$field`, a
+/// `spin::Mutex<$data>`
 #[macro_export]
 macro_rules! instance_lock {
-    ($t:ty, $field:ident) => {
+    ($t:ty, $field:ident, $data:ty) => {
         // SAFETY: a field of the object, fixed for its life
         unsafe impl $crate::sync::InstanceLock for $t {
-            fn instance_lock(&self) -> &$crate::sync::spin::Mutex<()> {
+            type Data = $data;
+            fn instance_lock(&self) -> &$crate::sync::spin::Mutex<$data> {
                 &self.$field
             }
         }
@@ -178,7 +184,7 @@ macro_rules! instance_lock {
 #[must_use]
 pub struct InstanceGuard<'a, B: InstanceLock> {
     owner: &'a B,
-    _g: crate::sync::spin::MutexGuard<'a, ()>,
+    _g: crate::sync::spin::MutexGuard<'a, B::Data>,
 }
 
 impl<'a, B: InstanceLock> InstanceGuard<'a, B> {
@@ -194,6 +200,19 @@ impl<'a, B: InstanceLock> InstanceGuard<'a, B> {
     /// The instance whose lock is held
     pub fn owner(&self) -> &'a B {
         self.owner
+    }
+}
+
+impl<B: InstanceLock> core::ops::Deref for InstanceGuard<'_, B> {
+    type Target = B::Data;
+    fn deref(&self) -> &B::Data {
+        &self._g
+    }
+}
+
+impl<B: InstanceLock> core::ops::DerefMut for InstanceGuard<'_, B> {
+    fn deref_mut(&mut self) -> &mut B::Data {
+        &mut self._g
     }
 }
 
@@ -549,7 +568,7 @@ mod tests {
     struct Inst {
         lock: crate::sync::spin::Mutex<()>,
     }
-    crate::instance_lock!(Inst, lock);
+    crate::instance_lock!(Inst, lock, ());
 
     fn inst() -> Inst {
         Inst {

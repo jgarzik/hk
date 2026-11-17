@@ -9,11 +9,10 @@
 //!
 //! # Locking Model
 //!
-//! - `SigHand.action` uses `IrqSpinlock` because signal handlers may be queried
-//!   from interrupt context (page faults, timer interrupts)
-//! - A task's handler table (`Task.sighand`) and signal state
-//!   (`Task.signal_state`) live in its Task, under TASKLIST; the
-//!   thread-group pending set is a `spin::Mutex`, taken under it
+//! - Linux sighand->siglock: a handler table's actions, the per-task
+//!   state of the tasks naming it (`Task.sig`) and their group's
+//!   pending and job-control state are under its siglock
+//!   (`lock_task_sighand`)
 //!
 //! See doc/LOCKING.md for full lock ordering.
 
@@ -354,13 +353,8 @@ impl Default for SigAction {
 /// Shared signal handlers (for CLONE_SIGHAND)
 ///
 /// Contains the signal action table for a task or group of tasks sharing
-/// handlers. Protected by IrqSpinlock because signal handlers may be queried
-/// from interrupt context (e.g., page faults generating SIGSEGV).
+/// handlers, under its siglock (Linux sighand->action).
 pub struct SigHand {
-    /// Signal actions, one per signal at [`Signal::idx`] (Linux
-    /// action[sig - 1]), built in the heap: the array moved through
-    /// fork's stack frames used ~9 KB of the 16 KB kernel stack
-    action: IrqSpinlock<Box<[SigAction]>>,
     /// Serializes sigaction's change of an action with the flush of
     /// pending signals that change makes (Linux holds siglock across
     /// both in do_sigaction): a thread's install waits until another's
@@ -381,8 +375,11 @@ pub struct SigHand {
     /// it changes (`SignalStruct.threads`); held across a send (Linux
     /// send_signal_locked). Thread context only (hk sends no signal
     /// from an interrupt handler: `check_send_context`; Linux
-    /// PREEMPT_RT's model), after TASKLIST
-    siglock: crate::sync::spin::Mutex<()>,
+    /// PREEMPT_RT's model), after TASKLIST. Its data is the action
+    /// table, one per signal at [`Signal::idx`] (Linux action[sig - 1]),
+    /// built in the heap: the array moved through fork's stack frames
+    /// used ~9 KB of the 16 KB kernel stack
+    siglock: crate::sync::spin::Mutex<Box<[SigAction]>>,
     /// References dropped a grace period late: a table a task stops
     /// naming may still be read under RCU (Linux frees it
     /// SLAB_TYPESAFE_BY_RCU)
@@ -390,15 +387,21 @@ pub struct SigHand {
 }
 
 crate::rcu_puts!(SigHand, puts);
-crate::instance_lock!(SigHand, siglock);
+crate::instance_lock!(SigHand, siglock, Box<[SigAction]>);
 
 /// A table's siglock held (Linux spin_lock(&sighand->siglock)): the
 /// proof its siglock-owned state checks (`SignalStruct.threads`)
 pub type SigGuard<'a> = crate::sync::InstanceGuard<'a, SigHand>;
 
-/// A table's siglock, one lockdep class for every table
-fn new_siglock() -> crate::sync::spin::Mutex<()> {
-    crate::sync::spin::Mutex::new(())
+/// A table's siglock over its actions, one lockdep class for every table
+fn new_siglock(actions: Box<[SigAction]>) -> crate::sync::spin::Mutex<Box<[SigAction]>> {
+    crate::sync::spin::Mutex::new(actions)
+}
+
+/// `sig`'s action in the table whose siglock `g` holds (Linux
+/// t->sighand->action[sig - 1] under siglock)
+pub fn action(g: &SigGuard<'_>, sig: Signal) -> SigAction {
+    g[sig.idx()].clone()
 }
 
 /// A handler table with every action at its default
@@ -409,12 +412,16 @@ fn default_actions() -> Box<[SigAction]> {
 impl SigHand {
     /// Create a new signal handler table with all defaults
     pub fn new() -> Self {
+        Self::with_actions(default_actions())
+    }
+
+    /// A table with `actions`
+    fn with_actions(actions: Box<[SigAction]>) -> Self {
         Self {
-            action: IrqSpinlock::new(default_actions()),
             update: crate::sync::Mutex::new(()),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
             users: crate::task::TableCell::new(0),
-            siglock: new_siglock(),
+            siglock: new_siglock(actions),
             puts: crate::sync::rcu::RcuPuts::new(),
         }
     }
@@ -449,17 +456,18 @@ impl SigHand {
         *n = n.saturating_sub(1);
     }
 
-    /// `sig`'s action
+    /// `sig`'s action, under this table's siglock (the caller holds
+    /// none: [`action`] under a held one)
     pub fn get_action(&self, sig: Signal) -> SigAction {
-        self.action.lock()[sig.idx()].clone()
+        action(&SigGuard::lock(self), sig)
     }
 
     /// The (ignored, caught) masks: signals whose handler is SIG_IGN, and
     /// those with a handler of their own (Linux collect_sigign_sigcatch),
-    /// read in one hold of the table
+    /// read in one hold of its siglock
     pub fn ign_cgt(&self) -> (u64, u64) {
         let (mut ign, mut cgt) = (0, 0);
-        for (i, a) in self.action.lock().iter().enumerate() {
+        for (i, a) in SigGuard::lock(self).iter().enumerate() {
             let bit = 1 << i;
             match a.handler {
                 SigHandler::Ignore => ign |= bit,
@@ -476,31 +484,26 @@ impl SigHand {
         self.update.lock()
     }
 
-    /// Set `sig`'s action; the old one, or EINVAL for SIGKILL and
-    /// SIGSTOP, whose action cannot change (Linux do_sigaction)
+    /// Set `sig`'s action under its siglock; the old one, or EINVAL for
+    /// SIGKILL and SIGSTOP, whose action cannot change (Linux
+    /// do_sigaction)
     pub fn set_action(&self, sig: Signal, action: SigAction) -> Result<SigAction, KernelError> {
         if sig.kernel_only() {
             return Err(KernelError::InvalidArgument);
         }
-        let mut actions = self.action.lock();
-        Ok(core::mem::replace(&mut actions[sig.idx()], action))
+        let mut g = SigGuard::lock(self);
+        Ok(core::mem::replace(&mut g[sig.idx()], action))
     }
 
     /// Deep clone for fork (without CLONE_SIGHAND)
     ///
     /// Creates a new SigHand with copies of all signal actions.
     pub fn deep_clone(self: &Arc<Self>) -> Result<Arc<Self>, KernelError> {
-        // Allocated before the lock is taken: SigHand.action stays a leaf
+        // Allocated before the siglock is taken: nothing allocates
+        // under it but a send's queue entry
         let mut actions = default_actions();
-        actions.clone_from_slice(&self.action.lock());
-        try_arc(Self {
-            action: IrqSpinlock::new(actions),
-            update: crate::sync::Mutex::new(()),
-            signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
-            users: crate::task::TableCell::new(0),
-            siglock: new_siglock(),
-            puts: crate::sync::rcu::RcuPuts::new(),
-        })
+        actions.clone_from_slice(&SigGuard::lock(self));
+        try_arc(Self::with_actions(actions))
     }
 
     /// Reset all signal handlers to default (for CLONE_CLEAR_SIGHAND)
@@ -514,8 +517,8 @@ impl SigHand {
     ///
     /// This is called when CLONE_CLEAR_SIGHAND is used during clone.
     pub fn flush_handlers(&self) {
-        let mut actions = self.action.lock();
-        for action in actions.iter_mut() {
+        let mut g = SigGuard::lock(self);
+        for action in g.iter_mut() {
             // Preserve SIG_IGN, reset everything else to default
             if action.handler != SigHandler::Ignore {
                 action.handler = SigHandler::Default;
@@ -1375,7 +1378,10 @@ pub fn exec_signals() -> Result<(), KernelError> {
     // above one)
     let shared = *old.users.access(&TASKLIST.read()) > 1;
     if shared {
-        let new = old.deep_clone()?;
+        // Allocated before the locks (Linux unshare_sighand:
+        // kmem_cache_alloc, then the actions copied under the old
+        // siglock)
+        let mut new = try_arc(SigHand::new())?;
         // The old reference goes after TASKLIST
         // Under TASKLIST's write lock and the old table's siglock
         // (Linux unshare_sighand)
@@ -1383,10 +1389,16 @@ pub fn exec_signals() -> Result<(), KernelError> {
         if table.view(&me).is_some()
             && let Some(prev) = me.sighand.get_protected(&table)
         {
+            let mut g = SigGuard::lock(&prev);
+            // Not shared yet: its actions are written without its lock
+            Arc::get_mut(&mut new)
+                .expect("a new table is unshared")
+                .siglock
+                .get_mut()
+                .clone_from_slice(&g);
             new.get(&mut table);
             // Its group's list (the caller alone, after de_thread) is
             // the new table's from now on
-            let mut g = SigGuard::lock(&prev);
             if let Some(s) = me.cpu_group() {
                 s.set_owner(&mut table, &mut g, &new);
             }
@@ -1460,18 +1472,13 @@ pub fn task_fatal_pending(t: &crate::task::Task) -> bool {
 /// not blocked (a blocked signal stays queued: the handler may change),
 /// awaited by sigtimedwait (blocked before it: real_blocked), nor for a
 /// `traced` task, whose tracer sees it first
-fn sig_ignored(
-    state: &TaskSignalState,
-    sighand: Option<&Arc<SigHand>>,
-    sig: Signal,
-    traced: bool,
-) -> bool {
+fn sig_ignored(state: &TaskSignalState, g: &SigGuard<'_>, sig: Signal, traced: bool) -> bool {
     let held = state.blocked.contains(sig) || state.real_blocked.contains(sig);
     // A tracer sees even an ignored signal, but SIGKILL (never ignored)
     if held || traced || sig.kernel_only() {
         return false;
     }
-    sighand.is_some_and(|h| h.get_action(sig).ignores(sig))
+    action(g, sig).ignores(sig)
 }
 
 /// The current thread's group is a namespace init's, still
@@ -1487,14 +1494,14 @@ fn current_unkillable(me: &Task) -> bool {
 /// kernel-forced signal never gets here: it lifts the protection
 /// (`send_signal_force`), and SIGKILL or SIGSTOP from an ancestor
 /// namespace is not protected against ([`Target::protects`]).
-fn init_ignores(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: Signal) -> bool {
+fn init_ignores(state: &TaskSignalState, g: &SigGuard<'_>, sig: Signal) -> bool {
     if sig.kernel_only() {
         return true;
     }
     if state.blocked.contains(sig) || state.real_blocked.contains(sig) {
         return false;
     }
-    sighand.is_none_or(|h| h.get_action(sig).is_default())
+    action(g, sig).is_default()
 }
 
 /// What a signal is sent with (Linux send_signal_locked's info: a
@@ -1743,11 +1750,7 @@ fn send_task_in(
     // was reset by the caller) lifts a namespace init's protection
     // (Linux force_sig_info_to_task: SIGNAL_UNKILLABLE cleared); one
     // init handles leaves it protected
-    let dfl = || {
-        tg.sighand
-            .as_ref()
-            .is_none_or(|h| h.get_action(sig).is_default())
-    };
+    let dfl = || action(&g, sig).is_default();
     if force
         && let Some(s) = tg.signal.as_ref()
         && s.unkillable()
@@ -1779,7 +1782,7 @@ fn send_task_in(
     let Ok(_j) = prepare_signal(&g, tg.signal.as_ref(), sig, gone) else {
         return Ok(());
     };
-    let sent = with_sig_send(&g, t, |t, state| send_locked(&g, t, state, sighand, &to));
+    let sent = with_sig_send(&g, t, |t, state| send_locked(&g, t, state, &to));
 
     let wants = match sent {
         Sent::Dropped => return Ok(()),
@@ -1791,7 +1794,7 @@ fn send_task_in(
     if let Some(h) = sighand {
         h.signalfd_wq.wake_all();
     }
-    complete_signal(&g, t, sig, ty, wants, sighand, to.init);
+    complete_signal(&g, t, sig, ty, wants, to.init);
     Ok(())
 }
 
@@ -1874,11 +1877,10 @@ fn send_locked(
     g: &SigGuard<'_>,
     t: &crate::task::Task,
     state: &mut TaskSignalState,
-    sighand: Option<&Arc<SigHand>>,
     to: &Send<'_>,
 ) -> Sent {
     let sig = to.sig;
-    if drops(g, t, state, sighand, to) {
+    if drops(g, t, state, to) {
         return Sent::Dropped;
     }
     let exiting = t.has_flag(crate::task::pf::EXITING);
@@ -1913,19 +1915,12 @@ fn send_locked(
 /// signal while it exits, ignored, a non-RT signal already pending
 /// where it would go, or a group signal for a task with no group
 /// (Linux task_can_queue_signal, prepare_signal, legacy_queue)
-fn drops(
-    g: &SigGuard<'_>,
-    t: &crate::task::Task,
-    state: &TaskSignalState,
-    sighand: Option<&Arc<SigHand>>,
-    to: &Send<'_>,
-) -> bool {
+fn drops(g: &SigGuard<'_>, t: &crate::task::Task, state: &TaskSignalState, to: &Send<'_>) -> bool {
     let sig = to.sig;
     if to.ty == PidType::Pid && t.has_flag(crate::task::pf::EXITING) {
         return true;
     }
-    if sig_ignored(state, sighand, sig, to.traced) || (to.init && init_ignores(state, sighand, sig))
-    {
+    if sig_ignored(state, g, sig, to.traced) || (to.init && init_ignores(state, g, sig)) {
         return true;
     }
     match to.ty {
@@ -1945,10 +1940,9 @@ fn complete_signal(
     sig: Signal,
     ty: PidType,
     p_wants: bool,
-    sighand: Option<&Arc<SigHand>>,
     init: bool,
 ) {
-    let chosen = choose(g, p, sig, ty, p_wants, sighand, init);
+    let chosen = choose(g, p, sig, ty, p_wants, init);
     deliver(g, p, sig, chosen);
 }
 
@@ -1971,7 +1965,6 @@ fn choose(
     sig: Signal,
     ty: PidType,
     p_wants: bool,
-    sighand: Option<&Arc<SigHand>>,
     init: bool,
 ) -> Option<Chosen> {
     let t = if p_wants {
@@ -1982,7 +1975,7 @@ fn choose(
         pick_thread(g, p, sig)?
     };
     let awaited = sig_of(&t, g).real_blocked.contains(sig);
-    let kill = !init && fatal(sighand, sig) && !awaited;
+    let kill = !init && fatal(g, sig) && !awaited;
     Some(Chosen { t, kill })
 }
 
@@ -2271,11 +2264,11 @@ pub fn kill_pgrp(
 /// and !sig_kernel_coredump in complete_signal): SIGKILL, or a SIG_DFL
 /// signal whose default is to terminate (core-dump signals end the
 /// group at delivery)
-fn fatal(sighand: Option<&Arc<SigHand>>, sig: Signal) -> bool {
+fn fatal(g: &SigGuard<'_>, sig: Signal) -> bool {
     if sig == SIGKILL {
         return true;
     }
-    let dfl = sighand.is_some_and(|h| h.get_action(sig).is_default());
+    let dfl = action(g, sig).is_default();
     dfl && !sig.kernel_ignore() && !sig.kernel_stop() && !sig.kernel_coredump()
 }
 
@@ -2555,7 +2548,7 @@ pub fn send_timer_sigqueue(
         if exiting && ty == PidType::Pid {
             return Err(false);
         }
-        if sig_ignored(state, sighand, sig, tg.traced) {
+        if sig_ignored(state, &g, sig, tg.traced) {
             return Err(true);
         }
         let wants = !state.blocked.contains(sig)
@@ -2583,7 +2576,7 @@ pub fn send_timer_sigqueue(
                 h.signalfd_wq.wake_all();
             }
             let init = tg.protects(sig, false);
-            complete_signal(&g, t, sig, ty, wants, sighand, init);
+            complete_signal(&g, t, sig, ty, wants, init);
             Ok(())
         }
         Err(ignored) => Err((q.expect("an unqueued entry comes back"), ignored)),

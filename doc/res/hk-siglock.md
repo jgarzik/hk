@@ -203,7 +203,8 @@ made under siglock as Linux's.
    - [x] `SignalStruct.jobctl`, `shared`: `InstanceCell`s owned with the
      thread list; group exit starts under siglock (do_group_exit,
      synchronize_group_exit).
-   - [ ] `SigHand.action`.
+   - [x] `SigHand.action`: the siglock's own data (`InstanceLock::Data`);
+     exec's unshare copies it under the old siglock.
    - [ ] `SigHand.update` gone; ignored POSIX timers on a siglock-owned
      list (Linux ignored_posix_timers).
 

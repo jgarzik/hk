@@ -653,7 +653,7 @@ Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     table, fs context, namespaces, name, memory policy and I/O context
     under its alloc_lock (3.1.1); under them only leaves:
     SigHand.siglock (its owned state: Task.sig, SignalStruct.jobctl
-    and shared) → SigHand.action (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf;
+    and shared, and its action table); SignalStruct.rlim (IrqSpinlock leaf;
     setrlimit/prlimit64 read the old limit, decide (with the
     lock-free capable()) and store in one hold, as Linux do_prlimit
     under task_lock); UCOUNTS (IrqSpinlock leaf, 3.1.1 Per-user
@@ -770,8 +770,8 @@ Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
     IRQ-safe; Linux task_lock; one task's at a time) →
     SigHand.siglock (spin Mutex, per handler table, thread context;
     Linux sighand->siglock, 3.7; owns each naming task's Task.sig and
-    its group's SignalStruct.jobctl and shared, no locks of their own) →
-    SigHand.action (IrqSpinlock leaf); Task.keyrings, Task.cgroup:
+    its group's SignalStruct.jobctl and shared, no locks of their own;
+    its data is the action table); Task.keyrings, Task.cgroup:
     per-task leaves reached through the task (current
     or a held TaskRef), never under TASKLIST; SignalStruct.posix_timers (never under TASKLIST)
     → PosixTimer.inner (the registry's timers, the CPU itimers),
@@ -921,7 +921,7 @@ Other CPUs cannot cause deadlock because:
   taken under them), so holding TASKLIST across a wakeup is allowed,
   though wakers drop it first where they can
 - Leaves may be taken under TASKLIST (a wait queue head,
-  `SigHand.siglock` -> `SigHand.action`,
+  `SigHand.siglock`,
   `SignalStruct.rlim`): they take nothing that leads back to it
 - TASKLIST is NEVER acquired from interrupt context (see Section 7.4)
 - Nothing is released under TASKLIST (3.1.1 rule 4): a release could
@@ -1772,7 +1772,7 @@ from `Task.se`.
 |------------|---------|---------------|
 | `alloc_lock` (task_lock) | mm, files, fs, nsproxy, comm, mempolicy, io_context | `Task.alloc_lock` (spin Mutex, per task) |
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
-| `sighand->siglock` | Signal state, handlers | `SigHand.siglock` with the per-task state it owns (`Task.sig`), `SignalStruct.jobctl` (group stop state) and `SignalStruct.shared` (owned too), `SigHand.action` (IrqSpinlock), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
+| `sighand->siglock` | Signal state, handlers | `SigHand.siglock` with the per-task state it owns (`Task.sig`), `SignalStruct.jobctl` (group stop state) and `SignalStruct.shared` (owned too), the action table (the siglock's own data), `SigHand.update` (sleeping Mutex, sigaction's install and flush; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
 | RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHList`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
 | RCU (`cred`, put_cred_rcu) | Credentials | `Task.cred` (`TaskCred`): lock-free for the task, an RCU read guard for others, the old set through `put_rcu` |
@@ -4421,7 +4421,7 @@ state patterns.
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `Task.sighand` | `RcuLockedArc<SigHand, GlobalTaskTable>` | The task's handler table (Linux task->sighand, `__rcu`): set by fork in the TASKLIST write section that lists the child (`install_fork_signal`, Linux copy_process: visible with its sighand); replaced (exec's unshare_sighand) or cleared at release (`unhash`, Linux __exit_signal from release_task: a zombie keeps its handlers) under TASKLIST's write lock and the old table's `siglock`, the old reference dropped a grace period later (`put_rcu` on `SigHand.puts`); read under TASKLIST (the views' `sighand`) or an RCU read guard (`get_task_sighand`) |
-| `SigHand.siglock` | `spin::Mutex<()>`, thread context only (not IRQ-safe), one lockdep class (`new_siglock`); held through a `SigGuard` (`sync::InstanceGuard`), the proof siglock-owned cells check against their owner table | Linux sighand->siglock: held with TASKLIST's write lock while a task stops naming the table (`SigHand::leave`: exec, release) and while a thread list of a group whose threads name it changes (`SignalStruct.threads`); held across a send, from its prepare to its last wakeup (`send_task_in`, `send_timer_sigqueue`; Linux send_signal_locked), across do_signal_stop's thread walk, and around a group kill's (`zap_group`: exit_group, de_thread). Never two at once (one lockdep class): a stop notice to a parent is sent after the stopping thread's is dropped. Not IRQ-safe as in Linux PREEMPT_RT: hk sends no signal from an interrupt handler (rule 1, `check_send_context`); a hardirq sender would make it an IrqSpinlock (Linux irqsave). Owns `Task.sig` (each task's, of the tasks naming the table). Owns `SignalStruct.jobctl` and `shared` of the group whose threads name it. Order: TASKLIST → `siglock` → `SigHand.action`. The rest of siglock's state moves under it per doc/res/hk-siglock.md |
+| `SigHand.siglock` | `spin::Mutex<()>`, thread context only (not IRQ-safe), one lockdep class (`new_siglock`); held through a `SigGuard` (`sync::InstanceGuard`), the proof siglock-owned cells check against their owner table | Linux sighand->siglock: held with TASKLIST's write lock while a task stops naming the table (`SigHand::leave`: exec, release) and while a thread list of a group whose threads name it changes (`SignalStruct.threads`); held across a send, from its prepare to its last wakeup (`send_task_in`, `send_timer_sigqueue`; Linux send_signal_locked), across do_signal_stop's thread walk, and around a group kill's (`zap_group`: exit_group, de_thread). Never two at once (one lockdep class): a stop notice to a parent is sent after the stopping thread's is dropped. Not IRQ-safe as in Linux PREEMPT_RT: hk sends no signal from an interrupt handler (rule 1, `check_send_context`); a hardirq sender would make it an IrqSpinlock (Linux irqsave). Owns `Task.sig` (each task's, of the tasks naming the table). Owns `SignalStruct.jobctl` and `shared` of the group whose threads name it. Its data is the action table. Order: TASKLIST → `siglock`. The rest of siglock's state moves under it per doc/res/hk-siglock.md |
 | `SignalStruct.threads` | `sync::LockedByBoth<OwnedList<ThreadNode>, GlobalTaskTable, SigHand>` | The group's threads (Linux signal->thread_head): changed under TASKLIST's write lock and the siglock of the table every thread names (the cell's owner, checked at run time: set when the group gets its first task, moved by exec's unshare under the old siglock), walked under either: `GlobalTaskTable::threads` (TASKLIST), `SignalStruct::threads` (a `SigGuard`: complete_signal's thread choice, `zap_threads`, `stop::prepare`, do_signal_stop). A task joins in the section that gives it its group (`install_fork_signal`, `init_task_signal`) and leaves at release (`unhash`, with its sighand clear, under one siglock hold). CLONE_THREAD requires CLONE_SIGHAND (EINVAL), so a group's threads share one table |
 | `SigHand.users` | `TableCell<u32>` (TASKLIST) | Tasks whose `Task.sighand` it is, changed with that field (Linux sighand->count): exec copies a table with more than one (unshare_sighand) |
 | `Task.sig` | `sync::InstanceCell<TaskSignalState, SigHand>` (per task), owned by the siglock of the table `Task.sighand` names | Blocked mask, private pending set, altstack; a ptrace stop: `jobctl` (TRACED, PTRACE_FROZEN, LISTENING), `ptrace_code`, `last_siginfo` (3.1.3) (Linux task->blocked, ->pending, ->jobctl, ->exit_code, ->last_siginfo: no lock of their own, under the siglock of the table the task names). Borrowed (`signal::sig_of`) under a `SigGuard` of that table, checked at run time: `lock_task_sighand` (RCU, retry) or, under TASKLIST, `lock_sighand_in`. The owner is set where the task first names a table (`install_fork_signal`, `init_task_signal`: the state was built unseen) and moves with `Task.sighand` (exec's unshare, TASKLIST write + the old siglock: Linux unshare_sighand), so a holder of the old table that found the task through it never shares the state with a holder of the new one; after release (no table) it is unreachable, as Linux's (lock_task_sighand fails). A kernel thread has no table: its state is never reached |
@@ -4429,24 +4429,11 @@ state patterns.
 | `SignalStruct.jobctl` | `sync::InstanceCell<stop::GroupStop, SigHand>`, owned by the siglock of the table the group's threads name (moved with the thread list: `SignalStruct::set_owner`); reached through the group's `SignalStruct` (a task's `cpu_group`, Linux task->signal, fixed for its life) | Job-control state (Linux signal->flags' SIGNAL_STOP_*/SIGNAL_CLD_*, group_stop_count, group_exit_code as the stop's signal: under siglock). A thread's stop bits (`jobctl` STOP_PENDING, STOP_CONSUME, STOPPED, TRAP_STOP, TRAP_NOTIFY, TRAPPING) change in the same hold. Borrowed by: a stop signal's or SIGCONT's send, across its prepare, queue, thread choice and wakeups (Linux prepare_signal/complete_signal); do_signal_stop; a ptrace trap's entry (`ptrace_stop_why`) and do_jobctl_trap; PTRACE_INTERRUPT; `zap_threads`; `exit_participate`; `notify_cld`; the tracer's attach and unlink; a clone's insert (`join_group_stop`); wait (`take_stopped`, `take_continued`, under `lock_sighand_in`); a stop notice's code. A group exit starts under the siglock (`SignalStruct::start_exit`: do_group_exit with its zap, a fatal signal's `group_kill`, the last thread's exit; Linux SIGNAL_GROUP_EXIT under siglock), so a stop signal's or SIGCONT's send, which checks for one before its prepare, is dropped by an exit begun before it and seen by one begun after. The siglock is dropped before any parent is notified (a SIGCHLD send takes the parent's); wakeups under it are allowed. Entries a stop signal or SIGCONT flushes go to the caller's `SigPending`, dropped with no signal lock held (a timer's entry goes back to its timer) |
 | `SignalStruct.shared` | `sync::InstanceCell<GroupPending, SigHand>`, owned as `jobctl` (`SignalStruct::shared`, `signal::group_pending`, Linux t->signal->shared_pending) | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target), and the forks in progress (`GroupPending.multiprocess`, Linux signal->multiprocess): a fork links its boxed `ForkDelay` node under its siglock at its start (`fork_signals_begin`, with its ERESTARTNOINTR check of the caller's pending signals in the same hold), a send of a `PidType::Pgid` signal records it in every node in the hold that queues it, and the child's attach (`install_fork_signal`, TASKLIST write) unlinks the node under the parent's siglock (Linux copy_process) and, after dropping it, ORs its set into the new group's set under the child's table's siglock; a failed fork unlinks it under its siglock as it returns |
 | `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
-| `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (64 entries, `Signal::idx`) | Signal handler table |
+| `SigHand.siglock` data | `Box<[SigAction]>` (64 entries, `Signal::idx`) inside the siglock (`SigGuard` derefs to it, `signal::action`) | Signal handler table (Linux sighand->action under siglock): read and written under the siglock; a send reads it in its hold (`sig_ignored`, `fatal`); `SigHand::get_action`, `set_action`, `ign_cgt`, `flush_handlers`, `deep_clone` take the siglock themselves (callers hold none); exec's unshare copies it into the new table under the old siglock (Linux unshare_sighand) |
 | `SigHand.update` | sleeping `sync::Mutex<()>`, thread context only (never from IRQ) | rt_sigaction's install of an action and the pending flush or timer requeue it makes, as one step for the table's other sigactions (Linux siglock held across do_sigaction). Outermost of the signal locks: taken with no lock held, before TASKLIST, `Task.sig`, `SignalStruct.shared`, `SignalStruct.posix_timers` and `SigHand.action`; never nested with itself (one lockdep class) |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf; nothing allocates under it: a fork allocates its SignalStruct, then copies the limits under the parent's, as Linux copy_signal under task_lock) |
 | `SignalStruct.subreaper` | `TableCell<bool>` (TASKLIST) | PR_SET_CHILD_SUBREAPER (Linux signal->is_child_subreaper): set by any thread under the write lock, read under the read lock by prctl and by the reparenting it decides (`find_reaper`, in `forget_original_parent`'s write section) |
 | `SignalStruct.unkillable` | `AtomicBool`, no lock | A pid namespace's init (Linux SIGNAL_UNKILLABLE): set before the group is visible (fork of a process numbered 1 in its namespace, the global init at boot), cleared once when the kernel forces a SIG_DFL signal on it; read by a send (`Target::protects`), CLONE_PARENT and delivery. A monotonic flag no other state is ordered with |
-
-#### Why SigHand.action Uses IrqSpinlock
-
-Signal handlers may be queried from interrupt context:
-- **SIGSEGV**: From page fault handler when accessing invalid memory
-- **SIGFPE**: From divide-by-zero or floating point exception handler
-- **SIGBUS**: From alignment fault handler
-- **SIGTRAP**: From debug exception handler
-
-Because these exceptions can occur at any time (including while holding other locks),
-the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures that:
-1. Interrupts are disabled during access
-2. No deadlock can occur if a page fault happens while setting a handler
 
 #### Locking Rules
 
@@ -4467,12 +4454,9 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    `SIGNAL:FAIL` if called with a nonzero interrupt depth (arm64 IRQ
    entry now counts the depth too).
 
-2. **SigHand.action uses IrqSpinlock** - Can be safely accessed from synchronous
-   exception handlers (page faults, etc.) and process context; a leaf.
-
-3. **The group set before action** - `SigHand.action` may be read
-   under siglock (a send's `sig_ignored`);
-   dequeueing reads the action after both are dropped.
+2. **The action table is siglock data** (Linux sighand->action) - a
+   fault's signal reads it in thread context with interrupts on, like
+   every sender (rule 1); dequeueing reads it after the state's hold.
 
 4. **Never hold IrqSpinlock while acquiring Mutex** - Would violate lock ordering.
 
@@ -4539,8 +4523,6 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 1a. SigHand.siglock (spin Mutex; a send, the thread list; with TASKLIST
     written, Task.sighand and the thread list change; owns Task.sig,
     SignalStruct.jobctl and SignalStruct.shared: no locks of their own)
-   ↓
-5. SigHand.action (IrqSpinlock, handler table; leaf)
 ```
 
 #### Clone Integration (CLONE_SIGHAND)
@@ -4574,7 +4556,7 @@ child.set_cpu_group(&signal);
 ```rust
 let sighand = get_task_sighand(&current())?;  // cloned out under RCU
 let _update = sighand.lock_update();     // SigHand.update (sleeping)
-let old = sighand.set_action(sig, new);  // SigHand.action (IrqSpinlock),
+let old = sighand.set_action(sig, new);  // the siglock's action table,
                                          // one hold: actions[sig.idx()]
 if new.ignores(sig) { flush_group_signal(sig) }  // siglock, threads,
 else if old.is_ignore() { sig_unignore(sig) }    // timers whose signal it ignored
@@ -4691,7 +4673,7 @@ de_thread, exit_group does not.
   lock: the receiver and signal, the autoreap decision (the parent
   process's SIGCHLD action, in the `SigHand` of the thread the signal
   goes to) and the whole send (`signal::send_task_in`: TASKLIST →
-  siglock → SigHand.action, the order above;
+  the receiver's siglock, the order above;
   its `SigQueue` entry made under the receiver's siglock,
   GFP_ATOMIC, rule 5); an autoreaped zombie leaves the task list there
   too (Linux EXIT_DEAD). The thread that takes the signal is chosen,
