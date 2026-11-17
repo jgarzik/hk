@@ -17,6 +17,7 @@ use crate::util::scope::ScopeGuard;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::ControlFlow;
 
 use crate::block::BlockDevice;
 use crate::block::blkdev::{BioOp, bdev_rw_bytes};
@@ -1349,6 +1350,11 @@ pub struct ParsedDirEntry {
     /// Index of the short entry's 32-byte slot in the directory (its
     /// stable readdir position, like Linux fat_readdir's cpos)
     pub slot: u64,
+    /// Disk offset of the short entry (its i_pos)
+    pub i_pos: u64,
+    /// Its slots, the long-name ones before it included (Linux
+    /// fat_slot_info.nr_slots)
+    pub nr_slots: u8,
     /// Its times
     pub times: EntryTimes,
 }
@@ -1464,106 +1470,144 @@ impl Lfn {
     }
 }
 
-/// Read and parse directory entries from a cluster chain; the list
-/// grows fallibly (ENOMEM), a directory being as large as its disk says
+/// One 32-byte slot of a directory
+struct Slot<'a> {
+    /// Its disk offset (a short entry's i_pos)
+    off: u64,
+    /// Its index in the directory
+    idx: u64,
+    b: &'a [u8; 32],
+}
+
+/// Walk the slots of the directory at `start` (0: none), a cluster
+/// read at a time (Linux fat_get_entry through the directory's
+/// buffers), the chain followed as it goes: `f` ends the walk with
+/// Break. None: the chain ended first. A corrupt chain is EIO as in
+/// `read_cluster_chain`.
+fn dir_walk<B>(
+    sb_data: &VfatSbData,
+    start: u32,
+    mut f: impl FnMut(&Slot<'_>) -> Result<ControlFlow<B>, KernelError>,
+) -> Result<Option<B>, KernelError> {
+    if start == 0 {
+        return Ok(None);
+    }
+    let cs = sb_data.cluster_size as usize;
+    let per = cs as u64 / 32;
+    // `read_cluster_chain`'s bound: a longer chain is a loop
+    let max_len = u64::from(sb_data.max_cluster).min((1u64 << 32) / cs as u64 + 1);
+    let mut buf = crate::util::kmem::try_vec(cs, 0u8)?;
+    let mut c = start;
+    for ci in 0..max_len {
+        if !(2..sb_data.max_cluster).contains(&c) {
+            return Err(KernelError::Io);
+        }
+        let base = cluster_to_offset(sb_data, c);
+        read_bytes(&sb_data.bdev, base, &mut buf)?;
+        for (i, b) in buf.as_chunks::<32>().0.iter().enumerate() {
+            let i = i as u64;
+            let s = Slot {
+                off: base + i * 32,
+                idx: ci * per + i,
+                b,
+            };
+            if let ControlFlow::Break(r) = f(&s)? {
+                return Ok(Some(r));
+            }
+        }
+        c = get_fat_entry(sb_data, c)?;
+        if is_end_of_chain(c) {
+            return Ok(None);
+        }
+    }
+    Err(KernelError::Io)
+}
+
 /// Directory short entries in the directory at `cluster`, "." and ".."
 /// included (Linux fat_subdirs: its i_nlink)
 fn fat_subdirs(sb_data: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
-    let chain = read_cluster_chain(sb_data, cluster)?;
-    let per = sb_data.cluster_size as usize / 32;
     let mut n = 0;
-    for &c in &chain {
-        let off = cluster_to_offset(sb_data, c);
-        for i in 0..per {
-            let mut b = [0u8; 32];
-            read_bytes(&sb_data.bdev, off + i as u64 * 32, &mut b)?;
-            match b[0] {
-                END_MARKER => return Ok(n),
-                DELETED_MARKER => {}
-                // fat_get_short_entry skips long-name slots
-                _ if b[11] & attr::LONG_NAME_MASK == attr::LONG_NAME => {}
-                _ if b[11] & attr::DIRECTORY != 0 => n += 1,
-                _ => {}
-            }
+    dir_walk(sb_data, cluster, |s| {
+        match s.b[0] {
+            END_MARKER => return Ok(ControlFlow::Break(())),
+            DELETED_MARKER => {}
+            // fat_get_short_entry skips long-name slots
+            _ if s.b[11] & attr::LONG_NAME_MASK == attr::LONG_NAME => {}
+            _ if s.b[11] & attr::DIRECTORY != 0 => n += 1,
+            _ => {}
         }
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(n)
 }
 
+/// The short entry in slot `s`, its long name (if `lfn` gathered one
+/// for it) as its name and `lfn_slots` long-name slots before it
+fn parse_short(s: &Slot<'_>, lfn: &mut Lfn, lfn_slots: usize) -> ParsedDirEntry {
+    let dirent = VfatDirEntry::read_from(s.b).expect("32-byte entry");
+    // The long name if its entries match, else the short one
+    let long = lfn.take_name(&dirent.name, &dirent.ext);
+    let nr_slots = if long.is_some() { lfn_slots + 1 } else { 1 };
+    let name = long.unwrap_or_else(|| short_name_to_string(&dirent.name, &dirent.ext));
+    let start_cluster =
+        (u32::from(dirent.first_cluster_hi) << 16) | u32::from(dirent.first_cluster_lo);
+    let mut short_name = [b' '; 11];
+    short_name[0..8].copy_from_slice(&dirent.name);
+    short_name[8..11].copy_from_slice(&dirent.ext);
+    ParsedDirEntry {
+        name,
+        short_name,
+        attr: s.b[11],
+        start_cluster,
+        file_size: dirent.file_size,
+        slot: s.idx,
+        i_pos: s.off,
+        nr_slots: nr_slots as u8,
+        times: EntryTimes::of(&dirent),
+    }
+}
+
+/// The entries of the directory at `start_cluster`, "." and ".." and
+/// volume labels left out, each with its disk offset; the list grows
+/// fallibly (ENOMEM), a directory being as large as its disk says
 fn read_directory_entries(
     sb_data: &VfatSbData,
     start_cluster: u32,
 ) -> Result<Vec<ParsedDirEntry>, KernelError> {
-    let chain = read_cluster_chain(sb_data, start_cluster)?;
     let mut entries = crate::util::kmem::KVec::new();
     let mut lfn = Lfn::default();
-
-    for (ci, &cluster) in chain.iter().enumerate() {
-        let cluster_offset = cluster_to_offset(sb_data, cluster);
-        let entries_per_cluster = sb_data.cluster_size as usize / 32;
-
-        for i in 0..entries_per_cluster {
-            let entry_offset = cluster_offset + (i as u64 * 32);
-            let mut buf = [0u8; 32];
-            read_bytes(&sb_data.bdev, entry_offset, &mut buf)?;
-
-            // Check for end of directory
-            if buf[0] == END_MARKER {
-                return Ok(entries.into_vec());
-            }
-
-            // Skip deleted entries
-            if buf[0] == DELETED_MARKER {
+    // Long-name slots gathered since the last other one
+    let mut run = 0;
+    dir_walk(sb_data, start_cluster, |s| {
+        let attr = s.b[11];
+        match s.b[0] {
+            END_MARKER => return Ok(ControlFlow::Break(())),
+            DELETED_MARKER => {
                 lfn.clear();
-                continue;
+                run = 0;
             }
-
-            let attr = buf[11];
-
-            // Check if this is a long filename entry
-            if (attr & attr::LONG_NAME_MASK) == attr::LONG_NAME {
-                lfn.add(&VfatLfnEntry::read_from(&buf).expect("32-byte entry"));
-            } else {
-                // Parse as regular directory entry
-                let dirent = VfatDirEntry::read_from(&buf).expect("32-byte entry");
-
-                // Skip volume labels
-                if (attr & attr::VOLUME_ID) != 0 {
-                    lfn.clear();
-                    continue;
+            _ if attr & attr::LONG_NAME_MASK == attr::LONG_NAME => {
+                let e = VfatLfnEntry::read_from(s.b).expect("32-byte entry");
+                if e.order & 0x40 != 0 {
+                    run = 0;
                 }
-
-                // The long name if its entries match, else the short one
-                let name = lfn
-                    .take_name(&dirent.name, &dirent.ext)
-                    .unwrap_or_else(|| short_name_to_string(&dirent.name, &dirent.ext));
-
-                // Skip "." and ".." entries
-                if name == "." || name == ".." {
-                    continue;
+                lfn.add(&e);
+                run += 1;
+            }
+            _ if attr & attr::VOLUME_ID != 0 => {
+                lfn.clear();
+                run = 0;
+            }
+            _ => {
+                let e = parse_short(s, &mut lfn, run);
+                run = 0;
+                if e.name != "." && e.name != ".." {
+                    entries.try_push(e)?;
                 }
-
-                let start_cluster =
-                    (u32::from(dirent.first_cluster_hi) << 16) | u32::from(dirent.first_cluster_lo);
-
-                // Build short_name array from name (8 bytes) + ext (3 bytes)
-                let mut short_name = [b' '; 11];
-                short_name[0..8].copy_from_slice(&dirent.name);
-                short_name[8..11].copy_from_slice(&dirent.ext);
-
-                entries.try_push(ParsedDirEntry {
-                    name,
-                    short_name,
-                    attr,
-                    start_cluster,
-                    file_size: dirent.file_size,
-                    slot: (ci * entries_per_cluster + i) as u64,
-                    times: EntryTimes::of(&dirent),
-                })?;
             }
         }
-    }
-
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(entries.into_vec())
 }
 
@@ -1712,108 +1756,77 @@ fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
     entries
 }
 
-/// Find consecutive free directory entry slots
-///
-/// Returns (cluster, index) of the first slot. Slots may span multiple clusters.
-/// If not enough space exists, may extend the directory by allocating new clusters.
+/// The disk offsets of `n` consecutive free slots of the directory at
+/// `dir_cluster` (Linux fat_add_entries: free slots found by
+/// fat_get_entry, else the free slots at its end and new clusters,
+/// fat_add_new_entries), in directory order. New clusters
+/// come zeroed (`allocate_cluster`): their slots are all free and the
+/// first ends the directory.
 fn find_free_dir_slots(
     sb_data: &VfatSbData,
     dir_cluster: u32,
-    num_slots: usize,
-) -> Result<(u32, usize), KernelError> {
-    let chain = read_cluster_chain(sb_data, dir_cluster)?;
-    let entries_per_cluster = sb_data.cluster_size as usize / 32;
-
-    let mut consecutive_free = 0;
-    let mut first_free_cluster = 0u32;
-    let mut first_free_index = 0usize;
-
-    for (chain_idx, &cluster) in chain.iter().enumerate() {
-        let cluster_offset = cluster_to_offset(sb_data, cluster);
-
-        for i in 0..entries_per_cluster {
-            let entry_offset = cluster_offset + (i as u64 * 32);
-            let mut buf = [0u8; 1];
-            read_bytes(&sb_data.bdev, entry_offset, &mut buf)?;
-
-            let is_free = buf[0] == END_MARKER || buf[0] == DELETED_MARKER;
-
-            if is_free {
-                if consecutive_free == 0 {
-                    first_free_cluster = cluster;
-                    first_free_index = chain_idx * entries_per_cluster + i;
-                }
-                consecutive_free += 1;
-
-                if consecutive_free >= num_slots {
-                    return Ok((first_free_cluster, first_free_index));
-                }
-            } else {
-                consecutive_free = 0;
-            }
+    n: usize,
+) -> Result<Vec<u64>, KernelError> {
+    let mut run = Vec::new();
+    run.try_reserve(n).map_err(|_| KernelError::OutOfMemory)?;
+    let mut last = dir_cluster;
+    let per = u64::from(sb_data.cluster_size) / 32;
+    let found = dir_walk(sb_data, dir_cluster, |s| {
+        if s.idx % per == 0 {
+            last = cluster_of(sb_data, s.off);
         }
+        if s.b[0] == END_MARKER || s.b[0] == DELETED_MARKER {
+            run.push(s.off);
+            if run.len() == n {
+                return Ok(ControlFlow::Break(()));
+            }
+        } else {
+            run.clear();
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    if found.is_some() {
+        return Ok(run);
     }
-
-    // Not enough space - extend directory by allocating new cluster
-    let last_cluster = *chain.last().unwrap_or(&dir_cluster);
-    let new_cluster = extend_cluster_chain(sb_data, last_cluster, 1)?;
-
-    if new_cluster != 0 {
-        // Initialize new cluster with end markers
-        let mut end_markers = crate::util::kmem::try_vec(sb_data.cluster_size as usize, 0u8)?;
-        // First byte of first entry should be END_MARKER (rest are zeros which is fine)
-        end_markers[0] = END_MARKER;
-        let new_cluster_offset = cluster_to_offset(sb_data, new_cluster);
-        write_bytes(&sb_data.bdev, new_cluster_offset, &end_markers)?;
-
-        let new_index = chain.len() * entries_per_cluster;
-        return Ok((new_cluster, new_index));
+    // Not enough room: the free run reaching the directory's end (its
+    // end-of-directory slots among them, which must not stay before
+    // the entry) continues into new clusters, only the slots still
+    // needed allocated (Linux fat_add_entries: fat_add_new_entries)
+    let more = (n - run.len()).div_ceil(per as usize);
+    let mut c = extend_cluster_chain(sb_data, last, more)?;
+    for k in 0..more {
+        if k > 0 {
+            c = get_fat_entry(sb_data, c)?;
+        }
+        let base = cluster_to_offset(sb_data, c);
+        let take = (n - run.len()).min(per as usize);
+        run.extend((0..take as u64).map(|i| base + i * 32));
     }
-
-    Err(KernelError::NoSpace)
+    Ok(run)
 }
 
-/// Write a directory entry (raw 32-byte entry) at a specific position
-fn write_raw_dir_entry(
-    sb_data: &VfatSbData,
-    dir_cluster: u32,
-    entry_index: usize,
-    entry_bytes: &[u8; 32],
-) -> Result<(), KernelError> {
-    let chain = read_cluster_chain(sb_data, dir_cluster)?;
-    let entries_per_cluster = sb_data.cluster_size as usize / 32;
-
-    let cluster_idx = entry_index / entries_per_cluster;
-    let index_in_cluster = entry_index % entries_per_cluster;
-
-    if cluster_idx >= chain.len() {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    let cluster = chain[cluster_idx];
-    let cluster_offset = cluster_to_offset(sb_data, cluster);
-    let entry_offset = cluster_offset + (index_in_cluster as u64 * 32);
-
-    write_bytes(&sb_data.bdev, entry_offset, entry_bytes)
+/// The cluster holding disk offset `off` of the data region
+fn cluster_of(sb_data: &VfatSbData, off: u64) -> u32 {
+    let data = sb_data.data_start_sector * u64::from(sb_data.bytes_per_sector);
+    ((off - data) / u64::from(sb_data.cluster_size)) as u32 + 2
 }
 
-/// Create a new directory entry with LFN support
-///
-/// Creates the LFN entries followed by the short entry.
-/// Returns the short name (8.3 format) that was generated.
+/// Create a new directory entry with LFN support, its long-name entries
+/// (if the name is not its own 8.3 form) followed by the short entry,
+/// in the directory at `parent_cluster` whose entries are `existing`.
+/// Returns the short name and the disk offsets of the slots written,
+/// the short entry's (its i_pos) last.
 fn create_dir_entry_with_lfn(
     sb_data: &VfatSbData,
     parent_cluster: u32,
+    existing: &[ParsedDirEntry],
     name: &str,
     attributes: u8,
-    start_cluster: u32,
-    file_size: u32,
+    (start_cluster, file_size): (u32, u32),
     times: &EntryTimes,
-) -> Result<([u8; 11], u64), KernelError> {
-    // Get existing short names to avoid collisions
-    let existing_entries = read_directory_entries(sb_data, parent_cluster)?;
-    let existing_short_names: Vec<[u8; 11]> =
-        existing_entries.iter().map(|e| e.short_name).collect();
+) -> Result<([u8; 11], Vec<u64>), KernelError> {
+    // Existing short names, to avoid collisions
+    let existing_short_names: Vec<[u8; 11]> = existing.iter().map(|e| e.short_name).collect();
 
     // Generate short name
     let short_name =
@@ -1834,52 +1847,23 @@ fn create_dir_entry_with_lfn(
         Vec::new()
     };
 
-    let total_slots = lfn_entries.len() + 1; // LFN entries + 1 short entry
+    // The LFN entries and the short one
+    let offs = find_free_dir_slots(sb_data, parent_cluster, lfn_entries.len() + 1)?;
 
-    // Find space
-    let (_first_cluster, first_index) = find_free_dir_slots(sb_data, parent_cluster, total_slots)?;
-
-    // Write LFN entries (they come first on disk, in reverse sequence order)
-    for (i, lfn) in lfn_entries.iter().enumerate() {
-        let entry_index = first_index + i;
-        let mut entry_bytes = [0u8; 32];
-
-        // The entry's on-disk bytes (packed, little-endian: its layout)
-        entry_bytes.copy_from_slice(lfn.as_bytes());
-
-        write_raw_dir_entry(sb_data, parent_cluster, entry_index, &entry_bytes)?;
+    // LFN entries first on disk, in reverse sequence order (the entry's
+    // on-disk bytes: packed, little-endian, its layout)
+    for (lfn, &off) in lfn_entries.iter().zip(&offs) {
+        write_bytes(&sb_data.bdev, off, lfn.as_bytes())?;
     }
 
-    // Write short entry
-    let short_entry_index = first_index + lfn_entries.len();
     let mut short_bytes = [0u8; 32];
-
-    // Name (8 bytes) + Extension (3 bytes)
-    short_bytes[0..8].copy_from_slice(&short_name[0..8]);
-    short_bytes[8..11].copy_from_slice(&short_name[8..11]);
-
-    // Attributes
+    short_bytes[0..11].copy_from_slice(&short_name);
     short_bytes[11] = attributes;
-
-    // Reserved, creation time (simplified: all zeros for now)
-    // NT reserved at 12, create time tenth at 13
-    // Create time at 14-15, create date at 16-17
-    // Access date at 18-19
-    // First cluster high at 20-21
-    short_bytes[20..22].copy_from_slice(&((start_cluster >> 16) as u16).to_le_bytes());
-
-    // Write time at 22-23, write date at 24-25
-    // First cluster low at 26-27
-    short_bytes[26..28].copy_from_slice(&(start_cluster as u16).to_le_bytes());
-
-    // File size at 28-31
-    short_bytes[28..32].copy_from_slice(&file_size.to_le_bytes());
+    entry_set_extent(&mut short_bytes, start_cluster, file_size);
     times.put(&mut short_bytes);
-
-    write_raw_dir_entry(sb_data, parent_cluster, short_entry_index, &short_bytes)?;
-
-    let i_pos = slot_offset(sb_data, parent_cluster, short_entry_index as u64)?;
-    Ok((short_name, i_pos))
+    let i_pos = *offs.last().ok_or(KernelError::Io)?;
+    write_bytes(&sb_data.bdev, i_pos, &short_bytes)?;
+    Ok((short_name, offs))
 }
 
 /// Set a raw short entry's first cluster (Linux fat_set_start)
@@ -1894,113 +1878,56 @@ fn entry_set_extent(b: &mut [u8; 32], start: u32, size: u32) {
     b[28..32].copy_from_slice(&size.to_le_bytes());
 }
 
-/// Disk offset of entry slot `slot` of the directory at `parent` (its
-/// i_pos)
-fn slot_offset(sb_data: &VfatSbData, parent: u32, slot: u64) -> Result<u64, KernelError> {
-    let chain = read_cluster_chain(sb_data, parent)?;
+/// The disk offsets of entry `e`'s slots in the directory at `parent`,
+/// its long-name ones first (Linux fat_remove_entries walks back from
+/// the short entry): in the short entry's cluster, below it, unless
+/// they begin in an earlier one
+fn entry_slots(
+    sb_data: &VfatSbData,
+    parent: u32,
+    e: &ParsedDirEntry,
+) -> Result<Vec<u64>, KernelError> {
+    let n = u64::from(e.nr_slots.max(1));
+    let first = e.slot + 1 - n;
+    let mut offs = Vec::new();
+    offs.try_reserve(n as usize)
+        .map_err(|_| KernelError::OutOfMemory)?;
     let per = u64::from(sb_data.cluster_size) / 32;
-    let c = usize::try_from(slot / per)
-        .ok()
-        .and_then(|i| chain.get(i))
-        .ok_or(KernelError::Io)?;
-    Ok(cluster_to_offset(sb_data, *c) + slot % per * 32)
+    if first / per == e.slot / per {
+        offs.extend((0..n).rev().map(|k| e.i_pos - k * 32));
+        return Ok(offs);
+    }
+    // Across clusters: the run's clusters from the chain
+    let chain = read_cluster_chain(sb_data, parent)?;
+    for idx in first..=e.slot {
+        let c = usize::try_from(idx / per)
+            .ok()
+            .and_then(|i| chain.get(i))
+            .ok_or(KernelError::Io)?;
+        offs.push(cluster_to_offset(sb_data, *c) + idx % per * 32);
+    }
+    Ok(offs)
 }
 
-/// Delete a directory entry by marking it as deleted (0xE5)
-fn delete_dir_entry(
-    sb_data: &VfatSbData,
-    parent_cluster: u32,
-    name: &str,
-) -> Result<u32, KernelError> {
-    let chain = read_cluster_chain(sb_data, parent_cluster)?;
-    let entries_per_cluster = sb_data.cluster_size as usize / 32;
-
-    let mut lfn_start: Option<(usize, usize)> = None; // (chain_idx, entry_in_cluster)
-    let mut lfn = Lfn::default();
-
-    // Search for the entry
-    for (chain_idx, &cluster) in chain.iter().enumerate() {
-        let cluster_offset = cluster_to_offset(sb_data, cluster);
-
-        for i in 0..entries_per_cluster {
-            let entry_offset = cluster_offset + (i as u64 * 32);
-            let mut buf = [0u8; 32];
-            read_bytes(&sb_data.bdev, entry_offset, &mut buf)?;
-
-            // End of directory
-            if buf[0] == END_MARKER {
-                return Err(KernelError::NotFound);
-            }
-
-            // Skip already deleted
-            if buf[0] == DELETED_MARKER {
-                lfn_start = None;
-                lfn.clear();
-                continue;
-            }
-
-            // Track and collect LFN entries
-            let attr_byte = buf[11];
-            if (attr_byte & attr::LONG_NAME_MASK) == attr::LONG_NAME {
-                let entry = VfatLfnEntry::read_from(&buf).expect("32-byte entry");
-                if entry.order & 0x40 != 0 {
-                    // Start of LFN sequence
-                    lfn_start = Some((chain_idx, i));
-                }
-                lfn.add(&entry);
-                continue;
-            }
-
-            // Regular entry - check name (both short and long)
-            let dirent = VfatDirEntry::read_from(&buf).expect("32-byte entry");
-            let short_name = short_name_to_string(&dirent.name, &dirent.ext);
-            let long_name = lfn.take_name(&dirent.name, &dirent.ext);
-            let current_lfn_start = lfn_start.take();
-
-            // Check if either short name or long name matches
-            let matches = short_name.eq_ignore_ascii_case(name)
-                || long_name
-                    .as_ref()
-                    .is_some_and(|ln| ln.eq_ignore_ascii_case(name));
-
-            if matches {
-                // Restore lfn_start for deletion
-                let lfn_start = current_lfn_start;
-                // Found it! Get start cluster before deleting
-                let cluster_hi = u32::from(u16::from_le_bytes([buf[20], buf[21]]));
-                let cluster_lo = u32::from(u16::from_le_bytes([buf[26], buf[27]]));
-                let start_cluster_to_free = (cluster_hi << 16) | cluster_lo;
-
-                // Delete LFN entries if any
-                if let Some((lfn_chain_idx, lfn_entry_idx)) = lfn_start {
-                    let lfn_global_idx = lfn_chain_idx * entries_per_cluster + lfn_entry_idx;
-                    let current_global_idx = chain_idx * entries_per_cluster + i;
-
-                    for idx in lfn_global_idx..current_global_idx {
-                        let c_idx = idx / entries_per_cluster;
-                        let e_idx = idx % entries_per_cluster;
-                        let c = chain[c_idx];
-                        let off = cluster_to_offset(sb_data, c) + (e_idx as u64 * 32);
-
-                        let mut del_buf = [0u8; 32];
-                        read_bytes(&sb_data.bdev, off, &mut del_buf)?;
-                        del_buf[0] = DELETED_MARKER;
-                        write_bytes(&sb_data.bdev, off, &del_buf)?;
-                    }
-                }
-
-                // Delete the short entry
-                buf[0] = DELETED_MARKER;
-                write_bytes(&sb_data.bdev, entry_offset, &buf)?;
-
-                return Ok(start_cluster_to_free);
-            }
-
-            lfn_start = None;
-        }
+/// Mark the slots at disk offsets `offs` deleted (0xE5)
+fn mark_deleted(sb_data: &VfatSbData, offs: &[u64]) -> Result<(), KernelError> {
+    for &off in offs {
+        let mut b = [0u8; 32];
+        read_bytes(&sb_data.bdev, off, &mut b)?;
+        b[0] = DELETED_MARKER;
+        write_bytes(&sb_data.bdev, off, &b)?;
     }
+    Ok(())
+}
 
-    Err(KernelError::NotFound)
+/// Remove entry `e` of the directory at `parent`, its long-name slots
+/// with it (Linux fat_remove_entries)
+fn remove_entries(
+    sb_data: &VfatSbData,
+    parent: u32,
+    e: &ParsedDirEntry,
+) -> Result<(), KernelError> {
+    mark_deleted(sb_data, &entry_slots(sb_data, parent, e)?)
 }
 
 // ============================================================================
@@ -2153,15 +2080,16 @@ impl InodeOps for VfatInodeOps {
         // Linux vfat_create: the entry's times all now (vfat_add_entry)
         let ts = crate::time::TIMEKEEPER.current_time();
         let et = EntryTimes::at(sb_data.opts.tz(), ts);
-        let (short_name, i_pos) = create_dir_entry_with_lfn(
+        let (short_name, offs) = create_dir_entry_with_lfn(
             &sb_data,
             parent_cluster,
+            &entries,
             name,
             attr::ARCHIVE,
-            start_cluster,
-            file_size,
+            (start_cluster, file_size),
             &et,
         )?;
+        let i_pos = *offs.last().ok_or(KernelError::Io)?;
         // Linux vfat_create: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail: a negative
         // dentry of the name is stale from here on
@@ -2260,15 +2188,17 @@ impl InodeOps for VfatInodeOps {
         write_bytes(&sb_data.bdev, cluster_offset + 32, &dotdot_entry)?;
 
         // Create entry in parent (function returns the generated short name)
-        let (short_name, i_pos) = create_dir_entry_with_lfn(
+        let (short_name, offs) = create_dir_entry_with_lfn(
             &sb_data,
             parent_cluster,
+            &entries,
             name,
             attr::DIRECTORY,
-            new_cluster,
-            0, // Directories have size 0 in FAT
+            // Directories have size 0 in FAT
+            (new_cluster, 0),
             &et,
         )?;
+        let i_pos = *offs.last().ok_or(KernelError::Io)?;
         // Linux vfat_mkdir: inode_inc_iversion(dir) right after
         // vfat_add_entry, before anything that can fail
         dir.inc_iversion();
@@ -2334,16 +2264,10 @@ impl InodeOps for VfatInodeOps {
 
         // Delete the directory entry; its clusters go now, or with the
         // last reference to its inode (Linux fat_unlink + fat_evict_inode)
-        let start_cluster = delete_dir_entry(&sb_data, dir_inode_data.start_cluster, name)?;
+        remove_entries(&sb_data, dir_inode_data.start_cluster, entry)?;
         // Linux fat_remove_entries: inode_inc_iversion(dir)
         dir.inc_iversion();
-        drop_link(
-            &sb,
-            &sb_data,
-            dir_inode_data.start_cluster,
-            entry,
-            start_cluster,
-        )?;
+        drop_link(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
         // The dentry the VFS makes negative next is valid at this
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
@@ -2388,7 +2312,7 @@ impl InodeOps for VfatInodeOps {
         }
 
         // Delete the directory entry (clusters as for unlink)
-        let start_cluster = delete_dir_entry(&sb_data, dir_inode_data.start_cluster, name)?;
+        remove_entries(&sb_data, dir_inode_data.start_cluster, entry)?;
         // Linux fat_remove_entries: inode_inc_iversion(dir)
         dir.inc_iversion();
         // Linux vfat_rmdir: the parent loses the ".." link
@@ -2400,13 +2324,7 @@ impl InodeOps for VfatInodeOps {
                 dir.get_nlink()
             );
         }
-        drop_link(
-            &sb,
-            &sb_data,
-            dir_inode_data.start_cluster,
-            entry,
-            start_cluster,
-        )?;
+        drop_link(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
         // The dentry the VFS makes negative next is valid at this
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
@@ -2531,7 +2449,7 @@ impl InodeOps for VfatInodeOps {
             .ok_or(KernelError::NotFound)?
             .clone();
         let old_inode = cached(&sb, op, &old_entry.short_name);
-        let old_ipos = slot_offset(&sb_data, op, old_entry.slot)?;
+        let old_ipos = old_entry.i_pos;
         // A directory moved to another one: its ".." entry
         // (vfat_get_dotdot_de)
         let is_dir = old_entry.is_dir();
@@ -2548,6 +2466,8 @@ impl InodeOps for VfatInodeOps {
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(new_name));
         let mut new_inode = None;
+        // The slots an added entry took
+        let mut added = Vec::new();
         let (new_short, new_ipos) = match existing {
             Some(t) => {
                 // A file over a directory or the reverse never gets here:
@@ -2560,7 +2480,7 @@ impl InodeOps for VfatInodeOps {
                 if let Some(i) = &new_inode {
                     fat_detach(i, &sb_data);
                 }
-                (t.short_name, slot_offset(&sb_data, np, t.slot)?)
+                (t.short_name, t.i_pos)
             }
             None => {
                 let a = if is_dir {
@@ -2569,11 +2489,20 @@ impl InodeOps for VfatInodeOps {
                     attr::ARCHIVE
                 };
                 let et = EntryTimes::at(sb_data.opts.tz(), ts);
-                let made = create_dir_entry_with_lfn(&sb_data, np, new_name, a, 0, 0, &et)?;
+                let made = create_dir_entry_with_lfn(
+                    &sb_data,
+                    np,
+                    &new_entries,
+                    new_name,
+                    a,
+                    (0, 0),
+                    &et,
+                )?;
+                added = made.1;
                 // vfat_add_entry: the new directory's mtime and ctime
                 fat_truncate_time(new_dir, Some(ts), false, true);
                 let _ = write_inode_sb(new_dir, &sb_data);
-                made
+                (made.0, *added.last().ok_or(KernelError::Io)?)
             }
         };
         new_dir.inc_iversion();
@@ -2584,7 +2513,7 @@ impl InodeOps for VfatInodeOps {
         let unwind = Unwind {
             sb_data: &sb_data,
             new_dir: np,
-            new_name,
+            added: &added,
             old: (&old_inode, op, old_entry.short_name, old_ipos),
             target: existing.map(|t| (&new_inode, t)),
             new_ipos,
@@ -2617,7 +2546,7 @@ impl InodeOps for VfatInodeOps {
         }
         // fat_remove_entries(old_dir) and its inode_inc_iversion, then
         // vfat_update_dir_metadata's
-        if let Err(e) = delete_dir_entry(&sb_data, op, old_name) {
+        if let Err(e) = remove_entries(&sb_data, op, &old_entry) {
             unwind.dotdot(dotdot, op);
             return Err(e);
         }
@@ -2740,7 +2669,8 @@ fn write_entry(
 struct Unwind<'a> {
     sb_data: &'a VfatSbData,
     new_dir: u32,
-    new_name: &'a str,
+    /// The slots of the entry rename added (none if it reused one)
+    added: &'a [u64],
     /// The moved object's inode, its old directory, entry and i_pos
     old: (&'a Option<InodeRef>, u32, [u8; 11], u64),
     /// The replaced object: its inode and entry
@@ -2788,7 +2718,7 @@ impl Unwind<'_> {
                 }
             }
             None => {
-                let r = delete_dir_entry(self.sb_data, self.new_dir, self.new_name);
+                let r = mark_deleted(self.sb_data, self.added);
                 failed |= corrupt.is_some() && r.is_err();
             }
         }
@@ -2858,15 +2788,14 @@ fn drop_link(
     sb_data: &VfatSbData,
     parent: u32,
     entry: &ParsedDirEntry,
-    start_cluster: u32,
 ) -> Result<(), KernelError> {
     if let Some(inode) = cached(sb, parent, &entry.short_name) {
         inode.nlink.store(0, core::sync::atomic::Ordering::Release);
         fat_detach(&inode, sb_data);
         return Ok(());
     }
-    if start_cluster != 0 {
-        free_cluster_chain(sb_data, start_cluster)?;
+    if entry.start_cluster != 0 {
+        free_cluster_chain(sb_data, entry.start_cluster)?;
     }
     Ok(())
 }
@@ -2923,10 +2852,9 @@ fn create_inode_for_entry(
         .store(nlink, core::sync::atomic::Ordering::Relaxed);
 
     let crtime = fill_times(&inode, o.tz(), &entry.times);
-    let i_pos = slot_offset(&sb_data, parent_cluster, entry.slot)?;
     inode.set_private(new_private(VfatInodeData {
         crtime,
-        i_pos,
+        i_pos: entry.i_pos,
         start_cluster: entry.start_cluster,
         file_size: entry.file_size,
         is_dir: entry.is_dir(),

@@ -17,6 +17,10 @@
 //! - VFAT_ATIME_RO: after a read-only remount a read updates no atime
 //!   (Linux touch_atime: mnt_get_write_access refused) and still reads;
 //!   the atime on disk is the one before
+//! - VFAT_DIR_GROW: a long name whose slots do not fit in a full
+//!   directory's free slots at its end starts there and goes on into a
+//!   new cluster (Linux fat_add_entries): after a remount it is found,
+//!   with no end-of-directory slot before it
 //! - VFAT_BAD_DIR: a directory whose "." and ".." are gone on disk is
 //!   EIO (Linux fat_validate_dir: fewer than 2 subdirectory entries),
 //!   and on hk its cluster stays allocated. Linux frees it: the refused
@@ -166,6 +170,7 @@ pub fn run_tests() {
     nlink(dev);
     times(dev);
     atime_ro(dev);
+    dir_grow(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -485,5 +490,78 @@ fn atime_ro(dev: &[u8]) {
     t.eq(b"mount again", mount(dev), 0);
     t.eq(b"atime on disk", stimes(r)[0].0, OLD);
     sys_unlink(r.as_ptr());
+    t.done();
+}
+
+/// `/tmp/vdk/GD/F<n>` (8.3 upper case: one slot on Linux and hk)
+fn grow_path(n: u64, out: &mut [u8; 32]) -> &[u8] {
+    let pre = b"/tmp/vdk/GD/F";
+    out[..pre.len()].copy_from_slice(pre);
+    let mut i = pre.len();
+    let mut digits = [0u8; 20];
+    let (mut k, mut v) = (0, n);
+    loop {
+        digits[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 {
+        k -= 1;
+        out[i] = digits[k];
+        i += 1;
+    }
+    out[i] = 0;
+    &out[..=i]
+}
+
+/// VFAT_DIR_GROW: GD's first cluster filled but for 2 slots, then a
+/// name of 3 slots (2 long-name ones and its short entry)
+fn dir_grow(dev: &[u8]) {
+    let mut t = T::new(b"VFAT_DIR_GROW");
+    let gd = b"/tmp/vdk/GD\0";
+    let long = b"/tmp/vdk/GD/a long name entry here.txt\0";
+    let per = Fat::open(dev).map_or(0, |f| f.spc * f.bps / 32);
+    if !t.ok(b"geometry", per >= 8, per as i64) {
+        t.done();
+        return;
+    }
+    t.eq(b"mkdir", sys_mkdir(gd.as_ptr(), 0o755), 0);
+    // "." and ".." take two slots; leave two free at the end
+    let files = per - 4;
+    let mut path = [0u8; 32];
+    for n in 0..files {
+        let fd = sys_open(grow_path(n, &mut path).as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        if fd < 0 {
+            t.ok(b"create", false, fd);
+            break;
+        }
+        sys_close(fd as u64);
+    }
+    let fd = sys_open(long.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create long", fd >= 0, fd);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"remount", mount(dev), 0);
+    t.eq(
+        b"long found",
+        sys_stat(long.as_ptr(), &mut Stat::default()),
+        0,
+    );
+    let last = grow_path(files - 1, &mut path);
+    t.eq(
+        b"last short",
+        sys_stat(last.as_ptr(), &mut Stat::default()),
+        0,
+    );
+    sys_unlink(long.as_ptr());
+    for n in 0..files {
+        sys_unlink(grow_path(n, &mut path).as_ptr());
+    }
+    t.eq(b"rmdir", sys_rmdir(gd.as_ptr()), 0);
     t.done();
 }
