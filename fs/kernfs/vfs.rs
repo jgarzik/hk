@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::{ATTR_MAX, AttrNode, BinAttr, KNode, Kind, SysBuf};
 use crate::fs::KernelError;
 use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, generic_llseek};
-use crate::fs::inode::{AsAny, FileType, Inode, InodeAttr, InodeData, InodeMode, InodeOps};
+use crate::fs::inode::{AsAny, FileType, Found, Inode, InodeAttr, InodeData, InodeMode, InodeOps};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::SuperBlock;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLPRI, PollTable};
@@ -117,13 +117,35 @@ impl InodeOps for KernfsIops {
     }
 
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+        self.lookup_neg(dir, name)?
+            .inode
+            .ok_or(KernelError::NotFound)
+    }
+
+    /// Linux kernfs_iop_lookup: the node and the directory's revision
+    /// read together, the new dentry (negative for no node) stamped
+    /// with it (kernfs_set_rev); a node being removed is invisible and
+    /// its negative entry stamped with nothing (always stale)
+    fn lookup_neg(&self, dir: &Inode, name: &[u8]) -> Result<Found, KernelError> {
         let d = knode(dir).ok_or(KernelError::Io)?;
-        let kn = d.find_ns(name, sb_ns(dir)).ok_or(KernelError::NotFound)?;
+        let (kn, rev) = d.find_rev(name, sb_ns(dir));
+        let Some(kn) = kn else {
+            return Ok(Found {
+                inode: None,
+                d_time: rev,
+            });
+        };
         if kn.removed() {
-            return Err(KernelError::NotFound);
+            return Ok(Found {
+                inode: None,
+                d_time: 0,
+            });
         }
         let sb = dir.superblock().ok_or(KernelError::Io)?;
-        inode(&sb, &kn)
+        Ok(Found {
+            inode: Some(inode(&sb, &kn)?),
+            d_time: rev,
+        })
     }
 
     /// Linux kernfs_iop_setattr: the node keeps the attributes, so an
@@ -173,19 +195,35 @@ pub static KERNFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::Dentry
 };
 
 /// Linux kernfs_dop_revalidate: ECHILD in an RCU walk; a negative
-/// dentry is looked up again (Linux keeps one while its directory's
-/// revision stands: hk caches no kernfs negative entry); a removed
-/// node's dentry is stale (the node is the inode data)
+/// dentry is valid while its directory's revision is the one its
+/// lookup saw (kernfs_dir_changed); a positive one while its node is
+/// active, still the child of `dir`'s node, by the dentry's name (the
+/// node is the inode data; a node's name and namespace never change
+/// here: no kernfs_rename)
 fn kernfs_revalidate(
-    _: &Inode,
-    _: &crate::fs::dentry::Dentry,
+    dir: &Inode,
+    d: &crate::fs::dentry::Dentry,
     inode: Option<&Inode>,
     flags: crate::fs::dentry::LookupBits,
 ) -> Result<bool, KernelError> {
     if flags.contains(crate::fs::dentry::LookupBits::RCU) {
         return Err(KernelError::NoChild);
     }
-    Ok(inode.and_then(knode).is_some_and(|kn| !kn.removed()))
+    let parent = knode(dir);
+    let Some(inode) = inode else {
+        return Ok(parent.is_none_or(|p| p.rev() == d.d_time()));
+    };
+    let Some(kn) = knode(inode) else {
+        return Ok(false);
+    };
+    if kn.removed() {
+        return Ok(false);
+    }
+    let same_parent = match (kn.parent(), parent) {
+        (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+        (a, b) => a.is_none() && b.is_none(),
+    };
+    Ok(same_parent && *d.name() == *kn.name_bytes())
 }
 
 /// show() output of an open file and where the last read ended (Linux

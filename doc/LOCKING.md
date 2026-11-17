@@ -3131,7 +3131,14 @@ is stamped (`Dentry.d_time`, a plain atomic) before it is hashed with
 what its d_revalidate compares, read under the lock the lookup holds:
 vfat's directory version (`Inode.i_version`, Linux i_version: bumped
 by an entry's add or removal under the directory's i_rwsem held for
-writing; the lookup holds it shared). Asked by an RCU walk (`LookupBits::RCU`,
+writing; the lookup holds it shared); kernfs's directory revision
+(`KNode.rev`, Linux dir.rev: bumped as a child is linked or unlinked
+under KERNFS_RWSEM write and the directory's `children` lock held for
+writing; the lookup reads it with the find under that lock held for
+reading); cgroupfs's (`Cgroup.rev`: bumped under the `children` or
+`subsys` lock held for writing as a child or a controller's files come
+or go; the lookup reads it, Acquire, before it looks, so a change after
+the read leaves the stamp stale). Asked by an RCU walk (`LookupBits::RCU`,
 Linux LOOKUP_RCU; and a permission check's MAY_NOT_BLOCK) the dentry,
 directory and inode are borrowed under the guard with no reference and may be
 torn down already: the answer may read only fields with no drop glue

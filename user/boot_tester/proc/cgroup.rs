@@ -29,8 +29,10 @@ pub fn run_tests() {
 }
 
 /// CGROUPFS_TWO_MOUNTS: two cgroup2 mounts show the one hierarchy
-/// (Linux cgrp_dfl_root): a name that failed in one is found once the
-/// other makes it, its control files too
+/// (Linux cgrp_dfl_root): a name that failed in one (a negative dentry,
+/// kept while its directory's revision stands: kernfs_iop_lookup,
+/// kernfs_dop_revalidate) is found once the other makes it, its control
+/// files too
 fn two_mounts() {
     let mut t = T::new(b"CGROUPFS_TWO_MOUNTS");
     let (a, b) = (b"/tmp/cga\0", b"/tmp/cgb\0");

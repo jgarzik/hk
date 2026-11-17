@@ -154,7 +154,31 @@ impl InodeData for CgroupfsInodeData {}
 /// Cgroupfs inode operations
 pub struct CgroupfsInodeOps;
 
+/// The cgroup of an inode
+fn cgroup_of(inode: &Inode) -> Option<Arc<Cgroup>> {
+    let p = inode.get_private()?;
+    p.as_any().downcast_ref::<CgroupfsInodeData>()?.cgroup()
+}
+
 impl InodeOps for CgroupfsInodeOps {
+    /// Linux kernfs_iop_lookup (cgroup2 is kernfs there): a missing
+    /// name is a negative dentry stamped with the directory's revision,
+    /// read before the lookup (a change after the read moves it on)
+    fn lookup_neg(&self, dir: &Inode, name: &[u8]) -> Result<crate::fs::inode::Found, KernelError> {
+        let rev = cgroup_of(dir).map_or(0, |c| c.rev());
+        match self.lookup(dir, name) {
+            Ok(i) => Ok(crate::fs::inode::Found {
+                inode: Some(i),
+                d_time: rev,
+            }),
+            Err(KernelError::NotFound) => Ok(crate::fs::inode::Found {
+                inode: None,
+                d_time: rev,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let data = private
@@ -779,19 +803,22 @@ static CGROUPFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOp
 };
 
 /// Linux kernfs_dop_revalidate: ECHILD in an RCU walk; a negative
-/// dentry is looked up again (Linux keeps one while its directory's
-/// revision stands: hk caches no cgroupfs negative entry); a positive
-/// one stays (a removed cgroup's leaves the tree at its rmdir)
+/// dentry is valid while its directory's revision is the one its
+/// lookup saw (kernfs_dir_changed); a positive one stays (a removed
+/// cgroup's leaves the tree at its rmdir)
 fn cgroupfs_revalidate(
-    _: &Inode,
-    _: &Dentry,
+    dir: &Inode,
+    d: &Dentry,
     inode: Option<&Inode>,
     flags: crate::fs::dentry::LookupBits,
 ) -> Result<bool, KernelError> {
     if flags.contains(crate::fs::dentry::LookupBits::RCU) {
         return Err(KernelError::NoChild);
     }
-    Ok(inode.is_some())
+    if inode.is_some() {
+        return Ok(true);
+    }
+    Ok(cgroup_of(dir).is_none_or(|c| c.rev() == d.d_time()))
 }
 
 /// The root directory, the root cgroup's

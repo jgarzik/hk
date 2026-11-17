@@ -212,6 +212,11 @@ pub struct KNode {
     drain: WaitQueue,
     /// What chmod/chown/utimes set (None: the defaults)
     pub iattr: crate::sync::spin::Mutex<Option<Iattr>>,
+    /// A directory's revision (Linux kernfs_node dir.rev): bumped as a
+    /// child is linked or unlinked (kernfs_inc_rev), under
+    /// `KERNFS_RWSEM` write and the children's lock; a negative dentry
+    /// in it is valid while it stands (kernfs_dir_changed)
+    rev: AtomicU64,
 }
 
 /// Linux kernfs_name_hash: positions 0, 1 and i32::MAX are reserved
@@ -263,6 +268,7 @@ impl KNode {
             active: AtomicI32::new(0),
             drain: WaitQueue::new(),
             iattr: crate::sync::spin::Mutex::new(None),
+            rev: AtomicU64::new(0),
         }
     }
 
@@ -329,13 +335,35 @@ impl KNode {
     /// Child `name` as a mount of namespace `ns` sees it: tagged with
     /// `ns`, else untagged
     pub fn find_ns(&self, name: &[u8], ns: u64) -> Option<Arc<KNode>> {
-        let c = self.children()?.read();
+        self.find_rev(name, ns).0
+    }
+
+    /// [`KNode::find_ns`] and this directory's revision, read under the
+    /// same hold of the children's lock (Linux kernfs_iop_lookup's
+    /// kernfs_find_ns and kernfs_set_rev under kernfs_rwsem)
+    pub fn find_rev(&self, name: &[u8], ns: u64) -> (Option<Arc<KNode>>, u64) {
+        let Some(c) = self.children() else {
+            return (None, 0);
+        };
+        let c = c.read();
+        let rev = self.rev();
         if ns != 0
             && let Some(n) = c.get(&key(name, ns))
         {
-            return Some(n.clone());
+            return (Some(n.clone()), rev);
         }
-        c.get(&key(name, 0)).cloned()
+        (c.get(&key(name, 0)).cloned(), rev)
+    }
+
+    /// The directory's revision (Linux dir.rev)
+    pub fn rev(&self) -> u64 {
+        self.rev.load(Ordering::Acquire)
+    }
+
+    /// A child was linked or unlinked (Linux kernfs_inc_rev), under the
+    /// children's lock held for writing
+    fn inc_rev(&self) {
+        self.rev.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Children a mount of namespace `ns` sees, from readdir position
@@ -382,6 +410,8 @@ impl KNode {
         }
         *child.parent.write() = Arc::downgrade(self);
         map.insert(k, child.clone());
+        // Linux kernfs_link_sibling's caller: kernfs_inc_rev(parent)
+        self.inc_rev();
         Ok(child)
     }
 
@@ -506,6 +536,8 @@ impl KNode {
             let mut map = c.write();
             if map.get(&k).is_some_and(|n| Arc::ptr_eq(n, self)) {
                 map.remove(&k);
+                // Linux kernfs_unlink_sibling: kernfs_inc_rev(parent)
+                p.inc_rev();
             }
         }
         *self.parent.write() = Weak::new();

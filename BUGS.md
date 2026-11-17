@@ -678,12 +678,6 @@ waiting).
 
 **Location**: `fs/namei/`
 
-- kernfs/cgroupfs cache no negative dentry at lookup
-  (`InodeOps::lookup_neg` not given); Linux kernfs_iop_lookup does
-  (d_splice_alias(NULL)) and keeps it valid while the directory's
-  revision (kernfs_dir_changed) stands. hk's ref-mode d_revalidate
-  (`kernfs_revalidate`, `cgroupfs_revalidate`) calls a negative one
-  stale every time: same answers, one more lookup.
 - cgroupfs's ref-mode d_revalidate keeps every positive dentry;
   Linux kernfs_dop_revalidate also checks the node is active and still
   that parent's child of that name (a removed cgroup's dentry goes at
