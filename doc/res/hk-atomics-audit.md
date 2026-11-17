@@ -72,5 +72,5 @@ rwlocks, `cpu::LocalWord`) are in place, and `sync::LockedCell` (a cell
 owned by one of many instances of a lock: the timer bases, and the
 run queues' `SchedEntity.rq`). Each atomic field's doc
 comment names its lockless reader and Linux equivalent (rule 7); a field
-"under lock X" with no lockless reader is a bug to fix. Remaining phases
-by blast radius: 3 and 13 (VFS, mm hot paths), then 22.
+"under lock X" with no lockless reader is a bug to fix. Remaining: 3
+(dcache RCU-walk, its own phase).
