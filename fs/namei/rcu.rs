@@ -529,6 +529,28 @@ fn legitimize_links(stack: Stack<'_>, m_seq: u32, puts: &mut Puts) -> Option<Hel
     Some(held)
 }
 
+/// The end of step_into under LOOKUP_RCU, onto `d` (on `mnt`, its
+/// `d_seq` sampled as `seq` when `inode` was read): ECHILD if it moved
+/// since; a negative entry is ENOENT, under LOOKUP_CACHED too (Linux
+/// step_into: -ENOENT whatever nd->flags)
+fn step_on<'g>(
+    mnt: &'g Mount,
+    d: &'g Dentry,
+    inode: Option<&'g Inode>,
+    seq: u32,
+) -> Result<RcuPath<'g>, KernelError> {
+    if d.d_seq_retry(seq) {
+        return Err(ECHILD);
+    }
+    let inode = inode.ok_or(KernelError::NotFound)?;
+    Ok(RcuPath {
+        mnt,
+        dentry: d,
+        inode: Some(inode),
+        seq,
+    })
+}
+
 /// step_into's flags (Linux WALK_TRAILING, WALK_MORE, WALK_NOFOLLOW):
 /// the last component, one more follows, never follow a symlink (".."
 /// lands on a directory)
@@ -850,25 +872,7 @@ impl Nd<'_> {
                 last,
             });
         }
-        if d.d_seq_retry(seq) {
-            return Err(ECHILD);
-        }
-        let Some(inode) = inode else {
-            // A negative entry, cached only by in-memory filesystems,
-            // where Linux keeps none (always_delete_dentry): ENOENT as
-            // Linux's step_into, and under LOOKUP_CACHED a miss there
-            return Err(if f.cached {
-                ECHILD
-            } else {
-                KernelError::NotFound
-            });
-        };
-        *cur = RcuPath {
-            mnt,
-            dentry: d,
-            inode: Some(inode),
-            seq,
-        };
+        *cur = step_on(mnt, d, inode, seq)?;
         Ok(Step::On)
     }
 
@@ -1255,5 +1259,29 @@ mod tests {
         drop(g);
         assert!(puts.path.is_none() && puts.mnt.is_none());
         assert_eq!(DentryRef::count(&a), n);
+    }
+
+    /// A cached negative entry the RCU walk steps onto is ENOENT, under
+    /// LOOKUP_CACHED too (Linux step_into), not ECHILD (EAGAIN); one
+    /// that moved since its sample is ECHILD; a positive one is stood on
+    #[test]
+    fn step_onto_negative_is_enoent() {
+        let m = crate::fs::mount::test_mnt();
+        let n = Dentry::alloc(&m.root, b"neg", None).unwrap();
+        let a = Dentry::alloc(&m.root, b"pos", Some(inode())).unwrap();
+        let g = crate::sync::rcu::read_lock();
+        let seq = n.d_seq_begin();
+        let r = step_on(&m, &n, n.d_inode_rcu(&g), seq);
+        assert_eq!(r.err(), Some(KernelError::NotFound));
+        let seq = a.d_seq_begin();
+        let p = step_on(&m, &a, a.d_inode_rcu(&g), seq).unwrap();
+        assert!(core::ptr::eq(p.dentry, &*a) && p.inode.is_some());
+        drop(g);
+        let t = Dentry::prealloc(&m.root, b"moved").unwrap();
+        d_move(&a, &t);
+        let g = crate::sync::rcu::read_lock();
+        let r = step_on(&m, &a, a.d_inode_rcu(&g), seq);
+        assert_eq!(r.err(), Some(ECHILD));
+        drop(g);
     }
 }
