@@ -17,6 +17,11 @@
 //! - VFAT_ATIME_RO: after a read-only remount a read updates no atime
 //!   (Linux touch_atime: mnt_get_write_access refused) and still reads;
 //!   the atime on disk is the one before
+//! - VFAT_UNLINK_RACE: a file unlinked while another process keeps
+//!   reading it (each read's atime update writes its entry back: Linux
+//!   __fat_write_inode) stays deleted on disk: after a remount none of
+//!   the names is there (Linux fat_remove_entries then fat_detach, the
+//!   entry's write-back rechecking i_pos)
 //! - VFAT_DIR_GROW: a long name whose slots do not fit in a full
 //!   directory's free slots at its end starts there and goes on into a
 //!   new cluster (Linux fat_add_entries): after a remount it is found,
@@ -31,10 +36,12 @@
 use crate::harness::T;
 use crate::helpers::{find_blkdev, host_mode};
 use crate::proc::sysfs::each_entry;
+use core::sync::atomic::{AtomicI32, Ordering};
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, Timespec, UTIME_OMIT, sys_clock_gettime, sys_close,
-    sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_rename, sys_rmdir,
-    sys_stat, sys_umount2, sys_unlink, sys_utimensat, sys_write,
+    MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROT_READ, PROT_WRITE, Stat,
+    Timespec, UTIME_OMIT, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mmap,
+    sys_mount, sys_munmap, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_rename, sys_rmdir,
+    sys_sched_yield, sys_stat, sys_umount2, sys_unlink, sys_utimensat, sys_wait4, sys_write,
 };
 
 const MNT: &[u8] = b"/tmp/vdk\0";
@@ -170,6 +177,7 @@ pub fn run_tests() {
     nlink(dev);
     times(dev);
     atime_ro(dev);
+    unlink_race(dev);
     dir_grow(dev);
     bad_dir(dev);
     sys_umount2(MNT.as_ptr(), 0);
@@ -490,6 +498,117 @@ fn atime_ro(dev: &[u8]) {
     t.eq(b"mount again", mount(dev), 0);
     t.eq(b"atime on disk", stimes(r)[0].0, OLD);
     sys_unlink(r.as_ptr());
+    t.done();
+}
+
+/// Rounds of VFAT_UNLINK_RACE
+const RACE_ROUNDS: i32 = 200;
+
+/// The path of round `n`'s file, /tmp/vdk/U<n>
+fn race_path(n: i32, out: &mut [u8; 24]) -> &[u8] {
+    let pre = b"/tmp/vdk/U";
+    out[..pre.len()].copy_from_slice(pre);
+    let mut i = pre.len();
+    let mut digits = [0u8; 10];
+    let mut k = 0;
+    let mut v = n as u32;
+    loop {
+        digits[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 {
+        k -= 1;
+        out[i] = digits[k];
+        i += 1;
+    }
+    out[i] = 0;
+    &out[..=i]
+}
+
+/// Spin (yielding) until `w` reads `v`
+fn wait_for(w: &AtomicI32, v: i32) {
+    while w.load(Ordering::Acquire) != v {
+        sys_sched_yield();
+    }
+}
+
+/// VFAT_UNLINK_RACE: per round the parent makes U<n>, the child opens
+/// it and reads it in a loop, the parent unlinks it meanwhile
+fn unlink_race(dev: &[u8]) {
+    let mut t = T::new(b"VFAT_UNLINK_RACE");
+    let p = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if !t.ok(b"mmap", p > 0, p) {
+        t.done();
+        return;
+    }
+    // SAFETY: a fresh MAP_SHARED page, unmapped only below
+    // [0]: made; [1]: opened; [2]: unlinked; [3]: closed
+    let sh = unsafe { core::slice::from_raw_parts(p as *const AtomicI32, 4) };
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut path = [0u8; 24];
+        for n in 1..=RACE_ROUNDS {
+            wait_for(&sh[0], n);
+            let fd = sys_open(race_path(n, &mut path).as_ptr(), O_RDONLY, 0);
+            sh[1].store(n, Ordering::Release);
+            let mut b = [0u8; 4];
+            while sh[2].load(Ordering::Acquire) != n {
+                if fd >= 0 {
+                    sys_pread64(fd as i32, b.as_mut_ptr(), 4, 0);
+                }
+            }
+            if fd >= 0 {
+                sys_close(fd as u64);
+            }
+            sh[3].store(n, Ordering::Release);
+        }
+        sys_exit(0);
+    }
+    let mut path = [0u8; 24];
+    for n in 1..=RACE_ROUNDS {
+        let u = race_path(n, &mut path);
+        let fd = sys_open(u.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        if fd >= 0 {
+            sys_write(fd as u64, b"data".as_ptr(), 4);
+            sys_close(fd as u64);
+        }
+        sh[0].store(n, Ordering::Release);
+        wait_for(&sh[1], n);
+        sys_sched_yield();
+        sys_unlink(u.as_ptr());
+        sh[2].store(n, Ordering::Release);
+        wait_for(&sh[3], n);
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    t.eq(b"child", ws as i64, 0);
+    sys_munmap(p as u64, 4096);
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"remount", mount(dev), 0);
+    let mut live = 0;
+    let mut first = 0;
+    for n in 1..=RACE_ROUNDS {
+        let u = race_path(n, &mut path);
+        if sys_stat(u.as_ptr(), &mut Stat::default()) == 0 {
+            live += 1;
+            if first == 0 {
+                first = n;
+            }
+            sys_unlink(u.as_ptr());
+        }
+    }
+    t.ok(b"all deleted", live == 0, i64::from(live * 1000 + first));
     t.done();
 }
 

@@ -567,8 +567,10 @@ pub struct VfatSbData {
     pub fat: Arc<crate::sync::Mutex<FatState>>,
     /// Every inode's entry location (`VfatInodeData.i_pos`) is read to
     /// write the entry, and changed, under it (Linux
-    /// sbi->inode_hash_lock): an attach, a detach, and a write_inode's
-    /// read-patch-write of the entry, which is block I/O here, so it is
+    /// sbi->inode_hash_lock): an attach, a detach, a write_inode's
+    /// read-patch-write of the entry, and every slot written when an
+    /// entry is added or removed (an unlink's detach in the same hold);
+    /// block I/O here, so it is
     /// sleeping and held across the write (Linux patches the buffer
     /// under its spin lock and rechecks i_pos instead)
     pub ipos: Arc<crate::sync::Mutex<()>>,
@@ -1847,21 +1849,24 @@ fn create_dir_entry_with_lfn(
         Vec::new()
     };
 
-    // The LFN entries and the short one
+    // The LFN entries and the short one (any new cluster allocated
+    // before `ipos`, which is never held with the FAT lock)
     let offs = find_free_dir_slots(sb_data, parent_cluster, lfn_entries.len() + 1)?;
-
-    // LFN entries first on disk, in reverse sequence order (the entry's
-    // on-disk bytes: packed, little-endian, its layout)
-    for (lfn, &off) in lfn_entries.iter().zip(&offs) {
-        write_bytes(&sb_data.bdev, off, lfn.as_bytes())?;
-    }
+    let i_pos = *offs.last().ok_or(KernelError::Io)?;
 
     let mut short_bytes = [0u8; 32];
     short_bytes[0..11].copy_from_slice(&short_name);
     short_bytes[11] = attributes;
     entry_set_extent(&mut short_bytes, start_cluster, file_size);
     times.put(&mut short_bytes);
-    let i_pos = *offs.last().ok_or(KernelError::Io)?;
+
+    // Every entry change under the location lock, as write_inode's
+    let _l = sb_data.ipos.lock();
+    // LFN entries first on disk, in reverse sequence order (the entry's
+    // on-disk bytes: packed, little-endian, its layout)
+    for (lfn, &off) in lfn_entries.iter().zip(&offs) {
+        write_bytes(&sb_data.bdev, off, lfn.as_bytes())?;
+    }
     write_bytes(&sb_data.bdev, i_pos, &short_bytes)?;
     Ok((short_name, offs))
 }
@@ -1909,25 +1914,33 @@ fn entry_slots(
     Ok(offs)
 }
 
-/// Mark the slots at disk offsets `offs` deleted (0xE5)
+/// Mark the slots at disk offsets `offs` deleted: their first byte
+/// 0xE5, as Linux sets de->name[0] in the buffer (the short entry's
+/// last). The caller holds `ipos`.
 fn mark_deleted(sb_data: &VfatSbData, offs: &[u64]) -> Result<(), KernelError> {
     for &off in offs {
-        let mut b = [0u8; 32];
-        read_bytes(&sb_data.bdev, off, &mut b)?;
-        b[0] = DELETED_MARKER;
-        write_bytes(&sb_data.bdev, off, &b)?;
+        write_bytes(&sb_data.bdev, off, &[DELETED_MARKER])?;
     }
     Ok(())
 }
 
 /// Remove entry `e` of the directory at `parent`, its long-name slots
-/// with it (Linux fat_remove_entries)
+/// with it (Linux fat_remove_entries), under `ipos`; with `detach`, the
+/// inode leaves the entry (i_pos 0, Linux fat_detach) in the same hold:
+/// no write_inode writes the entry back after its deletion
 fn remove_entries(
     sb_data: &VfatSbData,
     parent: u32,
     e: &ParsedDirEntry,
+    detach: Option<&Inode>,
 ) -> Result<(), KernelError> {
-    mark_deleted(sb_data, &entry_slots(sb_data, parent, e)?)
+    let offs = entry_slots(sb_data, parent, e)?;
+    let _l = sb_data.ipos.lock();
+    mark_deleted(sb_data, &offs)?;
+    if let Some(i) = detach {
+        with_vi(i, |v| v.d.lock().i_pos = 0)?;
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -2263,11 +2276,11 @@ impl InodeOps for VfatInodeOps {
         }
 
         // Delete the directory entry; its clusters go now, or with the
-        // last reference to its inode (Linux fat_unlink + fat_evict_inode)
-        remove_entries(&sb_data, dir_inode_data.start_cluster, entry)?;
+        // last reference to its inode (Linux vfat_unlink: fat_remove_entries,
+        // then fat_detach; fat_evict_inode)
+        unlink_entry(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
         // Linux fat_remove_entries: inode_inc_iversion(dir)
         dir.inc_iversion();
-        drop_link(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
         // The dentry the VFS makes negative next is valid at this
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
@@ -2312,7 +2325,7 @@ impl InodeOps for VfatInodeOps {
         }
 
         // Delete the directory entry (clusters as for unlink)
-        remove_entries(&sb_data, dir_inode_data.start_cluster, entry)?;
+        unlink_entry(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
         // Linux fat_remove_entries: inode_inc_iversion(dir)
         dir.inc_iversion();
         // Linux vfat_rmdir: the parent loses the ".." link
@@ -2324,7 +2337,6 @@ impl InodeOps for VfatInodeOps {
                 dir.get_nlink()
             );
         }
-        drop_link(&sb, &sb_data, dir_inode_data.start_cluster, entry)?;
         // The dentry the VFS makes negative next is valid at this
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
@@ -2546,7 +2558,7 @@ impl InodeOps for VfatInodeOps {
         }
         // fat_remove_entries(old_dir) and its inode_inc_iversion, then
         // vfat_update_dir_metadata's
-        if let Err(e) = remove_entries(&sb_data, op, &old_entry) {
+        if let Err(e) = remove_entries(&sb_data, op, &old_entry, None) {
             unwind.dotdot(dotdot, op);
             return Err(e);
         }
@@ -2718,7 +2730,9 @@ impl Unwind<'_> {
                 }
             }
             None => {
+                let l = self.sb_data.ipos.lock();
                 let r = mark_deleted(self.sb_data, self.added);
+                drop(l);
                 failed |= corrupt.is_some() && r.is_err();
             }
         }
@@ -2777,25 +2791,30 @@ fn vfat_iget(
     )
 }
 
-/// The entry `entry` of the directory at `parent` was removed: its
-/// cached inode becomes unlinked (nlink 0, unhashed) and keeps its
-/// clusters until its last reference goes (`evict_inode`); with no
-/// cached inode they are freed now. An unlinked inode has no directory
-/// entry any more (Linux fat_detach): writes and truncates never update
-/// one (the name may belong to a new file by then).
-fn drop_link(
+/// Remove the entry `entry` of the directory at `parent`: its cached
+/// inode leaves it in the same `ipos` hold (`remove_entries`), then
+/// becomes unlinked (nlink 0, unhashed) and keeps its clusters until
+/// its last reference goes (`evict_inode`); with no cached inode they
+/// are freed now. An unlinked inode has no directory entry any more
+/// (Linux fat_detach): writes and truncates never update one (the slot
+/// may belong to a new file by then).
+fn unlink_entry(
     sb: &Arc<SuperBlock>,
     sb_data: &VfatSbData,
     parent: u32,
     entry: &ParsedDirEntry,
 ) -> Result<(), KernelError> {
-    if let Some(inode) = cached(sb, parent, &entry.short_name) {
-        inode.nlink.store(0, core::sync::atomic::Ordering::Release);
-        fat_detach(&inode, sb_data);
-        return Ok(());
-    }
-    if entry.start_cluster != 0 {
-        free_cluster_chain(sb_data, entry.start_cluster)?;
+    // Looked up before `ipos`: the lookup may wait for an inode being
+    // freed, whose write-back takes it
+    let inode = cached(sb, parent, &entry.short_name);
+    remove_entries(sb_data, parent, entry, inode.as_deref())?;
+    match inode {
+        Some(i) => {
+            i.nlink.store(0, core::sync::atomic::Ordering::Release);
+            icache::remove_inode_hash(&i);
+        }
+        None if entry.start_cluster != 0 => free_cluster_chain(sb_data, entry.start_cluster)?,
+        None => {}
     }
     Ok(())
 }
