@@ -256,7 +256,10 @@ pub unsafe fn save_for_clone_child(regs: u64) -> u64 {
 /// access_ok), page faults disabled: false at a fault, which the caller
 /// resolves and retries (Linux copy_fpregs_to_sigframe)
 pub fn save_to_user(buf: u64) -> bool {
-    assert!(buf % 64 == 0, "FP signal image not 64-byte aligned");
+    assert!(
+        buf.is_multiple_of(64),
+        "FP signal image not 64-byte aligned"
+    );
     if !crate::uaccess::access_ok(buf, sigframe_size()) {
         return false;
     }
