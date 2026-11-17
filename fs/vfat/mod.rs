@@ -2311,9 +2311,8 @@ impl InodeOps for VfatInodeOps {
         let mut new_inode = None;
         let new_short = match existing {
             Some(t) => {
-                if t.is_dir() != is_dir {
-                    return Err(KernelError::InvalidArgument);
-                }
+                // A file over a directory or the reverse never gets here:
+                // the VFS refused it (may_delete: EISDIR / ENOTDIR)
                 if is_dir {
                     dir_empty(&sb_data, t.start_cluster)?;
                 }

@@ -21,7 +21,8 @@
 //!   (the name then has the moved file's inode and contents, the
 //!   replaced one stays readable through an open descriptor), a
 //!   directory over an empty directory in another directory, ENOTEMPTY
-//!   over a non-empty one; after a remount the names and contents are
+//!   over a non-empty one, EISDIR for a file over a directory and
+//!   ENOTDIR for the reverse; after a remount the names and contents are
 //!   as left.
 
 use crate::harness::T;
@@ -278,6 +279,9 @@ fn rename_over(dev: &[u8]) {
     t.ok(b"tgt/f", holds(TGT_F, b"SUB"), 0);
     let r = sys_rename(TGT.as_ptr(), FULL.as_ptr());
     t.eq(b"over non-empty", r, ENOTEMPTY);
+    // A type mismatch is the VFS's (may_delete), before vfat sees it
+    t.eq(b"file over dir", sys_rename(RB.as_ptr(), TGT.as_ptr()), -21);
+    t.eq(b"dir over file", sys_rename(TGT.as_ptr(), RB.as_ptr()), -20);
     // The disk as left, through a new superblock
     t.eq(b"umount", sys_umount2(DIR.as_ptr(), 0), 0);
     let r = sys_mount(
