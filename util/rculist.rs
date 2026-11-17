@@ -260,7 +260,11 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> RcuList<A, P> {
                 None => e.tail = prev,
             }
         }
-        // INVARIANT: off the list; `next` kept for readers on it
+        // INVARIANT: off the list; `next` kept for readers on it, `prev`
+        // poisoned so writers see it removed at once (Linux list_del_rcu:
+        // LIST_POISON2)
+        // SAFETY: `cur` is unlinked from its neighbours, `ends` held
+        unsafe { (*cur).unhash() };
         e.len -= 1;
         // SAFETY: the pointer the list took with into_raw
         let p = unsafe { P::from_raw(A::item(cur)) };
@@ -630,13 +634,32 @@ mod tests {
         let a = item(7);
         l.push_back(a.clone());
         let gone = l.remove_first(|i| i.v == 7).unwrap();
-        // Still linked for readers until the grace period ends
+        // Still linked for readers until the grace period ends, but
+        // removed for writers at once (the task list's liveness test:
+        // `GlobalTaskTable::view`, `Task::pid_alive`)
         assert!(a.link.is_linked());
+        assert!(!a.link.is_listed());
         drop(gone);
         assert!(!a.link.is_linked());
         assert_eq!(Arc::strong_count(&a), 1);
         l.push_back(a.clone());
         assert_eq!(values(&l), [7]);
+    }
+
+    #[test]
+    fn removed_at_once_by_membership() {
+        let l = RcuList::<ItemLink>::new();
+        let (a, b) = (item(1), item(2));
+        l.push_back(a.clone());
+        l.push_back(b.clone());
+        assert!(a.link.is_listed() && b.link.is_listed());
+        // SAFETY: `a` is on `l`
+        let gone = unsafe { l.remove(&a) };
+        assert!(!a.link.is_listed());
+        assert!(b.link.is_listed());
+        assert_eq!(values(&l), [2]);
+        drop(gone);
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 
     #[test]

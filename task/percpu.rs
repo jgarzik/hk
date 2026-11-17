@@ -883,7 +883,7 @@ impl TaskViewMut<'_> {
     /// listed and not exiting, and the task is listed or joins the list
     /// in this write section (the `Task` invariant)
     pub fn set_tracer(&mut self, p: Option<&Task>) {
-        debug_assert!(p.is_none_or(|p| p.tasks_link.is_linked()));
+        debug_assert!(p.is_none_or(|p| p.tasks_link.is_listed()));
         // INVARIANT: the callers', under the write lock
         self.task
             .ptracer
@@ -935,14 +935,14 @@ impl GlobalTaskTable {
         // `tasks_link` is on this list only, linked and unlinked under
         // the write lock (`insert`, `remove_task`): read under the lock
         // the borrow of `self` holds
-        t.tasks_link.is_linked().then(|| view(self, t))
+        t.tasks_link.is_listed().then(|| view(self, t))
     }
 
     /// Task `t`, writable; None once it is reaped
     pub fn view_mut<'a>(&'a mut self, t: &'a Task) -> Option<TaskViewMut<'a>> {
         let me = &*self;
         // SAFETY: `me` comes from `&mut self`; one view is handed out
-        t.tasks_link.is_linked().then(|| unsafe { view_mut(me, t) })
+        t.tasks_link.is_listed().then(|| unsafe { view_mut(me, t) })
     }
 
     /// A reference to task `tid`

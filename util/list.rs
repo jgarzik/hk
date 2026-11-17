@@ -66,6 +66,14 @@ impl Link {
         self.next.load(Relaxed) != UNLINKED
     }
 
+    /// On an RCU list and not removed from it (Linux: list_del_rcu
+    /// poisons `prev` at once, keeping `next` for readers): false from
+    /// the removal on, not only once the link is free again a grace
+    /// period later (read under the list's writers' lock)
+    pub fn is_listed(&self) -> bool {
+        self.is_linked() && self.prev.load(Relaxed) != UNLINKED
+    }
+
     /// Claim an unlinked link for an insert: false if it is on a list or
     /// being inserted (two lists under different locks cannot both win)
     pub(super) fn claim(&self) -> bool {

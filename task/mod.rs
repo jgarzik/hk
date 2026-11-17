@@ -1786,7 +1786,7 @@ impl Task {
     /// with no lock, so only a hint once it returns unless TASKLIST is
     /// held
     pub fn pid_alive(&self) -> bool {
-        self.tasks_link.is_linked()
+        self.tasks_link.is_listed()
     }
 
     /// Its real parent, none once it has left the task list (Linux
@@ -1794,7 +1794,7 @@ impl Task {
     /// taken: the parent stays allocated while `g` is held
     pub fn parent<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> Option<&'a Task> {
         let _ = g;
-        if !self.tasks_link.is_linked() {
+        if !self.tasks_link.is_listed() {
             return None;
         }
         // SAFETY: it was listed within `g`'s section, so its parent at
@@ -1809,7 +1809,7 @@ impl Task {
     /// tasklist_lock); none once it has left the task list
     pub fn parent_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
         let _ = table;
-        if !self.tasks_link.is_linked() {
+        if !self.tasks_link.is_listed() {
             return None;
         }
         // SAFETY: listed, and `table` borrowed for 'a keeps it so: its
@@ -1823,7 +1823,7 @@ impl Task {
     /// listed (the type invariant)
     pub fn set_parent(&self, p: Option<&Task>, table: &mut percpu::GlobalTaskTable) {
         let _ = table;
-        debug_assert!(p.is_none_or(|p| p.tasks_link.is_linked()));
+        debug_assert!(p.is_none_or(|p| p.tasks_link.is_listed()));
         // INVARIANT: `p` is listed (the callers'), under the write lock
         self.real_parent
             .set(p.map_or(core::ptr::null(), core::ptr::from_ref));
@@ -1839,7 +1839,7 @@ impl Task {
     /// reference taken: the tracer stays allocated while `g` is held
     pub fn tracer<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> Option<&'a Task> {
         let _ = g;
-        if !self.tasks_link.is_linked() {
+        if !self.tasks_link.is_listed() {
             return None;
         }
         // SAFETY: it was listed within `g`'s section, so its tracer at
@@ -1855,7 +1855,7 @@ impl Task {
     /// under tasklist_lock); none if not traced or no longer listed
     pub fn tracer_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
         let _ = table;
-        if !self.tasks_link.is_linked() {
+        if !self.tasks_link.is_listed() {
             return None;
         }
         // SAFETY: listed, and `table` borrowed for 'a keeps it so and
