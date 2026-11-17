@@ -2937,6 +2937,21 @@ the FAT is read and written through the device under it (page locks,
 block I/O), a claimed cluster zeroed after it is released; never held
 with `VfatInode.cache` or `VfatInode.d`.
 
+**vfat entry location lock** (`fs/vfat/mod.rs`, Linux
+sbi->inode_hash_lock over i_pos): `VfatSbData.ipos` (sleeping
+`sync::Mutex<()>`), one per filesystem, thread context only (never in
+IRQ context). Every inode's `VfatInodeData.i_pos` (its short entry's
+disk offset, 0 for none) changes under it (`attach`, Linux fat_attach;
+`fat_detach`, i_pos 0 before rename reuses a replaced object's slot
+and when unlink/rmdir removes an entry), and an entry is read,
+patched and written under it (`write_inode_sb`, Linux
+__fat_write_inode; rename's `write_entry`), so a write never lands on
+a slot its inode no longer owns. Linux patches the cached buffer under
+its spin lock and rechecks i_pos; here the patch is block I/O, so the
+lock sleeps and is held across it. Order: directory and inode
+`i_rwsem` -> `ipos` -> `VfatInode.d` (spin leaf), the device's page
+cache and I/O; never with `VfatSbData.fat`.
+
 **vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
 `VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in
 thread context only, never held with `VfatInode.d` and never across

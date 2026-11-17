@@ -176,23 +176,13 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
     }
     let first = extend_cluster_chain(sb_data, last, need - have)?;
     if d.start_cluster == 0 && first != 0 {
-        if d.parent_cluster != 0 && inode.get_nlink() != 0 {
-            update_dir_entry_by_short_name(
-                sb_data,
-                d.parent_cluster,
-                &d.short_name,
-                first,
-                inode.get_size() as u32,
-            )?;
-        }
-        // The clusters are on disk now: the inode follows
-        set_inode_data(
-            inode,
-            VfatInodeData {
-                start_cluster: first,
-                ..d
-            },
-        )?;
+        // The clusters are on disk now: the inode follows, and its entry
+        // (Linux fat_chain_add: mark_inode_dirty)
+        with_vi(inode, |v| {
+            v.d.lock().start_cluster = first;
+            v.cache.lock().set_start(first);
+        })?;
+        write_inode_sb(inode, sb_data)?;
     }
     // Linux fat_chain_add: i_blocks counts them
     with_vi(inode, |v| v.d.lock().clusters = need as u32)
@@ -574,6 +564,13 @@ pub struct VfatSbData {
     /// sbi->fat_lock, lock_fat): sleeping, under the inodes' i_rwsem,
     /// above the device's I/O; shared by every copy of this data
     pub fat: Arc<crate::sync::Mutex<FatState>>,
+    /// Every inode's entry location (`VfatInodeData.i_pos`) is read to
+    /// write the entry, and changed, under it (Linux
+    /// sbi->inode_hash_lock): an attach, a detach, and a write_inode's
+    /// read-patch-write of the entry, which is block I/O here, so it is
+    /// sleeping and held across the write (Linux patches the buffer
+    /// under its spin lock and rechecks i_pos instead)
+    pub ipos: Arc<crate::sync::Mutex<()>>,
 }
 
 impl SuperBlockData for VfatSbData {}
@@ -856,6 +853,9 @@ pub struct VfatInodeData {
     pub clusters: u32,
     /// Creation time (Linux i_crtime), written back with the entry
     pub crtime: Timespec,
+    /// Disk offset of its short entry, 0 for none: the root, or an
+    /// entry gone (Linux i_pos, under `VfatSbData.ipos`)
+    pub i_pos: u64,
 }
 
 /// A vfat inode's `Inode.private`: its data, changed in place (a
@@ -1318,11 +1318,13 @@ fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
 
 /// [`fat_write_inode`] with the superblock's data at hand
 fn write_inode_sb(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
+    // i_pos and the entry it names, unchanged until the write is done
+    let _l = sb_data.ipos.lock();
     let d = get_inode_data(inode)?;
-    if d.parent_cluster == 0 || inode.get_nlink() == 0 {
+    if d.i_pos == 0 {
         return Ok(());
     }
-    let off = entry_offset(sb_data, d.parent_cluster, &d.short_name)?;
+    let off = d.i_pos;
     let mut b = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut b)?;
     let size = if d.is_dir { 0 } else { inode.get_size() as u32 };
@@ -1807,7 +1809,7 @@ fn create_dir_entry_with_lfn(
     start_cluster: u32,
     file_size: u32,
     times: &EntryTimes,
-) -> Result<[u8; 11], KernelError> {
+) -> Result<([u8; 11], u64), KernelError> {
     // Get existing short names to avoid collisions
     let existing_entries = read_directory_entries(sb_data, parent_cluster)?;
     let existing_short_names: Vec<[u8; 11]> =
@@ -1876,7 +1878,8 @@ fn create_dir_entry_with_lfn(
 
     write_raw_dir_entry(sb_data, parent_cluster, short_entry_index, &short_bytes)?;
 
-    Ok(short_name)
+    let i_pos = slot_offset(sb_data, parent_cluster, short_entry_index as u64)?;
+    Ok((short_name, i_pos))
 }
 
 /// Set a raw short entry's first cluster (Linux fat_set_start)
@@ -1891,46 +1894,16 @@ fn entry_set_extent(b: &mut [u8; 32], start: u32, size: u32) {
     b[28..32].copy_from_slice(&size.to_le_bytes());
 }
 
-/// Update directory entry metadata (start_cluster and file_size) by short name
-fn update_dir_entry_by_short_name(
-    sb_data: &VfatSbData,
-    parent_cluster: u32,
-    short_name: &[u8; 11],
-    new_start_cluster: u32,
-    new_size: u32,
-) -> Result<(), KernelError> {
-    let off = entry_offset(sb_data, parent_cluster, short_name)?;
-    let mut buf = [0u8; 32];
-    read_bytes(&sb_data.bdev, off, &mut buf)?;
-    entry_set_extent(&mut buf, new_start_cluster, new_size);
-    write_bytes(&sb_data.bdev, off, &buf)
-}
-
-/// The disk offset of the short entry `short_name` in the directory at
-/// `parent_cluster` (Linux i_pos), ENOENT if it has none
-fn entry_offset(
-    sb_data: &VfatSbData,
-    parent_cluster: u32,
-    short_name: &[u8; 11],
-) -> Result<u64, KernelError> {
-    let chain = read_cluster_chain(sb_data, parent_cluster)?;
-    let entries_per_cluster = sb_data.cluster_size as usize / 32;
-    for &cluster in chain.iter() {
-        let cluster_offset = cluster_to_offset(sb_data, cluster);
-        for i in 0..entries_per_cluster {
-            let entry_offset = cluster_offset + (i as u64 * 32);
-            let mut buf = [0u8; 32];
-            read_bytes(&sb_data.bdev, entry_offset, &mut buf)?;
-            // Free, deleted and long-name entries are not it
-            if buf[0] == END_MARKER || buf[0] == DELETED_MARKER || buf[11] == attr::LONG_NAME {
-                continue;
-            }
-            if &buf[0..11] == short_name {
-                return Ok(entry_offset);
-            }
-        }
-    }
-    Err(KernelError::NotFound)
+/// Disk offset of entry slot `slot` of the directory at `parent` (its
+/// i_pos)
+fn slot_offset(sb_data: &VfatSbData, parent: u32, slot: u64) -> Result<u64, KernelError> {
+    let chain = read_cluster_chain(sb_data, parent)?;
+    let per = u64::from(sb_data.cluster_size) / 32;
+    let c = usize::try_from(slot / per)
+        .ok()
+        .and_then(|i| chain.get(i))
+        .ok_or(KernelError::Io)?;
+    Ok(cluster_to_offset(sb_data, *c) + slot % per * 32)
 }
 
 /// Delete a directory entry by marking it as deleted (0xE5)
@@ -2180,7 +2153,7 @@ impl InodeOps for VfatInodeOps {
         // Linux vfat_create: the entry's times all now (vfat_add_entry)
         let ts = crate::time::TIMEKEEPER.current_time();
         let et = EntryTimes::at(sb_data.opts.tz(), ts);
-        let short_name = create_dir_entry_with_lfn(
+        let (short_name, i_pos) = create_dir_entry_with_lfn(
             &sb_data,
             parent_cluster,
             name,
@@ -2219,6 +2192,7 @@ impl InodeOps for VfatInodeOps {
             mmu_private: 0,
             clusters: 0,
             crtime,
+            i_pos,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         // vfat_add_entry: the directory's mtime and ctime are `ts`
@@ -2286,7 +2260,7 @@ impl InodeOps for VfatInodeOps {
         write_bytes(&sb_data.bdev, cluster_offset + 32, &dotdot_entry)?;
 
         // Create entry in parent (function returns the generated short name)
-        let short_name = create_dir_entry_with_lfn(
+        let (short_name, i_pos) = create_dir_entry_with_lfn(
             &sb_data,
             parent_cluster,
             name,
@@ -2327,6 +2301,7 @@ impl InodeOps for VfatInodeOps {
             mmu_private: 0,
             clusters: 0,
             crtime,
+            i_pos,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         // vfat_add_entry: the directory's mtime and ctime are `ts`
@@ -2556,6 +2531,7 @@ impl InodeOps for VfatInodeOps {
             .ok_or(KernelError::NotFound)?
             .clone();
         let old_inode = cached(&sb, op, &old_entry.short_name);
+        let old_ipos = slot_offset(&sb_data, op, old_entry.slot)?;
         // A directory moved to another one: its ".." entry
         // (vfat_get_dotdot_de)
         let is_dir = old_entry.is_dir();
@@ -2572,7 +2548,7 @@ impl InodeOps for VfatInodeOps {
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(new_name));
         let mut new_inode = None;
-        let new_short = match existing {
+        let (new_short, new_ipos) = match existing {
             Some(t) => {
                 // A file over a directory or the reverse never gets here:
                 // the VFS refused it (may_delete: EISDIR / ENOTDIR)
@@ -2580,10 +2556,11 @@ impl InodeOps for VfatInodeOps {
                     dir_empty(&sb_data, t.start_cluster)?;
                 }
                 new_inode = cached(&sb, np, &t.short_name);
+                // Linux fat_detach(new_inode), before the slot is reused
                 if let Some(i) = &new_inode {
-                    icache::remove_inode_hash(i);
+                    fat_detach(i, &sb_data);
                 }
-                t.short_name
+                (t.short_name, slot_offset(&sb_data, np, t.slot)?)
             }
             None => {
                 let a = if is_dir {
@@ -2592,11 +2569,11 @@ impl InodeOps for VfatInodeOps {
                     attr::ARCHIVE
                 };
                 let et = EntryTimes::at(sb_data.opts.tz(), ts);
-                let short = create_dir_entry_with_lfn(&sb_data, np, new_name, a, 0, 0, &et)?;
+                let made = create_dir_entry_with_lfn(&sb_data, np, new_name, a, 0, 0, &et)?;
                 // vfat_add_entry: the new directory's mtime and ctime
                 fat_truncate_time(new_dir, Some(ts), false, true);
                 let _ = write_inode_sb(new_dir, &sb_data);
-                short
+                made
             }
         };
         new_dir.inc_iversion();
@@ -2608,19 +2585,20 @@ impl InodeOps for VfatInodeOps {
             sb_data: &sb_data,
             new_dir: np,
             new_name,
-            old: (&old_inode, op, old_entry.short_name),
+            old: (&old_inode, op, old_entry.short_name, old_ipos),
             target: existing.map(|t| (&new_inode, t)),
+            new_ipos,
         };
         let sync_ipos = || {
             let (start, size) = match &old_inode {
                 Some(i) => {
-                    attach(i, np, new_short)?;
+                    attach(i, &sb_data, np, new_short, new_ipos)?;
                     (get_inode_data(i)?.start_cluster, i.get_size() as u32)
                 }
                 None => (old_entry.start_cluster, old_entry.file_size),
             };
             let e = &old_entry;
-            write_entry(&sb_data, np, &new_short, e.attr, (start, size), &e.times)
+            write_entry(&sb_data, new_ipos, e.attr, (start, size), &e.times)
         };
         if let Err(e) = sync_ipos() {
             unwind.inode(None);
@@ -2666,13 +2644,31 @@ impl InodeOps for VfatInodeOps {
 
 /// Point `inode` at the entry `short` of the directory at `parent`
 /// (Linux fat_detach + fat_attach): its data and its inode-cache key
-fn attach(inode: &InodeRef, parent: u32, short: [u8; 11]) -> Result<(), KernelError> {
-    let mut d = get_inode_data(inode)?;
-    d.parent_cluster = parent;
-    d.short_name = short;
-    set_inode_data(inode, d)?;
+fn attach(
+    inode: &InodeRef,
+    sb_data: &VfatSbData,
+    parent: u32,
+    short: [u8; 11],
+    i_pos: u64,
+) -> Result<(), KernelError> {
+    let l = sb_data.ipos.lock();
+    with_vi(inode, |v| {
+        let mut d = v.d.lock();
+        (d.parent_cluster, d.short_name, d.i_pos) = (parent, short, i_pos);
+    })?;
+    drop(l);
     icache::rehash(inode, ikey(parent, &short));
     Ok(())
+}
+
+/// Linux fat_detach: the inode has no entry any more (i_pos 0, so no
+/// write_inode touches the slot it had, which may be reused) and is
+/// out of the inode cache
+fn fat_detach(inode: &InodeRef, sb_data: &VfatSbData) {
+    let l = sb_data.ipos.lock();
+    let _ = with_vi(inode, |v| v.d.lock().i_pos = 0);
+    drop(l);
+    icache::remove_inode_hash(inode);
 }
 
 /// ENOTEMPTY unless the directory at `cluster` holds only "." and ".."
@@ -2724,13 +2720,13 @@ fn set_start(sb_data: &VfatSbData, off: u64, start: u32) -> Result<(), KernelErr
 /// inode's i_pos)
 fn write_entry(
     sb_data: &VfatSbData,
-    parent: u32,
-    short: &[u8; 11],
+    off: u64,
     attr: u8,
     (start, size): (u32, u32),
     times: &EntryTimes,
 ) -> Result<(), KernelError> {
-    let off = entry_offset(sb_data, parent, short)?;
+    // The slot's entry, as write_inode writes one (under the i_pos lock)
+    let _l = sb_data.ipos.lock();
     let mut b = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut b)?;
     b[11] = attr;
@@ -2745,10 +2741,12 @@ struct Unwind<'a> {
     sb_data: &'a VfatSbData,
     new_dir: u32,
     new_name: &'a str,
-    /// The moved object's inode, its old directory and entry
-    old: (&'a Option<InodeRef>, u32, [u8; 11]),
+    /// The moved object's inode, its old directory, entry and i_pos
+    old: (&'a Option<InodeRef>, u32, [u8; 11], u64),
     /// The replaced object: its inode and entry
     target: Option<(&'a Option<InodeRef>, &'a ParsedDirEntry)>,
+    /// The new entry's i_pos (the replaced object's slot)
+    new_ipos: u64,
 }
 
 impl Unwind<'_> {
@@ -2769,30 +2767,23 @@ impl Unwind<'_> {
     /// whether a step failed so far; a failure then is reported
     /// (fat_fs_error)
     fn inode(&self, corrupt: Option<bool>) {
-        let (old_inode, op, old_short) = self.old;
+        let (old_inode, op, old_short, old_ipos) = self.old;
         if let Some(i) = old_inode {
-            let _ = attach(i, op, old_short);
+            let _ = attach(i, self.sb_data, op, old_short, old_ipos);
         }
         let mut failed = corrupt.unwrap_or(false);
         match self.target {
             Some((ni, t)) => {
                 let (mut start, mut size) = (t.start_cluster, t.file_size);
                 if let Some(i) = ni {
-                    let _ = attach(i, self.new_dir, t.short_name);
+                    let _ = attach(i, self.sb_data, self.new_dir, t.short_name, self.new_ipos);
                     if let Ok(d) = get_inode_data(i) {
                         (start, size) = (d.start_cluster, i.get_size() as u32);
                     }
                 }
                 if corrupt.is_some() {
-                    let s = &t.short_name;
-                    let r = write_entry(
-                        self.sb_data,
-                        self.new_dir,
-                        s,
-                        t.attr,
-                        (start, size),
-                        &t.times,
-                    );
+                    let ext = (start, size);
+                    let r = write_entry(self.sb_data, self.new_ipos, t.attr, ext, &t.times);
                     failed |= r.is_err();
                 }
             }
@@ -2871,7 +2862,7 @@ fn drop_link(
 ) -> Result<(), KernelError> {
     if let Some(inode) = cached(sb, parent, &entry.short_name) {
         inode.nlink.store(0, core::sync::atomic::Ordering::Release);
-        icache::remove_inode_hash(&inode);
+        fat_detach(&inode, sb_data);
         return Ok(());
     }
     if start_cluster != 0 {
@@ -2932,8 +2923,10 @@ fn create_inode_for_entry(
         .store(nlink, core::sync::atomic::Ordering::Relaxed);
 
     let crtime = fill_times(&inode, o.tz(), &entry.times);
+    let i_pos = slot_offset(&sb_data, parent_cluster, entry.slot)?;
     inode.set_private(new_private(VfatInodeData {
         crtime,
+        i_pos,
         start_cluster: entry.start_cluster,
         file_size: entry.file_size,
         is_dir: entry.is_dir(),
@@ -3270,6 +3263,7 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         max_cluster: (total_clusters + 2) as u32,
         cluster_size,
         opts,
+        ipos: try_arc(crate::sync::Mutex::new(()))?,
         fat: try_arc(crate::sync::Mutex::new(FatState {
             free: -1,
             prev_free: 2,
@@ -3316,6 +3310,7 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         mmu_private: 0,
         clusters: 0,
         crtime: Timespec::ZERO,
+        i_pos: 0,
     })?);
 
     // Names match without case or trailing dots (Linux setup's
