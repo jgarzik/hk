@@ -14,8 +14,8 @@
 //! open file, a mapping (the writeback lists hold none). The hash
 //! holds a `Weak` only (a `WeakList` per bucket, linked through the
 //! inode's own `i_hash_node`: hashing allocates nothing). When the last
-//! `Arc` goes, `Drop for Inode` runs [`evict`]: it unhashes the inode
-//! and calls the filesystem's `evict_inode`, which frees what an
+//! `Arc` goes, its teardown (`inode::IFree`) runs [`evict`]: it
+//! unhashes the inode and calls the filesystem's `evict_inode`, which frees what an
 //! unlinked object still owns (Linux iput_final -> evict ->
 //! ->evict_inode). Deviation from Linux: no LRU of unused inodes (Linux
 //! keeps an inode with i_count 0 cached until its superblock's shrinker
@@ -277,7 +277,7 @@ pub fn rehash(inode: &Arc<Inode>, hashval: u64) {
 /// its filesystem releases what it still owns while it is still hashed
 /// (lookups of its object wait), then it is unhashed and the waiters
 /// woken (Linux evict: ->evict_inode, remove_inode_hash, wake_up_bit).
-/// Runs from `Drop for Inode` in a context that may sleep (Linux iput:
+/// Runs from the inode's teardown (`IFree`) in a context that may sleep (Linux iput:
 /// might_sleep): the filesystem may do I/O (vfat frees an unlinked
 /// file's clusters).
 pub fn evict(inode: &Inode) {

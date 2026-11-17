@@ -2675,7 +2675,7 @@ sleeps once (Linux __wait_on_freeing_inode; `INODE_HASH_LOCK` -> that
 queue's lock), woken by the eviction after its unhash under the lock
 (Linux wake_up_bit(__I_NEW)), then searches again: a lookup may sleep, so
 its callers hold no spin lock (vfat's hold its directory's `i_rwsem`,
-which no writeback or eviction takes). Eviction (`Drop for Inode` ->
+which no writeback or eviction takes). Eviction (`IFree`'s drop ->
 `icache::evict`, Linux iput_final -> evict) runs where the last `Arc`
 goes, which must be a context that may sleep (Linux iput's
 might_sleep, checked first): never under a spin lock or with
@@ -2700,10 +2700,28 @@ reports one that does not. Deviation from Linux: no
 unused-inode LRU or I_NEW state (an inode is complete before it is
 hashed; the losing builder's inode is dropped unhashed).
 
+**Inode free** (`fs/inode.rs` `IFree`; Linux evict -> destroy_inode
+-> call_rcu(&inode->i_rcu, i_callback)): the whole teardown runs
+synchronously where the last `Arc` goes, as above: the eviction, then
+every field with drop glue (`destroy_inode`: the page cache, Linux
+truncate_inode_pages_final; inotify marks, file locks, the writeback
+state, the filesystem data, a FIFO's pipe, and the superblock's
+passive reference last), each a `ManuallyDrop` dropped through a raw
+pointer. Only the memory waits: the inode's `Arc` keeps a `Weak` of
+its own (`Inode::alloc`), and `i_callback`, queued after the teardown
+(no field is touched after it), drops that `Weak` in `rcuc/N` a grace
+period later: an atomic decrement and the block's free, which never
+sleeps and takes no lock. So an RCU reader that reached an inode with
+no reference (a dentry's `d_inode`) may read it until its guard ends,
+a torn-down one included, but only its fields with no drop glue
+(atomics, `ino`, `i_op`; Linux's RCU walk reads i_mode, i_uid, i_op
+the same way), never one a teardown releases (`private`, `i_data`,
+`sb`). No lock is added.
+
 **Superblock inode lists** (`fs/inode.rs`; Linux s_inodes,
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
 superblock's `s_inodes` (a `WeakList` through `Inode.i_sb_list`) until
-its eviction (`Drop for Inode`, first step) unlinks it. One global
+its eviction (`IFree`'s drop, first step) unlinks it. One global
 `INODE_SB_LIST_LOCK` (spin Mutex leaf, thread context; Linux
 inode_sb_list_lock as it was before s_inode_list_lock went per
 superblock) guards every list: an inode holds only a `Weak` to its

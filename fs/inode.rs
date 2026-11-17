@@ -4,12 +4,15 @@
 //! independent of its name(s) in the directory tree.
 
 use alloc::sync::{Arc, Weak};
+use core::mem::ManuallyDrop;
+use core::ptr::NonNull;
 
+use crate::sync::rcu::RcuHead;
 use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
-use crate::util::kalloc::try_arc;
+use crate::util::kalloc::try_arc_uninit;
 use crate::util::list::{self, WeakList};
-use ::core::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::RwSem;
 use crate::sync::waitqueue::var_waitqueue;
@@ -358,8 +361,8 @@ pub trait InodeOps: Send + Sync {
 
     /// The last reference to the inode is gone (Linux ->evict_inode):
     /// release what the object still owns, e.g. the blocks of an
-    /// unlinked file. Called from `Drop for Inode`, where the last
-    /// reference goes: a context that may sleep (Linux iput's
+    /// unlinked file. Called from the inode's teardown (`IFree`), where
+    /// the last reference goes: a context that may sleep (Linux iput's
     /// might_sleep), so it may do I/O.
     fn evict_inode(&self, inode: &Inode) {
         let _ = inode;
@@ -534,8 +537,25 @@ pub mod iflags {
     pub const I_LINKABLE: u32 = 1 << 16;
 }
 
-/// The inode structure - represents a file object
+/// A FIFO inode's pipe and its open count (`Inode.i_pipe`)
+pub type PipeSlot = Option<(Arc<crate::io::pipe::Pipe>, usize)>;
+
+/// The inode structure - represents a file object (Linux struct inode)
+///
+/// Made only by [`Inode::alloc`], in place in its `Arc`. Its last
+/// reference tears it down where it goes ([`IFree`]: Linux iput_final
+/// -> evict -> destroy_inode), and its memory is freed a grace period
+/// later (Linux i_callback), so an RCU reader that reached it with no
+/// reference (a dentry's `d_inode`) may read its atomics and fixed
+/// fields (`ino`, `i_op`, mode, owner, ...) until its guard ends, after
+/// the teardown included. Every field with drop glue is `ManuallyDrop`,
+/// dropped by `IFree`'s teardown through raw pointers; the others have
+/// none (`no_glue` below), so nothing writes a byte a reader reads
+/// before the free.
 pub struct Inode {
+    /// The teardown at the last reference and the deferred free
+    i_free: IFree,
+
     /// Inode number (unique within filesystem)
     pub ino: InodeId,
 
@@ -581,7 +601,7 @@ pub struct Inode {
     ctime: InodeTime,
 
     /// Pointer back to superblock
-    pub sb: Weak<SuperBlock>,
+    pub sb: ManuallyDrop<Weak<SuperBlock>>,
 
     /// Inode operations (filesystem-specific)
     pub i_op: &'static dyn InodeOps,
@@ -601,17 +621,17 @@ pub struct Inode {
     i_dio_count: AtomicU32,
 
     /// Filesystem-specific private data
-    pub private: RwLock<Option<Arc<dyn InodeData>>>,
+    pub private: ManuallyDrop<RwLock<Option<Arc<dyn InodeData>>>>,
 
     /// A FIFO's pipe while it is open, and how many files have it open
     /// (Linux inode->i_pipe and pipe->files)
-    pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::io::pipe::Pipe>, usize)>>,
+    pub i_pipe: ManuallyDrop<Mutex<PipeSlot>>,
 
     /// The file's page cache (Linux i_data)
-    pub i_data: crate::mm::filemap::AddressSpace,
+    pub i_data: ManuallyDrop<crate::mm::filemap::AddressSpace>,
 
     /// The inotify watches on it (Linux i_fsnotify_marks)
-    pub fsnotify: crate::io::inotify::Marks,
+    pub fsnotify: ManuallyDrop<crate::io::inotify::Marks>,
 
     /// Queued on its device's writeback lists (Linux I_DIRTY_PAGES;
     /// fs_writeback): set by `mark_inode_dirty`, cleared under the
@@ -626,14 +646,14 @@ pub struct Inode {
     pub(crate) i_io_on: core::sync::atomic::AtomicU8,
     /// The writeback state it was queued on (Linux inode->i_wb), set
     /// the first time and never changed
-    pub(crate) i_wb: spin::Once<Arc<crate::mm::writeback::BdiWriteback>>,
+    pub(crate) i_wb: ManuallyDrop<spin::Once<Arc<crate::mm::writeback::BdiWriteback>>>,
 
     /// Writers (> 0) or executions denying them (< 0) (Linux
     /// i_writecount; `get_write_access`, `deny_write`)
     i_writecount: core::sync::atomic::AtomicI32,
 
     /// Its flock and POSIX locks (Linux i_flctx; `fs::locks`)
-    pub i_flctx: super::locks::FileLockCtx,
+    pub i_flctx: ManuallyDrop<super::locks::FileLockCtx>,
 
     /// The inode cache key it is hashed under (`fs::icache`)
     pub(super) i_hash: AtomicU64,
@@ -745,11 +765,14 @@ pub fn for_each_sb_inode(sb: &Arc<SuperBlock>, f: &mut dyn FnMut(&Arc<Inode>) ->
 }
 
 impl Inode {
-    /// Create a new inode
+    /// What a new inode starts with (Linux new_inode's caller filling
+    /// in i_mode, i_uid, ...), for [`Inode::alloc`]
     ///
     /// # Arguments
     /// * `mtime` - Modification time (atime and ctime are initialized to same value)
-    #[expect(clippy::too_many_arguments)]
+    // The inode itself is built in place by `alloc` (it is too large to
+    // pass by value)
+    #[expect(clippy::too_many_arguments, clippy::new_ret_no_self)]
     pub fn new(
         ino: InodeId,
         mode: InodeMode,
@@ -759,55 +782,22 @@ impl Inode {
         mtime: Timespec,
         sb: Weak<SuperBlock>,
         i_op: &'static dyn InodeOps,
-    ) -> Self {
-        Self {
+    ) -> InodeInit {
+        InodeInit {
             ino,
-            mode: AtomicU16::new(mode.0),
-            uid: AtomicU32::new(uid),
-            gid: AtomicU32::new(gid),
-            size: AtomicU64::new(size),
-            nlink: AtomicU32::new(1),
-            i_generation: 0,
-            i_flags: core::sync::atomic::AtomicU32::new(0),
+            mode,
+            uid,
+            gid,
+            size,
             rdev: DevId::null(),
-            atime: InodeTime::new(mtime),
-            mtime: InodeTime::new(mtime),
-            ctime: InodeTime::new(mtime),
+            mtime,
             sb,
             i_op,
-            i_rwsem: RwSem::new(()),
-            private: RwLock::new(None),
-            i_pipe: crate::sync::spin::Mutex::new(None),
-            i_hash: AtomicU64::new(0),
-            i_hash_node: list::Link::new(),
-            i_data: crate::mm::filemap::AddressSpace::new(),
-            fsnotify: crate::io::inotify::Marks::default(),
-            i_dirty: core::sync::atomic::AtomicBool::new(false),
-            i_io_list: list::Link::new(),
-            i_io_on: core::sync::atomic::AtomicU8::new(0),
-            i_wb: spin::Once::new(),
-            i_writecount: core::sync::atomic::AtomicI32::new(0),
-            i_dio_count: AtomicU32::new(0),
-            i_flctx: super::locks::FileLockCtx::new(),
-            i_sequence: crate::task::futex::KeySeq::new(),
-            i_sb_list: list::Link::new(),
-            i_dentry: Mutex::new(list::List::new()),
+            i_generation: 0,
         }
     }
 
-    /// Put a new inode in its `Arc` and list it on its superblock's
-    /// `s_inodes` (Linux new_inode: alloc_inode + inode_sb_list_add);
-    /// one with no superblock stays unlisted
-    pub fn alloc(inode: Self) -> Result<Arc<Self>, KernelError> {
-        let sb = inode.sb.upgrade();
-        let i = try_arc(inode)?;
-        if let Some(sb) = &sb {
-            sb_list_add(sb, &i);
-        }
-        Ok(i)
-    }
-
-    /// Create a new device inode
+    /// A new device inode's start, for [`Inode::alloc`]
     ///
     /// # Arguments
     /// * `rdev` - Device ID (major/minor numbers)
@@ -822,40 +812,90 @@ impl Inode {
         mtime: Timespec,
         sb: Weak<SuperBlock>,
         i_op: &'static dyn InodeOps,
-    ) -> Self {
-        Self {
-            ino,
-            mode: AtomicU16::new(mode.0),
-            uid: AtomicU32::new(uid),
-            gid: AtomicU32::new(gid),
-            size: AtomicU64::new(0),
-            nlink: AtomicU32::new(1),
-            i_generation: 0,
-            i_flags: core::sync::atomic::AtomicU32::new(0),
+    ) -> InodeInit {
+        InodeInit {
             rdev,
-            atime: InodeTime::new(mtime),
-            mtime: InodeTime::new(mtime),
-            ctime: InodeTime::new(mtime),
-            sb,
-            i_op,
-            i_rwsem: RwSem::new(()),
-            private: RwLock::new(None),
-            i_pipe: crate::sync::spin::Mutex::new(None),
-            i_hash: AtomicU64::new(0),
-            i_hash_node: list::Link::new(),
-            i_data: crate::mm::filemap::AddressSpace::new(),
-            fsnotify: crate::io::inotify::Marks::default(),
-            i_dirty: core::sync::atomic::AtomicBool::new(false),
-            i_io_list: list::Link::new(),
-            i_io_on: core::sync::atomic::AtomicU8::new(0),
-            i_wb: spin::Once::new(),
-            i_writecount: core::sync::atomic::AtomicI32::new(0),
-            i_dio_count: AtomicU32::new(0),
-            i_flctx: super::locks::FileLockCtx::new(),
-            i_sequence: crate::task::futex::KeySeq::new(),
-            i_sb_list: list::Link::new(),
-            i_dentry: Mutex::new(list::List::new()),
+            ..Self::new(ino, mode, uid, gid, 0, mtime, sb, i_op)
         }
+    }
+
+    /// Make an inode in place in its `Arc` and list it on its
+    /// superblock's `s_inodes` (Linux new_inode: alloc_inode +
+    /// inode_sb_list_add); one with no superblock stays unlisted. The
+    /// `Arc` keeps a `Weak` of its own, given back a grace period after
+    /// the teardown (`IFree`).
+    pub fn alloc(init: InodeInit) -> Result<Arc<Self>, KernelError> {
+        let sb = init.sb.upgrade();
+        let mut a = try_arc_uninit::<Self>()?;
+        let p = Arc::get_mut(&mut a)
+            .expect("inode: a new Arc is unshared")
+            .as_mut_ptr();
+        // SAFETY: `p` is the new block, unshared and not yet initialized
+        unsafe { Self::init_at(p, init) };
+        // SAFETY: `init_at` wrote every field
+        let i = unsafe { a.assume_init() };
+        let me = Weak::into_raw(Arc::downgrade(&i)).cast_mut();
+        // INVARIANT: the inode's address, its `Weak` leaked for the free
+        i.i_free.me.store(me, Ordering::Release);
+        if let Some(sb) = &sb {
+            sb_list_add(sb, &i);
+        }
+        Ok(i)
+    }
+
+    /// Write every field of a new inode at `p`, one at a time, so the
+    /// inode never sits on the stack whole (it is large; arm64 kernel
+    /// stacks are 16 KiB)
+    ///
+    /// # Safety
+    /// `p` is valid for writes of an `Inode`, unshared.
+    unsafe fn init_at(p: *mut Self, i: InodeInit) {
+        macro_rules! w {
+            ($f:ident, $v:expr) => {
+                // SAFETY: `p` is valid for writes of an `Inode` (the
+                // caller's contract); a field write drops nothing
+                unsafe { (&raw mut (*p).$f).write($v) }
+            };
+        }
+        let t = i.mtime;
+        w!(i_free, IFree::new());
+        w!(ino, i.ino);
+        w!(mode, AtomicU16::new(i.mode.0));
+        w!(uid, AtomicU32::new(i.uid));
+        w!(gid, AtomicU32::new(i.gid));
+        w!(size, AtomicU64::new(i.size));
+        w!(nlink, AtomicU32::new(1));
+        w!(i_generation, i.i_generation);
+        w!(i_flags, core::sync::atomic::AtomicU32::new(0));
+        w!(rdev, i.rdev);
+        w!(atime, InodeTime::new(t));
+        w!(mtime, InodeTime::new(t));
+        w!(ctime, InodeTime::new(t));
+        w!(sb, ManuallyDrop::new(i.sb));
+        w!(i_op, i.i_op);
+        w!(i_rwsem, RwSem::new(()));
+        w!(i_dio_count, AtomicU32::new(0));
+        w!(private, ManuallyDrop::new(RwLock::new(None)));
+        w!(i_pipe, ManuallyDrop::new(Mutex::new(None)));
+        w!(
+            i_data,
+            ManuallyDrop::new(crate::mm::filemap::AddressSpace::new())
+        );
+        w!(
+            fsnotify,
+            ManuallyDrop::new(crate::io::inotify::Marks::default())
+        );
+        w!(i_dirty, core::sync::atomic::AtomicBool::new(false));
+        w!(i_io_list, list::Link::new());
+        w!(i_io_on, core::sync::atomic::AtomicU8::new(0));
+        w!(i_wb, ManuallyDrop::new(spin::Once::new()));
+        w!(i_writecount, core::sync::atomic::AtomicI32::new(0));
+        w!(i_flctx, ManuallyDrop::new(super::locks::FileLockCtx::new()));
+        w!(i_hash, AtomicU64::new(0));
+        w!(i_hash_node, list::Link::new());
+        w!(i_sequence, crate::task::futex::KeySeq::new());
+        w!(i_sb_list, list::Link::new());
+        w!(i_dentry, Mutex::new(list::List::new()));
     }
 
     fn iflag(&self, f: u32) -> bool {
@@ -1331,24 +1371,166 @@ impl Drop for InodeWrite {
     }
 }
 
-impl Drop for Inode {
-    /// Linux iput_final -> evict: an inode it would not drop (linked and
-    /// hashed, inode_generic_drop) is written back first, as Linux does
-    /// for one it does not keep cached (hk keeps no unused inodes):
-    /// write_inode_now; then off its superblock's and writeback lists
-    /// (the lists' contract, `WeakList`) and the filesystem's eviction.
-    /// An unlinked inode's dirty pages just go (truncate_inode_pages_final).
+/// What a new inode starts with ([`Inode::new`], [`Inode::new_device`]):
+/// [`Inode::alloc`] builds the inode from it in place
+pub struct InodeInit {
+    pub ino: InodeId,
+    pub mode: InodeMode,
+    pub uid: Uid,
+    pub gid: Gid,
+    pub size: u64,
+    pub rdev: DevId,
+    pub mtime: Timespec,
+    pub sb: Weak<SuperBlock>,
+    pub i_op: &'static dyn InodeOps,
+    /// Set by the filesystem before [`Inode::alloc`] (Linux
+    /// i_generation)
+    pub i_generation: u32,
+}
+
+/// An inode's end, its first field (Linux iput_final -> evict ->
+/// destroy_inode, then call_rcu(&inode->i_rcu, i_callback)): when the
+/// last `Arc` goes, its drop tears the whole inode down right there, in
+/// the context of that last put (which may sleep: Linux iput), then
+/// queues the release of the inode's own `Weak`, which frees the
+/// memory a grace period later (`i_callback`, the only part deferred).
+/// `Inode` has no `Drop` of its own and its other fields no drop glue
+/// (`ManuallyDrop`, or `no_glue`), so this is the whole teardown.
+///
+/// The one `&mut Inode` of the last put, std `Arc::drop_slow` handing
+/// the inode to its drop glue, writes no byte: the glue's only step is
+/// this field's drop, whose `&mut` covers just `me` and `i_rcu`
+/// (atomics and a cell no RCU reader reads). The teardown works through
+/// `me`, a raw pointer to the whole inode: a shared borrow for
+/// eviction, then each `ManuallyDrop` field dropped through its raw
+/// place, all before the free is queued. An RCU reader reads only
+/// fields with no drop glue (atomics, `ino`, `i_op`), which nothing
+/// writes, so it reads them intact until the memory goes. Linux's form,
+/// a counted `i_count` with `iput` as `DentryRef` does for dentries,
+/// would leave no `&mut` at all (BUGS.md).
+///
+/// # Invariants
+/// `me` is null until [`Inode::alloc`] stores the inode's address, a
+/// `Weak` leaked for the deferred free (`Weak::into_raw`); this type's
+/// drop takes it back once, through `i_callback`.
+struct IFree {
+    me: AtomicPtr<Inode>,
+    i_rcu: RcuHead,
+}
+
+impl IFree {
+    const fn new() -> Self {
+        Self {
+            me: AtomicPtr::new(core::ptr::null_mut()),
+            i_rcu: RcuHead::new(),
+        }
+    }
+}
+
+impl Drop for IFree {
     fn drop(&mut self) {
         // Linux iput: the last reference goes where sleeping is allowed
         crate::sync::might_sleep();
-        let keep = self.get_nlink() != 0 && self.i_hash_node.is_linked();
-        if keep && self.i_dirty.load(Ordering::Acquire) {
-            let _ = crate::mm::filemap::write_and_wait(self);
+        let me = NonNull::new(*self.me.get_mut()).expect("inode: made only by Inode::alloc");
+        // SAFETY: `me` is this inode (type invariant), whose last strong
+        // reference just went: nothing else uses it now, and the borrow
+        // ends before any field is dropped
+        evict(unsafe { me.as_ref() });
+        // SAFETY: as above; evicted, unborrowed, and called once
+        unsafe { destroy_inode(me.as_ptr()) };
+        let p = me.as_ptr().cast_const().cast::<()>();
+        if crate::sync::rcu::can_queue() {
+            // SAFETY: `i_rcu` is in the inode, whose memory the `Weak`
+            // `i_callback` drops keeps until then; `i_callback` only
+            // drops it, which may happen in any context
+            unsafe { crate::sync::rcu::call_rcu(&(*me.as_ptr()).i_free.i_rcu, i_callback, p) };
+        } else {
+            // SAFETY: no reader can stand on it (host tests; early boot,
+            // one CPU, no RCU yet)
+            unsafe { i_callback(p) };
         }
-        sb_list_del(self);
-        super::fs_writeback::inode_io_list_del(self);
-        super::icache::evict(self);
     }
+}
+
+/// Linux iput_final -> evict: an inode it would not drop (linked and
+/// hashed, inode_generic_drop) is written back first, as Linux does for
+/// one it does not keep cached (hk keeps no unused inodes):
+/// write_inode_now; then off its superblock's and writeback lists (the
+/// lists' contract, `WeakList`) and the filesystem's eviction.
+fn evict(i: &Inode) {
+    let keep = i.get_nlink() != 0 && i.i_hash_node.is_linked();
+    if keep && i.i_dirty.load(Ordering::Acquire) {
+        let _ = crate::mm::filemap::write_and_wait(i);
+    }
+    sb_list_del(i);
+    super::fs_writeback::inode_io_list_del(i);
+    super::icache::evict(i);
+}
+
+/// Drop the `ManuallyDrop` field at `f`
+///
+/// # Safety
+/// `f` points at a live field, valid for writes, that nothing uses or
+/// borrows again.
+unsafe fn drop_field<T>(f: *mut ManuallyDrop<T>) {
+    // SAFETY: `ManuallyDrop<T>` is `repr(transparent)` over `T`; the
+    // caller's contract
+    unsafe { core::ptr::drop_in_place(f.cast::<T>()) }
+}
+
+/// Release what an evicted inode still holds, synchronously: every
+/// field with drop glue (Linux evict's truncate_inode_pages_final, then
+/// destroy_inode: __destroy_inode's fsnotify_inode_delete,
+/// locks_free_lock_context, inode_detach_wb; ->destroy_inode's
+/// filesystem data; the superblock reference last, as Linux reads
+/// i_sb->s_op there)
+///
+/// # Safety
+/// `i` is an evicted inode whose last strong reference went, not
+/// borrowed; called once.
+unsafe fn destroy_inode(i: *mut Inode) {
+    // SAFETY: (each) a field of `i`, dropped once, unborrowed (the
+    // caller's contract)
+    unsafe { drop_field(&raw mut (*i).i_data) };
+    // SAFETY: as above
+    unsafe { drop_field(&raw mut (*i).fsnotify) };
+    // SAFETY: as above
+    unsafe { drop_field(&raw mut (*i).i_flctx) };
+    // SAFETY: as above
+    unsafe { drop_field(&raw mut (*i).i_wb) };
+    // SAFETY: as above
+    unsafe { drop_field(&raw mut (*i).private) };
+    // SAFETY: as above
+    unsafe { drop_field(&raw mut (*i).i_pipe) };
+    // SAFETY: as above
+    unsafe { drop_field(&raw mut (*i).sb) };
+}
+
+/// (`no_glue`) Every other field of `Inode` has no drop glue: nothing
+/// but `destroy_inode` writes an inode before its free (a field added
+/// with glue fails here; make it `ManuallyDrop` and drop it there)
+const _: () = {
+    use core::mem::needs_drop;
+    assert!(!needs_drop::<InodeId>() && !needs_drop::<AtomicU16>());
+    assert!(!needs_drop::<AtomicU32>() && !needs_drop::<AtomicU64>());
+    assert!(!needs_drop::<DevId>() && !needs_drop::<InodeTime>());
+    assert!(!needs_drop::<&'static dyn InodeOps>() && !needs_drop::<RwSem>());
+    assert!(!needs_drop::<core::sync::atomic::AtomicBool>());
+    assert!(!needs_drop::<core::sync::atomic::AtomicU8>());
+    assert!(!needs_drop::<core::sync::atomic::AtomicI32>());
+    assert!(!needs_drop::<list::Link>() && !needs_drop::<crate::task::futex::KeySeq>());
+    assert!(!needs_drop::<Mutex<list::List<super::dentry::AliasA>>>());
+};
+
+/// The inode's memory, a grace period after its teardown (Linux
+/// i_callback -> free_inode_nonrcu): the `Weak` it kept, whose drop
+/// frees the block once the `Arc`'s own is gone; nothing else
+///
+/// # Safety
+/// `p` is an inode's `IFree::me`, taken back once.
+unsafe fn i_callback(p: *const ()) {
+    // SAFETY: the `Weak` `Inode::alloc` leaked (`IFree` invariant)
+    drop(unsafe { Weak::from_raw(p.cast::<Inode>()) });
 }
 
 #[cfg(test)]
@@ -1367,7 +1549,7 @@ mod tests {
 
     #[test]
     fn dio_count() {
-        let i = Inode::new(
+        let i = Inode::alloc(Inode::new(
             1,
             InodeMode::regular(0o644),
             0,
@@ -1376,7 +1558,8 @@ mod tests {
             Timespec::ZERO,
             Weak::new(),
             &TEST_OPS,
-        );
+        ))
+        .unwrap();
         // None in flight: no wait
         i.inode_dio_wait();
         i.inode_dio_begin();

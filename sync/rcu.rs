@@ -771,6 +771,13 @@ pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
     }
 }
 
+/// Callbacks can be queued here: false in host unit tests and at the
+/// start of boot (no CPU id yet), when no other CPU runs a reader, so a
+/// release may happen at once
+pub fn can_queue() -> bool {
+    !cfg!(test) && crate::cpu::try_this_id().is_some()
+}
+
 /// Release one reference to `a` after a grace period (Linux
 /// kfree_rcu): its readers may still hold `&T` under a guard. The drop
 /// runs in `rcuc/N`, preemption off: it must not sleep, and allocates

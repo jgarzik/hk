@@ -1168,3 +1168,10 @@ ntp_update_frequency).
   `TaskInner` `ptracer`, read by /proc status TracerPid among others;
   Linux reads `ptrace_parent()` (`rcu_dereference(task->parent)`)
   under RCU.
+- **Inodes are counted by `Arc`, not `i_count` + `iput`**: `fs/inode.rs`
+  `IFree`; the last put runs the teardown from the `Arc`'s drop glue,
+  so std `Arc::drop_slow` makes a transient `&mut Inode` while RCU
+  readers may hold `&Inode` (argued harmless in doc/UNSAFE.md 12: it
+  writes no byte they read). Linux counts `i_count` and calls `iput`
+  explicitly, as `DentryRef` does for dentries (`d_count`), which
+  leaves no `&mut` at all.

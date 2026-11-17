@@ -174,6 +174,21 @@ named. A type kept in such a container says so where it is defined
 (Linux SOCK_RCU_FREE sockets: `__sk_destruct` runs from the RCU
 callback).
 
+An inode (`fs/inode.rs` `IFree`, Linux destroy_inode / i_callback) is
+the other shape: RCU readers reach it with no reference (a dentry's
+`d_inode`), its teardown runs synchronously at the last `Arc`, and only
+the memory is deferred (the inode's own `Weak`, dropped by the
+callback). `Inode` has no `Drop`; each field with drop glue is
+`ManuallyDrop` and dropped by `IFree`'s drop through a raw-pointer
+place before the free is queued, and a compile-time check keeps every
+other field glue-free. The one remaining `&mut Inode`, the transient
+one std `Arc::drop_slow` makes to run the drop glue, writes no byte an
+RCU reader reads: readers read only atomics, `ino`, `i_op` and other
+fields with no drop glue, and the glue's only step is `IFree`'s drop,
+whose own `&mut` covers just its atomics and its `RcuHead`. Linux's
+form, a counted `i_count` with an explicit `iput` (as `DentryRef` does
+with `d_count`), removes that transient `&mut` too (BUGS.md).
+
 ## Review checklist (for each new `unsafe`)
 
 1. Could an existing wrapper do it? Should a new one exist (rule 2)?

@@ -147,6 +147,11 @@ pub fn try_arc<T>(v: T) -> Result<Arc<T>, KernelError> {
     reserved(arc_layout::<T>(), || Arc::new(v))
 }
 
+/// `Arc::new_uninit()`, or ENOMEM: for a large `T` built in place
+pub fn try_arc_uninit<T>() -> Result<Arc<core::mem::MaybeUninit<T>>, KernelError> {
+    reserved(arc_layout::<T>(), Arc::new_uninit)
+}
+
 /// `Arc::<[T]>::from(s)`, or ENOMEM (a refcounted copy of a slice:
 /// Linux's external_name)
 pub fn try_arc_slice<T: Copy>(s: &[T]) -> Result<Arc<[T]>, KernelError> {
