@@ -558,15 +558,11 @@ NS_MNT_GET_INFO's nr_mounts is a walk of its tree under NAMESPACE_SEM
 
 ## detach_mounts gaps
 
-**Location**: `fs/mount.rs` (`detach_mounts`), `fs/namei/mod.rs`
-(`delete_entry`), `fs/link.rs` (rename)
+**Location**: `fs/mount.rs` (`detach_mounts`)
 
 - The detached trees' submounts are disconnected as for a lazy umount
   (locked ones leave covers); Linux __detach_mounts keeps them all
   connected (umount_tree with UMOUNT_CONNECTED).
-- rmdir, unlink and a rename over a victim leave mounts other
-  namespaces have on the removed dentry; Linux vfs_rmdir, vfs_unlink
-  and vfs_rename detach them (dont_mount, detach_mounts).
 
 ## nullfs gaps
 

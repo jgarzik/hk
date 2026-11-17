@@ -43,6 +43,9 @@ use crate::util::list::{ListPtr, RefPtr};
 /// MOUNT_LOCK): a hint for the walk; which mount covers it is the
 /// namespace's business
 const DCACHE_MOUNTED: u32 = 1 << 16;
+/// Nothing may be mounted on it any more (Linux DCACHE_CANT_MOUNT): its
+/// name was removed
+const DCACHE_CANT_MOUNT: u32 = 1 << 8;
 
 /// The dcache's tree shape (Linux rename_lock): held for writing by
 /// d_move / d_exchange, which bumps its sequence; for reading by
@@ -737,6 +740,9 @@ impl Dentry {
             return;
         }
         if DentryRef::count(&c) <= held + TREE_REFS + 1 {
+            // Negative in place: a name made there later may be mounted
+            // on again (Linux d_delete clears DCACHE_CANT_MOUNT)
+            c.set_flag(&mut cl, DCACHE_CANT_MOUNT, false);
             // Linux dentry_unlink_inode: inside a d_seq write section
             let s = c.seq_write(&mut cl);
             let i = c.take_inode(&mut cl);
@@ -867,6 +873,17 @@ impl Dentry {
     /// DCACHE_MOUNTED); under MOUNT_LOCK, with its mountpoint
     pub fn set_mounted(&self, on: bool) {
         self.set_flag(&mut self.d_lock.write(), DCACHE_MOUNTED, on);
+    }
+
+    /// Its name was removed (rmdir, unlink, a rename over it): nothing
+    /// may be mounted on it from now on (Linux dont_mount, under d_lock)
+    pub fn dont_mount(&self) {
+        self.set_flag(&mut self.d_lock.write(), DCACHE_CANT_MOUNT, true);
+    }
+
+    /// Nothing may be mounted on it (Linux cant_mount)
+    pub fn cant_mount(&self) -> bool {
+        self.flag(DCACHE_CANT_MOUNT)
     }
 
     /// Get the superblock this dentry belongs to

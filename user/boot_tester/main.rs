@@ -253,6 +253,7 @@ pub fn run_all_tests() {
     proc::sysfs::run_tests();
     proc::tracefs::run_tests();
     mount::pnode::run_tests();
+    mount::detach::run_tests();
     proc::proc_dcache::run_tests();
     process::process::run_tests();
     fs::file_io::run_tests();

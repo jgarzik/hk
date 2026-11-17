@@ -2420,7 +2420,9 @@ fn lock_mount(p: &Path) -> Result<LockedMp, KernelError> {
             drop(lock);
             continue;
         }
-        if dir.is_dead() || !p.mnt.is_mounted() {
+        // A name removed meanwhile (Linux do_lock_mount: cant_mount,
+        // under the dentry's inode lock, which the removal holds)
+        if dir.is_dead() || at.dentry.cant_mount() || !p.mnt.is_mounted() {
             return Err(KernelError::NotFound);
         }
         return Ok(LockedMp { ns, _dir: lock, at });

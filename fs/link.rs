@@ -491,6 +491,13 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
     {
         d.set_dead();
     }
+    // The replaced name: what other namespaces mounted on it goes, and
+    // nothing is mounted there any more (Linux vfs_rename: dont_mount,
+    // detach_mounts, under the target's lock)
+    if let Some(t) = dst.as_ref().filter(|_| !exchange && r.is_ok()) {
+        t.dont_mount();
+        super::mount::detach_mounts(t);
+    }
     // Both parents' mtime and ctime, both inodes' ctime (Linux
     // simple_rename_timestamp)
     if r.is_ok() {

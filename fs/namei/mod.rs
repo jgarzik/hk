@@ -1041,6 +1041,11 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         if r.is_ok() {
             dir.touch_mc();
             inode.touch_c();
+            // What other namespaces mounted on it goes too, and nothing
+            // is mounted there any more (Linux vfs_rmdir, vfs_unlink:
+            // dont_mount, detach_mounts, under the victim's lock)
+            victim.dont_mount();
+            super::mount::detach_mounts(&victim);
         }
         drop(victim_lock);
         r?;

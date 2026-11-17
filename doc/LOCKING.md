@@ -3681,7 +3681,15 @@ and target (`fs::lock_two_nondirs`, lower address first, one lock if
 they are the same inode) around the file system's `rename`. So a link
 never brings back an inode whose last link an unlink in another
 directory is dropping. Order: parent directory `i_rwsem`(s) -> that
-inode's `i_rwsem` -> dentry `d_lock` -> fs-internal locks. The victim
+inode's `i_rwsem` -> dentry `d_lock` -> fs-internal locks. Once the
+file system removed the name, still under the victim's lock (a
+rename's replaced target: under its own), its dentry is marked so
+nothing mounts on it again (`Dentry::dont_mount`, Linux dont_mount:
+DCACHE_CANT_MOUNT under its `d_lock`; `lock_mount` refuses it with
+ENOENT under the target's `i_rwsem`, which the removal holds) and what
+other mount namespaces mounted on it is detached (`detach_mounts`,
+Linux vfs_rmdir, vfs_unlink, vfs_rename: NAMESPACE_SEM write and
+MOUNT_LOCK under the inodes' `i_rwsem`, as the order above has it). The victim
 is never an ancestor of the locked parents (a link source is never a
 directory; rename skips directories, which have no hard links), so this
 nests strictly below the directory order.
