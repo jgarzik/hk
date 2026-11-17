@@ -376,13 +376,29 @@ fn lookup_fast_ref(
     }
 }
 
-/// A symlink's body in ref mode (Linux pick_link: the inode's i_link,
-/// else ->get_link)
-fn link_body(inode: &Inode) -> Result<Link, KernelError> {
-    match inode.i_link() {
-        Some(l) => Ok(Link::Text(l.to_vec())),
-        None => inode.i_op.get_link(inode, false),
+/// A symlink's body as ref mode takes it (Linux pick_link's body): the
+/// inode's `i_link`, read in place, else what ->get_link gives
+enum Body<'a> {
+    /// `i_link`
+    Kept(&'a [u8]),
+    /// ->get_link's text
+    Made(Vec<u8>),
+    /// ->get_link's object: a magic link (nd_jump_link)
+    Jump(Path),
+}
+
+/// A symlink's body in ref mode (Linux pick_link: READ_ONCE(i_link),
+/// else ->get_link with the dentry): the one choice both the walk
+/// ([`Nd::get_link`]) and an O_CREAT open's last links
+/// ([`Nd::last_links`]) make
+fn link_body(inode: &Inode) -> Result<Body<'_>, KernelError> {
+    if let Some(l) = inode.i_link() {
+        return Ok(Body::Kept(l));
     }
+    Ok(match inode.i_op.get_link(inode, false)? {
+        Link::Text(t) => Body::Made(t),
+        Link::Jump(p) => Body::Jump(p),
+    })
 }
 
 /// A ref-mode walk's name and link stack (Linux nameidata's nd->stack
@@ -829,15 +845,14 @@ impl<'a> Nd<'a> {
     ) -> Result<Path, KernelError> {
         let inode = link.get_inode().ok_or(KernelError::NotFound)?;
         inode.touch_atime(&link.mnt);
-        let body = match inode.i_link() {
-            Some(_) => None,
-            None => match inode.i_op.get_link(&inode, false)? {
-                Link::Jump(p) => {
-                    self.may_jump(&dir, &p, w.f)?;
-                    return Ok(p);
-                }
-                Link::Text(t) => Some(t),
-            },
+        // An i_link body is read through the held inode, not copied
+        let body = match link_body(&inode)? {
+            Body::Kept(_) => None,
+            Body::Made(t) => Some(t),
+            Body::Jump(p) => {
+                self.may_jump(&dir, &p, w.f)?;
+                return Ok(p);
+            }
         };
         let mut fr = HeldFrame {
             link,
@@ -944,14 +959,19 @@ impl<'a> Nd<'a> {
             if f.no_symlinks || found.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
                 return Err(KernelError::TooManySymlinks);
             }
-            let got = link_body(&inode)?;
+            // pick_link: the atime, then the body
             inode.touch_atime(&found.mnt);
-            let target = match got {
-                Link::Jump(o) => {
+            let made;
+            let target = match link_body(&inode)? {
+                Body::Kept(t) => t,
+                Body::Made(t) => {
+                    made = t;
+                    &made
+                }
+                Body::Jump(o) => {
                     self.may_jump(&dir, &o, f)?;
                     return Ok(CreateAt::Object(o));
                 }
-                Link::Text(t) => t,
             };
             let start = if target.starts_with(b"/") {
                 self.jump_root(&dir, f)?;
@@ -959,7 +979,7 @@ impl<'a> Nd<'a> {
             } else {
                 Start::path(&dir)
             };
-            p = self.parentat(start, &target, f)?;
+            p = self.parentat(start, target, f)?;
             if p.last != Last::Norm || p.slash {
                 return Err(KernelError::IsDirectory);
             }
