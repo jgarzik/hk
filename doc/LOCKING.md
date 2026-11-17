@@ -768,6 +768,8 @@ Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
     (spin, thread context; hash chains; in practice a leaf) →
     Task.alloc_lock (spin Mutex, per task, thread context, not
     IRQ-safe; Linux task_lock; one task's at a time) →
+    SigHand.siglock (spin Mutex, per handler table, thread context;
+    Linux sighand->siglock, 3.7) →
     SignalStruct.jobctl (spin Mutex, per thread group, thread context;
     job-control state, 3.7) → Task.sig (spin
     Mutex, per task) → SignalStruct.shared (spin Mutex) →
@@ -4354,7 +4356,8 @@ state patterns.
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `Task.sighand` | `Option<Arc<SigHand>>` under TASKLIST | The task's handler table |
+| `Task.sighand` | `RcuLockedArc<SigHand, GlobalTaskTable>` | The task's handler table (Linux task->sighand, `__rcu`): set by fork under TASKLIST's write lock before the child runs; replaced (exec's unshare_sighand) or cleared (exit) under TASKLIST's write lock and the old table's `siglock`, the old reference dropped a grace period later (`put_rcu` on `SigHand.puts`); read under TASKLIST (the views' `sighand`) or an RCU read guard (`get_task_sighand`) |
+| `SigHand.siglock` | `spin::Mutex<()>`, thread context only (not IRQ-safe), one lockdep class | Linux sighand->siglock: held with TASKLIST's write lock while a task stops naming the table (`SigHand::leave`: exec, exit), nothing taken under it. Not IRQ-safe as in Linux PREEMPT_RT: hk sends no signal from an interrupt handler (rule 1, `check_send_context`); a hardirq sender would make it an IrqSpinlock (Linux irqsave). Order: TASKLIST → `siglock` → `SignalStruct.jobctl`. The rest of siglock's state moves under it per doc/res/hk-siglock.md |
 | `SigHand.users` | `TableCell<u32>` (TASKLIST) | Tasks whose `Task.sighand` it is, changed with that field (Linux sighand->count): exec copies a table with more than one (unshare_sighand) |
 | `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack; a ptrace stop: `jobctl` (TRACED, PTRACE_FROZEN, LISTENING), `ptrace_code`, `last_siginfo` (3.1.3) (Linux siglock's per-task part: jobctl, exit_code, last_siginfo) |
 | `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under `Task.sig` | Pending-signal flag |
@@ -4383,7 +4386,7 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 #### Locking Rules
 
 1. **Per-task signal state has its own lock** - `get_task_sighand`
-   clones the `Arc<SigHand>` out under TASKLIST; `with_task_signal_state`
+   clones the `Arc<SigHand>` out under RCU; `with_task_signal_state`
    checks the task is still listed (the current one without TASKLIST,
    another under TASKLIST's read lock) and runs its closure under `Task.sig` (no
    sleeping, no user memory, no TASKLIST, nothing released in it).
@@ -4454,7 +4457,9 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 ```
 0. SigHand.update (sleeping Mutex; rt_sigaction only, never nested)
    ↓
-1. TASKLIST (Task.sighand; read lock to find a task)
+1. TASKLIST (read lock to find a task)
+   ↓
+1a. SigHand.siglock (spin Mutex; with TASKLIST written, Task.sighand changes)
    ↓
 2. SignalStruct.jobctl (spin Mutex, group stop state; one group's)
    ↓
@@ -4494,7 +4499,7 @@ child.shared_pending = SharedPending(Some(signal.clone()));
 
 **rt_sigaction(2):** Get/set signal handlers:
 ```rust
-let sighand = get_task_sighand(&current())?;  // cloned out under TASKLIST
+let sighand = get_task_sighand(&current())?;  // cloned out under RCU
 let _update = sighand.lock_update();     // SigHand.update (sleeping)
 let old = sighand.set_action(sig, new);  // SigHand.action (IrqSpinlock),
                                          // one hold: actions[sig.idx()]
@@ -5880,7 +5885,8 @@ this is the interrupt-safety invariant:
 | Lock | Location | Type | Reason |
 |------|----------|------|--------|
 | `TASKLIST` | task/percpu.rs | `RwLock` | every task (Linux tasklist_lock) |
-| `SignalStruct.jobctl` | signal/mod.rs, signal/stop.rs | `Mutex` | Job-control (group stop) state (after TASKLIST, before Task.sig; 3.7) |
+| `SigHand.siglock` | signal/mod.rs | `Mutex` | Linux sighand->siglock: `Task.sighand` changes (after TASKLIST, before SignalStruct.jobctl; 3.7) |
+| `SignalStruct.jobctl` | signal/mod.rs, signal/stop.rs | `Mutex` | Job-control (group stop) state (after SigHand.siglock, before Task.sig; 3.7) |
 | `SignalStruct.shared` | signal/mod.rs | `Mutex` | Thread-group pending signals and curr_target (under Task.sig) |
 | `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
 | `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |

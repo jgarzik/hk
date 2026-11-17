@@ -191,7 +191,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Snap> {
         blocked,
         pending,
         shared: Some(shared),
-        sighand: t.sighand().cloned(),
+        sighand: t.sighand(),
         signal: t.signal().cloned(),
         fs,
         files,

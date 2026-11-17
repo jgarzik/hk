@@ -184,7 +184,7 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> K
             return Err(KernelError::NoProcess);
         };
         (
-            (arc_key(&a.sighand), arc_key(&b.sighand)),
+            (arc_key(&a.sighand()), arc_key(&b.sighand())),
             (arc_key(&a.sysvsem), arc_key(&b.sysvsem)),
         )
     };

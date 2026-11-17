@@ -785,6 +785,12 @@ tracer_reads!(TaskViewMut);
 macro_rules! relation_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
+            /// A reference to its signal handlers (none before fork
+            /// attaches them or once it exits)
+            pub fn sighand(&self) -> Option<Arc<crate::signal::SigHand>> {
+                self.task.sighand.get_protected(self.table)
+            }
+
             /// Its real parent (no reference taken: listed while the
             /// table is borrowed)
             pub fn real_parent(&self) -> Option<&'a Task> {

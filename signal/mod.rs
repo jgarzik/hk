@@ -374,7 +374,20 @@ pub struct SigHand {
     /// Tasks whose `Task.sighand` it is (Linux sighand->count), changed
     /// and read under TASKLIST with that field
     users: crate::task::TableCell<u32>,
+    /// Linux sighand->siglock: held, with TASKLIST's write lock, while
+    /// a task's `Task.sighand` stops naming this table (exec's unshare,
+    /// exit), so a holder that found it through a task still sees it
+    /// there (`lock_task_sighand`). Thread context only (hk sends no
+    /// signal from an interrupt handler: `check_send_context`; Linux
+    /// PREEMPT_RT's model), after TASKLIST
+    siglock: crate::sync::spin::Mutex<()>,
+    /// References dropped a grace period late: a table a task stops
+    /// naming may still be read under RCU (Linux frees it
+    /// SLAB_TYPESAFE_BY_RCU)
+    puts: crate::sync::rcu::RcuPuts,
 }
+
+crate::rcu_puts!(SigHand, puts);
 
 /// A handler table with every action at its default
 fn default_actions() -> Box<[SigAction]> {
@@ -389,7 +402,24 @@ impl SigHand {
             update: crate::sync::Mutex::new(()),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
             users: crate::task::TableCell::new(0),
+            siglock: crate::sync::spin::Mutex::new(()),
+            puts: crate::sync::rcu::RcuPuts::new(),
         }
+    }
+
+    /// Task `t` names `new` in place of this table (or none), under
+    /// TASKLIST's write lock (`table`) and this table's siglock (Linux
+    /// unshare_sighand, __exit_signal); the old reference is dropped a
+    /// grace period later
+    fn leave(
+        &self,
+        t: &Task,
+        new: Option<Arc<SigHand>>,
+        table: &mut crate::task::percpu::GlobalTaskTable,
+    ) {
+        let _l = self.siglock.lock();
+        self.put(table);
+        t.sighand.replace(new, table).defer_put();
     }
 
     /// One more task uses it (under TASKLIST's write lock)
@@ -452,6 +482,8 @@ impl SigHand {
             update: crate::sync::Mutex::new(()),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
             users: crate::task::TableCell::new(0),
+            siglock: crate::sync::spin::Mutex::new(()),
+            puts: crate::sync::rcu::RcuPuts::new(),
         })
     }
 
@@ -914,9 +946,10 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
     let mut table = TASKLIST.write();
     if table.view(t).is_some() {
         sighand.get(&mut table);
+        // Named before anyone can lock it
+        t.sighand.replace(Some(sighand), &mut table).defer_put();
     }
     if let Some(mut task) = table.view_mut(t) {
-        task.set_sighand(sighand);
         *task.task.sig.lock() = state;
         task.task.set_sigpending(false);
         task.task.set_cpu_group(&s);
@@ -926,9 +959,10 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
     s.set_leader_pid(&mut table, pid);
 }
 
-/// Task `t`'s signal handlers
+/// Task `t`'s signal handlers, read under RCU (Linux
+/// rcu_dereference(t->sighand))
 pub fn get_task_sighand(t: &Task) -> Option<Arc<SigHand>> {
-    TASKLIST.read().view(t)?.sighand().cloned()
+    t.sighand.get(&crate::sync::rcu::read_lock())
 }
 
 /// How the current task takes `sig` (for tty job control)
@@ -1100,7 +1134,7 @@ pub fn fork_signal(
         let table = TASKLIST.read();
         let parent = table.view(parent);
         (
-            parent.and_then(|p| p.sighand().cloned()),
+            parent.and_then(|p| p.sighand()),
             parent.map(|p| {
                 let s = p.task.sig.lock();
                 (s.blocked, s.trap, s.altstack)
@@ -1197,6 +1231,11 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal, mut delay: ForkDelay) {
     }
     if table.view(child).is_some() {
         f.sighand.get(&mut table);
+        // Not named before (the child has not run): nothing to retire
+        child
+            .sighand
+            .replace(Some(f.sighand), &mut table)
+            .defer_put();
     }
     // A new process: the child leads it, with its parent's controlling
     // tty (Linux copy_process, under tasklist_lock)
@@ -1211,7 +1250,6 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal, mut delay: ForkDelay) {
         }
     }
     if let Some(mut c) = table.view_mut(child) {
-        c.set_sighand(f.sighand);
         c.task.set_cpu_group(&f.signal);
         c.set_signal(f.signal);
     }
@@ -1239,12 +1277,14 @@ pub fn exit_task_signal(t: &Task) {
                 }
                 task.take_signal()
             };
-            (task.take_sighand(), signal, old)
+            (signal, old)
         });
-        if let Some((Some(h), _, _)) = &old {
-            h.put(&mut table);
+        // Its handlers go (Linux __exit_signal, under siglock)
+        let h = old.as_ref().and_then(|_| t.sighand.get_protected(&table));
+        if let Some(h) = &h {
+            h.leave(t, None, &mut table);
         }
-        old
+        (h, old)
     };
 }
 
@@ -1272,17 +1312,17 @@ pub fn exec_signals() -> Result<(), KernelError> {
     if shared {
         let new = old.deep_clone()?;
         // The old reference goes after TASKLIST
-        let _old = {
-            let mut table = TASKLIST.write();
-            if table.view(&me).is_some() {
-                new.get(&mut table);
-            }
-            let prev = table.view_mut(&me).and_then(|mut t| t.set_sighand(new));
-            if let Some(p) = &prev {
-                p.put(&mut table);
-            }
-            prev
-        };
+        // Under TASKLIST's write lock and the old table's siglock
+        // (Linux unshare_sighand)
+        let mut table = TASKLIST.write();
+        if table.view(&me).is_some()
+            && let Some(prev) = me.sighand.get_protected(&table)
+        {
+            new.get(&mut table);
+            prev.leave(&me, Some(new), &mut table);
+            drop(table);
+            drop(prev);
+        }
     }
     if let Some(h) = get_task_sighand(&me) {
         h.flush_handlers();
@@ -1554,7 +1594,7 @@ fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &Task) -> Option<T
         traced: v.ptrace() != 0,
         ucounts: v.ucounts(),
         limit: limit.map_or(0, |r| r.rlim_cur),
-        sighand: v.sighand().cloned(),
+        sighand: v.sighand(),
         signal: sig.cloned(),
     })
 }

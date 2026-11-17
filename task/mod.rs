@@ -976,6 +976,12 @@ pub struct Task {
     /// after the task leaves a list (`put_rcu`; it may leave and join
     /// lists several times within one: setpgid)
     rcu_puts: crate::sync::rcu::RcuPuts,
+    /// Its signal handlers (Linux task->sighand, `__rcu`; shared with
+    /// CLONE_SIGHAND): written under TASKLIST's write lock and the old
+    /// table's `siglock`, the replaced one dropped a grace period later
+    /// (`put_rcu`); read under TASKLIST or an RCU read guard. None
+    /// before fork attaches it and once the task exits.
+    pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, percpu::GlobalTaskTable>,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner>>,
@@ -1038,9 +1044,6 @@ pub struct TaskInner {
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
-    /// Signal handlers (shared when CLONE_SIGHAND)
-    sighand: Option<Arc<SigHand>>,
-
     /// Thread-group signal state (shared when CLONE_THREAD)
     signal: Option<Arc<SignalStruct>>,
 
@@ -1134,7 +1137,6 @@ impl TaskInner {
             pgd,
             clear_child_tid: 0,
             set_child_tid: 0,
-            sighand: None,
             signal: None,
             sysvsem: None,
             robust_list: 0,
@@ -1150,21 +1152,6 @@ impl TaskInner {
             ptrace_message: 0,
             ptrace_options: 0,
         }
-    }
-
-    /// Its signal handlers (none once it exits)
-    pub fn sighand(&self) -> Option<&Arc<SigHand>> {
-        self.sighand.as_ref()
-    }
-
-    /// Install signal handlers `h`; returns the old ones
-    pub fn set_sighand(&mut self, h: Arc<SigHand>) -> Option<Arc<SigHand>> {
-        self.sighand.replace(h)
-    }
-
-    /// Detach its signal handlers
-    pub fn take_sighand(&mut self) -> Option<Arc<SigHand>> {
-        self.sighand.take()
     }
 
     /// Its thread group's signal state (none once it is reaped)
@@ -1725,6 +1712,7 @@ impl Task {
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
             rcu_puts: crate::sync::rcu::RcuPuts::new(),
+            sighand: crate::sync::rcu::RcuLockedArc::none(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1796,6 +1784,7 @@ impl Task {
             session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
             rcu_puts: crate::sync::rcu::RcuPuts::new(),
+            sighand: crate::sync::rcu::RcuLockedArc::none(),
             inner: TableCell::new(None),
         }
     }
