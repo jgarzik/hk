@@ -979,8 +979,9 @@ pub struct Task {
     /// Its signal handlers (Linux task->sighand, `__rcu`; shared with
     /// CLONE_SIGHAND): written under TASKLIST's write lock and the old
     /// table's `siglock`, the replaced one dropped a grace period later
-    /// (`put_rcu`); read under TASKLIST or an RCU read guard. None
-    /// before fork attaches it and once the task exits.
+    /// (`put_rcu`); read under TASKLIST or an RCU read guard. Set in
+    /// the section that lists the task, cleared at release (a zombie
+    /// keeps it, Linux __exit_signal).
     pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, percpu::GlobalTaskTable>,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)

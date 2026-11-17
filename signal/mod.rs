@@ -411,7 +411,7 @@ impl SigHand {
     /// TASKLIST's write lock (`table`) and this table's siglock (Linux
     /// unshare_sighand, __exit_signal); the old reference is dropped a
     /// grace period later
-    fn leave(
+    pub(crate) fn leave(
         &self,
         t: &Task,
         new: Option<Arc<SigHand>>,
@@ -1204,25 +1204,34 @@ impl ForkSignal {
     }
 }
 
-/// Attach new task `child`'s shared signal objects, once it is in
-/// TASKLIST.
+/// Before TASKLIST: an inherited finite RLIMIT_CPU is watched from the
+/// start (Linux posix_cpu_timers_init_group)
+pub fn fork_cpu_watch(child: &Task, f: &ForkSignal) {
+    if !f.share_signal {
+        crate::time::cpu_timer::rlimit_cpu_changed(&f.signal, child.tid());
+    }
+}
+
+/// Attach new task `child`'s shared signal objects in the TASKLIST
+/// write section (`table`) that lists it, before anyone can find it
+/// (Linux copy_process: copy_sighand / copy_signal before, the group's
+/// pending set under tasklist_lock and siglock).
 /// The multiprocess signals the fork recorded (`delay`) become the new
 /// process's pending signals, in the same TASKLIST hold that makes it
 /// reachable by a send (Linux copy_process: shared_pending.signal =
 /// delayed.signal under siglock and tasklist_lock), and its first
 /// return to user mode looks for them (Linux schedule_tail:
 /// calculate_sigpending).
-pub fn install_fork_signal(child: &Task, f: ForkSignal, mut delay: ForkDelay) {
+pub fn install_fork_signal(
+    table: &mut crate::task::percpu::GlobalTaskTable,
+    child: &Task,
+    f: ForkSignal,
+    mut delay: ForkDelay,
+) {
     if f.joined {
         // CLONE_THREAD: one more live thread
         f.signal.thread_added();
     }
-    if !f.share_signal {
-        // An inherited finite RLIMIT_CPU is watched from the start (Linux
-        // posix_cpu_timers_init_group)
-        crate::time::cpu_timer::rlimit_cpu_changed(&f.signal, child.tid());
-    }
-    let mut table = TASKLIST.write();
     let delayed = delay.take();
     if delayed.any() && !f.share_signal {
         let mut gp = f.signal.shared.lock();
@@ -1230,18 +1239,15 @@ pub fn install_fork_signal(child: &Task, f: ForkSignal, mut delay: ForkDelay) {
         child.set_sigpending(true);
     }
     if table.view(child).is_some() {
-        f.sighand.get(&mut table);
-        // Not named before (the child has not run): nothing to retire
-        child
-            .sighand
-            .replace(Some(f.sighand), &mut table)
-            .defer_put();
+        f.sighand.get(table);
+        // Not named before (the child is new): nothing to retire
+        child.sighand.replace(Some(f.sighand), table).defer_put();
     }
     // A new process: the child leads it, with its parent's controlling
     // tty (Linux copy_process, under tasklist_lock)
     if !f.share_signal {
         let pid = table.view(child).and_then(|c| c.thread_pid().cloned());
-        f.signal.set_leader_pid(&mut table, pid);
+        f.signal.set_leader_pid(table, pid);
         let me = crate::task::percpu::current();
         if let Some(ps) = table.view(&me).and_then(|p| p.signal().cloned()) {
             // One ctty lock at a time: it is a leaf
@@ -1262,7 +1268,7 @@ pub fn exit_task_signal(t: &Task) {
     // __exit_signal); an exiting task gets no more queued (send_locked)
     let _old = {
         let mut table = TASKLIST.write();
-        let old = table.view_mut(t).map(|mut task| {
+        table.view_mut(t).map(|mut task| {
             let old = core::mem::replace(&mut *task.task.sig.lock(), TaskSignalState::boot());
             task.task.set_sigpending(false);
             // A zombie leader keeps the group's SignalStruct (its exit
@@ -1278,13 +1284,7 @@ pub fn exit_task_signal(t: &Task) {
                 task.take_signal()
             };
             (signal, old)
-        });
-        // Its handlers go (Linux __exit_signal, under siglock)
-        let h = old.as_ref().and_then(|_| t.sighand.get_protected(&table));
-        if let Some(h) = &h {
-            h.leave(t, None, &mut table);
-        }
-        (h, old)
+        })
     };
 }
 

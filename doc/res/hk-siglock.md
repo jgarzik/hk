@@ -118,12 +118,14 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
 1. [x] siglock exists; `Task.sighand` RCU pointer out of TaskInner; exec
    unshare and the exit clear take TASKLIST write + old siglock;
    `get_task_sighand` under RCU.
-   Left for 2: fork names the child's table after the child is
-   listed (Linux: before it is visible), so `lock_task_sighand` (added
-   with its first caller) would see none in that gap.
-2. [ ] sighand cleared at release (`remove`, Linux __exit_signal), not
-   at exit; the zombie leader keeps handlers; `group_task` goes (Linux
-   takes the leader); group pending reached through `Task.cpu_group`.
+   `lock_task_sighand` is added with its first caller.
+2. [x] sighand set in the section that lists the child and cleared at
+   release (`unhash`, Linux __exit_signal), not at exit: a zombie keeps
+   its handlers.
+2b. [ ] the per-task flush at release too (Linux __exit_signal's
+   flush_sigqueue; hk swaps `Task.sig` at exit, so a zombie leader
+   loses its group-pending link); then `group_task` goes (Linux takes
+   the leader), group pending reached through `Task.cpu_group`.
 3. [ ] thread list into `SignalStruct` (`SigCell` + TASKLIST); walks in
    signal/ move from TASKLIST to siglock (complete_signal, zap_threads,
    stop::prepare, do_signal_stop).

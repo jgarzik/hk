@@ -786,7 +786,7 @@ macro_rules! relation_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
             /// A reference to its signal handlers (none before fork
-            /// attaches them or once it exits)
+            /// attaches them or once it is released)
             pub fn sighand(&self) -> Option<Arc<crate::signal::SigHand>> {
                 self.task.sighand.get_protected(self.table)
             }
@@ -1205,6 +1205,12 @@ impl GlobalTaskTable {
             .and_then(|i| i.user_ns.as_ref())
         {
             u.active_put();
+        }
+        // Its handlers go (Linux __exit_signal from release_task, under
+        // siglock): a zombie keeps them until here. The reference taken
+        // to do it is not the last (the cell's goes through put_rcu)
+        if let Some(h) = t.sighand.get_protected(self) {
+            h.leave(&t, None, self);
         }
         // SAFETY: listed (the caller's)
         let listed = unsafe { self.tasks.remove(&t) };
@@ -2869,6 +2875,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         None
     };
 
+    crate::signal::fork_cpu_watch(&child_task, &child_signal);
     // Add to global task table
     {
         let mut table = TASKLIST.write();
@@ -2911,6 +2918,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         new_pid.attached();
+        // Its handlers and group state, in the section that lists it
+        // (Linux copy_process: visible with its sighand and signal)
+        crate::signal::install_fork_signal(&mut table, &child_task, child_signal, delay);
         // CLONE_PTRACE: traced as the caller is now, by its tracer
         // (Linux ptrace_init_task under tasklist_lock: never a tracer
         // that has detached its tracees on its way out)
@@ -2958,12 +2968,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         fc.post_fork(&child_task);
     }
 
-    // Handle signal handlers (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)
-    // If CLONE_SIGHAND is set, child shares parent's signal handler table
-    // Otherwise, child gets a deep copy of handlers
-    // If CLONE_CLEAR_SIGHAND is set, handlers are reset to default (except SIG_IGN)
-    // CLONE_THREAD also implies sharing shared_pending
-    crate::signal::install_fork_signal(&child_task, child_signal, delay);
+    // A thread cloned into a dying group dies too (its signal state was
+    // attached in the listing section)
     if config.flags & CLONE_THREAD != 0 {
         crate::signal::zap_new_thread(&me, &child_task);
     }

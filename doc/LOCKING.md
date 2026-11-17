@@ -4356,7 +4356,7 @@ state patterns.
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `Task.sighand` | `RcuLockedArc<SigHand, GlobalTaskTable>` | The task's handler table (Linux task->sighand, `__rcu`): set by fork under TASKLIST's write lock before the child runs; replaced (exec's unshare_sighand) or cleared (exit) under TASKLIST's write lock and the old table's `siglock`, the old reference dropped a grace period later (`put_rcu` on `SigHand.puts`); read under TASKLIST (the views' `sighand`) or an RCU read guard (`get_task_sighand`) |
+| `Task.sighand` | `RcuLockedArc<SigHand, GlobalTaskTable>` | The task's handler table (Linux task->sighand, `__rcu`): set by fork in the TASKLIST write section that lists the child (`install_fork_signal`, Linux copy_process: visible with its sighand); replaced (exec's unshare_sighand) or cleared at release (`unhash`, Linux __exit_signal from release_task: a zombie keeps its handlers) under TASKLIST's write lock and the old table's `siglock`, the old reference dropped a grace period later (`put_rcu` on `SigHand.puts`); read under TASKLIST (the views' `sighand`) or an RCU read guard (`get_task_sighand`) |
 | `SigHand.siglock` | `spin::Mutex<()>`, thread context only (not IRQ-safe), one lockdep class | Linux sighand->siglock: held with TASKLIST's write lock while a task stops naming the table (`SigHand::leave`: exec, exit), nothing taken under it. Not IRQ-safe as in Linux PREEMPT_RT: hk sends no signal from an interrupt handler (rule 1, `check_send_context`); a hardirq sender would make it an IrqSpinlock (Linux irqsave). Order: TASKLIST → `siglock` → `SignalStruct.jobctl`. The rest of siglock's state moves under it per doc/res/hk-siglock.md |
 | `SigHand.users` | `TableCell<u32>` (TASKLIST) | Tasks whose `Task.sighand` it is, changed with that field (Linux sighand->count): exec copies a table with more than one (unshare_sighand) |
 | `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack; a ptrace stop: `jobctl` (TRACED, PTRACE_FROZEN, LISTENING), `ptrace_code`, `last_siginfo` (3.1.3) (Linux siglock's per-task part: jobctl, exit_code, last_siginfo) |
@@ -4640,7 +4640,7 @@ de_thread, exit_group does not.
 - Tasks share `Arc<SigHand>` through `Task.sighand`
 - Clone with CLONE_SIGHAND: child shares parent's `Arc<SigHand>`
 - Clone without CLONE_SIGHAND: new `Arc<SigHand>` with deep-cloned handlers
-- Exit: the Arc drops with the task's entry
+- Release: the task stops naming it (`unhash`), its reference dropped through `put_rcu`
 
 ### 3.8 Futex Subsystem
 
