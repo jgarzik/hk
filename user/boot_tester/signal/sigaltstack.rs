@@ -7,6 +7,10 @@
 //! - SIGALTSTACK_MINSIZE: ENOMEM below the arch MINSIGSTKSZ, OK at it
 //! - SIGALTSTACK_DELIVER: an SA_ONSTACK handler runs on the alt stack, one
 //!   without SA_ONSTACK on the interrupted stack
+//! - SIGALTSTACK_FRESH: a handler frame on alt stack pages never touched
+//!   before, its FP image across a page boundary (x86: the XSAVE straight
+//!   to the frame faults and is retried, Linux copy_fpstate_to_sigframe),
+//!   is delivered and returns
 //! - SIGALTSTACK_UCSTACK: the handler's uc_stack is the stack as set
 //!   (Linux __save_altstack: the stored flags, no SS_ONSTACK)
 //! - SIGALTSTACK_ONSTACK_EPERM: on the stack, a change is EPERM and a
@@ -22,7 +26,8 @@ use crate::harness::{R, check, report_r};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, SA_ONSTACK, SA_RESTORER,
     SA_SIGINFO, SIGCHLD, SIGSEGV, SIGUSR1, sys_exit, sys_exit_group, sys_fork, sys_getpid,
-    sys_gettid, sys_mmap, sys_mprotect, sys_rt_sigaction, sys_sigaltstack, sys_tgkill, sys_wait4,
+    sys_gettid, sys_mmap, sys_mprotect, sys_munmap, sys_rt_sigaction, sys_sigaltstack, sys_tgkill,
+    sys_wait4,
 };
 
 const SS_ONSTACK: i32 = 1;
@@ -92,6 +97,7 @@ pub fn run_tests() {
     test_mode_onstack();
     test_minsize();
     test_deliver();
+    test_fresh();
     test_ucstack();
     test_onstack_eperm();
     test_autodisarm();
@@ -225,6 +231,36 @@ fn deliver() -> R {
     let s = raise(0);
     check(b"plain ran", s.count == 1, s.count as i64)?;
     check(b"plain sp off alt", !in_alt(s.sp), s.sp as i64)
+}
+
+fn test_fresh() {
+    report_r(b"SIGALTSTACK_FRESH", fresh());
+    disable();
+}
+
+fn fresh() -> R {
+    let len = 4 * PAGE;
+    let base = sys_mmap(
+        0,
+        len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    check(b"mmap", base >= 0, base)?;
+    let base = base as u64;
+    // The top 580 bytes past a page boundary: an x86 FP image (836
+    // bytes with AVX, 64-byte aligned below the top) starts in the
+    // page below, which nothing touched
+    let size = 3 * PAGE + 580;
+    let r = want(StackT::new(base, 0, size));
+    let s = raise(SA_ONSTACK);
+    disable();
+    sys_munmap(base, len);
+    check(b"set", r == 0, r)?;
+    check(b"ran", s.count == 1, s.count as i64)?;
+    check(b"sp on it", s.sp > base && s.sp - base <= size, s.sp as i64)
 }
 
 fn test_ucstack() {

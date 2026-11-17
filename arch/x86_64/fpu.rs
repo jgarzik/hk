@@ -92,10 +92,6 @@ impl FpuArea {
         u64::from_le_bytes(self.0[off..off + 8].try_into().unwrap())
     }
 
-    fn set_u32(&mut self, off: usize, v: u32) {
-        self.0[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    }
-
     fn set_u64(&mut self, off: usize, v: u64) {
         self.0[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
@@ -279,26 +275,53 @@ pub unsafe fn save_for_clone_child(regs: u64) -> u64 {
     area
 }
 
-/// Build the signal-frame image of the current FP state in `area`: the
-/// registers plus Linux's `_fpx_sw_bytes` (XSAVE only). Returns the number
-/// of bytes to copy to the user frame.
-pub fn save_sigframe(area: &mut FpuArea) -> usize {
-    save(area);
-    if !use_xsave() {
-        // Linux leaves the sw bytes zero for an FXSAVE frame
-        area.0[FXSAVE_SW_BYTES..XSAVE_HDR].fill(0);
-        return 512;
+/// Save the registers straight into the user signal frame's FP image at
+/// `buf` (64-byte aligned, [`sigframe_size`] bytes that passed
+/// access_ok), page faults disabled: false at a fault, which the caller
+/// resolves and retries (Linux copy_fpregs_to_sigframe)
+pub fn save_to_user(buf: u64) -> bool {
+    assert!(buf % 64 == 0, "FP signal image not 64-byte aligned");
+    if !crate::uaccess::access_ok(buf, sigframe_size()) {
+        return false;
     }
-    let size = xstate_size();
-    let sw = FXSAVE_SW_BYTES;
-    area.0[sw..XSAVE_HDR].fill(0);
-    area.set_u32(sw, FP_XSTATE_MAGIC1);
-    area.set_u32(sw + 4, (size + FP_XSTATE_MAGIC2_SIZE) as u32); // extended_size
-    area.set_u64(sw + 8, xfeatures()); // xfeatures
-    area.set_u32(sw + 16, size as u32); // xstate_size
-    area.set_u32(size, FP_XSTATE_MAGIC2);
-    size + FP_XSTATE_MAGIC2_SIZE
+    crate::uaccess::pagefault_disable();
+    // SAFETY: aligned and in user space (checked above); user access
+    // open around it only
+    let ok = unsafe {
+        <super::uaccess::X86_64Uaccess as crate::uaccess::UaccessArch>::user_access_begin();
+        let ok = super::uaccess::fpsave_user(buf, use_xsave(), xfeatures());
+        <super::uaccess::X86_64Uaccess as crate::uaccess::UaccessArch>::user_access_end();
+        ok
+    };
+    crate::uaccess::pagefault_enable();
+    ok
 }
+
+/// The XSAVE header's offset in an image, cleared before an XSAVE to
+/// the user frame (Linux: so its reserved fields are zero)
+pub const fn xsave_header() -> (usize, usize) {
+    (XSAVE_HDR, XSAVE_HDR_SIZE)
+}
+
+/// Linux `_fpx_sw_bytes` of a signal frame's image, at its offset:
+/// FP_XSTATE_MAGIC1, extended size, features and image size with XSAVE
+/// (Linux save_sw_bytes); zero for an FXSAVE frame
+pub fn sw_bytes() -> (usize, [u8; XSAVE_HDR - FXSAVE_SW_BYTES]) {
+    let mut sw = [0u8; XSAVE_HDR - FXSAVE_SW_BYTES];
+    if use_xsave() {
+        let size = xstate_size();
+        // extended_size and xstate_size fit u32 (FPU_AREA_SIZE bound)
+        sw[0..4].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+        sw[4..8].copy_from_slice(&((size + FP_XSTATE_MAGIC2_SIZE) as u32).to_le_bytes());
+        sw[8..16].copy_from_slice(&xfeatures().to_le_bytes());
+        sw[16..20].copy_from_slice(&(size as u32).to_le_bytes());
+    }
+    (FXSAVE_SW_BYTES, sw)
+}
+
+/// x87 | SSE in XSTATE_BV, always set in a signal frame's image (Linux
+/// save_xstate_epilog: XFEATURE_MASK_FPSSE)
+pub const XFEATURE_MASK_FPSSE: u32 = (XFEATURE_X87 | XFEATURE_SSE) as u32;
 
 /// Bytes the signal frame reserves for the FP image
 pub fn sigframe_size() -> usize {

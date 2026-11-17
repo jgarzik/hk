@@ -126,6 +126,39 @@ core::arch::global_asm!(
     ".popsection",
 );
 
+// FP state saved straight to a user signal frame (Linux
+// xsave_to_user_sigframe / fxsave_to_user_sigframe: XSTATE_OP and
+// fxsave with _ASM_EXTABLE_UA): rdi=the 64-byte aligned frame,
+// esi:edx=the XSAVE feature mask. A fault the page-fault handler does
+// not resolve resumes at the fixup, which returns -EFAULT.
+core::arch::global_asm!(
+    ".pushsection .text.hk_fpsave_user, \"ax\"",
+    ".global hk_xsave_user",
+    "hk_xsave_user:",
+    "    mov eax, esi",
+    ".global hk_xsave_user_insn",
+    "hk_xsave_user_insn:",
+    "    xsave64 [rdi]",
+    ".global hk_xsave_user_insn_end",
+    "hk_xsave_user_insn_end:",
+    "    xor eax, eax",
+    "    ret",
+    ".global hk_fxsave_user",
+    "hk_fxsave_user:",
+    ".global hk_fxsave_user_insn",
+    "hk_fxsave_user_insn:",
+    "    fxsave64 [rdi]",
+    ".global hk_fxsave_user_insn_end",
+    "hk_fxsave_user_insn_end:",
+    "    xor eax, eax",
+    "    ret",
+    ".global hk_fpsave_user_fixup",
+    "hk_fpsave_user_fixup:",
+    "    mov eax, -14",
+    "    ret",
+    ".popsection",
+);
+
 unsafe extern "C" {
     fn hk_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
     static hk_copy_user_insn: u8;
@@ -135,6 +168,36 @@ unsafe extern "C" {
     static hk_cmpxchg_user_insn: u8;
     static hk_cmpxchg_user_insn_end: u8;
     static hk_cmpxchg_user_fixup: u8;
+    fn hk_xsave_user(buf: *mut u8, lmask: u32, hmask: u32) -> i32;
+    static hk_xsave_user_insn: u8;
+    static hk_xsave_user_insn_end: u8;
+    fn hk_fxsave_user(buf: *mut u8) -> i32;
+    static hk_fxsave_user_insn: u8;
+    static hk_fxsave_user_insn_end: u8;
+    static hk_fpsave_user_fixup: u8;
+}
+
+/// XSAVE (`mask` the features) or FXSAVE of this CPU's FP registers to
+/// the user address `buf`; false at a fault the page-fault handler did
+/// not resolve (Linux xsave_to_user_sigframe, fxsave_to_user_sigframe)
+///
+/// # Safety
+/// `buf` is 64-byte aligned (16 for FXSAVE) and passed access_ok for
+/// the image's size; user access is open (`user_access_begin`).
+pub unsafe fn fpsave_user(buf: u64, xsave: bool, mask: u64) -> bool {
+    let p = buf as *mut u8;
+    // Truncating on purpose: EDX:EAX halves of the mask
+    let (lo, hi) = (mask as u32, (mask >> 32) as u32);
+    // SAFETY: a user address that passed access_ok, aligned (caller): a
+    // fault resumes at the fixup
+    let r = unsafe {
+        if xsave {
+            hk_xsave_user(p, lo, hi)
+        } else {
+            hk_fxsave_user(p)
+        }
+    };
+    r == 0
 }
 
 /// Exception-table lookup (Linux fixup_exception over __ex_table): if a
@@ -151,6 +214,16 @@ pub fn uaccess_fixup(rip: u64) -> Option<u64> {
             &raw const hk_cmpxchg_user_insn,
             &raw const hk_cmpxchg_user_insn_end,
             &raw const hk_cmpxchg_user_fixup,
+        ),
+        (
+            &raw const hk_xsave_user_insn,
+            &raw const hk_xsave_user_insn_end,
+            &raw const hk_fpsave_user_fixup,
+        ),
+        (
+            &raw const hk_fxsave_user_insn,
+            &raw const hk_fxsave_user_insn_end,
+            &raw const hk_fpsave_user_fixup,
         ),
     ];
     table

@@ -16,7 +16,7 @@ use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{
     AltStack, SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, UserStack, sa_flags,
 };
-use crate::uaccess::{access_ok, copy_from_user, copy_to_user};
+use crate::uaccess::{access_ok, copy_from_user, copy_to_user, get_user, put_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -356,17 +356,37 @@ fn put_rt_frame(
         .map_err(|_| KernelError::BadAddress)
 }
 
-/// Write the FP image of the interrupted code (live in the registers:
-/// the kernel does not use them) at `fpstate` (Linux
-/// copy_fpstate_to_sigframe). Out of line: its image is on the stack
-/// only while it runs, not under the rest of the frame's building.
-#[inline(never)]
-fn copy_fpstate_to_sigframe(fpstate: u64) -> KernelResult<()> {
-    let mut area = super::fpu::FpuArea::init();
-    let len = super::fpu::save_sigframe(&mut area);
-    copy_to_user(fpstate, &area.0[..len])
-        .map(|_| ())
-        .map_err(|_| KernelError::BadAddress)
+/// Save the FP state of the interrupted code (live in the registers:
+/// the kernel does not use them) straight into the user frame's image
+/// at `buf`, which passed access_ok (Linux copy_fpstate_to_sigframe):
+/// XSAVE or FXSAVE with page faults disabled, the frame faulted in and
+/// the save retried after a fault; then the software bytes, the end
+/// magic and the x87/SSE bits (save_xstate_epilog)
+fn copy_fpstate_to_sigframe(buf: u64) -> KernelResult<()> {
+    use super::fpu;
+    let efault = |_| KernelError::BadAddress;
+    if fpu::use_xsave() {
+        // The header first, so its reserved fields are zero
+        let (hdr, len) = fpu::xsave_header();
+        copy_to_user(buf + hdr as u64, &[0u8; 64][..len]).map_err(efault)?;
+    }
+    while !fpu::save_to_user(buf) {
+        let size = fpu::sigframe_size();
+        if crate::uaccess::fault_in_writeable(buf, size) != 0 {
+            return Err(KernelError::BadAddress);
+        }
+    }
+    let (off, sw) = fpu::sw_bytes();
+    copy_to_user(buf + off as u64, &sw).map_err(efault)?;
+    if !fpu::use_xsave() {
+        return Ok(());
+    }
+    let size = fpu::xstate_size() as u64;
+    put_user(buf + size, fpu::FP_XSTATE_MAGIC2).map_err(efault)?;
+    let (hdr, _) = fpu::xsave_header();
+    let bv = buf + hdr as u64;
+    let x: u32 = get_user(bv).map_err(efault)?;
+    put_user(bv, x | fpu::XFEATURE_MASK_FPSSE).map_err(efault)
 }
 
 /// Where a handler frame for `action` goes when `rsp` is interrupted

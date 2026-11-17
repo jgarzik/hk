@@ -1150,13 +1150,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
     taken minutes apart in time and absorbs host contention; interleave
     the low and high batches, or compare more tries.
 
-## Kernel stack frames
-
-**Location**: `arch/x86_64/signal.rs`
-
-- Large frames left: x86 `copy_fpstate_to_sigframe` (the FP image on
-  the stack; Linux XSAVEs straight into the user frame).
-
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)

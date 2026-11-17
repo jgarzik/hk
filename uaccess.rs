@@ -315,6 +315,23 @@ pub fn fault_in_readable(addr: u64, len: usize) -> usize {
     0
 }
 
+/// Linux fault_in_writeable: fault in every page of [addr, addr + len)
+/// for writing (a zero stored at the start of each page: the caller
+/// overwrites the range). Returns the bytes from the first page that
+/// could not be faulted in to the end (0: all present). Call with no
+/// spinlock and no mmap_lock held.
+pub fn fault_in_writeable(addr: u64, len: usize) -> usize {
+    let end = addr.saturating_add(len as u64);
+    let mut a = addr;
+    while a < end {
+        if put_user::<u8>(a, 0).is_err() {
+            return (end - a) as usize;
+        }
+        a = (a & !0xfff) + 0x1000;
+    }
+    0
+}
+
 /// `copy_from_user` for a copy made under a lock that a fault must not
 /// nest under (Linux generic_perform_write: i_rwsem, later the page
 /// lock): the copy runs with page faults disabled; a missing page is
