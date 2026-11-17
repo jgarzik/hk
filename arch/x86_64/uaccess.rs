@@ -159,6 +159,39 @@ core::arch::global_asm!(
     ".popsection",
 );
 
+// FP state restored straight from a user signal frame (Linux
+// xrstor_from_user_sigframe / fxrstor_from_user_sigframe: XSTATE_OP and
+// fxrstor with EX_TYPE_FAULT_MCE_SAFE): rdi=the image, esi:edx=the
+// XRSTOR feature mask. Any trap on the instruction (a page fault the
+// handler did not resolve, a #GP for a malformed image) resumes at the
+// fixup with its number in eax (`fprestore_fixup`), which is returned.
+core::arch::global_asm!(
+    ".pushsection .text.hk_fprestore_user, \"ax\"",
+    ".global hk_xrstor_user",
+    "hk_xrstor_user:",
+    "    mov eax, esi",
+    ".global hk_xrstor_user_insn",
+    "hk_xrstor_user_insn:",
+    "    xrstor64 [rdi]",
+    ".global hk_xrstor_user_insn_end",
+    "hk_xrstor_user_insn_end:",
+    "    xor eax, eax",
+    "    ret",
+    ".global hk_fxrstor_user",
+    "hk_fxrstor_user:",
+    ".global hk_fxrstor_user_insn",
+    "hk_fxrstor_user_insn:",
+    "    fxrstor64 [rdi]",
+    ".global hk_fxrstor_user_insn_end",
+    "hk_fxrstor_user_insn_end:",
+    "    xor eax, eax",
+    "    ret",
+    ".global hk_fprestore_user_fixup",
+    "hk_fprestore_user_fixup:",
+    "    ret",
+    ".popsection",
+);
+
 unsafe extern "C" {
     fn hk_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
     static hk_copy_user_insn: u8;
@@ -175,6 +208,58 @@ unsafe extern "C" {
     static hk_fxsave_user_insn: u8;
     static hk_fxsave_user_insn_end: u8;
     static hk_fpsave_user_fixup: u8;
+    fn hk_xrstor_user(buf: *const u8, lmask: u32, hmask: u32) -> u32;
+    static hk_xrstor_user_insn: u8;
+    static hk_xrstor_user_insn_end: u8;
+    fn hk_fxrstor_user(buf: *const u8) -> u32;
+    static hk_fxrstor_user_insn: u8;
+    static hk_fxrstor_user_insn_end: u8;
+    static hk_fprestore_user_fixup: u8;
+}
+
+/// XRSTOR (`mask` the features) or FXRSTOR of this CPU's FP registers
+/// from the image at the user address `buf`: 0, or the number of the
+/// trap that stopped it (14: a page fault the handler did not resolve;
+/// 13: a malformed image) (Linux xrstor_from_user_sigframe,
+/// fxrstor_from_user_sigframe)
+///
+/// # Safety
+/// `buf` passed access_ok for the image's size; user access is open
+/// (`user_access_begin`).
+pub unsafe fn fprestore_user(buf: u64, xrstor: bool, mask: u64) -> u32 {
+    let p = buf as *const u8;
+    // Truncating on purpose: EDX:EAX halves of the mask
+    let (lo, hi) = (mask as u32, (mask >> 32) as u32);
+    // SAFETY: a user address that passed access_ok (caller): a trap
+    // resumes at the fixup
+    unsafe {
+        if xrstor {
+            hk_xrstor_user(p, lo, hi)
+        } else {
+            hk_fxrstor_user(p)
+        }
+    }
+}
+
+/// Exception-table lookup for the FP restores from user memory (Linux
+/// EX_TYPE_FAULT_MCE_SAFE): if a kernel-mode trap at `rip` is on one,
+/// the address to resume at, which returns the trap number the handler
+/// puts in RAX
+pub fn fprestore_fixup(rip: u64) -> Option<u64> {
+    let table = [
+        (
+            &raw const hk_xrstor_user_insn,
+            &raw const hk_xrstor_user_insn_end,
+        ),
+        (
+            &raw const hk_fxrstor_user_insn,
+            &raw const hk_fxrstor_user_insn_end,
+        ),
+    ];
+    table
+        .into_iter()
+        .any(|(lo, hi)| (lo as u64..hi as u64).contains(&rip))
+        .then_some(&raw const hk_fprestore_user_fixup as u64)
 }
 
 /// XSAVE (`mask` the features) or FXSAVE of this CPU's FP registers to

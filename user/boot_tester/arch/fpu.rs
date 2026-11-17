@@ -19,6 +19,10 @@
 //!   restores it from the frame (an edit made by the handler takes effect).
 //!   On x86 the handler starts with the default MXCSR (0x1f80). The
 //!   handler yields after its clobber (its state is saved by a switch).
+//! - FPU_SIGNAL_BADFRAME (x86, XSAVE): a handler that sets a reserved
+//!   byte of the XSAVE header in its frame makes rt_sigreturn fail (the
+//!   XRSTOR from the frame faults, Linux badframe): the process dies of
+//!   SIGSEGV.
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -404,6 +408,8 @@ pub fn run_tests() {
     test_fpu_fork();
     test_fpu_exec();
     test_fpu_signal();
+    #[cfg(target_arch = "x86_64")]
+    test_fpu_signal_badframe();
 }
 
 const PINGPONG_ITERS: u64 = 40;
@@ -820,6 +826,53 @@ extern "C" fn fpu_sig_handler(_signo: i32, _info: *mut u8, uc: *mut u8) {
         core::ptr::write_volatile(&raw mut SIG_HANDLER_CTRL, ctrl);
         core::ptr::write_volatile(&raw mut SIG_FRAME_ERR, err);
         core::ptr::write_volatile(&raw mut SIG_SEEN, 1);
+    }
+}
+
+/// Sets a reserved byte of the frame's XSAVE header (bytes 16..64 of
+/// it must be 0 for XRSTOR); exit 77 without an XSAVE image
+#[cfg(target_arch = "x86_64")]
+extern "C" fn badhdr_handler(_signo: i32, _info: *mut u8, uc: *mut u8) {
+    // uc_mcontext at 40; sigcontext.fpstate at +184
+    let fpstate = unsafe { *(uc.add(40 + 184) as *const u64) } as *mut u8;
+    // _fpx_sw_bytes.magic1 at 464: FP_XSTATE_MAGIC1 for an XSAVE image
+    if fpstate.is_null() || unsafe { *(fpstate.add(464) as *const u32) } != 0x4650_5853 {
+        sys_exit(77);
+    }
+    unsafe { *fpstate.add(512 + 16) = 1 };
+}
+
+/// Test (x86): rt_sigreturn refuses a frame whose XSAVE header the
+/// handler corrupted
+#[cfg(target_arch = "x86_64")]
+fn test_fpu_signal_badframe() {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        let action: [u64; 4] = [
+            badhdr_handler as *const () as u64,
+            SA_SIGINFO | SA_RESTORER,
+            crate::signal::signals::restorer_addr(),
+            0,
+        ];
+        if sys_rt_sigaction(SIGUSR1, action.as_ptr() as u64, 0, 8) != 0 {
+            sys_exit(2);
+        }
+        hk_syscall::sys_kill(sys_getpid(), SIGUSR1);
+        // The corrupted frame was taken
+        sys_exit(1);
+    }
+    if pid < 0 {
+        fail_num(b"FPU_SIGNAL_BADFRAME:FAIL: fork ", pid);
+        return;
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f == 11 {
+        pass(b"FPU_SIGNAL_BADFRAME");
+    } else if st == 77 << 8 {
+        crate::helpers::skip(b"FPU_SIGNAL_BADFRAME", b"no XSAVE image");
+    } else {
+        fail_num(b"FPU_SIGNAL_BADFRAME:FAIL: wait status ", st as i64);
     }
 }
 

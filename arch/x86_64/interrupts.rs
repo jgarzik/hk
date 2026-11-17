@@ -520,6 +520,23 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
         return;
     }
 
+    // A kernel-mode trap on an FP restore from a user frame (a page
+    // fault not resolved above, a #GP for a malformed image): resume at
+    // its fixup, which returns the trap number (Linux
+    // EX_TYPE_FAULT_MCE_SAFE, ex_handler_fault)
+    if cs & 3 == 0
+        && let Some(fixup) = super::uaccess::fprestore_fixup(rip)
+    {
+        // SAFETY: field stores
+        unsafe {
+            uframe.with(|r| {
+                r.rip = fixup;
+                r.rax = vector;
+            })
+        };
+        return;
+    }
+
     // A kernel stack overflow: a fault in the guard gap below a stack.
     // With RSP itself there the page fault could not push its frame
     // either, so it became a double fault, running on its IST stack

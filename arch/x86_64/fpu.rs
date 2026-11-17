@@ -12,10 +12,11 @@
 //!   pt_regs (`save_for_clone_child`); the child loads them in
 //!   `ret_from_fork` before its first return to user mode.
 //! - execve and the first entry to user mode load the initial state.
-//! - signal delivery writes the registers to the user signal frame (Linux
-//!   fpstate layout, `_fpx_sw_bytes` + FP_XSTATE_MAGIC2 when XSAVE is used)
-//!   and gives the handler the initial state; rt_sigreturn validates the
-//!   frame and loads it back.
+//! - signal delivery saves the registers straight into the user signal
+//!   frame (Linux fpstate layout, `_fpx_sw_bytes` + FP_XSTATE_MAGIC2 when
+//!   XSAVE is used) and gives the handler the initial state; rt_sigreturn
+//!   loads them straight from the frame, a malformed image trapping to
+//!   the restore's fixup (a bad frame).
 //!
 //! XSAVE/XRSTOR (standard format) are used when the CPU supports them, with
 //! XCR0 = x87 | SSE (| AVX); otherwise FXSAVE/FXRSTOR (x87 + SSE only).
@@ -40,7 +41,6 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 
 /// Offsets in the legacy (FXSAVE) region
 const FXSAVE_MXCSR: usize = 24;
-const FXSAVE_MXCSR_MASK: usize = 28;
 /// Software-reserved bytes 464..512 hold `struct _fpx_sw_bytes` in signal frames
 const FXSAVE_SW_BYTES: usize = 464;
 /// XSAVE header (XSTATE_BV, XCOMP_BV, reserved) follows the legacy region
@@ -62,8 +62,6 @@ static USE_XSAVE: AtomicBool = AtomicBool::new(false);
 static XCR0: AtomicU64 = AtomicU64::new(0);
 /// Bytes of the standard-format XSAVE image for XCR0 (512 for FXSAVE)
 static XSTATE_SIZE: AtomicU32 = AtomicU32::new(512);
-/// Writable MXCSR bits (MXCSR_MASK)
-static MXCSR_MASK: AtomicU32 = AtomicU32::new(0xffbf);
 
 /// One FXSAVE/XSAVE image (64-byte aligned as XSAVE requires)
 #[repr(C, align(64))]
@@ -82,18 +80,6 @@ impl FpuArea {
         a[FXSAVE_MXCSR] = m[0];
         a[FXSAVE_MXCSR + 1] = m[1];
         Self(a)
-    }
-
-    fn u32_at(&self, off: usize) -> u32 {
-        u32::from_le_bytes(self.0[off..off + 4].try_into().unwrap())
-    }
-
-    fn u64_at(&self, off: usize) -> u64 {
-        u64::from_le_bytes(self.0[off..off + 8].try_into().unwrap())
-    }
-
-    fn set_u64(&mut self, off: usize, v: u64) {
-        self.0[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 }
 
@@ -168,16 +154,6 @@ pub fn init_cpu(bsp: bool) {
         write_cr4(cr4);
     }
     unsafe { core::arch::asm!("fninit", options(nomem, nostack)) };
-
-    if bsp {
-        // MXCSR_MASK from an FXSAVE image (0 means the default 0xffbf)
-        let mut a = FpuArea::init();
-        unsafe {
-            core::arch::asm!("fxsave64 [{}]", in(reg) a.0.as_mut_ptr(), options(nostack));
-        }
-        let mask = a.u32_at(FXSAVE_MXCSR_MASK);
-        MXCSR_MASK.store(if mask == 0 { 0xffbf } else { mask }, Ordering::Relaxed);
-    }
     restore(&INIT_AREA);
 }
 
@@ -236,8 +212,8 @@ pub unsafe fn save_raw(area: *mut FpuArea) {
 /// [`restore`] from a raw pointer
 ///
 /// # Safety
-/// `area` must point to an image produced by [`save`]/[`save_raw`] (or
-/// validated by [`sanitize_sigframe`]), 64-byte aligned.
+/// `area` must point to an image produced by [`save`]/[`save_raw`],
+/// 64-byte aligned.
 #[inline]
 pub unsafe fn restore_raw(area: *const FpuArea) {
     let p = area.cast::<u8>();
@@ -297,6 +273,48 @@ pub fn save_to_user(buf: u64) -> bool {
     ok
 }
 
+/// Load the registers straight from the user signal frame's image at
+/// `buf` with page faults disabled (Linux __restore_fpregs_from_user):
+/// XRSTOR of the features in `xrestore`, or FXRSTOR for an image with
+/// only the legacy part (`fx_only`, or no XSAVE), the other enabled
+/// features then set to their initial state. Err: the number of the
+/// trap that stopped it (14: a page fault, which the caller resolves
+/// and retries)
+pub fn restore_from_user(buf: u64, xrestore: u64, fx_only: bool) -> Result<(), u32> {
+    if !crate::uaccess::access_ok(buf, sigframe_size()) {
+        return Err(14);
+    }
+    crate::uaccess::pagefault_disable();
+    // SAFETY: in user space (checked above); a misaligned or malformed
+    // image traps to the fixup; user access open around it only
+    let trap = unsafe {
+        <super::uaccess::X86_64Uaccess as crate::uaccess::UaccessArch>::user_access_begin();
+        let t = super::uaccess::fprestore_user(buf, use_xsave() && !fx_only, xrestore);
+        <super::uaccess::X86_64Uaccess as crate::uaccess::UaccessArch>::user_access_end();
+        t
+    };
+    crate::uaccess::pagefault_enable();
+    if trap != 0 {
+        return Err(trap);
+    }
+    let init = xfeatures() & !xrestore;
+    if use_xsave() && init != 0 {
+        // SAFETY: the initial image, XSTATE_BV 0: XRSTOR initializes
+        // the features in `init`
+        unsafe {
+            core::arch::asm!(
+                "xrstor64 [{}]",
+                in(reg) INIT_AREA.0.as_ptr(),
+                // Truncating on purpose: EDX:EAX halves of the mask
+                in("eax") init as u32,
+                in("edx") (init >> 32) as u32,
+                options(nostack)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The XSAVE header's offset in an image, cleared before an XSAVE to
 /// the user frame (Linux: so its reserved fields are zero)
 pub const fn xsave_header() -> (usize, usize) {
@@ -330,37 +348,4 @@ pub fn sigframe_size() -> usize {
     } else {
         512
     }
-}
-
-/// Validate a user-supplied signal-frame image (copied into `area`, of
-/// which the first `sigframe_size()` bytes are valid) and turn it into
-/// something XRSTOR/FXRSTOR accepts. Returns false for a bad frame.
-pub fn sanitize_sigframe(area: &mut FpuArea) -> bool {
-    let mxcsr_mask = MXCSR_MASK.load(Ordering::Relaxed);
-    if area.u32_at(FXSAVE_MXCSR) & !mxcsr_mask != 0 {
-        return false;
-    }
-    if !use_xsave() {
-        return true;
-    }
-    let size = xstate_size();
-    let sw = FXSAVE_SW_BYTES;
-    let extended = area.u32_at(sw) == FP_XSTATE_MAGIC1
-        && area.u32_at(sw + 4) as usize == size + FP_XSTATE_MAGIC2_SIZE
-        && area.u32_at(sw + 16) as usize == size
-        && area.u32_at(size) == FP_XSTATE_MAGIC2;
-    let xcr0 = xfeatures();
-    if extended {
-        // Only the features the frame claims, all of them enabled
-        let frame_features = area.u64_at(sw + 8) & xcr0;
-        let bv = area.u64_at(XSAVE_HDR) & frame_features;
-        area.set_u64(XSAVE_HDR, bv);
-    } else {
-        // Plain FXSAVE image: x87 + SSE from the frame, the rest initial
-        area.0[512..FPU_AREA_SIZE].fill(0);
-        area.set_u64(XSAVE_HDR, XFEATURE_X87 | XFEATURE_SSE);
-    }
-    // XCOMP_BV and the reserved header bytes must be zero (else #GP)
-    area.0[XSAVE_HDR + 8..XSAVE_HDR + XSAVE_HDR_SIZE].fill(0);
-    true
 }

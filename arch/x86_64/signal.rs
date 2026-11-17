@@ -417,34 +417,73 @@ fn get_sigframe(rsp: u64, action: &SigAction, alt: &AltStack) -> KernelResult<(u
 }
 
 /// Load the FP state saved at `fpstate` by [`setup_rt_frame`] (0 = none:
-/// initial state). False for an unreadable or malformed image.
+/// initial state) straight from the user frame (Linux fpu__restore_sig).
+/// False for an unreadable or malformed image, the initial state then
+/// loaded (fpu__clear_user_states).
 fn restore_sigframe_fpu(fpstate: u64) -> bool {
-    use super::fpu;
-
-    if fpstate == 0 {
-        fpu::load_init_state();
-        return true;
+    let ok = fpstate == 0 || fpu_restore_sig(fpstate);
+    if fpstate == 0 || !ok {
+        super::fpu::load_init_state();
     }
-    let mut area = fpu::FpuArea::init();
-    // The legacy 512 bytes always; the XSAVE part if the frame says so
-    if copy_from_user(&mut area.0[..512], fpstate, 512).is_err() {
+    ok
+}
+
+/// Linux __fpu_restore_sig for a 64-bit frame: the features its
+/// software bytes claim (`check_xstate_in_sigframe`; x87 and SSE
+/// without XSAVE), restored straight from the image; a page fault is
+/// resolved (fault_in_readable) and the restore retried, any other trap
+/// fails it
+fn fpu_restore_sig(buf: u64) -> bool {
+    use super::fpu;
+    if !access_ok(buf, fpu::sigframe_size()) {
         return false;
     }
-    let sw = &area.0[464..468];
-    if fpu::use_xsave() && u32::from_le_bytes(sw.try_into().unwrap()) == fpu::FP_XSTATE_MAGIC1 {
-        let size = fpu::sigframe_size();
-        let Some(rest) = fpstate.checked_add(512) else {
-            return false;
-        };
-        if copy_from_user(&mut area.0[512..size], rest, size - 512).is_err() {
-            return false;
+    let (features, fx_only) = if fpu::use_xsave() {
+        match check_xstate_in_sigframe(buf) {
+            Some(f) => f,
+            None => return false,
+        }
+    } else {
+        (u64::from(fpu::XFEATURE_MASK_FPSSE), false)
+    };
+    let xrestore = features & fpu::xfeatures();
+    loop {
+        match fpu::restore_from_user(buf, xrestore, fx_only) {
+            Ok(()) => return true,
+            Err(14) if crate::uaccess::fault_in_readable(buf, fpu::xstate_size()) == 0 => {}
+            Err(_) => return false,
         }
     }
-    if !fpu::sanitize_sigframe(&mut area) {
-        return false;
+}
+
+/// Linux check_xstate_in_sigframe: what the image at `buf` holds, from
+/// its software bytes: an XSAVE image when they say so with a size this
+/// kernel saves and the end magic follows it, (its features, false);
+/// else the legacy part only, (x87 | SSE, true). None when they cannot
+/// be read.
+fn check_xstate_in_sigframe(buf: u64) -> Option<(u64, bool)> {
+    use super::fpu;
+    let (off, _) = fpu::sw_bytes();
+    // magic1, extended_size, xfeatures, xstate_size
+    let mut sw = [0u8; 20];
+    copy_from_user(&mut sw, buf + off as u64, 20).ok()?;
+    let word = |i: usize| u32::from_le_bytes([sw[i], sw[i + 1], sw[i + 2], sw[i + 3]]);
+    let (magic1, extended, size) = (word(0), word(4), word(16));
+    let features = u64::from(word(8)) | u64::from(word(12)) << 32;
+    let fx_only = Some((u64::from(fpu::XFEATURE_MASK_FPSSE), true));
+    // The legacy region and the XSAVE header at least
+    let (hdr, hdr_len) = fpu::xsave_header();
+    let min = (hdr + hdr_len) as u32;
+    let max = fpu::xstate_size() as u32;
+    if magic1 != fpu::FP_XSTATE_MAGIC1 || size < min || size > max || size > extended {
+        return fx_only;
     }
-    fpu::restore(&area);
-    true
+    let magic2: u32 = get_user(buf + u64::from(size)).ok()?;
+    if magic2 == fpu::FP_XSTATE_MAGIC2 {
+        Some((features, false))
+    } else {
+        fx_only
+    }
 }
 
 /// Restore context from signal frame (sys_rt_sigreturn)
