@@ -761,12 +761,28 @@ fn vfat_cmpi(stored: &[u8], name: &[u8]) -> bool {
     striptail(stored).eq_ignore_ascii_case(striptail(name))
 }
 
-/// vfat's dentry name operations (Linux vfat_ci_dentry_ops)
+/// vfat's dentry operations (Linux vfat_ci_dentry_ops)
 static VFAT_CI_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
-    d_hash: vfat_hashi,
-    d_compare: vfat_cmpi,
+    d_hash: Some(vfat_hashi),
+    d_compare: Some(vfat_cmpi),
+    d_revalidate: Some(vfat_revalidate_ci),
     d_prune: None,
 };
+
+/// Linux vfat_revalidate_ci: ECHILD in an RCU walk (every vfat name is
+/// asked again in ref mode); a positive dentry stays; a negative one
+/// is looked up again (Linux keeps one while its directory's version
+/// stands, vfat_revalidate_shortname: hk keeps no version)
+fn vfat_revalidate_ci(
+    _: &crate::fs::dentry::Dentry,
+    inode: Option<&Inode>,
+    rcu: bool,
+) -> Result<bool, KernelError> {
+    if rcu {
+        return Err(KernelError::NoChild);
+    }
+    Ok(inode.is_some())
+}
 
 /// A name for a new entry (Linux vfat_create_shortname /
 /// vfat_valid_longname): EINVAL for nothing left or a character FAT

@@ -632,6 +632,7 @@ fn mount(
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     let sb = crate::fs::superblock::get_tree_single(fc, &TRACEFS_SOPS, |sb| {
         sb.set_private(try_arc(kernfs::vfs::KfSuper { ns: 0 })?);
+        sb.set_d_op(&kernfs::vfs::KERNFS_DOPS);
         let ri = kernfs::vfs::inode(sb, root())?;
         // Linux tracefs_fill_super: tracefs_apply_options(sb, false)
         ri.set_mode_perm(TRACEFS_DEFAULT_MODE);

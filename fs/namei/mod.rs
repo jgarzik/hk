@@ -255,8 +255,8 @@ fn start_path(start: Start<'_>) -> Result<Path, KernelError> {
 /// miss is cached as one (Linux d_add(dentry, NULL)) only on in-memory
 /// filesystems (ramfs, devtmpfs), where a name is its exact bytes:
 /// procfs and cgroupfs compute their entries behind the dcache, and
-/// vfat matches other spellings (case, trailing dots), which Linux
-/// handles with d_revalidate. Permission is the caller's business.
+/// vfat matches other spellings (case, trailing dots). Permission is
+/// the caller's business.
 pub fn lookup_one(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
     // No file system here has longer names (Linux simple_lookup and the
     // disk file systems' lookups: ENAMETOOLONG)
@@ -306,12 +306,9 @@ fn d_revalidate(
     child: DentryRef,
     rcu: Option<Result<bool, KernelError>>,
 ) -> Result<Option<DentryRef>, KernelError> {
-    // Only a positive dentry has a revalidation (its inode's operations)
-    let Some(i) = child.get_inode() else {
-        return Ok(Some(child));
-    };
+    // Positive or negative: its filesystem's d_revalidate sees both
     let valid = match rcu {
-        Some(Err(ECHILD)) | None => i.i_op.revalidate(&i, false),
+        Some(Err(ECHILD)) | None => child.revalidate(child.get_inode().as_deref(), false),
         Some(s) => s,
     }?;
     if valid {
@@ -354,10 +351,9 @@ fn lookup_fast_ref(
     name: &[u8],
     rcu: Result<bool, KernelError>,
 ) -> Result<DentryRef, KernelError> {
-    if child.is_negative() {
-        return Err(KernelError::NotFound);
-    }
     match d_revalidate(child, Some(rcu))? {
+        // A valid negative entry: Linux step_into's ENOENT
+        Some(c) if c.is_negative() => Err(KernelError::NotFound),
         Some(c) => Ok(c),
         None => lookup_slow(parent, name),
     }
@@ -1230,32 +1226,49 @@ pub fn filename_create(dirfd: i32, path: &[u8], want_dir: bool) -> Result<Parent
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::inode::{InodeMode, InodeOps, NULL_INODE_OPS, Timespec};
+    use crate::fs::dentry::DentryOps;
+    use crate::fs::inode::{InodeMode, NULL_INODE_OPS, Timespec};
     use alloc::sync::Weak;
 
-    /// Revalidation says `R`: Ok(false) stale, Err(EIO) an error
-    struct Reval(Result<bool, KernelError>);
+    /// Inode numbers whose dentries revalidate stale, and with EIO
+    const STALE: u64 = 2;
+    const BROKEN: u64 = 3;
+    const VALID: u64 = 4;
 
-    impl InodeOps for Reval {
-        fn lookup(&self, _: &Inode, _: &[u8]) -> Result<Arc<Inode>, KernelError> {
-            Err(KernelError::NotFound)
-        }
-        fn revalidate(&self, _: &Inode, _: bool) -> Result<bool, KernelError> {
-            self.0
+    /// The test filesystem's d_revalidate: by inode number; a negative
+    /// dentry is stale
+    fn reval(_: &Dentry, i: Option<&Inode>, _: bool) -> Result<bool, KernelError> {
+        match i.map(|i| i.ino) {
+            None | Some(STALE) => Ok(false),
+            Some(BROKEN) => Err(KernelError::Io),
+            Some(_) => Ok(true),
         }
     }
 
-    static STALE: Reval = Reval(Ok(false));
-    static BROKEN: Reval = Reval(Err(KernelError::Io));
+    static OPS: DentryOps = DentryOps {
+        d_revalidate: Some(reval),
+        ..DentryOps::NONE
+    };
 
-    fn inode(ops: &'static dyn InodeOps) -> Arc<Inode> {
+    fn inode(ino: u64) -> Arc<Inode> {
         let m = InodeMode::directory(0o755);
         let t = Timespec::from_secs(0);
-        Inode::alloc(Inode::new(1, m, 0, 0, 0, t, Weak::new(), ops)).unwrap()
+        Inode::alloc(Inode::new(ino, m, 0, 0, 0, t, Weak::new(), &NULL_INODE_OPS)).unwrap()
     }
 
     fn root() -> DentryRef {
-        DentryRef::new(Dentry::new_root(inode(&NULL_INODE_OPS), Weak::new())).unwrap()
+        DentryRef::new(Dentry::new_root_op(inode(1), &OPS)).unwrap()
+    }
+
+    /// A negative dentry is revalidated too (Linux d_revalidate on a
+    /// negative entry): a stale one leaves the tree and the name is
+    /// asked again
+    #[test]
+    fn negative_is_revalidated() {
+        let r = root();
+        let n = Dentry::alloc(&r, b"n", None).unwrap();
+        assert!(cached(&r, b"n").unwrap().is_none());
+        assert!(n.d_unhashed() && r.lookup_child(b"n").is_none());
     }
 
     /// A stale child is invalidated itself (Linux d_invalidate(dentry)):
@@ -1263,9 +1276,9 @@ mod tests {
     #[test]
     fn stale_invalidates_only_itself() {
         let r = root();
-        let a = Dentry::alloc(&r, b"x", Some(inode(&STALE))).unwrap();
+        let a = Dentry::alloc(&r, b"x", Some(inode(STALE))).unwrap();
         drop(r.remove_child(b"x"));
-        let b = Dentry::alloc(&r, b"x", Some(inode(&NULL_INODE_OPS))).unwrap();
+        let b = Dentry::alloc(&r, b"x", Some(inode(VALID))).unwrap();
         let d = lookup_fast_ref(&r, a, b"x", Err(ECHILD)).unwrap();
         assert!(DentryRef::ptr_eq(&d, &b) && !b.d_unhashed());
     }
@@ -1274,7 +1287,7 @@ mod tests {
     #[test]
     fn stale_is_dropped() {
         let r = root();
-        let a = Dentry::alloc(&r, b"x", Some(inode(&STALE))).unwrap();
+        let a = Dentry::alloc(&r, b"x", Some(inode(STALE))).unwrap();
         assert!(cached(&r, b"x").unwrap().is_none());
         assert!(a.d_unhashed() && r.lookup_child(b"x").is_none());
     }
@@ -1285,7 +1298,7 @@ mod tests {
     #[test]
     fn reval_error_returned() {
         let r = root();
-        let a = Dentry::alloc(&r, b"x", Some(inode(&BROKEN))).unwrap();
+        let a = Dentry::alloc(&r, b"x", Some(inode(BROKEN))).unwrap();
         let e = lookup_fast_ref(&r, a.clone(), b"x", Err(ECHILD));
         assert_eq!(e.err(), Some(KernelError::Io));
         assert_eq!(cached(&r, b"x").err(), Some(KernelError::Io));

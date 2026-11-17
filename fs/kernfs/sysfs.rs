@@ -88,6 +88,8 @@ fn mount(
             crate::fs::superblock::set_anon_super(sb)
         })?;
     if !sb.has_root() {
+        // Linux kernfs_fill_super: sb->s_d_op = &kernfs_dops
+        sb.set_d_op(&kernfs::vfs::KERNFS_DOPS);
         let ri = kernfs::vfs::inode(&sb, root())?;
         sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(
             ri,

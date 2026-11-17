@@ -792,11 +792,11 @@ impl Nd<'_> {
             return Err(ECHILD);
         }
         let inode = child.d_inode_rcu(rc.g);
-        // d_revalidate under LOOKUP_RCU (only a positive entry has one,
-        // as in ref mode); anything but "valid" is handled in ref mode
-        // (Linux lookup_fast: try_to_unlazy_next, then d_invalidate if
-        // stale, the error if one, ref-mode d_revalidate if ECHILD)
-        let status = inode.map_or(Ok(true), |i| i.i_op.revalidate(i, true));
+        // d_revalidate under LOOKUP_RCU, a negative entry's too; anything
+        // but "valid" is handled in ref mode (Linux lookup_fast:
+        // try_to_unlazy_next, then d_invalidate if stale, the error if
+        // one, ref-mode d_revalidate if ECHILD)
+        let status = child.revalidate(inode, true);
         if status != Ok(true) {
             let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
             return Ok(Step::Lazy(To::Child {

@@ -185,20 +185,9 @@ pub trait InodeOps: Send + Sync {
         false
     }
 
-    /// A cached dentry of this inode is still good for the walk (Linux
-    /// d_revalidate): Ok(false) drops it and the walk looks the name up
-    /// again. With `rcu` (LOOKUP_RCU) an RCU walk asks: `inode` is
-    /// borrowed with no reference and may be torn down already, so only
-    /// its fields with no drop glue may be read (`IFree`); ECHILD where
-    /// that is not enough, and the walk asks again in ref mode. Default
-    /// yes; procfs says no once its task or fd is gone.
-    fn revalidate(&self, _inode: &Inode, _rcu: bool) -> Result<bool, KernelError> {
-        Ok(true)
-    }
-
     /// Access check for `mask` (MAY_* bits) by `cred` (Linux
     /// ->permission). With MAY_NOT_BLOCK an RCU walk asks, as for
-    /// `revalidate`'s `rcu`. Default: generic_permission (mode bits plus
+    /// `DentryOps::d_revalidate`'s `rcu`. Default: generic_permission (mode bits plus
     /// capability overrides); /proc/sys overrides it with sysctl_perm.
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         super::dac::generic_permission(cred, inode, mask)
@@ -287,7 +276,8 @@ pub trait InodeOps: Send + Sync {
     /// jumps to (nd_jump_link), which RESOLVE_NO_MAGICLINKS refuses
     /// (ELOOP) and a scoped walk never takes (EXDEV). With `rcu` an RCU
     /// walk asks (Linux get_link with a NULL dentry): `inode` is
-    /// borrowed as for `revalidate`'s `rcu`, nothing may sleep, and
+    /// borrowed as for `DentryOps::d_revalidate`'s `rcu`, nothing may
+    /// sleep, and
     /// ECHILD sends the walk to ref mode to ask again. Default: ECHILD
     /// in RCU mode, else the text `readlink` gives; procfs's fd, cwd,
     /// root, exe and namespace links jump.

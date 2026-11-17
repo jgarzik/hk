@@ -6,11 +6,16 @@
 //!   a chdir to "DIR." stands in that dentry, which getcwd names by its
 //!   cached spelling, and a ramfs mounted on "dir" is crossed into
 //!   through "Dir".
+//! - VFAT_RESOLVE_CACHED: vfat revalidates every cached dentry and asks
+//!   ref mode (Linux vfat_revalidate_ci: ECHILD under LOOKUP_RCU), so
+//!   openat2 RESOLVE_CACHED through vfat is EAGAIN, for a cached name
+//!   and for one that failed.
 
 use crate::harness::T;
 use crate::helpers::find_blkdev;
 use hk_syscall::{
-    Stat, sys_chdir, sys_getcwd, sys_mkdir, sys_mount, sys_rmdir, sys_stat, sys_umount2,
+    O_PATH, Stat, sys_chdir, sys_close, sys_getcwd, sys_mkdir, sys_mount, sys_openat2, sys_rmdir,
+    sys_stat, sys_umount2,
 };
 
 const DIR: &[u8] = b"/tmp/vci\0";
@@ -50,6 +55,7 @@ pub fn run_tests() {
     sys_rmdir(b"/tmp/vci/dir\0".as_ptr());
     if t.eq(b"mkdir", sys_mkdir(b"/tmp/vci/dir\0".as_ptr(), 0o755), 0) {
         check(&mut t);
+        cached();
         sys_chdir(b"/\0".as_ptr());
         sys_rmdir(b"/tmp/vci/dir\0".as_ptr());
     }
@@ -83,4 +89,27 @@ fn check(t: &mut T) {
         t.ok(b"Dir crosses the mount", d != 0 && d != vfat, d as i64);
         sys_umount2(b"/tmp/vci/dir\0".as_ptr(), 0);
     }
+}
+
+/// openat2(AT_FDCWD, `p`, O_PATH, RESOLVE_CACHED)
+fn open_cached(p: &[u8]) -> i64 {
+    const RESOLVE_CACHED: u64 = 0x20;
+    let mut how = [0u8; 24];
+    how[..8].copy_from_slice(&u64::from(O_PATH).to_ne_bytes());
+    how[16..].copy_from_slice(&RESOLVE_CACHED.to_ne_bytes());
+    let r = sys_openat2(-100, p.as_ptr(), how.as_ptr(), how.len());
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    r
+}
+
+fn cached() {
+    const EAGAIN: i64 = -11;
+    let mut t = T::new(b"VFAT_RESOLVE_CACHED");
+    t.ok(b"stat dir", dev(b"/tmp/vci/dir\0") != 0, 0);
+    t.eq(b"cached dir", open_cached(b"/tmp/vci/dir\0"), EAGAIN);
+    t.ok(b"stat nosuch", dev(b"/tmp/vci/nosuch\0") == 0, 0);
+    t.eq(b"failed name", open_cached(b"/tmp/vci/nosuch\0"), EAGAIN);
+    t.done();
 }

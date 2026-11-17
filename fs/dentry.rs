@@ -147,27 +147,54 @@ fn d_hash(key: u64) -> &'static Bucket {
     &t[i]
 }
 
-/// A filesystem's dentry operations (Linux dentry_operations): name
-/// hashing and comparison for one whose names match more than their
-/// bytes (vfat ignores case and trailing dots, so each object has one
-/// dentry whatever the spelling it was reached by), and a hook at a
-/// dentry's kill (nsfs forgets its stashed dentry)
+/// A filesystem's dentry operations (Linux dentry_operations, from
+/// its s_d_op): name hashing and comparison for one whose names match
+/// more than their bytes (vfat ignores case and trailing dots, so each
+/// object has one dentry whatever the spelling it was reached by),
+/// revalidation of a cached dentry, and a hook at a dentry's kill
+/// (nsfs forgets its stashed dentry). None: Linux's default (its
+/// DCACHE_OP_* bit clear).
 pub struct DentryOps {
     /// The name's hash (Linux d_hash): names `d_compare` matches hash
     /// alike
-    pub d_hash: fn(&[u8]) -> u64,
+    pub d_hash: Option<fn(&[u8]) -> u64>,
     /// The cached name `stored` is `name` (Linux d_compare)
-    pub d_compare: fn(stored: &[u8], name: &[u8]) -> bool,
+    pub d_compare: Option<CompareFn>,
+    /// A cached dentry, positive or negative (`inode` None), is still
+    /// good for the walk (Linux d_revalidate): Ok(false) drops it and
+    /// the walk looks the name up again. With `rcu` (LOOKUP_RCU) an RCU
+    /// walk asks: the dentry and `inode` are borrowed with no
+    /// reference and may be torn down already, so only fields with no
+    /// drop glue may be read (`IFree`); ECHILD where that is not
+    /// enough, and the walk asks again in ref mode.
+    pub d_revalidate: Option<RevalidateFn>,
     /// Called as the dentry is killed, before its memory's grace period
     /// starts (Linux d_prune): no reference is left or can be taken
     pub d_prune: Option<fn(&Dentry)>,
 }
 
+/// [`DentryOps::d_compare`]: the cached name `stored` is `name`
+pub type CompareFn = fn(stored: &[u8], name: &[u8]) -> bool;
+
+/// [`DentryOps::d_revalidate`]: the dentry, its inode as the caller
+/// read it (None: negative), LOOKUP_RCU
+pub type RevalidateFn = fn(&Dentry, Option<&Inode>, bool) -> Result<bool, KernelError>;
+
+impl DentryOps {
+    /// No operation set (Linux's defaults), for `..DentryOps::NONE`
+    pub const NONE: Self = Self {
+        d_hash: None,
+        d_compare: None,
+        d_revalidate: None,
+        d_prune: None,
+    };
+}
+
 /// The hash of the child name `name` under `parent` (Linux
 /// full_name_hash, or d_hash where the filesystem has one)
 fn name_hash_in(parent: &Dentry, name: &[u8]) -> u64 {
-    match parent.d_op {
-        Some(op) => (op.d_hash)(name),
+    match parent.d_op.and_then(|o| o.d_hash) {
+        Some(h) => h(name),
         None => super::name::name_hash(name),
     }
 }
@@ -176,8 +203,8 @@ fn name_hash_in(parent: &Dentry, name: &[u8]) -> u64 {
 /// parent's children (`p`, its d_lock held for writing), then in its
 /// bucket (Linux d_add's __d_rehash, d_sib)
 fn hash_in(parent: &Dentry, p: &mut DentryInner, d: &DentryRef, name: &DName) {
-    let h = match parent.d_op {
-        Some(op) => (op.d_hash)(name),
+    let h = match parent.d_op.and_then(|o| o.d_hash) {
+        Some(h) => h(name),
         None => name.hash(),
     };
     let key = d_key(parent, h);
@@ -220,8 +247,8 @@ fn d_matcher<'a>(parent: &'a Dentry, name: &'a [u8]) -> (u64, impl Fn(&Dentry) -
 
 /// `stored` names the child `name` of `parent` (Linux d_same_name)
 fn d_same_name(parent: &Dentry, stored: &[u8], name: &[u8]) -> bool {
-    match parent.d_op {
-        Some(op) => (op.d_compare)(stored, name),
+    match parent.d_op.and_then(|o| o.d_compare) {
+        Some(cmp) => cmp(stored, name),
         None => stored == name,
     }
 }
@@ -280,7 +307,7 @@ pub fn __d_lookup_rcu<'g>(
 ) -> Option<(&'g Dentry, u32)> {
     let key = d_key(parent, name_hash_in(parent, name));
     let mut seq = 0;
-    let d = d_hash(key).find_rcu(g, |c| match parent.d_op {
+    let d = d_hash(key).find_rcu(g, |c| match parent.d_op.and_then(|o| o.d_compare) {
         None => {
             let s = c.d_seq.raw_begin();
             if !core::ptr::eq(c.parent_ptr(), parent)
@@ -293,7 +320,7 @@ pub fn __d_lookup_rcu<'g>(
             seq = s;
             true
         }
-        Some(op) => loop {
+        Some(cmp) => loop {
             let s = c.d_seq.raw_begin();
             if !core::ptr::eq(c.parent_ptr(), parent)
                 || c.d_unhashed()
@@ -303,9 +330,9 @@ pub fn __d_lookup_rcu<'g>(
             }
             // A consistent name for d_compare: checked against the
             // sample before the compare
-            let hit = c.d_name.read(g, |n| {
-                (!c.d_seq.read_retry(s)).then(|| (op.d_compare)(n, name))
-            });
+            let hit = c
+                .d_name
+                .read(g, |n| (!c.d_seq.read_retry(s)).then(|| cmp(n, name)));
             match hit {
                 Some(h) => {
                     seq = s;
@@ -466,8 +493,19 @@ impl Drop for Dentry {
 
 impl Dentry {
     fn with(name: DName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
+        let d_op = sb.upgrade().and_then(|s| s.d_op());
+        Self::with_op(name, inode, sb, d_op)
+    }
+
+    /// With `d_op` (its superblock's s_d_op: a child's is its parent's)
+    fn with_op(
+        name: DName,
+        inode: Option<Arc<Inode>>,
+        sb: Weak<SuperBlock>,
+        d_op: Option<&'static DentryOps>,
+    ) -> Self {
         Self {
-            d_op: sb.upgrade().and_then(|s| s.d_op()),
+            d_op,
             sb,
             d_count: AtomicUsize::new(1),
             d_parent: AtomicPtr::new(core::ptr::null_mut()),
@@ -492,6 +530,12 @@ impl Dentry {
     /// Create root dentry for a filesystem
     pub fn new_root(inode: Arc<Inode>, sb: Weak<SuperBlock>) -> Self {
         Self::with(DName::default(), Some(inode), sb)
+    }
+
+    /// A root with dentry operations `op` and no superblock, for tests
+    #[cfg(test)]
+    pub(crate) fn new_root_op(inode: Arc<Inode>, op: &'static DentryOps) -> Self {
+        Self::with_op(DName::default(), Some(inode), Weak::new(), Some(op))
     }
 
     /// Create an anonymous dentry (for pipes, sockets, etc.)
@@ -544,10 +588,11 @@ impl Dentry {
         name: &[u8],
         inode: Arc<Inode>,
     ) -> Result<DentryRef, KernelError> {
-        let d = DentryRef::new(Self::with(
+        let d = DentryRef::new(Self::with_op(
             DName::new(name)?,
             Some(inode),
             parent.sb.clone(),
+            parent.d_op,
         ))?;
         let dl = d.d_lock.write();
         d.set_parent(&dl, parent.clone());
@@ -561,7 +606,12 @@ impl Dentry {
     /// nothing half made. It holds its parent already (Linux d_alloc's
     /// dget of the parent).
     pub fn prealloc(parent: &DentryRef, name: &[u8]) -> Result<DentryRef, KernelError> {
-        let d = DentryRef::new(Self::with(DName::new(name)?, None, parent.sb.clone()))?;
+        let d = DentryRef::new(Self::with_op(
+            DName::new(name)?,
+            None,
+            parent.sb.clone(),
+            parent.d_op,
+        ))?;
         let dl = d.d_lock.write();
         d.set_parent(&dl, parent.clone());
         drop(dl);
@@ -759,6 +809,17 @@ impl Dentry {
             drop(p);
             drop(al);
             drop(ours);
+        }
+    }
+
+    /// Its filesystem's d_revalidate, else valid (Linux d_revalidate
+    /// without DCACHE_OP_REVALIDATE): `inode` is its inode as the
+    /// caller read it, None for a negative dentry; `rcu` as
+    /// [`DentryOps::d_revalidate`]
+    pub fn revalidate(&self, inode: Option<&Inode>, rcu: bool) -> Result<bool, KernelError> {
+        match self.d_op.and_then(|o| o.d_revalidate) {
+            Some(f) => f(self, inode, rcu),
+            None => Ok(true),
         }
     }
 

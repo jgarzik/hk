@@ -686,6 +686,21 @@ waiting).
 - `mount::detach_mounts` drops the dentry between two MOUNT_LOCK
   sections (so no dentry reference is put under MOUNT_LOCK); Linux
   __detach_mounts calls d_drop inside one lock_mount_hash section.
+- vfat and kernfs/cgroupfs cache no negative dentry at lookup
+  (`namei::lookup_one`); Linux's vfat_lookup and kernfs_iop_lookup do
+  (d_splice_alias(NULL)) and keep it valid while the directory's
+  version (vfat_d_version) or revision (kernfs_dir_changed) stands.
+  hk's ref-mode d_revalidate (`vfat_revalidate_ci`,
+  `kernfs_revalidate`, `cgroupfs_revalidate`) calls a negative one
+  stale every time: same answers, one more lookup.
+- cgroupfs's ref-mode d_revalidate keeps every positive dentry;
+  Linux kernfs_dop_revalidate also checks the node is active and still
+  that parent's child of that name (a removed cgroup's dentry goes at
+  its rmdir in hk).
+- tracefs is kernfs-based and revalidates as kernfs (ECHILD under
+  LOOKUP_RCU, `kernfs::vfs::KERNFS_DOPS`); Linux tracefs_d_revalidate
+  answers in RCU mode (stale only for a freed eventfs entry), so
+  RESOLVE_CACHED through tracefs is EAGAIN on hk only.
 
 ## renameat2 flag gaps
 

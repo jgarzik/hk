@@ -771,8 +771,27 @@ fn cgroupfs_mount(
     crate::fs::superblock::get_tree_nodev(fc, &CGROUPFS_SUPER_OPS, cgroupfs_fill)
 }
 
+/// cgroup2's dentry operations (Linux kernfs_dops: cgroup2 is a kernfs
+/// filesystem there)
+static CGROUPFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_revalidate: Some(cgroupfs_revalidate),
+    ..crate::fs::dentry::DentryOps::NONE
+};
+
+/// Linux kernfs_dop_revalidate: ECHILD in an RCU walk; a negative
+/// dentry is looked up again (Linux keeps one while its directory's
+/// revision stands: hk caches no cgroupfs negative entry); a positive
+/// one stays (a removed cgroup's leaves the tree at its rmdir)
+fn cgroupfs_revalidate(_: &Dentry, inode: Option<&Inode>, rcu: bool) -> Result<bool, KernelError> {
+    if rcu {
+        return Err(KernelError::NoChild);
+    }
+    Ok(inode.is_some())
+}
+
 /// The root directory, the root cgroup's
 fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
+    sb.set_d_op(&CGROUPFS_DOPS);
     // Get root cgroup
     let root_cg = CGROUP_ROOT
         .root_cgroup()

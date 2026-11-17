@@ -140,15 +140,6 @@ impl InodeOps for KernfsIops {
         });
     }
 
-    /// Linux kernfs_dop_revalidate: a removed node's dentry is stale;
-    /// ECHILD in an RCU walk, as there (the node is the inode data)
-    fn revalidate(&self, inode: &Inode, rcu: bool) -> Result<bool, KernelError> {
-        if rcu {
-            return Err(KernelError::NoChild);
-        }
-        Ok(knode(inode).is_some_and(|kn| !kn.removed()))
-    }
-
     fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
         let kn = knode(inode).ok_or(KernelError::Io)?;
         let Kind::Link(t) = &kn.kind else {
@@ -174,6 +165,27 @@ impl InodeOps for KernfsIops {
 }
 
 pub static KERNFS_IOPS: KernfsIops = KernfsIops;
+
+/// kernfs's dentry operations (Linux kernfs_dops)
+pub static KERNFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_revalidate: Some(kernfs_revalidate),
+    ..crate::fs::dentry::DentryOps::NONE
+};
+
+/// Linux kernfs_dop_revalidate: ECHILD in an RCU walk; a negative
+/// dentry is looked up again (Linux keeps one while its directory's
+/// revision stands: hk caches no kernfs negative entry); a removed
+/// node's dentry is stale (the node is the inode data)
+fn kernfs_revalidate(
+    _: &crate::fs::dentry::Dentry,
+    inode: Option<&Inode>,
+    rcu: bool,
+) -> Result<bool, KernelError> {
+    if rcu {
+        return Err(KernelError::NoChild);
+    }
+    Ok(inode.and_then(knode).is_some_and(|kn| !kn.removed()))
+}
 
 /// show() output of an open file and where the last read ended (Linux
 /// seq_file buf and read_pos)

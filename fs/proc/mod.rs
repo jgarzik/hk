@@ -551,18 +551,6 @@ impl InodeOps for ProcfsInodeOps {
         crate::sysctl::permission(ctl, cred, mask)
     }
 
-    /// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that
-    /// is gone, or of an fd no longer open, is invalid; a live one takes
-    /// the task's current owner (pid_update_inode). An RCU walk is
-    /// answered from what the inode keeps for it, ECHILD where Linux's
-    /// is (`revalidate_rcu`).
-    fn revalidate(&self, inode: &Inode, rcu: bool) -> Result<bool, KernelError> {
-        if rcu {
-            return revalidate_rcu(inode);
-        }
-        Ok(revalidate_ref(inode))
-    }
-
     /// A new per-process inode takes the task's owner (Linux
     /// proc_pid_make_inode -> pid_update_inode), so its first permission
     /// check sees it
@@ -687,7 +675,7 @@ fn proc_rcu(inode: &Inode) -> Option<&ProcRcu> {
     inode.private_rcu()?.as_any().downcast_ref::<ProcRcu>()
 }
 
-/// [`InodeOps::revalidate`] under LOOKUP_RCU (Linux pid_revalidate:
+/// [`proc_revalidate`] under LOOKUP_RCU (Linux pid_revalidate:
 /// the task under rcu_read_lock, its owner taken over; tid_fd_revalidate,
 /// proc_sys_revalidate and proc_misc_d_revalidate are ECHILD;
 /// proc_net_d_revalidate is always stale)
@@ -792,7 +780,7 @@ fn proc_fd_permission(
     }
 }
 
-/// [`InodeOps::revalidate`] of a procfs inode in ref mode
+/// [`proc_revalidate`] of a procfs inode in ref mode
 fn revalidate_ref(inode: &Inode) -> bool {
     // A /proc/<pid>/net file is looked up afresh by every walk, so
     // it follows the task's namespace (Linux proc_net_d_revalidate)
@@ -2801,8 +2789,34 @@ fn procfs_mount(
     })
 }
 
+/// procfs's dentry operations (Linux pid_dentry_operations,
+/// tid_fd_dentry_operations, proc_sys_dentry_operations,
+/// proc_misc_dentry_ops, proc_net_dentry_ops: one set here, told apart
+/// by the inode)
+static PROC_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_revalidate: Some(proc_revalidate),
+    ..crate::fs::dentry::DentryOps::NONE
+};
+
+/// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that
+/// is gone, or of an fd no longer open, is invalid, and so is a
+/// negative one (pid_revalidate: no inode, 0); a live one takes the
+/// task's current owner (pid_update_inode). An RCU walk is answered
+/// from what the inode keeps for it, ECHILD where Linux's is
+/// (`revalidate_rcu`).
+fn proc_revalidate(_: &Dentry, inode: Option<&Inode>, rcu: bool) -> Result<bool, KernelError> {
+    let Some(inode) = inode else {
+        return Ok(false);
+    };
+    if rcu {
+        return revalidate_rcu(inode);
+    }
+    Ok(revalidate_ref(inode))
+}
+
 /// The static tree (Linux proc_fill_super)
 fn procfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
+    sb.set_d_op(&PROC_DENTRY_OPS);
     // The static tree, built before it is reachable, in the order its
     // inodes are numbered (the root is 1)
     let mut root = DirBuild::new(sb)?;

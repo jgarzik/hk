@@ -3112,14 +3112,16 @@ dying dentry leaves the list in `dentry_kill` before its free is
 queued. No reference is dropped under the list lock (a last put would
 take it again), and nothing else is taken under it.
 
-A cached child is revalidated (`InodeOps::revalidate`, Linux
-d_revalidate) after its d_lock is released, inside whatever i_rwsem the
-walk holds: procfs's takes the task's task_lock and its fd table
-lock. Asked by an RCU walk (`rcu`, Linux LOOKUP_RCU; and a permission
-check's MAY_NOT_BLOCK) the inode is borrowed under the guard with no
-reference and may be torn down already: the answer may read only
-fields with no drop glue and take nothing that sleeps, else it is
-ECHILD; kernfs, whose answers need the inode data, always is. procfs
+A cached child, positive or negative, is revalidated by its
+filesystem's dentry operation (`DentryOps::d_revalidate` through
+`Dentry::revalidate`, Linux d_revalidate) after its d_lock is
+released, inside whatever i_rwsem the walk holds: procfs's takes the
+task's task_lock and its fd table lock. Asked by an RCU walk (`rcu`,
+Linux LOOKUP_RCU; and a permission check's MAY_NOT_BLOCK) the dentry
+and inode are borrowed under the guard with no reference and may be
+torn down already: the answer may read only fields with no drop glue
+and take nothing that sleeps, else it is ECHILD; kernfs, cgroupfs and
+vfat (Linux kernfs_dop_revalidate, vfat_revalidate_ci) always are. procfs
 answers from `ProcRcu` (`Inode::private_rcu`, Linux proc_inode's pid
 put by ->free_inode: set before the inode is visible, dropped by
 `i_callback` a grace period after the teardown): the task through its
