@@ -8,15 +8,22 @@
 //!   directory and binds over two files; the parent removes the
 //!   directory, unlinks one file and renames over the other; the
 //!   child's mounts there are gone from its mountinfo
+//! - DETACH_SUBMOUNT_HIDDEN: the detached directory's submount still
+//!   hides what it covered from the child, which stands in the
+//!   detached tree (Linux __detach_mounts: umount_tree with
+//!   UMOUNT_COVER, a cover left at the unmounted parent; before 7.x
+//!   UMOUNT_CONNECTED kept the submount itself)
 
 use crate::harness::verdict;
 use hk_syscall::{
-    CLONE_NEWNS, O_CREAT, O_RDONLY, O_WRONLY, sys_chdir, sys_close, sys_exit, sys_fork, sys_mkdir,
-    sys_mount, sys_open, sys_pipe, sys_read, sys_rename, sys_rmdir, sys_unlink, sys_unshare,
-    sys_wait4, sys_write,
+    CLONE_NEWNS, O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_exit, sys_fork,
+    sys_fstatat, sys_mkdir, sys_mount, sys_open, sys_pipe, sys_read, sys_rename, sys_rmdir,
+    sys_unlink, sys_unshare, sys_wait4, sys_write,
 };
 
 const MS_BIND: u64 = 4096;
+const ENOENT: i64 = -2;
+const AT_FDCWD: i32 = -100;
 const MS_REC: u64 = 1 << 14;
 const MS_PRIVATE: u64 = 1 << 18;
 
@@ -68,11 +75,13 @@ pub fn run_tests() {
         rn == 0 && code >= 0 && code & 4 == 0,
         rn * 1000 + code,
     );
+    verdict(b"DETACH_SUBMOUNT_HIDDEN", code >= 0 && code & 8 == 0, code);
 }
 
 /// The child: its mounts, then what is left of them once the parent
 /// removed the names (bit 0: the directory's two, bit 1: the unlinked
-/// file's, bit 2: the replaced file's; 64: setup failed)
+/// file's, bit 2: the replaced file's; bit 3: what the directory's
+/// submount covered shows; 64: setup failed)
 fn child(up: i32, down: i32) -> u64 {
     if sys_unshare(CLONE_NEWNS) != 0
         || sys_mount(
@@ -103,6 +112,10 @@ fn child(up: i32, down: i32) -> u64 {
     let after = [b"/tmp/dt_d".as_slice(), b"/tmp/dt_f", b"/tmp/dt_r"].map(|m| on(&mut buf, m));
     let want = [2, 1, 1];
     let mut code = 0;
+    let mut st = Stat::default();
+    if sys_fstatat(AT_FDCWD, b"sub/hidden\0".as_ptr(), &mut st, 0) != ENOENT {
+        code |= 8;
+    }
     for i in 0..3 {
         if before[i] != want[i] || after[i] != 0 {
             code |= 1 << i;

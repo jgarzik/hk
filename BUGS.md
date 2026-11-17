@@ -556,14 +556,6 @@ NS_MNT_GET_INFO's nr_mounts is a walk of its tree under NAMESPACE_SEM
 (Linux reads mnt_ns->nr_mounts), and there is no fs.mount-max limit
 (sysctl_mount_max, count_mounts: ENOSPC).
 
-## detach_mounts gaps
-
-**Location**: `fs/mount.rs` (`detach_mounts`)
-
-- The detached trees' submounts are disconnected as for a lazy umount
-  (locked ones leave covers); Linux __detach_mounts keeps them all
-  connected (umount_tree with UMOUNT_CONNECTED).
-
 ## nullfs gaps
 
 **Location**: `fs/nullfs.rs`, `fs/mount.rs` init_mount_tree,

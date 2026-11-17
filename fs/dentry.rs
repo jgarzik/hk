@@ -1349,6 +1349,22 @@ fn prune_one(parent: &DentryRef, d: &DentryRef, keep: bool) -> bool {
     true
 }
 
+/// Take `d` out of the tree unless it left already (Linux d_drop): the
+/// parent's d_lock, then its own, the parent read again if a rename
+/// moved it meanwhile. The children list's reference comes back, for
+/// the caller to put after its own locks.
+#[must_use]
+pub fn d_drop(d: &Dentry) -> Option<DentryRef> {
+    loop {
+        let parent = d.get_parent()?;
+        let mut p = parent.d_lock.write();
+        let mut dl = d.d_lock.write();
+        if core::ptr::eq(d.parent_ptr(), DentryRef::as_ptr(&parent)) {
+            return __d_drop(&mut p, d, &mut dl);
+        }
+    }
+}
+
 /// Everything cached below `d` leaves the tree (Linux
 /// shrink_dcache_parent / shrink_dcache_for_umount): a subtree out of
 /// the tree is no cache, and its parent<->child references would keep
