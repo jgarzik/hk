@@ -860,9 +860,8 @@ impl Mount {
             return None;
         }
         // SAFETY: both links change only under MOUNT_LOCK (attach_mnt,
-        // detach_mnt, a teardown's unhang_children and put_unhung, the
-        // last clearing the mountpoint only once the parent link is gone
-        // for good), so they stay while `_ml` is held and `self` lives.
+        // detach_mnt, a teardown's unhang_children, each clearing both
+        // in one section), so they stay while `_ml` is held and `self` lives.
         // The mountpoint is pinned by its `Mountpoint` while set. The
         // parent's memory is kept by a counted
         // reference, or once those are gone by its queued teardown's
@@ -2062,17 +2061,15 @@ fn put_umounted(mut l: UmountList) {
     }
 }
 
-/// Release submounts unhung onto `l` (their parent links cleared under
-/// MOUNT_LOCK write, their namespace left a grace period ago or never
-/// held): each one's mountpoint, then the reference its list entry held
-/// (Linux umount_mnt's put_mountpoint, then mntput)
+/// Release submounts unhung onto `l` (their parent and mountpoint
+/// links cleared under MOUNT_LOCK write, their namespace left a grace
+/// period ago or never held): the reference each list entry held
+/// (Linux umount_mnt, then mntput)
 fn put_unhung(mut l: OwnedList<MntChild>) {
     while let Some(c) = l.pop_front() {
         // SAFETY: entries of mnt_mounts are references (`attach_mnt`),
         // moved onto `l` as they were
-        let c = unsafe { MountRef::from_entry(c) };
-        // Its parent link is gone: `up` no longer reads this
-        c.put_mountpoint();
+        drop(unsafe { MountRef::from_entry(c) });
     }
 }
 
@@ -2641,7 +2638,8 @@ impl Mount {
 
     /// Unhang every submount (Linux umount_mnt for each) in one
     /// section under NAMESPACE_SEM write and MOUNT_LOCK: each loses its
-    /// parent link there, and moves, with the reference it held, to the
+    /// parent link and its mountpoint there (a last mountpoint to
+    /// ex_mountpoints), and moves, with the reference it held, to the
     /// list returned (intrusive: nothing allocated), released after the
     /// locks
     fn unhang_children(&self) -> OwnedList<MntChild> {
@@ -2657,6 +2655,11 @@ impl Mount {
             debug_assert_eq!(c.ns(), 0, "mount: a doomed mount's submount in a namespace");
             unhash_mnt(&mut ml, &c);
             drop(c.take_parent(&mut ml));
+            // Off its mountpoint with its parent (Linux umount_mnt), so
+            // a mountpoint's m_list holds hung mounts only
+            if let Some(mp) = c.take_mountpoint(&mut ml) {
+                ns.maybe_free_mountpoint(&mut ml, mp);
+            }
             out.push_back(c);
         }
         out
@@ -2718,22 +2721,23 @@ pub fn detach_mounts(d: &Dentry) -> bool {
         };
         let pin = pin_mp(&mut ml, mp);
         let mut any = false;
-        loop {
-            // SAFETY: pinned, under MOUNT_LOCK
-            let m = unsafe { mp.get() }.m_list.access(&ml).front();
-            // SAFETY: a mount on the list hangs on its parent, whose
-            // mnt_mounts holds a reference to it, under MOUNT_LOCK
-            let Some(m) = m.map(|m| unsafe { &*m }) else {
-                break;
-            };
-            // Every umount takes a mount off its mountpoint (a cover
-            // stands in for a connected one): none lingers here
-            debug_assert_eq!(
-                m.flags() & MNT_UMOUNT,
-                0,
-                "mount: unmounted on its mountpoint"
-            );
-            umount_tree(&mut ns, &mut ml, m, 0);
+        // Each pass takes the list's head off it (Linux: while
+        // (mp.node.next)), so the loop ends
+        // SAFETY: pinned, under MOUNT_LOCK
+        while let Some(m) = unsafe { mp.get() }.m_list.access(&ml).front() {
+            // SAFETY: a mount on the list hangs on its parent (both
+            // links set and cleared together under MOUNT_LOCK write),
+            // whose mnt_mounts holds a reference to it
+            let m = unsafe { &*m };
+            if m.flags() & MNT_UMOUNT != 0 {
+                // Linux: an unmounted mount left connected comes off
+                // (umount_mnt); here none is left so (covers stand in
+                // for them), and its umount's list holds its reference
+                umount_mnt(&mut ns, &mut ml, m);
+            } else {
+                // Hung and mounted: its tree's umount takes it off
+                umount_tree(&mut ns, &mut ml, m, 0);
+            }
             any = true;
         }
         (unpin_mountpoint(&mut ml, pin), any)
@@ -2955,6 +2959,45 @@ mod tests {
         assert!(detach_mnt(&mut ns, &e).is_some());
         change_mnt_propagation(&mut ns, &a, Prop::Private);
         change_mnt_propagation(&mut ns, &b, Prop::Private);
+    }
+
+    /// The mounts on a mountpoint's `m_list`
+    fn on_mp(d: &Dentry) -> usize {
+        let ml = MOUNT_LOCK.read_excl();
+        // SAFETY: found under MOUNT_LOCK, which is held for the read
+        lookup_mountpoint(&ml, d).map_or(0, |mp| unsafe { mp.get() }.m_list.access(&ml).len())
+    }
+
+    /// detach_mounts takes every mount off the dentry, each pass the
+    /// list's head (it ends); a second call finds nothing. An unhung
+    /// submount (a teardown's unhang_children) leaves its mountpoint's
+    /// list with its parent link, so detach_mounts never meets a
+    /// parentless mount there.
+    #[test]
+    fn detach_mounts_empties_mountpoint() {
+        let a = mnt();
+        let mut ns = namespace_lock();
+        let c1 = hang(&mut ns, &a);
+        let c2 = hang(&mut ns, &a);
+        drop(ns);
+        assert_eq!(on_mp(&a.root), 2);
+        assert!(detach_mounts(&a.root));
+        assert_eq!(on_mp(&a.root), 0);
+        for c in [&c1, &c2] {
+            assert_ne!(c.flags() & MNT_UMOUNT, 0);
+            assert!(!c.has_parent(&*MOUNT_LOCK.read_excl()));
+        }
+        assert!(!detach_mounts(&a.root));
+        let p = mnt();
+        let mut ns = namespace_lock();
+        let q = hang(&mut ns, &p);
+        drop(ns);
+        assert_eq!(on_mp(&p.root), 1);
+        let l = p.unhang_children();
+        assert_eq!(on_mp(&p.root), 0);
+        put_unhung(l);
+        assert!(!q.has_parent(&*MOUNT_LOCK.read_excl()));
+        assert!(!detach_mounts(&p.root));
     }
 
     #[test]
