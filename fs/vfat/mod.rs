@@ -1733,6 +1733,18 @@ fn create_dir_entry_with_lfn(
     Ok(short_name)
 }
 
+/// Set a raw short entry's first cluster (Linux fat_set_start)
+fn entry_set_start(b: &mut [u8; 32], start: u32) {
+    b[20..22].copy_from_slice(&((start >> 16) as u16).to_le_bytes());
+    b[26..28].copy_from_slice(&(start as u16).to_le_bytes());
+}
+
+/// Set a raw short entry's first cluster and size
+fn entry_set_extent(b: &mut [u8; 32], start: u32, size: u32) {
+    entry_set_start(b, start);
+    b[28..32].copy_from_slice(&size.to_le_bytes());
+}
+
 /// Update directory entry metadata (start_cluster and file_size) by short name
 fn update_dir_entry_by_short_name(
     sb_data: &VfatSbData,
@@ -1744,9 +1756,7 @@ fn update_dir_entry_by_short_name(
     let off = entry_offset(sb_data, parent_cluster, short_name)?;
     let mut buf = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut buf)?;
-    buf[20..22].copy_from_slice(&((new_start_cluster >> 16) as u16).to_le_bytes());
-    buf[26..28].copy_from_slice(&(new_start_cluster as u16).to_le_bytes());
-    buf[28..32].copy_from_slice(&new_size.to_le_bytes());
+    entry_set_extent(&mut buf, new_start_cluster, new_size);
     write_bytes(&sb_data.bdev, off, &buf)
 }
 
@@ -2371,13 +2381,7 @@ impl InodeOps for VfatInodeOps {
 
         // fat_detach + fat_attach: the moved object's inode at the new
         // entry, then written there (vfat_sync_ipos)
-        if let Some(i) = &old_inode {
-            attach(i, np, new_short)?;
-        }
-        let (start, size) = match &old_inode {
-            Some(i) => (get_inode_data(i)?.start_cluster, i.get_size() as u32),
-            None => (old_entry.start_cluster, old_entry.file_size),
-        };
+        // From here every failure is undone (Linux error_inode)
         let unwind = Unwind {
             sb_data: &sb_data,
             new_dir: np,
@@ -2385,7 +2389,17 @@ impl InodeOps for VfatInodeOps {
             old: (&old_inode, op, old_entry.short_name),
             target: existing.map(|t| (&new_inode, t)),
         };
-        if let Err(e) = write_entry(&sb_data, np, &new_short, old_entry.attr, start, size) {
+        let sync_ipos = || {
+            let (start, size) = match &old_inode {
+                Some(i) => {
+                    attach(i, np, new_short)?;
+                    (get_inode_data(i)?.start_cluster, i.get_size() as u32)
+                }
+                None => (old_entry.start_cluster, old_entry.file_size),
+            };
+            write_entry(&sb_data, np, &new_short, old_entry.attr, start, size)
+        };
+        if let Err(e) = sync_ipos() {
             unwind.inode(None);
             return Err(e);
         }
@@ -2473,8 +2487,7 @@ fn logstart(sb_data: &VfatSbData, cluster: u32) -> u32 {
 fn set_start(sb_data: &VfatSbData, off: u64, start: u32) -> Result<(), KernelError> {
     let mut b = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut b)?;
-    b[20..22].copy_from_slice(&((start >> 16) as u16).to_le_bytes());
-    b[26..28].copy_from_slice(&(start as u16).to_le_bytes());
+    entry_set_start(&mut b, start);
     write_bytes(&sb_data.bdev, off, &b)
 }
 
@@ -2493,9 +2506,7 @@ fn write_entry(
     let mut b = [0u8; 32];
     read_bytes(&sb_data.bdev, off, &mut b)?;
     b[11] = attr;
-    b[20..22].copy_from_slice(&((start >> 16) as u16).to_le_bytes());
-    b[26..28].copy_from_slice(&(start as u16).to_le_bytes());
-    b[28..32].copy_from_slice(&size.to_le_bytes());
+    entry_set_extent(&mut b, start, size);
     write_bytes(&sb_data.bdev, off, &b)
 }
 
