@@ -272,22 +272,32 @@ impl ProcView {
     }
 }
 
-/// A listener or connection line, its values read in one hold of the
-/// socket lock (Linux get_tcp4_sock reads the live fields racily; hk
-/// owns the socket to read them, process context, nothing held)
+/// A listener or connection line (Linux get_tcp4_sock reads the live
+/// fields racily): an unowned socket's from its block under `slock`, an
+/// owned one's as its owner took it; never waiting for an owner
 fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
     let a = s.inet.get();
     let ino = s.sk.ino.load(Ordering::Relaxed);
     let uid = s.sk.cred.euid;
-    let (state, v, rcvq, sndq) = {
-        let g = s.lock_sock();
-        (
-            g.cb.state,
-            ProcView::of(&g.cb),
-            g.cb.rcvq_len(),
-            g.cb.sndq_len(),
-        )
+    let live = {
+        let mut b = s.lock.bh_lock();
+        b.get().map(|g| {
+            (
+                g.cb.state,
+                ProcView::of(&g.cb),
+                g.cb.rcvq_len(),
+                g.cb.sndq_len(),
+            )
+        })
     };
+    let (state, v, rcvq, sndq) = live.unwrap_or_else(|| {
+        (
+            s.state(),
+            s.snap.proc.load(),
+            s.snap.rcvq.load(Ordering::Acquire),
+            s.snap.sndq.load(Ordering::Acquire),
+        )
+    });
     let rxq = if state == TcpState::Listen {
         s.queue.lock().as_ref().map_or(0, |q| q.ready.len())
     } else {
@@ -355,7 +365,7 @@ fn tw_line(i: usize, tw: &super::timewait::TimeWait, now: u64) -> Line {
 }
 
 /// One /proc/net/tcp entry, gathered under RCU: a socket (its line made
-/// after, under its lock) or a TIME_WAIT line
+/// after, `sock_line`) or a TIME_WAIT line
 enum Entry {
     Sock(usize, alloc::sync::Arc<super::TcpSock>),
     Tw(Line),
@@ -365,7 +375,7 @@ enum Entry {
 /// entries (Linux tcp4_seq_show over the hash walk). The walk is under
 /// RCU, which cannot sleep: it takes references (counted first, room
 /// made with RCU dropped, entries past the room left out as raced),
-/// then each socket's line is made under its socket lock.
+/// then makes each socket's line (`sock_line`).
 pub fn proc_net_tcp(net: &crate::net::NetNamespace) -> Vec<u8> {
     let c = core::cell::Cell::new(0usize);
     {

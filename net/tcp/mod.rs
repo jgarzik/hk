@@ -31,7 +31,8 @@
 //! shutdown bits and the lockless view (`Snap`: state, queue sizes,
 //! writability, send window edges, Linux's READ_ONCE fields that
 //! tcp_poll, the waits and tcp_v4_err read; /proc/net/tcp reads the
-//! control block under the socket lock) are published. Wakeups,
+//! live block under `slock`, an owned socket's view as its owner took
+//! it) are published. Wakeups,
 //! SIGIO included, run in the step: from the owner, or under `slock`
 //! (unowned input, timers and errors; `release_cb`), as Linux. Transmitting never re-enters a socket lock: `lo`
 //! queues to the receive backlog and `netif_rx_flush_local` runs only
@@ -61,7 +62,9 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::net::sock_lock::{BhGuard, SockGuard, SockHooks, SockLock};
 use crate::sync::spin::Mutex;
@@ -202,6 +205,54 @@ struct Snap {
     /// Linux snd_una / snd_nxt (the ICMP error sequence check)
     snd_una: AtomicU32,
     snd_max: AtomicU32,
+    /// /proc/net/tcp's view of an owned socket: stored as an owner takes
+    /// it (`lock_sock`), read by /proc while owned (an unowned socket's
+    /// line is made from the live block under `slock`); a reader never
+    /// waits for an owner, which may sleep for long (Linux reads the
+    /// live fields racily)
+    proc: ProcSnap,
+}
+
+/// `info::ProcView` as atomics, plus the queue sizes it goes with
+#[derive(Default)]
+struct ProcSnap {
+    tr: AtomicU8,
+    when: AtomicU64,
+    backoff: AtomicU32,
+    probes: AtomicU32,
+    rto: AtomicU64,
+    ato: AtomicU64,
+    qp: AtomicU32,
+    cwnd: AtomicU32,
+    last: AtomicI64,
+}
+
+impl ProcSnap {
+    fn store(&self, v: &info::ProcView) {
+        self.tr.store(v.tr, Ordering::Relaxed);
+        self.when.store(v.when, Ordering::Relaxed);
+        self.backoff.store(v.backoff, Ordering::Relaxed);
+        self.probes.store(v.probes, Ordering::Relaxed);
+        self.rto.store(v.rto, Ordering::Relaxed);
+        self.ato.store(v.ato, Ordering::Relaxed);
+        self.qp.store(v.qp, Ordering::Relaxed);
+        self.cwnd.store(v.cwnd, Ordering::Relaxed);
+        self.last.store(v.last, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> info::ProcView {
+        info::ProcView {
+            tr: self.tr.load(Ordering::Relaxed),
+            when: self.when.load(Ordering::Relaxed),
+            backoff: self.backoff.load(Ordering::Relaxed),
+            probes: self.probes.load(Ordering::Relaxed),
+            rto: self.rto.load(Ordering::Relaxed),
+            ato: self.ato.load(Ordering::Relaxed),
+            qp: self.qp.load(Ordering::Relaxed),
+            cwnd: self.cwnd.load(Ordering::Relaxed),
+            last: self.last.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Snap {
@@ -414,6 +465,8 @@ impl TcpSock {
     fn lock_sock(&self) -> Guard<'_> {
         let mut g = self.lock.lock(self);
         self.sync_caps(&mut g);
+        // What /proc shows while it is owned
+        self.snap.proc.store(&info::ProcView::of(&g.cb));
         g
     }
 
