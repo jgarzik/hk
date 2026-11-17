@@ -1051,7 +1051,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **`task/percpu.rs` is the largest file** (before C): scheduler core,
   do_clone, exit, wait, credential setters, several sleep APIs. Split
   like Linux (sched/core, fork, exit, cred). Other giant functions:
-  do_clone, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
+  copy_process, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
 - **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
@@ -1152,12 +1152,10 @@ Tag = roadmap phase (doc/ROADMAP.md).
 
 ## Kernel stack frames
 
-**Location**: `task/fork.rs`, others named below
+**Location**: `arch/x86_64/signal.rs`
 
-- Large frames left: `do_clone` (the clone state is gathered on its
-  frame before the task exists; Linux copy_process fills the task
-  dup_task_struct allocated) and x86 `copy_fpstate_to_sigframe` (the FP
-  image on the stack; Linux XSAVEs straight into the user frame).
+- Large frames left: x86 `copy_fpstate_to_sigframe` (the FP image on
+  the stack; Linux XSAVEs straight into the user frame).
 
 ## DRM dumb buffers are the boot framebuffer only
 

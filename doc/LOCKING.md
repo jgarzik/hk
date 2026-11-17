@@ -4260,7 +4260,8 @@ bitmap, are immutable after creation (no lock).
 
 3. **clone/unshare** - `copy_namespaces()` reads the parent's, then
    installs the child's under the child's alloc_lock, never with a
-   namespace lock held; it runs early in `do_clone()` (can fail on OOM).
+   namespace lock held; it runs in `copy_process()` after copy_mm, as
+   in Linux (can fail on OOM).
 
 4. **Namespace files** - an nsfs inode holds a reference to its
    namespace (Linux i_private), dropped with the inode at its dentry's

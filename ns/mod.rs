@@ -570,12 +570,9 @@ pub fn fork_nsproxy(
     child_fs: Option<&crate::fs::FsStruct>,
 ) -> KernelResult<Arc<NsProxy>> {
     let ns_flags = flags & CLONE_NS_FLAGS;
-    // CLONE_NEWNS with a shared fs struct is EINVAL, before any
-    // permission check (Linux copy_process); the child's own copy
-    // follows its new mounts
-    if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
-        return Err(KernelError::InvalidArgument);
-    }
+    // CLONE_NEWNS with a shared fs struct was refused before any work
+    // (`percpu::clone_flags_ok`, Linux copy_process); the child's own
+    // copy follows its new mounts
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);
     }

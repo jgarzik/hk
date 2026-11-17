@@ -1268,6 +1268,12 @@ impl<T> OwnCell<T> {
         Self(UnsafeCell::new(v))
     }
 
+    /// The field, writable, through exclusive access to the task (not
+    /// shared yet: its creator filling it in)
+    fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
+    }
+
     /// # Safety
     /// The caller owns the task, or holds its `alloc_lock`.
     unsafe fn get(&self) -> &T {
