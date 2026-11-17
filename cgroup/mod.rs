@@ -581,10 +581,15 @@ pub fn remove_task_cgroup(t: &Task) -> Option<Arc<Cgroup>> {
     t.cgroup.lock().take()
 }
 
-/// Initialize the cgroup subsystem
-///
-/// Called during kernel init to set up the root cgroup and register controllers.
+/// Initialize the cgroup subsystem: the root cgroup and its controllers'
+/// states, once (Linux cgroup_init at boot: every cgroup2 mount shows
+/// the one default hierarchy, cgrp_dfl_root); a later call does nothing
 pub fn cgroup_init() {
+    static INIT: spin::Once = spin::Once::new();
+    INIT.call_once(cgroup_init_once);
+}
+
+fn cgroup_init_once() {
     let root = CGROUP_ROOT.clone();
 
     // Create root cgroup

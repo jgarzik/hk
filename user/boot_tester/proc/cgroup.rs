@@ -8,9 +8,11 @@
 //! 5. Writing to control files (pids.max)
 //! 6. Cleaning up with rmdir
 
+use crate::harness::T;
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_RDONLY, O_RDWR, sys_close, sys_mkdir, sys_mount, sys_open, sys_read, sys_rmdir, sys_write,
+    O_RDONLY, O_RDWR, Stat, sys_close, sys_mkdir, sys_mount, sys_open, sys_read, sys_rmdir,
+    sys_stat, sys_umount2, sys_write,
 };
 
 /// Run all cgroup tests
@@ -22,7 +24,48 @@ pub fn run_tests() {
     test_read_control_files();
     test_write_pids_max();
     test_cleanup_cgroup();
+    two_mounts();
     println(b"=== Cgroup Test Complete ===");
+}
+
+/// CGROUPFS_TWO_MOUNTS: two cgroup2 mounts show the one hierarchy
+/// (Linux cgrp_dfl_root): a name that failed in one is found once the
+/// other makes it, its control files too
+fn two_mounts() {
+    let mut t = T::new(b"CGROUPFS_TWO_MOUNTS");
+    let (a, b) = (b"/tmp/cga\0", b"/tmp/cgb\0");
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(a.as_ptr(), 0o755);
+    sys_mkdir(b.as_ptr(), 0o755);
+    let fs = b"cgroup2\0".as_ptr();
+    let ra = sys_mount(b"none\0".as_ptr(), a.as_ptr(), fs, 0, 0);
+    let rb = sys_mount(b"none\0".as_ptr(), b.as_ptr(), fs, 0, 0);
+    if t.eq(b"mount a", ra, 0) && t.eq(b"mount b", rb, 0) {
+        two_mounts_cases(&mut t);
+    }
+    sys_umount2(a.as_ptr(), 0);
+    sys_umount2(b.as_ptr(), 0);
+    sys_rmdir(a.as_ptr());
+    sys_rmdir(b.as_ptr());
+    t.done();
+}
+
+fn two_mounts_cases(t: &mut T) {
+    const ENOENT: i64 = -2;
+    let mut st = Stat::default();
+    let bx = b"/tmp/cgb/tm2\0".as_ptr();
+    let bp = b"/tmp/cgb/tm2/cgroup.procs\0".as_ptr();
+    sys_rmdir(b"/tmp/cga/tm2\0".as_ptr());
+    t.eq(b"miss in b", sys_stat(bx, &mut st), ENOENT);
+    t.eq(b"miss again", sys_stat(bx, &mut st), ENOENT);
+    t.eq(
+        b"mkdir in a",
+        sys_mkdir(b"/tmp/cga/tm2\0".as_ptr(), 0o755),
+        0,
+    );
+    t.eq(b"found in b", sys_stat(bx, &mut st), 0);
+    t.eq(b"its file in b", sys_stat(bp, &mut st), 0);
+    sys_rmdir(b"/tmp/cga/tm2\0".as_ptr());
 }
 
 /// Mount cgroupfs at /sys/fs/cgroup (sysfs's mount point)
