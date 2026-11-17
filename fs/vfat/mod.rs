@@ -2035,6 +2035,8 @@ impl InodeOps for VfatInodeOps {
             clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
+        // The directory's mtime and ctime
+        dir.touch_mc();
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2131,6 +2133,8 @@ impl InodeOps for VfatInodeOps {
             clusters: 0,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
+        // The directory's mtime and ctime
+        dir.touch_mc();
         dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
@@ -2172,6 +2176,9 @@ impl InodeOps for VfatInodeOps {
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
         d.set_d_time(dir.iversion());
+        if let Some(i) = d.get_inode() {
+            super::libfs::simple_link_times(dir, &i);
+        }
         dir_sync(&sb, &sb_data)
     }
 
@@ -2228,6 +2235,9 @@ impl InodeOps for VfatInodeOps {
         // version (Linux vfat_d_version_set(dentry,
         // inode_query_iversion(dir)))
         d.set_d_time(dir.iversion());
+        if let Some(i) = d.get_inode() {
+            super::libfs::simple_link_times(dir, &i);
+        }
         dir_sync(&sb, &sb_data)
     }
 
@@ -2431,6 +2441,9 @@ impl InodeOps for VfatInodeOps {
                 None if t.start_cluster != 0 => free_cluster_chain(&sb_data, t.start_cluster)?,
                 None => {}
             }
+        }
+        if let Some(i) = &old_inode {
+            super::libfs::simple_rename_timestamp(old_dir, new_dir, i, new_inode.as_deref());
         }
         dir_sync(&sb, &sb_data)
     }

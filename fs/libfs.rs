@@ -30,6 +30,30 @@ use crate::fs::superblock::{FileSystemType, FsContext, vfs_get_tree};
 use crate::sync::spin::Mutex as SpinMutex;
 use crate::util::kalloc::try_arc;
 
+/// Linux simple_unlink's and simple_link's times: the inode's ctime,
+/// the directory's ctime and mtime, all one `now`
+pub fn simple_link_times(dir: &Inode, inode: &Inode) {
+    let now = crate::time::TIMEKEEPER.current_time();
+    inode.set_ctime(now);
+    dir.set_ctime(now);
+    dir.set_mtime(now);
+}
+
+/// Linux simple_rename_timestamp: both directories' ctime and mtime,
+/// the moved inode's ctime and the replaced (or exchanged) one's, all
+/// one `now`
+pub fn simple_rename_timestamp(old_dir: &Inode, new_dir: &Inode, old: &Inode, new: Option<&Inode>) {
+    let now = crate::time::TIMEKEEPER.current_time();
+    for d in [old_dir, new_dir] {
+        d.set_ctime(now);
+        d.set_mtime(now);
+    }
+    old.set_ctime(now);
+    if let Some(n) = new {
+        n.set_ctime(now);
+    }
+}
+
 /// Linux lookup_noperm_common: a kernel-made name is one component,
 /// not "." or ".." (EACCES)
 fn name_ok(name: &[u8]) -> Result<(), KernelError> {

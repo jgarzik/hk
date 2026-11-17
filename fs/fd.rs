@@ -56,7 +56,8 @@ fn do_truncate(inode: &super::InodeRef, length: u64, times: bool) -> KernelResul
         let changed = inode.get_size() != length;
         inode.i_op.truncate(inode, length).inspect(|()| {
             if times || changed {
-                inode.touch_mc();
+                let now = crate::time::TIMEKEEPER.current_time();
+                inode.set_times(None, Some(now), Some(now));
             }
         })
     };

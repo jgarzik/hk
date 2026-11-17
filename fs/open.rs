@@ -526,7 +526,10 @@ fn filp_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, Ker
         // ATTR_MTIME | ATTR_CTIME, also for a file already empty; a
         // refusal (a sealed memfd: EPERM) fails the open
         match inode.i_op.truncate(&inode, 0) {
-            Ok(()) => inode.touch_mc(),
+            Ok(()) => {
+                let now = crate::time::TIMEKEEPER.current_time();
+                inode.set_times(None, Some(now), Some(now));
+            }
             Err(KernelError::OperationNotSupported) => {}
             Err(e) => return Err(e),
         }

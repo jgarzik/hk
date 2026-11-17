@@ -985,7 +985,7 @@ impl File {
             // file_modified: set-id bits go unless CAP_FSETID, then
             // mtime and ctime, before the data
             super::dac::remove_privs(&inode);
-            inode.touch_mc();
+            inode.file_update_time();
             self.f_op
                 .write_iter(self, from, at, flags)
                 .map(|n| (pos, n))

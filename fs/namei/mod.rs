@@ -980,8 +980,8 @@ impl<'a> Nd<'a> {
         super::dac::may_create(c, dir)?;
         let perm = super::dac::create_mode(c, dir, (self.mode & 0o7777) as u16);
         let d = Dentry::prealloc(parent, name)?;
+        // The directory's times are its filesystem's (Linux ->create)
         let inode = dir.i_op.create(dir, name, InodeMode::regular(perm))?;
-        dir.touch_mc();
         self.created.set(true);
         Ok(Found::Made(Dentry::add(parent, d, Some(inode))))
     }
@@ -1312,8 +1312,9 @@ pub fn create_entry(
         super::dac::may_create(&c, &dir)?;
         // The dentry first, so an ENOMEM leaves no entry made
         let d = Dentry::prealloc(parent, name)?;
+        // The directory's times are its filesystem's (Linux ->mkdir,
+        // ->mknod, ->symlink, ->create)
         let inode = make(&dir, &c)?;
-        dir.touch_mc();
         Ok(Dentry::add(parent, d, Some(inode)))
     })()
 }
@@ -1357,11 +1358,9 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         } else {
             dir.i_op.unlink(&dir, name, &victim)
         };
-        // The parent's mtime and ctime, the victim's ctime
-        // (simple_unlink)
+        // The parent's and the victim's times are the filesystem's
+        // (Linux simple_unlink, vfat_unlink)
         if r.is_ok() {
-            dir.touch_mc();
-            inode.touch_c();
             // What other namespaces mounted on it goes too, and nothing
             // is mounted there any more (Linux vfs_rmdir, vfs_unlink:
             // dont_mount, detach_mounts, under the victim's lock)

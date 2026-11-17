@@ -232,6 +232,34 @@ pub trait InodeOps: Send + Sync {
         let _ = inode;
     }
 
+    /// A time update (Linux ->update_time, else generic_update_time):
+    /// atime, or mtime and ctime, become `now`. A filesystem with
+    /// coarser times or times of its own on disk overrides it (vfat).
+    fn update_time(&self, inode: &Inode, what: TimeUpdate, now: Timespec) {
+        generic_update_time(inode, what, now);
+    }
+
+    /// The times part of a setattr (Linux ->setattr applying ATTR_ATIME,
+    /// ATTR_MTIME, ATTR_CTIME the VFS computed: utimes, truncate,
+    /// chmod, chown), under i_rwsem; default setattr_copy's
+    fn setattr_times(
+        &self,
+        inode: &Inode,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+        ctime: Option<Timespec>,
+    ) {
+        if let Some(t) = atime {
+            inode.set_atime(t);
+        }
+        if let Some(t) = mtime {
+            inode.set_mtime(t);
+        }
+        if let Some(t) = ctime {
+            inode.set_ctime(t);
+        }
+    }
+
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let _ = (dir, name, mode);
@@ -1477,13 +1505,37 @@ impl Inode {
         self.mtime.set(now);
     }
 
+    /// A write changed the file (Linux file_update_time): mtime and ctime
+    /// become the current time through its filesystem (->update_time),
+    /// unless they are that already (inode_needs_update_time)
+    pub fn file_update_time(&self) {
+        let now = crate::time::TIMEKEEPER.current_time();
+        let same = |t: Timespec| (t.sec, t.nsec) == (now.sec, now.nsec);
+        if same(self.mtime()) && same(self.ctime()) {
+            return;
+        }
+        self.i_op.update_time(self, TimeUpdate::CMtime, now);
+    }
+
+    /// Times from a setattr (utimes, truncate, chmod, chown) through the
+    /// filesystem (Linux notify_change -> ->setattr), under i_rwsem
+    pub fn set_times(
+        &self,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+        ctime: Option<Timespec>,
+    ) {
+        self.i_op.setattr_times(self, atime, mtime, ctime);
+    }
+
     /// An access through `mnt` (Linux touch_atime): atime becomes the
     /// current time unless the mount is read-only, noatime (nodiratime
     /// for a directory), or relatime and the atime is newer than mtime
     /// and ctime and under a day old. Unlocked, as Linux.
     pub fn touch_atime(&self, mnt: &super::mount::Mount) {
         if let Some(now) = self.atime_update(mnt) {
-            self.atime.set(now);
+            // Linux touch_atime -> inode_update_time(S_ATIME)
+            self.i_op.update_time(self, TimeUpdate::Atime, now);
         }
     }
 
@@ -1751,6 +1803,24 @@ impl InodeOps for NullInodeOps {
 
 /// Static null inode ops instance
 pub static NULL_INODE_OPS: NullInodeOps = NullInodeOps;
+
+/// Which times a time update sets (Linux S_ATIME, S_MTIME | S_CTIME)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimeUpdate {
+    Atime,
+    CMtime,
+}
+
+/// Linux generic_update_time: the times `what` names become `now`
+pub fn generic_update_time(inode: &Inode, what: TimeUpdate, now: Timespec) {
+    match what {
+        TimeUpdate::Atime => inode.set_atime(now),
+        TimeUpdate::CMtime => {
+            inode.set_ctime(now);
+            inode.set_mtime(now);
+        }
+    }
+}
 
 /// Write access to an inode, held by a file open for writing and by a
 /// truncate (Linux get_write_access / put_write_access)

@@ -241,12 +241,15 @@ impl InodeOps for CgroupfsInodeOps {
         let new_cg = cgroup_mkdir(&parent_cg, name)?;
         // No inode, no cgroup: a failed mkdir leaves the name free
         // (Linux cgroup_mkdir destroys what it built on an error)
-        create_cgroup_dir_inode(dir, &new_cg).inspect_err(|_| {
+        let i = create_cgroup_dir_inode(dir, &new_cg).inspect_err(|_| {
             let _ = cgroup_rmdir(&parent_cg, name);
-        })
+        })?;
+        // The parent's times (Linux kernfs_link_sibling's parent iattr)
+        dir.touch_mc();
+        Ok(i)
     }
 
-    fn rmdir(&self, dir: &Inode, name: &[u8], _d: &Dentry) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let data = private
             .as_ref()
@@ -259,7 +262,16 @@ impl InodeOps for CgroupfsInodeOps {
             _ => return Err(KernelError::NotDirectory),
         };
         let parent_cg = parent.upgrade().ok_or(KernelError::NotFound)?;
-        cgroup_rmdir(&parent_cg, name)
+        cgroup_rmdir(&parent_cg, name)?;
+        // The parent's and the victim's times (Linux kernfs_remove's
+        // parent iattr)
+        let now = crate::time::TIMEKEEPER.current_time();
+        dir.set_ctime(now);
+        dir.set_mtime(now);
+        if let Some(i) = d.get_inode() {
+            i.set_ctime(now);
+        }
+        Ok(())
     }
 }
 

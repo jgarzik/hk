@@ -266,13 +266,7 @@ fn do_utimes(
         None => (Some(now), Some(now)),
         Some(t) => (pick(&t[0]), pick(&t[1])),
     };
-    if let Some(t) = atime {
-        inode.set_atime(t);
-    }
-    if let Some(t) = mtime {
-        inode.set_mtime(t);
-    }
-    inode.set_ctime(now);
+    inode.set_times(atime, mtime, Some(now));
     inode.i_op.setattr_done(&inode);
     drop(lock);
     Ok(())
