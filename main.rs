@@ -281,6 +281,11 @@ pub(crate) fn kmain() -> ! {
         .leak()
         + task::percpu::KERNEL_STACK_SIZE as u64;
 
+    // The default cgroup hierarchy's root before the first task and its
+    // namespaces (Linux cgroup_init_early, early in start_kernel; here
+    // once the heap is up)
+    cgroup::cgroup_init_early();
+
     // The per-CPU scheduler with its idle task, then pid 1 (the idle
     // tasks are tid 0, Linux swapper). No parent, pgid=sid=0
     // like Linux's init_task (init/init_task.c); init calls setsid()
@@ -328,6 +333,8 @@ pub(crate) fn kmain() -> ! {
     pseudo_init(&fs::pseudo::BDEV);
     // start_kernel's nsfs_init, after proc_root_init
     pseudo_init(&fs::pseudo::NSFS);
+    // then cgroup_init: the controllers' states in the root cgroup
+    cgroup::cgroup_init();
     fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();

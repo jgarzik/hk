@@ -615,21 +615,23 @@ pub fn remove_task_cgroup(t: &Task) -> Option<Arc<Cgroup>> {
     t.cgroup.lock().take()
 }
 
-/// Initialize the cgroup subsystem: the root cgroup and its controllers'
-/// states, once (Linux cgroup_init at boot: every cgroup2 mount shows
-/// the one default hierarchy, cgrp_dfl_root); a later call does nothing
-pub fn cgroup_init() {
-    static INIT: spin::Once = spin::Once::new();
-    INIT.call_once(cgroup_init_once);
+/// The default hierarchy's root cgroup (Linux cgroup_init_early:
+/// init_cgroup_root of cgrp_dfl_root, which the initial cgroup
+/// namespace points at), once at boot before anything reaches a cgroup;
+/// every cgroup2 mount shows this one hierarchy
+pub fn cgroup_init_early() {
+    let root = CGROUP_ROOT.clone();
+    root.set_root_cgroup(Cgroup::new_root(root.alloc_cg_id(), Vec::new(), &root));
 }
 
-fn cgroup_init_once() {
+/// The controllers' states in the root cgroup (Linux cgroup_init:
+/// cgroup_init_subsys for each), once at boot after
+/// [`cgroup_init_early`]
+pub fn cgroup_init() {
     let root = CGROUP_ROOT.clone();
-
-    // Create root cgroup
-    let root_cg = Cgroup::new_root(root.alloc_cg_id(), Vec::new(), &root);
-
-    root.set_root_cgroup(root_cg.clone());
+    let root_cg = root
+        .root_cgroup()
+        .expect("cgroup: cgroup_init_early runs first");
 
     // Initialize CSS for root cgroup for each controller
     for controller in root.registered_controllers() {

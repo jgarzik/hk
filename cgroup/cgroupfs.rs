@@ -31,7 +31,7 @@ use crate::fs::inode::{
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
-use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_init, cgroup_mkdir, cgroup_rmdir};
+use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_mkdir, cgroup_rmdir};
 use crate::task::Pid;
 use crate::util::kalloc::try_arc;
 
@@ -789,8 +789,6 @@ pub static CGROUPFS_SUPER_OPS: CgroupfsSuperOps = CgroupfsSuperOps;
 fn cgroupfs_mount(
     fc: &crate::fs::superblock::FsContext<'_>,
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
-    // Initialize cgroup subsystem if not done
-    cgroup_init();
     crate::fs::superblock::get_tree_nodev(fc, &CGROUPFS_SUPER_OPS, cgroupfs_fill)
 }
 

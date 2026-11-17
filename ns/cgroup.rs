@@ -38,13 +38,13 @@ pub struct CgroupNamespace {
 impl CgroupNamespace {
     /// Create the initial cgroup namespace (rooted at the real root cgroup)
     fn new_init() -> Arc<Self> {
-        // The initial namespace uses the real root cgroup
-        // We'll get it lazily when first accessed since cgroup_init()
-        // might not have been called yet (boot: failure cannot be reported)
+        // The default hierarchy's root (Linux init_cgroup_ns.root_cset:
+        // init_css_set), which cgroup_init_early made at boot, before any
+        // task or namespace exists
         let ns = arc_nofail(Self {
             root: CGROUP_ROOT
                 .root_cgroup()
-                .unwrap_or_else(create_placeholder_root),
+                .expect("cgroup: cgroup_init_early runs first"),
             ns: super::NsCommon::init(super::inum::Inum::fixed(super::inum::CGROUP_INIT)),
             user_ns: super::INIT_USER_NS.clone(),
         });
@@ -95,13 +95,6 @@ impl CgroupNamespace {
     pub fn is_visible(&self, cgroup: &Arc<Cgroup>) -> bool {
         Arc::ptr_eq(cgroup, &self.root) || cgroup.is_descendant_of(&self.root)
     }
-}
-
-/// Create a placeholder root cgroup for early init
-fn create_placeholder_root() -> Arc<Cgroup> {
-    // This is called before cgroup_init(), so we create a minimal placeholder
-    // It will be replaced when the real root is created
-    Cgroup::new_root(0, Vec::new(), &arc_nofail(crate::cgroup::CgroupRoot::new()))
 }
 
 /// Initial (root) cgroup namespace
