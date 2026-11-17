@@ -785,6 +785,11 @@ tracer_reads!(TaskViewMut);
 macro_rules! relation_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
+            /// Its ptrace flags (`Task::ptrace`)
+            pub fn ptrace(&self) -> u32 {
+                self.task.ptrace()
+            }
+
             /// Its struct pid (Linux task_pid), a counted reference;
             /// none for an idle task
             pub fn thread_pid(&self) -> Option<Arc<crate::task::pid::Pid>> {
@@ -849,6 +854,11 @@ relation_reads!(TaskView);
 relation_reads!(TaskViewMut);
 
 impl TaskViewMut<'_> {
+    /// Set its ptrace flags, TASKLIST held for writing (this view)
+    pub fn set_ptrace(&mut self, v: u32) {
+        self.task.ptrace.store(v, Ordering::Relaxed);
+    }
+
     /// Its tracer becomes `p` (Linux __ptrace_link, __ptrace_unlink:
     /// under tasklist_lock's write lock, which the view holds); `p` is
     /// listed and not exiting, and the task is listed or joins the list
@@ -2084,7 +2094,10 @@ fn reapable(table: &GlobalTaskTable, t: &TaskView<'_>, w: &Wait) -> bool {
     if tracee_of(t, w.parent_pid) {
         return true;
     }
-    t.leader && t.ptrace == 0 && t.ppid() == w.parent_pid && wait_eligible(t.exit_signal, w.wflags)
+    t.leader
+        && t.task.ptrace() == 0
+        && t.ppid() == w.parent_pid
+        && wait_eligible(t.exit_signal, w.wflags)
 }
 
 /// How [`wait_zombie`] releases the zombie it reaps
@@ -2449,7 +2462,7 @@ fn wait_match(t: &TaskView<'_>, target_pid: i64, pgid: Pid) -> bool {
 
 /// `t` is traced by a thread of group `tracer_pid`
 fn tracee_of(t: &TaskView<'_>, tracer_pid: Pid) -> bool {
-    t.ptrace != 0 && t.tracer().is_some_and(|tr| tr.pid == tracer_pid)
+    t.task.ptrace() != 0 && t.tracer().is_some_and(|tr| tr.pid == tracer_pid)
 }
 
 /// The group `tracer_pid` traces a task matching `target_pid` (so a
@@ -2982,12 +2995,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         if config.flags & (CLONE_PTRACE | CLONE_UNTRACED) == CLONE_PTRACE {
             let cur = table
                 .view(&me)
-                .filter(|v| v.ptrace != 0)
-                .and_then(|v| Some((v.ptrace, task_ref(v.tracer()?))));
+                .filter(|v| v.task.ptrace() != 0)
+                .and_then(|v| Some((v.task.ptrace(), task_ref(v.tracer()?))));
             if let Some((pt, tr)) = cur
                 && let Some(mut c) = table.view_mut(&child_task)
             {
-                c.ptrace = pt;
+                c.set_ptrace(pt);
                 c.set_tracer(Some(&tr));
             }
         }
@@ -3409,7 +3422,7 @@ fn exit_notify(tid: Tid, status: i32) {
 /// [`exit_notify`]'s TASKLIST write section for task `tid`
 fn exit_locked(table: &mut GlobalTaskTable, tid: Tid, status: i32) -> Option<Unhashed> {
     let t = table.get(tid)?;
-    let (pid, traced, leader) = (t.task.pid, t.ptrace != 0, t.leader);
+    let (pid, traced, leader) = (t.task.pid, t.task.ptrace() != 0, t.leader);
     // A traced task stays for its tracer, a leader for its parent; an
     // untraced thread goes now
     let stays = traced || leader;
@@ -3549,7 +3562,7 @@ fn detach_zombie(table: &mut GlobalTaskTable, me: &Task) -> Option<Unhashed> {
 /// leads, its real parent's pid
 fn traced_zombie(table: &GlobalTaskTable, me: &Task) -> Option<(Tid, Pid, bool, Pid)> {
     let mine = |t: &TaskView<'_>| {
-        t.ptrace != 0 && t.traced_by(me) && matches!(t.state, TaskState::Zombie(_))
+        t.task.ptrace() != 0 && t.traced_by(me) && matches!(t.state, TaskState::Zombie(_))
     };
     table
         .find(|t| mine(t) && t.leader)
@@ -3599,7 +3612,7 @@ fn last_thread(table: &GlobalTaskTable, pid: Pid, tid: Tid) -> bool {
 fn leader_waits(table: &GlobalTaskTable, pid: Pid) -> bool {
     table.get(pid).is_some_and(|l| {
         l.leader
-            && l.ptrace == 0
+            && l.task.ptrace() == 0
             && matches!(l.state, TaskState::Zombie(_))
             && !group_pending(table, pid, &[pid])
     })

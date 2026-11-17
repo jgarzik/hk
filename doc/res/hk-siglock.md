@@ -80,7 +80,7 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
 | `SigHand.users` | TASKLIST | `sighand->count` refcount | unchanged (TASKLIST write is held by every writer) |
 | `TaskInner.signal` | gone (2b) | `task->signal`, fixed | `Task.cpu_group` is it (fixed) |
 | leader `TaskInner.threads` | `SignalStruct.threads` (3) | `signal->thread_head`: tasklist write + siglock | done |
-| `TaskInner.ptrace` | TASKLIST | tasklist write; racy read under siglock | atomic (Relaxed load = Linux's racy read) |
+| `TaskInner.ptrace` | `Task.ptrace` atomic (4) | tasklist write; racy read under siglock | done |
 | `Task.sig` (blocked, pending, altstack, ptrace jobctl, last_siginfo) | per-task spin Mutex | siglock | nested under siglock first; folded into siglock-owned state last |
 | `SignalStruct.jobctl` (group stop) | spin Mutex after TASKLIST | siglock | as above |
 | `SignalStruct.shared` (shared_pending, curr_target, forks) | spin Mutex | siglock | as above |
@@ -136,10 +136,12 @@ setpgid, wait, ptrace attach/detach, release_task, de_thread.
    receiver's siglock; complete_signal, zap_threads, stop::prepare,
    do_signal_stop walk under it (TASKLIST still held for ptrace flags
    until step 4). CLONE_THREAD/CLONE_SIGHAND flag checks first.
-4. [ ] `TaskInner.ptrace` atomic; sender numbering under RCU; the send
-   (`send_task`) under `lock_task_sighand`: kill, tkill, tgkill,
-   rt_sigqueueinfo, pidfd_send_signal, POSIX timer signals off
-   TASKLIST; TASKLIST callers (pgrp walk, notify parent, exit_ptrace)
-   take siglock inside it. Delete the BUGS.md bullet.
+4. [x] `Task.ptrace` atomic (Relaxed loads, written under TASKLIST
+   write); sender numbering under RCU (`Task.thread_pid`, fixed
+   first); the send under `lock_task_sighand`: kill, tkill, tgkill,
+   rt_sigqueueinfo, pidfd_send_signal, POSIX/itimer timer signals off
+   TASKLIST; TASKLIST callers (pgrp walk, kill(-1), notify parent,
+   exit_ptrace, send_sigio) take siglock inside it. exit_group and
+   de_thread's zap take only siglock. BUGS.md bullet deleted.
 5. [ ] fold Task.sig, SignalStruct.jobctl/shared, SigHand.action/update
    into siglock-owned `SigCell`s (Linux: one lock). Delete this file.

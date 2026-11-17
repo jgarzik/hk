@@ -272,7 +272,10 @@ pub fn with_stopped_regs<R>(t: &Task, f: impl FnOnce(&mut PtRegs) -> R) -> Kerne
 
 /// Task `t` is being traced
 pub fn is_traced(t: &Task) -> bool {
-    TASKLIST.read().view(t).is_some_and(|v| v.ptrace != 0)
+    TASKLIST
+        .read()
+        .view(t)
+        .is_some_and(|v| v.task.ptrace() != 0)
 }
 
 // =============================================================================
@@ -289,7 +292,7 @@ fn ptrace_traceme() -> KernelResult<i64> {
     let parent = {
         let task = table.view(&me).ok_or(KernelError::NoProcess)?;
         // Already being traced?
-        if task.ptrace != 0 {
+        if task.task.ptrace() != 0 {
             return Err(KernelError::NotPermitted);
         }
         // Not to a parent on its way out, which may have detached its
@@ -303,7 +306,7 @@ fn ptrace_traceme() -> KernelResult<i64> {
         && let Some(mut task) = table.view_mut(&me)
     {
         // The parent becomes the tracer
-        task.ptrace = PT_PTRACED;
+        task.set_ptrace(PT_PTRACED);
         task.set_tracer(Some(&**p));
     }
     drop(table);
@@ -338,27 +341,20 @@ fn ptrace_attach(target_pid: Pid) -> KernelResult<i64> {
         let mut target = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
 
         // Already being traced?
-        if target.ptrace != 0 {
+        if target.task.ptrace() != 0 {
             return Err(KernelError::NotPermitted);
         }
 
         // Set up tracing: the caller, running, is listed and not
         // exiting (Linux ptrace_link to current)
-        target.ptrace = PT_PTRACED;
+        target.set_ptrace(PT_PTRACED);
         target.set_tracer(Some(&*percpu::current()));
 
         // SIGSTOP to stop it, in the section that attached (Linux
         // ptrace_attach: send_signal_locked(SIGSTOP, SEND_SIG_PRIV)
         // under tasklist_lock)
         let kernel = signal::SendInfo::Kernel;
-        let _ = signal::send_sig_info_in(
-            &table,
-            &task,
-            SIGSTOP,
-            kernel,
-            signal::PidType::Pid,
-            &mut gone,
-        );
+        let _ = signal::send_sig_info_in(&task, SIGSTOP, kernel, signal::PidType::Pid, &mut gone);
         // A task in a group stop re-traps for its tracer (Linux
         // ptrace_attach: JOBCTL_TRAP_STOP | JOBCTL_TRAPPING)
         signal::stop::attach_stopped(&task);
@@ -419,12 +415,12 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> KernelResult<i64> {
         let mut target = table.view_mut(&task).ok_or(KernelError::NoProcess)?;
 
         // Already being traced?
-        if target.ptrace != 0 {
+        if target.task.ptrace() != 0 {
             return Err(KernelError::NotPermitted);
         }
 
         // Set up tracing with SEIZED flag
-        target.ptrace = PT_PTRACED | PT_SEIZED;
+        target.set_ptrace(PT_PTRACED | PT_SEIZED);
         target.set_tracer(Some(&*percpu::current()));
         target.ptrace_options = options;
         // A task in a group stop re-traps for its tracer
@@ -509,17 +505,18 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u64) -> KernelResult<i64
         use crate::task::tif::SYSCALL_TRACE;
         match request {
             PTRACE_CONT => {
-                target.ptrace &= !(PT_SYSCALL_TRACE | PT_SINGLESTEP);
+                let pt = target.ptrace() & !(PT_SYSCALL_TRACE | PT_SINGLESTEP);
+                target.set_ptrace(pt);
                 target.task.clear_tif(SYSCALL_TRACE);
             }
             PTRACE_SYSCALL => {
-                target.ptrace |= PT_SYSCALL_TRACE;
-                target.ptrace &= !PT_SINGLESTEP;
+                let pt = (target.ptrace() | PT_SYSCALL_TRACE) & !PT_SINGLESTEP;
+                target.set_ptrace(pt);
                 target.task.set_tif(SYSCALL_TRACE);
             }
             PTRACE_SINGLESTEP => {
-                target.ptrace |= PT_SINGLESTEP;
-                target.ptrace &= !PT_SYSCALL_TRACE;
+                let pt = (target.ptrace() | PT_SINGLESTEP) & !PT_SYSCALL_TRACE;
+                target.set_ptrace(pt);
                 target.task.clear_tif(SYSCALL_TRACE);
             }
             _ => return Err(KernelError::InvalidArgument),
@@ -580,7 +577,10 @@ fn ptrace_interrupt(target_pid: Pid) -> KernelResult<i64> {
         return Err(KernelError::NoProcess);
     }
     // Linux: !seized || !lock_task_sighand
-    let Some(sig_struct) = task.cpu_group().filter(|_| v.ptrace & PT_SEIZED != 0) else {
+    let Some(sig_struct) = task
+        .cpu_group()
+        .filter(|_| v.task.ptrace() & PT_SEIZED != 0)
+    else {
         return Err(KernelError::Io);
     };
     let _g = sig_struct.jobctl.lock();
@@ -603,7 +603,7 @@ fn ptrace_listen(target_pid: Pid) -> KernelResult<i64> {
     let _frozen = ptrace_check_attach(&task)?;
     let table = TASKLIST.read();
     let v = table.view(&task).ok_or(KernelError::NoProcess)?;
-    if v.ptrace & PT_SEIZED == 0 {
+    if v.task.ptrace() & PT_SEIZED == 0 {
         return Err(KernelError::Io);
     }
     let mut s = task.sig.lock();
@@ -884,7 +884,7 @@ pub fn ptrace_stop_why(
         let mut s = me.sig.lock();
         // Untraced, or killed: no stop (Linux: !current->ptrace ||
         // __fatal_signal_pending)
-        if t.ptrace == 0 || s.pending.signal.contains(crate::signal::SIGKILL) {
+        if t.task.ptrace() == 0 || s.pending.signal.contains(crate::signal::SIGKILL) {
             return (Signal::new(code), info);
         }
         s.jobctl = (s.jobctl | TRACED) & !PTRACE_FROZEN;
@@ -983,7 +983,7 @@ pub fn ptrace_report_syscall(entry: bool) {
         let Some(mut t) = table.view_mut(&me) else {
             return;
         };
-        if t.ptrace & PT_SYSCALL_TRACE == 0 {
+        if t.task.ptrace() & PT_SYSCALL_TRACE == 0 {
             return;
         }
         t.ptrace_message = if entry { 1 } else { 2 };
@@ -1030,7 +1030,7 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo, sig: Signal) -> Option<S
 /// tracer never waited for still delivers its signal, one it did (code
 /// 0) none, a detach's the one PTRACE_DETACH gave
 pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
-    t.ptrace = 0;
+    t.set_ptrace(0);
     t.set_tracer(None);
     t.ptrace_options = 0;
     t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
@@ -1046,7 +1046,7 @@ pub fn exit_ptrace() {
     let traces = TASKLIST
         .read()
         .iter()
-        .any(|t| t.ptrace != 0 && t.traced_by(&me));
+        .any(|t| t.task.ptrace() != 0 && t.traced_by(&me));
     if !traces {
         return;
     }
@@ -1064,9 +1064,9 @@ fn detach_live(me: &crate::task::Task) -> bool {
     // SIGKILL flushes nothing; declared first, dropped after TASKLIST
     let mut gone = signal::SigPending::new();
     let mut table = TASKLIST.write();
-    let Some(v) = table
-        .find(|t| t.ptrace != 0 && t.traced_by(me) && !matches!(t.state, TaskState::Zombie(_)))
-    else {
+    let Some(v) = table.find(|t| {
+        t.task.ptrace() != 0 && t.traced_by(me) && !matches!(t.state, TaskState::Zombie(_))
+    }) else {
         return false;
     };
     let exitkill = v.ptrace_options & PTRACE_O_EXITKILL != 0;
@@ -1074,8 +1074,7 @@ fn detach_live(me: &crate::task::Task) -> bool {
     if exitkill {
         // Linux send_sig_info(SIGKILL, SEND_SIG_PRIV)
         let kernel = signal::SendInfo::Kernel;
-        let _ =
-            signal::send_sig_info_in(&table, &t, SIGKILL, kernel, signal::PidType::Pid, &mut gone);
+        let _ = signal::send_sig_info_in(&t, SIGKILL, kernel, signal::PidType::Pid, &mut gone);
     }
     if let Some(mut v) = table.view_mut(&t) {
         ptrace_unlink(&mut v);

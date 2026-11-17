@@ -1305,6 +1305,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 | `Task.cred` | `Arc<Cred>` (raw, `TaskCred`) | Credentials (Linux real_cred/cred, `__rcu`): replaced only by the task, published with Release, the old reference dropped a grace period later (`put_rcu`); read by the task lock-free, by others under an RCU read guard (Credential Handling) |
 | `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
 | `Task.real_parent` | `RcuPtr<Task>` | The real parent, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
+| `Task.ptrace` | `AtomicU32` | Ptrace flags (Linux task->ptrace): written under TASKLIST's write lock (a `TaskViewMut`: attach, seize, resume, unlink, CLONE_PTRACE), read with a Relaxed load anywhere (Linux's racy reads under siglock: sig_ignored, the stop prepare's PT_SEIZED, a group kill); a decision that must hold reads it under TASKLIST (ptrace_stop, wait, the tracer's checks) |
 | `Task.ptracer` | `RcuPtr<Task>` | The tracer while traced, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
 | `Task.pgrp`, `Task.session` | `RcuLockedArc<Pid, GlobalTaskTable>` | Group and session links: written under TASKLIST's write lock (old reference `put_rcu`), read under it or an RCU read guard |
 | `Task.thread_pid` | `RcuLockedArc<Pid, GlobalTaskTable>` | Its struct pid (Linux task->thread_pid): set before the task is listed, exchanged by de_thread (`take_leadership`, Linux exchange_tids) and cleared at release (`unhash`, Linux detach_pid PIDTYPE_PID; de_thread's removed threads after their numbers are released) under TASKLIST's write lock, the replaced reference dropped a grace period later; read under TASKLIST or an RCU read guard (`Task::pid_nr_ns`, Linux task_pid_nr_ns: 0 once released). A release pins it for proc_flush_pid (Linux release_task's get_pid) |
@@ -1396,14 +1397,14 @@ pid_task(pid, PIDTYPE_PGID)). A permission check reads the target's credentials
 in the same guard or after it (`Task::cred_rcu`, Linux __task_cred):
 tkill and tgkill find and check their thread under RCU (Linux
 do_send_specific), as do prlimit and the sched_* / setpriority /
-ioprio targets. What a send then reads of another task's `TaskInner`
-(its signal handlers, its group's threads) is still under TASKLIST's
-read lock, so kill, rt_sigqueueinfo, every send and a timer's signal
-find the task in that hold (BUGS.md); Linux takes
-tasklist_lock for these too only where it walks a group or a parent
-link (__kill_pgrp_info, send_sigio to a group, setpgid, ptrace
-attach and checks, wait, the PRIO_PGRP / IOPRIO_WHO_PGRP walks), as
-hk does.
+ioprio targets. kill(pid), rt_sigqueueinfo and pidfd_send_signal find
+and check their task under RCU too (Linux kill_pid_info_type), and
+every send, a POSIX or itimer timer's included, reaches the receiver's
+handlers through `lock_task_sighand` (3.7), no TASKLIST; Linux takes
+tasklist_lock only where it walks a group or a parent link
+(__kill_pgrp_info, kill(-1), send_sigio to a group, a child's notice,
+setpgid, ptrace attach and checks, wait, the PRIO_PGRP /
+IOPRIO_WHO_PGRP walks), as hk does.
 
 **A pid namespace's init** (`task/pidns.rs`; Linux child_reaper,
 pid_allocated, find_child_reaper, zap_pid_ns_processes): no new lock.
@@ -4447,13 +4448,18 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    hold spin locks (SIGIO from a socket wakeup under its locks, as in
    Linux): its held locks order above TASKLIST and the signal locks.
 
-6. **A group signal's thread is chosen under siglock** (Linux
-   complete_signal): a send holds TASKLIST's read lock from finding
-   its receiver to its last wakeup (`send_task_in`; a caller already
-   holding it, read or write, sends in place: a process-group walk, a
-   child's notice, exit_ptrace's EXITKILL, as Linux send_signal_locked
-   under tasklist_lock), and inside it the receiver's siglock (its
-   table cannot change while TASKLIST is held). After the signal is
+6. **A send runs under the receiver's siglock** (Linux
+   do_send_sig_info, send_signal_locked, complete_signal): it reaches
+   the receiver's table through `lock_task_sighand` (RCU: the table
+   the task names, its siglock taken, rechecked; ESRCH once released)
+   and holds it from its prepare to its last wakeup (`send_task_in`).
+   No TASKLIST: a caller already holding it, read or write, sends in
+   place (a process-group walk, kill(-1), a child's notice,
+   exit_ptrace's EXITKILL, send_sigio, as Linux send_signal_locked
+   under tasklist_lock), the siglock taken inside it. What the send
+   reads of the receiver comes from its siglock, RCU (credentials,
+   sender numbering: `Task::pid_nr_ns`) or a racy load (`Task.ptrace`,
+   as Linux under siglock). After the signal is
    queued under the receiver's `Task.sig`, the group's thread list is
    walked under siglock (`signal::choose`), each candidate's
    `Task.sig` taken alone to test wants_signal, and whether it ends the
@@ -4542,21 +4548,21 @@ with_task_signal_state(&current(), |state| {  // Task.sig, no TASKLIST
 ```
 
 **kill(2)/tgkill(2):** Send signal to task (`send_sig_info(&t, ..)`,
-process context only). The syscall finds the target once, under one
-TASKLIST read hold (the number, the permission check, a `TaskRef`);
-the send works on that task:
+process context only). The syscall finds and checks the target under
+RCU (the struct pid's task, its credentials and session; a
+`TaskRef`); the send works on that task under its siglock (Linux
+kill_pid_info_type, do_send_sig_info):
 ```rust
-let table = TASKLIST.read();
-let tg = target_in(&table, t)?;           // still listed, its handlers,
-                                          // group, limits
+let rcu = rcu::read_lock();
+let g = lock_task_sighand(t, &rcu)?;      // ESRCH once released
+let tg = target(t, &rcu);                 // handlers, group, limits
+prepare_signal(&g, ..);                   // stop/SIGCONT effects
 let sent = with_sig_send(t, |t, state| {  // Task.sig
     if sig_ignored(..) { return Dropped } // SIG_IGN / default-ignore
     state.pending.add(sig);
     Queued(wants)
 });                                       // TIF_SIGPENDING recomputed
-// Task.sig released, TASKLIST still read-held (complete_signal):
-signal_wake_task(&c, WakeMode::Interruptible) // try_to_wake_up(&Task) or
-                                              // kick_process
+complete_signal(&g, ..);                  // thread choice, wakeup
 ```
 `with_task_signal_state` recomputes the task's TIF_SIGPENDING after every
 access (the one record of it: no copy in `TaskSignalState`), so it means

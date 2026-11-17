@@ -206,7 +206,7 @@ pub(crate) fn kill_sig(sig: u32) -> KillSig {
 /// number, EPERM if the caller may not signal it
 fn group_target(pid: u64, sig: KillSig) -> KernelResult<TaskRef> {
     let me = Sender::current();
-    proc_target(pid, sig, |v, s| me.may_kill(v.task, s))
+    proc_target(pid, sig, |t, s| me.may_kill(t, s))
 }
 
 /// What the kill permission check needs of the caller, read before
@@ -327,7 +327,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> KernelResult<()> {
     // Numbers are the caller's (Linux find_vpid): none it sees is ESRCH
     let vpid = |nr: u64| crate::task::pid::from_vnr(nr).ok_or(KernelError::NoProcess);
     let me = Sender::current();
-    let check = |v: &crate::task::percpu::TaskView<'_>, s| me.may_kill(v.task, s);
+    let check = |t: &crate::task::Task, s| me.may_kill(t, s);
     match pid {
         1.. => user_group_send(vpid(pid as u64)?, sig, SendInfo::User),
         // Every process in the caller's process group, once each

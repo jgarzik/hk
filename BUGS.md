@@ -1185,12 +1185,6 @@ ntp_update_frequency).
 
 ## Deviations from Linux's lockless reads (fixing next)
 
-- **Another task's signal state is read under TASKLIST**: `task/mod.rs`
-  `TaskInner` `sighand`/`signal` and the group's thread list; so kill
-  and rt_sigqueueinfo (`signal/mod.rs` `kill_pid_info_type`), every
-  send (`send_task`) and a POSIX timer's signal (`send_timer_sigqueue`)
-  take TASKLIST's read lock. Linux reaches the handlers through
-  lock_task_sighand (RCU, then siglock, which owns the thread list).
 - **Inodes are counted by `Arc`, not `i_count` + `iput`**: `fs/inode.rs`
   `IFree`; the last put runs the teardown from the `Arc`'s drop glue,
   so std `Arc::drop_slow` makes a transient `&mut Inode` while RCU

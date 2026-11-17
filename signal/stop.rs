@@ -27,7 +27,7 @@ use super::{
 };
 use crate::sync::spin::MutexGuard;
 use crate::task::Task;
-use crate::task::percpu::{GlobalTaskTable, WakeMode};
+use crate::task::percpu::WakeMode;
 
 /// SignalStruct.flags' stop bits (Linux SIGNAL_STOP_*, SIGNAL_CLD_*)
 pub mod flags {
@@ -204,23 +204,21 @@ fn trap_notify(t: &Task, s: &mut TaskSignalState) {
     ptrace_signal_wake_up(t, s, listening);
 }
 
-/// `t` is traced with PTRACE_SEIZE, TASKLIST held (`table`)
-fn seized(table: &GlobalTaskTable, t: &Task) -> bool {
-    table
-        .view(t)
-        .is_some_and(|v| v.ptrace() & crate::task::ptrace::PT_SEIZED != 0)
+/// `t` is traced with PTRACE_SEIZE (a racy read, Linux t->ptrace &
+/// PT_SEIZED under siglock)
+fn seized(t: &Task) -> bool {
+    t.ptrace() & crate::task::ptrace::PT_SEIZED != 0
 }
 
 /// The process-wide effects of a stop signal or SIGCONT sent to the
 /// group `sig_struct` whose state `j` is (Linux prepare_signal), its
-/// threads walked under its table's siglock `g`, TASKLIST held for
-/// their ptrace flags: a stop signal drops every pending SIGCONT;
+/// threads walked under its table's siglock `g`: a stop signal drops
+/// every pending SIGCONT;
 /// SIGCONT drops every pending stop signal, ends the group stop,
 /// continues stopped threads and leaves the parent's notice to the
 /// first of them. The signal itself is then queued (or ignored) as any
 /// other.
 pub fn prepare(
-    table: &GlobalTaskTable,
     g: &SigGuard<'_>,
     sig_struct: &SignalStruct,
     j: &mut Group<'_>,
@@ -238,7 +236,7 @@ pub fn prepare(
         s.pending.flush_mask_into(&flush, gone);
         if !stop {
             clear_pending(&mut s, STOP_PENDING);
-            if !seized(table, t) {
+            if !seized(t) {
                 if s.jobctl & STOPPED != 0 {
                     s.jobctl &= !STOPPED;
                     crate::task::percpu::try_to_wake_up(t, WakeMode::Any);
@@ -323,7 +321,7 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
             let mut ts = t.sig.lock();
             if ts.jobctl & STOPPED == 0 && set_pending(t, &mut ts, signr.nr() | gstop) {
                 g.count += 1;
-                if !seized(&table, t) {
+                if !seized(t) {
                     signal_wake_up(t, &mut ts, false);
                 } else {
                     trap_notify(t, &mut ts);

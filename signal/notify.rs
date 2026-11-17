@@ -88,7 +88,6 @@ pub fn notify_parent_cldstop(
         let mut gone = super::SigPending::new();
         let info = SendInfo::Info(info);
         let _ = super::send_task_in(
-            table,
             &parent,
             SIGCHLD,
             info,
@@ -275,15 +274,7 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
         // the last thread's release sends its leader's notice with its
         // own pid already detached)
         let info = SendInfo::Notice(info.with_sig(sig));
-        let _ = super::send_task_in(
-            table,
-            &r.to,
-            sig,
-            info,
-            super::PidType::Tgid,
-            false,
-            &mut gone,
-        );
+        let _ = super::send_task_in(&r.to, sig, info, super::PidType::Tgid, false, &mut gone);
     }
     Told {
         autoreap,

@@ -992,6 +992,12 @@ pub struct Task {
     /// grace period later; read under TASKLIST or an RCU read guard
     /// (task_pid_nr_ns)
     pub thread_pid: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    /// Ptrace flags (Linux task->ptrace: PT_PTRACED, PT_SEIZED,
+    /// PT_SYSCALL_TRACE, PT_SINGLESTEP; 0: not traced): written under
+    /// TASKLIST's write lock (a `TaskViewMut`), read with a Relaxed load
+    /// anywhere (Linux reads it racily under siglock: sig_ignored,
+    /// ptrace_signal); a decision that must hold reads it under TASKLIST
+    ptrace: AtomicU32,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner>>,
@@ -1096,13 +1102,6 @@ pub struct TaskInner {
     /// SignalStruct as a zombie, for the group's exit status.
     leader: bool,
 
-    // =========================================================================
-    // Ptrace state (like Linux task_struct ptrace fields)
-    // =========================================================================
-    /// Ptrace flags (PT_PTRACED, PT_SEIZED, PT_SYSCALL_TRACE, PT_SINGLESTEP)
-    /// 0 = not traced, non-zero = traced with flags
-    ptrace: u32,
-
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
@@ -1142,7 +1141,6 @@ impl TaskInner {
             seccomp_filter: None,
             iopl_emul: 0,
             leader: true,
-            ptrace: 0,
             children: crate::util::list::ArcList::new(),
             in_children: false,
             ptrace_message: 0,
@@ -1158,11 +1156,6 @@ impl TaskInner {
     /// Its current state
     pub fn state(&self) -> TaskState {
         self.state
-    }
-
-    /// Its ptrace flags (0: not traced)
-    pub fn ptrace(&self) -> u32 {
-        self.ptrace
     }
 
     /// Its exit status, once a zombie
@@ -1692,6 +1685,7 @@ impl Task {
             rcu_puts: crate::sync::rcu::RcuPuts::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::new(ids.thread_pid),
+            ptrace: AtomicU32::new(0),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1765,6 +1759,7 @@ impl Task {
             rcu_puts: crate::sync::rcu::RcuPuts::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::none(),
+            ptrace: AtomicU32::new(0),
             inner: TableCell::new(None),
         }
     }
@@ -2103,6 +2098,12 @@ impl Task {
     /// Clear TIF_* flags `f`; whether any of them was set
     pub fn test_and_clear_tif(&self, f: u32) -> bool {
         self.thread_flags.fetch_and(!f, Ordering::AcqRel) & f != 0
+    }
+
+    /// Its ptrace flags, a racy read (Linux READ_ONCE(task->ptrace));
+    /// 0: not traced
+    pub fn ptrace(&self) -> u32 {
+        self.ptrace.load(Ordering::Relaxed)
     }
 
     /// Its thread group's SignalStruct (none for kernel threads)
