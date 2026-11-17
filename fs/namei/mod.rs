@@ -175,9 +175,13 @@ pub enum Start<'a> {
     Root,
     /// The cwd (AT_FDCWD); the root for boot code, which has none
     Cwd,
-    /// A path the caller holds for the lookup (a dirfd's file,
-    /// file_open_root's root, a parent already walked)
+    /// A path the caller holds for the lookup (a dirfd's file, a
+    /// parent already walked)
     At(&'a MountRef, &'a DentryRef),
+    /// file_open_root's root (Linux ND_ROOT_PRESET): the walk starts
+    /// there, and absolute names, absolute symlink bodies and ".." stop
+    /// there; held by the caller
+    Preset(&'a Path),
 }
 
 impl<'a> Start<'a> {
@@ -198,6 +202,8 @@ pub enum Dfd {
     File(FdRef),
     /// A path (an internal file's, or one the caller gave)
     Path(Path),
+    /// file_open_root's root (`Start::Preset`)
+    Preset(Path),
 }
 
 impl Dfd {
@@ -211,6 +217,7 @@ impl Dfd {
                 None => Start::Root,
             },
             Self::Path(p) => Start::path(p),
+            Self::Preset(p) => Start::Preset(p),
         }
     }
 }
@@ -239,6 +246,7 @@ fn start_path(start: Start<'_>) -> Result<Path, KernelError> {
             None => nd_root(),
         },
         Start::At(m, d) => Ok(Path::new(m.clone(), d.clone())),
+        Start::Preset(p) => Ok(p.clone()),
     }
 }
 
@@ -463,6 +471,11 @@ impl<'a> Nd<'a> {
     /// The root for a ref-mode walk (Linux nd->root, set_root when it
     /// is not set yet): a scoped lookup's start, else the task's root
     fn root(&self) -> Result<&Path, KernelError> {
+        // file_open_root's, held by the caller (Linux ND_ROOT_PRESET:
+        // nd->root set before path_init, never taken or put)
+        if let Start::Preset(p) = self.top {
+            return Ok(p);
+        }
         if let Some(r) = self.root.get() {
             return Ok(r);
         }
@@ -1120,14 +1133,15 @@ pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Pa
 
 /// Resolve `path` from `start` (None: the root), an empty path naming
 /// `start` itself: [`filename_lookup`]'s walk, also for a start that is
-/// no descriptor (Linux LOOKUP_ROOT: file_open_root)
+/// no descriptor: `start` is the lookup's root too (Linux
+/// ND_ROOT_PRESET: file_open_root)
 pub fn filename_lookup_from(
     start: Option<Path>,
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Path, KernelError> {
     match &start {
-        Some(p) => filename_lookup_start(Start::path(p), path, flags),
+        Some(p) => filename_lookup_start(Start::Preset(p), path, flags),
         None => filename_lookup_start(Start::Root, path, flags),
     }
 }

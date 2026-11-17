@@ -540,13 +540,18 @@ impl Nd<'_> {
     ) -> Result<Path, KernelError> {
         let fs = self.fs();
         // Boot code with no fs_struct: the namespace's root, held
-        let boot = match (fs, self.root.get()) {
+        // file_open_root's root, held by the caller (ND_ROOT_PRESET)
+        let preset = match self.top {
+            Start::Preset(p) => Some(p),
+            _ => self.root.get(),
+        };
+        let boot = match (fs, preset) {
             (None, None) => Some(super::nd_root()?),
             _ => None,
         };
         let mut puts = Puts::default();
         let g = crate::sync::rcu::read_lock();
-        let held = self.root.get().or(boot.as_ref());
+        let held = preset.or(boot.as_ref());
         let root = match (held, fs) {
             (Some(p), _) => RcuPath::at(&p.mnt, &p.dentry, &g),
             (None, Some(fs)) => match self.top {
@@ -567,6 +572,7 @@ impl Nd<'_> {
                 None => root,
             },
             Start::At(m, d) => RcuPath::at(m, d, &g),
+            Start::Preset(_) => root,
         };
         let rc = Rcu { g: &g, root, held };
         let r = self.link_path_walk_rcu(&rc, at, path, f, &mut puts);
@@ -1101,7 +1107,8 @@ impl Nd<'_> {
     /// (an earlier walk's, or a path the walk holds: a scoped lookup's
     /// start, boot code's namespace root); false if it moved
     fn legitimize_root(&self, rc: &Rcu<'_>, puts: &mut Puts) -> bool {
-        if self.root.get().is_some() {
+        // ND_ROOT_PRESET: the caller holds it
+        if self.root.get().is_some() || matches!(self.top, Start::Preset(_)) {
             return true;
         }
         let p = match (rc.held, self.top) {

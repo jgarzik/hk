@@ -3561,7 +3561,9 @@ owned paths, and their `d_seq` sampled in the same read; the old
 paths are put after the write section and freed a grace period
 later), a dirfd's path borrowed from its file (`fdget_raw`: no lock,
 and no reference from a table no other task uses), a
-held start (a parent, file_open_root's root) borrowed. The root is
+held start (a parent) borrowed, and file_open_root's root borrowed as
+the walk's root too (Linux ND_ROOT_PRESET: absolute names and bodies
+and ".." stop there; never legitimized, the caller holds it). The root is
 legitimized at the first unlazy that needs it (`legitimize_root`,
 Linux nd->root_seq: against its `d_seq` and MOUNT_LOCK's sequence,
 the reference kept in `Nd.root` for the ref walks, a scoped lookup's

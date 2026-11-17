@@ -239,7 +239,14 @@ impl OpenAt<'_> {
     fn start(self, path: &[u8], lf: LookupFlags) -> Result<Dfd, KernelError> {
         match self {
             Self::Fd(fd) => path_start(fd, path, lf),
-            Self::Root(r) => Ok(Dfd::Path(r.clone())),
+            Self::Root(r) => {
+                // Linux path_init under ND_ROOT_PRESET: a name to walk
+                // needs a directory to walk it in
+                if !path.is_empty() && !r.get_inode().is_some_and(|i| i.mode().is_dir()) {
+                    return Err(KernelError::NotDirectory);
+                }
+                Ok(Dfd::Preset(r.clone()))
+            }
         }
     }
 

@@ -695,8 +695,6 @@ waiting).
   `Held::text` for the stack an RCU walk hands over); Linux's one
   link_path_walk loop keeps the link stack (nd->stack) in ref mode
   too, the links held until each body is walked.
-- `file_open_root` (`OpenAt::Root`) resolves absolute bodies and ".."
-  against the task root, not the given root (Linux ND_ROOT_PRESET).
 - /proc/<pid> permission for a task that is gone falls back to the
   generic check instead of ESRCH (Linux proc_pid_permission).
 - /proc/<pid>/fd and fdinfo directory permission is a ptrace-read
