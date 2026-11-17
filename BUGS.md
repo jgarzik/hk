@@ -685,14 +685,6 @@ simple_recursive_removal. So hk's `tracefs_d_revalidate` calls a
 positive dentry stale once its node is removed and a negative one once
 the directory's `KNode.rev` moves, where Linux needs neither check.
 
-## O_CREAT last component
-
-**Location**: `fs/namei/` (`last_links`)
-
-An O_CREAT open's last name is walked by hk's own no-follow loop
-(`last_links`), not Linux's open_last_lookups/lookup_open shape, so its
-d_revalidate sees the open's intent bits but not LOOKUP_FOLLOW.
-
 ## renameat2 flag gaps
 
 **Location**: `fs/ramfs/`, `fs/vfat/mod.rs`

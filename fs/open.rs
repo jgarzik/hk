@@ -2,15 +2,11 @@
 
 use super::dentry::LookupBits;
 use super::file::EMPTY_FOPS;
-use crate::fs::DentryRef;
 use crate::fs::FileRef;
 use crate::fs::namei::{
-    CreateAt, Dfd, Last, Nd, Start, filename_lookup, filename_lookup_from, filename_lookup_start,
-    getname, path_start,
+    Dfd, Nd, filename_lookup, filename_lookup_from, filename_lookup_start, getname, path_start,
 };
-use crate::fs::{
-    Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
-};
+use crate::fs::{Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac};
 
 use super::file::flags::AT_FDCWD;
 use super::flags::{
@@ -23,44 +19,6 @@ use super::syscall::current_fd_table;
 use crate::task::FD_CLOEXEC;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
-
-/// Create regular file `name` in `parent` for O_CREAT (Linux
-/// lookup_open + may_o_create) under the parent's lock: an entry that
-/// appeared meanwhile is returned as is (created = false); otherwise
-/// write+search on the parent, the mode gets the umask and SGID
-/// stripping, the owner comes from init_owner. `flags`: the last name's
-/// nd->flags, the open's intent in them
-fn create_in(
-    mnt: &super::mount::MountRef,
-    parent: &DentryRef,
-    name: &[u8],
-    mode: u32,
-    flags: LookupBits,
-) -> Result<(DentryRef, bool), KernelError> {
-    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    if !dir.mode().is_dir() {
-        return Err(KernelError::NotDirectory);
-    }
-    let c = dac::cred();
-    // lookup_open: write access is needed only to create
-    let w = mnt.want_write();
-    let _dir_lock = dir.lock();
-    (|| {
-        // Linux lookup_open: d_revalidate with nd->flags, the open's
-        // intent in them
-        if let Ok(d) = lookup_one(parent, name, flags) {
-            return Ok((d, false));
-        }
-        let _w = w?;
-        dac::may_create(&c, &dir)?;
-        let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
-        // The dentry first, so an ENOMEM leaves no file made
-        let d = Dentry::prealloc(parent, name)?;
-        let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
-        dir.touch_mc();
-        Ok((Dentry::add(parent, d, Some(inode)), true))
-    })()
-}
 
 /// sys_open - open a file: sys_openat with AT_FDCWD
 pub fn sys_open(path: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
@@ -314,57 +272,33 @@ fn open_target_nd(
     if path.is_empty() {
         return creat_existing(at.lookup_try(path, lf, rcu)?, flags);
     }
-    // O_CREAT (Linux open_last_lookups): the parent is walked, then a
-    // last name of "/", "." or ".." (a directory) or one with a trailing
-    // slash is EISDIR, existing or not; one lookup (Nd) throughout, so
-    // RESOLVE_* holds for the parent, the symlinks and the last name
+    // O_CREAT (Linux path_openat): one walk, its last name looked up
+    // with the open's intent (a trailing symlink followed unless
+    // O_NOFOLLOW or O_EXCL, its body walked the same way) and made under
+    // the parent's lock if missing (open_last_lookups, lookup_open)
     let start = at.start(path, lf)?;
-    let nd = Nd::new(start.start(), lf, rcu)?;
-    let p = nd.parentat(start.start(), path, lf)?;
-    if p.last != Last::Norm || p.slash {
-        return Err(KernelError::IsDirectory);
-    }
-    // A final symlink is followed to where the file is (or is made),
-    // a dangling one included
-    let p = if lf.follow {
-        nd.last_links(p, lf)?
-    } else {
-        CreateAt::Name(p)
-    };
-    let p = match p {
-        CreateAt::Name(p) => p,
-        // A magic link's object (Linux nd_jump_link): no name to make
-        CreateAt::Object(d) => return creat_existing(d, flags),
-    };
-    let dir = Path::new(p.mnt.clone(), p.dir.clone());
-    let (d, created) = match nd.lookup(Start::path(&dir), &p.name, lf) {
-        Ok(d) => (d, false),
-        Err(KernelError::NotFound) => {
-            let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode, lf.bits(true))?;
-            (Path::new(p.mnt.clone(), d), c)
-        }
-        Err(e) => return Err(e),
-    };
+    let s = start.start();
+    let nd = Nd::new(s, lf, rcu)?.create_mode(op.mode);
+    let d = nd.lookup(s, path, lf)?;
+    let created = nd.created();
+    // do_open's O_CREAT checks
     if !created && flags & O_EXCL != 0 {
         return Err(KernelError::AlreadyExists);
     }
-    if !created && d.get_inode().is_some_and(|i| i.mode().is_dir()) {
+    if d.get_inode().is_some_and(|i| i.mode().is_dir()) {
         return Err(KernelError::IsDirectory);
     }
-    // An existing file opened O_CREAT in a sticky directory (Linux
-    // may_create_in_sticky: fs.protected_fifos / _regular)
-    // The directory is the one holding the file the walk ended on, after
-    // a final symlink (Linux nd->dir_mode after the follow)
-    let parent = d.dentry.get_parent().unwrap_or_else(|| p.dir.clone());
-    if !created && let (Some(dir), Some(inode)) = (parent.get_inode(), d.get_inode()) {
-        super::dac::may_create_in_sticky(&crate::task::current_cred(), &dir, &inode)?;
+    // In a sticky directory (fs.protected_fifos / _regular): the one the
+    // last name was looked up in (nd->dir_mode, nd->dir_vfsuid)
+    if let Some(inode) = d.get_inode() {
+        let (dmode, duid) = nd.dir();
+        dac::may_create_in_sticky(&dac::cred(), dmode, duid, &inode)?;
     }
     Ok((d, created))
 }
 
-/// O_CREAT landing on an existing object with no name to create (an
-/// empty name with O_EMPTYPATH, a magic link): do_open's O_CREAT checks
-/// (EEXIST with O_EXCL, EISDIR)
+/// O_CREAT of an empty name with O_EMPTYPATH, dirfd's own file:
+/// do_open's O_CREAT checks (EEXIST with O_EXCL, EISDIR)
 fn creat_existing(d: Path, flags: u32) -> Result<(Path, bool), KernelError> {
     if flags & O_EXCL != 0 {
         return Err(KernelError::AlreadyExists);
@@ -675,4 +609,83 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> KernelResult<()> {
         files.range_close(lo, hi);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::DentryRef;
+    use crate::fs::dentry::DentryOps;
+    use crate::fs::inode::{Inode, NULL_INODE_OPS, Timespec};
+    use alloc::sync::Weak;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// The inode whose revalidations are counted
+    const SEEN: u64 = 77;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    static BITS: AtomicU32 = AtomicU32::new(0);
+
+    /// Every entry is valid; `SEEN`'s revalidations are counted, the
+    /// last one's flags kept
+    fn reval(_: &Inode, _: &Dentry, i: Option<&Inode>, f: LookupBits) -> Result<bool, KernelError> {
+        if i.is_some_and(|i| i.ino == SEEN) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            BITS.store(f.bits(), Ordering::Relaxed);
+        }
+        Ok(true)
+    }
+
+    static OPS: DentryOps = DentryOps {
+        d_revalidate: Some(reval),
+        ..DentryOps::NONE
+    };
+
+    fn inode(ino: u64, mode: InodeMode) -> crate::fs::InodeRef {
+        let t = Timespec::from_secs(0);
+        Inode::alloc(Inode::new(
+            ino,
+            mode,
+            0,
+            0,
+            0,
+            t,
+            Weak::new(),
+            &NULL_INODE_OPS,
+        ))
+        .unwrap()
+    }
+
+    /// An O_CREAT open of an existing file is answered by the RCU walk
+    /// alone (Linux open_last_lookups: lookup_fast under LOOKUP_RCU,
+    /// step_into; no lookup_open, no i_rwsem), its one revalidation
+    /// seeing nd->flags: LOOKUP_FOLLOW and the open's intent. A walk a
+    /// concurrent mount change sent to ref mode is tried again.
+    #[test]
+    // The walk reads the current task, an aarch64 per-CPU register a
+    // host (EL0) test cannot read
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn creat_existing_rcu() {
+        let root = DentryRef::new(Dentry::new_root_op(
+            inode(1, InodeMode::directory(0o755)),
+            &OPS,
+        ))
+        .unwrap();
+        let d = Dentry::alloc(&root, b"d", Some(inode(2, InodeMode::directory(0o755)))).unwrap();
+        let _x = Dentry::alloc(&d, b"x", Some(inode(SEEN, InodeMode::regular(0o644)))).unwrap();
+        let top = Path::new(crate::fs::mount::test_mnt_root(root.clone()), root);
+        let op = build_open_flags(&build_open_how(O_CREAT | O_RDWR, 0o644)).unwrap();
+        let want = LookupBits::RCU | LookupBits::FOLLOW | LookupBits::OPEN | LookupBits::CREATE;
+        let mut seen = (0, 0);
+        for _ in 0..1000 {
+            CALLS.store(0, Ordering::Relaxed);
+            let r = open_target_nd(OpenAt::Root(&top), b"d/x", &op, true);
+            seen = (CALLS.load(Ordering::Relaxed), BITS.load(Ordering::Relaxed));
+            if r.is_ok_and(|(p, made)| !made && p.get_inode().is_some_and(|i| i.ino == SEEN))
+                && seen == (1, want.bits())
+            {
+                return;
+            }
+        }
+        panic!("revalidations {} flags {:#x}", seen.0, seen.1);
+    }
 }

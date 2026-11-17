@@ -3647,7 +3647,9 @@ chain of links holds one. A walk that starts in
 ref mode pushes its links on such a stack too (two levels in place,
 more allocated GFP_KERNEL on first need: ENOMEM, Linux
 nd_alloc_stack), the link held, its inode too for an `i_link` body.
-Where it must leave RCU mode (a miss, a
+Where it must leave RCU mode (a miss; for an O_CREAT open's last
+name a negative entry or O_EXCL too, lookup_open then taking the
+parent's i_rwsem (Linux open_last_lookups); a
 revalidation or permission check that said ECHILD) it
 takes references to where it stands (`try_to_unlazy`,
 `try_to_unlazy_next` for a child too, `legitimize_path`:
@@ -3760,10 +3762,13 @@ fn sys_mkdir(...) {
 ```
 
 **Lookup and permission under the lock (Linux lookup_open /
-filename_create):** `open.rs::create_in` (O_CREAT), `namei.rs::create_entry`
-(mkdir, mknod, symlink, link) and `namei.rs::delete_entry` (unlink, rmdir)
-take the parent's `Inode::lock()` first and, while holding it, look the name
-up (`lookup_one`: dentry `d_lock`, then the file system's `lookup`), decide
+filename_create):** `namei::Nd::lookup_open` (O_CREAT, when the walk's
+lookup_fast found no positive entry or O_EXCL skipped it; an existing name
+found by lookup_fast, in RCU mode or not, takes no i_rwsem),
+`namei.rs::create_entry` (mkdir, mknod, symlink, link) and
+`namei.rs::delete_entry` (unlink, rmdir) take the parent's `Inode::lock()`
+first and, while holding it, look the name up (`lookup_one`,
+`lookup_dcache`: dentry `d_lock`, then the file system's `lookup`), decide
 EEXIST / "created by this call", run the DAC checks (`dac::may_create`,
 `dac::may_delete`; these read the inode's atomic mode/uid/gid and, for the
 new mode, the task's umask under `FsStruct.seq`'s locking read) and perform the

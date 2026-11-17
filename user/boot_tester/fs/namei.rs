@@ -8,12 +8,14 @@
 
 use crate::harness::{R, report_r};
 use hk_syscall::{
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_dup3, sys_execve,
-    sys_fstatat, sys_link, sys_lstat, sys_mkdir, sys_mount, sys_open, sys_openat, sys_rename,
-    sys_renameat2, sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink,
+    O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close,
+    sys_dup3, sys_execve, sys_fstatat, sys_link, sys_lstat, sys_mkdir, sys_mount, sys_open,
+    sys_openat, sys_openat2, sys_rename, sys_renameat2, sys_rmdir, sys_stat, sys_symlink,
+    sys_umount2, sys_unlink,
 };
 
 const ENOENT: i64 = -2;
+const EAGAIN: i64 = -11;
 const EBADF: i64 = -9;
 const EBUSY: i64 = -16;
 const EEXIST: i64 = -17;
@@ -36,6 +38,8 @@ pub fn run_tests() {
     report_r(b"PATH_TRAILING_SLASH", trailing());
     report_r(b"DOTDOT_LAST_NAME", dots());
     report_r(b"CREAT_DANGLING_LINK", creat_dangling());
+    report_r(b"CREAT_LAST_NAME", creat_last());
+    report_r(b"CREAT_LINK_COUNT", creat_links());
     report_r(b"NEG_DENTRY_CREATE", negative());
     report_r(b"DOTDOT_DISCONNECTED", disconnected());
     report_r(b"LINK_STACK_UNLAZY", link_stack());
@@ -355,8 +359,6 @@ fn disconnected() -> R {
     r
 }
 
-/// open(O_CREAT) through a dangling symlink creates its target (Linux
-/// open_last_lookups follows the link); with O_EXCL it is EEXIST
 /// Symlinks nested three deep whose last body leads into procfs, which
 /// computes its entries behind the dcache: the walk follows the links,
 /// then must look a name up the slow way inside the innermost body
@@ -494,6 +496,8 @@ fn link_stack_ref() -> R {
     want(b"magic same file", same2 as i64, 1)
 }
 
+/// open(O_CREAT) through a dangling symlink creates its target (Linux
+/// open_last_lookups follows the link); with O_EXCL it is EEXIST
 fn creat_dangling() -> R {
     let link = b"/tmp/dangle\0";
     let target = b"/tmp/dangle_target\0";
@@ -522,4 +526,131 @@ fn creat_dangling() -> R {
         return Err((b"target made", made));
     }
     Ok(())
+}
+
+/// `path` opened with `flags`: the errno, or 0 (the file closed)
+fn open_err(path: &[u8], flags: u32) -> i64 {
+    let fd = sys_open(path.as_ptr(), flags, 0o644);
+    if fd >= 0 {
+        sys_close(fd as u64);
+        return 0;
+    }
+    fd
+}
+
+/// open(O_CREAT)'s last name (Linux open_last_lookups, do_open): a
+/// symlink is followed unless O_EXCL or O_NOFOLLOW (O_EXCL: EEXIST, a
+/// dangling one too; O_NOFOLLOW: the link itself, ELOOP); a relative
+/// dangling body is created where it points; a body or name with a
+/// slash after its last component, ".", or a directory is EISDIR;
+/// RESOLVE_CACHED is EAGAIN
+fn creat_last() -> R {
+    sys_mkdir(b"/tmp/cl\0".as_ptr(), 0o755);
+    sys_mkdir(b"/tmp/cl/d\0".as_ptr(), 0o755);
+    open_err(b"/tmp/cl/f\0", O_CREAT | O_WRONLY);
+    let links: [(&[u8], &[u8]); 6] = [
+        (b"f\0", b"/tmp/cl/lf\0"),
+        (b"d\0", b"/tmp/cl/ld\0"),
+        (b"d/new\0", b"/tmp/cl/ln\0"),
+        (b"d/x/\0", b"/tmp/cl/ls\0"),
+        (b".\0", b"/tmp/cl/lo\0"),
+        (b"d/nf\0", b"/tmp/cl/lx\0"),
+    ];
+    for (t, l) in links {
+        sys_symlink(t.as_ptr(), l.as_ptr());
+    }
+    let r = creat_last_ops();
+    for (_, l) in links {
+        sys_unlink(l.as_ptr());
+    }
+    for p in [&b"/tmp/cl/f\0"[..], b"/tmp/cl/d/new\0", b"/tmp/cl/d/nf\0"] {
+        sys_unlink(p.as_ptr());
+    }
+    sys_rmdir(b"/tmp/cl/d\0".as_ptr());
+    sys_rmdir(b"/tmp/cl\0".as_ptr());
+    r
+}
+
+fn creat_last_ops() -> R {
+    let (c, x, nf) = (O_CREAT | O_WRONLY, O_CREAT | O_EXCL | O_WRONLY, O_NOFOLLOW);
+    let mut st = Stat::default();
+    want(b"existing", open_err(b"/tmp/cl/f\0", c), 0)?;
+    want(b"excl existing", open_err(b"/tmp/cl/f\0", x), EEXIST)?;
+    want(b"via link", open_err(b"/tmp/cl/lf\0", c), 0)?;
+    want(b"excl link", open_err(b"/tmp/cl/lf\0", x), EEXIST)?;
+    want(b"excl dangling", open_err(b"/tmp/cl/ln\0", x), EEXIST)?;
+    want(b"nofollow link", open_err(b"/tmp/cl/lf\0", c | nf), ELOOP)?;
+    want(
+        b"nofollow dangling",
+        open_err(b"/tmp/cl/lx\0", c | nf),
+        ELOOP,
+    )?;
+    let r = sys_lstat(b"/tmp/cl/d/nf\0".as_ptr(), &mut st);
+    want(b"not made", r, ENOENT)?;
+    want(b"dangling", open_err(b"/tmp/cl/ln\0", c), 0)?;
+    want(b"made", sys_lstat(b"/tmp/cl/d/new\0".as_ptr(), &mut st), 0)?;
+    want(b"made again", open_err(b"/tmp/cl/ln\0", c), 0)?;
+    want(b"dir", open_err(b"/tmp/cl/d\0", c), EISDIR)?;
+    want(b"dir/", open_err(b"/tmp/cl/d/\0", c), EISDIR)?;
+    want(b"link to dir", open_err(b"/tmp/cl/ld\0", c), EISDIR)?;
+    want(b"body slash", open_err(b"/tmp/cl/ls\0", c), EISDIR)?;
+    want(b"body dot", open_err(b"/tmp/cl/lo\0", c), EISDIR)?;
+    want(b"root", open_err(b"/\0", c), EISDIR)?;
+    // RESOLVE_CACHED never tries a create (Linux build_open_flags)
+    let mut how = [0u8; 24];
+    how[..8].copy_from_slice(&u64::from(c).to_ne_bytes());
+    how[8..16].copy_from_slice(&0o644u64.to_ne_bytes());
+    how[16..].copy_from_slice(&0x20u64.to_ne_bytes());
+    let p = b"/tmp/cl/f\0".as_ptr();
+    let r = sys_openat2(AT_FDCWD, p, how.as_ptr(), how.len());
+    want(b"cached", r, EAGAIN)
+}
+
+/// A chain of `n` links /tmp/cc/tNN, each body "s/" and the next link
+/// (s: a link to "."), the last's "s/new": 2n symlinks in all. An
+/// O_CREAT open counts the trailing links and the ones on the way in one
+/// lookup (Linux nd->total_link_count, MAXSYMLINKS): 40 make "new", 42
+/// are ELOOP, as for an open without O_CREAT
+fn creat_links() -> R {
+    sys_mkdir(b"/tmp/cc\0".as_ptr(), 0o755);
+    sys_symlink(b".\0".as_ptr(), b"/tmp/cc/s\0".as_ptr());
+    let r = (|| {
+        cc_chain(21);
+        let c = O_CREAT | O_WRONLY;
+        want(b"42 links", open_err(b"/tmp/cc/t00\0", c), ELOOP)?;
+        let r = open_err(b"/tmp/cc/t00\0", O_RDONLY);
+        want(b"42 links plain", r, ELOOP)?;
+        cc_unchain(21);
+        cc_chain(20);
+        want(b"40 links", open_err(b"/tmp/cc/t00\0", c), 0)?;
+        let mut st = Stat::default();
+        want(b"made", sys_lstat(b"/tmp/cc/new\0".as_ptr(), &mut st), 0)?;
+        want(b"40 links plain", open_err(b"/tmp/cc/t00\0", O_RDONLY), 0)
+    })();
+    cc_unchain(21);
+    sys_unlink(b"/tmp/cc/new\0".as_ptr());
+    sys_unlink(b"/tmp/cc/s\0".as_ptr());
+    sys_rmdir(b"/tmp/cc\0".as_ptr());
+    r
+}
+
+fn cc_chain(n: usize) {
+    let (mut lb, mut tb) = ([0u8; 64], [0u8; 64]);
+    for i in 0..n {
+        let l = numbered(&mut lb, b"/tmp/cc/t", i, b"");
+        let t: &[u8] = if i + 1 == n {
+            b"s/new\0"
+        } else {
+            numbered(&mut tb, b"s/t", i + 1, b"")
+        };
+        sys_unlink(l.as_ptr());
+        sys_symlink(t.as_ptr(), l.as_ptr());
+    }
+}
+
+fn cc_unchain(n: usize) {
+    let mut lb = [0u8; 64];
+    for i in 0..n {
+        sys_unlink(numbered(&mut lb, b"/tmp/cc/t", i, b"").as_ptr());
+    }
 }

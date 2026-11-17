@@ -556,13 +556,18 @@ pub fn may_linkat(c: &Cred, inode: &Inode) -> Result<(), KernelError> {
     }
 }
 
-/// An O_CREAT open of the existing `inode` in `dir` (Linux
-/// may_create_in_sticky): with fs.protected_fifos / _regular, a FIFO or
-/// regular file in a sticky directory owned by neither the directory's
-/// owner nor the caller is refused if the directory is world-writable
-/// (level 1), or group-writable (level 2) (EACCES)
-pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), KernelError> {
-    let dmode = dir.mode().raw();
+/// An O_CREAT open of `inode`, its last name looked up in a directory
+/// of mode `dmode` owned by `duid` (Linux may_create_in_sticky with
+/// nd->dir_mode, nd->dir_vfsuid): with fs.protected_fifos / _regular, a
+/// FIFO or regular file in a sticky directory owned by neither the
+/// directory's owner nor the caller is refused if the directory is
+/// world-writable (level 1), or group-writable (level 2) (EACCES)
+pub fn may_create_in_sticky(
+    c: &Cred,
+    dmode: u16,
+    duid: Uid,
+    inode: &Inode,
+) -> Result<(), KernelError> {
     let mode = inode.mode();
     // A regular file or FIFO only when its knob is on; any other type
     // is checked whatever the knobs (Linux may_create_in_sticky)
@@ -576,7 +581,7 @@ pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), 
     if dmode & S_ISVTX == 0 || level == Some(0) {
         return Ok(());
     }
-    if inode.uid() == dir.uid() || inode.uid() == c.fsuid {
+    if inode.uid() == duid || inode.uid() == c.fsuid {
         return Ok(());
     }
     // World-writable: refused; group-writable: only at level 2

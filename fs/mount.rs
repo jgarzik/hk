@@ -2881,6 +2881,14 @@ pub(super) fn test_mnt() -> MountRef {
     Mount::alloc(sb, root, 0, b"t".as_slice().into()).unwrap()
 }
 
+/// An unattached mount whose root is `root`, for unit tests
+#[cfg(test)]
+pub(super) fn test_mnt_root(root: DentryRef) -> MountRef {
+    let t = &super::nullfs::NULLFS_TYPE;
+    let sb = vfs_get_tree(&FsContext::new(t, b"")).unwrap().unlock();
+    Mount::alloc(sb, root, 0, b"t".as_slice().into()).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,7 +29,7 @@ use crate::fs::dac::{MAY_EXEC, permission_as};
 use crate::fs::dentry::{Dentry, DentryRef, LookupBits, d_invalidate};
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use crate::fs::fsstruct::FsStruct;
-use crate::fs::inode::{Inode, InodeRef, Link};
+use crate::fs::inode::{Inode, InodeMode, InodeRef, Link, Uid};
 use crate::fs::mount::{
     MOUNT_LOCK, MountRef, choose_mountpoint, follow_mount, is_path_reachable, path_connected,
 };
@@ -383,24 +383,6 @@ fn d_revalidate(
 /// Longest name of one path component (Linux NAME_MAX)
 pub const NAME_MAX: usize = 255;
 
-/// walk_component's lookup in ref mode: `name` in `parent`, whose inode
-/// is `dir` (Linux lookup_fast without LOOKUP_RCU: the dcache with no
-/// lock; on a miss, or a stale entry, lookup_slow); a negative answer
-/// is ENOENT (step_into). `flags`: nd->flags for this component
-/// ([`LookupFlags::bits`]).
-fn walk_lookup(
-    parent: &DentryRef,
-    dir: &Inode,
-    name: &[u8],
-    flags: LookupBits,
-) -> Result<DentryRef, KernelError> {
-    name_ok(name)?;
-    match lookup_dcache(parent, dir, name, flags)? {
-        Some(d) => positive(d),
-        None => positive(lookup_slow(parent, dir, name, flags)?),
-    }
-}
-
 /// Linux lookup_slow: [`__lookup_slow`] under the directory's shared
 /// inode lock, so it cannot race a create, unlink or rename there
 fn lookup_slow(
@@ -432,30 +414,20 @@ fn __lookup_slow(
     }
 }
 
-/// The ref-mode half of lookup_fast after try_to_unlazy_next: `child`,
-/// found for `name` in `parent` by an RCU walk whose revalidation said
-/// `rcu` (Linux: ECHILD revalidated again without LOOKUP_RCU); a stale
-/// one is invalidated and the name looked up again (d_invalidate, then
-/// lookup_slow), an error returned
-fn lookup_fast_ref(
-    parent: &DentryRef,
-    child: DentryRef,
-    name: &[u8],
-    rcu: Result<bool, KernelError>,
-    flags: LookupBits,
-) -> Result<DentryRef, KernelError> {
-    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    match d_revalidate(&dir, child, Some(rcu), flags)? {
-        Some(c) => positive(c),
-        None => positive(lookup_slow(parent, &dir, name, flags)?),
-    }
+/// What a component's lookup gives a ref-mode walk: a child to step
+/// into, or the file an O_CREAT open made there, which is not stepped
+/// into (Linux open_last_lookups: FMODE_CREATED, no step_into)
+enum Found {
+    Child(DentryRef),
+    Made(DentryRef),
 }
 
 /// A symlink's body as ref mode takes it (Linux pick_link's body): the
-/// inode's `i_link`, read in place, else what ->get_link gives
-enum Body<'a> {
+/// inode's `i_link`, read in place through the held inode, else what
+/// ->get_link gives
+enum Body {
     /// `i_link`
-    Kept(&'a [u8]),
+    Kept,
     /// ->get_link's text
     Made(Vec<u8>),
     /// ->get_link's object: a magic link (nd_jump_link)
@@ -463,12 +435,10 @@ enum Body<'a> {
 }
 
 /// A symlink's body in ref mode (Linux pick_link: READ_ONCE(i_link),
-/// else ->get_link with the dentry): the one choice both the walk
-/// ([`Nd::get_link`]) and an O_CREAT open's last links
-/// ([`Nd::last_links`]) make
-fn link_body(inode: &Inode) -> Result<Body<'_>, KernelError> {
-    if let Some(l) = inode.i_link() {
-        return Ok(Body::Kept(l));
+/// else ->get_link with the dentry)
+fn link_body(inode: &Inode) -> Result<Body, KernelError> {
+    if inode.i_link().is_some() {
+        return Ok(Body::Kept);
     }
     Ok(match inode.i_op.get_link(inode, false)? {
         Link::Text(t) => Body::Made(t),
@@ -489,13 +459,14 @@ struct RefWalk<'p> {
 }
 
 /// A component of the current text: the name's offsets, whether it is
-/// the walk's last, and whether another follows in this text (Linux
-/// WALK_MORE)
+/// the walk's last, whether another follows in this text (Linux
+/// WALK_MORE), and whether a slash follows it (Linux trailing_slashes)
 struct Comp {
     at: usize,
     end: usize,
     last: bool,
     more: bool,
+    slash: bool,
 }
 
 impl<'p> RefWalk<'p> {
@@ -524,11 +495,10 @@ impl<'p> RefWalk<'p> {
     }
 
     /// The next component, None at the end of the caller's path; a
-    /// slash after a body's last component asks for a directory,
-    /// through a final symlink (lookup_last). A body is put with its
-    /// last component ([`RefWalk::advance`]): one left on the stack
-    /// with nothing in it is a broken stack (ECHILD), never a shorter
-    /// name.
+    /// slash after the last name asks for a directory, through a final
+    /// symlink ([`trailing_slash`]). A body is put with its last
+    /// component ([`RefWalk::advance`]): one left on the stack with
+    /// nothing in it is a broken stack (ECHILD), never a shorter name.
     fn next(&mut self) -> Result<Option<Comp>, KernelError> {
         let (t, tail_empty) = self.text()?;
         let Some((name, after)) = next_comp(t) else {
@@ -541,15 +511,19 @@ impl<'p> RefWalk<'p> {
         let end = t.len() - after.len();
         let more = next_comp(after).is_some();
         let last = tail_empty && !more;
-        if last && self.stack.len() > 0 && !after.is_empty() {
-            self.f.follow = true;
-            self.f.directory = true;
-        }
+        let slash = !after.is_empty();
+        let f = if last && slash {
+            trailing_slash(self.f, name)
+        } else {
+            self.f
+        };
+        self.f = f;
         Ok(Some(Comp {
             at,
             end,
             last,
             more,
+            slash,
         }))
     }
 
@@ -572,6 +546,22 @@ impl<'p> RefWalk<'p> {
             Some(fr) => fr.pos += c.end,
             None => self.user = &self.user[c.end..],
         }
+    }
+}
+
+/// A slash after the walk's last name `name` asks for a directory,
+/// through a final symlink, unless it is "." or ".." (Linux lookup_last
+/// and lookup_fast_for_open: LAST_NORM with trailing_slashes,
+/// LOOKUP_FOLLOW | LOOKUP_DIRECTORY): only that name's lookup sees
+/// them, none on the way
+fn trailing_slash(f: LookupFlags, name: &[u8]) -> LookupFlags {
+    if name == b"." || name == b".." {
+        return f;
+    }
+    LookupFlags {
+        follow: true,
+        directory: true,
+        ..f
     }
 }
 
@@ -629,6 +619,14 @@ pub struct Nd<'a> {
     r_seq: u32,
     /// LOOKUP_IS_SCOPED
     scoped: bool,
+    /// The permission bits an O_CREAT open's file is made with (Linux
+    /// op->mode)
+    mode: u32,
+    /// The open made its file (Linux FMODE_CREATED)
+    created: Cell<bool>,
+    /// The mode and owner of the directory the last name was looked up
+    /// in (Linux nd->dir_mode, nd->dir_vfsuid): 0 if there was none
+    dir: Cell<(u16, Uid)>,
 }
 
 impl<'a> Nd<'a> {
@@ -651,7 +649,34 @@ impl<'a> Nd<'a> {
             m_seq,
             r_seq,
             scoped: f.scoped(),
+            mode: 0,
+            created: Cell::new(false),
+            dir: Cell::new((0, 0)),
         })
+    }
+
+    /// An O_CREAT open's lookup, its file made with permission bits
+    /// `mode` (Linux op->mode)
+    pub fn create_mode(self, mode: u32) -> Self {
+        Self { mode, ..self }
+    }
+
+    /// The lookup's open made its file (Linux FMODE_CREATED)
+    pub fn created(&self) -> bool {
+        self.created.get()
+    }
+
+    /// The mode and owner of the directory the last name was looked up
+    /// in (Linux nd->dir_mode, nd->dir_vfsuid)
+    pub fn dir(&self) -> (u16, Uid) {
+        self.dir.get()
+    }
+
+    /// The last name is looked up in `dir` (Linux link_path_walk's end:
+    /// nd->dir_mode, nd->dir_vfsuid); its mode and owner are atomics,
+    /// read in RCU mode too
+    fn set_dir(&self, dir: &Inode) {
+        self.dir.set((dir.mode().raw(), dir.uid()));
     }
 
     /// The caller's credentials (Linux current_cred), borrowed
@@ -695,7 +720,11 @@ impl<'a> Nd<'a> {
         }
     }
 
-    /// Walk `path` from `start` (Linux path_lookupat + complete_walk)
+    /// Walk `path` from `start` (Linux path_lookupat + complete_walk;
+    /// for an open, path_openat's link_path_walk + open_last_lookups
+    /// loop: the last name with the open's intent, an O_CREAT open's
+    /// made under the parent's lock, and complete_walk unless it was:
+    /// do_open)
     pub fn lookup(
         &self,
         start: Start<'_>,
@@ -703,6 +732,9 @@ impl<'a> Nd<'a> {
         f: LookupFlags,
     ) -> Result<Path, KernelError> {
         let p = self.walk(start, path, f)?;
+        if self.created.get() {
+            return Ok(p);
+        }
         self.complete(p)
     }
 
@@ -755,13 +787,7 @@ impl<'a> Nd<'a> {
     /// absolute path): in RCU mode while the lookup is still in it
     /// (only its first walk; a later walk starts in ref mode), else in
     /// ref mode, each following symlinks on its own link stack
-    fn walk(&self, start: Start<'_>, path: &[u8], mut f: LookupFlags) -> Result<Path, KernelError> {
-        // A trailing slash asks for a directory, through a final symlink
-        // (Linux link_path_walk: LOOKUP_FOLLOW | LOOKUP_DIRECTORY)
-        if path.ends_with(b"/") {
-            f.follow = true;
-            f.directory = true;
-        }
+    fn walk(&self, start: Start<'_>, path: &[u8], f: LookupFlags) -> Result<Path, KernelError> {
         // An absolute path starts at the root (nd_jump_root): never
         // beneath dirfd
         let abs = path.starts_with(b"/");
@@ -801,21 +827,143 @@ impl<'a> Nd<'a> {
     fn walk_ref(&self, mut cur: Path, w: &mut RefWalk<'_>) -> Result<Path, KernelError> {
         while let Some(c) = w.next()? {
             let dir = may_lookup(self.cred(), &cur.dentry)?;
-            let d = match w.name(&c)? {
+            if c.last {
+                self.set_dir(&dir);
+            }
+            let found = match w.name(&c)? {
                 b"." => None,
                 b".." => {
                     cur = follow_dotdot(cur, self.root()?, w.f)?;
                     self.recheck()?;
                     None
                 }
-                name => Some(walk_lookup(&cur.dentry, &dir, name, w.f.bits(c.last))?),
+                name => Some(self.walk_comp(&cur, &dir, name, &c, w.f)?),
             };
             w.advance(&c);
-            if let Some(d) = d {
-                cur = self.step(cur, d, c.last, w)?;
+            if let Some(found) = found {
+                cur = self.found(cur, found, c.last, w)?;
             }
         }
         self.finish(cur, w.f)
+    }
+
+    /// The lookup of component `c`, `name` in `cur` (whose inode is
+    /// `dir`), in ref mode: walk_component's lookup_fast (the dcache
+    /// with no lock), or, for an O_CREAT open's last name,
+    /// open_last_lookups' (lookup_fast_for_open: a slash after it is
+    /// EISDIR; O_EXCL does not look); then [`Nd::lookup_rest`]
+    fn walk_comp(
+        &self,
+        cur: &Path,
+        dir: &Inode,
+        name: &[u8],
+        c: &Comp,
+        f: LookupFlags,
+    ) -> Result<Found, KernelError> {
+        let bits = f.bits(c.last);
+        if bits.contains(LookupBits::CREATE) {
+            if c.slash {
+                return Err(KernelError::IsDirectory);
+            }
+            if bits.contains(LookupBits::EXCL) {
+                return self.lookup_rest(cur, dir, name, bits, None);
+            }
+        }
+        let fast = lookup_dcache(&cur.dentry, dir, name, bits)?;
+        self.lookup_rest(cur, dir, name, bits, fast)
+    }
+
+    /// A component's lookup once lookup_fast gave `fast` (None: a miss
+    /// or a stale entry), `bits` its nd->flags: walk_component's
+    /// lookup_slow, or, for an O_CREAT open's last name (LOOKUP_CREATE:
+    /// only there), open_last_lookups' lookup_open, a negative entry
+    /// discarded (lookup_fast_for_open: the create needs the lock); a
+    /// negative answer to step into is ENOENT (step_into). An open
+    /// without O_CREAT takes walk_component's way: Linux's lookup_open
+    /// without O_CREAT is lookup_slow's (the shared lock, the dcache,
+    /// ->lookup).
+    fn lookup_rest(
+        &self,
+        cur: &Path,
+        dir: &Inode,
+        name: &[u8],
+        bits: LookupBits,
+        fast: Option<DentryRef>,
+    ) -> Result<Found, KernelError> {
+        let open = bits.contains(LookupBits::CREATE);
+        match fast.filter(|d| !(open && d.is_negative())) {
+            Some(d) => Ok(Found::Child(positive(d)?)),
+            None if open => self.lookup_open(cur, dir, name, bits),
+            None => {
+                name_ok(name)?;
+                let d = lookup_slow(&cur.dentry, dir, name, bits)?;
+                Ok(Found::Child(positive(d)?))
+            }
+        }
+    }
+
+    /// Linux lookup_open with O_CREAT (no ->atomic_open here): `name` in
+    /// `cur` (whose inode is `dir`) under the directory's i_rwsem held
+    /// for writing, write access asked before it and its error kept for
+    /// a create (EROFS after EEXIST); ENOENT in a dead directory; the
+    /// dcache under the lock (a stale entry invalidated), else the file
+    /// system. A positive answer is the file to open; on a negative one
+    /// the file is made (may_o_create: write and search on the
+    /// directory; the mode with the umask and SGID stripping, the owner
+    /// from init_owner) and its dentry cached, the dentry first so an
+    /// ENOMEM leaves no file made.
+    fn lookup_open(
+        &self,
+        cur: &Path,
+        dir: &Inode,
+        name: &[u8],
+        bits: LookupBits,
+    ) -> Result<Found, KernelError> {
+        let parent = &cur.dentry;
+        let w = cur.mnt.want_write();
+        let _lock = dir.lock();
+        if dir.is_dead() {
+            return Err(KernelError::NotFound);
+        }
+        name_ok(name)?;
+        // A file system that keeps no negative dentry answers ENOENT
+        // (Linux ->lookup's NULL)
+        let d = match lookup_dcache(parent, dir, name, bits)? {
+            Some(d) => Some(d),
+            None => match d_alloc_lookup(parent, dir, name) {
+                Err(KernelError::NotFound) => None,
+                r => Some(r?),
+            },
+        };
+        // A negative one is not held while the made inode fills its name
+        if let Some(d) = d.filter(|d| !d.is_negative()) {
+            return Ok(Found::Child(d));
+        }
+        let _w = w?;
+        let c = self.cred();
+        super::dac::may_create(c, dir)?;
+        let perm = super::dac::create_mode(c, dir, (self.mode & 0o7777) as u16);
+        let d = Dentry::prealloc(parent, name)?;
+        let inode = dir.i_op.create(dir, name, InodeMode::regular(perm))?;
+        dir.touch_mc();
+        self.created.set(true);
+        Ok(Found::Made(Dentry::add(parent, d, Some(inode))))
+    }
+
+    /// Where the walk goes on from `cur` once a component's lookup gave
+    /// `found`: step_into the child (`last`: the walk's last
+    /// component), or the file an O_CREAT open made, as it is
+    fn found(
+        &self,
+        cur: Path,
+        found: Found,
+        last: bool,
+        w: &mut RefWalk<'_>,
+    ) -> Result<Path, KernelError> {
+        match found {
+            Found::Child(d) => self.step(cur, d, last, w),
+            Found::Made(d) => Ok(Path::new(cur.mnt.clone(), d)),
+        }
     }
 
     /// The end of a walk: LOOKUP_DIRECTORY's check (Linux
@@ -862,22 +1010,27 @@ impl<'a> Nd<'a> {
             To::Done(p) => return self.finish(p, w.f),
             To::Comp(cur) => cur,
             To::Link { cur, link, last } => self.get_link(cur, link, last, &mut w)?,
-            // lookup_fast missed in RCU mode: lookup_slow
+            // lookup_fast missed in RCU mode, or an O_CREAT open's last
+            // name needs the lock: lookup_slow or lookup_open
             To::Lookup(cur) => {
                 let c = w.next()?.ok_or(ECHILD)?;
-                let name = w.name(&c)?;
-                name_ok(name)?;
                 let dir = cur.dentry.get_inode().ok_or(KernelError::NotFound)?;
-                let d = positive(lookup_slow(&cur.dentry, &dir, name, w.f.bits(c.last))?)?;
+                let bits = w.f.bits(c.last);
+                let found = self.lookup_rest(&cur, &dir, w.name(&c)?, bits, None)?;
                 w.advance(&c);
-                self.step(cur, d, c.last, &mut w)?
+                self.found(cur, found, c.last, &mut w)?
             }
+            // lookup_fast after try_to_unlazy_next: ECHILD revalidated
+            // again in ref mode, a stale entry invalidated and the name
+            // looked up again
             To::Child { cur, child, reval } => {
                 let c = w.next()?.ok_or(ECHILD)?;
-                let f = w.f.bits(c.last);
-                let d = lookup_fast_ref(&cur.dentry, child, w.name(&c)?, reval, f)?;
+                let dir = cur.dentry.get_inode().ok_or(KernelError::NotFound)?;
+                let bits = w.f.bits(c.last);
+                let fast = d_revalidate(&dir, child, Some(reval), bits)?;
+                let found = self.lookup_rest(&cur, &dir, w.name(&c)?, bits, fast)?;
                 w.advance(&c);
-                self.step(cur, d, c.last, &mut w)?
+                self.found(cur, found, c.last, &mut w)?
             }
             // The component is behind: step_into goes on
             To::Step {
@@ -957,7 +1110,7 @@ impl<'a> Nd<'a> {
         inode.touch_atime(&link.mnt);
         // An i_link body is read through the held inode, not copied
         let body = match link_body(&inode)? {
-            Body::Kept(_) => None,
+            Body::Kept => None,
             Body::Made(t) => Some(t),
             Body::Jump(p) => {
                 self.may_jump(&dir, &p, w.f)?;
@@ -1039,74 +1192,6 @@ impl<'a> Nd<'a> {
             slash,
         })
     }
-
-    /// Where an O_CREAT open of `p` lands (Linux open_last_lookups +
-    /// step_into on the last component): while the last name is a
-    /// symlink, its target's parent and last name, each link checked as
-    /// a walk checks it (fs.protected_symlinks, then RESOLVE_NO_SYMLINKS
-    /// or nosymfollow, then an absolute target's jump); a magic link's
-    /// object itself (nd_jump_link: there is no name left to create);
-    /// ELOOP past MAX_SYMLINKS. A target ending in '/', "." or ".." is
-    /// EISDIR.
-    pub fn last_links(&self, mut p: Parent, f: LookupFlags) -> Result<CreateAt, KernelError> {
-        const MAX_SYMLINKS: usize = 40;
-        for _ in 0..MAX_SYMLINKS {
-            let dir = Path::new(p.mnt.clone(), p.dir.clone());
-            // The last name with the open's intent (Linux lookup_open)
-            let nofollow = LookupFlags {
-                follow: false,
-                intent: f.intent,
-                ..f.resolve()
-            };
-            let found = match self.walk(Start::path(&dir), &p.name, nofollow) {
-                Ok(f) => f,
-                Err(KernelError::NotFound) => return Ok(CreateAt::Name(p)),
-                Err(e) => return Err(e),
-            };
-            let Some(inode) = found.get_inode().filter(|i| i.mode().is_symlink()) else {
-                return Ok(CreateAt::Name(p));
-            };
-            if let Some(d) = p.dir.get_inode() {
-                super::dac::may_follow_link(self.cred(), &d, &inode)?;
-            }
-            if f.no_symlinks || found.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
-                return Err(KernelError::TooManySymlinks);
-            }
-            // pick_link: the atime, then the body
-            inode.touch_atime(&found.mnt);
-            let made;
-            let target = match link_body(&inode)? {
-                Body::Kept(t) => t,
-                Body::Made(t) => {
-                    made = t;
-                    &made
-                }
-                Body::Jump(o) => {
-                    self.may_jump(&dir, &o, f)?;
-                    return Ok(CreateAt::Object(o));
-                }
-            };
-            let start = if target.starts_with(b"/") {
-                self.jump_root(&dir, f)?;
-                Start::Root
-            } else {
-                Start::path(&dir)
-            };
-            p = self.parentat(start, target, f)?;
-            if p.last != Last::Norm || p.slash {
-                return Err(KernelError::IsDirectory);
-            }
-        }
-        Err(KernelError::TooManySymlinks)
-    }
-}
-
-/// Where an O_CREAT open lands ([`Nd::last_links`])
-pub enum CreateAt {
-    /// A name to look up or create in its parent
-    Name(Parent),
-    /// An existing object a magic link jumped to
-    Object(Path),
 }
 
 /// The next component of `p` and what follows it, skipping slashes
@@ -1497,7 +1582,15 @@ mod tests {
         let a = Dentry::alloc(&r, b"x", Some(inode(STALE))).unwrap();
         drop(r.remove_child(b"x"));
         let b = Dentry::alloc(&r, b"x", Some(inode(VALID))).unwrap();
-        let d = lookup_fast_ref(&r, a, b"x", Err(ECHILD), LookupBits::empty()).unwrap();
+        let (dir, f) = (r.get_inode().unwrap(), LookupBits::empty());
+        // lookup_fast's ref half after an RCU walk's ECHILD, then
+        // lookup_slow
+        assert!(
+            d_revalidate(&dir, a, Some(Err(ECHILD)), f)
+                .unwrap()
+                .is_none()
+        );
+        let d = lookup_slow(&r, &dir, b"x", f).unwrap();
         assert!(DentryRef::ptr_eq(&d, &b) && !b.d_unhashed());
     }
 
@@ -1522,14 +1615,13 @@ mod tests {
     fn reval_error_returned() {
         let r = root();
         let a = Dentry::alloc(&r, b"x", Some(inode(BROKEN))).unwrap();
-        let f = LookupBits::empty();
-        let e = lookup_fast_ref(&r, a.clone(), b"x", Err(ECHILD), f);
+        let (dir, f) = (r.get_inode().unwrap(), LookupBits::empty());
+        let e = d_revalidate(&dir, a.clone(), Some(Err(ECHILD)), f);
         assert_eq!(e.err(), Some(KernelError::Io));
-        let dir = r.get_inode().unwrap();
         let c = lookup_dcache(&r, &dir, b"x", LookupBits::empty());
         assert_eq!(c.err(), Some(KernelError::Io));
         assert!(!a.d_unhashed());
-        let _ = lookup_fast_ref(&r, a.clone(), b"x", Ok(false), f);
+        let _ = d_revalidate(&dir, a.clone(), Some(Ok(false)), f);
         assert!(a.d_unhashed());
     }
 

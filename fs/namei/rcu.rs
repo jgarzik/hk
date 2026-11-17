@@ -290,7 +290,8 @@ pub(super) enum To {
     Done(Path),
     /// may_lookup's ECHILD: the component asked again in ref mode
     Comp(Path),
-    /// lookup_fast's miss: lookup_slow of the component
+    /// lookup_fast's miss: lookup_slow of the component; for an O_CREAT
+    /// open's last name, a miss, a negative entry or O_EXCL: lookup_open
     Lookup(Path),
     /// lookup_fast's try_to_unlazy_next with `child`, found for the
     /// component in `cur` and not valid under LOOKUP_RCU (`reval`, what
@@ -711,11 +712,9 @@ impl Nd<'_> {
             // WALK_MORE: a component follows in this text
             let more = next_comp(after).is_some();
             let last = tail_empty && !more;
-            // lookup_last of a body's last component: a slash after it
-            // asks for a directory, through a final symlink
-            if last && stack.depth() > 0 && !after.is_empty() {
-                f.follow = true;
-                f.directory = true;
+            let slash = !after.is_empty();
+            if last && slash {
+                f = super::trailing_slash(f, name);
             }
             if let Err(e) = self.may_lookup_rcu(&cur) {
                 // Out of RCU mode to see it was not transient (Linux
@@ -727,10 +726,17 @@ impl Nd<'_> {
                 }
                 return self.lazy(To::Comp(p), stack, user, at, f, total, puts);
             }
-            // walk_component: lookup_fast ("." and ".." need none)
+            if last && let Some(dir) = cur.inode {
+                self.set_dir(dir);
+            }
+            // walk_component: lookup_fast ("." and ".." need none); an
+            // O_CREAT open's last name with a slash after it is EISDIR
+            // (open_last_lookups: lookup_fast_for_open)
             let dot = name == b".";
+            let create = f.bits(last).contains(LookupBits::CREATE);
             let got = match name {
                 b"." | b".." => None,
+                _ if create && slash => return Err(KernelError::IsDirectory),
                 _ => match self.lookup_fast_rcu(rc, &cur, name, f, last, puts)? {
                     Ok(c) => Some(c),
                     Err(to) => return self.lazy(to, stack, user, at, f, total, puts),
@@ -865,7 +871,10 @@ impl Nd<'_> {
     /// lookup_fast under LOOKUP_RCU: `name` in `cur` from the dcache,
     /// revalidated with nd->flags for it (`last`: the walk's last
     /// component): the child, its inode and its `d_seq` sample; else
-    /// where ref mode takes over (a miss, an answer other than valid)
+    /// where ref mode takes over (a miss, an answer other than valid).
+    /// For an O_CREAT open's last name (lookup_fast_for_open), O_EXCL
+    /// does not look and a negative entry is discarded: ref mode's
+    /// lookup_open, after try_to_unlazy.
     fn lookup_fast_rcu<'g>(
         &self,
         rc: &Rcu<'g>,
@@ -875,6 +884,12 @@ impl Nd<'_> {
         last: bool,
         puts: &mut Puts,
     ) -> Result<Result<Hit<'g>, To>, KernelError> {
+        let bits = f.bits(last);
+        let create = bits.contains(LookupBits::CREATE);
+        if create && bits.contains(LookupBits::EXCL) {
+            let at = self.try_to_unlazy(rc, cur, f.cached, puts)?;
+            return Ok(Err(To::Lookup(at)));
+        }
         // A miss, maybe a rename's (no RENAME_LOCK check: lookup_slow
         // decides under the directory's lock)
         let Some((child, seq)) = __d_lookup_rcu(cur.dentry, name, rc.g) else {
@@ -892,7 +907,7 @@ impl Nd<'_> {
         // one, ref-mode d_revalidate if ECHILD)
         // `cur` is a directory may_lookup let through
         let dir = cur.inode.ok_or(ECHILD)?;
-        let status = child.revalidate(dir, inode, LookupBits::RCU | f.bits(last));
+        let status = child.revalidate(dir, inode, LookupBits::RCU | bits);
         if status != Ok(true) {
             let (at, c) = self.try_to_unlazy_next(rc, cur, child, seq, f.cached, puts)?;
             return Ok(Err(To::Child {
@@ -900,6 +915,10 @@ impl Nd<'_> {
                 child: c,
                 reval: status,
             }));
+        }
+        if create && inode.is_none() {
+            let at = self.try_to_unlazy(rc, cur, f.cached, puts)?;
+            return Ok(Err(To::Lookup(at)));
         }
         Ok(Ok((child, inode, seq)))
     }
