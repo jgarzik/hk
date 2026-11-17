@@ -1220,11 +1220,21 @@ impl GlobalTaskTable {
         crate::sync::rcu::kfree_rcu(listed);
     }
 
-    /// Children `t` still has as it leaves the list name no parent
-    /// (Linux has none here: exit hands them on first,
-    /// forget_original_parent): a parent link never outlives its
-    /// target's listing (the `Task` invariant)
+    /// A task leaves the list with no children (Linux: exit hands them
+    /// on first, forget_original_parent, so release_task has no such
+    /// step). Any left is a bug, reported once as TASK:FAIL (Linux
+    /// WARN_ON_ONCE); they are then made to name no parent, so a parent
+    /// link never outlives its target's listing (the `Task` invariant
+    /// `Task::parent`'s RCU read rests on)
     fn orphan_children(&mut self, t: &Task) {
+        if self.inner_mut_of(t).children.is_empty() {
+            return;
+        }
+        static REPORTED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            crate::printkln!("TASK:FAIL tid {} left the task list with children", t.tid());
+        }
         while let Some(c) = self.inner_mut_of(t).children.front().map(task_ref) {
             // SAFETY: on `t`'s children list
             drop(unsafe { self.inner_mut_of(t).children.remove(&c) });

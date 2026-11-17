@@ -1452,9 +1452,10 @@ read guard (Linux ptrace_signal). `real_parent` (`Task.real_parent`, an
 `RcuPtr`, Linux real_parent) holds no reference: it is set, under the
 write lock, only to a listed task (fork, `adopt`, exec's leader
 change keeps the old leader's), and a task's children are handed on
-before it leaves the list (`forget_original_parent`; `remove`
-clears any left, `orphan_children`), so a listed task's parent is
-listed. Read under TASKLIST (`Task::parent_locked`, the views'
+before it leaves the list (`forget_original_parent`), so a listed
+task's parent is listed; one left at `remove` is a bug, reported once
+as `TASK:FAIL` (Linux has no such step), and made to name no parent
+(`orphan_children`) so the rule still holds. Read under TASKLIST (`Task::parent_locked`, the views'
 `real_parent`/`ppid`: no count) or under an RCU read guard
 (`Task::parent`, Linux pid_alive(p) ? rcu_dereference(p->real_parent)):
 a task seen listed within the guard has a parent listed at some point

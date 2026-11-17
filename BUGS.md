@@ -1187,6 +1187,12 @@ ntp_update_frequency).
   send (`send_task`) and a POSIX timer's signal (`send_timer_sigqueue`)
   take TASKLIST's read lock. Linux reaches the handlers through
   lock_task_sighand (RCU, then siglock, which owns the thread list).
+- **A task's own struct pid is not RCU-readable**: `task/mod.rs`
+  `TaskInner.thread_pid` is under TASKLIST, so `Task::pid_nr_ns` finds
+  it by hashing the tid and checking `Pid.task`, and exec's
+  `take_leadership` moves the tid and `Pid.task` separately. Linux reads
+  task->thread_pid under RCU (task_pid_nr_ns); it is written under
+  tasklist_lock (attach_pid, exchange_tids, detach_pid).
 - **Inodes are counted by `Arc`, not `i_count` + `iput`**: `fs/inode.rs`
   `IFree`; the last put runs the teardown from the `Arc`'s drop glue,
   so std `Arc::drop_slow` makes a transient `&mut Inode` while RCU
