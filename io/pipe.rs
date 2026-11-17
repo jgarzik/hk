@@ -35,16 +35,15 @@
 //! pipe pages and the caller's iterator under it (a user copy may
 //! fault: -> mmap_lock, as in Linux). Wait conditions and poll never take
 //! it (poll runs under epoll's spin lock): like Linux pipe_readable /
-//! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`
-//! and the usable slots `Pipe.max_usage`, which the guard publishes as
-//! it unlocks (or before a wakeup made
-//! under it). Wakeups follow the unlock where Linux's do (read, write,
+//! pipe_writable they read the ring indices `Pipe.head_tail` (one
+//! word, stored as the guard unlocks or before a wakeup made under
+//! it), the usable slots `Pipe.max_usage` and the reader/writer counts,
+//! all written under `Pipe.inner`. Wakeups follow the unlock where Linux's do (read, write,
 //! most of splice). O_ASYNC files are on `fasync_readers` /
 //! `fasync_writers` (by access mode; changed under `Pipe.inner`, Linux
 //! pipe_fasync); their SIGIO goes with the wakeups (Linux pipe_read,
-//! pipe_write: after the unlock), and a release's under `Inode.i_pipe`,
-//! the lock of the count change (Linux pipe_release: under pipe->mutex,
-//! the counts' lock there).
+//! pipe_write: after the unlock), and a FIFO release's under
+//! `Pipe.inner` with its count change (Linux pipe_release).
 //! splice/tee lock two pipes in address order (Linux pipe_double_lock).
 //!
 //! ## Reference
@@ -59,7 +58,7 @@ use crate::util::error::KernelResult;
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
@@ -574,22 +573,24 @@ pub struct Pipe {
     inner: Mutex<PipeInner>,
     /// The user charged for its slots (Linux pipe->user)
     user: UcountsRef,
-    /// `inner.head`, `inner.tail` and `inner.max_usage` as of the last
-    /// unlock, for lockless readers (Linux READ_ONCE(pipe->head/tail),
-    /// pipe->max_usage)
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    /// The ring indices in one word, head low and tail high (Linux
+    /// pipe->head_tail): stored under `inner` as the ring changes
+    /// (`PipeGuard::publish`), read with one load by lockless readers
+    /// (pipe_readable, pipe_writable), so head and tail are of one moment
+    head_tail: AtomicU64,
+    /// `inner.max_usage()`, stored under `inner` where it changes
+    /// (`set_size`), read by lockless readers
     max_usage: AtomicUsize,
     /// Wait queue for readers/writers
     pub wait_queue: WaitQueue,
-    /// Number of read end references
+    /// Read and write ends (Linux pipe->readers / writers), opens of a
+    /// FIFO for reading and writing so far (r_counter / w_counter: an
+    /// opener waiting for its partner wakes when the other count
+    /// moves): changed under `inner` (pipe_release, fifo_open), read
+    /// with a plain load by lockless readers (READ_ONCE)
     readers: AtomicU32,
-    /// Opens of a FIFO for reading and writing so far (Linux
-    /// r_counter/w_counter): an opener waiting for its partner wakes
-    /// when the other count moves
     r_counter: AtomicU32,
     w_counter: AtomicU32,
-    /// Number of write end references
     writers: AtomicU32,
     /// O_ASYNC files open for reading / writing (Linux
     /// fasync_readers / fasync_writers)
@@ -631,8 +632,7 @@ impl Pipe {
         try_arc(Self {
             inner: Mutex::new(inner),
             user,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            head_tail: AtomicU64::new(0),
             max_usage: AtomicUsize::new(slots),
             wait_queue: WaitQueue::new(),
             readers: AtomicU32::new(1),
@@ -683,6 +683,7 @@ impl Pipe {
             account_pipe_buffers(&self.user, slots, old);
             return Err(e);
         }
+        self.max_usage.store(g.max_usage(), Ordering::Relaxed);
         let n = g.max_usage() * PAGE_SIZE;
         drop(g);
         self.wait_queue.wake_all();
@@ -698,11 +699,11 @@ impl Pipe {
         }
     }
 
-    /// Used slots, without the lock (a snapshot)
+    /// Used slots, without the lock: head and tail of one moment (Linux
+    /// pipe_occupancy of one READ_ONCE(pipe->head_tail))
     fn occupancy(&self) -> usize {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-        head.wrapping_sub(tail)
+        let ht = self.head_tail.load(Ordering::Acquire);
+        (ht as u32).wrapping_sub((ht >> 32) as u32) as usize
     }
 
     /// No buffered data, without the lock
@@ -712,7 +713,7 @@ impl Pipe {
 
     /// Every slot used, without the lock
     pub fn ring_full(&self) -> bool {
-        self.occupancy() >= self.max_usage.load(Ordering::Acquire)
+        self.occupancy() >= self.max_usage.load(Ordering::Relaxed)
     }
 
     /// A reader need not wait (Linux pipe_readable): data or no writer
@@ -753,11 +754,13 @@ impl Pipe {
     /// ends the wait
     pub fn lock_room(&self, nonblock: bool) -> KernelResult<PipeGuard<'_>> {
         loop {
+            let g = self.lock();
+            // Decided under the mutex (Linux wait_for_space)
             if !self.has_readers() {
+                drop(g);
                 sigpipe();
                 return Err(KernelError::BrokenPipe);
             }
-            let g = self.lock();
             if !g.is_full() {
                 return Ok(g);
             }
@@ -770,40 +773,46 @@ impl Pipe {
         }
     }
 
-    /// Check if there are any readers
+    /// A read end is open (exact under `inner`, a snapshot without)
     pub fn has_readers(&self) -> bool {
-        self.readers.load(Ordering::Acquire) > 0
+        self.readers.load(Ordering::Relaxed) > 0
     }
 
-    /// Check if there are any writers
+    /// A write end is open (exact under `inner`, a snapshot without)
     pub fn has_writers(&self) -> bool {
-        self.writers.load(Ordering::Acquire) > 0
+        self.writers.load(Ordering::Relaxed) > 0
     }
 
-    /// Increment reader count
+    /// One more read end (a duplicated one)
     pub fn add_reader(&self) {
-        self.readers.fetch_add(1, Ordering::AcqRel);
+        let g = self.lock();
+        g.count(&self.readers, 1);
     }
 
-    /// Decrement reader count
+    /// One read end less (Linux pipe_release): the last wakes writers
+    /// (EPIPE, POLLERR)
     pub fn remove_reader(&self) {
-        let prev = self.readers.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            // Last reader closed - wake writers so they can see POLLHUP/EPIPE
+        let g = self.lock();
+        g.count(&self.readers, -1);
+        drop(g);
+        if !self.has_readers() {
             self.wait_queue.wake_all();
         }
     }
 
-    /// Increment writer count
+    /// One more write end (a duplicated one)
     pub fn add_writer(&self) {
-        self.writers.fetch_add(1, Ordering::AcqRel);
+        let g = self.lock();
+        g.count(&self.writers, 1);
     }
 
-    /// Decrement writer count
+    /// One write end less (Linux pipe_release): the last wakes readers
+    /// (EOF, POLLHUP)
     pub fn remove_writer(&self) {
-        let prev = self.writers.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            // Last writer closed - wake readers so they can see EOF
+        let g = self.lock();
+        g.count(&self.writers, -1);
+        drop(g);
+        if !self.has_writers() {
             self.wait_queue.wake_all();
         }
     }
@@ -894,11 +903,17 @@ impl PipeGuard<'_> {
     /// pipe->head / pipe->tail); a wakeup made under the lock follows
     /// it, so the woken see the change
     pub fn publish(&self) {
-        self.pipe.head.store(self.g.head, Ordering::Release);
-        self.pipe.tail.store(self.g.tail, Ordering::Release);
-        self.pipe
-            .max_usage
-            .store(self.g.max_usage(), Ordering::Release);
+        let ht = u64::from(self.g.head as u32) | (u64::from(self.g.tail as u32) << 32);
+        if self.pipe.head_tail.load(Ordering::Relaxed) != ht {
+            self.pipe.head_tail.store(ht, Ordering::Release);
+        }
+    }
+
+    /// Change one of the pipe's counts (`readers`, `writers`,
+    /// `r_counter`, `w_counter`) by `d`: under `inner` (this guard), so a
+    /// load and a store
+    fn count(&self, c: &AtomicU32, d: i32) {
+        crate::sync::Sole::sole_add(c, d as u32);
     }
 }
 
@@ -990,11 +1005,13 @@ fn pipe_write_wait(
     let mut done = 0;
     let mut first = true;
     loop {
+        let mut inner = pipe.lock();
+        // Decided under the mutex (Linux pipe_write)
         if !pipe.has_readers() {
+            drop(inner);
             sigpipe();
             return partial(done, KernelError::BrokenPipe);
         }
-        let mut inner = pipe.lock();
         let (n, err) = inner.write_from(from, packet, core::mem::take(&mut first));
         drop(inner);
         done += n;
@@ -1309,55 +1326,50 @@ impl FileOps for FifoFileOps {
             let Some((p, files)) = slot.as_mut() else {
                 unreachable!("fifo slot filled above");
             };
-            if mode == flags::O_WRONLY && nonblock && !p.has_readers() {
-                if *files == 0 {
-                    *slot = None;
-                }
+            // Linux pipe->files, under i_lock
+            *files += 1;
+            p.clone()
+        };
+        // Another open's pipe won: ours goes with the lock released
+        drop(fresh);
+        // The counts and the decisions on them under the pipe's mutex
+        // (Linux fifo_open: __pipe_lock): a partner that opens, even and
+        // closes, after the unlock moves the counter this waits on, so the
+        // wait ends at once
+        let (wait, w_version) = {
+            let g = pipe.lock();
+            if mode == flags::O_WRONLY && nonblock && !pipe.has_readers() {
+                drop(g);
+                fifo_put_file(&inode);
                 return Err(KernelError::NoDeviceOrAddress);
             }
-            *files += 1;
-            match mode {
-                flags::O_RDONLY => {
-                    p.readers.fetch_add(1, Ordering::AcqRel);
-                    p.r_counter.fetch_add(1, Ordering::AcqRel);
-                }
-                flags::O_WRONLY => {
-                    p.writers.fetch_add(1, Ordering::AcqRel);
-                    p.w_counter.fetch_add(1, Ordering::AcqRel);
-                }
-                _ => {
-                    p.readers.fetch_add(1, Ordering::AcqRel);
-                    p.writers.fetch_add(1, Ordering::AcqRel);
-                    p.r_counter.fetch_add(1, Ordering::AcqRel);
-                    p.w_counter.fetch_add(1, Ordering::AcqRel);
-                }
+            if mode != flags::O_WRONLY {
+                g.count(&pipe.readers, 1);
+                g.count(&pipe.r_counter, 1);
             }
-            // Decided under the slot lock, as every open changes the
-            // counters under it (Linux holds pipe->mutex until it sleeps):
-            // a partner that opens, even and closes, after the unlock moves
-            // the counter this waits on, so the wait ends at once
+            if mode != flags::O_RDONLY {
+                g.count(&pipe.writers, 1);
+                g.count(&pipe.w_counter, 1);
+            }
             let wait = match mode {
-                flags::O_RDONLY if !nonblock && !p.has_writers() => {
-                    Some((true, p.w_counter.load(Ordering::Acquire)))
+                flags::O_RDONLY if !nonblock && !pipe.has_writers() => {
+                    Some((true, pipe.w_counter.load(Ordering::Relaxed)))
                 }
-                flags::O_WRONLY if !p.has_readers() => {
-                    Some((false, p.r_counter.load(Ordering::Acquire)))
+                flags::O_WRONLY if !pipe.has_readers() => {
+                    Some((false, pipe.r_counter.load(Ordering::Relaxed)))
                 }
                 _ => None,
             };
             // Linux f_version: a nonblocking reader that found no writer
             // gets POLLHUP only after one comes and goes; any other open
             // compares against 0, so POLLHUP shows once writers are gone
-            let w_version = if mode == flags::O_RDONLY && nonblock && !p.has_writers() {
-                p.w_counter.load(Ordering::Acquire)
+            let w_version = if mode == flags::O_RDONLY && nonblock && !pipe.has_writers() {
+                pipe.w_counter.load(Ordering::Relaxed)
             } else {
                 0
             };
-            (p.clone(), wait, w_version)
+            (wait, w_version)
         };
-        // Another open's pipe won: ours goes with the lock released
-        drop(fresh);
-        let (pipe, wait, w_version) = pipe;
         pipe.wait_queue.wake_all();
         let waited = match wait {
             Some((true, seen)) => wait_for_partner(&pipe, &pipe.w_counter, seen),
@@ -1468,22 +1480,32 @@ impl FileOps for FifoFileOps {
 }
 
 /// Drop one open of a FIFO in `mode` (Linux pipe_release): its
-/// reader/writer counts (waking the other side; if that was the last
-/// reader or writer but not both, the O_ASYNC files of both sides
-/// learn it), and the inode's pipe with the last file; all under the
-/// slot lock, like the open side
+/// reader/writer counts under the pipe's mutex (waking the other side;
+/// if that was the last reader or writer but not both, the O_ASYNC
+/// files of both sides learn it), then the inode's pipe with the last
+/// file (`fifo_put_file`)
 fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
+    {
+        let g = pipe.lock();
+        if mode != flags::O_WRONLY {
+            g.count(&pipe.readers, -1);
+        }
+        if mode != flags::O_RDONLY {
+            g.count(&pipe.writers, -1);
+        }
+        if pipe.has_readers() != pipe.has_writers() {
+            pipe.kill_readers();
+            pipe.kill_writers();
+        }
+    }
+    pipe.wait_queue.wake_all();
+    fifo_put_file(inode);
+}
+
+/// One file of the FIFO less (Linux put_pipe_info, under i_lock): the
+/// inode's pipe goes with the last
+fn fifo_put_file(inode: &crate::fs::inode::Inode) {
     let mut slot = inode.i_pipe.lock();
-    if mode != flags::O_WRONLY {
-        pipe.remove_reader();
-    }
-    if mode != flags::O_RDONLY {
-        pipe.remove_writer();
-    }
-    if pipe.has_readers() != pipe.has_writers() {
-        pipe.kill_readers();
-        pipe.kill_writers();
-    }
     if let Some((_, files)) = slot.as_mut() {
         *files -= 1;
         if *files == 0 {

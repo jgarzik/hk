@@ -66,28 +66,6 @@ argued / published copy of locked state.
   `waitqueue_active` fast path; drop the global counter (re-check the hash
   instead). LOCKING.md VFS section.
 
-### 11. Pipe: published ring indices and counts outside the mutex — (e)(b)(a)
-- Where: `io/pipe.rs` `Pipe.head`/`tail`/`max_usage` (copied by
-  `PipeGuard::publish` on every unlock), `occupancy`, `ring_full`;
-  `Pipe.readers`/`writers` (`remove_reader`/`remove_writer` from
-  `PipeReadEnd`/`PipeWriteEnd` drop with no pipe lock; FIFO opens under the
-  inode slot lock), `r_counter`/`w_counter`.
-- Wrong: three extra stores per lock hold; `occupancy` loads head and tail
-  separately, so a lockless reader can see a wrapped (huge) or stale
-  occupancy (spurious POLLIN/POLLOUT, spurious "full"). Reader/writer counts
-  change outside `Pipe.inner`, so a writer holding the mutex does not see a
-  stable reader count across its write (Linux decides EPIPE under the mutex);
-  the FIFO path holds a different lock than the anon path. AcqRel RMWs under a
-  lock are redundant.
-- Linux: `pipe->head_tail` is one union word written under `pipe->mutex`,
-  read with a single `READ_ONCE` (`pipe_readable`, `pipe_writable`);
-  `readers`/`writers`/`r_counter`/`w_counter` change under `pipe->mutex`
-  (`pipe_release`, `fifo_open`), read with READ_ONCE.
-- Fix: one `head_tail: AtomicU64` owned by the ring, written (Relaxed/Release)
-  where the ring changes under the mutex, no publish-on-drop; counts changed
-  under the pipe mutex (release path takes it, as Linux), Relaxed atomic only
-  for the lockless poll read. LOCKING.md pipe section.
-
 ### 12. Timer wheel fields as atomics; `running` read outside the base lock — (a)(e)
 - Where: `time/timer.rs` `TimerList.expires`, `not_before`, `slot` (all
   "under the base lock"), `TimerBase.running`/`runner`,
