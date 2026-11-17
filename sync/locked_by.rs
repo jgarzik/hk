@@ -145,6 +145,51 @@ impl<T, A: UniqueOwner, B: UniqueOwner> LockedByEither<T, A, B> {
     }
 }
 
+/// A `Copy` value owned by one of many instances of a lock (a timer's
+/// expiry, owned by whichever per-CPU base it is on): the owner is not
+/// unique, so the caller proves it holds the right one (RfL `LockedBy`
+/// checks a stored owner; here the cell's owner is the lock its object
+/// names, e.g. a timer's `base`, checked by the caller)
+///
+/// # Invariants
+/// `data` is read only under a shared borrow of its lock's data and
+/// written only under a mutable borrow of it; values are copied in and
+/// out, so no reference into the cell outlives the borrow.
+pub struct LockedCell<T>(UnsafeCell<T>);
+
+// SAFETY: every access copies a value under its lock's data borrow
+// (shared reads, one exclusive writer), so threads only exchange owned
+// copies (T: Send)
+unsafe impl<T: Copy + Send> Sync for LockedCell<T> {}
+
+impl<T: Copy> LockedCell<T> {
+    pub const fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+
+    /// The value, under a shared borrow of its lock's data
+    ///
+    /// # Safety
+    /// `owner` is the data of the lock this cell belongs to.
+    pub unsafe fn get<O>(&self, owner: &O) -> T {
+        let _ = owner;
+        // SAFETY: the owner is borrowed shared, so no `set` (which
+        // borrows it mutably) runs meanwhile; the read is a copy
+        unsafe { *self.0.get() }
+    }
+
+    /// Replace the value, under a mutable borrow of its lock's data
+    ///
+    /// # Safety
+    /// `owner` is the data of the lock this cell belongs to.
+    pub unsafe fn set<O>(&self, owner: &mut O, v: T) {
+        let _ = owner;
+        // SAFETY: the owner is borrowed mutably, so no other access to
+        // the cell runs meanwhile, and none holds a reference into it
+        unsafe { *self.0.get() = v };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +234,15 @@ mod tests {
         *c.access_mut(&mut a, &mut b) += 1;
         assert_eq!(*c.access_a(&a), 2);
         assert_eq!(*c.access_b(&b), 2);
+    }
+
+    #[test]
+    fn cell_copies_under_owner() {
+        let mut o = Owner;
+        let c = LockedCell::new(1u64);
+        // SAFETY: `o` is the one owner of the cell
+        unsafe { c.set(&mut o, 5) };
+        // SAFETY: as above
+        assert_eq!(unsafe { c.get(&o) }, 5);
     }
 }

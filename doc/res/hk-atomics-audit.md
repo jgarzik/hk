@@ -54,22 +54,6 @@ argued / published copy of locked state.
 - Fix: set-once (`Once` or the constructor) where boot order allows.
 
 
-### 12. Timer wheel fields as atomics; `running` read outside the base lock — (a)(e)
-- Where: `time/timer.rs` `TimerList.expires`, `not_before`, `slot` (all
-  "under the base lock"), `TimerBase.running`/`runner`,
-  `TimerList::del_timer_sync`; `time/hrtimer.rs` `HrTimer.expires`/`clock`,
-  `HrBase.running`.
-- Wrong: wheel-owned fields are atomics only to dodge `UnsafeCell`.
-  `del_timer_sync` detaches under the lock, then reads `running` after
-  dropping it, and `run` clears `running` without the lock; correctness
-  rests on an unargued Acquire/Release pairing across the unlock, and
-  `runner` is a second atomic that must agree with `running`.
-- Linux: `timer->expires` and wheel index plain under `base->lock`;
-  `timer_pending` is the lockless READ_ONCE; `try_to_del_timer_sync` reads
-  `base->running_timer` under `base->lock`, and `__run_timers` sets/clears it
-  under the lock.
-- Fix: wheel fields in a base-lock-owned cell; `pending` stays atomic
-  (timer_pending); set/clear/read `running` (and owner) under the base lock.
 
 ### 13. Dirty throttling sums every possible CPU's slot per write — (c)
 - Where: `mm/writeback.rs` `balance_dirty_pages` -> `mm/filemap.rs`
@@ -123,9 +107,9 @@ argued / published copy of locked state.
 
 LOCKING.md §5.4 rules 10-12 (single writers, per-CPU areas, no published
 copies) and the primitives behind them (`percpu!` areas, queued spin and
-rwlocks, `cpu::LocalWord`) are in place. Still to provide: a lock-owned
-cell (`LockedBy`-style, proof by guard) for rq/timer-base/zone fields and
-a `SeqCount` type, with their first users. Each atomic field's doc
+rwlocks, `cpu::LocalWord`) are in place, and `sync::LockedCell` (a cell
+owned by one of many instances of a lock, first used by the timer
+bases). Still to do: its rq/zone users. Each atomic field's doc
 comment names its lockless reader and Linux equivalent (rule 7); a field
 "under lock X" with no lockless reader is a bug to fix. Remaining phases
 by blast radius: 4-6 and 15/21 (scheduler, allocator, syscall path),

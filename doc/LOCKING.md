@@ -3488,24 +3488,32 @@ nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
 A `TimerList` is embedded in its pinned owner and armed in jiffies
 (`mod_timer`) or not before a CLOCK_MONOTONIC instant (`mod_timer_ns`,
 tick granularity, never early). Each CPU has a HARD and a SOFT base
-(`TimerBase`: an IrqSpinlock-protected 64-slot wheel, `running`, a wait
-queue); a timer stays on the base of the CPU that first armed it. A
-timer's expiry, `not_before` bound, slot and pending flag change only
-under its base's wheel lock (one arm sets expiry and bound together),
-where `run` reads them.
+(`TimerBase`: `wheel`, an IrqSpinlock over the 64-slot wheel and the
+running callback, and a wait queue); a timer stays on the base of the
+CPU that first armed it. Under its base's wheel lock (Linux
+base->lock): the timer's expiry, `not_before` bound and slot
+(`TimerList.pos`, a `sync::LockedCell` read and written only through
+that lock's data, checked against the timer's `base`; one arm sets
+expiry and bound together), its pending flag (changed there, read
+without it by `pending`, Linux timer_pending), and `Wheel.running` /
+`runner` (Linux running_timer). `deadline_ns` (/proc/net/tcp) takes
+the lock to read the bound.
 
 - **HARD** callbacks run in the CPU's tick with interrupts off and only
   wake tasks (`schedule_timeout`'s on-stack timer, Linux
   process_timeout). **SOFT** callbacks run in `ktimers/N`, process
   context (`Alarm`s run the network protocol timers); the tick only
   wakes the thread.
-- Callbacks run with the base lock dropped and `running` set.
-  `del_timer_sync` detaches and waits for a running callback (spinning
+- `run` sets `running` under the base lock, drops it for the callback
+  and clears `running` once it holds it again (Linux __run_timers).
+  `del_timer_sync` detaches and checks `running` under the lock (Linux
+  try_to_del_timer_sync), and waits with it dropped for a running
+  callback, then retries (spinning
   for HARD, whose callback runs with interrupts off on another CPU;
   sleeping on the base's wait queue for SOFT, whose callback may
   sleep), so the owner may go once it returns; dropping a `TimerList`
   does that. From the timer's own callback it only detaches (the base
-  records the running task, `TimerBase.runner`, and never touches the
+  records the running task, `Wheel.runner`, and never touches the
   timer after the callback returns), so a callback may drop the
   timer's owner; elsewhere (SOFT) never where sleeping is not allowed.
 - `ArcTimer<T>` (Linux sk_reset_timer/sk_stop_timer): a SOFT timer in
@@ -3526,7 +3534,13 @@ where `run` reads them.
 An `HrTimer` is embedded in its pinned owner and fires at an absolute
 CLOCK_MONOTONIC or CLOCK_REALTIME ns time. Each CPU has a HARD and a
 SOFT `HrBase`: `q`, an IrqSpinlock over one sorted intrusive list per
-clock, and `running`. The CPU's clock event device runs one-shot,
+clock and `running` (Linux hrtimer_cpu_base->running). Each timer's
+expiry and clock (`HrTimer.node`, a `sync::LockedCell`: Linux
+node.expires / _softexpires and its clock base) are read and written
+only under the lock of the base it names; `pending` changes there and
+is also read without it. `run` sets `running` under `q`, drops it for
+the callback and clears it once it holds it again (Linux
+__run_hrtimer). The CPU's clock event device runs one-shot,
 programmed for the earliest expiry of both bases; the scheduler tick is
 a HARD hrtimer re-armed every TICK_NS.
 
@@ -3547,9 +3561,11 @@ a HARD hrtimer re-armed every TICK_NS.
   timer there unless its callback is running on the old one (Linux
   switch_hrtimer_base). `HrTimer.base` changes only under the old base's
   lock, and every locker rechecks it after locking (`lock_base`, Linux
-  lock_hrtimer_base). `cancel_sync` waits out a running
-  callback (spinning for HARD, sleeping on the `ktimers/N` wait queue
-  for SOFT); dropping an `HrTimer` does that.
+  lock_hrtimer_base). `cancel_sync` detaches and checks `running`
+  under the base lock (Linux hrtimer_try_to_cancel), then waits out a
+  running callback with it dropped and retries (spinning for HARD,
+  sleeping on the `ktimers/N` wait queue for SOFT); dropping an
+  `HrTimer` does that.
 - `HrBase.q` is a leaf: callbacks run with it dropped, and
   `reprogram` takes the two bases' locks one at a time.
 

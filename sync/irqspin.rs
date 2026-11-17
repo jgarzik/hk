@@ -60,6 +60,12 @@ impl<T> IrqSpinlock<T> {
         self.data.get_mut()
     }
 
+    /// `data` is this lock's data (a guard's borrow proves the lock is
+    /// held; this says which lock)
+    pub fn owns(&self, data: &T) -> bool {
+        core::ptr::eq(self.data.get().cast_const(), data)
+    }
+
     /// Acquire the lock, disabling interrupts and preemption
     ///
     /// This is equivalent to Linux's spin_lock_irqsave():

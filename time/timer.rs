@@ -26,9 +26,10 @@
 //! end, so the owner's last drop never finds it pending or running and
 //! only disarms, in any context (Linux neigh_destroy, sk_free).
 //!
-//! Locking: `TimerBase.wheel` is an IrqSpinlock leaf (only the wheel's
-//! lists and the timers' `expires`/`pending` under it); callbacks run
-//! with no timer lock held.
+//! Locking: `TimerBase.wheel` is an IrqSpinlock leaf over the wheel's
+//! lists, `running`/`runner`, and each armed timer's `pos` (expiry,
+//! bound, slot) and `pending` (read locklessly by `pending`, Linux
+//! timer_pending); callbacks run with no timer lock held.
 
 use crate::util::kalloc::box_nofail;
 use alloc::boxed::Box;
@@ -38,8 +39,8 @@ use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
+use crate::sync::{IrqSpinlock, LockedCell};
 use crate::task::percpu::{TICK_NS, get_ticks};
 use crate::util::list::{Link, List};
 
@@ -57,24 +58,33 @@ const WHEEL: usize = 64;
 /// Callbacks run per pass at most (a pass resumes at the next tick)
 const MAX_RUN: usize = 256;
 
+/// A timer's place on its wheel (Linux timer_list.expires and the
+/// wheel index in its flags)
+#[derive(Clone, Copy)]
+struct WheelPos {
+    /// Expiry in jiffies
+    expires: u64,
+    /// Not before this CLOCK_MONOTONIC ns (0: no bound; `mod_timer_ns`),
+    /// set with the expiry
+    not_before: u64,
+    /// Its slot while pending
+    slot: usize,
+}
+
 /// A timer (Linux struct timer_list)
 pub struct TimerList {
     link: Link,
-    /// Expiry in jiffies (under the base lock)
-    expires: AtomicU64,
-    /// Not before this CLOCK_MONOTONIC ns (0: no bound; `mod_timer_ns`);
-    /// set with the expiry under the base lock, read there by `run`
-    not_before: AtomicU64,
+    /// Owned by its base's wheel lock (`Wheel::pos`)
+    pos: LockedCell<WheelPos>,
     func: TimerFn,
     /// The callback's data (an owner pointer)
     data: AtomicUsize,
     flags: u8,
     /// The base it is armed on (set at its first arm, kept)
     base: AtomicPtr<TimerBase>,
-    /// On the wheel (under the base lock)
+    /// On the wheel: changed under the base lock, read without it
+    /// (`pending`, Linux timer_pending)
     pending: AtomicBool,
-    /// Its wheel slot while pending (under the base lock)
-    slot: AtomicUsize,
     _pin: PhantomPinned,
 }
 
@@ -85,14 +95,16 @@ impl TimerList {
     pub const fn new(func: TimerFn, flags: u8) -> Self {
         Self {
             link: Link::new(),
-            expires: AtomicU64::new(0),
-            not_before: AtomicU64::new(0),
+            pos: LockedCell::new(WheelPos {
+                expires: 0,
+                not_before: 0,
+                slot: 0,
+            }),
             func,
             data: AtomicUsize::new(0),
             flags,
             base: AtomicPtr::new(core::ptr::null_mut()),
             pending: AtomicBool::new(false),
-            slot: AtomicUsize::new(0),
             _pin: PhantomPinned,
         }
     }
@@ -154,7 +166,10 @@ impl TimerList {
     /// The CLOCK_MONOTONIC bound it was armed with (0: armed in
     /// jiffies or never armed); /proc/net/tcp shows the time left
     pub fn deadline_ns(&self) -> u64 {
-        self.not_before.load(Ordering::Relaxed)
+        match base_ref(self.base.load(Ordering::Acquire)) {
+            Some(base) => base.wheel.lock().pos(self).not_before,
+            None => 0,
+        }
     }
 
     /// Expiry and lower bound change together under the base lock, so
@@ -164,8 +179,7 @@ impl TimerList {
         let base = self.home();
         let mut w = base.wheel.lock();
         let was = w.detach(&self);
-        self.not_before.store(not_before, Ordering::Relaxed);
-        w.insert(&self, expires);
+        w.insert(&self, expires, not_before);
         was
     }
 
@@ -187,19 +201,22 @@ impl TimerList {
         let Some(base) = base_ref(self.base.load(Ordering::Acquire)) else {
             return false;
         };
-        let me = core::ptr::from_ref::<TimerList>(self).cast_mut();
+        let me = core::ptr::from_ref::<TimerList>(self).addr();
         let mut was = false;
+        // Linux timer_delete_sync: try_to_del_timer_sync under the base
+        // lock, then wait for the callback with the lock dropped
         loop {
-            was |= base.wheel.lock().detach(self);
-            if base.running.load(Ordering::Acquire) != me || base.runs_here() {
+            let mut w = base.wheel.lock();
+            was |= w.detach(self);
+            if w.running != me || w.runner == crate::task::percpu::current_tid() {
                 return was;
             }
+            drop(w);
             if self.flags & TIMER_HARD != 0 {
                 // Its callback runs in another CPU's tick, interrupts off
                 core::hint::spin_loop();
             } else {
-                base.wq
-                    .wait_event(|| base.running.load(Ordering::Acquire) != me);
+                base.wq.wait_event(|| base.wheel.lock().running != me);
             }
         }
     }
@@ -211,12 +228,19 @@ impl Drop for TimerList {
     }
 }
 
-/// One base's timers: `WHEEL` lists hashed by expiry jiffy
+/// One base's timers: `WHEEL` lists hashed by expiry jiffy, and the
+/// callback running (Linux struct timer_base under base->lock)
 struct Wheel {
     /// Allocated at CPU bring-up (`init_cpu`)
     slots: Option<Box<[List<TimerAdapter>; WHEEL]>>,
     /// The next jiffy to process
     clk: u64,
+    /// Address of the timer whose callback runs now, 0: none (Linux
+    /// running_timer); compared only, never dereferenced
+    running: usize,
+    /// The task running it (valid while `running` is set): a
+    /// `del_timer_sync` by that task is inside the callback
+    runner: u64,
 }
 
 impl Wheel {
@@ -225,14 +249,39 @@ impl Wheel {
         &mut s[i]
     }
 
-    /// Link `t` to fire at `expires` (an expiry already past goes in
-    /// the slot processed next)
-    fn insert(&mut self, t: &TimerList, expires: u64) {
-        t.expires.store(expires, Ordering::Relaxed);
-        let i = (expires.max(self.clk) % WHEEL as u64) as usize;
-        t.slot.store(i, Ordering::Relaxed);
+    /// `t`'s base is this wheel's (its `pos` is ours to touch)
+    fn owns(&self, t: &TimerList) -> bool {
+        base_ref(t.base.load(Ordering::Acquire)).is_some_and(|b| b.wheel.owns(self))
+    }
+
+    /// `t`'s place on this wheel (panics unless armed on it)
+    fn pos(&self, t: &TimerList) -> WheelPos {
+        assert!(self.owns(t), "timer: not on this base");
+        // SAFETY: `self` is the data of `t`'s base lock (checked), held
+        // by the guard it is borrowed from
+        unsafe { t.pos.get(self) }
+    }
+
+    fn set_pos(&mut self, t: &TimerList, p: WheelPos) {
+        assert!(self.owns(t), "timer: not on this base");
+        // SAFETY: as in `pos`, borrowed mutably
+        unsafe { t.pos.set(self, p) };
+    }
+
+    /// Link `t` to fire at `expires`, not before `not_before` (an
+    /// expiry already past goes in the slot processed next)
+    fn insert(&mut self, t: &TimerList, expires: u64, not_before: u64) {
+        let slot = (expires.max(self.clk) % WHEEL as u64) as usize;
+        self.set_pos(
+            t,
+            WheelPos {
+                expires,
+                not_before,
+                slot,
+            },
+        );
         // SAFETY: pinned (callers take Pin), unlinked first
-        unsafe { self.slot(i).push_back(t) };
+        unsafe { self.slot(slot).push_back(t) };
         t.pending.store(true, Ordering::Release);
     }
 
@@ -241,7 +290,7 @@ impl Wheel {
         if !t.pending.load(Ordering::Relaxed) {
             return false;
         }
-        let i = t.slot.load(Ordering::Relaxed);
+        let i = self.pos(t).slot;
         // SAFETY: a pending timer is on its recorded slot
         unsafe { self.slot(i).remove(t) };
         t.pending.store(false, Ordering::Release);
@@ -254,12 +303,7 @@ impl Wheel {
         self.slots.as_ref()?;
         let end = now.min(self.clk.saturating_add(WHEEL as u64 - 1));
         while self.clk <= end {
-            let i = (self.clk % WHEEL as u64) as usize;
-            let found = self
-                .slot(i)
-                .iter()
-                .find(|t| t.expires.load(Ordering::Relaxed) <= now)
-                .map(core::ptr::from_ref::<TimerList>);
+            let found = self.due_in((self.clk % WHEEL as u64) as usize, now);
             if found.is_some() {
                 return found;
             }
@@ -271,19 +315,23 @@ impl Wheel {
         None
     }
 
+    /// The first timer in slot `i` due by `now`
+    fn due_in(&self, i: usize, now: u64) -> Option<*const TimerList> {
+        let s = self.slots.as_ref()?;
+        s[i].iter()
+            .find(|t| self.pos(t).expires <= now)
+            .map(core::ptr::from_ref::<TimerList>)
+    }
+
     /// Some timer is due by `now` (without moving `clk`)
-    fn any_due(&mut self, now: u64) -> bool {
-        let Some(s) = self.slots.as_ref() else {
-            return false;
-        };
+    fn any_due(&self, now: u64) -> bool {
         let n = now
             .saturating_sub(self.clk)
             .saturating_add(1)
             .min(WHEEL as u64);
         (0..n).any(|k| {
-            s[((self.clk + k) % WHEEL as u64) as usize]
-                .iter()
-                .any(|t| t.expires.load(Ordering::Relaxed) <= now)
+            self.due_in(((self.clk + k) % WHEEL as u64) as usize, now)
+                .is_some()
         })
     }
 }
@@ -291,11 +339,6 @@ impl Wheel {
 /// A CPU's timers of one kind (Linux struct timer_base)
 pub struct TimerBase {
     wheel: IrqSpinlock<Wheel>,
-    /// The timer whose callback runs now (Linux running_timer)
-    running: AtomicPtr<TimerList>,
-    /// The task running it (valid while `running` is set): a
-    /// `del_timer_sync` by that task is inside the callback
-    runner: AtomicU64,
     /// SOFT: `ktimers/N` waits here for due timers, `del_timer_sync`
     /// for a callback to end
     wq: WaitQueue,
@@ -307,16 +350,11 @@ impl TimerBase {
             wheel: IrqSpinlock::new(Wheel {
                 slots: None,
                 clk: 0,
+                running: 0,
+                runner: 0,
             }),
-            running: AtomicPtr::new(core::ptr::null_mut()),
-            runner: AtomicU64::new(0),
             wq: WaitQueue::new(),
         }
-    }
-
-    /// The running callback is the caller's (its owner dropped in it)
-    fn runs_here(&self) -> bool {
-        self.runner.load(Ordering::Relaxed) == crate::task::percpu::current_tid()
     }
 
     fn ready(&self) -> bool {
@@ -331,20 +369,22 @@ impl TimerBase {
             // SAFETY: a pending timer is live (its drop unlinks it)
             let t = unsafe { &*p };
             w.detach(t);
-            let nb = t.not_before.load(Ordering::Relaxed);
+            let nb = w.pos(t).not_before;
             if nb != 0 && crate::time::monotonic_ns() < nb {
                 // The tick ran ahead of the clock: next jiffy
-                w.insert(t, now + 1);
+                w.insert(t, now + 1, nb);
                 continue;
             }
-            self.runner
-                .store(crate::task::percpu::current_tid(), Ordering::Relaxed);
-            self.running.store(p.cast_mut(), Ordering::Release);
+            // Linux __run_timers / expire_timers: running_timer set
+            // under the lock, the lock dropped for the callback, cleared
+            // once it is taken again
+            w.running = p.addr();
+            w.runner = crate::task::percpu::current_tid();
             drop(w);
             // `t` may be freed by its callback: not touched after it
             (t.func)(t);
-            self.running.store(core::ptr::null_mut(), Ordering::Release);
             w = self.wheel.lock();
+            w.running = 0;
         }
     }
 }
@@ -461,7 +501,7 @@ pub fn start_ktimers() {
 /// sk_free only disarm): it runs at the owner's last drop, and a pending
 /// arm or a running callback still holds a reference until the base no
 /// longer touches the timer (`arc_timer_fire` reads nothing of it after
-/// the callback, the base only clears `running`, a pointer it never
+/// the callback, the base only clears `running`, an address it never
 /// dereferences). So the owner may go anywhere, e.g. in `rcuc/N` after
 /// `kfree_rcu`.
 ///
