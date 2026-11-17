@@ -367,8 +367,8 @@ fn copy_fpstate_to_sigframe(buf: u64) -> KernelResult<()> {
     let efault = |_| KernelError::BadAddress;
     if fpu::use_xsave() {
         // The header first, so its reserved fields are zero
-        let (hdr, len) = fpu::xsave_header();
-        copy_to_user(buf + hdr as u64, &[0u8; 64][..len]).map_err(efault)?;
+        let hdr = buf + fpu::XSAVE_HDR as u64;
+        copy_to_user(hdr, &[0u8; fpu::XSAVE_HDR_SIZE]).map_err(efault)?;
     }
     while !fpu::save_to_user(buf) {
         let size = fpu::sigframe_size();
@@ -376,15 +376,14 @@ fn copy_fpstate_to_sigframe(buf: u64) -> KernelResult<()> {
             return Err(KernelError::BadAddress);
         }
     }
-    let (off, sw) = fpu::sw_bytes();
-    copy_to_user(buf + off as u64, &sw).map_err(efault)?;
+    let sw = fpu::sw_bytes();
+    copy_to_user(buf + fpu::FXSAVE_SW_BYTES as u64, &sw).map_err(efault)?;
     if !fpu::use_xsave() {
         return Ok(());
     }
     let size = fpu::xstate_size() as u64;
     put_user(buf + size, fpu::FP_XSTATE_MAGIC2).map_err(efault)?;
-    let (hdr, _) = fpu::xsave_header();
-    let bv = buf + hdr as u64;
+    let bv = buf + fpu::XSAVE_HDR as u64;
     let x: u32 = get_user(bv).map_err(efault)?;
     put_user(bv, x | fpu::XFEATURE_MASK_FPSSE).map_err(efault)
 }
@@ -463,17 +462,15 @@ fn fpu_restore_sig(buf: u64) -> bool {
 /// be read.
 fn check_xstate_in_sigframe(buf: u64) -> Option<(u64, bool)> {
     use super::fpu;
-    let (off, _) = fpu::sw_bytes();
     // magic1, extended_size, xfeatures, xstate_size
     let mut sw = [0u8; 20];
-    copy_from_user(&mut sw, buf + off as u64, 20).ok()?;
+    copy_from_user(&mut sw, buf + fpu::FXSAVE_SW_BYTES as u64, 20).ok()?;
     let word = |i: usize| u32::from_le_bytes([sw[i], sw[i + 1], sw[i + 2], sw[i + 3]]);
     let (magic1, extended, size) = (word(0), word(4), word(16));
     let features = u64::from(word(8)) | u64::from(word(12)) << 32;
     let fx_only = Some((u64::from(fpu::XFEATURE_MASK_FPSSE), true));
     // The legacy region and the XSAVE header at least
-    let (hdr, hdr_len) = fpu::xsave_header();
-    let min = (hdr + hdr_len) as u32;
+    let min = (fpu::XSAVE_HDR + fpu::XSAVE_HDR_SIZE) as u32;
     let max = fpu::xstate_size() as u32;
     if magic1 != fpu::FP_XSTATE_MAGIC1 || size < min || size > max || size > extended {
         return fx_only;

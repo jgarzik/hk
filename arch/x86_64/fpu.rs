@@ -42,10 +42,10 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 /// Offsets in the legacy (FXSAVE) region
 const FXSAVE_MXCSR: usize = 24;
 /// Software-reserved bytes 464..512 hold `struct _fpx_sw_bytes` in signal frames
-const FXSAVE_SW_BYTES: usize = 464;
+pub const FXSAVE_SW_BYTES: usize = 464;
 /// XSAVE header (XSTATE_BV, XCOMP_BV, reserved) follows the legacy region
-const XSAVE_HDR: usize = 512;
-const XSAVE_HDR_SIZE: usize = 64;
+pub const XSAVE_HDR: usize = 512;
+pub const XSAVE_HDR_SIZE: usize = 64;
 
 /// Linux signal-frame magic numbers (arch/x86/include/uapi/asm/sigcontext.h)
 pub const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
@@ -318,16 +318,10 @@ pub fn restore_from_user(buf: u64, xrestore: u64, fx_only: bool) -> Result<(), u
     Ok(())
 }
 
-/// The XSAVE header's offset in an image, cleared before an XSAVE to
-/// the user frame (Linux: so its reserved fields are zero)
-pub const fn xsave_header() -> (usize, usize) {
-    (XSAVE_HDR, XSAVE_HDR_SIZE)
-}
-
-/// Linux `_fpx_sw_bytes` of a signal frame's image, at its offset:
-/// FP_XSTATE_MAGIC1, extended size, features and image size with XSAVE
-/// (Linux save_sw_bytes); zero for an FXSAVE frame
-pub fn sw_bytes() -> (usize, [u8; XSAVE_HDR - FXSAVE_SW_BYTES]) {
+/// Linux `_fpx_sw_bytes` of a signal frame's image (at
+/// `FXSAVE_SW_BYTES`): FP_XSTATE_MAGIC1, extended size, features and
+/// image size with XSAVE (Linux save_sw_bytes); zero for an FXSAVE frame
+pub fn sw_bytes() -> [u8; XSAVE_HDR - FXSAVE_SW_BYTES] {
     let mut sw = [0u8; XSAVE_HDR - FXSAVE_SW_BYTES];
     if use_xsave() {
         let size = xstate_size();
@@ -337,7 +331,7 @@ pub fn sw_bytes() -> (usize, [u8; XSAVE_HDR - FXSAVE_SW_BYTES]) {
         sw[8..16].copy_from_slice(&xfeatures().to_le_bytes());
         sw[16..20].copy_from_slice(&(size as u32).to_le_bytes());
     }
-    (FXSAVE_SW_BYTES, sw)
+    sw
 }
 
 /// x87 | SSE in XSTATE_BV, always set in a signal frame's image (Linux
