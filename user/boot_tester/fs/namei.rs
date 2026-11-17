@@ -16,6 +16,7 @@ use hk_syscall::{
 
 const ENOENT: i64 = -2;
 const EAGAIN: i64 = -11;
+const EXDEV: i64 = -18;
 const EBADF: i64 = -9;
 const EBUSY: i64 = -16;
 const EEXIST: i64 = -17;
@@ -40,6 +41,7 @@ pub fn run_tests() {
     report_r(b"CREAT_DANGLING_LINK", creat_dangling());
     report_r(b"CREAT_LAST_NAME", creat_last());
     report_r(b"CREAT_LINK_COUNT", creat_links());
+    report_r(b"CREAT_RESOLVE_SCOPED", creat_scoped());
     report_r(b"NEG_DENTRY_CREATE", negative());
     report_r(b"DOTDOT_DISCONNECTED", disconnected());
     report_r(b"LINK_STACK_UNLAZY", link_stack());
@@ -653,4 +655,80 @@ fn cc_unchain(n: usize) {
     for i in 0..n {
         sys_unlink(numbered(&mut lb, b"/tmp/cc/t", i, b"").as_ptr());
     }
+}
+
+/// openat2 of `p` from `dfd` with `flags` (mode 0644) and `resolve`:
+/// the errno, or 0 (the file closed)
+fn open2_err(dfd: i32, p: &[u8], flags: u32, resolve: u64) -> i64 {
+    let mut how = [0u8; 24];
+    how[..8].copy_from_slice(&u64::from(flags).to_ne_bytes());
+    how[8..16].copy_from_slice(&0o644u64.to_ne_bytes());
+    how[16..].copy_from_slice(&resolve.to_ne_bytes());
+    let fd = sys_openat2(dfd, p.as_ptr(), how.as_ptr(), how.len());
+    if fd >= 0 {
+        sys_close(fd as u64);
+        return 0;
+    }
+    fd
+}
+
+/// An O_CREAT open scoped to its dirfd (Linux: the walk keeps the scope,
+/// handle_dots and nd_jump_root under LOOKUP_IS_SCOPED; do_open skips
+/// complete_walk for a made file): RESOLVE_BENEATH through "..", an
+/// absolute symlink or a symlink with ".." in it is EXDEV and makes
+/// nothing; RESOLVE_IN_ROOT makes the file inside the root
+fn creat_scoped() -> R {
+    const BENEATH: u64 = 0x08;
+    const IN_ROOT: u64 = 0x10;
+    sys_mkdir(b"/tmp/cs\0".as_ptr(), 0o755);
+    sys_mkdir(b"/tmp/cs/d\0".as_ptr(), 0o755);
+    let links: [(&[u8], &[u8]); 3] = [
+        (b"/tmp/cs/o2\0", b"/tmp/cs/d/abs\0"),
+        (b"../o3\0", b"/tmp/cs/d/up\0"),
+        (b"/n2\0", b"/tmp/cs/d/root\0"),
+    ];
+    for (t, l) in links {
+        sys_symlink(t.as_ptr(), l.as_ptr());
+    }
+    let dfd = sys_open(b"/tmp/cs/d\0".as_ptr(), O_DIRECTORY | O_RDONLY, 0);
+    let r = (|| {
+        if dfd < 0 {
+            return Err((&b"dirfd"[..], dfd));
+        }
+        let (d, c) = (dfd as i32, O_CREAT | O_WRONLY);
+        let mut st = Stat::default();
+        want(b"beneath ..", open2_err(d, b"../o1\0", c, BENEATH), EXDEV)?;
+        want(b"beneath abs", open2_err(d, b"abs\0", c, BENEATH), EXDEV)?;
+        want(b"beneath up", open2_err(d, b"up\0", c, BENEATH), EXDEV)?;
+        for p in [&b"/tmp/cs/o1\0"[..], b"/tmp/cs/o2\0", b"/tmp/cs/o3\0"] {
+            want(b"nothing made", sys_lstat(p.as_ptr(), &mut st), ENOENT)?;
+        }
+        want(b"in root ..", open2_err(d, b"../n1\0", c, IN_ROOT), 0)?;
+        want(b"in root abs", open2_err(d, b"root\0", c, IN_ROOT), 0)?;
+        want(b"in root up", open2_err(d, b"up\0", c, IN_ROOT), 0)?;
+        for p in [&b"/tmp/cs/d/n1\0"[..], b"/tmp/cs/d/n2\0", b"/tmp/cs/d/o3\0"] {
+            want(b"made inside", sys_lstat(p.as_ptr(), &mut st), 0)?;
+        }
+        let r = sys_lstat(b"/tmp/cs/o3\0".as_ptr(), &mut st);
+        want(b"none outside", r, ENOENT)
+    })();
+    if dfd >= 0 {
+        sys_close(dfd as u64);
+    }
+    for (_, l) in links {
+        sys_unlink(l.as_ptr());
+    }
+    for p in [
+        &b"/tmp/cs/o1\0"[..],
+        b"/tmp/cs/o2\0",
+        b"/tmp/cs/o3\0",
+        b"/tmp/cs/d/n1\0",
+        b"/tmp/cs/d/n2\0",
+        b"/tmp/cs/d/o3\0",
+    ] {
+        sys_unlink(p.as_ptr());
+    }
+    sys_rmdir(b"/tmp/cs/d\0".as_ptr());
+    sys_rmdir(b"/tmp/cs\0".as_ptr());
+    r
 }
