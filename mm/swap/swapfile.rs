@@ -15,11 +15,10 @@
 //! spin `RwLock`, read mostly; Linux swap_lock and swap_info[]) holds
 //! the devices and the types in use: swapon reserves a type under it
 //! first (alloc_swap_info), sets the area up under its file's i_rwsem
-//! and publishes it under `SWAPON` (a sleeping `Mutex`, swapon_mutex:
-//! enable_swap_info); swapoff takes SWP_WRITEOK away under it, empties
-//! the device with neither held, and takes it out of the table under
-//! `SWAPON`, so swapons and swapoffs of different areas run in
-//! parallel.
+//! and publishes it under it (enable_swap_info); swapoff takes
+//! SWP_WRITEOK away under it, empties the device with no swap lock
+//! held, and takes it out of the table under it, so swapons and
+//! swapoffs of different areas run in parallel.
 //!
 //! Lifetime (Linux si->users, get_swap_device / put_swap_device): every
 //! use of a device by swap entry or type holds a [`SwapDev`], one count
@@ -144,15 +143,12 @@ pub static SWAP_INFO: RwLock<SwapTable> = RwLock::new(SwapTable {
     used: 0,
 });
 
-/// Usable slots of every device (Linux total_swap_pages)
+/// Usable slots of every device taking new ones (Linux
+/// total_swap_pages): changed under `SWAP_INFO` with SWP_WRITEOK
 pub static TOTAL_SWAP_PAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Slots in use (counted or cached)
 pub static TOTAL_SWAP_USED: AtomicU64 = AtomicU64::new(0);
-
-/// A device entering or leaving the table (Linux swapon_mutex:
-/// enable_swap_info, swapoff's teardown); under a swap file's i_rwsem
-static SWAPON: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 /// A swap type swapon reserved (Linux alloc_swap_info: SWP_USED under
 /// swap_lock), given back on drop (Linux bad_swap: flags = 0 under
@@ -716,8 +712,8 @@ fn generic_swapfile_activate(
 /// S_SWAPFILE is set before its writes are drained, so no write or
 /// truncate of the file runs from the mapping to the swap's end. The
 /// type is reserved first (Linux alloc_swap_info), the area published
-/// under `SWAPON` inside the i_rwsem (enable_swap_info). Unknown flags
-/// are EINVAL before anything else.
+/// under `SWAP_INFO` inside the i_rwsem (enable_swap_info). Unknown
+/// flags are EINVAL before anything else.
 pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
     if swap_flags & !SWAP_FLAGS_VALID != 0 {
         return Err(KernelError::InvalidArgument);
@@ -813,11 +809,13 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         drop(si);
         return Err(e);
     }
-    // Linux enable_swap_info, under swapon_mutex
-    let g = SWAPON.lock();
-    SWAP_INFO.write().dev[swap_type as usize] = Some(si);
-    TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
-    drop(g);
+    // Linux enable_swap_info: listed, SWP_WRITEOK, its slots counted,
+    // under swap_lock
+    {
+        let mut t = SWAP_INFO.write();
+        t.dev[swap_type as usize] = Some(si);
+        TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
+    }
     ty.keep();
     drop(lock);
     Ok(())
@@ -831,9 +829,10 @@ fn inode_drain_writes(inode: &Inode) -> KernelResult<()> {
 }
 
 /// The enabled device whose swap file (or device inode) is `inode`,
-/// SWP_WRITEOK taken from it so no other swapoff finds it (Linux
-/// swapoff under swap_lock: p->swap_file->f_mapping == mapping among
-/// the SWP_WRITEOK areas, then del_from_avail_list under si->lock)
+/// SWP_WRITEOK taken from it so no other swapoff finds it and its
+/// slots no longer counted in the total (Linux swapoff under
+/// swap_lock: p->swap_file->f_mapping == mapping among the SWP_WRITEOK
+/// areas, then del_from_avail_list and total_swap_pages -= p->pages)
 fn swapoff_find(inode: &Inode) -> Option<Arc<SwapInfo>> {
     let tbl = SWAP_INFO.write();
     let si = tbl
@@ -842,7 +841,17 @@ fn swapoff_find(inode: &Inode) -> Option<Arc<SwapInfo>> {
         .flatten()
         .find(|si| si.writeok() && core::ptr::eq(si.swapfile_inode(), inode))?;
     si.set_writeok(false);
+    TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     Some(si.clone())
+}
+
+/// A swapoff that failed gives its device back (Linux
+/// reinsert_swap_info: SWP_WRITEOK and its slots in the total again,
+/// under swap_lock)
+fn reinsert_swap_info(si: &SwapInfo) {
+    let _tbl = SWAP_INFO.write();
+    si.set_writeok(true);
+    TOTAL_SWAP_PAGES.fetch_add(si.max - 1, Ordering::Relaxed);
 }
 
 /// swapoff(2): bring every page of a swap area back into memory and
@@ -863,9 +872,7 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     let si = swapoff_find(&victim).ok_or(KernelError::InvalidArgument)?;
     let t = si.swap_type;
     if let Err(e) = super::swap_state::try_to_unuse(&si) {
-        // Linux reinsert_swap_info, under swap_lock
-        let _tbl = SWAP_INFO.write();
-        si.set_writeok(true);
+        reinsert_swap_info(&si);
         return Err(e);
     }
     // Wait for every use of the device to end (Linux percpu_ref_kill,
@@ -874,15 +881,11 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     // device is released here, in process context
     si.users.kill();
     si.users.wait();
-    let table = {
-        let _g = SWAPON.lock();
-        SWAP_INFO.write().dev[t as usize].take()
-    };
+    let table = SWAP_INFO.write().dev[t as usize].take();
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
     si_inode.set_swapfile(false);
     drop(lock);
-    TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);
     drop(table);
     debug_assert_eq!(
@@ -896,18 +899,34 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     Ok(())
 }
 
+/// Free slots of the devices taking new ones, less the slots a
+/// swapoff's device still holds (Linux nr_swap_pages: below zero while
+/// those outnumber the rest's free ones)
+fn nr_swap_pages() -> i64 {
+    TOTAL_SWAP_PAGES.load(Ordering::Relaxed) as i64 - TOTAL_SWAP_USED.load(Ordering::Relaxed) as i64
+}
+
 /// Over half of swap is in use (Linux vm_swap_full): a page read back
 /// gives its slot up at once rather than keep a clean copy
 pub fn swap_full() -> bool {
-    let (total, free) = swap_totals();
-    free * 2 < total
+    nr_swap_pages() * 2 < TOTAL_SWAP_PAGES.load(Ordering::Relaxed) as i64
 }
 
-/// Swap totals in pages: (total, free) (meminfo, sysinfo)
+/// Swap totals in pages: (total, free) (Linux si_swapinfo: meminfo,
+/// sysinfo): a swapoff's device counts its slots still in use in both
 pub fn swap_totals() -> (u64, u64) {
-    let total = TOTAL_SWAP_PAGES.load(Ordering::Relaxed);
-    let used = TOTAL_SWAP_USED.load(Ordering::Relaxed);
-    (total, total.saturating_sub(used))
+    let tbl = SWAP_INFO.read();
+    let unused: u64 = tbl
+        .dev
+        .iter()
+        .flatten()
+        .filter(|si| !si.writeok())
+        .map(|si| si.inuse.load(Ordering::Relaxed))
+        .sum();
+    let total = TOTAL_SWAP_PAGES.load(Ordering::Relaxed) + unused;
+    let free = (nr_swap_pages() + unused as i64).max(0) as u64;
+    drop(tbl);
+    (total, free)
 }
 
 #[cfg(test)]

@@ -291,7 +291,7 @@ subsys}`; `Mutex`:
 `SuperBlock.s_vfs_rename_mutex`, `File.f_pos_lock`,
 `SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex),
 `UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`,
-`VdDisk.vdev`, `SWAPON`,
+`VdDisk.vdev`,
 `Pipe.inner` (Linux pipe->mutex), `Eventpoll.mtx` (Linux ep->mtx) and
 the inotify and fanotify `mark_mutex` (Linux group->mark_mutex).
 The socket owner lock `net::sock_lock::SockLock` (Linux socket_lock_t:
@@ -2284,24 +2284,28 @@ pub struct Zone {
   (`SwapTable.used`, Linux SWP_USED). swapon reserves the lowest free
   type under it before it opens anything (EPERM if none; Linux
   alloc_swap_info) and gives it back, after releasing what it opened,
-  if it fails; swapoff finds its device among the SWP_WRITEOK ones and
-  clears SWP_WRITEOK under it (so a second swapoff of the area is
-  EINVAL), sets it again there if `try_to_unuse` fails (Linux
-  reinsert_swap_info), and frees the type last, after the device's
-  release: `SWAP_INFO` -> `SwapInfo.map`. Nothing sleeps under it.
-- `SWAPON` (sleeping `Mutex`, Linux swapon_mutex): held only while a
-  device enters the table (swapon's enable_swap_info, under the
-  `i_rwsem` below) and while swapoff takes it out (after its users
-  are drained, with nothing else held): `i_rwsem` -> `SWAPON` ->
-  `SWAP_INFO`. Swapons and swapoffs of different areas otherwise run
-  in parallel, `try_to_unuse` included.
+  if it fails; swapon publishes the device under it (Linux
+  enable_swap_info), swapoff finds its device among the SWP_WRITEOK
+  ones and clears SWP_WRITEOK under it (so a second swapoff of the
+  area is EINVAL), sets it again there if `try_to_unuse` fails (Linux
+  reinsert_swap_info), takes the device out of the table under it
+  once drained, and frees the type last, after the device's release:
+  `SWAP_INFO` -> `SwapInfo.map`. `TOTAL_SWAP_PAGES` (Linux
+  total_swap_pages) changes under it with SWP_WRITEOK (swapon's
+  publication, swapoff's clear and reinsert); `swap_totals` (Linux
+  si_swapinfo) reads it and the draining devices' in-use slots under
+  it. Nothing sleeps under it. Swapons and swapoffs of different
+  areas run in parallel, `try_to_unuse` included. There is no
+  swapon_mutex: Linux takes it to serialize enable_swap_info and
+  swapoff's removal (both under `SWAP_INFO` here) with /proc/swaps'
+  walk, whose show sleeps; hk has no /proc/swaps.
 - swapon holds the mapping host's `i_rwsem` (the swap file's inode,
   or the device's bdev inode; Linux swapon's inode_lock) from the
   IS_SWAPFILE check (EBUSY, whatever path names the file) through the
   header's read (page cache), the extents' mapping, S_SWAPFILE and the
   write-back that follows it (inode_drain_writes) to the area's
   publication: `i_rwsem` -> invalidate_lock -> page and buffer locks
-  (the header read, ->bmap's FAT reads), `i_rwsem` -> `SWAPON`.
+  (the header read, ->bmap's FAT reads), `i_rwsem` -> `SWAP_INFO`.
   swapoff (`try_to_unuse`), no swap lock held, walks `MMLIST` and
   faults the device's swap PTEs of each address space in, its
   mmap_lock held for reading; then it clears S_SWAPFILE under the
@@ -2311,11 +2315,11 @@ pub struct Zone {
   get_swap_device / put_swap_device), taken under `SWAP_INFO` read
   (tryget, refused once killed) and put anywhere, PTE lock included.
   swapoff, its device empty, kills and waits for it with nothing
-  held, then takes the device out of `SWAP_INFO` (under `SWAPON`)
-  and drops the last `Arc` itself: the release (block device close
-  under `Disk.open_mutex`, sync, page-cache invalidate; a swap file's
-  iput) sleeps, so it runs only there (`SwapInfo` drop asserts
-  might_sleep). No `SwapDev` is held while waiting on `SWAPON`.
+  held, then takes the device out of `SWAP_INFO` and drops the last
+  `Arc` itself: the release (block device close under
+  `Disk.open_mutex`, sync, page-cache invalidate; a swap file's iput)
+  sleeps, so it runs only there (`SwapInfo` drop asserts
+  might_sleep).
 - `MMLIST` (`spin::Mutex` leaf, mm/mod.rs; Linux init_mm.mmlist under
   mmlist_lock): an `OwnedList` of the address spaces that may hold
   swap entries, one `Arc<Mm>` each. An mm is linked the first time it
@@ -6075,7 +6079,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `Inode.i_flags` | fs/inode.rs | atomic word (fetch_or / fetch_and: bits of different writers share it, Linux inode_set_flags' cmpxchg) | S_DEAD (set by rmdir or a replacing rename under the directory's `i_rwsem`), S_SWAPFILE (set and cleared by swapon/swapoff), I_LINKABLE (an O_TMPFILE file not opened O_EXCL may get its first name, Linux i_state under i_lock: set before the file is reachable, tested and cleared by linkat under the inode's `i_rwsem`, `link_locked`); read lock-free |
 | `Inode.i_writecount`, `Inode.i_flags` S_SWAPFILE | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: tested, set and cleared by swapon/swapoff
-under its i_rwsem, i_rwsem -> `SWAPON`, and checked under it by
+under its i_rwsem, i_rwsem -> `SWAP_INFO`, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
 | `BdiWriteback.pass` | mm/writeback.rs, fs/pageio/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, a superblock's shutdown and vfat's remount (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step; an inode's metadata is written under it after its pages (`__writeback_single_inode` -> ->write_inode: pass -> the device's page cache (vfat's entry block, bread) -> vfat `VfatSbData.ipos` (spin); a sync(2)/syncfs pass is for_sync, so no ->sync_inode_metadata under it), a data-integrity pass sleeps under it on an inode another writer has (I_SYNC: that writer takes no `pass`), and an inode's last reference may go under it (eviction, which may write that inode back first). fsync and the write-back before an eviction write an inode without it (`writeback_single_inode`), under I_SYNC |
 | `BdiWriteback.list_lock` | mm/writeback.rs, fs/pageio/fs_writeback.rs | spin Mutex, a leaf but for an inode's `i_lock` (Linux wb->list_lock -> i_lock) | Linux wb->list_lock: the disk's dirty inodes, `b_dirty` (oldest first), `b_io` (the running pass's) and `b_more_io` (left for the next pass), `InodeList`s through `Inode.i_io_list` holding no reference (Linux), `Inode.i_io_on` (which list it is on) and `Inode.dirtied_when` (Linux dirtied_when: written under it and the inode's `i_lock` as it is queued or requeued, read under it by a pass's expiry test). An inode's dirty state is its `i_state` bits (Linux I_DIRTY_SYNC, I_DIRTY_DATASYNC, I_DIRTY_PAGES; I_SYNC, I_SYNC_QUEUED; I_METADATA_WRITEBACK, set by ->write_inode and cleared by a WB_SYNC_ALL write, not for sync, before it calls ->sync_inode_metadata with no lock held), written under `i_lock` only. `__mark_inode_dirty` (every page dirtying through the mapping's `host`, `filemap::dirty_page`, Linux __folio_mark_dirty; the filesystems' metadata) tests the bits lock-free after a full fence (Linux smp_mb, paired with the one `__writeback_single_inode` puts between clearing them and testing the cache's DIRTY mark: either side sees the other), sets them under `i_lock` and, for an inode going from clean to dirty, drops `i_lock`, takes `list_lock` then `i_lock` (Linux locked_inode_to_wb_and_lock_list) and queues it at `b_dirty`'s tail unless a pass has it (I_SYNC_QUEUED) or it is I_FREEING, then arms the periodic work after unlocking if the lists were empty; under a page lock at most. A pass moves the expired inodes (of one superblock for a sync) to `b_io` in one hold, marking each I_SYNC_QUEUED under its `i_lock` (Linux queue_io), then per inode, under `list_lock` and its `i_lock`: one of another superblock or being freed back to `b_dirty` (Linux redirty_tail_locked; I_FREEING off the lists), one another writer has (I_SYNC) to `b_more_io` or, for a data-integrity pass, slept on with `i_lock` only (the eviction, which takes the inode off `b_io` under `list_lock` then `i_lock`, waits for it, so the inode stays live); else it sets I_SYNC and takes a reference (`Inode::__iget`: not I_FREEING/I_WILL_FREE under `i_lock`, so the count is above zero), unlocks, writes it, then under both locks requeues it by its state (Linux requeue_inode) and clears I_SYNC, waking its waiters under `i_lock` (Linux inode_sync_complete), and drops it with no lock held (its last reference may evict it). `writeback_single_inode` (fsync, sync_inode_metadata, the write-back before an eviction) sets I_SYNC under `i_lock` (waiting for a writer already at it, for WB_SYNC_ALL), writes, then under both locks takes a clean inode off the lists or puts a dirty one back on `b_dirty` unless a pass has it. An inode's eviction takes it off its list under the lock and its `i_lock` (`inode_io_list_del`, Linux evict), before any field goes, so a linked entry is a live value. The mapping's `host` is the inode whose `i_data` it is (Linux mapping->host, a plain pointer): page dirtying grabs it (`Inode::igrab`, failing once its last reference went, as Linux skips an I_FREEING inode) |
