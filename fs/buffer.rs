@@ -749,8 +749,11 @@ fn mmb_set_error(bh: &BufferHead) {
     // waits a grace period (`Drop for MappingMetadataBhs`), and this
     // read is inside an RCU read section
     if let Some(mmb) = unsafe { mmb.as_ref() } {
-        // SAFETY: the list's mapping outlives it (`MappingMetadataBhs::new`)
-        unsafe { &*mmb.mapping }.wb_err.set(KernelError::Io);
+        // SAFETY: the mapping's memory stays allocated while a buffer is
+        // on the list and a grace period after (`MappingMetadataBhs::new`),
+        // and this is inside an RCU read section; `ErrSeq` has no drop
+        // glue, so it is a valid atomic even after the mapping dropped
+        unsafe { &*mmb.wb_err }.set(KernelError::Io);
         crate::fs::superblock::sb_wb_err_set(&mmb.sb, KernelError::Io);
     }
 }
@@ -1990,8 +1993,10 @@ unsafe fn assoc_bh<'a>(l: *mut AssocLink) -> &'a BufferHead {
 pub struct MappingMetadataBhs {
     lock: crate::sync::spin::Mutex<()>,
     list: AssocHead,
-    /// The mapping whose fsync writes them (Linux mmb->mapping)
-    mapping: *const AddressSpace,
+    /// The `wb_err` of the mapping whose fsync writes them, where a write
+    /// error goes (Linux mmb->mapping's): the only part of the mapping
+    /// a completion touches, valid after the mapping's drop (`new`)
+    wb_err: *const crate::util::errseq::ErrSeq,
     /// Its inode's superblock, for a write error's `s_wb_err` from a
     /// completion (Linux mmb->mapping->host->i_sb): kept until the
     /// list's drop has waited out every reader
@@ -2000,8 +2005,8 @@ pub struct MappingMetadataBhs {
     used: core::sync::atomic::AtomicBool,
 }
 
-// SAFETY: the links are atomics changed only under `lock`; `mapping`
-// is a shared borrow of a Sync value that outlives it (`new`)
+// SAFETY: the links are atomics changed only under `lock`; `wb_err`
+// is an atomic (Sync) read only while its memory is allocated (`new`)
 unsafe impl Send for MappingMetadataBhs {}
 // SAFETY: as above
 unsafe impl Sync for MappingMetadataBhs {}
@@ -2010,14 +2015,20 @@ impl MappingMetadataBhs {
     /// An empty list for `mapping` (Linux mmb_init)
     ///
     /// # Safety
-    /// `mapping` outlives the list (it is the inode's own, the list in
-    /// the inode).
+    /// `mapping`'s memory stays allocated, its value dropped or not,
+    /// while a buffer is on the list and a grace period after the list
+    /// was emptied (Linux: the list and the mapping are in one inode,
+    /// freed by RCU; hk drops an inode's `i_data` at its teardown, but
+    /// frees its memory, and so the list in its RCU data, a grace period
+    /// later).
     pub unsafe fn new(mapping: &AddressSpace) -> Self {
+        // A dropped mapping's `wb_err` is still a valid atomic
+        const { assert!(!core::mem::needs_drop::<crate::util::errseq::ErrSeq>()) };
         let sb = mapping.host_sb().unwrap_or_default();
         Self {
             lock: crate::sync::spin::Mutex::new(()),
             list: AssocHead::new(),
-            mapping,
+            wb_err: &raw const mapping.wb_err,
             sb,
             used: core::sync::atomic::AtomicBool::new(false),
         }

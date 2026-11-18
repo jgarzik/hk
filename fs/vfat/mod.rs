@@ -932,8 +932,10 @@ impl AsAny for VfatInode {
 /// mmb_init on its i_data)
 fn new_private(inode: &Inode, d: VfatInodeData) -> Result<Arc<VfatInode>, KernelError> {
     inode.set_private_rcu(try_arc(VfatInodeRcu {
-        // SAFETY: the list goes in `inode`'s RCU data, dropped with its
-        // memory (`i_callback`), so the mapping's memory outlives it
+        // SAFETY: the list goes in `inode`'s RCU data, dropped by
+        // `i_callback` just before the inode's memory (`i_data`'s) is
+        // freed, a grace period after the eviction emptied the list
+        // (`evict_inode`), with no buffer added since
         i_metadata_bhs: unsafe { MappingMetadataBhs::new(&inode.i_data) },
     })?);
     try_arc(VfatInode {

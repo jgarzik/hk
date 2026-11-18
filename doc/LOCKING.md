@@ -2755,8 +2755,12 @@ clean_bdev_aliases: page lock -> buffer lock.)
   pages (truncation's discard_buffer) before it drops `i_data` and
   then its superblock `Weak`, which keeps the superblock's memory
   (`s_wb_err` has no drop glue). A list's (`MappingMetadataBhs`)
-  mapping and superblock likewise: its drop empties it, then waits a
-  grace period before its `Weak` goes.
+  mapping and superblock likewise, under the RCU read guard: its drop
+  empties it, then waits a grace period before its `Weak` goes, and of
+  its mapping only `wb_err` (no drop glue) is touched, valid while the
+  mapping's memory is (an inode's `i_data` drops at its teardown, but
+  its memory, and a vfat inode's list with it, goes a grace period
+  after the eviction emptied the list).
 - `mark_buffer_dirty` never sleeps: the page's mapping is reached under
   an RCU read guard (`filemap::folio_mapping`: a mapping is part of an
   inode freed by RCU) for its count and DIRTY mark (`i_pages`); the
@@ -3091,7 +3095,9 @@ directories'); a changed block goes on that directory's metadata list
 a spin leaf), a moved directory's ".." block on the moved one's. The
 list is in the inode's RCU data (`Inode::private_rcu`), dropped a
 grace period after the eviction emptied it (Linux frees the inode by
-RCU), so its drop need not wait one (`rcu_passed`). A
+RCU), so its drop need not wait one (`rcu_passed`); a completion's
+write error reaches only the directory mapping's `wb_err`, in that
+memory still. A
 dirsync change writes and waits for exactly the buffers it changed
 (sync_dirty_buffer, fat_sync_bhs: buffer lock, no other lock held),
 where Linux does.
