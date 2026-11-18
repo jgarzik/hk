@@ -70,6 +70,19 @@ pub const SWAP_FLAG_PRIO_MASK: i32 = 0x7FFF;
 /// Enable discard (TRIM) for SSD swap
 pub const SWAP_FLAG_DISCARD: i32 = 0x10000;
 
+/// Discard the whole area at swapon (Linux SWAP_FLAG_DISCARD_ONCE)
+const SWAP_FLAG_DISCARD_ONCE: i32 = 0x20000;
+
+/// Discard freed page clusters (Linux SWAP_FLAG_DISCARD_PAGES)
+const SWAP_FLAG_DISCARD_PAGES: i32 = 0x40000;
+
+/// The flags swapon accepts (Linux SWAP_FLAGS_VALID)
+const SWAP_FLAGS_VALID: i32 = SWAP_FLAG_PRIO_MASK
+    | SWAP_FLAG_PREFER
+    | SWAP_FLAG_DISCARD
+    | SWAP_FLAG_DISCARD_ONCE
+    | SWAP_FLAG_DISCARD_PAGES;
+
 /// The device takes new slots (Linux SWP_WRITEOK)
 const SWP_WRITEOK: u32 = 1 << 1;
 
@@ -703,8 +716,12 @@ fn generic_swapfile_activate(
 /// S_SWAPFILE is set before its writes are drained, so no write or
 /// truncate of the file runs from the mapping to the swap's end. The
 /// type is reserved first (Linux alloc_swap_info), the area published
-/// under `SWAPON` inside the i_rwsem (enable_swap_info).
+/// under `SWAPON` inside the i_rwsem (enable_swap_info). Unknown flags
+/// are EINVAL before anything else.
 pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
+    if swap_flags & !SWAP_FLAGS_VALID != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     if !capable(CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
