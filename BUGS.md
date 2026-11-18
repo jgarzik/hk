@@ -283,6 +283,23 @@ lo (hk has no checksum offload states).
   FAN_MARK_IGNORE, FAN_MARK_IGNORED_SURV_MODIFY and FAN_MARK_EVICTABLE
   are accepted but have no effect (Linux fanotify_add_mark).
 
+## vfat gaps
+
+**Location**: `fs/vfat/mod.rs`, `fs/vfat/fatent.rs`
+
+- FAT32 only: `vfat_fill_super` refuses FAT12/16 (Linux fat_ent_ops
+  fat12_ops / fat16_ops).
+- A directory whose cluster chain breaks mid-way is EIO; Linux
+  fat__get_entry ends the directory there.
+- No FAT attribute bits on the inode: write_inode does not write
+  them (Linux fat_make_attrs, ATTR_RO from the mode, ATTR_HIDDEN etc.
+  kept in MSDOS_I(inode)->i_attrs).
+- No `sbi->s_lock` mutex around namespace operations (Linux
+  vfat_create, vfat_rename etc. take it).
+- A directory's i_size is 0 (Linux: its chain length, fat_calc_dir_size).
+- No FSINFO: the free count and next-free hint are kept in memory
+  only (Linux fat_set_state / fat_clusters_flush).
+
 ## O_DIRECT gaps
 
 **Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
