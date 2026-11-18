@@ -93,8 +93,7 @@ fn fat_cont_expand(inode: &Inode, size: u64) -> Result<(), KernelError> {
 /// mmu_private lowered to it first: a write into the hole a grown
 /// file left zeroes it again
 fn fat_truncate_blocks(inode: &Inode, offset: u64) -> Result<(), KernelError> {
-    let sb = inode.superblock().ok_or(KernelError::Io)?;
-    let sb_data = &msdos_sb(sb)?;
+    let sb_data = msdos_sb_of(inode);
     with_vi(inode, |v| {
         v.mmu_private.fetch_min(offset, Ordering::Relaxed)
     })?;
@@ -107,11 +106,8 @@ fn fat_truncate_blocks(inode: &Inode, offset: u64) -> Result<(), KernelError> {
 /// entry is written with the new chain (a file of no bytes gets no
 /// first cluster again)
 fn fat_free_eofblocks(inode: &Inode) {
-    let (Some(cs), Ok(d), Ok(mmu)) = (
-        cluster_size(inode),
-        get_inode_data(inode),
-        mmu_private(inode),
-    ) else {
+    let cs = cluster_size(inode);
+    let (Ok(d), Ok(mmu)) = (get_inode_data(inode), mmu_private(inode)) else {
         return;
     };
     let cs = u64::from(cs);
@@ -450,11 +446,76 @@ pub struct VfatSbData {
     pub ipos: Arc<crate::sync::spin::Mutex<()>>,
     /// The FAT's own inode (Linux sbi->fat_inode): its metadata list
     /// holds the dirty FAT blocks fsync writes; never hashed or dirtied.
-    /// Put with the data, by put_super (or a failed fill)
-    pub fat_inode: InodeRef,
+    /// Put by put_super (or a failed fill) before the data goes
+    pub fat_inode: FatInode,
 }
 
 impl SuperBlockData for VfatSbData {}
+
+/// [`VfatSbData::fat_inode`]: one reference, set once by the fill and
+/// put by `fat_put_data` while the data is still there, as Linux
+/// fat_put_super's iput before the free (its eviction reaches the data);
+/// borrowed with no lock between
+pub struct FatInode(core::sync::atomic::AtomicPtr<Inode>);
+
+impl FatInode {
+    const fn new() -> Self {
+        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
+    }
+
+    /// Hold `i`, once, before the superblock is born
+    fn set(&self, i: InodeRef) {
+        let old = self.0.swap(
+            InodeRef::into_raw(i).cast_mut(),
+            core::sync::atomic::Ordering::Release,
+        );
+        debug_assert!(old.is_null(), "vfat: FAT inode set twice");
+    }
+
+    /// The inode
+    pub fn get(&self) -> &Inode {
+        let p = self.0.load(core::sync::atomic::Ordering::Acquire);
+        // SAFETY: null or the reference `set` stored, which `put` alone
+        // gives up, once no operation of the filesystem runs (its
+        // contract): live for the borrow of `self`
+        unsafe { p.as_ref() }.expect("vfat: no FAT inode")
+    }
+
+    /// Put the inode (Linux iput(sbi->fat_inode))
+    ///
+    /// # Safety
+    /// No borrow from [`FatInode::get`] lives or is taken after: the
+    /// filesystem's put_super or failed fill, s_umount held for writing
+    /// and every other inode evicted.
+    unsafe fn put(&self) {
+        let p = self
+            .0
+            .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+        if !p.is_null() {
+            // SAFETY: the reference `set` stored, taken out once
+            drop(unsafe { InodeRef::from_raw(p) });
+        }
+    }
+}
+
+impl Drop for FatInode {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self`: no borrow of it lives
+        unsafe { self.put() };
+    }
+}
+
+/// Release `sb`'s VFAT data (Linux fat_put_super, a failed fill's
+/// out_fail): the FAT's inode put first, evicted while the data is
+/// there, then the data a grace period on (`kill_fs_info`)
+fn fat_put_data(sb: &SuperBlock) {
+    // SAFETY: put_super or the failed fill: every other inode evicted,
+    // s_umount held for writing, and the data set
+    let d = unsafe { msdos_sb(sb) };
+    // SAFETY: as above, no operation of the filesystem runs
+    unsafe { d.fat_inode.put() };
+    sb.kill_fs_info();
+}
 
 /// What the FAT lock guards beyond the FAT itself
 pub struct FatState {
@@ -621,16 +682,14 @@ impl VfatOpts {
 }
 
 /// The mount's options for an inode of it
-fn opts_of(i: &Inode) -> Option<VfatOpts> {
-    let sb = i.superblock()?;
-    let g = crate::sync::rcu::read_lock();
-    sb.fs_info_rcu::<VfatSbData>(&g).map(|d| d.opts)
+fn opts_of(i: &Inode) -> VfatOpts {
+    msdos_sb_of(i).opts
 }
 
 /// A name the user gave, read by the mount's charset (`err` if it does
 /// not decode), trailing dots dropped (Linux vfat_striptail_len)
 fn user_name(dir: &Inode, name: &[u8], err: KernelError) -> Result<String, KernelError> {
-    let cs = opts_of(dir).map_or(Charset::Utf8, |o| o.cs);
+    let cs = opts_of(dir).cs;
     let s = cs.to_text(name).ok_or(err)?;
     Ok(String::from(s.trim_end_matches('.')))
 }
@@ -824,22 +883,35 @@ fn with_vi<R>(inode: &Inode, f: impl FnOnce(&VfatInode) -> R) -> Result<R, Kerne
 // VFAT Helpers
 // ============================================================================
 
-/// `sb`'s VFAT data (Linux MSDOS_SB(sb)), a reference; EIO once its
-/// put_super released it
-fn msdos_sb(sb: &SuperBlock) -> Result<Arc<VfatSbData>, KernelError> {
-    sb.fs_info::<VfatSbData>().ok_or(KernelError::Io)
+/// A vfat inode's superblock (Linux inode->i_sb): every one has its
+fn i_sb(inode: &Inode) -> &Arc<SuperBlock> {
+    inode
+        .superblock()
+        .expect("vfat: an inode with no superblock")
 }
 
-/// The VFAT data of `inode`'s filesystem (Linux MSDOS_SB(inode->i_sb))
-fn msdos_sb_of(inode: &Inode) -> Result<Arc<VfatSbData>, KernelError> {
-    msdos_sb(inode.superblock().ok_or(KernelError::Io)?)
+/// `sb`'s VFAT data (Linux MSDOS_SB(sb)), borrowed
+///
+/// # Safety
+/// As [`SuperBlock::fs_info_ref`]: the caller holds an active reference
+/// to `sb`, or works for a live inode of it, or is its put_super.
+unsafe fn msdos_sb(sb: &SuperBlock) -> &VfatSbData {
+    // SAFETY: the caller's contract
+    unsafe { sb.fs_info_ref::<VfatSbData>() }.expect("vfat: a superblock with no data")
+}
+
+/// The VFAT data of `inode`'s filesystem (Linux
+/// MSDOS_SB(inode->i_sb)): borrowed with the inode
+fn msdos_sb_of(inode: &Inode) -> &VfatSbData {
+    // SAFETY: `inode` is live for the borrow; the shutdown evicts every
+    // inode before put_super releases the data, the FAT's own put first
+    // (`VfatSuperOps::put_super`)
+    unsafe { msdos_sb(i_sb(inode)) }
 }
 
 /// The cluster size of `inode`'s filesystem
-fn cluster_size(inode: &Inode) -> Option<u32> {
-    let sb = inode.superblock()?;
-    let g = crate::sync::rcu::read_lock();
-    sb.fs_info_rcu::<VfatSbData>(&g).map(|d| d.cluster_size)
+fn cluster_size(inode: &Inode) -> u32 {
+    msdos_sb_of(inode).cluster_size
 }
 
 /// A copy of `inode`'s VFAT data
@@ -1081,9 +1153,7 @@ fn fat_truncate_time(inode: &Inode, now: Option<Timespec>, atime: bool, cmtime: 
     if is_root(inode) {
         return;
     }
-    let Some(off) = opts_of(inode).map(|o| o.tz()) else {
-        return;
-    };
+    let off = opts_of(inode).tz();
     let now = now.unwrap_or_else(|| crate::time::TIMEKEEPER.current_time());
     if atime {
         inode.set_atime(fattime::trunc_atime(off, now));
@@ -1121,8 +1191,7 @@ fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
         super::pageio::fs_writeback::set_inode_metadata_writeback(inode);
         return Ok(());
     }
-    let sb = inode.superblock().ok_or(KernelError::Io)?;
-    let sb_data = &msdos_sb(sb)?;
+    let sb_data = msdos_sb_of(inode);
     loop {
         let i_pos = get_inode_data(inode)?.i_pos;
         if i_pos == 0 {
@@ -1157,8 +1226,7 @@ fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
 /// entry.
 fn fat_sync_inode_metadata(inode: &Inode) -> Result<(), KernelError> {
     if !is_root(inode) {
-        let sb = inode.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb_data = msdos_sb_of(inode);
         let i_pos = get_inode_data(inode)?.i_pos;
         if i_pos != 0 {
             let bs = u64::from(sb_data.bytes_per_sector);
@@ -2103,8 +2171,8 @@ impl InodeOps for VfatInodeOps {
 
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         let name = &user_name(dir, name, KernelError::NotFound)?;
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb = i_sb(dir);
+        let sb_data = msdos_sb_of(dir);
         let inode_data = get_inode_data(dir)?;
 
         if !inode_data.is_dir {
@@ -2117,7 +2185,7 @@ impl InodeOps for VfatInodeOps {
         // Find matching entry (case-insensitive for FAT)
         for entry in entries {
             if entry.name.eq_ignore_ascii_case(name) {
-                return vfat_iget(sb, &entry, inode_data.start_cluster);
+                return vfat_iget((sb, sb_data), &entry, inode_data.start_cluster);
             }
         }
 
@@ -2164,9 +2232,7 @@ impl InodeOps for VfatInodeOps {
     /// The preferred I/O size is the cluster size (Linux fat_getattr)
     fn getattr(&self, inode: &Inode) -> super::inode::InodeAttr {
         let mut a = super::inode::generic_fillattr(inode);
-        let Some(cs) = cluster_size(inode) else {
-            return a;
-        };
+        let cs = cluster_size(inode);
         a.blksize = cs;
         // A file's blocks are its clusters (Linux i_blocks)
         if a.mode.is_file()
@@ -2183,23 +2249,16 @@ impl InodeOps for VfatInodeOps {
     /// one's metadata buffers are written first (mmb_sync) and its
     /// fallocated clusters past mmu_private freed (fat_free_eofblocks);
     /// then its list is emptied (mmb_invalidate)
-    /// Linux fat_evict_inode. An inode evicted after its superblock's
-    /// put_super (hk lets one outlive the shutdown; Linux evicts every
-    /// inode before) finds no data (`msdos_sb`: EIO) and does no I/O:
-    /// the shutdown wrote what was dirty
     fn evict_inode(&self, inode: &Inode) {
-        let sbi = inode.superblock().and_then(|sb| msdos_sb(sb).ok());
-        if let Some(sbi) = &sbi {
-            if inode.get_nlink() == 0 {
-                if let Ok(d) = get_inode_data(inode)
-                    && d.start_cluster != 0
-                {
-                    let _ = fat_free_clusters(sbi, inode, d.start_cluster);
-                }
-            } else {
-                let _ = with_mmb(inode, buffer::mmb_sync);
-                fat_free_eofblocks(inode);
+        if inode.get_nlink() == 0 {
+            if let Ok(d) = get_inode_data(inode)
+                && d.start_cluster != 0
+            {
+                let _ = fat_free_clusters(msdos_sb_of(inode), inode, d.start_cluster);
             }
+        } else {
+            let _ = with_mmb(inode, buffer::mmb_sync);
+            fat_free_eofblocks(inode);
         }
         let _ = with_mmb(inode, buffer::mmb_invalidate);
     }
@@ -2207,8 +2266,8 @@ impl InodeOps for VfatInodeOps {
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let name = &new_name(dir, name)?;
         let _ = mode; // FAT doesn't support Unix permissions
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb = i_sb(dir);
+        let sb_data = msdos_sb_of(dir);
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
@@ -2280,8 +2339,8 @@ impl InodeOps for VfatInodeOps {
     fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
         let name = &new_name(dir, name)?;
         let _ = mode; // FAT doesn't support Unix permissions
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb = i_sb(dir);
+        let sb_data = msdos_sb_of(dir);
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
@@ -2359,8 +2418,8 @@ impl InodeOps for VfatInodeOps {
 
     fn unlink(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
         let name = &user_name(dir, name, KernelError::NotFound)?;
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb = i_sb(dir);
+        let sb_data = msdos_sb_of(dir);
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
@@ -2396,8 +2455,8 @@ impl InodeOps for VfatInodeOps {
 
     fn rmdir(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
         let name = &user_name(dir, name, KernelError::NotFound)?;
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb = i_sb(dir);
+        let sb_data = msdos_sb_of(dir);
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
@@ -2496,8 +2555,7 @@ impl InodeOps for VfatInodeOps {
             return Err(KernelError::FileTooLarge);
         }
         if mode & FALLOC_FL_KEEP_SIZE != 0 {
-            let sb = inode.superblock().ok_or(KernelError::Io)?;
-            let sbi = &msdos_sb(sb)?;
+            let sbi = msdos_sb_of(inode);
             let cs = u64::from(sbi.cluster_size);
             let ondisksize = u64::from(get_inode_data(inode)?.clusters) * cs;
             for _ in 0..end.saturating_sub(ondisksize).div_ceil(cs) {
@@ -2528,8 +2586,8 @@ impl InodeOps for VfatInodeOps {
             return Err(KernelError::InvalidArgument);
         }
 
-        let sb = old_dir.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb = i_sb(old_dir);
+        let sb_data = msdos_sb_of(old_dir);
         let (od, nd) = (get_inode_data(old_dir)?, get_inode_data(new_dir)?);
         let (op, np) = (od.start_cluster, nd.start_cluster);
 
@@ -2544,7 +2602,7 @@ impl InodeOps for VfatInodeOps {
             .clone();
         // The moved object's inode (Linux d_inode(old_dentry): the VFS
         // holds it, so this finds it cached)
-        let old_inode = vfat_iget(sb, &old_entry, op)?;
+        let old_inode = vfat_iget((sb, sb_data), &old_entry, op)?;
         let old_ipos = old_entry.i_pos;
         // A directory moved to another one: its ".." entry
         // (vfat_get_dotdot_de)
@@ -2969,7 +3027,7 @@ fn cached(sb: &Arc<SuperBlock>, parent: u32, short: &[u8; 11]) -> Option<InodeRe
 /// The one inode of a directory entry (Linux fat_build_inode: fat_iget,
 /// else a new inode hashed by its position)
 fn vfat_iget(
-    sb: &Arc<SuperBlock>,
+    (sb, sb_data): (&Arc<SuperBlock>, &VfatSbData),
     entry: &ParsedDirEntry,
     parent: u32,
 ) -> Result<InodeRef, KernelError> {
@@ -2978,7 +3036,7 @@ fn vfat_iget(
         sb,
         ikey(parent, &short),
         &|i| is_obj(i, parent, &short),
-        || create_inode_for_entry(sb, entry, parent),
+        || create_inode_for_entry((sb, sb_data), entry, parent),
     )
 }
 
@@ -3013,11 +3071,10 @@ fn unlink_entry(
 
 /// Create an inode for a parsed directory entry
 fn create_inode_for_entry(
-    sb: &Arc<SuperBlock>,
+    (sb, sb_data): (&Arc<SuperBlock>, &VfatSbData),
     entry: &ParsedDirEntry,
     parent_cluster: u32,
 ) -> Result<InodeRef, KernelError> {
-    let sb_data = &msdos_sb(sb)?;
     // A directory's link count is fat_subdirs (Linux fat_fill_inode),
     // then fat_validate_dir: its "." and ".." at least, and a cluster of
     // its own; both checked before any inode exists, so a refused one
@@ -3189,9 +3246,8 @@ impl FileOps for VfatFileOps {
     fn fsync(&self, file: &File, start: u64, end: u64, datasync: bool) -> Result<(), KernelError> {
         super::libfs::simple_fsync_noflush(file, start, end, datasync)?;
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let sb = inode.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
-        with_mmb(&sb_data.fat_inode, crate::fs::pageio::buffer::mmb_sync)??;
+        let sb_data = msdos_sb_of(&inode);
+        with_mmb(sb_data.fat_inode.get(), crate::fs::pageio::buffer::mmb_sync)??;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
 
@@ -3199,8 +3255,8 @@ impl FileOps for VfatFileOps {
 
     fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let sb = inode.superblock().ok_or(KernelError::Io)?;
-        let sb_data = &msdos_sb(sb)?;
+        let sb = i_sb(&inode);
+        let sb_data = msdos_sb_of(&inode);
         let inode_data = get_inode_data(&inode)?;
 
         if !inode_data.is_dir {
@@ -3281,20 +3337,20 @@ impl SuperOps for VfatSuperOps {
         Ok(())
     }
 
-    /// Linux fat_put_super: the data goes, the FAT's inode put with it
-    /// (iput, then the rest a grace period on: call_rcu(delayed_free)),
-    /// in thread context; from here `msdos_sb` is EIO, so a late caller
-    /// (an inode evicted after the shutdown) never reaches the device
-    /// kill_block_super releases next
+    /// Linux fat_put_super: the FAT's inode put (iput: evicted while
+    /// the data is there), then the data released a grace period on
+    /// (call_rcu(delayed_free)), in thread context, every other inode
+    /// evicted already
     fn put_super(&self, sb: &SuperBlock) {
-        sb.kill_fs_info();
+        fat_put_data(sb);
     }
 
     /// Linux fat_statfs: clusters as blocks, the free ones counted once
     /// and kept; a long name of 255 characters of up to 6 bytes each
     /// (FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE)
     fn statfs(&self, sb: &SuperBlock) -> Result<StatFs, KernelError> {
-        let d = &msdos_sb(sb)?;
+        // SAFETY: statfs(2) holds the mount, an active reference
+        let d = unsafe { msdos_sb(sb) };
         // A FAT that cannot be read fails the call (Linux
         // fat_count_free_clusters' error)
         let free = fatent::fat_count_free_clusters(d)?;
@@ -3435,6 +3491,37 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         return Err(KernelError::InvalidArgument);
     }
 
+    // Create superblock data
+    let sb_data = try_arc(VfatSbData {
+        bdev: bdev.clone(),
+        bytes_per_sector: u32::from(bytes_per_sector),
+        sectors_per_cluster: u32::from(boot_sector.sectors_per_cluster),
+        fat_start_sector,
+        fat_sectors,
+        num_fats,
+        data_start_sector,
+        root_cluster: boot_sector.root_cluster,
+        max_cluster: (total_clusters + 2) as u32,
+        cluster_size,
+        opts,
+        ipos: try_arc(crate::sync::spin::Mutex::new(()))?,
+        fat_inode: FatInode::new(),
+        fat: try_arc(crate::sync::Mutex::new(FatState {
+            free: -1,
+            prev_free: 2,
+        }))?,
+    })?;
+    // Set before any inode is made, which reaches it from its eviction
+    // on (Linux fat_fill_super: sb->s_fs_info = sbi)
+    sb.set_fs_info(crate::fs::superblock::FsInfo::new(sb_data.clone())?);
+    // Linux fat_fill_super's out_fail: the FAT's inode put and the data
+    // freed (sb->s_fs_info = NULL), here in thread context
+    fat_fill_inodes(sb, &sb_data).inspect_err(|_| fat_put_data(sb))
+}
+
+/// The FAT's inode, then the root (Linux fat_fill_super from new_inode
+/// of sbi->fat_inode)
+fn fat_fill_inodes(sb: &Arc<SuperBlock>, sb_data: &VfatSbData) -> Result<(), KernelError> {
     // The FAT's inode (Linux fat_fill_super: new_inode, i_pos 0)
     let fat_inode = Inode::alloc(Inode::new(
         sb.alloc_ino(),
@@ -3459,38 +3546,15 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
             i_pos: 0,
         },
     )?);
-
-    // Create superblock data
-    let sb_data = try_arc(VfatSbData {
-        bdev: bdev.clone(),
-        bytes_per_sector: u32::from(bytes_per_sector),
-        sectors_per_cluster: u32::from(boot_sector.sectors_per_cluster),
-        fat_start_sector,
-        fat_sectors,
-        num_fats,
-        data_start_sector,
-        root_cluster: boot_sector.root_cluster,
-        max_cluster: (total_clusters + 2) as u32,
-        cluster_size,
-        opts,
-        ipos: try_arc(crate::sync::spin::Mutex::new(()))?,
-        fat_inode,
-        fat: try_arc(crate::sync::Mutex::new(FatState {
-            free: -1,
-            prev_free: 2,
-        }))?,
-    })?;
+    sb_data.fat_inode.set(fat_inode);
 
     // The root directory's chain must be sound (Linux fat_read_root ->
     // fat_calc_dir_size walks it: EIO)
-    read_cluster_chain(&sb_data, sb_data.root_cluster)?;
+    read_cluster_chain(sb_data, sb_data.root_cluster)?;
 
     // FAT sizes are 32-bit (Linux fat_fill_super: s_maxbytes 0xffffffff)
     sb.set_maxbytes(0xffff_ffff);
-    sb.set_fs_info(crate::fs::superblock::FsInfo::new(sb_data.clone())?);
-    // Linux fat_fill_super's out_fail: the FAT's inode put and the data
-    // freed (sb->s_fs_info = NULL), here in thread context
-    fat_read_root(sb, &sb_data, boot_sector.root_cluster).inspect_err(|_| sb.kill_fs_info())
+    fat_read_root(sb, sb_data, sb_data.root_cluster)
 }
 
 /// The root directory, its inode and dentry (Linux fat_fill_super from

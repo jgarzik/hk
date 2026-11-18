@@ -311,13 +311,6 @@ lo (hk has no checksum offload states).
   against its chain).
 - No FSINFO: the free count and next-free hint are kept in memory
   only (Linux fat_set_state / fat_clusters_flush).
-- Every reach of the filesystem's data from an inode (`msdos_sb_of`,
-  `fat_get_block`) takes a reference to `s_fs_info`; Linux
-  MSDOS_SB(inode->i_sb) is plain pointer loads. Its callers handle
-  EIO for data already released, which no inode outlives (put_super
-  runs after every inode is evicted), and the FAT's inode is put with
-  the data, after it is released (`VfatSbData.fat_inode`; Linux
-  fat_put_super puts it first).
 
 ## O_DIRECT gaps
 

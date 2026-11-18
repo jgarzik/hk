@@ -1119,9 +1119,10 @@ pub struct SuperBlock {
     /// Its filesystem's data (Linux s_fs_info): set once, by its fill
     /// or sget's set; released by the filesystem's ->put_super or
     /// ->kill_sb (or its failed fill) in thread context, a grace period
-    /// after it leaves the cell (`kill_fs_info`). Read under an RCU
-    /// guard or as a reference ([`SuperBlock::fs_info`]): once released
-    /// it reads as None (EIO to a filesystem's late callers)
+    /// after it leaves the cell (`kill_fs_info`), once every inode is
+    /// evicted. Read under an RCU guard, as a reference
+    /// ([`SuperBlock::fs_info`]), or borrowed for an inode's life
+    /// ([`SuperBlock::fs_info_ref`]); once released it reads as None
     s_fs_info: RcuOnceArc<FsInfo>,
 
     /// The block device a device filesystem is mounted from (Linux
@@ -1469,6 +1470,21 @@ impl SuperBlock {
     pub fn fs_info<T: SuperBlockData>(&self) -> Option<Arc<T>> {
         let a: Arc<dyn core::any::Any + Send + Sync> = self.fs_info_arc()?;
         a.downcast::<T>().ok()
+    }
+
+    /// Its filesystem's data as a `T`, borrowed with no reference or
+    /// guard (Linux MSDOS_SB(sb) etc.: a plain load of s_fs_info); None
+    /// if unset or another type
+    ///
+    /// # Safety
+    /// The data is not released while the borrow lives: the caller
+    /// works for a live inode of `self` (its shutdown evicts every inode
+    /// before ->put_super or ->kill_sb releases the data, the
+    /// filesystem's own inodes put first) or holds an active reference.
+    pub unsafe fn fs_info_ref<T: SuperBlockData>(&self) -> Option<&T> {
+        // SAFETY: not released while the borrow lives (the caller)
+        let d: &dyn core::any::Any = &*unsafe { self.s_fs_info.get_unguarded() }?.0;
+        d.downcast_ref::<T>()
     }
 
     /// Its filesystem's data as a `T`, borrowed for the RCU read `g`

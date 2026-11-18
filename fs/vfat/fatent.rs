@@ -183,7 +183,7 @@ fn ent_put(sb: &VfatSbData, fe: &FatEnt, new: u32) {
     debug_assert!(new & 0xF000_0000 == 0);
     let v = new | (ent_raw(fe) & !0x0FFF_FFFF);
     bh.write_data(off, &v.to_le_bytes());
-    mmb_dirty(&sb.fat_inode, bh);
+    mmb_dirty(sb.fat_inode.get(), bh);
 }
 
 /// Linux fat32_ent_next: on to the next entry; false past the block
@@ -269,7 +269,7 @@ fn fat_mirror_bhs<'a>(
             }
             c_bh.set_uptodate();
             buffer::unlock_buffer(&c_bh);
-            mmb_dirty(&sb.fat_inode, &c_bh);
+            mmb_dirty(sb.fat_inode.get(), &c_bh);
             if sync {
                 buffer::sync_dirty_buffer(&c_bh)?;
             }

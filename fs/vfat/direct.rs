@@ -160,7 +160,7 @@ fn direct_read(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize, K
     if pos >= size {
         return Ok(0);
     }
-    let sb = &msdos_sb_of(inode)?;
+    let sb = msdos_sb_of(inode);
     let bs = blocksize(sb, pos, to.alignment())?;
     filemap::write_and_wait_range(inode, pos, last(pos, count))?;
     // The block holding the last byte is read whole (Linux: up to
@@ -228,7 +228,7 @@ fn direct_write(
     if mmu_private(inode)? < end {
         return Ok(0);
     }
-    let sb = &msdos_sb_of(inode)?;
+    let sb = msdos_sb_of(inode);
     let r = blocksize(sb, pos, from.alignment())
         .and_then(|_| map(inode, pos, count, true))
         .and_then(|m| match m {
@@ -470,7 +470,7 @@ fn read_async(
     if pos >= size {
         return Ok(Some(0));
     }
-    let sb = &msdos_sb_of(inode)?;
+    let sb = msdos_sb_of(inode);
     let bs = blocksize(sb, pos, IovDest::async_io(&*io).alignment())?;
     filemap::write_and_wait_range(inode, pos, last(pos, count))?;
     let len = (size.next_multiple_of(bs) - pos).min(count as u64) as usize;
@@ -507,7 +507,7 @@ fn write_async(
         return sync(&*io);
     }
     let lock = inode.lock();
-    let sb = &msdos_sb_of(inode)?;
+    let sb = msdos_sb_of(inode);
     let end = pos
         .checked_add(count as u64)
         .ok_or(KernelError::InvalidArgument)?;

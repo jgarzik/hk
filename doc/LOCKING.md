@@ -3152,18 +3152,18 @@ Order: `i_rwsem` -> page and buffer locks (the bread) -> `ipos` ->
 
 **vfat superblock data** (`fs/vfat/mod.rs`, Linux msdos_sb_info in
 s_fs_info): `VfatSbData` is the superblock's `s_fs_info` (Superblock
-lists below), set by the fill and released by put_super (Linux
-fat_put_super: iput of the FAT's inode, then call_rcu of the rest),
+lists below), set by the fill before it makes any inode and released
+by put_super (`fat_put_data`, Linux fat_put_super: iput of the FAT's
+inode, evicted while the data is there, then call_rcu of the rest),
 or by a fill that fails after setting it (Linux out_fail), in thread
-context. `msdos_sb` (Linux MSDOS_SB) takes a reference to it for an
-operation, none of whose drops is in atomic context; it is EIO once
-released, so an inode evicted after the shutdown (`Inode.sb` is a
-`Weak`; Linux evicts every inode before put_super) does no I/O on the
-device kill_block_super releases next. `VfatSbData.fat_inode` is a
-plain `InodeRef` (Linux sbi->fat_inode) living as long as the data:
-the FAT's blocks are put on its metadata list with no lock taken.
-Short reads (`cluster_size`, `opts_of`) borrow the data under an RCU
-guard.
+context. Every other inode is evicted before put_super
+(`generic_shutdown_super`), so an operation reaches the data from
+its inode with no reference or lock (`msdos_sb_of`, Linux
+MSDOS_SB(inode->i_sb): `SuperBlock::fs_info_ref`), as statfs does
+through its mount's active reference. `VfatSbData.fat_inode`
+(`FatInode`, Linux sbi->fat_inode) holds one reference from the fill
+to put_super, borrowed with no lock taken: the FAT's blocks are put on
+its metadata list.
 
 **vfat directory blocks** (`fs/vfat/mod.rs`, Linux fs/fat/dir.c): a
 directory is walked block by block in the device's buffers

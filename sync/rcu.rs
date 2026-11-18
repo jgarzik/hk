@@ -555,6 +555,19 @@ impl<T> RcuOnceArc<T> {
         unsafe { p.as_ref() }
     }
 
+    /// The current version with no RCU guard (Linux a plain load of a
+    /// pointer whose release the caller's own hold excludes)
+    ///
+    /// # Safety
+    /// The version this loads is not released (taken out of the cell
+    /// and its `RcuRetired` dropped) while the borrow lives.
+    pub unsafe fn get_unguarded(&self) -> Option<&T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a version the cell owns (type invariant), kept
+        // allocated for the borrow (the caller)
+        unsafe { p.as_ref() }
+    }
+
     /// A reference to the current version, if any
     pub fn get(&self) -> Option<Arc<T>> {
         let g = read_lock();
