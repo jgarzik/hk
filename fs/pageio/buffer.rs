@@ -58,6 +58,7 @@ use crate::block::blkdev::{Bio, BioOp, BlockDevice, SECTOR_SHIFT, bio_io_error, 
 use crate::fs::inode::Inode;
 use crate::fs::superblock::SuperBlock;
 use crate::mm::filemap::{self, AddressSpace, PAGE_SIZE};
+use crate::mm::page::zero_frame_racy;
 use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::{page_wait_queue, var_waitqueue};
 use crate::util::error::KernelError;
@@ -354,20 +355,6 @@ fn put_bdev(p: *mut BlockDevice) {
     }
 }
 
-/// Zero `len` bytes of page `phys` at `off`, which a mapping may access
-/// meanwhile (Linux folio_zero_range)
-pub(crate) fn zero_frame(phys: u64, off: usize, len: usize) {
-    const Z: [u8; 64] = [0; 64];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(Z.len());
-        // SAFETY: a page-cache page the caller holds (locked or under
-        // its locked buffer's I/O); the range lies in it
-        unsafe { crate::mm::page::copy_to_frame_racy(phys, off + done, &Z[..n]) };
-        done += n;
-    }
-}
-
 /// The buffers of page `phys` (Linux folio_buffers)
 ///
 /// # Safety
@@ -556,7 +543,11 @@ type BhEndIo = fn(Box<Bio>);
 
 /// Cut a bio that runs past the end of its device to the device's end
 /// (Linux guard_bio_eod, bio_truncate): a read's part past it zeroed
-pub(crate) fn guard_bio_eod(bdev: &BlockDevice, bio: &mut Bio) {
+///
+/// # Safety
+/// A read bio's first segment is a page the caller holds for the read
+/// (locked, or under the locked buffer it carries).
+pub(crate) unsafe fn guard_bio_eod(bdev: &BlockDevice, bio: &mut Bio) {
     let max = bdev.nr_sects();
     if max == 0 || bio.sector >= max {
         return;
@@ -568,7 +559,9 @@ pub(crate) fn guard_bio_eod(bdev: &BlockDevice, bio: &mut Bio) {
     let keep = (left << SECTOR_SHIFT) as usize;
     let seg = &mut bio.segs[0];
     if bio.op == BioOp::Read {
-        zero_frame(seg.frame, seg.offset + keep, seg.len - keep);
+        // SAFETY: the read's page, held for it (contract above); the
+        // segment's tail lies in it
+        unsafe { zero_frame_racy(seg.frame, seg.offset + keep, seg.len - keep) };
     }
     seg.len = keep;
 }
@@ -596,7 +589,8 @@ pub fn bh_submit(bh: &BufferHead, op: BioOp, end_io: BhEndIo) {
     let Some(bdev) = bh.bdev() else {
         return bio_io_error(bio, KernelError::Io);
     };
-    guard_bio_eod(&bdev, &mut bio);
+    // SAFETY: the bio carries the locked buffer `bh`, on its page
+    unsafe { guard_bio_eod(&bdev, &mut bio) };
     submit_bio(&bdev, bio);
 }
 
@@ -1521,7 +1515,9 @@ pub fn block_read_full_folio(inode: &Inode, phys: u64, get_block: GetBlock) {
                 page_error = true;
             }
             if !bh.mapped() {
-                zero_frame(phys, bh.offset(), bh.size());
+                // SAFETY: the locked page (the caller's); the buffer
+                // lies in it
+                unsafe { zero_frame_racy(phys, bh.offset(), bh.size()) };
                 if !err {
                     bh.set_uptodate();
                 }
@@ -1675,11 +1671,14 @@ pub fn block_write_full_folio(
     if pos >= size {
         return Ok(());
     }
-    zero_frame(
-        phys,
-        (size - pos) as usize,
-        PAGE_SIZE - (size - pos) as usize,
-    );
+    // SAFETY: the locked page (the caller's); its tail past the size
+    unsafe {
+        zero_frame_racy(
+            phys,
+            (size - pos) as usize,
+            PAGE_SIZE - (size - pos) as usize,
+        )
+    };
     block_write_full_folio_locked(inode, phys, get_block)
 }
 
@@ -1705,7 +1704,9 @@ pub fn folio_zero_new_buffers(phys: u64, from: usize, to: usize) {
         if bh.new_block() && block_end > from && block_start < to {
             if !filemap::uptodate(phys) {
                 let (s, e) = (from.max(block_start), to.min(block_end));
-                zero_frame(phys, s, e - s);
+                // SAFETY: the locked page (the caller's); the range
+                // lies in its buffer
+                unsafe { zero_frame_racy(phys, s, e - s) };
                 bh.set_uptodate();
             }
             bh.clear(BH_NEW);
@@ -1716,12 +1717,18 @@ pub fn folio_zero_new_buffers(phys: u64, from: usize, to: usize) {
 }
 
 /// Zero [s1, e1) and [s2, e2) of the page (Linux folio_zero_segments)
-fn zero_segments(phys: u64, s1: usize, e1: usize, s2: usize, e2: usize) {
+///
+/// # Safety
+/// The caller holds the page lock of `phys`, a page-cache page; the
+/// ranges lie in the page.
+unsafe fn zero_segments(phys: u64, s1: usize, e1: usize, s2: usize, e2: usize) {
     if e1 > s1 {
-        zero_frame(phys, s1, e1 - s1);
+        // SAFETY: the locked page; the range lies in it (contract)
+        unsafe { zero_frame_racy(phys, s1, e1 - s1) };
     }
     if e2 > s2 {
-        zero_frame(phys, s2, e2 - s2);
+        // SAFETY: as above
+        unsafe { zero_frame_racy(phys, s2, e2 - s2) };
     }
 }
 
@@ -1773,7 +1780,9 @@ pub fn block_write_begin_int(
                     continue;
                 }
                 if be > to || bs < from {
-                    zero_segments(phys, to, be, bs, from);
+                    // SAFETY: the locked page (the caller's); the
+                    // block lies in it
+                    unsafe { zero_segments(phys, to, be, bs, from) };
                 }
                 continue;
             }
@@ -1903,7 +1912,8 @@ fn round_bytes(bytes: &AtomicU64, blocksize: u64) {
 fn cont_zero(inode: &Inode, pos: u64, len: usize) -> Result<(), KernelError> {
     let a = inode.i_data.aops();
     let phys = a.write_begin(inode, pos, len)?;
-    zero_frame(phys, (pos % PAGE_SIZE as u64) as usize, len);
+    // SAFETY: ->write_begin returned it locked; `len` stays in the page
+    unsafe { zero_frame_racy(phys, (pos % PAGE_SIZE as u64) as usize, len) };
     let n = a.write_end(inode, pos, len, len, phys);
     // Linux BUG_ON(err != len): a whole copy is always committed
     debug_assert_eq!(n, len);
@@ -1999,7 +2009,9 @@ pub fn block_truncate_page(
                 bh_read_locked(bh, true)?;
             }
         }
-        zero_frame(phys, offset, blocksize - length);
+        // SAFETY: `grab` returned it locked, held until the unlock below;
+        // the block's tail lies in it
+        unsafe { zero_frame_racy(phys, offset, blocksize - length) };
         mark_buffer_dirty(bh);
         Ok(())
     })();

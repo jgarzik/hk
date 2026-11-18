@@ -509,6 +509,25 @@ pub unsafe fn copy_to_frame_racy(phys: u64, off: usize, src: &[u8]) {
     }
 }
 
+/// Zero `len` bytes of the frame `phys` at `off`, which a mapping may
+/// access meanwhile (Linux folio_zero_range, memzero_page): volatile
+/// byte stores, as `copy_to_frame_racy`
+///
+/// # Safety
+/// `phys` is a RAM frame kept allocated meanwhile (a page-cache page
+/// locked or under its locked buffer's I/O, a pinned page) and meant
+/// to be written (no kernel data); [off, off + len) lies in it.
+pub unsafe fn zero_frame_racy(phys: u64, off: usize, len: usize) {
+    const Z: [u8; 64] = [0; 64];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(Z.len());
+        // SAFETY: the frame and range are the caller's (contract above)
+        unsafe { copy_to_frame_racy(phys, off + done, &Z[..n]) };
+        done += n;
+    }
+}
+
 /// Fill `dst` from byte `off` of the frame `phys`, which user space may
 /// write meanwhile: volatile byte loads (as `copy_to_frame_racy`)
 ///

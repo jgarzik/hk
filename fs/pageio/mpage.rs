@@ -25,9 +25,10 @@ use crate::block::blkdev::{Bio, BioOp, BlockDevice, SECTOR_SHIFT, submit_bio};
 use crate::fs::inode::Inode;
 use crate::fs::pageio::buffer::{
     self, BufferHead, GetBlock, folio_buffers, folio_end_read, folio_end_writeback,
-    folio_start_writeback, folio_wait_writeback, guard_bio_eod, ring, zero_frame,
+    folio_start_writeback, folio_wait_writeback, guard_bio_eod, ring,
 };
 use crate::mm::filemap::{self, PAGE_SIZE};
+use crate::mm::page::zero_frame_racy;
 use crate::util::error::KernelError;
 
 /// The disk run a page's first blocks map to: its first block, how many
@@ -59,12 +60,24 @@ fn run_add<'a>(
 
 /// One bio of `run`'s blocks to or from the start of page `phys`, ending
 /// with `end_io` (Linux bio_alloc + bio_add_folio + mpage_bio_submit_*)
-fn submit(phys: u64, run: &Run, blkbits: u32, op: BioOp, end_io: fn(Box<Bio>), private: usize) {
+///
+/// # Safety
+/// The caller holds the page lock of `phys`, a page-cache page, for
+/// the I/O.
+unsafe fn submit(
+    phys: u64,
+    run: &Run,
+    blkbits: u32,
+    op: BioOp,
+    end_io: fn(Box<Bio>),
+    private: usize,
+) {
     let mut bio = Bio::new(op, run.first_block << (blkbits - SECTOR_SHIFT));
     bio.add_seg(phys, 0, run.blocks << blkbits);
     bio.end_io = Some(end_io);
     bio.private = private;
-    guard_bio_eod(&run.bdev, &mut bio);
+    // SAFETY: the bio's page is locked for the I/O (contract above)
+    unsafe { guard_bio_eod(&run.bdev, &mut bio) };
     submit_bio(&run.bdev, bio);
 }
 
@@ -143,21 +156,28 @@ pub fn mpage_read_folio(inode: &Inode, phys: u64, get_block: GetBlock) {
     };
     let blkbits = inode.blkbits();
     if first_hole != PAGE_SIZE >> blkbits {
-        zero_frame(
-            phys,
-            first_hole << blkbits,
-            PAGE_SIZE - (first_hole << blkbits),
-        );
+        // SAFETY: the locked page (the caller's); its tail
+        unsafe {
+            zero_frame_racy(
+                phys,
+                first_hole << blkbits,
+                PAGE_SIZE - (first_hole << blkbits),
+            )
+        };
     }
     match run {
-        Some(r) => submit(
-            phys,
-            &r,
-            blkbits,
-            BioOp::Read,
-            mpage_read_end_io,
-            phys as usize,
-        ),
+        // SAFETY: the locked page (the caller's), unlocked by the read's
+        // end
+        Some(r) => unsafe {
+            submit(
+                phys,
+                &r,
+                blkbits,
+                BioOp::Read,
+                mpage_read_end_io,
+                phys as usize,
+            )
+        },
         // All holes
         None => folio_end_read(phys, true),
     }
@@ -301,7 +321,8 @@ pub fn mpage_write_folio(inode: &Inode, phys: u64, get_block: GetBlock) -> Resul
         // The page straddles i_size: zeroed past it on each and every
         // write, as it may be mmapped
         let length = (i_size - pos) as usize;
-        zero_frame(phys, length, PAGE_SIZE - length);
+        // SAFETY: the locked page (the caller's); its tail
+        unsafe { zero_frame_racy(phys, length, PAGE_SIZE - length) };
     }
     let w = WriteIo {
         phys,
@@ -312,14 +333,18 @@ pub fn mpage_write_folio(inode: &Inode, phys: u64, get_block: GetBlock) -> Resul
     debug_assert!(!filemap::writeback(phys));
     folio_start_writeback(phys);
     let private = core::ptr::from_ref(&w) as usize;
-    submit(
-        phys,
-        &run,
-        inode.blkbits(),
-        BioOp::Write,
-        mpage_write_end_io,
-        private,
-    );
+    // SAFETY: the locked page (the caller's), kept locked across the
+    // wait below
+    unsafe {
+        submit(
+            phys,
+            &run,
+            inode.blkbits(),
+            BioOp::Write,
+            mpage_write_end_io,
+            private,
+        )
+    };
     folio_wait_writeback(phys);
     if w.failed.load(Ordering::Relaxed) {
         return Err(KernelError::Io);

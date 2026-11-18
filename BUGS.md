@@ -26,7 +26,12 @@ Most of their blocks belong in a missing wrapper:
 
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
   place of the `mm/page.rs` `frame_bytes` unsafe fn (callers: vfat,
-  pipe, fault, filemap, swap, blkdev_ops).
+  pipe, fault, filemap, swap, blkdev_ops) and `zero_frame_racy`
+  (callers: buffer, mpage), and in the safe fns that take a page they
+  require locked by its address alone (`fs/pageio/buffer.rs`
+  block_read_full_folio, block_write_full_folio,
+  folio_zero_new_buffers; `fs/pageio/mpage.rs`). `mm/filemap.rs`
+  `zero_page` is still a safe fn zeroing any frame.
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
