@@ -2760,13 +2760,13 @@ fn attach(
 }
 
 /// Linux fat_detach: the inode has no entry any more (i_pos 0, so no
-/// write_inode touches the slot it had, which may be reused) and is
-/// out of the inode cache
+/// write_inode touches the slot it had, which may be reused, and no
+/// lookup finds it: `is_obj`); it stays hashed until its eviction, as
+/// Linux keeps it in the VFS hash
 fn fat_detach(inode: &InodeRef, sb_data: &VfatSbData) {
     let l = sb_data.ipos.lock();
     let _ = with_vi(inode, |v| v.d.lock().i_pos = 0);
     drop(l);
-    icache::remove_inode_hash(inode);
 }
 
 /// ENOTEMPTY unless the directory at `cluster` holds only "." and ".."
@@ -2963,10 +2963,14 @@ fn ikey(parent: u32, short: &[u8; 11]) -> u64 {
         })
 }
 
-/// `inode` is the object at (parent, short); runs under the inode
+/// `inode` is the object at (parent, short) and still has that entry
+/// (i_pos set: Linux fat_iget finds only inodes in fat's position
+/// hash, which fat_detach takes an unlinked or replaced one out of; its
+/// VFS hash entry stays until its eviction). Runs under the inode
 /// cache's bucket lock (takes only `Inode.private`)
 fn is_obj(inode: &Inode, parent: u32, short: &[u8; 11]) -> bool {
-    get_inode_data(inode).is_ok_and(|d| d.parent_cluster == parent && d.short_name == *short)
+    get_inode_data(inode)
+        .is_ok_and(|d| d.i_pos != 0 && d.parent_cluster == parent && d.short_name == *short)
 }
 
 /// The cached inode of the entry `short` in the directory at `parent`
@@ -2992,7 +2996,8 @@ fn vfat_iget(
 
 /// Remove the entry `entry` of `dir` (at `parent`): its cached inode
 /// leaves it in the same `ipos` hold (`fat_remove_entries`), then
-/// becomes unlinked (nlink 0, unhashed) and keeps its clusters until
+/// becomes unlinked (nlink 0, detached: still hashed, as Linux, but
+/// never found again) and keeps its clusters until
 /// its last reference goes (`evict_inode`); with no cached inode they
 /// are freed now. An unlinked inode has no directory entry any more
 /// (Linux fat_detach): writes and truncates never update one (the slot
@@ -3010,10 +3015,7 @@ fn unlink_entry(
     let offs = entry_slots(sb_data, parent, entry)?;
     fat_remove_entries(dir, sb, sb_data, &offs, inode.as_deref())?;
     match inode {
-        Some(i) => {
-            i.nlink.store(0, core::sync::atomic::Ordering::Release);
-            icache::remove_inode_hash(&i);
-        }
+        Some(i) => i.nlink.store(0, core::sync::atomic::Ordering::Release),
         None if entry.start_cluster != 0 => free_cluster_chain(sb_data, entry.start_cluster)?,
         None => {}
     }
@@ -3489,6 +3491,10 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         crtime: Timespec::ZERO,
         i_pos: 0,
     })?);
+    // Linux fat_fill_super: insert_inode_hash(root_inode); no lookup
+    // finds it (no entry, `is_obj`), the hash makes it a writeback
+    // candidate
+    icache::insert_inode_hash(&root_inode, 0);
 
     // Names match without case or trailing dots (Linux setup's
     // vfat_ci_dentry_ops), before the root dentry takes them

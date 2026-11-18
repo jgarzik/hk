@@ -156,9 +156,10 @@ pub fn mark_inode_dirty_sync(inode: &Inode) {
 /// tail of its device's `b_dirty` (noting when, Linux dirtied_when),
 /// unless a pass has it (I_SYNC_QUEUED: the pass requeues it by its
 /// state) or it is being freed, and the periodic writeback is armed if
-/// the lists were empty. An inode with no device to write to stays
-/// marked and unqueued (Linux noop_backing_dev_info). The caller holds
-/// a reference; may run under a page lock, never a spinlock.
+/// the lists were empty. An unhashed inode (but a block device's) and
+/// one with no device to write to (Linux noop_backing_dev_info) stay
+/// marked and unqueued. The caller holds a reference; may run under a
+/// page lock, never a spinlock.
 pub fn __mark_inode_dirty(inode: &Inode, flags: u32) {
     // Linux smp_mb, paired with the one in __writeback_single_inode:
     // either this test sees the bits cleared or that one sees the
@@ -187,7 +188,16 @@ pub fn __mark_inode_dirty(inode: &Inode, flags: u32) {
     let first = {
         let mut lists = wb.list_lock.lock();
         let l = inode.i_lock.lock();
-        if inode.state() & (I_SYNC_QUEUED | I_FREEING) != 0 {
+        if inode.state() & I_SYNC_QUEUED != 0 {
+            return;
+        }
+        // Only a hashed inode, or a block device's, is queued (Linux:
+        // an unhashed one is never written back; hashing and unhashing
+        // hold `i_lock`)
+        if !inode.mode().is_blkdev() && !inode.i_hash_node.is_linked() {
+            return;
+        }
+        if inode.state() & I_FREEING != 0 {
             return;
         }
         inode

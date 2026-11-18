@@ -620,7 +620,7 @@ VFS locks (detailed order):
                    (i_dentry) and its i_state writes, the dirty bits
                    and I_SYNC included; taken before the d_locks of
                    the dentry it links or unlinks and its parent; under
-                   INODE_HASH_LOCK, INODE_SB_LIST_LOCK by igrab, under
+                   INODE_HASH_LOCK by igrab and (un)hashing, INODE_SB_LIST_LOCK by igrab, under
                    BdiWriteback.list_lock by igrab and writeback; under
                    it a wait queue head (I_SYNC's, var_waitqueue) and
                    AddressSpace.i_pages (writeback's mapping_tagged))
@@ -2801,8 +2801,11 @@ pub struct Inode {
 ```
 
 **Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
-(by directory-entry position) are hashed so each on-disk object has one
-`Inode`, block devices' inodes on the bdev superblock by device
+(by directory entry; its `test` also requires the entry still set,
+i_pos, so it doubles as Linux fat's position hash: an unlinked or
+replaced inode, detached, stays hashed until its eviction, as in
+Linux's VFS hash, but is never found) are hashed so each on-disk
+object has one `Inode`, the vfat root too (found by no lookup), block devices' inodes on the bdev superblock by device
 number, so a device is found by its number (3.10), and a tmpfs inode
 by number plus generation once a file handle of it is made
 (`insert_inode_hash_once`, checked and hashed under the lock; Linux
@@ -2815,7 +2818,11 @@ inode_hash_lock, thread context): under it only the bucket links and
 the filesystem's `test` (which may take `Inode.private`, a spin
 RwLock, then vfat's `VfatInode.d`, a spin Mutex leaf held only to copy
 the data in or out), and a candidate's `i_lock` (igrab's slow path,
-Linux find_inode's spin_lock(&inode->i_lock)). Not IRQ-safe: an inode's last reference never goes
+Linux find_inode's spin_lock(&inode->i_lock)), as every hash, unhash
+and rehash (one hold for a rename's move) takes the inode's `i_lock`
+(Linux __insert_inode_hash, __remove_inode_hash), so its hashed state
+is exact under `i_lock` (`__mark_inode_dirty` queues only a hashed
+inode, or a block device's). Not IRQ-safe: an inode's last reference never goes
 in an interrupt handler (pinned pages and files are released in thread
 context: `PinnedPages`, `fput`), which lockdep checks (a tracked lock
 taken in an interrupt handler is reported). A lookup (Linux
