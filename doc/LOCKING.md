@@ -3024,18 +3024,22 @@ inode's superblock (`Inode.sb`, Linux i_sb) is a passive reference
 staying valid by the order below), which keeps only the memory, so
 its drop, the teardown's last, never shuts the filesystem down (it
 takes `SB_LOCK` if it is the last, so none is dropped under that
-lock). The superblock and its filesystem's data are there for the
-inode's whole life: the shutdown evicts every inode before ->put_super
-releases the data. The shutdown
+lock). The superblock is there for the inode's whole life, and so is
+the data of a filesystem whose inodes borrow it (vfat): the shutdown
+evicts every inode before ->put_super, which releases the data only
+if no inode is left on s_inodes (`SuperBlock::kill_fs_info_idle`;
+else it goes with the superblock's memory). The shutdown
 belongs to the last active reference (`SbActive`, Linux s_active:
 each mount's, devtmpfs's): its drop (Linux deactivate_super) takes
 s_umount for writing and runs `generic_shutdown_super` (inotify
 watches; the dentry tree, whose drop evicts the inodes its dentries
 held; sync_filesystem; ->put_super, which puts the filesystem's own
 inodes; then any inode left on s_inodes is a bug, reported as Linux's
-"Busy inodes after unmount": one referenced past its superblock's
-end, which nothing that pins the filesystem (a mount, an open file, a
-writeback pass under s_umount, a walk under s_umount) leaves) and the
+"Busy inodes after unmount", which fails a boot test: one referenced
+past its superblock's end, which nothing that pins the filesystem (a
+mount, an open file, a writeback pass under s_umount, a walk under
+s_umount) leaves, and no pinned page does (a pin holds the page, not
+its inode)) and the
 device's release, in
 thread context with nothing atomic held (mount teardown drops its
 reference after MOUNT_LOCK and NAMESPACE_SEM): `might_sleep` there
@@ -3100,11 +3104,15 @@ it too. No lock is added.
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
 superblock's `s_inodes` (an `InodeList` through `Inode.i_sb_list`,
 holding no reference) until
-its eviction (`evict`, after the writeback lists) unlinks it, under
-the list's own lock (`SuperBlock.s_inodes`, a spin Mutex leaf, thread
+its teardown (`destroy_inode`, its superblock reference's drop next)
+unlinks it, under the list's own lock (`SuperBlock.s_inodes`, a spin Mutex leaf, thread
 context; Linux s_inode_list_lock): the inode's superblock reference
 keeps the lock's memory, and the shutdown evicts every inode while the
-superblock runs (Inode cache, above). Taken by an inode's eviction, with
+superblock runs (Inode cache, above). Deviation from Linux (evict's
+inode_sb_list_del comes before ->evict_inode): unlinked last, so a
+listed inode is any that may still use its filesystem's data, which
+`kill_fs_info_idle` tests under this lock (walkers skip one being
+freed either way: igrab fails). Taken by an inode's teardown, with
 nothing held; under it only an inode's `i_lock` (igrab's slow path). The
 reclaim and drop_caches walks and the inotify shutdown
 (`for_each_sb_inode`, Linux drop_pagecache_sb, fsnotify_unmount_inodes)
@@ -3166,11 +3174,12 @@ lists below), set by the fill before it makes any inode and released
 by put_super (`fat_put_data`, Linux fat_put_super: iput of the FAT's
 inode, evicted while the data is there, then call_rcu of the rest),
 or by a fill that fails after setting it (Linux out_fail), in thread
-context. Every other inode is evicted before put_super
-(`generic_shutdown_super`), so an operation reaches the data from
-its inode with no reference or lock (`msdos_sb_of`, Linux
-MSDOS_SB(inode->i_sb): `SuperBlock::fs_info_ref`), as statfs does
-through its mount's active reference. `VfatSbData.fat_inode`
+context, both through `kill_fs_info_idle`: with an inode still
+listed (busy past the shutdown) the data stays until the superblock's
+memory goes. So an operation reaches the data from its inode with no
+reference or lock (`msdos_sb_of`, Linux MSDOS_SB(inode->i_sb):
+`SuperBlock::fs_info_ref`), as statfs does through its mount's active
+reference. `VfatSbData.fat_inode`
 (`FatInode`, Linux sbi->fat_inode) holds one reference from the fill
 to put_super, borrowed with no lock taken: the FAT's blocks are put on
 its metadata list.
@@ -3546,15 +3555,18 @@ put_super), so the lists allocate nothing under the lock (only a new
 superblock's anonymous device number may, GFP_ATOMIC, below). A
 filesystem's data (`SuperBlock.s_fs_info`, Linux s_fs_info, an
 `RcuOnceArc`) is set once by its fill or sget's set and released, as
-Linux, by its ->put_super (vfat, tmpfs) or ->kill_sb (procfs, sysfs,
-cgroup2, ramfs, tracefs) or a fill that fails after setting it, in
+Linux, by its ->put_super (vfat, tmpfs: every other inode evicted) or
+->kill_sb (procfs, sysfs, cgroup2, tracefs after kill_anon_super, every
+inode evicted; ramfs before it, its inodes live, as Linux
+ramfs_kill_sb: it sets none) or a fill that fails after setting it, in
 thread context (`kill_fs_info`: out of the cell, a grace period
 (synchronize_rcu), then the reference dropped there; Linux frees it
 by kfree_rcu / call_rcu, but here the data's drop may sleep: an
 inode's put, a pid namespace's), never with the superblock's memory,
 whose drop may come in any context (only a superblock never listed,
 sget's set having failed, still holds it then, dropped in sget's
-thread context). Readers borrow it under an RCU guard (`fs_info_rcu`:
+thread context, or one a busy inode kept: `kill_fs_info_idle`, vfat,
+whose data's drop does not sleep). Readers borrow it under an RCU guard (`fs_info_rcu`:
 sget's tests, short reads) or take a reference (`fs_info`), dropped
 in thread context; once released it reads as None. A superblock has two counts, as in
 Linux: active references (`SbActive`, `SuperBlock.s_active`, Linux

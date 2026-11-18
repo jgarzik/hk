@@ -507,14 +507,17 @@ impl Drop for FatInode {
 
 /// Release `sb`'s VFAT data (Linux fat_put_super, a failed fill's
 /// out_fail): the FAT's inode put first, evicted while the data is
-/// there, then the data a grace period on (`kill_fs_info`)
+/// there, then the data a grace period on, unless an inode is still
+/// listed, busy past the shutdown, whose borrows it then outlives
+/// (`kill_fs_info_idle`)
 fn fat_put_data(sb: &SuperBlock) {
-    // SAFETY: put_super or the failed fill: every other inode evicted,
-    // s_umount held for writing, and the data set
+    // SAFETY: put_super or the failed fill, the release's caller: the
+    // data set, s_umount held for writing
     let d = unsafe { msdos_sb(sb) };
-    // SAFETY: as above, no operation of the filesystem runs
+    // SAFETY: as above; every other inode evicted, so no operation of
+    // the filesystem runs
     unsafe { d.fat_inode.put() };
-    sb.kill_fs_info();
+    sb.kill_fs_info_idle();
 }
 
 /// What the FAT lock guards beyond the FAT itself
@@ -893,8 +896,9 @@ fn i_sb(inode: &Inode) -> &Arc<SuperBlock> {
 /// `sb`'s VFAT data (Linux MSDOS_SB(sb)), borrowed
 ///
 /// # Safety
-/// As [`SuperBlock::fs_info_ref`]: the caller holds an active reference
-/// to `sb`, or works for a live inode of it, or is its put_super.
+/// As [`SuperBlock::fs_info_ref`] (vfat releases the data only by
+/// `kill_fs_info_idle`): the caller holds an active reference to `sb`,
+/// or works for a live inode of it, or is its put_super.
 unsafe fn msdos_sb(sb: &SuperBlock) -> &VfatSbData {
     // SAFETY: the caller's contract
     unsafe { sb.fs_info_ref::<VfatSbData>() }.expect("vfat: a superblock with no data")
@@ -903,9 +907,10 @@ unsafe fn msdos_sb(sb: &SuperBlock) -> &VfatSbData {
 /// The VFAT data of `inode`'s filesystem (Linux
 /// MSDOS_SB(inode->i_sb)): borrowed with the inode
 fn msdos_sb_of(inode: &Inode) -> &VfatSbData {
-    // SAFETY: `inode` is live for the borrow; the shutdown evicts every
-    // inode before put_super releases the data, the FAT's own put first
-    // (`VfatSuperOps::put_super`)
+    // SAFETY: `inode` is live for the borrow, so listed on its
+    // superblock's s_inodes until its teardown is past any use of the
+    // data, and the data is released only while no inode is listed
+    // (`fat_put_data`: kill_fs_info_idle)
     unsafe { msdos_sb(i_sb(inode)) }
 }
 
