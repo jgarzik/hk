@@ -78,7 +78,7 @@ for b in $BOOTS; do
         # Where it stopped: the last serial lines and any failure lines
         log=$QEMU_LOG_DIR/serial.log
         case $b in check-arm) log=$QEMU_LOG_DIR/serial_arm.log ;; check-linux*) log=$OUT/$b.out ;; esac
-        grep -aE 'FAIL|panic|PANIC|abort|EXCEPTION' "$log" 2>/dev/null | tail -5 | sed 's/^/    /'
+        grep -aE 'FAIL|panic|PANIC|abort|EXCEPTION|Busy inodes' "$log" 2>/dev/null | tail -5 | sed 's/^/    /'
         echo "    (last lines of $log)"
         tail -3 "$log" 2>/dev/null | sed 's/^/    /'
     fi
