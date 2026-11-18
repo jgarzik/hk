@@ -320,10 +320,7 @@ lo (hk has no checksum offload states).
   vfat inode evicted after put_super finds no data (EIO): an unlinked
   one's clusters stay allocated (`VfatInodeOps::evict_inode`), and an
   operation already running when put_super ran keeps the data, its
-  FAT inode and device I/O going past kill_block_super's release
-  (`fs/pageio/fs_writeback.rs` `wb_writeback` with no superblock
-  given takes no s_umount per inode's superblock: Linux
-  __writeback_inodes_wb skips one super_trylock_shared fails on).
+  FAT inode and device I/O going past kill_block_super's release.
 
 ## O_DIRECT gaps
 

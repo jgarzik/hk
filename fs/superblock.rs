@@ -838,8 +838,10 @@ fn super_lock_excl(sb: &SuperBlock) -> Option<sync::RwSemWriteGuard<'_, ()>> {
 }
 
 /// s_umount for reading if free at once, on a superblock born and not
-/// dying (Linux super_trylock_shared)
-fn super_trylock_shared(sb: &SuperBlock) -> Option<sync::RwSemReadGuard<'_, ()>> {
+/// dying (Linux super_trylock_shared): reclaim's walk, the writeback
+/// pass over every superblock (taken under `BdiWriteback.list_lock`,
+/// never waiting)
+pub(in crate::fs) fn super_trylock_shared(sb: &SuperBlock) -> Option<sync::RwSemReadGuard<'_, ()>> {
     let g = sb.s_umount.try_read()?;
     (sb.super_flags(SB_BORN) && !sb.super_flags(SB_DYING)).then_some(g)
 }

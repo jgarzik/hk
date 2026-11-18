@@ -45,14 +45,19 @@
 //! syncfs(2), umount and a remount; sync(2) runs sync_inodes_sb on
 //! each, then the block devices; the periodic writeback
 //! (`wb_writeback`) runs for every superblock of the device and its
-//! own cache (the block device's inode is on the same lists).
+//! own cache (the block device's inode is on the same lists), each
+//! superblock pinned by s_umount for reading if free at once, else
+//! skipped (Linux __writeback_inodes_wb's super_trylock_shared).
 //!
 //! Locking (Linux): `BdiWriteback.list_lock` -> `Inode.i_lock`, both
 //! spin, thread context only; `i_state` is written under `i_lock` and
 //! read lock-free. `__mark_inode_dirty` may run under a page lock (the
 //! fault path), never under a spinlock. Writing sleeps (block I/O)
 //! with no spinlock held, under `BdiWriteback.pass` for a pass (its
-//! ->write_inode too: pass -> what that takes, vfat's `ipos`).
+//! ->write_inode too: pass -> what that takes, vfat's `ipos`), and
+//! under the inode's superblock's s_umount: the caller's for a pass
+//! over one superblock (sync_filesystem, sync(2)), else taken by the
+//! pass with trylock under `list_lock`.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{Ordering, fence};
@@ -68,7 +73,7 @@ use crate::fs::inode::istate::{
     I_SYNC_QUEUED, I_WILL_FREE,
 };
 use crate::fs::inode::{ILocked, Inode, InodeList, InodeRef};
-use crate::fs::superblock::{SuperBlock, iterate_supers};
+use crate::fs::superblock::{SuperBlock, iterate_supers, super_trylock_shared};
 use crate::mm::writeback::{BdiWriteback, WbLists};
 use crate::mm::xarray::{MARK_DIRTY, MARK_WRITEBACK};
 use crate::sync::spin::MutexGuard;
@@ -576,11 +581,14 @@ enum Next {
 
 /// Take the next inode off `b_io` for `wbc`'s pass over `sb` (Linux
 /// writeback_sb_inodes' checks): one of another superblock goes back
-/// to `b_dirty`, as does one being freed (its teardown writes it); one
-/// another writer has (I_SYNC) goes to `b_more_io`, or is waited for by
-/// a data-integrity pass; else it is marked I_SYNC and referenced (hk
-/// pins it so; Linux by I_SYNC, which evict waits for)
-fn next_inode(wb: &BdiWriteback, wbc: &WritebackControl, sb: Option<&SuperBlock>) -> Next {
+/// to `b_dirty` if the pass is for `sb` only (`only`), else ends this
+/// superblock's part of the pass (Linux: back to the caller, to pin the
+/// next superblock); one being freed goes back to `b_dirty` (its
+/// teardown writes it); one another writer has (I_SYNC) goes to
+/// `b_more_io`, or is waited for by a data-integrity pass; else it is
+/// marked I_SYNC and referenced (hk pins it so; Linux by I_SYNC, which
+/// evict waits for)
+fn next_inode(wb: &BdiWriteback, wbc: &WritebackControl, sb: &SuperBlock, only: bool) -> Next {
     let mut lists = wb.list_lock.lock();
     let l = &mut *lists;
     let Some(w) = l.b_io.front() else {
@@ -591,10 +599,12 @@ fn next_inode(wb: &BdiWriteback, wbc: &WritebackControl, sb: Option<&SuperBlock>
     // list under `list_lock` then `i_lock` before any field goes. The
     // borrow is detached from the list's so the list can be changed.
     let w: &Inode = unsafe { &*core::ptr::from_ref(w) };
+    let other = !core::ptr::eq(w.sb.as_ptr(), sb);
+    if other && !only {
+        return Next::Done;
+    }
     let il = w.i_lock.lock();
-    if sb.is_some_and(|s| !core::ptr::eq(w.sb.as_ptr(), s))
-        || w.state() & (I_FREEING | I_WILL_FREE) != 0
-    {
+    if other || w.state() & (I_FREEING | I_WILL_FREE) != 0 {
         // SAFETY: under both locks; I_FREEING is dropped off the lists
         unsafe { redirty_tail_locked(l, w, &il) };
         return Next::Again;
@@ -614,16 +624,16 @@ fn next_inode(wb: &BdiWriteback, wbc: &WritebackControl, sb: Option<&SuperBlock>
     Next::Write(w.__iget(&il))
 }
 
-/// One pass over `wb` (Linux wb_writeback -> writeback_sb_inodes): the
-/// inodes dirtied at or before `cutoff` (of `sb` only, if given) are
-/// queued on `b_io` and written one at a time, each requeued by its
-/// state after. Write errors are the mappings' (Linux: recorded by
-/// mapping_set_error for fsync and syncfs to report).
-fn wb_writeback(wb: &BdiWriteback, wbc: &WritebackControl, cutoff: u64, sb: Option<&SuperBlock>) {
-    let _pass = wb.pass.lock();
-    queue_io(&mut wb.list_lock.lock(), cutoff, sb);
+/// Write the inodes of `sb` at the front of `b_io` one at a time, each
+/// requeued by its state after (Linux writeback_sb_inodes), until
+/// `b_io` is empty or, unless the pass is for `sb` only (`only`),
+/// begins with another superblock's inode. The caller holds `sb`'s
+/// s_umount (Linux: for reading, or the pass's own caller's). Write
+/// errors are the mappings' (Linux: recorded by mapping_set_error for
+/// fsync and syncfs to report).
+fn writeback_sb_inodes(wb: &BdiWriteback, wbc: &WritebackControl, sb: &SuperBlock, only: bool) {
     loop {
-        let inode = match next_inode(wb, wbc, sb) {
+        let inode = match next_inode(wb, wbc, sb, only) {
             Next::Done => break,
             Next::Again | Next::Waited => continue,
             Next::Write(i) => i,
@@ -637,6 +647,55 @@ fn wb_writeback(wb: &BdiWriteback, wbc: &WritebackControl, cutoff: u64, sb: Opti
         }
         // Its last reference may go here, with no lock held
         drop(inode);
+    }
+}
+
+/// Write `b_io` superblock by superblock (Linux __writeback_inodes_wb):
+/// the front inode's superblock is pinned with s_umount for reading
+/// (`super_trylock_shared`, taken under `list_lock` as Linux), its
+/// inodes written, then released; one whose s_umount is not free at
+/// once, or that is not set up or is being shut down, has the inode
+/// sent back to `b_dirty` (Linux redirty_tail: no busy retry), so no
+/// pass writes an inode of a superblock a shutdown or remount holds
+fn __writeback_inodes_wb(wb: &BdiWriteback, wbc: &WritebackControl) {
+    loop {
+        let mut lists = wb.list_lock.lock();
+        let Some(w) = lists.b_io.front() else {
+            return;
+        };
+        // SAFETY: linked, so live while `list_lock` is held (the lists'
+        // contract); detached from the list's borrow so it can change
+        let w: &Inode = unsafe { &*core::ptr::from_ref(w) };
+        // A passive reference, dropped with `list_lock` released
+        let sb = w.superblock();
+        let g = sb.as_deref().and_then(super_trylock_shared);
+        let Some(g) = g else {
+            let il = w.i_lock.lock();
+            // SAFETY: under both locks, linked (see above)
+            unsafe { redirty_tail_locked(&mut lists, w, &il) };
+            drop(il);
+            // `sb` goes after, at the iteration's end
+            drop(lists);
+            continue;
+        };
+        drop(lists);
+        if let Some(sb) = &sb {
+            writeback_sb_inodes(wb, wbc, sb, false);
+        }
+        drop(g);
+    }
+}
+
+/// One pass over `wb` (Linux wb_writeback): the inodes dirtied at or
+/// before `cutoff` (of `sb` only, if given) are queued on `b_io` and
+/// written, those of `sb` under its caller's s_umount, the others
+/// superblock by superblock (`__writeback_inodes_wb`)
+fn wb_writeback(wb: &BdiWriteback, wbc: &WritebackControl, cutoff: u64, sb: Option<&SuperBlock>) {
+    let _pass = wb.pass.lock();
+    queue_io(&mut wb.list_lock.lock(), cutoff, sb);
+    match sb {
+        Some(sb) => writeback_sb_inodes(wb, wbc, sb, true),
+        None => __writeback_inodes_wb(wb, wbc),
     }
 }
 
