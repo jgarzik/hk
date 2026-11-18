@@ -49,16 +49,20 @@ pub fn vfs_fsync(file: &crate::fs::file::File, datasync: bool) -> KernelResult<(
     vfs_fsync_range(file, 0, LLONG_MAX, datasync)
 }
 
-/// syncfs(2) (Linux sync_filesystem of the file's superblock): its
-/// dirty inodes, then its device's cache; a write error is EIO, as is
-/// a writeback error of the filesystem since this file last looked,
+/// syncfs(2) (Linux sync_filesystem of the file's superblock, under
+/// its s_umount for reading, so no remount or freeze runs meanwhile):
+/// its dirty inodes, then its device's cache; a write error is EIO, as
+/// is a writeback error of the filesystem since this file last looked,
 /// once (Linux s_wb_err against f_sb_err)
 pub fn sys_syncfs(fd: i32) -> KernelResult<()> {
     let file = fget(fd)?;
     let Some(sb) = file.get_inode().and_then(|i| i.superblock().cloned()) else {
         return Ok(());
     };
-    let r = sync_filesystem(&sb);
+    let r = {
+        let _g = sb.s_umount.read();
+        sync_filesystem(&sb)
+    };
     let seen = file.check_and_advance_sb_err();
     r.and(seen)
 }
