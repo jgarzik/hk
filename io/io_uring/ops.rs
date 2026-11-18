@@ -168,12 +168,27 @@ pub fn open(r: &IoRing, a: &OpenArgs, held: Option<&mut Submit>) -> KernelResult
     }
 }
 
+/// Linux io_fsync_prep, io_fsync: bytes [off, off + len] synced (to
+/// the end for an end past LLONG_MAX or a zero len at 0), data only
+/// with IORING_FSYNC_DATASYNC
 fn fsync(sqe: &IoUringSqe) -> KernelResult<i32> {
-    if sqe.op_flags & IORING_FSYNC_DATASYNC != 0 {
-        crate::fs::syscall::sys_fdatasync(sqe.fd).map(|()| 0)
-    } else {
-        crate::fs::syscall::sys_fsync(sqe.fd).map(|()| 0)
+    use crate::fs::sync::{LLONG_MAX, vfs_fsync_range};
+    if sqe.addr != 0
+        || sqe.buf_index != 0
+        || sqe.splice_fd_in != 0
+        || sqe.op_flags & !IORING_FSYNC_DATASYNC != 0
+        || (sqe.off as i64) < 0
+    {
+        return Err(KernelError::InvalidArgument);
     }
+    let file = crate::fs::io::fget(sqe.fd)?;
+    // loff_t end = off + len; end > 0 ? end : LLONG_MAX
+    let end = match (sqe.off as i64).checked_add(i64::from(sqe.len)) {
+        Some(e) if e > 0 => e as u64,
+        _ => LLONG_MAX,
+    };
+    let datasync = sqe.op_flags & IORING_FSYNC_DATASYNC != 0;
+    vfs_fsync_range(&file, sqe.off, end, datasync).map(|()| 0)
 }
 
 /// The socket operations, through their syscalls, `more` (MSG_*) added

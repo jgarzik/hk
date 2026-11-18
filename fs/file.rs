@@ -408,16 +408,14 @@ pub trait FileOps: Send + Sync {
         None
     }
 
-    /// Sync file data to backing store
-    fn fsync(&self, _file: &File) -> Result<(), KernelError> {
+    /// Sync bytes [start, end] of the file and, unless `datasync`, its
+    /// metadata, or with `datasync` only the metadata the data needs
+    /// (Linux f_op->fsync); its writeback error since this file last
+    /// looked is reported here too (file_check_and_advance_wb_err).
+    /// Default nothing to sync (Linux noop_fsync).
+    fn fsync(&self, file: &File, start: u64, end: u64, datasync: bool) -> Result<(), KernelError> {
+        let _ = (file, start, end, datasync);
         Ok(())
-    }
-
-    /// Sync the data of bytes [start, end] (Linux f_op->fsync with a
-    /// range, from generic_write_sync); default: the whole file
-    fn fsync_range(&self, file: &File, start: u64, end: u64) -> Result<(), KernelError> {
-        let _ = (start, end);
-        self.fsync(file)
     }
 
     /// A descriptor of the file is being closed (close, dup2 over it,
@@ -991,10 +989,8 @@ impl File {
                 .map(|n| (pos, n))
         })()?;
         drop(lock);
-        // After i_rwsem is released; a synchronous mount is Linux IS_SYNC
-        let sync =
-            flags.contains(RwFlags::DSYNC) || inode.superblock().is_some_and(|sb| sb.synchronous());
-        generic_write_sync(self, pos, n, sync)
+        // After i_rwsem is released
+        generic_write_sync(self, pos, n, flags)
     }
 
     /// Seek
@@ -1496,18 +1492,33 @@ pub fn files_init() {
     }
 }
 
-/// After a write of `n` bytes at `pos` of `file` that must be
-/// synchronous (`dsync`: IOCB_DSYNC, or the inode IS_SYNC), those bytes
-/// reach the storage before the write returns, and an error doing so is
-/// the write's (Linux generic_write_sync: vfs_fsync_range over them)
+/// The write must be synchronous (Linux iocb_is_dsync): IOCB_DSYNC
+/// (O_DSYNC, O_SYNC, RWF_DSYNC, RWF_SYNC), or the file's inode IS_SYNC
+/// (a synchronous mount)
+fn iocb_is_dsync(file: &File, flags: RwFlags) -> bool {
+    flags.contains(RwFlags::DSYNC)
+        || file
+            .get_inode()
+            .and_then(|i| i.superblock())
+            .is_some_and(|sb| sb.synchronous())
+}
+
+/// After a write of `n` bytes at `pos` of `file` with I/O flags
+/// `flags`: for a synchronous one (`iocb_is_dsync`) those bytes reach
+/// the storage before the write returns, with all the metadata for
+/// IOCB_SYNC (O_SYNC, RWF_SYNC) and only what the data needs otherwise
+/// (datasync), and an error doing so is the write's (Linux
+/// generic_write_sync: vfs_fsync_range over them)
 pub fn generic_write_sync(
     file: &File,
     pos: u64,
     n: usize,
-    dsync: bool,
+    flags: RwFlags,
 ) -> Result<usize, KernelError> {
-    if n > 0 && dsync {
-        crate::fs::sync::vfs_fsync_range(file, pos, pos.saturating_add(n as u64 - 1))?;
+    if n > 0 && iocb_is_dsync(file, flags) {
+        let end = pos.saturating_add(n as u64 - 1);
+        let datasync = !flags.contains(RwFlags::SYNC);
+        crate::fs::sync::vfs_fsync_range(file, pos, end, datasync)?;
     }
     Ok(n)
 }

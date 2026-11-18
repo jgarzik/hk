@@ -727,6 +727,25 @@ pub fn write_and_wait_range(inode: &Inode, start: u64, end: u64) -> Result<(), K
     write_range(inode, start / p, end / p)
 }
 
+/// Write back the dirty pages of `file`'s mapping holding bytes
+/// [start, end] and wait, then report its writeback error since the
+/// file last looked, once; the first error (Linux
+/// file_write_and_wait_range)
+pub fn file_write_and_wait_range(
+    file: &crate::fs::file::File,
+    start: u64,
+    end: u64,
+) -> Result<(), KernelError> {
+    if end < start {
+        return Ok(());
+    }
+    let r = match file.mapping_inode() {
+        Some(host) => write_and_wait_range(&host, start, end),
+        None => Ok(()),
+    };
+    r.and(file.check_and_advance_wb_err())
+}
+
 /// Some page of `m` has mark `mark` (Linux mapping_tagged)
 pub fn mapping_tagged(m: &AddressSpace, mark: usize) -> bool {
     m.i_pages.lock().marked(mark)

@@ -179,7 +179,7 @@ fn cache_fallback(
     let mut from = IovSource::async_io(io);
     from.truncate(count);
     let n = write_fallback(b, &mut from, pos, 0, flags.nowait())?;
-    generic_write_sync(file, pos, n, flags.contains(RwFlags::DSYNC))
+    generic_write_sync(file, pos, n, flags)
 }
 
 /// Last byte of `count` (> 0) bytes at `pos`
@@ -742,7 +742,7 @@ impl FileOps for BlockFileOps {
         if at.is_none() {
             file.advance_pos(n as u64);
         }
-        generic_write_sync(file, pos, n, flags.contains(RwFlags::DSYNC))
+        generic_write_sync(file, pos, n, flags)
     }
 
     /// Positions within the device only (Linux fixed_size_llseek)
@@ -765,18 +765,17 @@ impl FileOps for BlockFileOps {
         Ok(pos as u64)
     }
 
-    /// Write the whole cache back, then flush the disk's write cache
-    fn fsync(&self, file: &File) -> Result<(), KernelError> {
-        self.fsync_range(file, 0, u64::MAX)
-    }
-
     /// Write back the cache over bytes [start, end], then flush the
     /// disk's write cache (Linux blkdev_fsync:
-    /// file_write_and_wait_range, blkdev_issue_flush)
-    fn fsync_range(&self, file: &File, start: u64, end: u64) -> Result<(), KernelError> {
+    /// file_write_and_wait_range, blkdev_issue_flush; EOPNOTSUPP from
+    /// the flush is success)
+    fn fsync(&self, file: &File, start: u64, end: u64, _datasync: bool) -> Result<(), KernelError> {
         let b = bdev(file)?;
-        filemap::write_and_wait_range(&b.bd_inode, start, end)?;
-        blkdev_issue_flush(&b)
+        filemap::file_write_and_wait_range(file, start, end)?;
+        match blkdev_issue_flush(&b) {
+            Err(KernelError::OperationNotSupported) => Ok(()),
+            r => r,
+        }
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {

@@ -1274,14 +1274,21 @@ fn msync_vmas(mm: &super::Mm, mut start: u64, end: u64, flags: i32) -> Result<()
             if flags & MS_INVALIDATE != 0 && vma.is_locked() {
                 return Err(KernelError::Busy);
             }
+            // The file bytes [fstart, fend] behind [start, min(end,
+            // vm_end)), start past a hole moved to vm_start (Linux
+            // linear_page_index)
+            let s = start.max(vma.start);
+            let fstart = vma.offset + (s - vma.start);
+            let fend = fstart + (end.min(vma.end) - s) - 1;
             start = vma.end;
             vma.file
                 .clone()
                 .filter(|_| flags & MS_SYNC != 0 && vma.is_shared())
+                .map(|f| (f, fstart, fend))
         };
-        // The whole file is written back (Linux: the range only)
-        if let Some(f) = file {
-            crate::fs::sync::vfs_fsync(&f, false)?;
+        // Linux msync: vfs_fsync_range(file, fstart, fend, 1)
+        if let Some((f, fstart, fend)) = file {
+            crate::fs::sync::vfs_fsync_range(&f, fstart, fend, true)?;
         }
     }
     if unmapped {

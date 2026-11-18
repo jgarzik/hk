@@ -3191,11 +3191,18 @@ impl FileOps for VfatFileOps {
 
     /// Write the file's pages, the FAT and directory blocks, then flush
     /// the disk (Linux fat_file_fsync: generic_file_fsync + blkdev flush)
-    fn fsync(&self, file: &File) -> Result<(), KernelError> {
+    fn fsync(
+        &self,
+        file: &File,
+        _start: u64,
+        _end: u64,
+        _datasync: bool,
+    ) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        super::fs_writeback::write_inode_now(&inode, true)?;
+        let r = super::fs_writeback::write_inode_now(&inode, true);
+        r.and(file.check_and_advance_wb_err())?;
         crate::block::blkdev::sync_blockdev(&sb_data.bdev)?;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }

@@ -683,10 +683,10 @@ waiting).
 
 ## fsync and freeze gaps
 
-**Location**: `fs/file.rs` (`FileOps::fsync`), `fs/inode.rs` (`touch_atime`)
+**Location**: `fs/vfat/mod.rs` (`VfatFileOps::fsync`), `fs/inode.rs` (`touch_atime`)
 
-- `FileOps::fsync` takes no datasync flag, so fdatasync writes a
-  times-only dirty inode too (Linux vfs_fsync_range(datasync) skips
+- vfat's fsync ignores datasync, so fdatasync and an O_DSYNC write
+  write a times-only dirty inode too (Linux simple_fsync_noflush skips
   I_DIRTY_SYNC unless I_DIRTY_DATASYNC).
 - No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
   such as touch_atime take mount write access only.
