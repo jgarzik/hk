@@ -105,6 +105,7 @@ pub fn start_threads() {
 
 /// Initialize the network subsystem
 pub fn init() {
+    netlink::init();
     crate::ns::net::net_ns_init();
     tcp::mem::init();
     tcp::table::init();

@@ -28,7 +28,7 @@ use spin::Lazy;
 use crate::net::device::{DevList, LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::inet::fib::Fib;
 use crate::net::inet::port::PortRange;
-use crate::net::netlink::NlTable;
+use crate::net::netlink::NlNet;
 use crate::util::error::KernelError;
 use crate::util::rculist::RcuList;
 
@@ -74,7 +74,7 @@ pub struct NetNamespace {
     pub fib: Fib,
 
     /// netlink sockets bound in this namespace
-    pub nl: NlTable,
+    pub nl: NlNet,
 
     /// TCP connection, listener and port tables
     pub tcp: crate::net::tcp::table::TcpTables,

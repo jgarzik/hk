@@ -3754,7 +3754,7 @@ by `for_each_net` and the sysfs setup's snapshot, which registers
 devices and so sends uevents after releasing it; written at namespace
 creation and by `cleanup_net` (from the `netns` workqueue, before it
 takes RTNL); thread context, a uevent is sent from a sleepable context as
-Linux's kobject_uevent), then each namespace's `NlTable.socks` -> `NlSock.rxq`;
+Linux's kobject_uevent), then each namespace's uevent multicast list (a snapshot: the clones are GFP_KERNEL) -> `NlSock.rxq`;
 `ksysfs::UEVENT_HELPER` (a fixed array, Linux uevent_helper) is a spin
 leaf: show copies it out and emits after releasing it.
 
@@ -5872,7 +5872,7 @@ not rely on either.
 | `NetMib` (`net/mib.rs`, per netns `NetNamespace.mib`; Linux net->mib) | none: per-CPU `AtomicU64` words (IcmpMsg: one atomic per entry, Linux DEFINE_SNMP_STAT_ATOMIC) | any (receive, transmit under socket and queue locks, timers, syscalls) | lock-free counters: an update is one relaxed RMW on the calling CPU's word (Linux this_cpu_inc: safe from IRQs and preemption; a task moved between picking the word and the RMW still counts exactly, on the other CPU's word); /proc/net/snmp and /proc/net/netstat sum every CPU's words (snmp_fold_field), not a snapshot. Its `inuse` gauges (/proc/net/sockstat's sockets, TCP/UDP/RAW hashed and TIME_WAIT counts; Linux prot_inuse) also go down by one: a part may wrap, the sum (read clamped at 0, sock_prot_inuse_get) does not; each socket moves them once each way, guarded by its own flag (`Sock.inuse`, `TcpSock.inuse`, swapped). Takes no lock, so it has no order position |
 | `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimers/N) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
 | `route::FNHE_LOCK` (`net/inet/route.rs`, global; Linux fnhe_lock) | `spin::Mutex<FnheLock>` (its `UniqueOwner` proves writers of every nexthop's `RcuHList` exception chains) | thread only (softnet ICMP frag-needed input, `route::output` deleting an expired exception, possibly under a socket lock) | leaf: a route's chains are allocated at its first exception and each exception is created under it with `Gfp::ATOMIC` (Linux kzalloc GFP_ATOMIC under fnhe_lock), dropped without memory; past a chain depth of 5 to 9 (randomized, Linux FNHE_RECLAIM_DEPTH) the oldest is removed first; removed ones are freed after a grace period. Readers (`route::output`) walk the chain under RCU; pmtu and expiry are atomics updated in place. The chains go with their route (a replaced route's with it) |
-| `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones. A bind/autobind checks the socket's `bound` and publishes its portid under the write lock (Linux netlink_insert), so concurrent binds of one socket cannot both insert |
+| `NL_TABLE.lock` (`net/netlink`, one for every namespace) | `spin::Mutex<NlLocked>` (Linux nl_table's hash locks and netlink_table_grab; its `UniqueOwner` proves writers of the port id `RcuHList` chains, sized at boot) | thread only | a bind/autobind checks the socket's `bound`, searches the chain and publishes its portid in one hold (Linux netlink_insert), so concurrent binds of one socket cannot both insert; release unhashes under it; a first subscription adds the socket to its namespace's multicast list of its protocol (`NlNet.mc`, an `RcuList` whose writers' leaf nests inside), which it leaves at release. Unicast lookups walk a chain under `rcu::read_lock` and take a reference under the guard (Linux netlink_lookup); broadcasts walk a multicast list under RCU, or a snapshot taken before when the clones may sleep (Linux netlink_lock_table + do_one_broadcast's caller GFP). Released sockets' references go a grace period later (`defer_put`, `RcuUnlinked::defer`), possibly in `rcuc/N` |
 | `NlSock.dump` | sleeping `sync::Mutex<Option<Dump>>` (Linux nlk->cb_mutex) | thread only (sender's `sendmsg`, reader's `recvmsg`, release) | running dump cursor; held while it snapshots devices/FIB/ARP and while its part is queued to `rxq` (keeps parts ordered); readers are woken after it is dropped; never with RTNL. `NlSock.running` (atomic, Linux cb_running) says a dump is set: written under it, read lock-free by poll (`readable`, possibly under an epoll IrqSpinlock) |
 | `NlSock.rxq`, `NlSock.dst` | `SkbQueue` (spin `Mutex`) / `spin::Mutex` | thread only | leaves; replies, dump parts and notifications are skbs (`SkBuff::from_vec`, `SkbCb::Nl`) wrapped in their `Arc` before the queue lock and pushed under it (each charged to rcvbuf first; a broadcast clones each extra receiver's copy with no lock held, under the caller's GFP, Linux netlink_broadcast's allocation), MSG_PEEK takes a reference under it and copies after, a release purges it and frees after; `Sock.wq` is woken (`data_ready`) after it is dropped; a dequeue wakes `NlSock.wait` (Linux nlk->wait: user senders waiting for room) after it is dropped |
 | `NlSock` portid/groups/flags/err/rmem/congested/dead, autobind `ROVER` | atomics | thread only | `dead` (Linux SOCK_DEAD) is set at release, which then purges `rxq` and wakes `NlSock.wait`: a user sender waiting there for room fails ECONNREFUSED |
@@ -5926,7 +5926,8 @@ NetNamespace tables (RwLocks; lookups drop the guard before returning);
      transmit)
   (RAW_TABLE.lock -> Inet.addr; FragTable.st, FNHE_LOCK, IcmpRate.st,
    Sock.errq, RxQueue.q: leaves, never held while transmitting)
-  -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
+  -> NL_TABLE.lock -> NlSock.rxq (netlink replies/notifications;
+     lookups and broadcasts under RCU take no table lock)
   (AF_UNIX: UnixSock.bindlock (sleeping) -> UnixTable buckets / BSD bucket
    -> UnixSock.addr / path; UnixSock.iolock (sleeping) -> UnixSock.st (listener
    before connector, else by address) -> UnixSock.rq / peercred / addr /
@@ -5970,7 +5971,7 @@ the sender's `sendmsg` with no lock held on entry; mutating handlers take
 RTNL; handlers that change a device look it up under RTNL (Linux
 locked doits), so they never act on an unregistered one. Carrier
 changes (`netif_carrier_on/off`, from a driver's NAPI poll
-or `open()`) send RTM_NEWLINK without RTNL (NlTable.socks -> NlSock.rxq
+or `open()`) send RTM_NEWLINK without RTNL (a multicast list -> NlSock.rxq
 only). Open/close follow Linux __dev_open/__dev_close: `running` is set
 before the driver's open (which `napi_enable`s, then unmasks) and cleared
 before its stop (which `napi_disable`s, waiting for a running poll, then
