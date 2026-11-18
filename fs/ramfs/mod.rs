@@ -1323,7 +1323,7 @@ fn new_inode(
     time: Timespec,
 ) -> Result<InodeRef, KernelError> {
     reserve_inode(sb)?;
-    let (ino, w) = (sb.alloc_ino(), Arc::downgrade(sb));
+    let (ino, w) = (sb.alloc_ino(), Some(sb));
     let ops = &RAMFS_INODE_OPS;
     let mut i = match &kind {
         Kind::Dev(rdev) => Inode::new_device(ino, mode, uid, gid, *rdev, time, w, ops),

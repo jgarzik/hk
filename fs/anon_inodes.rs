@@ -88,7 +88,7 @@ pub fn anon_inode_init() -> Result<(), KernelError> {
         0,
         0,
         Timespec::from_secs(0),
-        Arc::downgrade(&sb),
+        Some(&sb),
         &ANON_INODE_OPS,
     ))?;
     ANON_INODE.call_once(|| inode);

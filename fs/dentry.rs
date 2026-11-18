@@ -1996,7 +1996,7 @@ mod tests {
             0,
             0,
             Timespec::from_secs(0),
-            Weak::new(),
+            None,
             &NULL_INODE_OPS,
         ))
         .unwrap()
@@ -2182,7 +2182,7 @@ mod tests {
             0,
             0,
             Timespec::from_secs(0),
-            Weak::new(),
+            None,
             &NULL_INODE_OPS,
         ))
         .unwrap();

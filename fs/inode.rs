@@ -4,7 +4,7 @@
 //! independent of its name(s) in the directory tree.
 
 use alloc::boxed::Box;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
@@ -1263,7 +1263,7 @@ impl Inode {
         gid: Gid,
         size: u64,
         mtime: Timespec,
-        sb: Weak<SuperBlock>,
+        sb: Option<&Arc<SuperBlock>>,
         i_op: &'static dyn InodeOps,
     ) -> InodeInit {
         InodeInit {
@@ -1274,7 +1274,7 @@ impl Inode {
             size,
             rdev: DevId::null(),
             mtime,
-            sb,
+            sb: sb.cloned(),
             i_op,
             i_generation: 0,
         }
@@ -1293,7 +1293,7 @@ impl Inode {
         gid: Gid,
         rdev: DevId,
         mtime: Timespec,
-        sb: Weak<SuperBlock>,
+        sb: Option<&Arc<SuperBlock>>,
         i_op: &'static dyn InodeOps,
     ) -> InodeInit {
         InodeInit {
@@ -1308,14 +1308,14 @@ impl Inode {
     /// superblock stays unlisted. Its memory is freed a grace period
     /// after its last reference's teardown (`i_callback`).
     pub fn alloc(init: InodeInit) -> Result<InodeRef, KernelError> {
-        let sb = init.sb.upgrade();
         // Linux inode_init_always: i_blkbits = sb->s_blocksize_bits
-        let blkbits = sb
+        let blkbits = init
+            .sb
             .as_ref()
             .map_or(crate::mm::page::PAGE_SHIFT as u8, |s| s.s_blocksize_bits());
         let p = Box::into_raw(try_box_uninit::<Self>()?).cast::<Self>();
         // SAFETY: `p` is the new block, unshared and not yet initialized
-        unsafe { Self::init_at(p, init, sb, blkbits) };
+        unsafe { Self::init_at(p, init, blkbits) };
         // INVARIANT: `init_at` wrote every field, `i_count` 1: this
         // reference; the block is freed only by `i_callback`
         // SAFETY: from `Box::into_raw`, never null
@@ -1332,7 +1332,7 @@ impl Inode {
     ///
     /// # Safety
     /// `p` is valid for writes of an `Inode`, unshared.
-    unsafe fn init_at(p: *mut Self, i: InodeInit, sb: Option<Arc<SuperBlock>>, blkbits: u8) {
+    unsafe fn init_at(p: *mut Self, i: InodeInit, blkbits: u8) {
         // Each field written once, and every field: the pattern names
         // the same list without `..`, so a field missed or named twice
         // fails to build
@@ -1367,7 +1367,7 @@ impl Inode {
             atime: InodeTime::new(t),
             mtime: InodeTime::new(t),
             ctime: InodeTime::new(t),
-            sb: ManuallyDrop::new(sb),
+            sb: ManuallyDrop::new(i.sb),
             i_op: i.i_op,
             i_rwsem: RwSem::new(()),
             i_dio_count: AtomicU32::new(0),
@@ -2024,7 +2024,9 @@ pub struct InodeInit {
     pub size: u64,
     pub rdev: DevId,
     pub mtime: Timespec,
-    pub sb: Weak<SuperBlock>,
+    /// Its superblock, a passive reference the inode keeps (Linux
+    /// new_inode(sb)); None for one of no filesystem
+    pub sb: Option<Arc<SuperBlock>>,
     pub i_op: &'static dyn InodeOps,
     /// Set by the filesystem before [`Inode::alloc`] (Linux
     /// i_generation)
@@ -2251,7 +2253,7 @@ mod tests {
             0,
             0,
             Timespec::ZERO,
-            Weak::new(),
+            None,
             &COUNT_OPS,
         ))
         .unwrap();
@@ -2276,7 +2278,7 @@ mod tests {
             0,
             0,
             Timespec::ZERO,
-            Weak::new(),
+            None,
             &TEST_OPS,
         ))
         .unwrap();

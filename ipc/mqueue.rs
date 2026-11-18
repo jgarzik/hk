@@ -32,7 +32,7 @@ use crate::util::list::{BoxList, Link};
 use crate::util::rbtree::{RbTree, RbTreeNode, RbTreeNodeReservation};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -637,7 +637,7 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> KernelRe
         0,                           // gid
         0,                           // size
         InodeTimespec::from_secs(0), // mtime
-        Weak::new(),                 // no superblock
+        None,                        // no superblock
         &NULL_INODE_OPS,
     ))?;
 

@@ -162,7 +162,7 @@ fn pseudo_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
         0,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &NULL_INODE_OPS,
     ))?;
     sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(

@@ -372,7 +372,7 @@ mod tests {
             0,
             0,
             Timespec::ZERO,
-            Arc::downgrade(&sb),
+            Some(&sb),
             &DYING_OPS,
         ))
         .unwrap();

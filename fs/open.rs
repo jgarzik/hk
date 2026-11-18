@@ -643,17 +643,7 @@ mod tests {
 
     fn inode(ino: u64, mode: InodeMode) -> crate::fs::InodeRef {
         let t = Timespec::from_secs(0);
-        Inode::alloc(Inode::new(
-            ino,
-            mode,
-            0,
-            0,
-            0,
-            t,
-            Weak::new(),
-            &NULL_INODE_OPS,
-        ))
-        .unwrap()
+        Inode::alloc(Inode::new(ino, mode, 0, 0, 0, t, None, &NULL_INODE_OPS)).unwrap()
     }
 
     /// An O_CREAT open of an existing file is answered by the RCU walk

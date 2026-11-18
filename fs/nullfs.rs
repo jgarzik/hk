@@ -186,7 +186,7 @@ pub fn new_file(sb: &Arc<SuperBlock>) -> Result<crate::fs::DentryRef, KernelErro
         0,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &NULLFS_FILE_INODE_OPS,
     ))?;
     crate::fs::DentryRef::new(Dentry::new_root(inode, Arc::downgrade(sb)))
@@ -209,7 +209,7 @@ fn fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
         0,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &NULLFS_INODE_OPS,
     ))?;
     sb.set_root(crate::fs::DentryRef::new(Dentry::new_root(

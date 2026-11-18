@@ -18,7 +18,7 @@
 //! A file's operations run with no tracefs lock held (a write under
 //! the file's i_rwsem, as every regular file's).
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -144,7 +144,7 @@ static TRACEFS_IOPS: TracefsIops = TracefsIops;
 /// A new inode of the superblock `sb` (Linux tracefs_get_inode: the
 /// next pseudo inode number, the times now)
 fn new_inode(
-    sb: Weak<SuperBlock>,
+    sb: Option<&Arc<SuperBlock>>,
     ino: u64,
     mode: InodeMode,
     (uid, gid): (u32, u32),
@@ -179,13 +179,7 @@ fn create(
             None => Inode::igrab(dir).ok_or(KernelError::NotFound)?,
         };
         let ids = (dir.uid(), dir.gid());
-        let i = new_inode(
-            dir.superblock().map_or_else(Weak::new, Arc::downgrade),
-            ino,
-            mode,
-            ids,
-            (f, Some(root)),
-        )?;
+        let i = new_inode(dir.superblock(), ino, mode, ids, (f, Some(root)))?;
         if mode.is_dir() {
             dir.inc_nlink();
         }
@@ -499,7 +493,7 @@ fn fill_super(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     let fsi = FsInfo(SpinMutex::new((0, 0, TRACEFS_DEFAULT_MODE)));
     sb.set_fs_info(crate::fs::superblock::FsInfo::new(try_arc(fsi)?)?);
     let mode = InodeMode::directory(TRACEFS_DEFAULT_MODE);
-    let ri = new_inode(Arc::downgrade(sb), 1, mode, (0, 0), (None, None))?;
+    let ri = new_inode(Some(sb), 1, mode, (0, 0), (None, None))?;
     sb.set_root(DentryRef::new(Dentry::new_root(ri, Arc::downgrade(sb)))?);
     Ok(())
 }
@@ -573,15 +567,8 @@ mod tests {
     // host (EL0) test cannot read
     #[cfg_attr(target_arch = "aarch64", ignore)]
     fn create_and_remove() {
-        let ri = new_inode(
-            Weak::new(),
-            1,
-            InodeMode::directory(0o700),
-            (0, 0),
-            (None, None),
-        )
-        .unwrap();
-        let root = DentryRef::new(Dentry::new_root(ri.clone(), Weak::new())).unwrap();
+        let ri = new_inode(None, 1, InodeMode::directory(0o700), (0, 0), (None, None)).unwrap();
+        let root = DentryRef::new(Dentry::new_root(ri.clone(), alloc::sync::Weak::new())).unwrap();
         let nop: Arc<dyn TraceFops> = Arc::new(Nop);
         let reg = InodeMode::regular(0o640);
         let dir = InodeMode::directory(0o750);

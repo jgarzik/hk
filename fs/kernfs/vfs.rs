@@ -92,7 +92,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<InodeRef, KernelEr
         0,
         size,
         now,
-        Arc::downgrade(sb),
+        Some(sb),
         &KERNFS_IOPS,
     ))?;
     i.set_private_rcu(try_arc(KfInode(kn.clone()))?);

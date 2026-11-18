@@ -2317,7 +2317,7 @@ impl InodeOps for VfatInodeOps {
             sb_data.opts.gid,
             0, // Empty file
             Timespec::ZERO,
-            Arc::downgrade(sb),
+            Some(sb),
             &VFAT_INODE_OPS,
         ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
@@ -2395,7 +2395,7 @@ impl InodeOps for VfatInodeOps {
             sb_data.opts.gid,
             0,
             Timespec::ZERO,
-            Arc::downgrade(sb),
+            Some(sb),
             &VFAT_INODE_OPS,
         ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
@@ -3115,7 +3115,7 @@ fn create_inode_for_entry(
         o.gid,
         u64::from(entry.file_size),
         Timespec::ZERO,
-        Arc::downgrade(sb),
+        Some(sb),
         &VFAT_INODE_OPS,
     ))?;
     inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
@@ -3383,7 +3383,7 @@ impl SuperOps for VfatSuperOps {
             0,
             0,
             Timespec::ZERO,
-            Arc::downgrade(sb),
+            Some(sb),
             i_op,
         ))
     }
@@ -3535,7 +3535,7 @@ fn fat_fill_inodes(sb: &Arc<SuperBlock>, sb_data: &VfatSbData) -> Result<(), Ker
         0,
         0,
         Timespec::ZERO,
-        Arc::downgrade(sb),
+        Some(sb),
         &VFAT_INODE_OPS,
     ))?;
     fat_inode.set_private(new_private(
@@ -3578,7 +3578,7 @@ fn fat_read_root(
         sb_data.opts.gid,
         0,
         Timespec::ZERO,
-        Arc::downgrade(sb),
+        Some(sb),
         &VFAT_INODE_OPS,
     ))?;
     root_inode

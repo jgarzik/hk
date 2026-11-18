@@ -490,7 +490,7 @@ pub fn bdev_inode(dev: DevId, size: u64) -> Result<InodeRef, KernelError> {
         0,
         dev,
         Timespec::ZERO,
-        Arc::downgrade(&sb),
+        Some(&sb),
         &BDEV_INODE_OPS,
     ))?;
     inode.set_size(size);

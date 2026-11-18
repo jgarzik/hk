@@ -364,7 +364,7 @@ mod tests {
 
     fn inode(ino: u64, mode: InodeMode) -> InodeRef {
         let t = Timespec::from_secs(0);
-        let i = Inode::new(ino, mode, 0, 0, 0, t, Weak::new(), &NULL_INODE_OPS);
+        let i = Inode::new(ino, mode, 0, 0, 0, t, None, &NULL_INODE_OPS);
         Inode::alloc(i).unwrap()
     }
 

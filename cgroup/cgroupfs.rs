@@ -292,7 +292,7 @@ fn create_cgroup_dir_inode(parent: &Inode, cgroup: &Arc<Cgroup>) -> Result<Inode
         0,
         0,
         current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     inode.set_private(try_arc(CgroupfsInodeData::Directory {
@@ -320,7 +320,7 @@ fn create_control_file_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     inode.set_private(try_arc(CgroupfsInodeData::ControlFile {
@@ -357,7 +357,7 @@ fn create_subsys_file_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     inode.set_private(try_arc(CgroupfsInodeData::SubsysFile {
@@ -780,7 +780,7 @@ impl SuperOps for CgroupfsSuperOps {
             0,
             0,
             current_time(),
-            Arc::downgrade(sb),
+            Some(sb),
             i_op,
         ))?;
         inode.set_private(try_arc(CgroupfsInodeData::Directory {
@@ -909,7 +909,7 @@ fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
         0,
         0,
         current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     root_inode.set_private(try_arc(CgroupfsInodeData::Directory {

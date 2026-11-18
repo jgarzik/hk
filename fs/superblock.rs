@@ -1683,7 +1683,7 @@ mod tests {
             0,
             0,
             crate::time::TIMEKEEPER.current_time(),
-            Arc::downgrade(sb),
+            Some(sb),
             ops,
         ))?;
         sb.set_root(DentryRef::new(Dentry::new_root(root, Arc::downgrade(sb)))?);
@@ -1747,7 +1747,7 @@ mod tests {
                 0,
                 0,
                 crate::time::TIMEKEEPER.current_time(),
-                Arc::downgrade(sb),
+                Some(sb),
                 &crate::fs::inode::NULL_INODE_OPS,
             ))?;
             *T3_KEPT.lock().unwrap() = Some(inode);
@@ -1859,7 +1859,7 @@ mod tests {
                     0,
                     0,
                     crate::time::TIMEKEEPER.current_time(),
-                    Arc::downgrade(sb),
+                    Some(sb),
                     &crate::fs::inode::NULL_INODE_OPS,
                 ))?;
                 *T5_KEPT.lock().unwrap() = Some(inode);
