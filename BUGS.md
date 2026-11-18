@@ -707,13 +707,22 @@ patch and write, where Linux __fat_write_inode reads the block with
 sb_bread, then patches the pinned buffer under the inode_hash_lock
 spinlock after rechecking i_pos, and marks it dirty. With no buffer
 held to wait on, every wait for vfat metadata syncs the device's whole
-cache (`sync_buffers`): ->sync_inode_metadata (Linux sync_dirty_buffer
-of the entry's block + mmb_sync of the inode's metadata blocks),
-fsync's FAT step (Linux fat_file_fsync: mmb_sync of the FAT inode's
-metadata blocks) and a dirsync directory change (Linux
-sync_dirty_buffer / mmb_sync of the blocks it touched). A new
-cluster's zeroing writes the disk directly and drops the device
-cache's pages around it (`filemap::invalidate_range`), where Linux
+cache (`sync_buffers`):
+- `fat_sync_inode_metadata` (->sync_inode_metadata; Linux
+  sync_dirty_buffer of the entry's block + mmb_sync of the inode's
+  i_metadata_bhs), which every data-integrity write of an inode marked
+  I_METADATA_WRITEBACK runs: fsync and fdatasync (simple_fsync_noflush
+  syncs any inode so marked, clean or not, as Linux), O_SYNC/O_DSYNC
+  writes, and the write-back with wait of an inode put after its
+  superblock's SB_ACTIVE went (`iput_final`).
+- `VfatFileOps::fsync`'s FAT step (Linux fat_file_fsync: mmb_sync of
+  the FAT inode's i_metadata_bhs), a second whole-cache sync right
+  after the first.
+- A dirsync directory change (Linux sync_dirty_buffer / mmb_sync of
+  the blocks it touched).
+
+A new cluster's zeroing writes the disk directly and drops the
+device cache's pages around it (`filemap::invalidate_range`), where Linux
 fat_zeroed_cluster zeroes the buffers (sb_getblk, mark_buffer_dirty).
 
 ## Buffer head gaps
@@ -731,6 +740,10 @@ fat_zeroed_cluster zeroes the buffers (sb_getblk, mark_buffer_dirty).
 - No buffer-head count limit (Linux buffer_heads_over_limit, which
   makes reclaim strip buffers), no page migration of buffered pages,
   no BH_Delay / BH_Unwritten / BH_Boundary users.
+- No inode LRU (Linux inode_lru, prune_icache_sb): an inode put to
+  zero while its superblock is active is evicted at once, so
+  `iput_final` writes it back first (WB_SYNC_NONE) where Linux keeps
+  it cached, dirty, for the flusher.
 
 ## renameat2 flag gaps
 

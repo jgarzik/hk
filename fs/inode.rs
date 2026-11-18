@@ -763,10 +763,14 @@ unsafe fn iput(p: NonNull<Inode>) {
 /// The last reference to the inode at `p` went, under its `i_lock`
 /// (`l`) (Linux iput_final): it is marked I_FREEING under the lock, so
 /// no igrab or cache lookup takes a reference from now on, then
-/// evicted. hk keeps no unused inode (no LRU, `fs::icache`): one Linux
-/// would keep cached (linked and hashed, inode_generic_drop false) is
-/// written back first under I_WILL_FREE (write_inode_now, as Linux for
-/// one it does not keep), then evicted all the same.
+/// evicted. One to drop (unlinked or unhashed, Linux
+/// inode_generic_drop) is evicted at once; any other is written back
+/// first under I_WILL_FREE: with wait once its superblock is shut down
+/// (Linux write_inode_now(inode, 1) for one not kept, !SB_ACTIVE);
+/// while it is active, where Linux keeps the inode on its LRU for the
+/// flusher to write and evicts it clean later, hk, which keeps no
+/// unused inode (no LRU, `fs::icache`), writes it as the flusher would
+/// (WB_SYNC_NONE: no wait for the metadata) and evicts it.
 ///
 /// # Safety
 /// `p`'s count reached zero under `l`, its `i_lock`; called once.
@@ -780,7 +784,9 @@ unsafe fn iput_final(p: NonNull<Inode>, l: MutexGuard<'_, ILocked>) {
     } else {
         i.set_state(&l, I_WILL_FREE);
         core::mem::drop(l);
-        let _ = super::fs_writeback::write_inode_now(i, true);
+        // The superblock's Arc is dropped with no lock held
+        let sync = !i.superblock().is_some_and(|sb| sb.active());
+        let _ = super::fs_writeback::write_inode_now(i, sync);
         let l = i.i_lock.lock();
         i.i_state
             .store((i.state() & !I_WILL_FREE) | I_FREEING, Ordering::Release);

@@ -686,11 +686,11 @@ pub fn reconfigure_super(sb: &SuperBlock, ro: bool, data: &[u8]) -> Result<(), K
 /// under s_umount held for writing, which it releases: inotify watches
 /// get IN_UNMOUNT and go (fsnotify_sb_delete), the dentry tree is
 /// dropped (shrink_dcache_for_umount), what is dirty is written back
-/// while the device is still open (sync_filesystem) and the inodes
-/// leave s_inodes (evict_inodes); then SB_DYING tells walkers and
-/// mounters
+/// while the device is still open (sync_filesystem), SB_ACTIVE is
+/// cleared (an inode put from then on is written back with wait
+/// before its eviction, `inode::iput_final`) and the inodes leave
+/// s_inodes (evict_inodes); then SB_DYING tells walkers and mounters
 pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
-    sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
     let root = sb.root.write().take();
     if let Some(root) = root {
         crate::io::inotify::sb_delete(sb);
@@ -698,9 +698,11 @@ pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
         drop(root);
         // Linux ignores sync_filesystem's error here too
         let _ = super::sync::sync_filesystem(sb);
+        sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
         super::inode::sb_list_drain(&sb.s_inodes);
         sb.s_op.put_super(sb);
     } else {
+        sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
         // A fill that failed before its root may have made inodes that
         // outlive it: unlinked all the same, so their eviction never
         // reaches this superblock's list once its memory goes
@@ -1203,6 +1205,11 @@ impl SuperBlock {
     /// Filled (Linux sb->s_flags |= SB_ACTIVE after fill_super)
     pub fn set_active(&self) {
         self.s_flags.fetch_or(SB_ACTIVE, Ordering::Relaxed);
+    }
+
+    /// Filled and not yet shut down (Linux SB_ACTIVE)
+    pub fn active(&self) -> bool {
+        self.s_flags.load(Ordering::Relaxed) & SB_ACTIVE != 0
     }
 
     /// Its device number (Linux s_dev)

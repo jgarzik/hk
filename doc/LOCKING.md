@@ -2922,8 +2922,12 @@ the last reference goes, which must be a context that may sleep (Linux
 iput's might_sleep, checked first): never under a spin lock or with
 interrupts off. A linked, hashed inode (Linux inode_generic_drop
 false) is marked I_WILL_FREE and written back first with
-`i_lock` released (Linux write_inode_now for an inode not kept cached,
-nothing for a clean one; hk keeps none), then marked I_FREEING; then
+`i_lock` released (nothing for a clean one), then marked I_FREEING:
+with wait once its superblock is shut down (Linux write_inode_now(1)
+for one not kept, !SB_ACTIVE, which `generic_shutdown_super` clears
+after its sync_filesystem, as Linux); while it is active, WB_SYNC_NONE,
+as Linux's flusher writes the inode it keeps on its LRU (hk keeps
+none); then
 it leaves its writeback list (under the list lock and `i_lock`, then
 waiting for I_SYNC under `i_lock`, Linux inode_wait_for_writeback: a
 writer holds a reference, so there is none) and its superblock list,
