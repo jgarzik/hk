@@ -115,14 +115,16 @@ struct Rcu<'g> {
 /// the step before the next, or its own slot (the root's leftover;
 /// a mount alone only from the first that fails). A second fill would
 /// drop a value under the guard; it panics instead (`put`), in every
-/// build.
+/// build. Fields drop in order: the child first, before the path and
+/// mount it was found in (Linux try_to_unlazy_next's dput, then
+/// terminate_walk's path_put), so no dentry outlives its mount.
 #[derive(Default)]
 pub(super) struct Puts {
+    dentry: Option<DentryRef>,
     path: Option<Path>,
     link: Option<Path>,
     root: Option<Path>,
     mnt: Option<MountRef>,
-    dentry: Option<DentryRef>,
     /// The mount of the link a failed legitimize_links stopped at
     /// (Linux drop_links)
     links_mnt: Option<MountRef>,
@@ -282,7 +284,8 @@ impl Held {
     }
 }
 
-/// What ref mode does first ([`Lazy`])
+/// What ref mode does first ([`Lazy`]); a child before the path it
+/// was found in (fields drop in order: no dentry outlives its mount)
 pub(super) enum To {
     /// The walk's end (complete_walk)
     Done(Path),
@@ -296,8 +299,8 @@ pub(super) enum To {
     /// its revalidation said): revalidated in ref mode, then stepped
     /// into
     Child {
-        cur: Path,
         child: DentryRef,
+        cur: Path,
         reval: Result<bool, KernelError>,
     },
     /// step_into's try_to_unlazy_next (handle_mounts): `child`, found
@@ -306,8 +309,8 @@ pub(super) enum To {
     /// (WALK_TRAILING); `dots`: the parent ".." gave (WALK_NOFOLLOW,
     /// then handle_dots' scoped check)
     Step {
-        cur: Path,
         child: DentryRef,
+        cur: Path,
         last: bool,
         dots: bool,
     },
