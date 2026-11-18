@@ -1160,23 +1160,24 @@ fn sb_list_del(inode: &Inode) {
     unsafe { l.remove(inode) }
 }
 
-/// Some inode is still on `sb`'s list (Linux !list_empty(&sb->s_inodes)
-/// after put_super: generic_shutdown_super's busy check)
+/// Some inode is still on `sb`'s list (Linux !list_empty(&sb->s_inodes))
 pub(super) fn sb_busy(sb: &SuperBlock) -> bool {
     !sb.s_inodes.lock().is_empty()
 }
 
-/// Poison every inode still on `sb`'s list (Linux generic_shutdown_super
-/// after its busy report: i_op, i_sb and i_mapping set to
-/// VFS_PTR_POISON under s_inode_list_lock), so a later use of one
-/// panics (`istate::I_POISON`) instead of reaching what the shutdown
-/// released; each bit set under the inode's `i_lock`
-pub(super) fn sb_poison(sb: &SuperBlock) {
+/// Poison every inode still on `sb`'s list, true if there was one
+/// (Linux generic_shutdown_super's busy check and, for a busy list,
+/// i_op, i_sb and i_mapping set to VFS_PTR_POISON under
+/// s_inode_list_lock): one pass under the list's lock, so a later use
+/// of one panics (`istate::I_POISON`) instead of reaching what the
+/// shutdown released; each bit set under the inode's `i_lock`
+pub(super) fn sb_poison(sb: &SuperBlock) -> bool {
     let l = sb.s_inodes.lock();
     for i in l.iter() {
         let g = i.i_lock.lock();
         i.set_state(&g, istate::I_POISON);
     }
+    !l.is_empty()
 }
 
 /// `f` on each live inode of `sb` until it returns false (Linux

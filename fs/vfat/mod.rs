@@ -507,16 +507,16 @@ impl Drop for FatInode {
 
 /// Release `sb`'s VFAT data (Linux fat_put_super, a failed fill's
 /// out_fail): the FAT's inode put first, evicted while the data is
-/// there, then the data by `release` (put_super's queued
-/// `kill_fs_info_rcu`, the failed fill's `kill_fs_info`)
-fn fat_put_data(sb: &SuperBlock, release: fn(&SuperBlock)) {
+/// there, then the data a grace period on, unless an inode is busy
+/// (`kill_fs_info_rcu`)
+fn fat_put_data(sb: &SuperBlock) {
     // SAFETY: put_super or the failed fill, the release's caller: the
     // data set, s_umount held for writing
     let d = unsafe { msdos_sb(sb) };
     // SAFETY: as above; every other inode evicted, so no operation of
     // the filesystem runs
     unsafe { d.fat_inode.put() };
-    release(sb);
+    sb.kill_fs_info_rcu();
 }
 
 /// What the FAT lock guards beyond the FAT itself
@@ -895,8 +895,8 @@ fn i_sb(inode: &Inode) -> &Arc<SuperBlock> {
 /// `sb`'s VFAT data (Linux MSDOS_SB(sb)), borrowed
 ///
 /// # Safety
-/// As [`SuperBlock::fs_info_ref`] (vfat releases the data by
-/// `kill_fs_info_rcu`, or `kill_fs_info` from a failed fill): the
+/// As [`SuperBlock::fs_info_ref`] (vfat releases the data only by
+/// `kill_fs_info_rcu`): the
 /// caller holds an active reference to `sb`, or works for a live
 /// inode of it, or is its put_super.
 unsafe fn msdos_sb(sb: &SuperBlock) -> &VfatSbData {
@@ -912,9 +912,10 @@ fn msdos_sb_of(inode: &Inode) -> &VfatSbData {
     // shutdown evicts every inode before put_super, and nothing puts one
     // during it (every inode reference is held under a mount, an active
     // reference or s_umount: LOCKING.md, Inode cache), so put_super's
-    // queued release runs only with no inode live or mid-eviction; with
-    // one left on s_inodes it poisons them and keeps the data with the
-    // superblock's memory, which `inode` keeps (`kill_fs_info_rcu`)
+    // release runs only with no inode live or mid-eviction (`evict`
+    // panics on one that overlaps it); with one left on s_inodes it
+    // keeps the data with the superblock's memory, which `inode` keeps
+    // (`kill_fs_info_rcu`), and the shutdown poisons it
     unsafe { msdos_sb(i_sb(inode)) }
 }
 
@@ -3347,11 +3348,11 @@ impl SuperOps for VfatSuperOps {
     }
 
     /// Linux fat_put_super: the FAT's inode put (iput: evicted while
-    /// the data is there), then the data's release queued
+    /// the data is there), then the data released a grace period on
     /// (call_rcu(delayed_free): `kill_fs_info_rcu`), every other inode
     /// evicted already
     fn put_super(&self, sb: &SuperBlock) {
-        fat_put_data(sb, SuperBlock::kill_fs_info_rcu);
+        fat_put_data(sb);
     }
 
     /// Linux fat_statfs: clusters as blocks, the free ones counted once
@@ -3526,7 +3527,7 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
     // Linux fat_fill_super's out_fail: the FAT's inode put and the data
     // freed (sb->s_fs_info = NULL), here in thread context; every inode
     // the fill made is put already, and none was reachable but by it
-    fat_fill_inodes(sb, &sb_data).inspect_err(|_| fat_put_data(sb, SuperBlock::kill_fs_info))
+    fat_fill_inodes(sb, &sb_data).inspect_err(|_| fat_put_data(sb))
 }
 
 /// The FAT's inode, then the root (Linux fat_fill_super from new_inode
