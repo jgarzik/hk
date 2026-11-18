@@ -90,7 +90,7 @@ impl WritableHold {
     fn new(v: &Vma) -> Result<Self, KernelError> {
         let inode = v.inode().filter(|_| v.shared_maywrite());
         if let Some(i) = &inode {
-            i.i_data.map_writable()?;
+            i.i_mapping().map_writable()?;
         }
         Ok(Self(inode))
     }
@@ -99,7 +99,7 @@ impl WritableHold {
 impl Drop for WritableHold {
     fn drop(&mut self) {
         if let Some(i) = &self.0 {
-            i.i_data.unmap_writable();
+            i.i_mapping().unmap_writable();
         }
     }
 }
@@ -1633,7 +1633,7 @@ fn move_mapping(
     mm.insert_vma(new_vma);
     mm.add_total_vm(new_len / PAGE_SIZE);
     {
-        let _rmap = inode.as_ref().map(|i| i.i_data.i_mmap.lock_write());
+        let _rmap = inode.as_ref().map(|i| i.i_mapping().i_mmap.lock_write());
         let t = super::pgtable::PgTables::new(owner, mm);
         super::mremap::move_ptes(owner, t, old_addr, new_addr, old_len);
     }

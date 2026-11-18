@@ -1569,7 +1569,7 @@ fn mnt_already_visible(ns: &crate::ns::MntNamespace, sb: &SuperBlock, new: &mut 
                 && !c
                     .get_mountpoint(&*g)
                     .and_then(|d| d.get_inode())
-                    .is_some_and(|i| i.i_op.is_empty_dir(&i))
+                    .is_some_and(|i| i.i_op().is_empty_dir(&i))
         });
         (!hides).then_some(mf & (MNT_LOCK_READONLY | MNT_LOCK_ATIME))
     });

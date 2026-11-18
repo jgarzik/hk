@@ -333,7 +333,7 @@ fn positive(d: DentryRef) -> Result<DentryRef, KernelError> {
 /// last put, as ramfs's always_delete_dentry, is gone at once), else
 /// none (procfs: ENOENT)
 fn d_alloc_lookup(parent: &DentryRef, dir: &Inode, name: &[u8]) -> Result<DentryRef, KernelError> {
-    let found = dir.i_op.lookup_neg(dir, name)?;
+    let found = dir.i_op().lookup_neg(dir, name)?;
     // Stamped before it is hashed (Linux vfat_d_version_set,
     // kernfs_set_rev before d_splice_alias)
     let d = Dentry::prealloc(parent, name)?;
@@ -441,7 +441,7 @@ fn link_body(inode: &Inode) -> Result<Body, KernelError> {
     if inode.i_link().is_some() {
         return Ok(Body::Kept);
     }
-    Ok(match inode.i_op.get_link(inode, false)? {
+    Ok(match inode.i_op().get_link(inode, false)? {
         Link::Text(t) => Body::Made(t),
         Link::Jump(p) => Body::Jump(p),
     })
@@ -981,7 +981,7 @@ impl<'a> Nd<'a> {
         let perm = super::dac::create_mode(c, dir, (self.mode & 0o7777) as u16);
         let d = Dentry::prealloc(parent, name)?;
         // The directory's times are its filesystem's (Linux ->create)
-        let inode = dir.i_op.create(dir, name, InodeMode::regular(perm))?;
+        let inode = dir.i_op().create(dir, name, InodeMode::regular(perm))?;
         self.created.set(true);
         Ok(Found::Made(Dentry::add(parent, d, Some(inode))))
     }
@@ -1351,12 +1351,12 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         } else if isdir {
             // What is cached below goes first (Linux vfs_rmdir:
             // shrink_dcache_parent, then S_DEAD)
-            dir.i_op.rmdir(&dir, name, &victim).inspect(|()| {
+            dir.i_op().rmdir(&dir, name, &victim).inspect(|()| {
                 super::dentry::d_drop_tree(&victim);
                 inode.set_dead();
             })
         } else {
-            dir.i_op.unlink(&dir, name, &victim)
+            dir.i_op().unlink(&dir, name, &victim)
         };
         // The parent's and the victim's times are the filesystem's
         // (Linux simple_unlink, vfat_unlink)

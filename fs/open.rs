@@ -421,7 +421,7 @@ fn tmpfile_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, 
     dac::may_create(&c, &dir_inode)?;
     let perm = dac::create_mode(&c, &dir_inode, (op.mode & 0o7777) as u16);
     let inode = dir_inode
-        .i_op
+        .i_op()
         .tmpfile(&dir_inode, InodeMode::regular(perm))?;
     if op.flags & O_EXCL == 0 {
         inode.set_linkable(true);
@@ -525,7 +525,7 @@ fn filp_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, Ker
         dac::remove_privs(&inode);
         // ATTR_MTIME | ATTR_CTIME, also for a file already empty; a
         // refusal (a sealed memfd: EPERM) fails the open
-        match inode.i_op.truncate(&inode, 0) {
+        match inode.i_op().truncate(&inode, 0) {
             Ok(()) => {
                 let now = crate::time::TIMEKEEPER.current_time();
                 inode.set_times(None, Some(now), Some(now));

@@ -143,14 +143,14 @@ fn inode_attach_wb(inode: &Inode) -> Option<&Arc<BdiWriteback>> {
 
 /// Its cache holds a page marked `mark` (Linux mapping_tagged)
 fn mapping_tagged(inode: &Inode, mark: usize) -> bool {
-    crate::mm::filemap::mapping_tagged(&inode.i_data, mark)
+    crate::mm::filemap::mapping_tagged(inode.i_mapping(), mark)
 }
 
 /// `inode` has a new dirty page (Linux __folio_mark_dirty ->
 /// __mark_inode_dirty(I_DIRTY_PAGES)), for a mapping that writes back
 /// (Linux mapping_can_writeback)
 pub fn mark_inode_dirty_pages(inode: &Inode) {
-    if !inode.i_data.aops().can_dirty() {
+    if !inode.i_mapping().aops().can_dirty() {
         return;
     }
     __mark_inode_dirty(inode, I_DIRTY_PAGES);
@@ -505,7 +505,7 @@ fn writeback_single_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(), K
 /// error is returned after both were tried. The caller holds a
 /// reference, or it is I_WILL_FREE.
 pub fn write_inode_now(inode: &Inode, sync: bool) -> Result<(), KernelError> {
-    let can = inode.i_data.aops().can_dirty();
+    let can = inode.i_mapping().aops().can_dirty();
     let mode = if sync { SyncMode::All } else { SyncMode::None };
     let wbc = WritebackControl::new(mode, if can { i64::MAX } else { 0 });
     crate::sync::might_sleep();

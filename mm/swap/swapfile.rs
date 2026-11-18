@@ -658,7 +658,7 @@ fn add_swap_extent(
 /// The device block of a swap file's block `block` (Linux bmap): EINVAL
 /// for a hole or a file without ->bmap ("swapfile has holes")
 fn swap_bmap(inode: &Inode, block: u64) -> Result<u64, KernelError> {
-    match inode.i_data.aops().bmap(inode, block) {
+    match inode.i_mapping().aops().bmap(inode, block) {
         Ok(b) if b != 0 => Ok(b),
         _ => {
             crate::printkln!("swapon: swapfile has holes");

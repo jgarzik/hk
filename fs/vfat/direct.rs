@@ -190,7 +190,7 @@ fn invalidate_pages(inode: &Inode, pos: u64, count: usize) -> Result<(), KernelE
 /// error but the mapping's (`filemap::dio_warn_stale_pagecache`)
 fn invalidate_post(inode: &Inode, pos: u64, count: usize) {
     let p = PAGE_SIZE as u64;
-    if inode.i_data.nrpages() != 0
+    if inode.i_mapping().nrpages() != 0
         && filemap::invalidate_pages2(inode, pos / p, last(pos, count) / p).is_err()
     {
         filemap::dio_warn_stale_pagecache(inode);
@@ -416,7 +416,7 @@ unsafe impl AsyncIo for VfatAio {
 
     fn complete(self: Arc<Self>, res: Result<usize, KernelError>) {
         let res = res.map(|n| n.min(self.cut));
-        let cached = matches!(res, Ok(n) if n > 0) && self.inode().i_data.nrpages() != 0;
+        let cached = matches!(res, Ok(n) if n > 0) && self.inode().i_mapping().nrpages() != 0;
         if let Some(p) = self.post.as_ref().filter(|_| cached) {
             let (job, work) = (p.job.clone(), p.work.clone());
             *job.lock() = Some((self, res));
@@ -514,7 +514,7 @@ fn write_async(
     let fits = !inode.is_swapfile()
         && end <= inode.get_size()
         && mmu_private(inode)? >= end
-        && inode.i_data.nrpages() == 0
+        && inode.i_mapping().nrpages() == 0
         && inode.write_limit(pos, count) == Ok(count)
         && blocksize(sb, pos, IovSource::async_io(&*io).alignment()).is_ok();
     if !fits {

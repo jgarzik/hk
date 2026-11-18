@@ -762,7 +762,7 @@ pub fn mark_buffer_write_io_error(bh: &BufferHead) {
             // Not under I/O: a caller in thread context (an unlocked
             // buffer pins no inode), with a reference taken
             // SAFETY: the reference keeps the inode whole
-            unsafe { filemap::mapping_set_error_raw(&i.i_data, KernelError::Io) };
+            unsafe { filemap::mapping_set_error_raw(i.i_mapping(), KernelError::Io) };
             drop(g);
             drop(i);
             return mmb_set_error(bh);
@@ -929,7 +929,7 @@ unsafe fn folio_create_buffers<'a>(inode: &Inode, phys: u64, b_state: u32) -> &'
         return h;
     }
     // SAFETY: as above; no buffers
-    unsafe { create_empty_buffers(&inode.i_data, phys, buffer_size(inode), b_state) }
+    unsafe { create_empty_buffers(inode.i_mapping(), phys, buffer_size(inode), b_state) }
 }
 
 /// The size of a mapping's buffers: its inode's block size. hk's
@@ -989,7 +989,7 @@ fn grow_dev_folio(
     index: u64,
     size: usize,
 ) -> Result<bool, KernelError> {
-    let m = &bdev.bd_inode.i_data;
+    let m = bdev.bd_inode.i_mapping();
     let phys = filemap::grab(m, index)?;
     let mut end_block = 0;
     let mut r = Ok(());
@@ -1069,7 +1069,7 @@ fn getblk_slow(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> Result<BhRef
 /// mapped yet miss the block is reported, rate limited (Linux).
 fn find_get_block_slow(bdev: &BlockDevice, block: u64, atomic: bool) -> Option<BhRef> {
     let inode = &bdev.bd_inode;
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     let index = (block << buffer_bits(inode)) / PAGE_SIZE as u64;
     let phys = filemap::find_get(m, index)?;
     let found = {
@@ -1451,7 +1451,7 @@ pub fn try_to_free_buffers(m: Option<&AddressSpace>, phys: u64) -> bool {
 /// so no old write lands on the reused blocks
 pub fn clean_bdev_aliases(bdev: &BlockDevice, block: u64, len: u64) {
     let inode = &bdev.bd_inode;
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     let bits = buffer_bits(inode);
     let mut index = (block << bits) / PAGE_SIZE as u64;
     let end = ((block + len - 1) << bits) / PAGE_SIZE as u64;
@@ -1853,7 +1853,7 @@ pub fn block_write_begin(
     get_block: GetBlock,
 ) -> Result<u64, KernelError> {
     let index = pos / PAGE_SIZE as u64;
-    let phys = filemap::grab(&inode.i_data, index)?;
+    let phys = filemap::grab(inode.i_mapping(), index)?;
     if let Err(e) = block_write_begin_int(inode, phys, pos, len, get_block) {
         crate::mm::page::unlock_page(phys);
         filemap::put_page(phys);
@@ -1910,7 +1910,7 @@ fn round_bytes(bytes: &AtomicU64, blocksize: u64) {
 /// Write `len` zeros at `pos` (one page) through the mapping's own
 /// ->write_begin and ->write_end (cont_expand_zero's step)
 fn cont_zero(inode: &Inode, pos: u64, len: usize) -> Result<(), KernelError> {
-    let a = inode.i_data.aops();
+    let a = inode.i_mapping().aops();
     let phys = a.write_begin(inode, pos, len)?;
     // SAFETY: ->write_begin returned it locked; `len` stays in the page
     unsafe { zero_frame_racy(phys, (pos % PAGE_SIZE as u64) as usize, len) };
@@ -1983,7 +1983,7 @@ pub fn block_truncate_page(
     let index = from / PAGE_SIZE as u64;
     let offset = (from % PAGE_SIZE as u64) as usize;
     let iblock = index * (PAGE_SIZE / blocksize) as u64 + (offset / blocksize) as u64;
-    let phys = filemap::grab(&inode.i_data, index)?;
+    let phys = filemap::grab(inode.i_mapping(), index)?;
     // SAFETY: `grab` returned it locked, held until the unlock below
     let head = unsafe { folio_create_buffers(inode, phys, 0) };
     let bh = ring(head)
@@ -2033,7 +2033,7 @@ pub fn generic_block_bmap(inode: &Inode, block: u64, get_block: GetBlock) -> u64
 /// ->write_end raises i_size
 pub fn generic_cont_expand_simple(inode: &Inode, size: u64) -> Result<(), KernelError> {
     inode.newsize_ok(size)?;
-    let a = inode.i_data.aops();
+    let a = inode.i_mapping().aops();
     let phys = a.write_begin(inode, size, 0)?;
     let n = a.write_end(inode, size, 0, 0, phys);
     debug_assert_eq!(n, 0);

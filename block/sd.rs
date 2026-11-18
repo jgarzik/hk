@@ -393,7 +393,7 @@ impl SdDisk {
             return;
         }
         let all = self.bdev.disk.bdevs();
-        let pages: u64 = all.iter().map(|b| b.bd_inode.i_data.nrpages()).sum();
+        let pages: u64 = all.iter().map(|b| b.bd_inode.i_mapping().nrpages()).sum();
         del_gendisk(&self.bdev.disk);
         self.sdev.mark_deleted();
         crate::printkln!(

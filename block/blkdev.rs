@@ -1260,7 +1260,7 @@ pub(super) fn bdev_del(st: &mut OpenState, partno: u16) -> Option<Arc<BlockDevic
     let b = st.part_tbl.get_mut(usize::from(partno))?.take()?;
     crate::fs::icache::remove_inode_hash(&b.bd_inode);
     b.mark_dead();
-    crate::mm::filemap::unmap_mapping_range(&b.bd_inode.i_data, 0);
+    crate::mm::filemap::unmap_mapping_range(b.bd_inode.i_mapping(), 0);
     kill_bdev(&b);
     Some(b)
 }
@@ -1300,7 +1300,7 @@ pub(super) fn for_each_bdev(mut f: impl FnMut(&Arc<BlockDevice>)) {
 /// meminfo's Buffers)
 pub fn nr_blockdev_pages() -> u64 {
     let mut n = 0;
-    for_each_bdev_inode(|i| n += i.i_data.nrpages());
+    for_each_bdev_inode(|i| n += i.i_mapping().nrpages());
     n
 }
 
@@ -1560,7 +1560,7 @@ pub fn bdev_rw_bytes(
 /// Drop the device's whole cache, dirty or not (Linux kill_bdev: the
 /// per-CPU buffer LRUs emptied, truncate_inode_pages from 0)
 pub fn kill_bdev(bdev: &BlockDevice) {
-    if bdev.bd_inode.i_data.nrpages() == 0 {
+    if bdev.bd_inode.i_mapping().nrpages() == 0 {
         return;
     }
     crate::fs::pageio::buffer::invalidate_bh_lrus();
@@ -1570,7 +1570,7 @@ pub fn kill_bdev(bdev: &BlockDevice) {
 /// Drop the device cache's clean, unused pages (Linux invalidate_bdev:
 /// the buffer LRUs emptied first, then invalidate_mapping_pages)
 pub fn invalidate_bdev(bdev: &BlockDevice) {
-    if bdev.bd_inode.i_data.nrpages() == 0 {
+    if bdev.bd_inode.i_mapping().nrpages() == 0 {
         return;
     }
     crate::fs::pageio::buffer::invalidate_bh_lrus();
@@ -1613,7 +1613,7 @@ pub fn set_blocksize(
     let inode = &bdev.bd_inode;
     if inode.blkbits() != bits {
         let _g = inode.lock();
-        let _inv = inode.i_data.invalidate_lock.write();
+        let _inv = inode.i_mapping().invalidate_lock.write();
         let _ = sync_blockdev(bdev);
         kill_bdev(bdev);
         inode.set_blkbits(bits);
@@ -1654,7 +1654,7 @@ pub fn sync_blockdev(bdev: &BlockDevice) -> Result<(), KernelError> {
 /// one at a time with no lock held
 pub fn sync_bdevs() {
     for_each_bdev_inode(|i| {
-        if i.i_data.nrpages() != 0 {
+        if i.i_mapping().nrpages() != 0 {
             let _ = crate::mm::filemap::write_and_wait(i);
         }
     });

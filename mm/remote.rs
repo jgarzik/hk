@@ -250,7 +250,7 @@ fn write_tracked(
     if let Some(p) = page {
         if let Some(inode) = vma.inode() {
             crate::mm::page::lock_page(p);
-            crate::mm::filemap::dirty_page(&inode.i_data, p);
+            crate::mm::filemap::dirty_page(inode.i_mapping(), p);
             crate::mm::page::unlock_page(p);
         }
         crate::mm::filemap::put_page(p);

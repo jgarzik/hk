@@ -181,7 +181,7 @@ pub fn sys_mkdirat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32) -> KernelRe
     // adds S_ISGID under a SGID parent
     create_entry(&p, |dir, c| {
         let perm = dac::create_mode(c, dir, (mode & 0o1777) as u16);
-        dir.i_op.mkdir(dir, &p.name, InodeMode::directory(perm))
+        dir.i_op().mkdir(dir, &p.name, InodeMode::directory(perm))
     })
     .map_err(no_op_eperm)?;
     Ok(())
@@ -243,18 +243,19 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32, dev: u64) -
         let perm = dac::create_mode(c, dir, (mode & 0o7777) as u16);
         match ty {
             S_IFCHR => dir
-                .i_op
+                .i_op()
                 .mknod(dir, name, InodeMode::chardev(perm), DevId::from_user(dev)),
-            S_IFBLK => dir
-                .i_op
-                .mknod(dir, name, InodeMode::blockdev(perm), DevId::from_user(dev)),
+            S_IFBLK => {
+                dir.i_op()
+                    .mknod(dir, name, InodeMode::blockdev(perm), DevId::from_user(dev))
+            }
             S_IFSOCK => dir
-                .i_op
+                .i_op()
                 .mknod(dir, name, InodeMode::socket(perm), DevId::from_user(0)),
             S_IFIFO => dir
-                .i_op
+                .i_op()
                 .mknod(dir, name, InodeMode::fifo(perm), DevId::from_user(0)),
-            _ => dir.i_op.create(dir, name, InodeMode::regular(perm)),
+            _ => dir.i_op().create(dir, name, InodeMode::regular(perm)),
         }
     })
     .map_err(no_op_eperm)?;
@@ -270,7 +271,7 @@ pub fn mknod_sock(path: &[u8], perm: u16) -> Result<super::path_ref::Path, Kerne
     let p = filename_create(AT_FDCWD, path, false)?;
     let d = create_entry(&p, |dir, c| {
         let perm = dac::create_mode(c, dir, perm);
-        dir.i_op
+        dir.i_op()
             .mknod(dir, &p.name, InodeMode::socket(perm), DevId::from_user(0))
     })
     .map_err(no_op_eperm)?;

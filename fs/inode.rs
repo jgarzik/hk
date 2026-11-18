@@ -626,6 +626,19 @@ pub mod istate {
     /// Linux I_DIRTY_ALL: I_DIRTY, there being no lazytime
     /// (I_DIRTY_TIME)
     pub const I_DIRTY_ALL: u32 = I_DIRTY;
+    /// Busy after its superblock's shutdown (no Linux bit: it stands
+    /// for the VFS_PTR_POISON generic_shutdown_super stores in i_op,
+    /// i_sb and i_mapping): set once, by `sb_poison`, never cleared;
+    /// [`super::Inode::i_op`], [`super::Inode::superblock`] and
+    /// [`super::Inode::i_mapping`] panic on it
+    pub const I_POISON: u32 = 1 << 31;
+}
+
+/// A use of a poisoned inode (Linux: a fault on VFS_PTR_POISON)
+#[cold]
+#[inline(never)]
+fn poisoned() -> ! {
+    panic!("VFS: poisoned inode");
 }
 
 use istate::{I_FREEING, I_WILL_FREE};
@@ -1015,11 +1028,13 @@ pub struct Inode {
     /// filesystem runs on its active references), valid for the
     /// inode's whole life with the superblock's fields and its
     /// filesystem's data, as Linux's plain pointer: the shutdown evicts
-    /// every inode before ->put_super (`generic_shutdown_super`)
+    /// every inode before ->put_super and poisons any left
+    /// (`generic_shutdown_super`), so [`Inode::superblock`] panics then
     sb: ManuallyDrop<Option<Arc<SuperBlock>>>,
 
-    /// Inode operations (filesystem-specific)
-    pub i_op: &'static dyn InodeOps,
+    /// Inode operations (filesystem-specific; Linux i_op), read through
+    /// [`Inode::i_op`]
+    i_op: &'static dyn InodeOps,
 
     /// Directory operation semaphore (like Linux i_rwsem)
     ///
@@ -1042,8 +1057,9 @@ pub struct Inode {
     /// (Linux inode->i_pipe and pipe->files)
     pub i_pipe: ManuallyDrop<Mutex<PipeSlot>>,
 
-    /// The file's page cache (Linux i_data)
-    pub i_data: ManuallyDrop<crate::mm::filemap::AddressSpace>,
+    /// The file's page cache (Linux i_data), reached through
+    /// [`Inode::i_mapping`]
+    i_data: ManuallyDrop<crate::mm::filemap::AddressSpace>,
 
     /// The inotify watches on it (Linux i_fsnotify_marks)
     pub fsnotify: ManuallyDrop<crate::io::inotify::Marks>,
@@ -1148,6 +1164,19 @@ fn sb_list_del(inode: &Inode) {
 /// after put_super: generic_shutdown_super's busy check)
 pub(super) fn sb_busy(sb: &SuperBlock) -> bool {
     !sb.s_inodes.lock().is_empty()
+}
+
+/// Poison every inode still on `sb`'s list (Linux generic_shutdown_super
+/// after its busy report: i_op, i_sb and i_mapping set to
+/// VFS_PTR_POISON under s_inode_list_lock), so a later use of one
+/// panics (`istate::I_POISON`) instead of reaching what the shutdown
+/// released; each bit set under the inode's `i_lock`
+pub(super) fn sb_poison(sb: &SuperBlock) {
+    let l = sb.s_inodes.lock();
+    for i in l.iter() {
+        let g = i.i_lock.lock();
+        i.set_state(&g, istate::I_POISON);
+    }
 }
 
 /// `f` on each live inode of `sb` until it returns false (Linux
@@ -1586,7 +1615,7 @@ impl Inode {
         if same(self.mtime()) && same(self.ctime()) {
             return;
         }
-        self.i_op.update_time(self, TimeUpdate::CMtime, now);
+        self.i_op().update_time(self, TimeUpdate::CMtime, now);
     }
 
     /// Times from a setattr (utimes, truncate, chmod, chown) through the
@@ -1597,7 +1626,7 @@ impl Inode {
         mtime: Option<Timespec>,
         ctime: Option<Timespec>,
     ) {
-        self.i_op.setattr(self, atime, mtime, ctime);
+        self.i_op().setattr(self, atime, mtime, ctime);
     }
 
     /// An access through `mnt` (Linux touch_atime): atime becomes the
@@ -1616,7 +1645,7 @@ impl Inode {
         if mnt.get_write().is_err() {
             return;
         }
-        self.i_op.update_time(self, TimeUpdate::Atime, now);
+        self.i_op().update_time(self, TimeUpdate::Atime, now);
         mnt.put_write();
     }
 
@@ -1657,9 +1686,32 @@ impl Inode {
     }
 
     /// Its superblock (Linux inode->i_sb), borrowed: live with its
-    /// fields while the inode is (`sb`)
+    /// fields while the inode is (`sb`). Panics on a poisoned inode
     pub fn superblock(&self) -> Option<&Arc<SuperBlock>> {
+        self.poison_check();
         self.sb.as_ref()
+    }
+
+    /// Its operations (Linux inode->i_op). Panics on a poisoned inode
+    pub fn i_op(&self) -> &'static dyn InodeOps {
+        self.poison_check();
+        self.i_op
+    }
+
+    /// Its page cache (Linux inode->i_mapping, which is its own
+    /// i_data). Panics on a poisoned inode
+    pub fn i_mapping(&self) -> &crate::mm::filemap::AddressSpace {
+        self.poison_check();
+        &self.i_data
+    }
+
+    /// Panic if it is poisoned (`istate::I_POISON`): what a use of
+    /// Linux's VFS_PTR_POISON in i_op, i_sb or i_mapping does
+    #[inline]
+    fn poison_check(&self) {
+        if self.i_state.load(Ordering::Relaxed) & istate::I_POISON != 0 {
+            poisoned();
+        }
     }
 
     /// Its superblock's address, to compare only; null for none
@@ -2098,7 +2150,7 @@ unsafe fn destroy_inode(i: *mut Inode) {
     // Off s_inodes with only its superblock reference left (Linux
     // evict's inode_sb_list_del, before ->evict_inode there): a listed
     // inode is one that may still use its filesystem's data
-    // (`SuperBlock::kill_fs_info_idle`)
+    // (`generic_shutdown_super`'s busy check, `kill_fs_info_rcu`)
     // SAFETY: live memory until `i_callback`; the fields read (its
     // superblock, its list link) are not dropped yet
     sb_list_del(unsafe { &*i });

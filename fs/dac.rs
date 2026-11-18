@@ -173,7 +173,7 @@ fn sb_permission(inode: &Inode, mask: u32) -> Result<(), KernelError> {
 /// with MAY_NOT_BLOCK, `inode` may be one an RCU walk borrowed
 pub fn permission_as(c: &Cred, inode: &Inode, mask: u32) -> Result<(), KernelError> {
     sb_permission(inode, mask)?;
-    inode.i_op.permission(inode, c, mask)
+    inode.i_op().permission(inode, c, mask)
 }
 
 /// inode_permission for the current task
@@ -347,7 +347,7 @@ pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _w = p.mnt.want_write()?;
     let _l = inode.lock();
-    inode.i_op.setattr_ok(inode)?;
+    inode.i_op().setattr_ok(inode)?;
     let c = cred();
     if !owner_or_capable(&c, inode) {
         return Err(KernelError::NotPermitted);
@@ -356,7 +356,7 @@ pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     if !in_group_or_capable(&c, inode.gid()) {
         perm &= !S_ISGID;
     }
-    inode.i_op.chmod_ok(inode, perm)?;
+    inode.i_op().chmod_ok(inode, perm)?;
     inode.set_mode_perm(perm);
     inode.set_times(None, None, Some(crate::time::TIMEKEEPER.current_time()));
     Ok(())
@@ -382,7 +382,7 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
     let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _w = p.mnt.want_write()?;
     let _l = inode.lock();
-    inode.i_op.setattr_ok(inode)?;
+    inode.i_op().setattr_ok(inode)?;
     let c = cred();
     if uid.is_some_and(|u| !chown_ok(&c, inode, u)) || gid.is_some_and(|g| !chgrp_ok(&c, inode, g))
     {
@@ -402,12 +402,14 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
         return Err(KernelError::NotPermitted);
     }
     if uid.is_some() || gid.is_some() {
-        inode.i_op.chown_ok(inode)?;
+        inode.i_op().chown_ok(inode)?;
     }
     // The filesystem learns which ids change before they do (Linux
     // tracefs_setattr sets its PERM_SET flags, then simple_setattr)
     if uid.is_some() || gid.is_some() {
-        inode.i_op.setattr_ids(inode, uid.is_some(), gid.is_some());
+        inode
+            .i_op()
+            .setattr_ids(inode, uid.is_some(), gid.is_some());
     }
     if let Some(u) = uid {
         inode.set_uid(u);

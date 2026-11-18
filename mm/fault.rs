@@ -428,7 +428,7 @@ fn file_page(
     access: Access,
 ) -> Option<Result<(u64, bool, bool), VmFault>> {
     let inode = file.mapping_inode()?;
-    if !inode.i_op.maps_cache() {
+    if !inode.i_op().maps_cache() {
         return None;
     }
     let exec = area.prot & PROT_EXEC != 0;
@@ -454,9 +454,9 @@ fn file_page(
         // writable (do_shared_fault), a read maps it read-only and clean
         // (do_read_fault), so its first write faults and dirties it
         // (do_wp_page). tmpfs and ramfs map as the VMA allows.
-        let notify = area.prot & PROT_WRITE != 0 && inode.i_data.aops().can_dirty();
+        let notify = area.prot & PROT_WRITE != 0 && inode.i_mapping().aops().can_dirty();
         if notify && access == Access::Write {
-            super::filemap::dirty_page(&inode.i_data, page);
+            super::filemap::dirty_page(inode.i_mapping(), page);
         }
         return Some(Ok((page, true, notify && access != Access::Write)));
     }
@@ -621,7 +621,7 @@ fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Resul
     // meanwhile; wp_locked rechecks the entry).
     if area.shared
         && let Some(inode) = area.file.as_ref().and_then(|f| f.mapping_inode())
-        && inode.i_op.maps_cache()
+        && inode.i_op().maps_cache()
     {
         // An active swap file is written only by swap (Linux
         // do_page_mkwrite: SIGBUS), also after a read mapped it
@@ -634,7 +634,7 @@ fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Resul
         }
         super::page::lock_page(phys);
         let r = wp_locked(mm, ptep, pte, addr, area, &mut None);
-        super::filemap::dirty_page(&inode.i_data, phys);
+        super::filemap::dirty_page(inode.i_mapping(), phys);
         super::page::unlock_page(phys);
         FRAME_ALLOCATOR.decref(phys);
         super::writeback::balance_dirty_pages(&inode);

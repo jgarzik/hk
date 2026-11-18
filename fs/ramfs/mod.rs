@@ -127,19 +127,19 @@ static TMPFS_AOPS: TmpfsAops = TmpfsAops;
 /// cache is the only copy; Linux ramfs mapping_set_unevictable and
 /// tmpfs, which has no swap here)
 fn file_mapping(sb: &SuperBlock, inode: &Inode) {
-    inode.i_data.set_flags(filemap::AS_UNEVICTABLE);
+    inode.i_mapping().set_flags(filemap::AS_UNEVICTABLE);
     // tmpfs charges its pages (Linux shmem_inode_acct_blocks)
     if let Some(a) = tmpfs::with(sb, |t| t.page_acct()) {
-        inode.i_data.set_aops(&TMPFS_AOPS, None);
-        inode.i_data.set_acct(a);
+        inode.i_mapping().set_aops(&TMPFS_AOPS, None);
+        inode.i_mapping().set_acct(a);
         // Every tmpfs file starts sealed against sealing (Linux
         // shmem_get_inode); memfd_create may clear it
         inode
-            .i_data
+            .i_mapping()
             .seals
             .store(crate::mm::memfd::F_SEAL_SEAL, Ordering::Relaxed);
     } else {
-        inode.i_data.set_aops(&RAMFS_AOPS, None);
+        inode.i_mapping().set_aops(&RAMFS_AOPS, None);
     }
 }
 
@@ -396,12 +396,12 @@ pub fn with_seals<R>(
     inode: &Inode,
     f: impl FnOnce(&core::sync::atomic::AtomicU32) -> R,
 ) -> Option<R> {
-    (inode.mode().is_file() && inode.i_data.charged()).then(|| f(&inode.i_data.seals))
+    (inode.mode().is_file() && inode.i_mapping().charged()).then(|| f(&inode.i_mapping().seals))
 }
 
 /// The seals of `inode` (0 for any but a tmpfs file): one load
 fn seals(inode: &Inode) -> u32 {
-    inode.i_data.seals.load(Ordering::Acquire)
+    inode.i_mapping().seals.load(Ordering::Acquire)
 }
 
 /// One name of `inode` goes (Linux shmem_unlink): on tmpfs a name

@@ -272,7 +272,7 @@ fn needs_dirty_tracking(vma: &Vma) -> bool {
         && vma.is_writable()
         && vma
             .inode()
-            .is_some_and(|i| i.i_op.maps_cache() && i.i_data.aops().can_dirty())
+            .is_some_and(|i| i.i_op().maps_cache() && i.i_mapping().aops().can_dirty())
 }
 
 /// The frame of the current task's page at `addr`, faulted in for

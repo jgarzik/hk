@@ -507,17 +507,16 @@ impl Drop for FatInode {
 
 /// Release `sb`'s VFAT data (Linux fat_put_super, a failed fill's
 /// out_fail): the FAT's inode put first, evicted while the data is
-/// there, then the data a grace period on, unless an inode is still
-/// listed, busy past the shutdown, whose borrows it then outlives
-/// (`kill_fs_info_idle`)
-fn fat_put_data(sb: &SuperBlock) {
+/// there, then the data by `release` (put_super's queued
+/// `kill_fs_info_rcu`, the failed fill's `kill_fs_info`)
+fn fat_put_data(sb: &SuperBlock, release: fn(&SuperBlock)) {
     // SAFETY: put_super or the failed fill, the release's caller: the
     // data set, s_umount held for writing
     let d = unsafe { msdos_sb(sb) };
     // SAFETY: as above; every other inode evicted, so no operation of
     // the filesystem runs
     unsafe { d.fat_inode.put() };
-    sb.kill_fs_info_idle();
+    release(sb);
 }
 
 /// What the FAT lock guards beyond the FAT itself
@@ -863,7 +862,7 @@ fn new_private(inode: &Inode, d: VfatInodeData) -> Result<Arc<VfatInode>, Kernel
         // `i_callback` just before the inode's memory (`i_data`'s) is
         // freed, a grace period after the eviction emptied the list
         // (`evict_inode`), with no buffer added since
-        i_metadata_bhs: unsafe { MappingMetadataBhs::new(&inode.i_data) },
+        i_metadata_bhs: unsafe { MappingMetadataBhs::new(inode.i_mapping()) },
     })?);
     try_arc(VfatInode {
         d: crate::sync::spin::Mutex::new(d),
@@ -896,9 +895,10 @@ fn i_sb(inode: &Inode) -> &Arc<SuperBlock> {
 /// `sb`'s VFAT data (Linux MSDOS_SB(sb)), borrowed
 ///
 /// # Safety
-/// As [`SuperBlock::fs_info_ref`] (vfat releases the data only by
-/// `kill_fs_info_idle`): the caller holds an active reference to `sb`,
-/// or works for a live inode of it, or is its put_super.
+/// As [`SuperBlock::fs_info_ref`] (vfat releases the data by
+/// `kill_fs_info_rcu`, or `kill_fs_info` from a failed fill): the
+/// caller holds an active reference to `sb`, or works for a live
+/// inode of it, or is its put_super.
 unsafe fn msdos_sb(sb: &SuperBlock) -> &VfatSbData {
     // SAFETY: the caller's contract
     unsafe { sb.fs_info_ref::<VfatSbData>() }.expect("vfat: a superblock with no data")
@@ -907,10 +907,11 @@ unsafe fn msdos_sb(sb: &SuperBlock) -> &VfatSbData {
 /// The VFAT data of `inode`'s filesystem (Linux
 /// MSDOS_SB(inode->i_sb)): borrowed with the inode
 fn msdos_sb_of(inode: &Inode) -> &VfatSbData {
-    // SAFETY: `inode` is live for the borrow, so listed on its
-    // superblock's s_inodes until its teardown is past any use of the
-    // data, and the data is released only while no inode is listed
-    // (`fat_put_data`: kill_fs_info_idle)
+    // SAFETY: `inode` is live for the borrow and was not poisoned when
+    // it was taken (`i_sb` panics on one): the shutdown evicts every
+    // inode before put_super, whose queued release runs only if none is
+    // left on s_inodes, else poisons them and keeps the data with the
+    // superblock's memory, which `inode` keeps (`kill_fs_info_rcu`)
     unsafe { msdos_sb(i_sb(inode)) }
 }
 
@@ -2320,7 +2321,7 @@ impl InodeOps for VfatInodeOps {
             Some(sb),
             &VFAT_INODE_OPS,
         ))?;
-        inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
+        inode.i_mapping().set_aops(&VFAT_FILE_AOPS, Some(&inode));
         inode.inc_iversion();
 
         let crtime = fill_times(&inode, sb_data.opts.tz(), &et);
@@ -2398,7 +2399,7 @@ impl InodeOps for VfatInodeOps {
             Some(sb),
             &VFAT_INODE_OPS,
         ))?;
-        inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
+        inode.i_mapping().set_aops(&VFAT_FILE_AOPS, Some(&inode));
         inode.inc_iversion();
         // Linux vfat_mkdir: set_nlink(inode, 2)
         inode.nlink.store(2, core::sync::atomic::Ordering::Relaxed);
@@ -3118,7 +3119,7 @@ fn create_inode_for_entry(
         Some(sb),
         &VFAT_INODE_OPS,
     ))?;
-    inode.i_data.set_aops(&VFAT_FILE_AOPS, Some(&inode));
+    inode.i_mapping().set_aops(&VFAT_FILE_AOPS, Some(&inode));
     inode.inc_iversion();
     inode
         .nlink
@@ -3343,11 +3344,11 @@ impl SuperOps for VfatSuperOps {
     }
 
     /// Linux fat_put_super: the FAT's inode put (iput: evicted while
-    /// the data is there), then the data released a grace period on
-    /// (call_rcu(delayed_free)), in thread context, every other inode
+    /// the data is there), then the data's release queued
+    /// (call_rcu(delayed_free): `kill_fs_info_rcu`), every other inode
     /// evicted already
     fn put_super(&self, sb: &SuperBlock) {
-        fat_put_data(sb);
+        fat_put_data(sb, SuperBlock::kill_fs_info_rcu);
     }
 
     /// Linux fat_statfs: clusters as blocks, the free ones counted once
@@ -3520,8 +3521,9 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
     // on (Linux fat_fill_super: sb->s_fs_info = sbi)
     sb.set_fs_info(crate::fs::superblock::FsInfo::new(sb_data.clone())?);
     // Linux fat_fill_super's out_fail: the FAT's inode put and the data
-    // freed (sb->s_fs_info = NULL), here in thread context
-    fat_fill_inodes(sb, &sb_data).inspect_err(|_| fat_put_data(sb))
+    // freed (sb->s_fs_info = NULL), here in thread context; every inode
+    // the fill made is put already, and none was reachable but by it
+    fat_fill_inodes(sb, &sb_data).inspect_err(|_| fat_put_data(sb, SuperBlock::kill_fs_info))
 }
 
 /// The FAT's inode, then the root (Linux fat_fill_super from new_inode
@@ -3582,7 +3584,7 @@ fn fat_read_root(
         &VFAT_INODE_OPS,
     ))?;
     root_inode
-        .i_data
+        .i_mapping()
         .set_aops(&VFAT_FILE_AOPS, Some(&root_inode));
     // Linux fat_fill_inode: inode_inc_iversion
     root_inode.inc_iversion();

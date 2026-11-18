@@ -640,7 +640,7 @@ crate::pod!(ShmInfo {
 /// The resident pages of a segment (Linux shm_add_rss_swap: its file's
 /// cached pages; none are swapped)
 fn rss(shm: &ShmidKernel) -> u64 {
-    shm.inode.i_data.nrpages()
+    shm.inode.i_mapping().nrpages()
 }
 
 /// The resident pages of every segment of `ns` (Linux shm_get_stat)

@@ -1099,7 +1099,7 @@ impl Nd<'_> {
         }
         let body = match l.inode.i_link() {
             Some(b) => Body::Ref(b),
-            None => match l.inode.i_op.get_link(l.inode, true) {
+            None => match l.inode.i_op().get_link(l.inode, true) {
                 Ok(Link::Text(t)) => Body::Own(t),
                 Ok(Link::Jump(p)) => {
                     // RCU mode never jumps (procfs's magic links are

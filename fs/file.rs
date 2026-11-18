@@ -671,7 +671,7 @@ impl File {
     pub fn sample_wb_err(&self) {
         if let Some(i) = self.mapping_inode() {
             self.f_wb_err
-                .store(i.i_data.wb_err.sample(), Ordering::Relaxed);
+                .store(i.i_mapping().wb_err.sample(), Ordering::Relaxed);
         }
         if let Some(i) = self.dentry.get_inode()
             && let Some(sb) = i.superblock()
@@ -686,7 +686,7 @@ impl File {
         let Some(i) = self.mapping_inode() else {
             return Ok(());
         };
-        advance(&i.i_data.wb_err, &self.f_wb_err, &self.f_lock)
+        advance(&i.i_mapping().wb_err, &self.f_wb_err, &self.f_lock)
     }
 
     /// A writeback error of its filesystem since it last looked, once

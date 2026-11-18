@@ -219,7 +219,7 @@ impl AddressSpace {
         if let Some(h) = host {
             // INVARIANT: the host's own mapping (Linux inode->i_data)
             assert!(
-                core::ptr::eq(&raw const *h.i_data, self),
+                core::ptr::eq(&raw const *h.i_mapping(), self),
                 "filemap: a host's own mapping"
             );
             self.host
@@ -674,7 +674,7 @@ fn add_new(m: &AddressSpace, index: u64) -> Result<Option<u64>, KernelError> {
 /// stays cached, not uptodate, for a later read to retry: it may hold
 /// dirty buffers a write left (a block device page written in part)
 fn filemap_read_folio(inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
-    inode.i_data.aops().read_folio(inode, phys, index)?;
+    inode.i_mapping().aops().read_folio(inode, phys, index)?;
     super::page::wait_on_page_locked(phys);
     if uptodate(phys) {
         Ok(())
@@ -688,7 +688,7 @@ fn filemap_read_folio(inode: &Inode, phys: u64, index: u64) -> Result<(), Kernel
 /// must create or fill is, under the mapping's invalidate_lock read
 /// (Linux filemap_create_folio, filemap_update_page, filemap_fault)
 pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     loop {
         let Some(phys) = find_get(m, index) else {
             let _inv = m.invalidate_lock.read();
@@ -939,7 +939,7 @@ fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
 /// filesystem, for fsync and syncfs to report (Linux mapping_set_error:
 /// wb_err and s_wb_err)
 pub fn mapping_set_error(inode: &Inode, e: KernelError) {
-    inode.i_data.wb_err.set(e);
+    inode.i_mapping().wb_err.set(e);
     if let Some(sb) = inode.superblock() {
         sb.s_wb_err.set(e);
     }
@@ -966,7 +966,7 @@ pub unsafe fn mapping_set_error_raw(m: &AddressSpace, e: KernelError) {
 /// dio_warn_stale_pagecache): the mapping's writeback error is EIO,
 /// which the next fsync of each open file reports, and a warning
 pub fn dio_warn_stale_pagecache(inode: &Inode) {
-    inode.i_data.wb_err.set(KernelError::Io);
+    inode.i_mapping().wb_err.set(KernelError::Io);
     crate::printkln!(
         "Page cache invalidation failure on direct I/O.  Possible data corruption due to collision with buffered I/O!"
     );
@@ -985,7 +985,7 @@ pub fn write_and_wait(inode: &Inode) -> Result<(), KernelError> {
 /// `write_and_wait` of the pages with index in [first, last] (Linux
 /// filemap_write_and_wait_range)
 pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelError> {
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     let mut err = Ok(());
     let mut at = first;
     loop {
@@ -1037,7 +1037,7 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
 /// wait (Linux filemap_write_and_wait_range): nothing to do in an empty
 /// mapping
 pub fn write_and_wait_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
-    if end < start || inode.i_data.nrpages() == 0 {
+    if end < start || inode.i_mapping().nrpages() == 0 {
         return Ok(());
     }
     let p = PAGE_SIZE as u64;
@@ -1115,7 +1115,7 @@ pub fn range_needs_writeback(m: &AddressSpace, start: u64, end: u64) -> bool {
 /// from every mapping first (Linux invalidate_inode_pages2_range): EBUSY
 /// if one could not go, the others still do. Sleeps (page locks).
 pub fn invalidate_pages2(inode: &Inode, first: u64, last: u64) -> Result<(), KernelError> {
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     if m.nrpages() == 0 {
         return Ok(());
     }
@@ -1197,7 +1197,7 @@ fn wait_writeback(m: &AddressSpace, first: u64, last: u64) {
 /// [first, last] (Linux invalidate_mapping_pages: best effort; dirty,
 /// locked, mapped or otherwise referenced pages stay)
 pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) -> u64 {
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     // The cache is the only copy of an unevictable mapping's data
     // (ramfs: its pages are never dirty, yet cannot be re-read)
     if m.has_flag(AS_UNEVICTABLE) {
@@ -1262,9 +1262,9 @@ pub fn invalidate(inode: &Inode) {
     // Unmapped first and again after (Linux truncate_inode_pages unmaps
     // a mapped folio): no mapping keeps an orphaned page whose writes
     // would reach nothing
-    unmap_mapping_range(&inode.i_data, 0);
-    truncate_from(&inode.i_data, 0);
-    unmap_mapping_range(&inode.i_data, 0);
+    unmap_mapping_range(inode.i_mapping(), 0);
+    truncate_from(inode.i_mapping(), 0);
+    unmap_mapping_range(inode.i_mapping(), 0);
 }
 
 /// Linux simple_write_begin: the page, locked; one not uptodate (a
@@ -1272,7 +1272,7 @@ pub fn invalidate(inode: &Inode) {
 /// bytes outside the write zeroed, and simple_write_end marks it
 /// uptodate
 pub fn simple_write_begin(inode: &Inode, pos: u64, len: usize) -> Result<u64, KernelError> {
-    let phys = grab(&inode.i_data, pos / PAGE_SIZE as u64)?;
+    let phys = grab(inode.i_mapping(), pos / PAGE_SIZE as u64)?;
     if !uptodate(phys) && len != PAGE_SIZE {
         let from = (pos % PAGE_SIZE as u64) as usize;
         zero_bytes(phys, 0, from);
@@ -1296,7 +1296,7 @@ pub fn simple_write_end(inode: &Inode, pos: u64, len: usize, copied: usize, phys
     if end > inode.get_size() {
         inode.set_size(end);
     }
-    dirty_page(&inode.i_data, phys);
+    dirty_page(inode.i_mapping(), phys);
     unlock_page(phys);
     put_page(phys);
     copied
@@ -1327,7 +1327,7 @@ pub fn read_iter_nowait(
     to: &mut IovDest<'_>,
     pos: u64,
 ) -> Result<usize, KernelError> {
-    read_with(inode, to, pos, &|i| match find_get(&inode.i_data, i) {
+    read_with(inode, to, pos, &|i| match find_get(inode.i_mapping(), i) {
         Some(p) if uptodate(p) => Ok(Some(p)),
         Some(p) => {
             put_page(p);
@@ -1345,7 +1345,7 @@ pub fn read_iter_holes(
     to: &mut IovDest<'_>,
     pos: u64,
 ) -> Result<usize, KernelError> {
-    read_with(inode, to, pos, &|i| match find_get(&inode.i_data, i) {
+    read_with(inode, to, pos, &|i| match find_get(inode.i_mapping(), i) {
         None => Ok(None),
         Some(p) if uptodate(p) => Ok(Some(p)),
         Some(p) => {
@@ -1413,7 +1413,7 @@ pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, Kerne
 /// some. A failure after some bytes reports those; a source that
 /// cannot be faulted in is EFAULT.
 pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
-    let a = inode.i_data.aops();
+    let a = inode.i_mapping().aops();
     write_with(inode, from, pos, &|at, n| a.write_begin(inode, at, n))
 }
 
@@ -1427,7 +1427,7 @@ pub fn write_iter_nowait(
     from: &mut IovSource<'_>,
     pos: u64,
 ) -> Result<usize, KernelError> {
-    let a = inode.i_data.aops();
+    let a = inode.i_mapping().aops();
     write_with(inode, from, pos, &|at, n| {
         a.write_begin_nowait(inode, at, n)
     })
@@ -1436,7 +1436,7 @@ pub fn write_iter_nowait(
 /// simple_write_begin's page for a write of `n` bytes at `at`, without
 /// waiting: EAGAIN where that would wait for a page lock or a read
 pub fn grab_nowait(inode: &Inode, at: u64, n: usize) -> Result<u64, KernelError> {
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     let index = at / PAGE_SIZE as u64;
     let whole = n == PAGE_SIZE || index * PAGE_SIZE as u64 >= inode.get_size();
     let Some(phys) = find_get(m, index) else {
@@ -1469,7 +1469,7 @@ fn write_with(
     pos: u64,
     begin: &dyn Fn(u64, usize) -> Result<u64, KernelError>,
 ) -> Result<usize, KernelError> {
-    let a = inode.i_data.aops();
+    let a = inode.i_mapping().aops();
     let mut done = 0;
     let mut limit = PAGE_SIZE;
     while !from.is_empty() {
@@ -1573,7 +1573,7 @@ pub fn truncate_setsize(inode: &Inode, size: u64) {
 /// a fault that raced), the pages removed, and the partial last page
 /// zeroed past it. The caller holds i_rwsem.
 pub fn truncate_pagecache(inode: &Inode, size: u64) {
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     let from = size.div_ceil(PAGE_SIZE as u64);
     unmap_mapping_range(m, from);
     truncate_from(m, from);
@@ -1605,7 +1605,7 @@ pub fn punch_range(inode: &Inode, start: u64, end: u64) {
     if start >= end {
         return;
     }
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     let ps = PAGE_SIZE as u64;
     let (first, past) = (start.div_ceil(ps), end / ps);
     if first < past {
@@ -1644,7 +1644,7 @@ pub fn punch_range(inode: &Inode, start: u64, end: u64) {
 /// made uptodate now, so that undo cannot take it. A fatal signal stops
 /// it (EINTR). The caller holds i_rwsem.
 pub fn falloc_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
-    let m = &inode.i_data;
+    let m = inode.i_mapping();
     let ps = PAGE_SIZE as u64;
     let (first, past) = (start / ps, end.div_ceil(ps));
     for index in first..past {
@@ -1718,7 +1718,7 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
     loop {
         let phys = read_page(inode, index).map_err(err)?;
         lock_page(phys);
-        if page(phys).mapping.load(Ordering::Acquire) != inode.i_data.key() {
+        if page(phys).mapping.load(Ordering::Acquire) != inode.i_mapping().key() {
             // Truncated meanwhile
             unlock_page(phys);
             put_page(phys);
@@ -1745,7 +1745,9 @@ fn for_each_cache_inode(reclaim: bool, f: &mut dyn FnMut(&Inode) -> bool) {
     let mut more = true;
     let each = |sb: &alloc::sync::Arc<crate::fs::superblock::SuperBlock>| {
         more = more
-            && crate::fs::inode::for_each_sb_inode(sb, &mut |i| i.i_data.nrpages() == 0 || f(i));
+            && crate::fs::inode::for_each_sb_inode(sb, &mut |i| {
+                i.i_mapping().nrpages() == 0 || f(i)
+            });
     };
     if reclaim {
         iterate_supers_trylock(each);

@@ -298,7 +298,7 @@ pub fn rehash(inode: &InodeRef, hashval: u64) {
 /// might_sleep): the filesystem may do I/O (vfat frees an unlinked
 /// file's clusters).
 pub fn evict(inode: &Inode) {
-    inode.i_op.evict_inode(inode);
+    inode.i_op().evict_inode(inode);
     if unhash(inode) {
         // Its waiters queued under the hash lock this unhash took (Linux
         // evict: wake_up_bit(__I_NEW) on the inode's hashed queue)

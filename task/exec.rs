@@ -1130,7 +1130,7 @@ where
     // its filesystem maps its cache and the kernel writes nothing into
     // it: a static PIE without an interpreter is relocated here, so its
     // pages are private copies made now
-    let maps = |f: &File| f.get_inode().is_some_and(|i| i.i_op.maps_cache());
+    let maps = |f: &File| f.get_inode().is_some_and(|i| i.i_op().maps_cache());
     let exe_map = (maps(&file) && !(elf.is_pie && interp.is_none())).then_some(&file);
     let interp_map = interp_file.as_ref().filter(|f| maps(f));
     let segments_end = load_elf_segments(

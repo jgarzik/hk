@@ -231,7 +231,7 @@ fn write_and_wait(
     if !nowait {
         return filemap::write_and_wait_range(&b.bd_inode, pos, end);
     }
-    if filemap::range_needs_writeback(&b.bd_inode.i_data, pos, end) {
+    if filemap::range_needs_writeback(b.bd_inode.i_mapping(), pos, end) {
         return Err(KernelError::WouldBlock);
     }
     Ok(())
@@ -248,7 +248,7 @@ fn invalidate_pages(
 ) -> Result<(), KernelError> {
     let end = last(pos, count);
     if nowait {
-        if filemap::range_has_page(&b.bd_inode.i_data, pos, end) {
+        if filemap::range_has_page(b.bd_inode.i_mapping(), pos, end) {
             return Err(KernelError::WouldBlock);
         }
     } else {
@@ -263,7 +263,7 @@ fn invalidate_pages(
 /// error but the mapping's (`filemap::dio_warn_stale_pagecache`)
 fn invalidate_post(b: &BlockDevice, pos: u64, count: usize) {
     let p = PAGE_SIZE as u64;
-    if b.bd_inode.i_data.nrpages() != 0
+    if b.bd_inode.i_mapping().nrpages() != 0
         && filemap::invalidate_pages2(&b.bd_inode, pos / p, last(pos, count) / p).is_err()
     {
         filemap::dio_warn_stale_pagecache(&b.bd_inode);
@@ -494,7 +494,7 @@ pub fn bdev_inode(dev: DevId, size: u64) -> Result<InodeRef, KernelError> {
         &BDEV_INODE_OPS,
     ))?;
     inode.set_size(size);
-    inode.i_data.set_aops(&BDEV_AOPS, Some(&inode));
+    inode.i_mapping().set_aops(&BDEV_AOPS, Some(&inode));
     Ok(inode)
 }
 

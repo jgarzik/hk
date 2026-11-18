@@ -54,7 +54,7 @@ fn do_truncate(inode: &super::InodeRef, length: u64, times: bool) -> KernelResul
         // ATTR_KILL_* in the same notify_change)
         super::dac::remove_privs(inode);
         let changed = inode.get_size() != length;
-        inode.i_op.truncate(inode, length).inspect(|()| {
+        inode.i_op().truncate(inode, length).inspect(|()| {
             if times || changed {
                 let now = crate::time::TIMEKEEPER.current_time();
                 inode.set_times(None, Some(now), Some(now));
