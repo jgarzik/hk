@@ -52,6 +52,7 @@ use crate::util::kalloc::{arc_nofail, box_nofail, try_arc};
 use crate::util::smallvec::SmallVec;
 
 use super::blk_mq::BlkMq;
+use super::claim::{self, Holder};
 
 /// Largest soft block size (Linux BLK_MAX_BLOCK_SIZE: 64K since 6.15
 /// with CONFIG_TRANSPARENT_HUGEPAGE)
@@ -883,6 +884,9 @@ pub struct Disk {
     /// Opens, releases and rescans (Linux open_mutex), and the state
     /// they share
     pub(super) open_mutex: crate::sync::Mutex<OpenState>,
+    /// Its devices' exclusive claims (Linux bd_holder, bd_holders,
+    /// bd_claiming), under `claim::BDEV_LOCK`
+    pub(super) claims: super::claim::DiskClaims,
     /// Sequence number, unique for the boot, set at allocation (Linux
     /// diskseq)
     pub seq: u64,
@@ -906,6 +910,7 @@ impl Disk {
     ) -> Result<Arc<Self>, KernelError> {
         let dev = DevId::new(major, first_minor);
         let part_tbl = crate::util::kmem::try_vec(usize::from(minors.max(1)), None)?;
+        let claims = super::claim::Claims::new(usize::from(minors))?;
         let bdi = bdi_register(dev);
         let wb = bdi.clone();
         try_arc(Self {
@@ -922,6 +927,7 @@ impl Disk {
                 open_partitions: 0,
                 part_tbl: part_tbl.into_boxed_slice(),
             }),
+            claims: crate::sync::LockedBy::new(claims),
             seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
             private: spin::Once::new(),
             getgeo: spin::Once::new(),
@@ -1107,8 +1113,24 @@ impl BlockDevice {
         self.dead.store(true, Ordering::Release);
     }
 
-    /// A file opened the device (Linux blkdev_get_whole/_part)
-    pub fn open(&self) -> Result<(), KernelError> {
+    /// Open the device (Linux bdev_open): with a `holder`, for its
+    /// exclusive use (EBUSY if another holder has it)
+    pub fn open(&self, holder: Option<Holder>) -> Result<(), KernelError> {
+        if let Some(h) = holder {
+            claim::prepare(self, h)?;
+        }
+        let r = self.open_locked(holder);
+        if r.is_err()
+            && let Some(h) = holder
+        {
+            claim::abort(self, h);
+        }
+        r
+    }
+
+    /// `open` under `open_mutex`, the claim prepared (Linux
+    /// blkdev_get_whole/_part, bd_finish_claiming)
+    fn open_locked(&self, holder: Option<Holder>) -> Result<(), KernelError> {
         let mut st = self.disk.open_mutex.lock();
         // Checked under open_mutex: a rescan or removal that replaced
         // this device (it holds the mutex) is seen, so an open never
@@ -1122,23 +1144,36 @@ impl BlockDevice {
                 st.open_partitions += 1;
             }
         }
+        if let Some(h) = holder {
+            claim::finish(self, h);
+        }
         Ok(())
     }
 
-    /// Open the device for the kernel (a mount, active swap; Linux
-    /// bdev_file_open_by_dev): counted like an open file, so a rescan
-    /// sees the partition in use, until the handle is dropped
-    pub fn open_handle(self: &Arc<Self>) -> Result<BdevHandle, KernelError> {
-        self.open()?;
-        Ok(BdevHandle(self.clone()))
+    /// Open the device for the kernel (a mount, active swap, BLKBSZSET;
+    /// Linux bdev_file_open_by_dev): counted like an open file, so a
+    /// rescan sees the partition in use, and claimed by `holder`, until
+    /// the handle is dropped
+    pub fn open_handle(
+        self: &Arc<Self>,
+        holder: Option<Holder>,
+    ) -> Result<BdevHandle, KernelError> {
+        self.open(holder)?;
+        Ok(BdevHandle {
+            bdev: self.clone(),
+            holder,
+        })
     }
 
-    /// The last reference of an open file went away; the last opener
-    /// writes the cache back and drops it (Linux blkdev_put_whole ->
-    /// blkdev_flush_mapping: sync_blockdev + kill_bdev), under
-    /// open_mutex, so the next opener reads the disk
-    pub fn release(&self) {
+    /// An opener is done (Linux bdev_release): its claim ends; the last
+    /// opener writes the cache back and drops it (Linux
+    /// blkdev_put_whole -> blkdev_flush_mapping: sync_blockdev +
+    /// kill_bdev), under open_mutex, so the next opener reads the disk
+    pub fn release(&self, holder: Option<Holder>) {
         let mut st = self.disk.open_mutex.lock();
+        if let Some(h) = holder {
+            claim::end(self, h);
+        }
         if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 {
             let _ = sync_blockdev(self);
             kill_bdev(self);
@@ -1149,19 +1184,28 @@ impl BlockDevice {
     }
 }
 
-/// A kernel open of a block device (`BlockDevice::open_handle`)
-pub struct BdevHandle(Arc<BlockDevice>);
+/// A kernel open of a block device (`BlockDevice::open_handle`; Linux
+/// a bdev file, its holder in private_data)
+pub struct BdevHandle {
+    bdev: Arc<BlockDevice>,
+    holder: Option<Holder>,
+}
 
 impl BdevHandle {
     pub fn bdev(&self) -> &Arc<BlockDevice> {
-        &self.0
+        &self.bdev
+    }
+
+    /// Its exclusive claim's holder, if it has one
+    pub fn holder(&self) -> Option<Holder> {
+        self.holder
     }
 }
 
 impl core::ops::Deref for BdevHandle {
     type Target = BlockDevice;
     fn deref(&self) -> &BlockDevice {
-        &self.0
+        &self.bdev
     }
 }
 
@@ -1170,7 +1214,7 @@ impl Drop for BdevHandle {
         // Host tests make superblocks but never open devices (and
         // cannot sleep on open_mutex)
         #[cfg(not(test))]
-        self.0.release();
+        self.bdev.release(self.holder);
     }
 }
 
@@ -1547,16 +1591,25 @@ fn validate_blocksize(bdev: &BlockDevice, size: i32) -> Result<(), KernelError> 
     }
 }
 
-/// Change the soft block size of an open device (Linux set_blocksize,
-/// BLKBSZSET): its cache is written back and dropped first, under the
+/// Change the soft block size of a device its caller holds
+/// exclusively (`holder`; EINVAL without: Linux set_blocksize, the
+/// bdev file's private_data), so no filesystem or other exclusive user
+/// has its cache in use: its cache is written back and dropped first, under the
 /// bdev inode's i_rwsem held for writing, which the device file's
 /// buffered reads and writes hold shared, so none of them runs on the
 /// old geometry meanwhile. Linux also takes the invalidate lock there
 /// for a large folio's order; order-0 folios need none, and a page
 /// given buffers of the old size meanwhile (a fault) has them replaced
 /// on the next lookup of the new size.
-pub fn set_blocksize(bdev: &BlockDevice, size: i32) -> Result<(), KernelError> {
+pub fn set_blocksize(
+    bdev: &BlockDevice,
+    holder: Option<Holder>,
+    size: i32,
+) -> Result<(), KernelError> {
     validate_blocksize(bdev, size)?;
+    if holder.is_none() {
+        return Err(KernelError::InvalidArgument);
+    }
     let bits = (size as u32).trailing_zeros();
     let inode = &bdev.bd_inode;
     if inode.blkbits() != bits {
@@ -1569,8 +1622,8 @@ pub fn set_blocksize(bdev: &BlockDevice, size: i32) -> Result<(), KernelError> {
 }
 
 /// Set a device filesystem's block size and its device's (Linux
-/// sb_set_blocksize, at mount): the new size, or 0 if the device does
-/// not take it
+/// sb_set_blocksize, at mount: set_blocksize on s_bdev_file, which the
+/// superblock claims): the new size, or 0 if the device does not take it
 pub fn sb_set_blocksize(sb: &crate::fs::superblock::SuperBlock, size: u32) -> u32 {
     let Some(bdev) = sb.bdev() else {
         return 0;
@@ -1578,7 +1631,7 @@ pub fn sb_set_blocksize(sb: &crate::fs::superblock::SuperBlock, size: u32) -> u3
     let Ok(n) = i32::try_from(size) else {
         return 0;
     };
-    if set_blocksize(bdev, n).is_err() {
+    if set_blocksize(bdev, Some(sb.bdev_holder()), n).is_err() {
         return 0;
     }
     sb.set_s_blocksize(size);

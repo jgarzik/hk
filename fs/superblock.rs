@@ -993,9 +993,10 @@ fn lookup_bdev(path: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
 /// The superblock on the block device `fc.source` names (Linux
 /// get_tree_bdev): one per device (sget_dev, test_bdev_super), shared
 /// by every mount of it; a mount that would change its read-only state
-/// is EBUSY. A new one holds the device open (setup_bdev_super: under
-/// the disk's open_mutex, failing for a removed device; a rescan sees
-/// it in use), then `fill`
+/// is EBUSY. A new one holds the device open and claimed for its
+/// exclusive use (setup_bdev_super: holder the superblock; EBUSY if
+/// another holder has it; under the disk's open_mutex, failing for a
+/// removed device; a rescan sees it in use), then `fill`
 pub fn get_tree_bdev(
     fc: &FsContext<'_>,
     s_op: &'static dyn SuperOps,
@@ -1021,7 +1022,7 @@ pub fn get_tree_bdev(
     if fc.sb_flags & SB_RDONLY == 0 && bdev.ro() {
         return Err(KernelError::PermissionDenied);
     }
-    sb.set_bdev(bdev.open_handle()?);
+    sb.set_bdev(bdev.open_handle(Some(sb.bdev_holder()))?);
     fill(&sb)?;
     sb.set_active();
     Ok(sb)
@@ -1414,6 +1415,11 @@ impl SuperBlock {
     /// Allocate the next inode number
     pub fn alloc_ino(&self) -> InodeId {
         self.next_ino.next()
+    }
+
+    /// Its claim of its block device (Linux holder sb): its address
+    pub fn bdev_holder(&self) -> crate::block::claim::Holder {
+        core::ptr::from_ref(self) as usize
     }
 
     /// The block device it is mounted from, held open until its

@@ -278,13 +278,29 @@ fn drop_bdevs(st: &mut OpenState, from: u16) {
 
 /// BLKRRPART: re-read the partition table (Linux disk_scan_partitions):
 /// EINVAL on a partition or a disk without partitions, EBUSY while a
-/// partition is in use
-pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
+/// partition is in use or another holder claims the disk. The disk is
+/// claimed for the scan unless the caller's file (`excl`, opened
+/// O_EXCL) already has it, so no exclusive opener races it.
+pub fn rescan(bdev: &BlockDevice, excl: bool) -> Result<(), KernelError> {
     let disk = &bdev.disk;
     if bdev.partno != 0 || disk.minors <= 1 {
         return Err(KernelError::InvalidArgument);
     }
-    let mut st = disk.open_mutex.lock();
+    // Linux holder disk_scan_partitions
+    let holder = rescan as fn(&BlockDevice, bool) -> Result<(), KernelError> as usize;
+    if !excl {
+        crate::block::claim::prepare(bdev, holder)?;
+    }
+    let r = rescan_locked(bdev);
+    if !excl {
+        crate::block::claim::abort(bdev, holder);
+    }
+    r
+}
+
+/// `rescan` under `open_mutex`
+fn rescan_locked(bdev: &BlockDevice) -> Result<(), KernelError> {
+    let mut st = bdev.disk.open_mutex.lock();
     // A partition is open: a file, a mounted filesystem or active swap
     // (each opens the device, as in Linux)
     if st.open_partitions != 0 {

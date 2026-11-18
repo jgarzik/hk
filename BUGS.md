@@ -1039,11 +1039,7 @@ its no-writeback skip, before it relies on sync.
   UnixWare, Minix, AIX or DM6 subpartitions. GPT: like Linux without
   the `gpt` parameter, a bad primary header is not replaced by the
   backup.
-- BLKRRPART is EBUSY while a partition is open, mounted or used for
-  swap (any holder of the partition besides the registry); Linux also
-  takes the whole disk for exclusive use during the scan
-  (bd_prepare_to_claim), so a rescan can race an exclusive opener.
-  BLKDISCARD, BLKZEROOUT, BLKSECDISCARD, BLKGETDISKSEQ, BLKROTATIONAL,
+- BLKDISCARD, BLKZEROOUT, BLKSECDISCARD, BLKGETDISKSEQ, BLKROTATIONAL,
   BLKDISCARDZEROES, BLKRAGET/BLKRASET, BLKFRAGET/BLKFRASET, BLKTRACE*,
   the zone, persistent reservation and BLKPG partition ioctls are
   ENOTTY. HDIO_GETGEO is ENOTTY on sd disks (Linux sd_getgeo:
@@ -1061,9 +1057,10 @@ its no-writeback skip, before it relies on sync.
 - No /proc/devices block section; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
-- A mounted filesystem or active swap opens its block device, but not
-  exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
-  are not refused.
+- Exclusive claims have no holder operations (Linux blk_holder_ops:
+  mark_dead, sync, freeze, thaw of a mounted filesystem when its device
+  goes away or is frozen), no BLK_OPEN_RESTRICT_WRITES and no
+  disk-event blocking for write holders.
 
 fallocate on a block device is EOPNOTSUPP (Linux blkdev_fallocate zeroes
 or discards the range).

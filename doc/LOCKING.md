@@ -737,7 +737,8 @@ SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fa_lock,
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem, INODE_HASH_LOCK
-    (bdev_add/bdev_del), MAJORS; I/O sleeps under open_mutex only
+    (bdev_add/bdev_del), MAJORS, BDEV_LOCK (claims; sleeping leaf, also
+    taken alone to prepare a claim); I/O sleeps under open_mutex only
     SuperBlock.s_umount → bdev inode i_rwsem (sleeping; set_blocksize
     writes it, device-file buffered I/O reads it) → mmap_lock, page lock
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
@@ -5433,6 +5434,7 @@ thread context, the driver completes it from its interrupt handler and
 |------|------|-----------|-------|
 | `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain) and the disk's `part_tbl` (its block devices by partition number, one slot per minor, each a reference; Linux disk->part_tbl), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) changes only under it, as does the soft block size's initial value at the first open (Linux set_init_blocksize; BLKBSZSET changes it under the bdev inode's `i_rwsem`, Rules): block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev_file`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `INODE_HASH_LOCK` (`bdev_add` hashes a device's inode, `bdev_del` unhashes it), `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `MAJORS` | sleeping `sync::Mutex` (block majors, register_blkdev; Linux major_names_lock) | thread only | leaf |
+| `BDEV_LOCK` (`block/claim.rs`; Linux bdev_lock) | sleeping `sync::Mutex<BdevLock>` | thread only | leaf: every disk's exclusive claims (`Disk.claims`: each device's holder and count, Linux bd_holder, bd_holders; the claim in progress, Linux whole->bd_claiming). A claim is prepared under it alone, before `open_mutex` (`claim::prepare`: EBUSY if another holder has the device; a claim in progress on the disk is waited for on its `var_waitqueue`, queued under it, slept with it dropped), then finished or ended under `open_mutex` (`claim::finish` at open, `claim::end` at release: open_mutex -> it) or abandoned alone (`claim::abort`). Holders: a mounted superblock (`get_tree_bdev`), a file opened O_EXCL, active swap, BLKBSZSET's and BLKRRPART's claims for the call |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) and hardirq (a FUA write's post-flush, sent from the write's completion after the hardware queue lock is dropped) | leaf: never taken with the hardware queue lock held; in the ISR it nests under the line's `IrqDesc.lock` (IrqDesc.lock -> ctx lock; nothing allocates under it: the flush is preallocated with its post-flush queue, and the completions free bios and the `FlushSeq` to the heap under `IrqDesc.lock` only, outside every queue lock); its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
 | Post-flush queue (`RequestQueue.fqs[h]`, `block/blkdev.rs`, one per hardware queue; Linux blk_flush_queue->mq_flush_lock) | `IrqSpinlock` | thread (a FUA write's submission) and hardirq (its data's and the shared flush's completions) | leaf: writes waiting for a flush, the writes the flush in flight serves, the FUA data in flight and the preallocated flush; the flush is sent and the writes are ended after it is dropped |
 | blk-mq requests taken (`BlkMq.rqs[h]`, Linux tags in use) | `AtomicUsize` per hardware queue, lock-free (as Linux's sbitmap) | thread (`get_rq` at submission or plug time) and hardirq (completion, failed dispatch) | counts requests from `get_rq` to their end, wherever they are (software queue, parked for kblockd, dispatch list, driver); a NOWAIT bio takes one only below the driver's depth (compare-and-swap), else ends with EAGAIN; the dispatch itself stays under the hardware queue lock. With `BlkMq.dying` (set once by `start_drain`) the end that brings a count to 0 wakes `drained` (Linux q_usage_counter) |
@@ -5561,9 +5563,11 @@ Rules:
   -> page lock -> buffer lock, i_private_lock -> i_pages.
 - **Soft block size (the bdev inode's `Inode.i_blkbits`, Linux
   i_blkbits; BLKBSZGET):** set at the first open under `open_mutex`
-  (Linux set_init_blocksize) and changed by `set_blocksize` (BLKBSZSET,
-  and a device filesystem's mount through `sb_set_blocksize`: under its
-  `s_umount`) under the bdev inode's `i_rwsem` held for writing, across
+  (Linux set_init_blocksize) and changed by `set_blocksize` only for a
+  caller holding the device's exclusive claim (BLKBSZSET: an O_EXCL
+  file's or one taken for the call; a device filesystem's mount through
+  `sb_set_blocksize`, its superblock's: under its `s_umount`), so no
+  mounted filesystem's buffers change size under it, under the bdev inode's `i_rwsem` held for writing, across
   the cache's write-back and drop (sync_blockdev, kill_bdev): `s_umount`
   -> bdev `i_rwsem` -> page lock. Buffered reads and writes of the
   device file hold that `i_rwsem` shared (Linux blkdev_read_iter,

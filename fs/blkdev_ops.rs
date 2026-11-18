@@ -13,8 +13,12 @@
 //! and writes hold the bdev inode's i_rwsem shared, which
 //! `set_blocksize` takes for writing (Linux blkdev_read_iter,
 //! blkdev_write_iter); direct I/O takes none.
-//! The open file holds its block device (`File.private`), counted as an
-//! opener (BLKRRPART, BLKBSZGET's initial value).
+//! The open file holds its block device (`File.private`, a `BdevFile`),
+//! counted as an opener (BLKRRPART, BLKBSZGET's initial value), and
+//! with O_EXCL claimed for its exclusive use (Linux blkdev_open: holder
+//! the file; EBUSY while a mounted filesystem, active swap or another
+//! O_EXCL file has it). BLKBSZSET needs such a claim: the file's own,
+//! else one it takes for the call (Linux blkdev_bszset).
 
 use alloc::sync::Arc;
 
@@ -23,6 +27,7 @@ use crate::block::blkdev::{
     BlockDevice, HdGeometry, SECTOR_SHIFT, blkdev_issue_flush, get_blkdev, invalidate_bdev,
     set_blocksize, sync_blockdev,
 };
+use crate::block::claim::Holder;
 use crate::block::genhd;
 use crate::fs::inode::{Inode, InodeMode, InodeRef, Timespec};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
@@ -59,9 +64,28 @@ pub struct BlockFileOps;
 /// Static block file ops instance
 pub static BLOCK_FILE_OPS: BlockFileOps = BlockFileOps;
 
-fn bdev(file: &File) -> Result<Arc<BlockDevice>, KernelError> {
-    file.private_arc::<BlockDevice>()
+/// An open block device file's state (Linux the file's bdev and its
+/// private_data holder)
+pub struct BdevFile {
+    pub bdev: Arc<BlockDevice>,
+    /// Opened O_EXCL: claimed, its holder this state's address
+    excl: bool,
+}
+
+impl BdevFile {
+    /// Its claim's holder, if opened O_EXCL
+    fn holder(&self) -> Option<Holder> {
+        self.excl.then(|| core::ptr::from_ref(self) as usize)
+    }
+}
+
+fn bdev_file(file: &File) -> Result<&BdevFile, KernelError> {
+    file.private_ref::<BdevFile>()
         .ok_or(KernelError::NoDeviceOrAddress)
+}
+
+fn bdev(file: &File) -> Result<Arc<BlockDevice>, KernelError> {
+    bdev_file(file).map(|f| f.bdev.clone())
 }
 
 /// Read at `pos` through the cache: short at the end, 0 past it (Linux
@@ -548,8 +572,30 @@ fn sectget(b: &BlockDevice, arg: u64) -> Result<i64, KernelError> {
     put_u16(arg, n as u16)
 }
 
+/// BLKBSZSET (Linux blkdev_bszset): through an O_EXCL file's claim,
+/// else a claim taken for the call (EBUSY if another holder has the
+/// device: a mounted filesystem, active swap, an O_EXCL file)
+fn bszset(f: &BdevFile, arg: u64) -> Result<i64, KernelError> {
+    need_admin()?;
+    if arg == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let n = get_user::<i32>(arg).map_err(|_| KernelError::BadAddress)?;
+    if f.excl {
+        return set_blocksize(&f.bdev, f.holder(), n).map(|()| 0);
+    }
+    // Linux holder &dev: an address unique for the call
+    let dev = f.bdev.dev;
+    let excl = f
+        .bdev
+        .open_handle(Some(core::ptr::from_ref(&dev) as usize))
+        .map_err(|_| KernelError::Busy)?;
+    set_blocksize(&excl, excl.holder(), n).map(|()| 0)
+}
+
 /// Linux blkdev_common_ioctl / blkdev_ioctl subset
-fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+fn blkdev_ioctl(f: &BdevFile, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    let b = &*f.bdev;
     match cmd {
         ioc::HDIO_GETGEO => getgeo(b, arg),
         ioc::BLKROSET => roset(b, arg),
@@ -563,17 +609,10 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
         ioc::BLKBSZGET => put_int(arg, b.block_size() as i32),
         ioc::BLKGETSIZE => put_u64(arg, b.nr_sects()),
         ioc::BLKGETSIZE64 => put_u64(arg, b.nr_sects() << SECTOR_SHIFT),
-        ioc::BLKBSZSET => {
-            need_admin()?;
-            if arg == 0 {
-                return Err(KernelError::InvalidArgument);
-            }
-            let n = get_user::<i32>(arg).map_err(|_| KernelError::BadAddress)?;
-            set_blocksize(b, n).map(|()| 0)
-        }
+        ioc::BLKBSZSET => bszset(f, arg),
         ioc::BLKRRPART => {
             need_admin()?;
-            genhd::rescan(b).map(|()| 0)
+            genhd::rescan(b, f.excl).map(|()| 0)
         }
         // Write the cache back and drop its clean pages (Linux
         // blkdev_flushbuf: sync_blockdev, invalidate_bdev)
@@ -649,18 +688,21 @@ impl FileOps for BlockFileOps {
         Ok(())
     }
 
-    /// Bind the file to its block device (Linux blkdev_open)
+    /// Bind the file to its block device (Linux blkdev_open): O_EXCL
+    /// claims it, the file's state the holder
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let b = get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
-        b.open()?;
-        file.private.call_once(|| b);
+        let excl = file.get_flags() & super::file::flags::O_EXCL != 0;
+        let f = crate::util::kalloc::try_arc(BdevFile { bdev: b, excl })?;
+        f.bdev.open(f.holder())?;
+        file.private.call_once(|| f);
         Ok(())
     }
 
     fn release(&self, file: &File) -> Result<(), KernelError> {
-        if let Some(b) = file.private_arc::<BlockDevice>() {
-            b.release();
+        if let Ok(f) = bdev_file(file) {
+            f.bdev.release(f.holder());
         }
         Ok(())
     }
@@ -760,6 +802,6 @@ impl FileOps for BlockFileOps {
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
-        blkdev_ioctl(&*bdev(file)?, cmd, arg)
+        blkdev_ioctl(bdev_file(file)?, cmd, arg)
     }
 }

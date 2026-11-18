@@ -575,9 +575,12 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         .ok_or(KernelError::Busy)? as u8;
     // A block device swaps through bios, a file through its inode
     let bdev = if inode.mode().is_blkdev() {
-        // Opened for the swap's life (Linux swapon opens the device)
+        // Opened and claimed for the swap's life (Linux claim_swapfile:
+        // holder the swap area, EBUSY if another holder has it); the
+        // holder is the type's slot, unique while the area exists
         let b = crate::block::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
-        Some(b.open_handle()?)
+        let slot = core::ptr::from_ref(&SWAP_INFO) as usize + usize::from(swap_type);
+        Some(b.open_handle(Some(slot))?)
     } else {
         None
     };
