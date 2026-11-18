@@ -198,11 +198,12 @@ pub(super) struct Lazy<'p> {
 /// held): the link, the body (an `i_link` read through `inode`, the
 /// link's inode, or one ->get_link made), where its rest begins, and
 /// whether nothing follows it below (its last component is the walk's
-/// last). The link is put as the level is popped (put_link).
+/// last). The link is put as the level is popped (put_link), its inode
+/// before its path (fields drop in order: no inode outlives its mount)
 pub(super) struct HeldFrame {
-    pub(super) link: Path,
-    pub(super) body: Option<Vec<u8>>,
     pub(super) inode: Option<InodeRef>,
+    pub(super) body: Option<Vec<u8>>,
+    pub(super) link: Path,
     pub(super) pos: usize,
     pub(super) tail_empty: bool,
 }
