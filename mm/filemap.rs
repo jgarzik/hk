@@ -60,11 +60,13 @@ pub trait Aops: Sync {
         simple_write_begin(inode, pos, len)
     }
 
-    /// `copied` bytes were copied into `phys` at `pos` (Linux
-    /// ->write_end): extend i_size, dirty and release the page. Returns
-    /// the bytes accepted. Default simple_write_end.
-    fn write_end(&self, inode: &Inode, pos: u64, copied: usize, phys: u64) -> usize {
-        simple_write_end(inode, pos, copied, phys)
+    /// `copied` of the `len` bytes asked at `pos` were copied into
+    /// `phys` (Linux ->write_end; `copied` may be short, even 0):
+    /// extend i_size, dirty and release the page. Returns the bytes
+    /// accepted, which the caller steps the source back to. Default
+    /// simple_write_end.
+    fn write_end(&self, inode: &Inode, pos: u64, len: usize, copied: usize, phys: u64) -> usize {
+        simple_write_end(inode, pos, len, copied, phys)
     }
 
     /// Write the locked, dirty page `phys`, index `index`, to the
@@ -1245,9 +1247,17 @@ pub fn simple_write_begin(inode: &Inode, pos: u64, len: usize) -> Result<u64, Ke
     Ok(phys)
 }
 
-/// Linux simple_write_end: mark uptodate, extend i_size, dirty, unlock
-pub fn simple_write_end(inode: &Inode, pos: u64, copied: usize, phys: u64) -> usize {
-    set_uptodate(phys);
+/// Linux simple_write_end: a page that was not read in (a whole-page
+/// write) has the part a short copy left zeroed and is uptodate; extend
+/// i_size, dirty, unlock
+pub fn simple_write_end(inode: &Inode, pos: u64, len: usize, copied: usize, phys: u64) -> usize {
+    if !uptodate(phys) {
+        if copied < len {
+            let from = (pos % PAGE_SIZE as u64) as usize;
+            zero_bytes(phys, from + copied, from + len);
+        }
+        set_uptodate(phys);
+    }
     let end = pos + copied as u64;
     if end > inode.get_size() {
         inode.set_size(end);
@@ -1458,10 +1468,12 @@ fn write_with(
 }
 
 /// Copy up to `n` bytes of `from` into the locked page `phys` for a
-/// write at `at` and release it; the bytes accepted. A copy that comes
-/// up empty, or short into a page that was not read in (Linux
-/// block_write_end), is rejected with the bytes it got: the source
-/// steps back over them and the page stays as it was.
+/// write at `at`, then ->write_end, which releases it (Linux
+/// generic_perform_write); the bytes accepted. The source steps back
+/// over what ->write_end did not take; none taken (a copy that came up
+/// empty, or short into a page that was not read in: Linux
+/// block_write_end) is an error with the bytes the copy got, to retry
+/// with just those.
 fn copy_page(
     inode: &Inode,
     a: &dyn Aops,
@@ -1474,13 +1486,12 @@ fn copy_page(
     // SAFETY: the locked page with our reference, no reference to it
     // held
     let c = unsafe { from.copy_to_page_nofault(phys, off, n) };
-    if c == 0 || (c < n && !uptodate(phys)) {
-        from.revert(c);
-        unlock_page(phys);
-        put_page(phys);
+    let status = a.write_end(inode, at, n, c, phys);
+    from.revert(c - status);
+    if status == 0 {
         return Err(c);
     }
-    Ok(a.write_end(inode, at, c, phys))
+    Ok(status)
 }
 
 /// Unmap the file's pages from index `from` on in every mapping of it

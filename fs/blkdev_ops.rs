@@ -451,10 +451,9 @@ impl Aops for BdevAops {
 
     /// Linux iomap_write_end with IOMAP_F_BUFFER_HEAD: block_write_end,
     /// the written buffers dirty (a short copy into a page not uptodate
-    /// never gets here: `filemap::write_iter` retries it); the device's
-    /// size is fixed
-    fn write_end(&self, _inode: &Inode, pos: u64, copied: usize, phys: u64) -> usize {
-        let n = buffer::block_write_end(phys, pos, copied, copied);
+    /// takes nothing); the device's size is fixed
+    fn write_end(&self, _inode: &Inode, pos: u64, len: usize, copied: usize, phys: u64) -> usize {
+        let n = buffer::block_write_end(phys, pos, len, copied);
         crate::mm::page::unlock_page(phys);
         filemap::put_page(phys);
         n
