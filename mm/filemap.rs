@@ -674,10 +674,10 @@ pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
             // unlock at the end of the read and lock again): again (Linux
             // filemap_read's retry of a folio that lost its mapping)
             let gone = page(phys).mapping.load(Ordering::Acquire) != m.key();
-            // A failed read leaves no page behind (Linux
-            // filemap_read_folio error: the folio stays !uptodate and is
-            // retried; hk drops it so a later read starts over)
-            truncate_folio(m, phys);
+            // The page stays cached, not uptodate, for a later read to
+            // retry (Linux do_read_cache_folio / filemap_read_folio
+            // error): it may hold dirty buffers a write left (a block
+            // device page written in part), which must not be dropped
             unlock_page(phys);
             put_page(phys);
             if gone {
