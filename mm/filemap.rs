@@ -48,9 +48,10 @@ pub const AS_UNEVICTABLE: u32 = 1 << 0;
 
 /// Filesystem I/O of a mapping (Linux address_space_operations)
 pub trait Aops: Sync {
-    /// Fill the locked, not uptodate page `phys`, index `index` of
-    /// `inode`, and mark it uptodate (Linux ->read_folio); the page
-    /// stays locked. An error leaves it not uptodate.
+    /// Start filling the locked, not uptodate page `phys`, index
+    /// `index` of `inode` (Linux ->read_folio): the page is unlocked
+    /// when the read ends, uptodate if it worked, and on an error
+    /// return too. Callers wait for the unlock (`filemap_read_folio`).
     fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError>;
 
     /// The locked page with a reference that a write of `len` bytes at
@@ -142,6 +143,7 @@ impl Aops for NoAops {
     fn read_folio(&self, _inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
         zero_page(phys, 0);
         set_uptodate(phys);
+        unlock_page(phys);
         Ok(())
     }
 }
@@ -640,60 +642,112 @@ pub fn grab(m: &AddressSpace, index: u64) -> Result<u64, KernelError> {
             put_page(phys);
             continue;
         }
-        let phys = crate::mm::fault::alloc_user().ok_or(KernelError::OutOfMemory)?;
-        let pg = page(phys);
-        pg.flags.fetch_or(PG_LOCKED, Ordering::Acquire);
-        match add(m, phys, index) {
-            Ok(()) => return Ok(phys),
-            Err(KernelError::AlreadyExists) => {
-                pg.flags.fetch_and(!PG_LOCKED, Ordering::Release);
-                put_page(phys);
-            }
-            Err(e) => {
-                pg.flags.fetch_and(!PG_LOCKED, Ordering::Release);
-                put_page(phys);
-                return Err(e);
+        if let Some(phys) = add_new(m, index)? {
+            return Ok(phys);
+        }
+    }
+}
+
+/// A new page at `index`, locked, not uptodate, with a reference
+/// (Linux filemap_alloc_folio + filemap_add_folio); None if one is
+/// there already (Linux EEXIST)
+fn add_new(m: &AddressSpace, index: u64) -> Result<Option<u64>, KernelError> {
+    let phys = crate::mm::fault::alloc_user().ok_or(KernelError::OutOfMemory)?;
+    let pg = page(phys);
+    pg.flags.fetch_or(PG_LOCKED, Ordering::Acquire);
+    match add(m, phys, index) {
+        Ok(()) => Ok(Some(phys)),
+        Err(e) => {
+            pg.flags.fetch_and(!PG_LOCKED, Ordering::Release);
+            put_page(phys);
+            match e {
+                KernelError::AlreadyExists => Ok(None),
+                e => Err(e),
             }
         }
     }
 }
 
+/// Fill the locked page `phys` through ->read_folio and wait for the
+/// read to end (Linux filemap_read_folio): Ok if it is uptodate then,
+/// EIO if not. The page comes back unlocked either way; a failed one
+/// stays cached, not uptodate, for a later read to retry: it may hold
+/// dirty buffers a write left (a block device page written in part)
+fn filemap_read_folio(inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
+    inode.i_data.aops().read_folio(inode, phys, index)?;
+    super::page::wait_on_page_locked(phys);
+    if uptodate(phys) {
+        Ok(())
+    } else {
+        Err(KernelError::Io)
+    }
+}
+
 /// The page at `index` of `inode`, uptodate, unlocked, with a
-/// reference (Linux read_mapping_folio); one it must create or fill is,
-/// under the mapping's invalidate_lock read (Linux filemap_create_folio,
-/// filemap_update_page, filemap_fault)
+/// reference (Linux read_mapping_folio -> do_read_cache_folio); one it
+/// must create or fill is, under the mapping's invalidate_lock read
+/// (Linux filemap_create_folio, filemap_update_page, filemap_fault)
 pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
     let m = &inode.i_data;
     loop {
-        if let Some(phys) = find_get(m, index) {
-            if uptodate(phys) {
-                return Ok(phys);
+        let Some(phys) = find_get(m, index) else {
+            let _inv = m.invalidate_lock.read();
+            let Some(phys) = add_new(m, index)? else {
+                continue;
+            };
+            match read_done(m, phys, filemap_read_folio(inode, phys, index)) {
+                Some(r) => return r,
+                None => continue,
             }
-            put_page(phys);
+        };
+        if uptodate(phys) {
+            return Ok(phys);
         }
-        let _inv = m.invalidate_lock.read();
-        let phys = grab(m, index)?;
-        if !uptodate(phys)
-            && let Err(e) = m.aops().read_folio(inode, phys, index)
-        {
-            // Truncated while the read was in flight (a ->read_folio may
-            // unlock at the end of the read and lock again): again (Linux
-            // filemap_read's retry of a folio that lost its mapping)
-            let gone = page(phys).mapping.load(Ordering::Acquire) != m.key();
-            // The page stays cached, not uptodate, for a later read to
-            // retry (Linux do_read_cache_folio / filemap_read_folio
-            // error): it may hold dirty buffers a write left (a block
-            // device page written in part), which must not be dropped
+        let inv = m.invalidate_lock.read();
+        if !super::page::trylock_page(phys) {
+            // A read in flight: wait for it, then look again (Linux
+            // filemap_update_page: folio_put_wait_locked with the
+            // invalidate_lock dropped)
+            drop(inv);
+            super::page::wait_on_page_locked(phys);
+            put_page(phys);
+            continue;
+        }
+        // Truncated from the mapping meanwhile
+        if page(phys).mapping.load(Ordering::Acquire) != m.key() {
             unlock_page(phys);
             put_page(phys);
-            if gone {
-                continue;
-            }
-            return Err(e);
+            continue;
         }
-        unlock_page(phys);
-        return Ok(phys);
+        // Someone else locked and filled the page in a very small window
+        if uptodate(phys) {
+            unlock_page(phys);
+            return Ok(phys);
+        }
+        let r = filemap_read_folio(inode, phys, index);
+        drop(inv);
+        match read_done(m, phys, r) {
+            Some(r) => return r,
+            None => continue,
+        }
     }
+}
+
+/// `read_page`'s result for the page `phys` its read `r` filled: the
+/// page, or the error with the reference dropped; None (look again) if
+/// the read failed because a truncate removed the page meanwhile: hk's
+/// removal clears PG_uptodate, which Linux's leaves set
+fn read_done(
+    m: &AddressSpace,
+    phys: u64,
+    r: Result<(), KernelError>,
+) -> Option<Result<u64, KernelError>> {
+    let Err(e) = r else {
+        return Some(Ok(phys));
+    };
+    let gone = page(phys).mapping.load(Ordering::Acquire) != m.key();
+    put_page(phys);
+    (!gone).then_some(Err(e))
 }
 
 /// Remove the locked page `phys` from `m` (Linux
@@ -1217,26 +1271,16 @@ pub fn invalidate(inode: &Inode) {
     unmap_mapping_range(&inode.i_data, 0);
 }
 
-/// Linux simple_write_begin: the page, read first unless the write
-/// covers it whole or it lies at or past EOF (then zeroed)
+/// Linux simple_write_begin: the page, locked; one not uptodate (a
+/// mapping with no backing store: a page not cached is a hole) has the
+/// bytes outside the write zeroed, and simple_write_end marks it
+/// uptodate
 pub fn simple_write_begin(inode: &Inode, pos: u64, len: usize) -> Result<u64, KernelError> {
-    let m = &inode.i_data;
-    let index = pos / PAGE_SIZE as u64;
-    let phys = grab(m, index)?;
-    if uptodate(phys) || len == PAGE_SIZE {
-        return Ok(phys);
-    }
-    let r = if index * PAGE_SIZE as u64 >= inode.get_size() {
-        zero_page(phys, 0);
-        set_uptodate(phys);
-        Ok(())
-    } else {
-        m.aops().read_folio(inode, phys, index)
-    };
-    if let Err(e) = r {
-        unlock_page(phys);
-        put_page(phys);
-        return Err(e);
+    let phys = grab(&inode.i_data, pos / PAGE_SIZE as u64)?;
+    if !uptodate(phys) && len != PAGE_SIZE {
+        let from = (pos % PAGE_SIZE as u64) as usize;
+        zero_bytes(phys, 0, from);
+        zero_bytes(phys, from + len, PAGE_SIZE);
     }
     Ok(phys)
 }

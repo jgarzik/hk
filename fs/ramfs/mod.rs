@@ -59,6 +59,7 @@ impl Aops for RamfsAops {
     fn read_folio(&self, _inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
         filemap::zero_page(phys, 0);
         filemap::set_uptodate(phys);
+        crate::mm::page::unlock_page(phys);
         Ok(())
     }
 

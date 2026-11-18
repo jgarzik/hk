@@ -2631,6 +2631,14 @@ buffer lock.)
   removed (truncate) under it. Order: i_rwsem -> page lock ->
   i_pages. Removal also needs `i_pages`; a lookup that then locks the
   page rechecks `Page.mapping` (truncated meanwhile: retry).
+  ->read_folio unlocks the page when its read ends (an I/O
+  completion), uptodate if it worked, or on an error return (Linux);
+  `read_page` waits for the unlock without the lock
+  (`filemap_read_folio`, `wait_on_page_locked`, Linux folio_wait_locked)
+  and returns the page as it then is: a truncate meanwhile may have
+  removed it (as Linux do_read_cache_folio; one whose read failed for
+  it, its PG_uptodate cleared by the removal, is looked up again), and
+  a page found locked is waited for unlocked, then looked up again.
 - `AddressSpace.invalidate_lock` (sleeping `RwSem`, thread context;
   Linux invalidate_lock): held shared by a read or fault that creates
   or fills a page (`read_page`, Linux filemap_create_folio,
@@ -2733,8 +2741,7 @@ buffer lock.)
   locked (read) or under writeback, so its ring stays, until then.
   hk's ->writepage is synchronous: it keeps the page locked and waits
   for the writeback to end (`PG_writeback`, the page's wait queue),
-  where Linux unlocks it after submitting; ->read_folio locks the page
-  again after block_read_full_folio's completion unlocked it.
+  where Linux unlocks it after submitting.
 - mpage (`fs/pageio/mpage.rs`, Linux fs/mpage.c; vfat files): a page whose
   blocks are contiguous on the disk is read or written in one bio of
   its own, mapped under its page lock through a map buffer (a

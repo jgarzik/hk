@@ -422,18 +422,15 @@ impl Aops for BdevAops {
     }
 
     /// Linux blkdev_read_folio: block_read_full_folio, which unlocks the
-    /// page when the read ends; hk's ->read_folio returns it locked, so
-    /// it is locked again once the read has ended. The device is held
-    /// meanwhile.
+    /// page when the read ends; a removed device's page is unlocked
+    /// unread (EIO)
     fn read_folio(&self, inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
-        let _b = inode_bdev(inode)?;
-        buffer::block_read_full_folio(inode, phys, blkdev_get_block);
-        crate::mm::page::lock_page(phys);
-        if filemap::uptodate(phys) {
-            Ok(())
-        } else {
-            Err(KernelError::Io)
+        if let Err(e) = inode_bdev(inode) {
+            crate::mm::page::unlock_page(phys);
+            return Err(e);
         }
+        buffer::block_read_full_folio(inode, phys, blkdev_get_block);
+        Ok(())
     }
 
     /// Linux blkdev_writepages: block_write_full_folio, the dirty

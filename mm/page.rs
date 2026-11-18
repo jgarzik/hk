@@ -413,6 +413,18 @@ pub fn lock_page(phys: u64) {
     }
 }
 
+/// Wait until no one holds the page at `phys` locked (Linux
+/// folio_wait_locked): a read's end, which unlocks it. Thread context,
+/// no spinlock held; the caller holds a reference on the page.
+#[track_caller]
+pub fn wait_on_page_locked(phys: u64) {
+    crate::sync::might_sleep();
+    let Some(pg) = phys_to_page(phys) else {
+        return;
+    };
+    crate::sync::waitqueue::page_wait_queue(phys).wait_event(|| !pg.is_locked());
+}
+
 /// The page at `phys` is a private mapping's own, writable in place
 /// whatever its count ([`Page::reusable`]; Linux PageAnonExclusive)
 pub fn reusable(phys: u64) -> bool {

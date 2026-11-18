@@ -159,16 +159,10 @@ impl Aops for VfatAops {
     }
 
     /// Linux fat_read_folio: mpage_read_folio, which unlocks the page
-    /// when the read ends; hk's ->read_folio returns it locked, so it is
-    /// locked again
+    /// when the read ends
     fn read_folio(&self, inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
         mpage::mpage_read_folio(inode, phys, fat_get_block);
-        crate::mm::page::lock_page(phys);
-        if filemap::uptodate(phys) {
-            Ok(())
-        } else {
-            Err(KernelError::Io)
-        }
+        Ok(())
     }
 
     /// Linux fat_writepages: mpage_writepages, a page at a time
