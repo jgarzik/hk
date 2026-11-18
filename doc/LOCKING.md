@@ -3571,7 +3571,12 @@ sget's tests, short reads) or take a reference (`fs_info`), dropped
 in thread context; once released it reads as None. A superblock has two counts, as in
 Linux: active references (`SbActive`, `SuperBlock.s_active`, Linux
 s_active; never raised from zero) and passive ones (the `Arc`, Linux
-s_passive). Its life's flags in `s_flags` (Linux SB_BORN: set when its
+s_passive; every inode holds one, `Inode.sb`, dropped at its teardown
+in thread context). What is freed by an RCU callback (`rcuc/N`,
+preemption off) names its superblock by a `Weak` instead, memory only
+(`Dentry.sb`, d_free; a vfat metadata list's, i_callback): a last
+passive put there would run `Drop for SuperBlock`, whose block
+device's last put puts its inode (sleeps). Its life's flags in `s_flags` (Linux SB_BORN: set when its
 mount returns, `vfs_get_tree`; SB_DYING: set by the shutdown under
 s_umount; SB_DEAD: set under `SB_LOCK` after kill_sb) are waited for on
 `sync::waitqueue::var_waitqueue` (Linux wait_var_event); SB_DEAD's

@@ -2216,7 +2216,10 @@ pub struct MappingMetadataBhs {
     wb_err: *const crate::util::errseq::ErrSeq,
     /// Its inode's superblock, for a write error's `s_wb_err` from a
     /// completion (Linux mmb->mapping->host->i_sb): kept until the
-    /// list's drop has waited out every reader
+    /// list's drop has waited out every reader. A `Weak` (memory only):
+    /// the list goes in its inode's RCU callback (`i_callback`), where
+    /// an owning reference's last drop would run `Drop for SuperBlock`,
+    /// which may sleep (see `Dentry.sb`)
     sb: Weak<SuperBlock>,
     /// A buffer was ever on it: its drop waits a grace period
     used: core::sync::atomic::AtomicBool,

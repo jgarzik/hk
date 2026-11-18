@@ -56,12 +56,15 @@ pub fn vfs_fsync(file: &crate::fs::file::File, datasync: bool) -> KernelResult<(
 /// once (Linux s_wb_err against f_sb_err)
 pub fn sys_syncfs(fd: i32) -> KernelResult<()> {
     let file = fget(fd)?;
-    let Some(sb) = file.get_inode().and_then(|i| i.superblock().cloned()) else {
+    let Some(inode) = file.get_inode() else {
+        return Ok(());
+    };
+    let Some(sb) = inode.superblock() else {
         return Ok(());
     };
     let r = {
         let _g = sb.s_umount.read();
-        sync_filesystem(&sb)
+        sync_filesystem(sb)
     };
     let seen = file.check_and_advance_sb_err();
     r.and(seen)
