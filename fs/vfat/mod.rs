@@ -580,15 +580,11 @@ pub struct VfatSbData {
     /// sbi->fat_lock, lock_fat): sleeping, under the inodes' i_rwsem,
     /// above the device's I/O; shared by every copy of this data
     pub fat: Arc<crate::sync::Mutex<FatState>>,
-    /// Every inode's entry location (`VfatInodeData.i_pos`) is read to
-    /// write the entry, and changed, under it (Linux
-    /// sbi->inode_hash_lock): an attach, a detach, a write_inode's
-    /// read-patch-write of the entry, and every slot written when an
-    /// entry is added or removed (an unlink's detach in the same hold);
-    /// block I/O here, so it is
-    /// sleeping and held across the write (Linux patches the buffer
-    /// under its spin lock and rechecks i_pos instead)
-    pub ipos: Arc<crate::sync::Mutex<()>>,
+    /// Every inode's entry location (`VfatInodeData.i_pos`) changes
+    /// under it (Linux sbi->inode_hash_lock: an attach, a detach), and
+    /// an entry is patched in its pinned buffer under it once its i_pos
+    /// is rechecked (write_inode, rename's `write_entry`): a spin leaf
+    pub ipos: Arc<crate::sync::spin::Mutex<()>>,
     /// The FAT's own inode (Linux sbi->fat_inode): its metadata list
     /// holds the dirty FAT blocks fsync writes; never hashed or dirtied
     pub fat_inode: Arc<InodeRef>,
@@ -966,52 +962,6 @@ fn with_vi<R>(inode: &Inode, f: impl FnOnce(&VfatInode) -> R) -> Result<R, Kerne
 }
 
 // ============================================================================
-// Block Device I/O
-// ============================================================================
-
-/// Read bytes of the device through its page cache (Linux sb_bread:
-/// the bdev mapping, shared with device-node I/O)
-fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), KernelError> {
-    match crate::mm::filemap::read(&bdev.bd_inode, buf, offset)? {
-        n if n == buf.len() => Ok(()),
-        _ => Err(KernelError::Io),
-    }
-}
-
-/// Write bytes of the device through its buffer cache: each block
-/// touched read (unless written whole), patched and marked dirty (Linux
-/// sb_bread / sb_getblk, mark_buffer_dirty), in the device's block size,
-/// which mount set to the FAT sector size (`sb_set_blocksize`): only
-/// metadata blocks are dirtied, as a cache page may also hold file-data
-/// clusters, which the file's own cache writes
-fn write_bytes(bdev: &Arc<BlockDevice>, offset: u64, buf: &[u8]) -> Result<(), KernelError> {
-    use crate::fs::buffer;
-    let size = bdev.block_size() as usize;
-    let mut done = 0;
-    while done < buf.len() {
-        let at = offset + done as u64;
-        let (block, off) = (at / size as u64, (at % size as u64) as usize);
-        let n = (size - off).min(buf.len() - done);
-        let src = &buf[done..done + n];
-        let bh = if n == size {
-            let bh = buffer::bdev_getblk(bdev, block, size)?;
-            buffer::lock_buffer(&bh);
-            bh.write_data(0, src);
-            bh.set_uptodate();
-            buffer::unlock_buffer(&bh);
-            bh
-        } else {
-            let bh = buffer::bread(bdev, block, size)?;
-            bh.write_data(off, src);
-            bh
-        };
-        buffer::mark_buffer_dirty(&bh);
-        done += n;
-    }
-    Ok(())
-}
-
-// ============================================================================
 // VFAT Helpers
 // ============================================================================
 
@@ -1352,14 +1302,27 @@ fn fat_truncate_time(inode: &Inode, now: Option<Timespec>, atime: bool, cmtime: 
     }
 }
 
+/// The entry's fields `inode` writes (Linux __fat_write_inode: size,
+/// first cluster, times; not the name, so a deleted entry stays deleted)
+/// into the raw entry at `at` in `bh`, under `ipos`
+fn put_inode_entry(bh: &BhRef, at: usize, inode: &Inode, d: &VfatInodeData, sb_data: &VfatSbData) {
+    let mut b = [0u8; 32];
+    bh.read_data(at, &mut b);
+    let ((start, size), times) = inode_entry(inode, d, sb_data);
+    entry_set_extent(&mut b, start, size);
+    times.put(&mut b);
+    bh.write_data(at + 13, &b[13..]);
+}
+
 /// Linux fat_write_inode / __fat_write_inode (->write_inode, from
 /// writeback, fsync, sync, unmount and the write-back before an
-/// eviction, whatever its sync mode): size (0 for a directory), first
-/// cluster and times into the inode's entry in the device's cache,
-/// then marked I_METADATA_WRITEBACK for a data-integrity write to wait
-/// for (`fat_sync_inode_metadata`); the root has no entry but is
-/// marked all the same, an inode with no entry left (unlinked) is
-/// neither
+/// eviction, whatever its sync mode): the entry's block read (sb_bread),
+/// then under `ipos`, once the inode's i_pos is the one read (else
+/// again), size (0 for a directory), first cluster and times patched
+/// into the pinned buffer, marked dirty after; then the inode marked
+/// I_METADATA_WRITEBACK for a data-integrity write to wait for
+/// (`fat_sync_inode_metadata`). The root has no entry but is marked all
+/// the same; an inode with no entry left (unlinked) is neither.
 fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
     if is_root(inode) {
         super::fs_writeback::set_inode_metadata_writeback(inode);
@@ -1367,33 +1330,59 @@ fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
     }
     let sb = inode.superblock().ok_or(KernelError::Io)?;
     let sb_data = get_sb_data(&sb)?;
-    {
-        // i_pos and the entry it names, unchanged until the write is done
-        let _l = sb_data.ipos.lock();
-        let d = get_inode_data(inode)?;
-        if d.i_pos == 0 {
+    loop {
+        let i_pos = get_inode_data(inode)?.i_pos;
+        if i_pos == 0 {
             return Ok(());
         }
-        let off = d.i_pos;
-        let mut b = [0u8; 32];
-        read_bytes(&sb_data.bdev, off, &mut b)?;
-        let ((start, size), times) = inode_entry(inode, &d, &sb_data);
-        entry_set_extent(&mut b, start, size);
-        times.put(&mut b);
-        write_bytes(&sb_data.bdev, off, &b)?;
+        let Ok((bh, at)) = entry_bh(&sb_data, i_pos) else {
+            crate::printkln!(
+                "FAT-fs: unable to read inode block for updating (i_pos {})",
+                i_pos
+            );
+            return Err(KernelError::Io);
+        };
+        {
+            let _l = sb_data.ipos.lock();
+            let d = get_inode_data(inode)?;
+            if d.i_pos != i_pos {
+                continue;
+            }
+            put_inode_entry(&bh, at, inode, &d, &sb_data);
+        }
+        buffer::mark_buffer_dirty(&bh);
+        drop(bh);
+        super::fs_writeback::set_inode_metadata_writeback(inode);
+        return Ok(());
     }
-    super::fs_writeback::set_inode_metadata_writeback(inode);
-    Ok(())
 }
 
 /// Linux fat_sync_inode_metadata (->sync_inode_metadata): the entry's
-/// block on the disk (sync_dirty_buffer), then the inode's other
-/// metadata blocks (mmb_sync of i_metadata_bhs). With no buffer heads
-/// the device's whole cache stands in for both (BUGS.md "No buffer
-/// heads").
+/// block, if cached and uptodate, written and waited for
+/// (sync_dirty_buffer; EIO if it failed), then the inode's other
+/// metadata blocks (mmb_sync of its i_metadata_bhs). The root has no
+/// entry.
 fn fat_sync_inode_metadata(inode: &Inode) -> Result<(), KernelError> {
-    let sb = inode.superblock().ok_or(KernelError::Io)?;
-    sync_buffers(&get_sb_data(&sb)?)
+    if !is_root(inode) {
+        let sb = inode.superblock().ok_or(KernelError::Io)?;
+        let sb_data = get_sb_data(&sb)?;
+        let i_pos = get_inode_data(inode)?.i_pos;
+        if i_pos != 0 {
+            let bs = u64::from(sb_data.bytes_per_sector);
+            let bh = buffer::find_get_block_nonatomic(&sb_data.bdev, i_pos / bs, bs as usize);
+            // The dirty check is sync_dirty_buffer's, against I/O in
+            // flight (Linux)
+            if let Some(bh) = bh
+                && bh.uptodate()
+            {
+                let _ = buffer::sync_dirty_buffer(&bh);
+                if bh.write_io_error() {
+                    return Err(KernelError::Io);
+                }
+            }
+        }
+    }
+    with_mmb(inode, buffer::mmb_sync)?
 }
 
 /// Parsed directory entry with long name support
@@ -2169,18 +2158,15 @@ fn fat_remove_slots(
 /// Remove an entry of `dir` whose slots are at `offs` (Linux
 /// fat_remove_entries): first the short entry and the long-name slots
 /// before it in its block, so the entry is gone (synced on a dirsync
-/// mount, an error returned before anything else changes), with
-/// `detach`'s inode leaving the entry in the same `ipos` hold (i_pos 0,
-/// Linux fat_detach: no write_inode writes the entry back after its
-/// deletion); the directory's version; then the long-name slots in
-/// earlier blocks (a failure there only reported); then the
-/// directory's end of change, atime too (`dir_update`)
+/// mount, an error returned before anything else changes); the
+/// directory's version; then the long-name slots in earlier blocks (a
+/// failure there only reported); then the directory's end of change,
+/// atime too (`dir_update`)
 fn fat_remove_entries(
     dir: &Inode,
     sb: &SuperBlock,
     sb_data: &VfatSbData,
     offs: &[u64],
-    detach: Option<&Inode>,
 ) -> Result<(), KernelError> {
     let bs = u64::from(sb_data.bytes_per_sector);
     let short = *offs.last().ok_or(KernelError::Io)?;
@@ -2191,14 +2177,8 @@ fn fat_remove_entries(
             .take_while(|&&o| o / bs == short / bs)
             .count();
     let (bh, _) = entry_bh(sb_data, short)?;
-    {
-        let _l = sb_data.ipos.lock();
-        for &off in offs[k..].iter().rev() {
-            bh.write_data((off % bs) as usize, &[DELETED_MARKER]);
-        }
-        if let Some(i) = detach {
-            with_vi(i, |v| v.d.lock().i_pos = 0)?;
-        }
+    for &off in offs[k..].iter().rev() {
+        bh.write_data((off % bs) as usize, &[DELETED_MARKER]);
     }
     mmb_dirty(dir, &bh);
     if sb.dirsync() {
@@ -2851,7 +2831,7 @@ impl InodeOps for VfatInodeOps {
         }
         // fat_remove_entries(old_dir), then vfat_update_dir_metadata
         let removed = entry_slots(&sb_data, op, &old_entry)
-            .and_then(|offs| fat_remove_entries(old_dir, &sb, &sb_data, &offs, None));
+            .and_then(|offs| fat_remove_entries(old_dir, &sb, &sb_data, &offs));
         if let Err(e) = removed {
             unwind.dotdot(dotdot, op);
             return Err(e);
@@ -2966,7 +2946,7 @@ fn vfat_update_dotdot_de(
 
 /// Write an object's attributes, first cluster and size and times into
 /// its entry at disk offset `off`, as __fat_write_inode does, in the
-/// entry's pinned buffer (marked dirty), under the i_pos lock
+/// entry's pinned buffer (marked dirty after), under `ipos`
 fn write_entry(
     sb_data: &VfatSbData,
     off: u64,
@@ -3054,7 +3034,7 @@ impl Unwind<'_> {
             }
             None => {
                 // Linux fat_remove_entries(new_dir)
-                let r = fat_remove_entries(self.dir, self.sb, self.sb_data, self.added, None);
+                let r = fat_remove_entries(self.dir, self.sb, self.sb_data, self.added);
                 failed |= corrupt.is_some() && r.is_err();
             }
         }
@@ -3065,12 +3045,6 @@ impl Unwind<'_> {
 }
 
 pub static VFAT_INODE_OPS: VfatInodeOps = VfatInodeOps;
-
-/// The device's cache on the disk (Linux sync_dirty_buffer of vfat's
-/// metadata blocks: a directory change's on a dirsync or sync mount)
-fn sync_buffers(sb_data: &VfatSbData) -> Result<(), KernelError> {
-    crate::block::blkdev::sync_blockdev(&sb_data.bdev)
-}
 
 /// The end of a change to directory `dir` (Linux vfat_add_entry's,
 /// fat_remove_entries', vfat_update_dir_metadata's): its mtime and
@@ -3198,8 +3172,8 @@ fn vfat_iget(
     )
 }
 
-/// Remove the entry `entry` of `dir` (at `parent`): its cached inode
-/// leaves it in the same `ipos` hold (`fat_remove_entries`), then
+/// Remove the entry `entry` of `dir` (at `parent`; Linux vfat_unlink:
+/// fat_remove_entries, clear_nlink, fat_detach): its cached inode
 /// becomes unlinked (nlink 0, detached: still hashed, as Linux, but
 /// never found again) and keeps its clusters until
 /// its last reference goes (`evict_inode`); with no cached inode they
@@ -3213,13 +3187,14 @@ fn unlink_entry(
     parent: u32,
     entry: &ParsedDirEntry,
 ) -> Result<(), KernelError> {
-    // Looked up before `ipos`: the lookup may wait for an inode being
-    // freed, whose write-back takes it
     let inode = cached(sb, parent, &entry.short_name);
     let offs = entry_slots(sb_data, parent, entry)?;
-    fat_remove_entries(dir, sb, sb_data, &offs, inode.as_deref())?;
+    fat_remove_entries(dir, sb, sb_data, &offs)?;
     match inode {
-        Some(i) => i.nlink.store(0, core::sync::atomic::Ordering::Release),
+        Some(i) => {
+            i.nlink.store(0, core::sync::atomic::Ordering::Release);
+            fat_detach(&i, sb_data);
+        }
         None if entry.start_cluster != 0 => fat_free_clusters(sb_data, dir, entry.start_cluster)?,
         None => {}
     }
@@ -3565,9 +3540,10 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
     if crate::block::blkdev::sb_min_blocksize(sb, 512) == 0 {
         return Err(KernelError::InvalidArgument);
     }
-    // Read boot sector
+    // Read boot sector (Linux fat_fill_super: sb_bread(sb, 0)), its
+    // buffer released before the block size changes
     let mut boot_sector_buf = [0u8; 512];
-    read_bytes(&bdev, 0, &mut boot_sector_buf)?;
+    buffer::sb_bread(sb, 0)?.read_data(0, &mut boot_sector_buf);
 
     let boot_sector =
         VfatBootSector::read_from(&boot_sector_buf).expect("boot sector fits 512 bytes");
@@ -3686,7 +3662,7 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         max_cluster: (total_clusters + 2) as u32,
         cluster_size,
         opts,
-        ipos: try_arc(crate::sync::Mutex::new(()))?,
+        ipos: try_arc(crate::sync::spin::Mutex::new(()))?,
         fat_inode: try_arc(fat_inode)?,
         fat: try_arc(crate::sync::Mutex::new(FatState {
             free: -1,

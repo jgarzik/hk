@@ -2603,8 +2603,8 @@ layout in `doc/MEMORY.md`
 **Location:** `mm/filemap.rs` (`AddressSpace`, the inode's
 `i_data`), `fs/buffer.rs` (buffer heads); users: ramfs, tmpfs, vfat
 files, block devices (`BlockDevice.bd_inode`). The device cache holds
-its blocks in buffer heads (Buffer heads, below): vfat writes its FAT
-and directory blocks through them, in the device's block size, which
+its blocks in buffer heads (Buffer heads, below): vfat reads and
+writes all its metadata (FAT, directories, boot sector) in them, in the device's block size, which
 its mount sets to the FAT sector size (`sb_set_blocksize`), and the
 device's writepage writes only dirty buffers: a device-cache page may
 also hold file-data clusters, which the file's own cache writes. (A
@@ -3061,30 +3061,25 @@ pinned buffer, so writers of other entries of the block never clobber
 it.
 
 **vfat entry location lock** (`fs/vfat/mod.rs`, Linux
-sbi->inode_hash_lock over i_pos): `VfatSbData.ipos` (sleeping
-`sync::Mutex<()>`), one per filesystem, thread context only (never in
-IRQ context). Every inode's `VfatInodeData.i_pos` (its short entry's
-disk offset, 0 for none) changes under it (`attach`, Linux fat_attach;
-`fat_detach`, i_pos 0 before rename reuses a replaced object's slot),
-and an entry is read, patched and written under it (`fat_write_inode`,
-Linux __fat_write_inode, which marks the inode I_METADATA_WRITEBACK
-under its `i_lock` after the hold; rename's `write_entry`, in the
-entry's buffer, its name untouched), so a write never lands on a slot
-its inode no longer owns. An entry's removal (`fat_remove_entries`'s
-first stage: the short entry's block) marks its slots deleted under
-it, with the unlink/rmdir detach of the cached inode (i_pos 0, Linux
-fat_detach) in the same hold, so no write-back of an inode (an atime
-update of an open file, no `i_rwsem`, whose read-patch-write copies
-the whole entry) puts back a deleted entry. A new entry's slots are
-written without it (Linux fat_add_entries, under the directory's
-`i_rwsem`): free slots no inode owns. That inode is looked up before
-the lock: the lookup may wait for an inode being freed, whose
-write-back takes `ipos`. Linux patches the cached buffer under its
-spin lock and rechecks i_pos; here write_inode's patch is block I/O,
-so the lock sleeps and is held across it. Order: directory and inode
-`i_rwsem` -> `ipos` -> `VfatInode.d` (spin leaf), the device's page
-cache and I/O; never with `VfatSbData.fat`; no inode reference is put
-under it.
+sbi->inode_hash_lock over i_pos): `VfatSbData.ipos` (spin `Mutex<()>`
+leaf but for `Inode.private` and `VfatInode.d` taken to copy an
+inode's data), one per filesystem, thread context only. Every inode's
+`VfatInodeData.i_pos` (its short entry's disk offset, 0 for none)
+changes under it (`attach`, Linux fat_attach; `fat_detach`, i_pos 0:
+an unlink's after its entry is removed, a replaced object's before
+rename reuses its slot). An entry is patched under it in its block's
+buffer, read (bread) and pinned before it is taken and marked dirty
+after it is dropped: `fat_write_inode` (Linux __fat_write_inode,
+which rechecks under it that i_pos is still the one whose block it
+read, else reads again, and marks the inode I_METADATA_WRITEBACK under
+its `i_lock` after) and rename's `write_entry`, so a write never lands
+on a slot its inode no longer owns. Only the entry's fields past the
+name are written, so a removal's deleted mark (`fat_remove_entries`,
+under the directory's `i_rwsem`, no `ipos`, as Linux) is never put
+back; a slot is reused only under that `i_rwsem`, after the detach.
+Order: `i_rwsem` -> page and buffer locks (the bread) -> `ipos` ->
+`Inode.private` -> `VfatInode.d`; nothing sleeps under it; never with
+`VfatSbData.fat`.
 
 **vfat directory blocks** (`fs/vfat/mod.rs`, Linux fs/fat/dir.c): a
 directory is walked block by block in the device's buffers
@@ -5980,7 +5975,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `Inode.i_writecount`, `Inode.i_flags` S_SWAPFILE | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
 under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
-| `BdiWriteback.pass` | mm/writeback.rs, fs/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, a superblock's shutdown and vfat's remount (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step; an inode's metadata is written under it after its pages (`__writeback_single_inode` -> ->write_inode: pass -> vfat `VfatSbData.ipos` and the device's page cache; a sync(2)/syncfs pass is for_sync, so no ->sync_inode_metadata under it), a data-integrity pass sleeps under it on an inode another writer has (I_SYNC: that writer takes no `pass`), and an inode's last reference may go under it (eviction, which may write that inode back first). fsync and the write-back before an eviction write an inode without it (`writeback_single_inode`), under I_SYNC |
+| `BdiWriteback.pass` | mm/writeback.rs, fs/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, a superblock's shutdown and vfat's remount (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step; an inode's metadata is written under it after its pages (`__writeback_single_inode` -> ->write_inode: pass -> the device's page cache (vfat's entry block, bread) -> vfat `VfatSbData.ipos` (spin); a sync(2)/syncfs pass is for_sync, so no ->sync_inode_metadata under it), a data-integrity pass sleeps under it on an inode another writer has (I_SYNC: that writer takes no `pass`), and an inode's last reference may go under it (eviction, which may write that inode back first). fsync and the write-back before an eviction write an inode without it (`writeback_single_inode`), under I_SYNC |
 | `BdiWriteback.list_lock` | mm/writeback.rs, fs/fs_writeback.rs | spin Mutex, a leaf but for an inode's `i_lock` (Linux wb->list_lock -> i_lock) | Linux wb->list_lock: the disk's dirty inodes, `b_dirty` (oldest first), `b_io` (the running pass's) and `b_more_io` (left for the next pass), `InodeList`s through `Inode.i_io_list` holding no reference (Linux), `Inode.i_io_on` (which list it is on) and `Inode.dirtied_when` (Linux dirtied_when: written under it and the inode's `i_lock` as it is queued or requeued, read under it by a pass's expiry test). An inode's dirty state is its `i_state` bits (Linux I_DIRTY_SYNC, I_DIRTY_DATASYNC, I_DIRTY_PAGES; I_SYNC, I_SYNC_QUEUED; I_METADATA_WRITEBACK, set by ->write_inode and cleared by a WB_SYNC_ALL write, not for sync, before it calls ->sync_inode_metadata with no lock held), written under `i_lock` only. `__mark_inode_dirty` (every page dirtying through the mapping's `host`, `filemap::dirty_page`, Linux __folio_mark_dirty; the filesystems' metadata) tests the bits lock-free after a full fence (Linux smp_mb, paired with the one `__writeback_single_inode` puts between clearing them and testing the cache's DIRTY mark: either side sees the other), sets them under `i_lock` and, for an inode going from clean to dirty, drops `i_lock`, takes `list_lock` then `i_lock` (Linux locked_inode_to_wb_and_lock_list) and queues it at `b_dirty`'s tail unless a pass has it (I_SYNC_QUEUED) or it is I_FREEING, then arms the periodic work after unlocking if the lists were empty; under a page lock at most. A pass moves the expired inodes (of one superblock for a sync) to `b_io` in one hold, marking each I_SYNC_QUEUED under its `i_lock` (Linux queue_io), then per inode, under `list_lock` and its `i_lock`: one of another superblock or being freed back to `b_dirty` (Linux redirty_tail_locked; I_FREEING off the lists), one another writer has (I_SYNC) to `b_more_io` or, for a data-integrity pass, slept on with `i_lock` only (the eviction, which takes the inode off `b_io` under `list_lock` then `i_lock`, waits for it, so the inode stays live); else it sets I_SYNC and takes a reference (`Inode::__iget`: not I_FREEING/I_WILL_FREE under `i_lock`, so the count is above zero), unlocks, writes it, then under both locks requeues it by its state (Linux requeue_inode) and clears I_SYNC, waking its waiters under `i_lock` (Linux inode_sync_complete), and drops it with no lock held (its last reference may evict it). `writeback_single_inode` (fsync, sync_inode_metadata, the write-back before an eviction) sets I_SYNC under `i_lock` (waiting for a writer already at it, for WB_SYNC_ALL), writes, then under both locks takes a clean inode off the lists or puts a dirty one back on `b_dirty` unless a pass has it. An inode's eviction takes it off its list under the lock and its `i_lock` (`inode_io_list_del`, Linux evict), before any field goes, so a linked entry is a live value. The mapping's `host` is the inode whose `i_data` it is (Linux mapping->host, a plain pointer): page dirtying grabs it (`Inode::igrab`, failing once its last reference went, as Linux skips an I_FREEING inode) |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
 | `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu, the mempolicy syscalls (mbind copies the node spans before taking mmap_lock; get_mempolicy's page node with no lock held) and futex_waitv (FUTEX2_NUMA node checks, after `futex_mpol` drops mmap_lock) |

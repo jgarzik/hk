@@ -692,31 +692,6 @@ waiting).
 - No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
   such as touch_atime take mount write access only.
 
-## vfat metadata does not use buffer heads yet
-
-**Location**: `fs/vfat/mod.rs` (`read_bytes`, `write_bytes`,
-`fat_write_inode`, `fat_sync_inode_metadata`, `sync_buffers`,
-`VfatSbData.ipos`)
-
-vfat's FAT and directories go through the device's buffers
-(`fs/vfat/fatent.rs`, `dir_walk`, `entry_bh`), but an inode's entry
-and the boot sector do not: vfat reads them by copy through the block
-device's page cache (`read_bytes`: `filemap::read`) and writes them
-through a byte-range adapter over the device's buffer heads
-(`write_bytes`). So vfat's write_inode holds its `ipos` lock (a
-sleeping mutex) across the entry's read, patch and write, where Linux
-__fat_write_inode reads the block with sb_bread, then patches the
-pinned buffer under the inode_hash_lock spinlock after rechecking
-i_pos, and marks it dirty; and `fat_sync_inode_metadata`
-(->sync_inode_metadata; Linux sync_dirty_buffer of the entry's block +
-mmb_sync of the inode's i_metadata_bhs) syncs the device's whole cache
-(`sync_buffers`) for every data-integrity write of an inode marked
-I_METADATA_WRITEBACK: fsync and fdatasync (simple_fsync_noflush syncs
-any inode so marked, clean or not, as Linux), O_SYNC/O_DSYNC writes,
-a dirsync directory's end of change, and the write-back with wait of
-an inode put after its superblock's SB_ACTIVE went (`iput_final`).
-
-
 ## Buffer head gaps
 
 **Location**: `fs/buffer.rs`, `mm/filemap.rs`
