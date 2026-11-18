@@ -5586,14 +5586,16 @@ Rules:
   lock to unmap, then i_pages; Linux invalidate_inode_pages2_range).
 - **vfat direct I/O (`fs/vfat/direct.rs`, Linux fat_direct_IO over
   __blockdev_direct_IO with DIO_LOCKING):** the same bios and
-  `DioWait` (`dio::direct_io_map`, through the file's disk extents),
+  `DioWait` (`dio::direct_io_map`, through the disk extents
+  fat_get_block maps, Linux get_more_blocks),
   under the file's `i_rwsem` held exclusive. A write runs under the
   one `File::write_iter` holds for the whole call (invalidation, bios,
   wait, size update, the buffered rest), as Linux
   generic_file_write_iter. A read takes it itself after writing the
   cache back unlocked (Linux kiocb_write_and_wait), and holds it over
-  the end-of-file check, a second write-back, the chain walk
-  (`VfatInode.cache`) and the pinning and submission of every bio
+  the end-of-file check, a second write-back, the mapping
+  (fat_get_block: `VfatInode.cache`, FAT reads) and the pinning and
+  submission of every bio
   (plugged), dropping it after the plug is flushed and before the
   wait (`direct_io_map`'s `unlock`); a buffered rest is read unlocked.
   Order: `i_rwsem` -> page lock -> i_pages (write-back,
