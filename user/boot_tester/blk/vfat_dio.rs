@@ -35,15 +35,8 @@ pub fn run_tests() {
         report_r(b"VFAT_DIO", check(b"no vda1", false, 0));
         return;
     };
-    let mut p = [0u8; 48];
     sys_mkdir(MNT.as_ptr(), 0o755);
-    let m = sys_mount(
-        p1.path(&mut p).as_ptr(),
-        MNT.as_ptr(),
-        b"vfat\0".as_ptr(),
-        0,
-        b"iocharset=cp437\0".as_ptr() as u64,
-    );
+    let m = mount(&p1);
     if m != 0 {
         report_r(b"VFAT_DIO", check(b"mount", false, m));
         return;
@@ -57,8 +50,21 @@ pub fn run_tests() {
     report_r(b"VFAT_WRITE_SHORT", write_short());
     report_r(b"VFAT_PARTIAL_WB", partial_wb(&p1));
     report_r(b"VFAT_SWAPFILE_IO", swapfile_io());
+    report_r(b"VFAT_DIO_HOLE", hole(&p1));
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
+}
+
+/// Mount vda1 at MNT
+fn mount(p1: &BlkDev) -> i64 {
+    let mut p = [0u8; 48];
+    sys_mount(
+        p1.path(&mut p).as_ptr(),
+        MNT.as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    )
 }
 
 /// Anonymous memory (page aligned), unmapped when dropped
@@ -561,6 +567,72 @@ fn swapfile_io() -> R {
         swap_off(&p);
     }
     sys_unlink(p.as_ptr());
+    r
+}
+
+/// A file whose entry has a size but no cluster (Linux
+/// fat_bmap_cluster: i_start 0 maps nothing, so its blocks are holes)
+/// reads as zeros through O_DIRECT (Linux do_direct_IO zeroes a hole),
+/// not EIO
+fn hole(p1: &BlkDev) -> R {
+    const NAME: &[u8; 11] = b"HOLE    BIN";
+    put(b"HOLE.BIN", &[])?;
+    let r = entry_size(p1, NAME, 4096).and_then(|()| {
+        let fd = open(b"HOLE.BIN", O_RDWR | O_DIRECT);
+        check(b"open", fd >= 0, fd as i64)?;
+        let b = Buf::new(4096)?;
+        b.bytes(0, 4096).fill(0xa5);
+        let n = sys_pread64(fd, b.ptr(0), 4096, 0);
+        sys_close(fd as u64);
+        check(b"read", n == 4096, n)?;
+        let nz = b.bytes(0, 4096).iter().position(|&c| c != 0);
+        check(b"zeros", nz.is_none(), nz.map_or(0, |i| i as i64))
+    });
+    // Empty again before it goes
+    let back = entry_size(p1, NAME, 0);
+    sys_unlink(path(b"HOLE.BIN", &mut [0; 64]));
+    r.and(back)
+}
+
+/// Set the size in the directory entry `name` (8.3, padded) on the
+/// disk to `size`, vda1 unmounted meanwhile
+fn entry_size(p1: &BlkDev, name: &[u8; 11], size: u32) -> R {
+    let u = sys_umount2(MNT.as_ptr(), 0);
+    check(b"umount", u == 0, u)?;
+    let r = poke_entry(p1, name, size);
+    let m = mount(p1);
+    r?;
+    check(b"remount", m == 0, m)
+}
+
+/// The first live short entry `name` on vda1 (not deleted, not a long
+/// name piece) gets `size`, written straight to the disk
+fn poke_entry(p1: &BlkDev, name: &[u8; 11], size: u32) -> R {
+    let buf = Buf::new(MIB)?;
+    let mut p = [0u8; 48];
+    let fd = sys_open(p1.path(&mut p).as_ptr(), O_RDWR | O_DIRECT, 0) as i32;
+    check(b"open vda1", fd >= 0, fd as i64)?;
+    let r = (|| {
+        let mut off = 0;
+        while off < PART {
+            let n = sys_pread64(fd, buf.ptr(0), MIB as u64, off as i64);
+            check(b"entry scan", n == MIB as i64, n)?;
+            let hit = buf
+                .bytes(0, MIB)
+                .chunks(32)
+                .position(|e| &e[..11] == name && e[11] != 0x0f);
+            if let Some(k) = hit {
+                let e = k * 32;
+                buf.bytes(e + 28, 4).copy_from_slice(&size.to_le_bytes());
+                let unit = e / UNIT * UNIT;
+                let w = sys_pwrite64(fd, buf.ptr(unit), UNIT as u64, (off + unit) as i64);
+                return check(b"entry write", w == UNIT as i64, w);
+            }
+            off += MIB;
+        }
+        check(b"entry found", false, 0)
+    })();
+    sys_close(fd as u64);
     r
 }
 

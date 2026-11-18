@@ -5,8 +5,10 @@
 //! range mapped once per I/O into disk extents by fat_get_block (Linux
 //! do_blockdev_direct_IO's get_more_blocks, DIO_SKIP_HOLES: `create`
 //! only past the size, where a write's blocks lie below mmu_private).
-//! An unmapped block (no cluster below the size: a corrupt entry) is
-//! EIO, where Linux reads zeros for it.
+//! An unmapped block below the size (a file with no cluster, Linux
+//! fat_bmap_cluster's i_start 0: its only holes) reads as zeros; a
+//! write meeting one goes through the cache (Linux do_direct_IO:
+//! -ENOTBLK, then the buffered fallback).
 //!
 //! - Alignment: the position and every segment's address and length
 //!   are multiples of the filesystem's block (its logical sector), or
@@ -82,9 +84,17 @@ fn blocksize(sb: &VfatSbData, pos: u64, mem: u64) -> Result<u64, KernelError> {
 /// The disk extents of the file's `len` bytes at `pos`, a run of
 /// blocks per fat_get_block, contiguous ones merged (Linux
 /// get_more_blocks with DIO_SKIP_HOLES: a write's blocks past the size
-/// mapped with `create`); EIO for an unmapped block or a chain that
-/// ends first (fat_bmap: "request beyond EOF")
-fn map(inode: &Inode, pos: u64, len: usize, write: bool) -> Result<Vec<Extent>, KernelError> {
+/// mapped with `create`), an unmapped block a hole of one block (Linux
+/// do_direct_IO zeroes a hole block by block); None if a write meets
+/// one (Linux -ENOTBLK: vfat's holes are a whole file without a
+/// cluster, so nothing before it would go direct). EIO for a chain
+/// that ends first (fat_bmap: "request beyond EOF").
+fn map(
+    inode: &Inode,
+    pos: u64,
+    len: usize,
+    write: bool,
+) -> Result<Option<Vec<Extent>>, KernelError> {
     let bits = inode.blkbits();
     let bs = 1u64 << bits;
     let (end, size) = (pos + len as u64, inode.get_size());
@@ -98,13 +108,17 @@ fn map(inode: &Inode, pos: u64, len: usize, write: bool) -> Result<Vec<Extent>, 
         map_bh.set_size(((end - (block << bits)).div_ceil(bs) << bits) as usize);
         let create = write && (size == 0 || block > (size - 1) >> bits);
         fat_get_block(inode, block, &map_bh, create)?;
-        if !map_bh.mapped() {
-            return Err(KernelError::Io);
-        }
-        let disk = (map_bh.blocknr() << bits) + off;
-        let n = (map_bh.size() as u64 - off).min(end - at) as usize;
-        match out.last_mut() {
-            Some((o, l)) if *o + *l as u64 == disk => *l += n,
+        let (disk, n) = if map_bh.mapped() {
+            let n = (map_bh.size() as u64 - off).min(end - at) as usize;
+            (Some((map_bh.blocknr() << bits) + off), n)
+        } else if write {
+            return Ok(None);
+        } else {
+            (None, (bs - off).min(end - at) as usize)
+        };
+        match (out.last_mut(), disk) {
+            (Some((Some(o), l)), Some(d)) if *o + *l as u64 == d => *l += n,
+            (Some((None, l)), None) => *l += n,
             _ => {
                 out.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
                 out.push((disk, n));
@@ -112,7 +126,7 @@ fn map(inode: &Inode, pos: u64, len: usize, write: bool) -> Result<Vec<Extent>, 
         }
         at += n as u64;
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// The filesystem of `inode`
@@ -159,7 +173,7 @@ fn direct_read(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize, K
     // i_size aligned to the block)
     let len = (size.next_multiple_of(bs) - pos).min(count as u64) as usize;
     to.truncate(len);
-    let m = map(inode, pos, len, false)?;
+    let m = map(inode, pos, len, false)?.ok_or(KernelError::Io)?;
     // Counted until the last bio is done, after the lock is dropped: a
     // truncate waits for it before freeing clusters (Linux
     // inode_dio_begin in do_blockdev_direct_IO)
@@ -223,9 +237,13 @@ fn direct_write(
     let sb = sb_of(inode)?;
     let r = blocksize(&sb, pos, from.alignment())
         .and_then(|_| map(inode, pos, count, true))
-        .and_then(|m| {
-            let _dio = inode.dio_guard();
-            dio::direct_io_map(&sb.bdev, from, &m, ())
+        .and_then(|m| match m {
+            Some(m) => {
+                let _dio = inode.dio_guard();
+                dio::direct_io_map(&sb.bdev, from, &m, ())
+            }
+            // A hole: all of it through the cache
+            None => Ok(0),
         });
     let n = match r {
         Ok(n) => n,
@@ -462,7 +480,7 @@ fn read_async(
     let bs = blocksize(&sb, pos, IovDest::async_io(&*io).alignment())?;
     filemap::write_and_wait_range(inode, pos, last(pos, count))?;
     let len = (size.next_multiple_of(bs) - pos).min(count as u64) as usize;
-    let m = map(inode, pos, len, false)?;
+    let m = map(inode, pos, len, false)?.ok_or(KernelError::Io)?;
     // Lossless: below `count`
     let cut = (size - pos).min(count as u64) as usize;
     let w = VfatAio::new(io, inode, cut, None)?;
@@ -509,7 +527,11 @@ fn write_async(
         drop(lock);
         return sync(&*io);
     }
-    let m = map(inode, pos, count, true)?;
+    let Some(m) = map(inode, pos, count, true)? else {
+        // A hole: the whole write at once through the VFS
+        drop(lock);
+        return sync(&*io);
+    };
     // file_modified, before the data (Linux __generic_file_write_iter):
     // the times through the filesystem (fat_update_time)
     crate::fs::dac::remove_privs(inode);

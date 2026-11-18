@@ -730,18 +730,29 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
     } else {
         -1
     };
-    let backing = match bdev {
+    // Allocated before it takes its backing, whose release (a device's
+    // close, an iput) a failure leaves for after the unlock (Linux
+    // bad_swap: filp_close after inode_unlock)
+    let mut si = try_arc(SwapInfo::new(
+        (None, None),
+        file_map,
+        swap_type,
+        max,
+        priority,
+    )?)?;
+    let s = Arc::get_mut(&mut si).expect("swapon: a new area is unshared");
+    (s.inode, s.bdev) = match bdev {
         Some(b) => (None, Some(b)),
         None => (Some(inode.clone()), None),
     };
-    let mut si = SwapInfo::new(backing, file_map, swap_type, max, priority)?;
-    si.swap_file = Some(swap_file);
-    let si = try_arc(si)?;
+    s.swap_file = Some(swap_file);
     // Flush any pending I/O and dirty pages before the area is used
     // (Linux: S_SWAPFILE, then inode_drain_writes)
     inode.set_swapfile(true);
     if let Err(e) = inode_drain_writes(&inode) {
         inode.set_swapfile(false);
+        drop(lock);
+        drop(si);
         return Err(e);
     }
     SWAP_INFO.write()[swap_type as usize] = Some(si);
