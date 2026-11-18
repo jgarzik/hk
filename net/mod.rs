@@ -78,6 +78,8 @@ pub mod skb;
 pub mod sock;
 #[path = "core/sock_lock.rs"]
 pub mod sock_lock;
+#[path = "core/sock_reuseport.rs"]
+pub mod sock_reuseport;
 pub mod socket;
 pub mod syscall;
 pub mod sysctl;
@@ -106,6 +108,7 @@ pub fn init() {
     crate::ns::net::net_ns_init();
     tcp::mem::init();
     tcp::table::init();
+    udp::init();
     arp::arp_init();
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
     // Linux's order: dev_add_pack puts each first

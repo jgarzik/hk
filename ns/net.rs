@@ -29,7 +29,6 @@ use crate::net::device::{DevList, LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::inet::fib::Fib;
 use crate::net::inet::port::PortRange;
 use crate::net::netlink::NlTable;
-use crate::net::udp::UdpTable;
 use crate::util::error::KernelError;
 use crate::util::rculist::RcuList;
 
@@ -74,9 +73,6 @@ pub struct NetNamespace {
 
     /// TCP connection, listener and port tables
     pub tcp: crate::net::tcp::table::TcpTables,
-
-    /// UDP sockets by local port
-    pub udp: UdpTable,
 
     /// net.ipv4.ip_local_port_range
     pub port_range: PortRange,
@@ -201,7 +197,6 @@ impl NetNamespace {
             fib: Fib::new()?,
             nl: Default::default(),
             tcp: Default::default(),
-            udp: UdpTable::default(),
             port_range: PortRange::default(),
             sysctl: Default::default(),
             frags: Default::default(),

@@ -99,7 +99,14 @@ so memory pressure does not clamp windows), no orphan count limit
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
 
-A socket on RCU hash chains (ping, raw) leaves "sockets: used" a grace
+UDP has the port hash only (Linux udp_table.hash), not the second
+hash by address and port (hash2) Linux looks up in when a slot is
+long, and so walks a whole slot per datagram. Its lookup scores the
+whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
+a group's pick at once (with no connected members), before scoring
+the rest of the hash2 chain.
+
+A socket on RCU hash chains (ping, raw, UDP) leaves "sockets: used" a grace
 period after its close: the chain's `Arc` is released by
 `RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
 drops the count at sk_free (the last reference, at unhash) and defers
@@ -824,9 +831,8 @@ Phase A2 (net) remaining:
   GFP_ATOMIC.
 - ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
   with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
-- UDP, packet and netlink socket tables still allocate under their
-  spin locks: hslot/RCU tables, sock_reuseport groups (GFP_ATOMIC under
-  reuseport_lock), packet RCU sklist, netlink RCU portid table.
+- Packet and netlink socket tables still allocate under their spin
+  locks: packet RCU sklist, netlink RCU portid table.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
 - TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the
