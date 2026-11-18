@@ -386,7 +386,7 @@ pub fn ns_get_path(ns: NsRef) -> Result<Path, KernelError> {
             0,
             0,
             crate::time::TIMEKEEPER.current_time(),
-            Arc::downgrade(&mnt.sb),
+            Some(&mnt.sb),
             &NULL_INODE_OPS,
         ))?;
         let name = alloc::format!("{}:[{inum}]", ns.name());

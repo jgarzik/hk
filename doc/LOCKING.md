@@ -291,7 +291,7 @@ subsys}`; `Mutex`:
 `SuperBlock.s_vfs_rename_mutex`, `File.f_pos_lock`,
 `SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex),
 `UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`,
-`VdDisk.vdev`, `SWAPON`,
+`VdDisk.vdev`,
 `Pipe.inner` (Linux pipe->mutex), `Eventpoll.mtx` (Linux ep->mtx) and
 the inotify and fanotify `mark_mutex` (Linux group->mark_mutex).
 The socket owner lock `net::sock_lock::SockLock` (Linux socket_lock_t:
@@ -332,7 +332,10 @@ form whose lock is typed (Linux a `__rcu` pointer written under a
 named lock: signal->pids[] under tasklist_lock): `read` under a
 guard, `protected` (rcu_dereference_protected) under a borrow of the
 lock's `UniqueOwner` data `O`, `replace` under a mutable borrow of
-it. `RcuPtr<T>` owns nothing (Linux task->real_parent): `set` is
+it. `RcuOnceArc<T>` is the nullable form set once and emptied once by
+atomic exchanges, so it needs no lock (Linux sb->s_fs_info): `read`
+under a guard, `get` a reference, `take` the version as `RcuRetired`.
+`RcuPtr<T>` owns nothing (Linux task->real_parent): `set` is
 rcu_assign_pointer, `get` (unsafe) rcu_dereference, valid only on
 the caller's argument that its target is freed a grace period after
 no reader can reach it (`Task::parent`). `util::rculist::RcuList` (Linux rculist.h) is an
@@ -586,11 +589,15 @@ VFS locks (detailed order):
                    only the mountpoint path then, no VFS lock), and
                    for the last active reference's shutdown (taken with
                    nothing held: generic_shutdown_super takes d_locks,
-                   INODE_SB_LIST_LOCK, inotify locks, the writeback
+                   SuperBlock.s_inodes, inotify locks, the writeback
                    pass (BdiWriteback.pass and what writeback takes)
                    and what eviction takes under it), read for a bind
                    remount and the superblock walks; trylock-read for
-                   reclaim's)
+                   reclaim's, and for the writeback pass over every
+                   superblock, per superblock under BdiWriteback.pass
+                   and its list_lock, never waiting (Linux
+                   __writeback_inodes_wb): no pass writes an inode of a
+                   superblock being shut down or remounted)
         ↓
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write, and
                    the tree's links in attach_mnt/detach_mnt; across
@@ -617,10 +624,13 @@ VFS locks (detailed order):
                    read guard)
         ↓
     Inode.i_lock (spin Mutex, Linux i_lock: the inode's dentries
-                   (i_dentry) and its i_state writes; taken before the
-                   d_locks of the dentry it links or unlinks and its
-                   parent; under INODE_HASH_LOCK, INODE_SB_LIST_LOCK
-                   and BdiWriteback.list_lock by igrab)
+                   (i_dentry) and its i_state writes, the dirty bits
+                   and I_SYNC included; taken before the d_locks of
+                   the dentry it links or unlinks and its parent; under
+                   INODE_HASH_LOCK by igrab and (un)hashing, SuperBlock.s_inodes by igrab, under
+                   BdiWriteback.list_lock by igrab and writeback; under
+                   it a wait queue head (I_SYNC's, var_waitqueue) and
+                   AddressSpace.i_pages (writeback's mapping_tagged))
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
@@ -663,7 +673,9 @@ Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
-    [→ AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
+    [→ buffer lock (BH_Lock bit, sleeping) | AddressSpace.i_private_lock
+    (spin, Linux i_private_lock) → MappingMetadataBhs.lock (spin);
+    → AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
     → AddressSpace.i_mmap (sleeping RwSem, Linux i_mmap_rwsem)
     → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
     → page_table_lock → PTE lock (spin) [→ MMLIST (spin leaf)]
@@ -732,7 +744,12 @@ SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fa_lock,
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem, INODE_HASH_LOCK
-    (bdev_add/bdev_del), MAJORS; I/O sleeps under open_mutex only
+    (bdev_add/bdev_del), MAJORS, BDEV_LOCK (claims; sleeping leaf, also
+    taken alone to prepare a claim); I/O sleeps under open_mutex only
+    SuperBlock.s_umount → bdev inode i_rwsem (sleeping; set_blocksize
+    writes it, device-file buffered I/O reads it) → mmap_lock,
+    AddressSpace.invalidate_lock (sleeping; set_blocksize writes it, a
+    read or fault filling a page reads it, mmap_lock → it) → page lock
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
     hardware queue also from the driver ISR, under its line's IrqDesc.lock;
     a poll queue is a hardware queue no interrupt reaches: taken by the
@@ -2233,13 +2250,19 @@ pub struct Zone {
   reset by the free. Read under the PTE lock by the write fault and
   mprotect (reuse in place, for a page out of the swap cache:
   `Page::reusable`), remote writes and fork.
-- Unpinning (`PinnedPages` drop) takes no lock for anonymous pages
-  (their dirty flag is an atomic bit; the count drop may free the page,
-  which the allocator allows in any context). A page-cache page written
-  through a shared mapping is dirtied under its page lock (sleeping),
-  so a `PinnedPages` with such pages is dropped in thread context; a
-  completion in an interrupt handler must hand it to a thread (Linux
-  bio_dirty_work). Block-device direct I/O keeps its pins until the
+- A pin holds the page only (Linux a folio reference), never the inode
+  or file whose cache it is in. Unpinning (`PinnedPages` drop) of
+  unwritten pages takes no lock (the count drop may free the page,
+  which the allocator allows in any context); a written page not yet
+  dirty is dirtied under its page lock (sleeping; Linux
+  unpin_user_pages_dirty_lock -> folio_mark_dirty_lock), through its
+  mapping if it is still in one (borrowed under that lock, see the
+  page cache's eviction), else by its flag, so a `PinnedPages` that
+  was written is dropped in thread context; a completion in an
+  interrupt handler must hand it to a thread (Linux bio_dirty_work).
+  A long-term pin (FOLL_LONGTERM: a registered io_uring buffer) of a
+  writable shared mapping of a file that writes back is refused (Linux
+  writable_file_mapping_allowed: EFAULT). Block-device direct I/O keeps its pins until the
   submitter's wait returns and drops them there (3.10).
 
 #### Swap (mm/swap/swapfile.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
@@ -2266,21 +2289,47 @@ pub struct Zone {
   Order: mmap_lock -> page lock -> AnonVma.chain -> PTE lock; under a
   spinlock only `trylock_page` (zap, a write fault's swap-cache reuse).
   I/O happens under the page lock, never under a spinlock.
-- `SWAP_INFO` (spin `RwLock`, read mostly): the devices; `SWAPON`
-  (sleeping `Mutex`, Linux swapon_mutex) serializes swapon/swapoff.
-  swapoff (`try_to_unuse`) clears SWP_WRITEOK, then walks `MMLIST`
-  and faults the device's swap PTEs of each address space in, its
-  mmap_lock held for reading.
+- `SWAP_INFO` (spin `RwLock`, read mostly, thread context; Linux
+  swap_lock and swap_info[]): the enabled devices and the types in use
+  (`SwapTable.used`, Linux SWP_USED). swapon reserves the lowest free
+  type under it before it opens anything (EPERM if none; Linux
+  alloc_swap_info) and gives it back, after releasing what it opened,
+  if it fails; swapon publishes the device under it (Linux
+  enable_swap_info), swapoff finds its device among the SWP_WRITEOK
+  ones and clears SWP_WRITEOK under it (so a second swapoff of the
+  area is EINVAL), sets it again there if `try_to_unuse` fails (Linux
+  reinsert_swap_info), takes the device out of the table under it
+  once drained, and frees the type last, after the device's release:
+  `SWAP_INFO` -> `SwapInfo.map`. `TOTAL_SWAP_PAGES` (Linux
+  total_swap_pages) changes under it with SWP_WRITEOK (swapon's
+  publication, swapoff's clear and reinsert); `swap_totals` (Linux
+  si_swapinfo) reads it and the draining devices' in-use slots under
+  it. Nothing sleeps under it. Swapons and swapoffs of different
+  areas run in parallel, `try_to_unuse` included. There is no
+  swapon_mutex: Linux takes it to serialize enable_swap_info and
+  swapoff's removal (both under `SWAP_INFO` here) with /proc/swaps'
+  walk, whose show sleeps; hk has no /proc/swaps.
+- swapon holds the mapping host's `i_rwsem` (the swap file's inode,
+  or the device's bdev inode; Linux swapon's inode_lock) from the
+  IS_SWAPFILE check (EBUSY, whatever path names the file) through the
+  header's read (page cache), the extents' mapping, S_SWAPFILE and the
+  write-back that follows it (inode_drain_writes) to the area's
+  publication: `i_rwsem` -> invalidate_lock -> page and buffer locks
+  (the header read, ->bmap's FAT reads), `i_rwsem` -> `SWAP_INFO`.
+  swapoff (`try_to_unuse`), no swap lock held, walks `MMLIST` and
+  faults the device's swap PTEs of each address space in, its
+  mmap_lock held for reading; then it clears S_SWAPFILE under the
+  `i_rwsem` with no swap lock held.
 - `SwapInfo.users` (`PercpuRef`, 1.3.3; Linux si->users): every use
   of a device by entry or type holds a `SwapDev` (Linux
   get_swap_device / put_swap_device), taken under `SWAP_INFO` read
   (tryget, refused once killed) and put anywhere, PTE lock included.
-  swapoff, its device empty, kills and waits for it under `SWAPON`
-  with nothing else held, then takes the device out of `SWAP_INFO`
-  and drops the last `Arc` itself: the release (block device close
-  under `Disk.open_mutex`, sync, page-cache invalidate; a swap file's
-  iput) sleeps, so it runs only there (`SwapInfo` drop asserts
-  might_sleep). No `SwapDev` is held while waiting on `SWAPON`.
+  swapoff, its device empty, kills and waits for it with nothing
+  held, then takes the device out of `SWAP_INFO` and drops the last
+  `Arc` itself: the release (block device close under
+  `Disk.open_mutex`, sync, page-cache invalidate; a swap file's iput)
+  sleeps, so it runs only there (`SwapInfo` drop asserts
+  might_sleep).
 - `MMLIST` (`spin::Mutex` leaf, mm/mod.rs; Linux init_mm.mmlist under
   mmlist_lock): an `OwnedList` of the address spaces that may hold
   swap entries, one `Arc<Mm>` each. An mm is linked the first time it
@@ -2397,6 +2446,8 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
 No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
 info, wait)` runs `func(info)` on other CPUs from their call-function
 IPI (x86 vector 0xfc, arm64 SGI 1); `on_each_cpu` adds this CPU;
+`on_each_cpu_cond` calls only the CPUs its condition picks, run on the
+caller for each CPU first (Linux on_each_cpu_cond);
 `smp_send_reschedule` (x86 0xfd, arm64 SGI 0) makes a remote CPU
 reschedule (`resched_curr` after queueing a task on its run queue,
 `kick_process`); its handler flags the running task NEED_RESCHED.
@@ -2578,10 +2629,11 @@ layout in `doc/MEMORY.md`
   allocations take GFP_ATOMIC and never reclaim again; swap writeback
   runs with PF_MEMALLOC_NOIO (Linux memalloc_noio_save). The reverse map
   only tries the AnonVma chain lock under PF_MEMALLOC (Linux rmap_walk
-  with try_lock): an allocating task may hold it for writing. Direct
-  reclaim swaps only to block-device areas (`swap::get_swap_page`
-  skips swap files under PF_MEMALLOC), since a file's swap_rw may
-  need filesystem locks the allocating task holds. A page table
+  with try_lock): an allocating task may hold it for writing. Swap
+  I/O takes no filesystem lock: a swap file's slots are its blocks,
+  mapped at swapon (->bmap under its i_rwsem, Linux
+  generic_swapfile_activate) and written straight to its device, as
+  a partition's. A page table
   is allocated before the page_table_lock is taken (Linux
   pte_alloc_one), so it may reclaim; a fault whose table still cannot
   be allocated reclaims again and retries.
@@ -2589,16 +2641,19 @@ layout in `doc/MEMORY.md`
 #### Per-inode page cache (Linux i_pages)
 
 **Location:** `mm/filemap.rs` (`AddressSpace`, the inode's
-`i_data`); users: ramfs, tmpfs, vfat files, block devices
-(`BlockDevice.bd_inode`). vfat writes its FAT and directory blocks
-into the device cache marking only the 512-byte sectors it changes
-(`bdev_write_meta`: bits in `Page.private`, set under the page lock;
-Linux dirty buffer heads), and the device's writepage writes only
-those: a device-cache page may also hold file-data clusters, which
-the file's own cache writes. (A write-back widened to the device's logical
-block stays inside one FAT sector: vfat refuses a FAT sector smaller
-than that block. A newly allocated cluster's device-cache pages are
-dropped before and after it is zeroed on the disk.)
+`i_data`), `fs/pageio/buffer.rs` (buffer heads); users: ramfs, tmpfs, vfat
+files, block devices (`BlockDevice.bd_inode`). The device cache holds
+its blocks in buffer heads (Buffer heads, below): vfat reads and
+writes all its metadata (FAT, directories, boot sector) in them, in the device's block size, which
+its mount sets to the FAT sector size (`sb_set_blocksize`), and the
+device's writepage writes only dirty buffers: a device-cache page may
+also hold file-data clusters, which the file's own cache writes. A
+vfat file's pages hold buffers of the same block size, mapped by
+fat_get_block (`fs/vfat/aops.rs`) under the file page's lock. (A new
+directory cluster is zeroed in its buffers, Linux fat_zeroed_cluster;
+a file block get_block maps new has its device-cache alias cleaned,
+Linux clean_bdev_bh_alias: file page lock -> device page lock ->
+buffer lock.)
 
 - `AddressSpace.i_pages` (`spin::Mutex<XArray>`, Linux xa_lock): the
   cached pages by index. Thread context only (no I/O completion or
@@ -2612,6 +2667,24 @@ dropped before and after it is zeroed on the disk.)
   removed (truncate) under it. Order: i_rwsem -> page lock ->
   i_pages. Removal also needs `i_pages`; a lookup that then locks the
   page rechecks `Page.mapping` (truncated meanwhile: retry).
+  ->read_folio unlocks the page when its read ends (an I/O
+  completion), uptodate if it worked, or on an error return (Linux);
+  `read_page` waits for the unlock without the lock
+  (`filemap_read_folio`, `wait_on_page_locked`, Linux folio_wait_locked)
+  and returns the page as it then is: a truncate meanwhile may have
+  removed it, its data still valid (removal leaves PG_uptodate, as
+  Linux __filemap_remove_folio; do_read_cache_folio returns it), a
+  read that failed is EIO, and a page found locked is waited for
+  unlocked, then looked up again (a truncation is found by its
+  `Page.mapping` once locked).
+- `AddressSpace.invalidate_lock` (sleeping `RwSem`, thread context;
+  Linux invalidate_lock): held shared by a read or fault that creates
+  or fills a page (`read_page`, Linux filemap_create_folio,
+  filemap_update_page, filemap_fault), exclusive by `set_blocksize`
+  across a device cache's write-back and drop, so no page is filled
+  on the old geometry meanwhile. i_rwsem -> it (buffered reads of a
+  device file, `set_blocksize`), mmap_lock -> it (faults), it -> page
+  lock.
 - `AddressSpace.writable` (atomic, Linux i_mmap_writable): the
   shared writable mappings (VM_SHARED, file open for writing, not
   `VM_NOMAYWRITE`), counted by the VMA link/unlink (mmap_lock held for
@@ -2663,8 +2736,100 @@ dropped before and after it is zeroed on the disk.)
   held but each page's, taken with trylock (reclaim never waits for
   one); an unevictable mapping (ramfs) is never touched.
 - Eviction (`Drop for AddressSpace`, the inode's last reference)
-  empties `i_pages` without page locks: nothing else can reach the
-  mapping any more.
+  truncates every page under its page lock, as any truncate (Linux
+  truncate_inode_pages_final), before the inode's fields go: a page's
+  `mapping` word is cleared only under its lock, so the holder of a
+  page's lock that finds it in a mapping may use the mapping and its
+  `host` inode, with no reference, until it unlocks
+  (`filemap::folio_mark_dirty_lock`, Linux folio->mapping under the
+  folio lock).
+- Private data (`PG_private`, `Page.private`; Linux folio private):
+  attached and detached under the page lock and `i_private_lock`
+  (`folio_attach_private` takes a page reference for it). Truncation
+  (`truncate_folio`, Linux truncate_inode_folio) calls the
+  filesystem's ->invalidate_folio under the page lock, eviction from
+  the cache (`evict_folio`, Linux mapping_evict_folio, and
+  `invalidate_pages2`) its ->release_folio (`filemap_release_folio`;
+  default try_to_free_buffers): the expected count is the cache's,
+  the caller's and the private data's.
+
+#### Buffer heads (fs/pageio/buffer.rs; Linux fs/buffer.c)
+
+- A page's buffers (a ring through `b_this_page`, on the page's
+  private word) are made under the page lock and attached under
+  `i_private_lock` too (create_empty_buffers, grow_dev_folio); they
+  are freed only by `try_to_free_buffers`, under both, when none is
+  referenced (`b_count`), dirty or locked. So the page lock,
+  `i_private_lock` or a reference on any buffer of the ring keeps the
+  whole ring; `__find_get_block` looks up under `i_private_lock`
+  alone (it may not sleep), the rest under the page lock.
+- `AddressSpace.i_private_lock` (spin `Mutex`, thread context; Linux
+  i_private_lock): page lock -> it -> `i_pages` (block_dirty_folio
+  dirties every buffer and the page under it, so a ring attached
+  meanwhile comes dirty and try_to_free_buffers never frees a dirty
+  one) -> `MappingMetadataBhs.lock` (drop_buffers takes buffers off
+  their list). Nothing sleeps or allocates under it (the ring is
+  allocated before it is taken).
+- Buffer lock (BH_Lock, a sleeping bit lock over `var_waitqueue`;
+  Linux lock_buffer): held across a buffer's I/O; taken under the page
+  lock (block_write_full_folio, discard_buffer, clean_bdev_aliases)
+  or alone (bread, sync_dirty_buffer, write_dirty_buffer), never under
+  a spin lock. Unlocked from the bio's completion (hardirq), which
+  touches nothing of the buffer after the bit clears.
+- `b_uptodate_lock` of a ring's first buffer (`IrqSpinlock` leaf;
+  Linux): the async read and write completions (hardirq) of a page's
+  buffers, so exactly one ends the page's read (unlocks it,
+  folio_end_read) or writeback (folio_end_writeback); the page stays
+  locked (read) or under writeback, so its ring stays, until then.
+  hk's ->writepage is synchronous: it keeps the page locked and waits
+  for the writeback to end (`PG_writeback`, the page's wait queue),
+  where Linux unlocks it after submitting.
+- mpage (`fs/pageio/mpage.rs`, Linux fs/mpage.c; vfat files): a page whose
+  blocks are contiguous on the disk is read or written in one bio of
+  its own, mapped under its page lock through a map buffer (a
+  `BufferHead::new_map` value of the caller's, Linux an on-stack
+  buffer_head, never shared); the bio's completion (hardirq) ends the
+  page's read (unlocks it) or writeback. The synchronous ->writepage
+  waits for the writeback to end under the page lock; its outcome,
+  on the writer's stack, is written by the completion before that.
+- A buffer's `b_size` is its block size, which get_block stores again
+  (Linux map_bh) under the page lock, never another value.
+- A buffer's `b_bdev` holds a `Weak` of its device, changed only while
+  unmapped (page lock) or under the buffer lock: a locked, mapped
+  buffer's is stable for its bio's submission. A buffer's I/O holds no
+  reference on the device: its submitter keeps it (a mounted
+  filesystem's `s_bdev`, or the caller across its wait).
+- Per-CPU LRU of looked-up buffers (`lru::BH_LRUS`, an `IrqSpinlock`
+  per CPU, leaf; Linux bh_lrus under local_irq_disable): each slot holds
+  a reference; taken by its CPU's lookups (the lock replaces the
+  interrupt masking), by any CPU's `invalidate_bh_lrus` to see whether
+  it holds a buffer (`has_bh_in_lru`; Linux reads it unlocked) and by
+  its CPU's call of it (a cross-CPU call on those CPUs, interrupts off,
+  Linux on_each_cpu_cond), which kill_bdev and invalidate_bdev make
+  first, so the pages' buffers can go.
+- `MappingMetadataBhs.lock` (spin, thread context; Linux mmb->lock):
+  the list of a mapping's metadata buffers (`b_assoc_buffers`, `b_mmb`)
+  and a sync's private list (`mmb_sync`); a buffer's `b_mmb` is read
+  without it under an RCU read guard (`remove_assoc_queue`,
+  `mark_buffer_write_io_error`): the list's memory is freed a grace
+  period after its last buffer left (`mmb_mark_buffer_dirty`'s
+  contract, Linux's RCU-freed inode).
+- A write error (`mark_buffer_write_io_error`, from the completion)
+  reaches the page's mapping and its superblock's `s_wb_err` with no
+  reference taken (`filemap::mapping_set_error_raw`): the buffer is
+  locked, and an inode's teardown waits for every buffer lock of its
+  pages (truncation's discard_buffer) before it drops `i_data` and
+  then its superblock reference, which keeps the superblock. A list's (`MappingMetadataBhs`)
+  mapping and superblock likewise, under the RCU read guard: its drop
+  empties it, then waits a grace period before its `Weak` goes, and of
+  its mapping only `wb_err` (no drop glue) is touched, valid while the
+  mapping's memory is (an inode's `i_data` drops at its teardown, but
+  its memory, and a vfat inode's list with it, goes a grace period
+  after the eviction emptied the list).
+- `mark_buffer_dirty` never sleeps: the page's mapping is reached under
+  an RCU read guard (`filemap::folio_mapping`: a mapping is part of an
+  inode freed by RCU) for its count and DIRTY mark (`i_pages`); the
+  inode is queued for writeback after the guard drops.
 
 ### 3.3 Virtual File System (VFS)
 
@@ -2773,8 +2938,10 @@ lock is released: `Workqueue.inner`), under `DELAYED_FPUT_RUN`
 (sleeping, outermost: 2). So a `FileRef` may be dropped under any
 lock, spin or sleeping, in any context. Only close(2) releases inline
 (`fput_close_sync`, Linux the same), with no lock held. The release
-drops the file's fields (dentry, mount: Linux __fput's dput and
-mntput) and gives its memory back to the file cache at once
+drops the file's fields, in Linux __fput's order: its filesystem's
+per-open data and write accesses (put_file_access) before the dentry
+and mount (dput, mntput), so no inode reference of the file outlives
+its mount reference, and gives its memory back to the file cache at once
 (`file_free`, Linux kmem_cache_free(filp_cache)): every file is a
 `FileObj` of `FILP_CACHE` (`File::alloc`, the one way to a `FileRef`),
 whose count stays 0 there and is set last, Release, by the next file
@@ -2798,8 +2965,11 @@ pub struct Inode {
 ```
 
 **Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
-(by directory-entry position) are hashed so each on-disk object has one
-`Inode`, block devices' inodes on the bdev superblock by device
+(by directory entry; its `test` also requires the entry still set,
+i_pos, so it doubles as Linux fat's position hash: an unlinked or
+replaced inode, detached, stays hashed until its eviction, as in
+Linux's VFS hash, but is never found) are hashed so each on-disk
+object has one `Inode`, the vfat root too (found by no lookup), block devices' inodes on the bdev superblock by device
 number, so a device is found by its number (3.10), and a tmpfs inode
 by number plus generation once a file handle of it is made
 (`insert_inode_hash_once`, checked and hashed under the lock; Linux
@@ -2812,7 +2982,11 @@ inode_hash_lock, thread context): under it only the bucket links and
 the filesystem's `test` (which may take `Inode.private`, a spin
 RwLock, then vfat's `VfatInode.d`, a spin Mutex leaf held only to copy
 the data in or out), and a candidate's `i_lock` (igrab's slow path,
-Linux find_inode's spin_lock(&inode->i_lock)). Not IRQ-safe: an inode's last reference never goes
+Linux find_inode's spin_lock(&inode->i_lock)), as every hash, unhash
+and rehash (one hold for a rename's move) takes the inode's `i_lock`
+(Linux __insert_inode_hash, __remove_inode_hash), so its hashed state
+is exact under `i_lock` (`__mark_inode_dirty` queues only a hashed
+inode, or a block device's). Not IRQ-safe: an inode's last reference never goes
 in an interrupt handler (pinned pages and files are released in thread
 context: `PinnedPages`, `fput`), which lockdep checks (a tracked lock
 taken in an interrupt handler is reported). A lookup (Linux
@@ -2833,22 +3007,67 @@ which no writeback or eviction takes). Eviction (`iput` ->
 the last reference goes, which must be a context that may sleep (Linux
 iput's might_sleep, checked first): never under a spin lock or with
 interrupts off. A linked, hashed inode (Linux inode_generic_drop
-false) is marked I_WILL_FREE and, if dirty, written back first with
-`i_lock` released (Linux write_inode_now for an inode not kept cached;
-hk keeps none), then marked I_FREEING; then it leaves its writeback
-and superblock lists,
+false) is marked I_WILL_FREE and written back first with
+`i_lock` released (nothing for a clean one), then marked I_FREEING:
+with wait once its superblock is shut down (Linux write_inode_now(1)
+for one not kept, !SB_ACTIVE, which `generic_shutdown_super` clears
+after its sync_filesystem, as Linux); while it is active, WB_SYNC_NONE,
+as Linux's flusher writes the inode it keeps on its LRU (hk keeps
+none); then
+it leaves its writeback list (under the list lock and `i_lock`, then
+waiting for I_SYNC under `i_lock`, Linux inode_wait_for_writeback: a
+writer holds a reference, so there is none) and its superblock list,
 `->evict_inode` runs while it is still hashed (may sleep and do I/O:
 vfat frees an unlinked file's clusters at once, Linux
 fat_evict_inode), and `INODE_HASH_LOCK` is taken to unhash it, the
-waiters woken after (Linux evict's remove_inode_hash, wake_up_bit). `->evict_inode` may upgrade
-the inode's `Weak` superblock: that is a passive reference (`Arc`,
-Linux s_passive), which keeps only the memory, so its drop never
-shuts the filesystem down, whatever the context (it takes `SB_LOCK`
-if it is the last, so none is dropped under that lock). The shutdown
+waiters woken after (Linux evict's remove_inode_hash, wake_up_bit). An
+inode's superblock (`Inode.sb`, Linux i_sb) is a passive reference
+(`Arc`, Linux s_passive: Linux takes none per inode, its plain pointer
+staying valid by the order below), which keeps only the memory, so
+its drop, the teardown's last, never shuts the filesystem down (it
+takes `SB_LOCK` if it is the last, so none is dropped under that
+lock). The superblock is there for the inode's whole life, and so is
+the data of a filesystem whose inodes borrow it (vfat): the shutdown
+evicts every inode before ->put_super, which releases the data
+(`SuperBlock::kill_fs_info_rcu`, Linux call_rcu) unless an inode is
+still listed (busy, below). The shutdown
 belongs to the last active reference (`SbActive`, Linux s_active:
 each mount's, devtmpfs's): its drop (Linux deactivate_super) takes
 s_umount for writing and runs `generic_shutdown_super` (inotify
-watches, the dentry tree, s_inodes) and the device's release, in
+watches; the dentry tree, whose drop evicts the inodes its dentries
+held; sync_filesystem; ->put_super, which puts the filesystem's own
+inodes; then any inode left on s_inodes is a bug, reported as Linux's
+"Busy inodes after unmount", which fails a boot test: one referenced
+past its superblock's end, which nothing that pins the filesystem (a
+mount, an open file, a writeback pass under s_umount, a walk under
+s_umount) leaves, and no pinned page does (a pin holds the page, not
+its inode). Nor does any put an inode during the shutdown, so none is
+mid-eviction (off s_inodes, in ->evict_inode) when put_super's
+release runs: every inode reference is held under a mount, an active
+reference or s_umount and put before it (a file's write access and
+per-open data before its dentry and mount, Linux __fput; a bound
+AF_UNIX socket's path, mount included, Linux u->path; a link level's
+inode before its path; writeback's under s_umount; the s_inodes walks'
+under s_umount), an inotify watch's is waited for by the shutdown
+(`s_fsnotify_watched`, Linux fsnotify_sb_watched_objects), and no
+inode's RCU-freed data holds another inode (tracefs reads its root
+through the superblock). Linux relies on this with no check (no count
+of evictions in flight; its ->evict_inode would use what put_super
+freed); hk's `evict` panics ("VFS: inode evicted across its
+superblock's shutdown") if, after ->evict_inode, it finds its
+superblock shut down (SB_BORN and SB_DYING), so an overlap that ran
+past the shutdown is caught rather than left a silent use after free. Each busy inode is poisoned, as Linux, under the
+s_inodes lock and its `i_lock`, in the one pass that finds it (`inode::sb_poison`: `I_POISON` stands
+for VFS_PTR_POISON in i_op, i_sb and i_mapping, so `Inode::i_op`,
+`Inode::superblock` and `Inode::i_mapping` panic "VFS: poisoned
+inode" on any later use, its eviction too), and put_super left
+the data: a borrow of it taken before the poison
+(`msdos_sb_of`) stays valid, the data going with the superblock's
+memory, which that inode keeps (Rust analogue of Linux's poison,
+where such a borrow would be a use after free; with no busy inode
+the release runs as Linux's call_rcu callback, a grace period on))
+and the
+device's release, in
 thread context with nothing atomic held (mount teardown drops its
 reference after MOUNT_LOCK and NAMESPACE_SEM): `might_sleep` there
 reports one that does not. Deviation from Linux: no
@@ -2870,10 +3089,13 @@ one only if neither I_FREEING nor I_WILL_FREE is set (Linux igrab,
 __iget): since those bits are set under `i_lock` in the same hold that
 dropped the count to zero, no reference is taken to an inode in its
 teardown, and the teardown runs once. `i_state` is written only under
-`i_lock` and read lock-free (Linux inode_state_read_once). `i_lock` is
+`i_lock` and read lock-free (Linux inode_state_read_once): its writers
+and `Inode::__iget` take the lock's `ILocked` borrow and assert it is
+this inode's (`Inode::assert_locked`), `__iget` that neither bit is
+set. `i_lock` is
 a spin leaf above the d_locks (it guards the inode's dentries too,
 Linux i_dentry): taken by igrab under `INODE_HASH_LOCK`,
-`INODE_SB_LIST_LOCK` or a `BdiWriteback.list_lock` (Linux:
+`SuperBlock.s_inodes` or a `BdiWriteback.list_lock` (Linux:
 inode_hash_lock, s_inode_list_lock and wb->list_lock before i_lock),
 and never held while any of those is taken (iput_final drops it before
 the eviction takes them). Every put may sleep (Linux iput's
@@ -2909,78 +3131,137 @@ it too. No lock is added.
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
 superblock's `s_inodes` (an `InodeList` through `Inode.i_sb_list`,
 holding no reference) until
-its eviction (`evict`, after the writeback lists) unlinks it. One global
-`INODE_SB_LIST_LOCK` (spin Mutex leaf, thread context; Linux
-inode_sb_list_lock as it was before s_inode_list_lock went per
-superblock) guards every list: an inode holds only a `Weak` to its
-superblock and may be evicted after that superblock's shutdown, which
-drains the list under this lock, before the last passive put frees any
-field, so an inode still linked under the lock has a superblock with
-intact fields (a per-superblock lock would live in memory the last put
-may already have freed). Taken by an inode's eviction, with nothing
-held; under it only an inode's `i_lock` (igrab's slow path). The
+its eviction (`evict`) unlinks it, under the list's own lock (`SuperBlock.s_inodes`, a spin Mutex leaf, thread
+context; Linux s_inode_list_lock): the inode's superblock reference
+keeps the lock's memory, and the shutdown evicts every inode while the
+superblock runs (Inode cache, above). Unlinked as Linux evict's
+inode_sb_list_del: after the writeback list, before ->evict_inode, so
+an inode mid-eviction is not listed; none is when the shutdown's busy
+check runs (Inode cache, above: nothing puts an inode during the
+shutdown). Taken by an inode's eviction, with nothing held, by vfat's
+put_super (`kill_fs_info_rcu`'s `sb_busy`) and by the shutdown's busy
+check, which poisons in the same pass (`sb_poison`); under it only an inode's `i_lock` (igrab's
+slow path, the poison bit). The
 reclaim and drop_caches walks and the inotify shutdown
 (`for_each_sb_inode`, Linux drop_pagecache_sb, fsnotify_unmount_inodes)
 take each inode's reference under it (`Inode::igrab`) and work with it
 released, dropping the previous reference unlocked.
 
-**vfat FAT lock** (`fs/vfat/mod.rs`, Linux fs/fat/fatent.c):
+**vfat FAT lock** (`fs/vfat/fatent.rs`, Linux fs/fat/fatent.c):
 `VfatSbData.fat` (sleeping `sync::Mutex`, Linux sbi->fat_lock /
 lock_fat), one per filesystem, thread context only, serializes a
-free cluster's search and claim (`allocate_cluster`, Linux
-fat_alloc_clusters), freeing a chain (`free_cluster_chain`, Linux
-fat_free_clusters, an unlinked file's from its eviction included) and
-the free count (`FatState.free`, Linux sbi->free_clusters: counted by
-the first statfs, then kept by both). Taken under the inodes'
-`i_rwsem` (write and truncate paths) or with nothing held (eviction);
-the FAT is read and written through the device under it (page locks,
-block I/O), a claimed cluster zeroed after it is released; never held
-with `VfatInode.cache` or `VfatInode.d`.
+free cluster's search and claim (`fat_alloc_clusters`), freeing a
+chain (`fat_free_clusters`, an unlinked file's from its eviction
+included) and the free count (`FatState.free`, Linux
+sbi->free_clusters: counted by the first statfs,
+`fat_count_free_clusters`, then kept by both). Taken under the inodes'
+`i_rwsem` (write, truncate and fallocate paths), under a file page's
+lock too where fat_get_block allocates the cluster a write reaches
+(->write_begin; Linux fat_add_cluster under the folio lock: page lock
+-> FAT lock), or from an eviction (an unlinked file's chain, a linked
+one's fallocated clusters past mmu_private: fat_free_eofblocks).
+Under it the FAT's blocks are read (`bread`: page lock, buffer lock,
+block I/O) and changed in their pinned buffers, which go on the FAT
+inode's metadata list (`MappingMetadataBhs.lock`, spin leaf; Linux
+MSDOS_I(sbi->fat_inode)->i_metadata_bhs, which fsync writes) and are
+copied into the other FATs (`fat_mirror_bhs`: buffer lock) by
+`fat_free_clusters` under it and by `fat_alloc_clusters` after it is
+released, as Linux. A claimed cluster is zeroed after it is released;
+never held with `VfatInode.cache` or `VfatInode.d`. A single entry read
+or written outside it (a chain walk, `fat_ent_link` linking a new
+cluster, `fat_free` writing a new end; Linux fat_ent_read /
+fat_ent_write) changes only its own inode's chain, which that inode's
+`i_rwsem` keeps; an entry's four bytes are copied in and out of the
+pinned buffer, so writers of other entries of the block never clobber
+it.
 
 **vfat entry location lock** (`fs/vfat/mod.rs`, Linux
-sbi->inode_hash_lock over i_pos): `VfatSbData.ipos` (sleeping
-`sync::Mutex<()>`), one per filesystem, thread context only (never in
-IRQ context). Every inode's `VfatInodeData.i_pos` (its short entry's
-disk offset, 0 for none) changes under it (`attach`, Linux fat_attach;
-`fat_detach`, i_pos 0 before rename reuses a replaced object's slot),
-and an entry is read, patched and written under it (`write_inode_sb`,
-Linux __fat_write_inode; rename's `write_entry`), so a write never
-lands on a slot its inode no longer owns. Every other change of a
-directory's slots is under it too: a new entry's slots written
-(`fat_add_entries`, after any cluster for them is allocated; on a
-dirsync mount they are synced with it released, and on failure marked
-deleted again under it), and an entry's removal (`fat_remove_entries`,
-synced likewise after the hold), whose unlink/rmdir detach of the cached inode
-(i_pos 0, Linux fat_detach) is in the same hold, so no write-back of
-an inode (an atime update of an open file, no `i_rwsem`) puts back a
-deleted entry. That inode is looked up before the lock: the lookup may
-wait for an inode being freed, whose write-back takes `ipos`. Linux
-patches the cached buffer under its spin lock and rechecks i_pos;
-here the patch is block I/O, so the lock sleeps and is held across
-it. Order: directory and inode `i_rwsem` -> `ipos` -> `VfatInode.d`
-(spin leaf), the device's page cache and I/O; never with
-`VfatSbData.fat`; no inode reference is put under it.
+sbi->inode_hash_lock over i_pos): `VfatSbData.ipos` (spin `Mutex<()>`
+leaf but for `Inode.private` and `VfatInode.d` taken to copy an
+inode's data), one per filesystem, thread context only. Every inode's
+`VfatInodeData.i_pos` (its short entry's disk offset, 0 for none)
+changes under it (`attach`, Linux fat_attach; `fat_detach`, i_pos 0:
+an unlink's after its entry is removed, a replaced object's before
+rename reuses its slot). An entry is patched under it in its block's
+buffer, read (bread) and pinned before it is taken and marked dirty
+after it is dropped: `fat_write_inode` (Linux __fat_write_inode,
+which rechecks under it that i_pos is still the one whose block it
+read, else reads again, and marks the inode I_METADATA_WRITEBACK under
+its `i_lock` after) and rename's `write_entry`, so a write never lands
+on a slot its inode no longer owns. Only the entry's fields past the
+name are written, so a removal's deleted mark (`fat_remove_entries`,
+under the directory's `i_rwsem`, no `ipos`, as Linux) is never put
+back; a slot is reused only under that `i_rwsem`, after the detach.
+Order: `i_rwsem` -> page and buffer locks (the bread) -> `ipos` ->
+`Inode.private` -> `VfatInode.d`; nothing sleeps under it; never with
+`VfatSbData.fat`.
+
+**vfat superblock data** (`fs/vfat/mod.rs`, Linux msdos_sb_info in
+s_fs_info): `VfatSbData` is the superblock's `s_fs_info` (Superblock
+lists below), set by the fill before it makes any inode and released
+by put_super (`fat_put_data`, Linux fat_put_super: iput of the FAT's
+inode, evicted while the data is there, then call_rcu of the rest:
+`kill_fs_info_rcu`, kept with the superblock's memory if an inode is
+busy, which the shutdown then poisons), or by a fill that fails after
+setting it (Linux out_fail: the same, every inode it made put, none
+reachable but by it), in thread context. So an
+operation reaches the data from its inode with no reference or lock
+(`msdos_sb_of`, Linux MSDOS_SB(inode->i_sb): `SuperBlock::fs_info_ref`,
+through `Inode::superblock`, which panics on a poisoned inode), as
+statfs does through its mount's active reference. `VfatSbData.fat_inode`
+(`FatInode`, Linux sbi->fat_inode) holds one reference from the fill
+to put_super, borrowed with no lock taken: the FAT's blocks are put on
+its metadata list.
+
+**vfat directory blocks** (`fs/vfat/mod.rs`, Linux fs/fat/dir.c): a
+directory is walked block by block in the device's buffers
+(`dir_walk`, Linux fat_get_entry: bread, each cluster read ahead) and
+its slots changed in them, under its `i_rwsem` (a rename's: both
+directories'); a changed block goes on that directory's metadata list
+(`VfatInodeRcu.i_metadata_bhs`, Linux i_metadata_bhs, which its
+->sync_inode_metadata and eviction write; `MappingMetadataBhs.lock`,
+a spin leaf), a moved directory's ".." block on the moved one's. The
+list is in the inode's RCU data (`Inode::private_rcu`), dropped a
+grace period after the eviction emptied it (Linux frees the inode by
+RCU), so its drop need not wait one (`rcu_passed`); a completion's
+write error reaches only the directory mapping's `wb_err`, in that
+memory still. A
+dirsync change writes and waits for exactly the buffers it changed
+(sync_dirty_buffer, fat_sync_bhs: buffer lock, no other lock held),
+where Linux does.
 
 **vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
 `VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in
 thread context only, never held with `VfatInode.d` and never across
 the FAT reads. It holds the cached runs, their id (Linux
 cache_valid_id) and the chain's first cluster, a copy of
-`VfatInodeData.start_cluster` that `set_inode_data` updates after the
-data. A walk (`read_folio`/`writepage`/`swap_rw` under a page lock,
-direct I/O, the write and truncate paths under `i_rwsem`) takes, in
+`VfatInodeData.start_cluster` that `set_start` updates after the
+data. A walk (fat_get_block under a page lock: reads, writeback,
+->write_begin; direct I/O, ->bmap at swapon, the write and truncate
+paths under `i_rwsem`) takes, in
 one hold, the first cluster, the id and its starting run, so the three
 always belong to one chain; it reads the FAT through the device cache
 with no lock held, then caches its run only if the id is unchanged. A
 new first cluster invalidates the cache (bumping the id); a cut that
-keeps the first cluster (`free_past`, under `i_rwsem`) invalidates it
+keeps the first cluster (`fat_free`, under `i_rwsem`) invalidates it
 before touching the FAT and again once the new end is written, before
 the tail is freed: a walk that began before the second invalidation
 caches nothing, and one that begins after it stops at the new end, so
 no cached run can name a freed cluster. Walks that use what they find
 for I/O and can race a cut: writes, truncate and direct I/O are
 excluded by `i_rwsem`; page-cache reads past a shrinking end are the
-pages truncate drops first (`truncate_setsize` before `free_past`).
+pages truncate drops first (`truncate_setsize` before `fat_free`),
+which discards their mapped buffers (block_invalidate_folio), so no
+buffer names a freed cluster.
+
+**vfat mmu_private** (`VfatInode.mmu_private`, Linux mmu_private):
+the bytes allocated and initialized, changed only under the inode's
+`i_rwsem` (cont_write_begin's zeroing and fat_get_block's allocation
+from ->write_begin, truncate, a failed write) and read under it (the
+direct I/O checks; fat_bmap with `create`, which only the write paths
+pass for blocks past the size), or by the eviction, which nothing
+else reaches (fat_free_eofblocks). An atomic only so the shared inode
+can hold it; `i_rwsem` orders every access.
 
 **Dentry** (`fs/dentry.rs`):
 
@@ -3300,10 +3581,33 @@ the SB_DEAD wakeup's `var_waitqueue` lock) guards `super_blocks`
 are `util::list::WeakList`s: a `Weak` per superblock, linked by `sget`
 and unlinked by its last passive put (`Drop for SuperBlock`, Linux
 put_super), so the lists allocate nothing under the lock (only a new
-superblock's anonymous device number may, GFP_ATOMIC, below). A superblock has two counts, as in
+superblock's anonymous device number may, GFP_ATOMIC, below). A
+filesystem's data (`SuperBlock.s_fs_info`, Linux s_fs_info, an
+`RcuOnceArc`) is set once by its fill or sget's set and released, as
+Linux, by its ->put_super (tmpfs; vfat by `kill_fs_info_rcu`, unless an
+inode is busy: every other inode evicted) or
+->kill_sb (procfs, sysfs, cgroup2, tracefs after kill_anon_super, every
+inode evicted; ramfs before it, its inodes live, as Linux
+ramfs_kill_sb: it sets none) or a fill that fails after setting it, in
+thread context (`kill_fs_info`: out of the cell, a grace period
+(synchronize_rcu), then the reference dropped there; Linux frees it
+by kfree_rcu / call_rcu, but here the data's drop may sleep: an
+inode's put, a pid namespace's), never with the superblock's memory,
+whose drop may come in any context (only a superblock never listed,
+sget's set having failed, still holds it then, dropped in sget's
+thread context, or one whose shutdown left a busy, poisoned inode,
+whose data put_super kept: vfat, whose data's drop does not
+sleep). Readers borrow it under an RCU guard (`fs_info_rcu`:
+sget's tests, short reads) or take a reference (`fs_info`), dropped
+in thread context; once released it reads as None. A superblock has two counts, as in
 Linux: active references (`SbActive`, `SuperBlock.s_active`, Linux
 s_active; never raised from zero) and passive ones (the `Arc`, Linux
-s_passive). Its life's flags in `s_flags` (Linux SB_BORN: set when its
+s_passive; every inode holds one, `Inode.sb`, dropped at its teardown
+in thread context). What is freed by an RCU callback (`rcuc/N`,
+preemption off) names its superblock by a `Weak` instead, memory only
+(`Dentry.sb`, d_free; a vfat metadata list's, i_callback): a last
+passive put there would run `Drop for SuperBlock`, whose block
+device's last put puts its inode (sleeps). Its life's flags in `s_flags` (Linux SB_BORN: set when its
 mount returns, `vfs_get_tree`; SB_DYING: set by the shutdown under
 s_umount; SB_DEAD: set under `SB_LOCK` after kill_sb) are waited for on
 `sync::waitqueue::var_waitqueue` (Linux wait_var_event); SB_DEAD's
@@ -3314,9 +3618,11 @@ releases it, waits for SB_BORN or SB_DYING and takes s_umount for
 reading unless it is dying (Linux super_lock_shared), runs its
 callback (which may sleep), and drops the previous reference with the
 lock released. `sget` (Linux sget_fc) runs its test under it, on
-superblocks not yet dead (sysfs: `SuperBlock.private`, a spin RwLock
-read, and a new superblock's `set`, which stores its identity:
-`SuperBlock.private` written, and an anonymous device number taken
+superblocks not yet dead (sysfs, cgroup2: `SuperBlock.s_fs_info`
+borrowed under an RCU guard), and a new superblock's `set`, which
+stores its identity: `s_fs_info` set (an atomic exchange; its
+wrapper allocated before), and
+an anonymous device number taken
 from `UNNAMED_DEV_IDA` (Linux get_anon_bdev under sb_lock: the
 `util::ida::Ida` IrqSpinlock leaf, its bitmap grown GFP_ATOMIC; freed
 by kill_anon_super after SB_DEAD, any context) — the only other locks
@@ -3374,7 +3680,11 @@ class), replaced by a mount or remount and read by show_options; the
 owner an inode takes from the root (Linux set_tracefs_inode_owner) is
 written with no lock, by permission (an RCU walk's too) and getattr,
 from the root's ids and the inode's PERM_SET flags (atomics, as Linux
-writes i_uid there); a uid=/gid= remount walks the superblock's inodes
+writes i_uid there), the root's inode borrowed with no reference under
+`SuperBlock.root` (a spin RwLock leaf: written only by the fill's
+`set_root` and the shutdown's take) and an RCU guard (Linux
+ti->private, a plain pointer: no inode holds another, so none is put
+from an inode's RCU-freed data); a uid=/gid= remount walks the superblock's inodes
 (`for_each_sb_inode`, Linux the tracefs_inodes RCU list) setting them.
 
 #### kernfs / sysfs (fs/kernfs/, fs/kernfs/sysfs.rs; Linux fs/kernfs)
@@ -3387,7 +3697,7 @@ writes i_uid there); a uid=/gid= remount walks the superblock's inodes
 | `KNode.iattr` | spin Mutex, leaf (Linux kernfs_iattr_rwsem) | written by chmod/chown/utimes under the inode's i_rwsem; read (copied out) when lookup builds an inode, under the parent's i_rwsem |
 | `AttrNode.ops`, `BinNode.ops` | spin RwLock, leaf | read (clone) under an active reference by show()/store(); cleared by `KNode::remove` after the drain, with no lock held, the operations dropped after it is released (a removed node kept by a dentry or open file pins nothing) |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks, and across a read's copy to the caller (may fault: -> mmap_lock; no active reference held then, Linux seq_read_iter under m->lock); a write copies its data in before taking it; under f_pos_lock for read/write |
-| `SB_LOCK` (sget) | spin Mutex (under it only `SuperBlock.private` read by a test or written by a set, `UNNAMED_DEV_IDA` (IrqSpinlock leaf, its bitmap grown GFP_ATOMIC), and the SB_DEAD wakeup's `var_waitqueue` lock) | a network namespace's sysfs superblock, and the default cgroup hierarchy's cgroup2 one (cgroupfs `CgSuper`, shared by every cgroup2 mount), is found in its type's `fs_supers` by `sget` (Linux kernfs_get_tree: kernfs_test_super on the kernfs root and namespace), its test reading `SuperBlock.private` under the lock; the match is then taken by `grab_super` with the lock released |
+| `SB_LOCK` (sget) | spin Mutex (under it only `SuperBlock.s_fs_info` read by a test (RCU guard) or set by a set (an atomic exchange), `UNNAMED_DEV_IDA` (IrqSpinlock leaf, its bitmap grown GFP_ATOMIC), and the SB_DEAD wakeup's `var_waitqueue` lock) | a network namespace's sysfs superblock, and the default cgroup hierarchy's cgroup2 one (cgroupfs `CgSuper`, shared by every cgroup2 mount), is found in its type's `fs_supers` by `sget` (Linux kernfs_get_tree: kernfs_test_super on the kernfs root and namespace), its test reading `SuperBlock.s_fs_info` under the lock; the match is then taken by `grab_super` with the lock released |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
 guards the device's "dead" flag, set first by `del` (a dead device is
@@ -4469,6 +4779,15 @@ so it never wakes readers itself: it sets `WAKE_PENDING`, and the
 scheduler tick (no locks held) wakes them (Linux defers the klogd
 wakeup through irq_work).
 
+**Rate limits** (`util/ratelimit.rs`, Linux lib/ratelimit.c): a
+`RatelimitState` (a caller's static: `buffer_io_error`,
+`__find_get_block_slow`'s report) keeps its interval's start under an
+`IrqSpinlock` leaf, any context (bio completions call it in hardirq),
+only tried: a caller that finds it held decides from the burst left
+(an atomic, as Linux's rs_n_left) without it. The suppressed-count
+report is printed after the lock is dropped (Linux printk_deferred
+under it), so OUTPUT_LOCK never nests under it.
+
 **Why IRQ-Safe:**
 
 All three locks use `IrqSpinlock` because printk can be called from:
@@ -5323,7 +5642,7 @@ keep: no access ever reaches an unmapped register.
 #### Block Device Subsystem
 
 **Location:** `block/` (`blkdev.rs`, `blk_mq.rs`, `dio.rs`, `genhd.rs`,
-`part/`), `hw/virtio/blk.rs`, `fs/blkdev_ops.rs`, `fs/ramfs/devtmpfs.rs`,
+`part/`), `hw/virtio/blk.rs`, `fs/pageio/blkdev_ops.rs`, `fs/ramfs/devtmpfs.rs`,
 `sync/completion.rs`
 
 Linux model (block/bio.c, blk-mq.c, genhd.c): a bio is submitted from
@@ -5333,8 +5652,9 @@ thread context, the driver completes it from its interrupt handler and
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
-| `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain) and the disk's `part_tbl` (its block devices by partition number, one slot per minor, each a reference; Linux disk->part_tbl), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) and soft block size (BLKBSZSET) change only under it: block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev_file`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `INODE_HASH_LOCK` (`bdev_add` hashes a device's inode, `bdev_del` unhashes it), `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
+| `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain) and the disk's `part_tbl` (its block devices by partition number, one slot per minor, each a reference; Linux disk->part_tbl), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) changes only under it, as does the soft block size's initial value at the first open (Linux set_init_blocksize; BLKBSZSET changes it under the bdev inode's `i_rwsem`, Rules): block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev_file`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `INODE_HASH_LOCK` (`bdev_add` hashes a device's inode, `bdev_del` unhashes it), `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `MAJORS` | sleeping `sync::Mutex` (block majors, register_blkdev; Linux major_names_lock) | thread only | leaf |
+| `BDEV_LOCK` (`block/claim.rs`; Linux bdev_lock) | sleeping `sync::Mutex<BdevLock>` | thread only | leaf: every disk's exclusive claims (`Disk.claims`: each device's holder and count, Linux bd_holder, bd_holders; the claim in progress, Linux whole->bd_claiming). A claim is prepared under it alone, before `open_mutex` (`claim::prepare`: EBUSY if another holder has the device; a claim in progress on the disk is waited for on its `var_waitqueue`, queued under it, slept with it dropped), then finished or ended under `open_mutex` (`claim::finish` at open, `claim::end` at release: open_mutex -> it) or abandoned alone (`claim::abort`). Holders: a mounted superblock (`get_tree_bdev`), a file opened O_EXCL, active swap, BLKBSZSET's and BLKRRPART's claims for the call |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) and hardirq (a FUA write's post-flush, sent from the write's completion after the hardware queue lock is dropped) | leaf: never taken with the hardware queue lock held; in the ISR it nests under the line's `IrqDesc.lock` (IrqDesc.lock -> ctx lock; nothing allocates under it: the flush is preallocated with its post-flush queue, and the completions free bios and the `FlushSeq` to the heap under `IrqDesc.lock` only, outside every queue lock); its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
 | Post-flush queue (`RequestQueue.fqs[h]`, `block/blkdev.rs`, one per hardware queue; Linux blk_flush_queue->mq_flush_lock) | `IrqSpinlock` | thread (a FUA write's submission) and hardirq (its data's and the shared flush's completions) | leaf: writes waiting for a flush, the writes the flush in flight serves, the FUA data in flight and the preallocated flush; the flush is sent and the writes are ended after it is dropped |
 | blk-mq requests taken (`BlkMq.rqs[h]`, Linux tags in use) | `AtomicUsize` per hardware queue, lock-free (as Linux's sbitmap) | thread (`get_rq` at submission or plug time) and hardirq (completion, failed dispatch) | counts requests from `get_rq` to their end, wherever they are (software queue, parked for kblockd, dispatch list, driver); a NOWAIT bio takes one only below the driver's depth (compare-and-swap), else ends with EAGAIN; the dispatch itself stays under the hardware queue lock. With `BlkMq.dying` (set once by `start_drain`) the end that brings a count to 0 wakes `drained` (Linux q_usage_counter) |
@@ -5362,7 +5682,7 @@ Rules:
   open files still hold. sync(2) (`sync_bdevs`), meminfo's Buffers
   (`nr_blockdev_pages`), reclaim and /proc/partitions walk the bdev
   superblock's `s_inodes` (`for_each_sb_inode`: one inode per
-  `INODE_SB_LIST_LOCK` hold, the work done with no lock);
+  hold of its lock, the work done with no lock);
   /proc/partitions gathers references that way and sorts and formats
   them with no lock held. No global map of devices.
 - **Disk removal (`del_gendisk`, Linux):** under `open_mutex` every
@@ -5406,14 +5726,16 @@ Rules:
   lock to unmap, then i_pages; Linux invalidate_inode_pages2_range).
 - **vfat direct I/O (`fs/vfat/direct.rs`, Linux fat_direct_IO over
   __blockdev_direct_IO with DIO_LOCKING):** the same bios and
-  `DioWait` (`dio::direct_io_map`, through the file's disk extents),
+  `DioWait` (`dio::direct_io_map`, through the disk extents
+  fat_get_block maps, Linux get_more_blocks),
   under the file's `i_rwsem` held exclusive. A write runs under the
   one `File::write_iter` holds for the whole call (invalidation, bios,
   wait, size update, the buffered rest), as Linux
   generic_file_write_iter. A read takes it itself after writing the
   cache back unlocked (Linux kiocb_write_and_wait), and holds it over
-  the end-of-file check, a second write-back, the chain walk
-  (`VfatInode.cache`) and the pinning and submission of every bio
+  the end-of-file check, a second write-back, the mapping
+  (fat_get_block: `VfatInode.cache`, FAT reads) and the pinning and
+  submission of every bio
   (plugged), dropping it after the plug is flushed and before the
   wait (`direct_io_map`'s `unlock`); a buffered rest is read unlocked.
   Order: `i_rwsem` -> page lock -> i_pages (write-back,
@@ -5454,11 +5776,28 @@ Rules:
   accounting); a remount reconfigures it under its `s_umount` held
   for writing, like any tmpfs.
 - **Block device page cache (`BlockDevice.bd_inode`, Linux
-  bd_mapping):** device-file I/O and vfat metadata go through it (3.2
-  Per-inode page cache); pages are read and written synchronously
-  under their page lock, never under a spinlock. The last opener's
-  release writes it back and drops it under `open_mutex` (Linux
-  blkdev_flush_mapping): open_mutex -> page lock -> i_pages.
+  bd_mapping):** device-file I/O and vfat metadata go through it, in
+  buffer heads (3.2 Per-inode page cache, Buffer heads); pages are
+  read and written synchronously under their page lock, never under a
+  spinlock. The last opener's release writes it back and drops it
+  under `open_mutex` (Linux blkdev_flush_mapping: sync_blockdev,
+  kill_bdev, which empties the per-CPU buffer LRUs first): open_mutex
+  -> page lock -> buffer lock, i_private_lock -> i_pages.
+- **Soft block size (the bdev inode's `Inode.i_blkbits`, Linux
+  i_blkbits; BLKBSZGET):** set at the first open under `open_mutex`
+  (Linux set_init_blocksize) and changed by `set_blocksize` only for a
+  caller holding the device's exclusive claim (BLKBSZSET: an O_EXCL
+  file's or one taken for the call; a device filesystem's mount through
+  `sb_set_blocksize`, its superblock's: under its `s_umount`), so no
+  mounted filesystem's buffers change size under it, under the bdev inode's `i_rwsem` held for writing, across
+  the cache's write-back and drop (sync_blockdev, kill_bdev), with the
+  mapping's `invalidate_lock` held for writing inside it (a fault or
+  read filling a page waits): `s_umount` -> bdev `i_rwsem` ->
+  invalidate_lock -> page lock. Buffered reads and writes of the
+  device file hold that `i_rwsem` shared (Linux blkdev_read_iter,
+  blkdev_write_iter), across their user copies: bdev `i_rwsem` ->
+  mmap_lock; direct I/O and filesystem metadata take none. Read
+  lock-free elsewhere (READ_ONCE).
 
 #### Network Subsystem
 
@@ -5542,6 +5881,7 @@ not rely on either.
 | `UnixCb.fp` (a queued message's files) | `spin::Mutex` | thread only | leaf (`queue` charges the files in flight under the receiver's `st` and `fp`: an atomic of the sender's ucounts, Linux user->unix_inflight); changed only by the `iolock` holder: the reader takes the files, a peek takes them out, copies them unlocked (Linux unix_peek_fds) and puts them back |
 | `UnixTable.buckets` (per netns, 2 x 256), `unix::BSD` (global, 256, by inode number) | `spin::Mutex` per bucket (Linux unx.table.locks, bsd_socket_locks; one lockdep class each) | thread only | sockets linked through `UnixSock.node` / `bind_node` and held weakly (WeakList: a socket leaves at release, or first thing in its drop): unbound and path-bound ones in the lower half, abstract names (hashed with the type) in the upper; after `bindlock`; a bind makes its address before any lock, then takes the old and new buckets in index order (Linux unix_table_double_lock) and publishes `UnixSock.addr` under them (bucket -> `addr`), then the `BSD` bucket alone; lookups upgrade under the bucket and drop the `Arc` after it; /proc/net/unix formats each bucket under its lock into a `SeqBuf`. Nothing is allocated under them, no socket lock is taken under them |
 | `UnixSock.addr`, `UnixSock.peercred` | `spin::RwLock` / `spin::Mutex` | thread only | leaves (Linux u->addr, sk_peer_lock) |
+| `UnixSock.path` | `spin::Mutex` | thread only | leaf (Linux u->path: the bound socket inode's dentry with its mount, so umount of a filesystem with a bound socket is EBUSY, as Linux): set by a path bind after `bindlock`'s check, before the `BSD` insert; read under a `BSD` bucket (`find_bsd` compares its inode); copied to an accepted socket under `UnixSock.st` (the listener's copied out first: never two `path` locks nested); taken by the release under `UnixSock.st` after `unhash_bsd` (Linux unix_release_sock: under unix_state_lock, with sock_orphan) and put with nothing held, last (path_put) |
 | `UnixSock.relay` | `spin::Mutex<()>` | thread only | Linux peer_wait.lock's part in peer_wake: a datagram sender (poll, or a non-blocking send) whose peer's queue is full links its own embedded `peer_wake` entry on the peer's `peer_wait` under it, holding its own `st` so the peer stays its peer while linked (Linux unix_dgram_poll under unix_state_lock); order `st` -> `relay` -> `peer_wait` head; the sender's `peer_wake_to` atomic is set under it. Nothing is allocated |
 | `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake` | atomics | thread only | |
 | `NetDevice.ops` | `spin::RwLock<Option<Arc<dyn NetDeviceOps>>>` | thread only | the driver while registered (Linux reg_state + netdev_ops); written once, under RTNL, by `rtnl::unregister_netdevice` (`detach_ops`: None = unregistered). Read-held across the driver's `xmit` (after the lock-free IFF_UP check, so a closed device's senders do not take it), so the write waits for transmits in flight (Linux synchronize_net after dev_deactivate); RTNL-side callbacks (open, stop, set_promisc) clone the `Arc` out, since they may sleep, and RTNL orders them with the detach. Under it: the driver's TX lock, `Softnet.backlog` (lo). Also read under `NeighTable.lock` (`is_gone`: no neighbour is created for an unregistered device after its flush) |
@@ -5586,9 +5926,9 @@ NetNamespace tables (RwLocks; lookups drop the guard before returning);
    Sock.errq, RxQueue.q: leaves, never held while transmitting)
   -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
   (AF_UNIX: UnixSock.bindlock (sleeping) -> UnixTable buckets / BSD bucket
-   -> UnixSock.addr; UnixSock.iolock (sleeping) -> UnixSock.st (listener
+   -> UnixSock.addr / path; UnixSock.iolock (sleeping) -> UnixSock.st (listener
    before connector, else by address) -> UnixSock.rq / peercred / addr /
-   UnixCb.fp; UnixSock.st -> peer's UnixSock.relay ->
+   path / UnixCb.fp; UnixSock.st -> peer's UnixSock.relay ->
    peer_wait head -> Sock.wq head)
   (NlSock.dump -> RCU walks of devices, addresses, FIB, neighbours
    -> NlSock.rxq: dump parts)
@@ -5766,7 +6106,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `EPNESTED` (sleeping) → `Eventpoll.mtx` (sleeping) → `EpItem.regs` (spin) → file wait queue heads → `Eventpoll.lock` (IrqSpinlock); `File.f_ep` (spin leaf) | io/epoll.rs | see column 1 | epoll (Linux epnested_mutex, ep->mtx, ep->lock, file->f_lock): `EPNESTED` serializes an epoll target's loop check and insert. `Eventpoll.mtx` (Linux ep->mtx) holds the item map (Linux ep->rbr) and, as Linux, is held across each epoll_ctl operation (an add polls the target with it held, registering), each scan of the ready list (epoll_wait's `send_events`, Linux ep_send_events, with its items' polls and copies to user; the epoll file's own poll, Linux __ep_eventpoll_poll) and each item's removal (EPOLL_CTL_DEL, and a watched file's release: `eventpoll_release` takes each watching epoll's `mtx` in turn), so one scan at a time looks at the ready list. An epoll watched by another is polled with the outer one's `mtx` held and takes its own inside (Linux mutex_lock_nested by depth; hk lockdep does not check nesting within a class): the loop check under `EPNESTED` keeps the nesting acyclic and at most EP_MAX_NESTS deep. A file's last `FileRef` dropped under it only queues the release (`fput`), whose `eventpoll_release` takes it later. An item keeps its file's address only (Linux epi->ffd.file). To poll an item's file, epoll takes a reference with `FileRef::try_get` (`EpItem::fget`, Linux epi_fget), always under `mtx`: an item a holder sees is still in the map, so its file's release has not passed this epoll's `eventpoll_release` and the file is not freed. An epoll's drop (no `mtx` is needed: nothing else reaches it) takes each item off its file's `f_ep` under an RCU read guard (`f_ep_off`): a linked item's file has not finished its release, so its memory stays a file object for the guard (type-stable file cache), and a count taken there (or none: the release unlinks the item) lets it lock `f_ep`. `Eventpoll.file` (Linux ep->file) is set before the epoll is reachable and cleared by the epoll file's release under `EPNESTED`, which the loop check holds while it reads it. `EpItem.regs` holds an item's callback entries: an add polls the file (a poll method may sleep) into a local list and swaps it into `regs` after; unregistering takes the watched file's queue locks under it, before the item leaves the map and ready list, so no callback can queue it again. `Eventpoll.lock` (Linux ep->lock) holds the ready list (`EpItem.rdlink`): `ep_poll_callback` runs under a woken queue's lock (possibly in an interrupt), queues the item under it, then wakes the epoll's own queues after releasing it (a nested epoll's callback in turn: bounded by EP_MAX_NESTS, no cycles). A scan takes the items queued when it starts off the front one at a time (Linux ep_start_scan) and polls each with the lock released; an event meanwhile queues one again at the end (Linux's ovflist), a level-triggered one reported goes back at the end, one whose copy-out failed back in front, and waiters are woken after if any is ready (ep_done_scan). Nothing sleeps, allocates, polls, copies to user or drops a last `Arc<EpItem>` under `Eventpoll.lock`. `File.f_ep` (Linux file->f_ep under file->f_lock) lists the items watching the file through `EpItem.fllink`, holding a reference each (no allocation): an add links the item, EPOLL_CTL_DEL and an epoll's drop unlink it if still linked (an item's link is only ever on its own file's list), the file's release takes them off one at a time under it; the loop check counts an epoll file's watchers under it, sizes its vector with it released and fills it under it (no add meanwhile: `EPNESTED`). |
 | `Inotify.fasync` | io/inotify.rs | `FasyncList` (RCU, see `Fasync.fa`) | the group's O_ASYNC files (Linux fsnotify group fsn_fa); queueing an event sends their SIGIO after `Inotify.inner` is dropped |
 | `Inotify.mark_mutex`; `Inode.fsnotify` (`Marks.list`) | io/inotify.rs | sleeping `sync::Mutex`; spin leaf | `mark_mutex` (Linux group->mark_mutex) serializes a group's adds and is taken before every other inotify lock. `Marks.list` holds the watches on an inode (Linux i_fsnotify_marks: group and wd); it grows with the lock released (`push_if`, `kmem::grow_locked`: nothing allocates under it). The superblock's shutdown finds its watched inodes by walking `s_inodes` (`for_each_sb_inode`, Linux fsnotify_unmount_inodes' s_inodes walk): a watch holds its inode, so every watched one is live and listed. An add holds the watched path (mount and dentry) throughout, so neither the superblock's shutdown nor the dentry's release of the inode can run meanwhile: it puts the mark on the inode, then under `Inotify.inner` (order `Inotify.inner` -> `Marks.list`, the only nesting) inserts the watch only if the mark is still there; a failure undoes the charge before anything is published. rm_watch and a group's drop remove the watch under `Inotify.inner`, then the mark. Removal of an inode's watches (Linux fsnotify_inoderemove: a dentry letting go of an inode with no name left, in `d_delete` after its locks or in a dentry's final drop, never under a d_lock (Linux dentry_unlink_inode); fsnotify_sb_delete: the superblock's shutdown under s_umount, the
-list taken whole under its lock) takes the marks out under `Marks.list`, releases it, then per group takes `Inotify.inner` and checks the wd still names that inode before queueing IN_DELETE_SELF/IN_UNMOUNT and IN_IGNORED; only the remover that finds the watch uncharges it. The group's watch table (wd -> watch, Linux's idr under idr_lock) stays under `Inotify.inner`, a sorted vector: an add makes room for one more under `mark_mutex` before taking `Inotify.inner` (`kmem::grow_locked`, Linux idr_preload; only adds insert, so the room stays), and removals free nothing under it. Nothing there sleeps: each event is allocated before `Inotify.inner` is taken (Linux allocates in inotify_handle_inode_event, then fsnotify_insert_event takes notification_lock; no memory: IN_Q_OVERFLOW takes its place, a queue position that allocates nothing, Linux's preallocated overflow_event), an unqueued or read event is freed after the lock, the wakeup is allowed under any lock and SIGIO is sent with `kill_fasync` once `Inotify.inner` is dropped (Linux fsnotify_insert_event). A watch never counts toward a mount being busy |
+list taken whole under its lock) takes the marks out under `Marks.list`, releases it, then per group takes `Inotify.inner` and checks the wd still names that inode before queueing IN_DELETE_SELF/IN_UNMOUNT and IN_IGNORED; only the remover that finds the watch uncharges it. A watch's inode reference is counted on its superblock (`WatchedInode`, `SuperBlock.s_fsnotify_watched`, Linux fsnotify_get_inode_ref / fsnotify_put_inode_ref): the put comes first, then the count's decrement, the last waking its `var_waitqueue`; the shutdown, after its walk, sleeps there (under s_umount for writing, nothing else held) until the count is zero (Linux fsnotify_sb_delete's wait_var_event), so a watch rm_watch or a group's drop took out before the walk puts its inode before the dentry tree goes, never during or after the shutdown. The group's watch table (wd -> watch, Linux's idr under idr_lock) stays under `Inotify.inner`, a sorted vector: an add makes room for one more under `mark_mutex` before taking `Inotify.inner` (`kmem::grow_locked`, Linux idr_preload; only adds insert, so the room stays), and removals free nothing under it. Nothing there sleeps: each event is allocated before `Inotify.inner` is taken (Linux allocates in inotify_handle_inode_event, then fsnotify_insert_event takes notification_lock; no memory: IN_Q_OVERFLOW takes its place, a queue position that allocates nothing, Linux's preallocated overflow_event), an unqueued or read event is freed after the lock, the wakeup is allowed under any lock and SIGIO is sent with `kill_fasync` once `Inotify.inner` is dropped (Linux fsnotify_insert_event). A watch never counts toward a mount being busy |
 | `USER_WATCHES` | io/inotify.rs | spin leaf | each user's inotify watches against fs.inotify.max_user_watches (Linux UCOUNT_INOTIFY_WATCHES ucounts), a vector of (uid, count) that grows with the lock released (`push_if`; Linux alloc_ucounts allocates before ucounts_lock): a new watch is charged before `Inotify.inner` is taken and a removed one returned after it is released (never nested in it; returning frees nothing); the limit itself (`MAX_USER_WATCHES`) is a sysctl atomic read lock-free |
 | `Fanotify.mark_mutex` → `Fanotify.inner` | io/fanotify.rs | sleeping `sync::Mutex`; IrqSpinlock leaf | a fanotify group's marks (Linux group->mark_mutex): fanotify_mark adds, removes and flushes them under it (allocating there); never nested with `Fanotify.inner`, the event queue (Linux notification_lock): an event is allocated before it is taken (Linux fanotify_alloc_event, then fsnotify_insert_event; no memory or a full queue: FAN_Q_OVERFLOW, a queue position that allocates nothing) and freed after it is released |
 | `Eventfd.inner`, `Inotify.inner`, `Fanotify.inner`, `Signalfd.inner`, `Timerfd.inner` | io/eventfd.rs, io/inotify.rs, io/fanotify.rs, io/signalfd.rs, time/timerfd.rs | IrqSpinlock | per-object state of the anon-inode files (inotify: watch table and event queue; fanotify: event queue; both queues are `io/fsnotify.rs` `NotifQueue`, Linux fs/notify/notification.c: insert, remove_first, the overflow event as a queue position, max_events); their wait queues are woken after unlocking. An inotify watch holds its inode (`InodeRef`, matched by identity, Linux's mark pinning the inode); a removed watch's inode is released after `Inotify.inner` is dropped. eventfd, inotify and fanotify readers wait with it held (`wait_event_interruptible_locked`: inner -> wait queue head while queueing, released while asleep) |
@@ -5788,7 +6128,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock; a POSIX owner is a descriptor table's id; nothing allocates for a POSIX change under it: room for the two locks one change can add is reserved before it is taken, Linux posix_lock_inode's new_fl/new_fl2, and splits, inserts and merges are done in place; a flock change likewise reserves room for one more shared holder, Linux flock_lock_inode's new_fl),  leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK). A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves; `locks::BLOCKED` (Linux blocked_hash) is an rbtree whose node the waiter allocates before taking it and frees after it |
 | `cmdline::SAVED` | cmdline.rs | `spin::Once` | the saved kernel command line (Linux saved_command_line): set once while parsing, before SMP; read lock-free (init's arguments, /proc/cmdline) |
 | `FILE_SYSTEMS`, `SB_LOCK` | fs/superblock.rs | spin RwLock, spin Mutex | the registered filesystem types (Linux file_systems_lock) and the superblock lists (Linux sb_lock); 3.3 Superblock lists |
-| `INODE_SB_LIST_LOCK` | fs/inode.rs | spin Mutex | every superblock's `s_inodes` (Linux inode_sb_list_lock); 3.3 Superblock inode lists |
+| `SuperBlock.s_inodes` | fs/inode.rs, fs/superblock.rs | spin Mutex (per superblock) | the superblock's inodes (Linux s_inodes under s_inode_list_lock); 3.3 Superblock inode lists |
 | `INODE_HASH_LOCK` | fs/icache.rs | spin Mutex | the inode cache's buckets (Linux inode_hash_lock); 3.3 Inode cache: under it `Inode.private` -> `VfatInode.d` (vfat's `test`) |
 | `CHARDEV_REGISTRY` | fs/chardev.rs | sleeping `sync::RwSem` (Linux chrdevs_lock, cdev_map->lock: mutexes) | character device registry: registered at probe, looked up at open and mmap (under mmap_lock); never under a spin lock |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf but for `FASYNC_LOCK` under it (O_ASYNC is set or cleared only with the file's fasync entry, Linux fasync_insert_entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |
@@ -5810,11 +6150,11 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
 | `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `Inode.i_flags` | fs/inode.rs | atomic word (fetch_or / fetch_and: bits of different writers share it, Linux inode_set_flags' cmpxchg) | S_DEAD (set by rmdir or a replacing rename under the directory's `i_rwsem`), S_SWAPFILE (set and cleared by swapon/swapoff), I_LINKABLE (an O_TMPFILE file not opened O_EXCL may get its first name, Linux i_state under i_lock: set before the file is reachable, tested and cleared by linkat under the inode's `i_rwsem`, `link_locked`); read lock-free |
-| `Inode.i_writecount`, `Inode.i_flags` S_SWAPFILE | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
-under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
+| `Inode.i_writecount`, `Inode.i_flags` S_SWAPFILE | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: tested, set and cleared by swapon/swapoff
+under its i_rwsem, i_rwsem -> `SWAP_INFO`, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
-| `BdiWriteback.pass` | mm/writeback.rs, fs/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, a superblock's shutdown and vfat's remount (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step; an inode's metadata is written under it after its pages (`write_inode_now` -> ->write_inode: pass -> vfat `VfatSbData.ipos` and the device's page cache), and an inode's last reference may go under it (eviction, which may write that inode back first). fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
-| `BdiWriteback.list_lock` | mm/writeback.rs, fs/fs_writeback.rs | spin Mutex, a leaf but for an inode's `i_lock` (`Inode::igrab`'s slow path, Linux wb->list_lock -> i_lock) | Linux wb->list_lock: the disk's dirty inodes, `b_dirty` (oldest first) and `b_io` (the running pass's), `InodeList`s through `Inode.i_io_list` holding no reference (Linux), `Inode.i_io_on` (which list it is on) and `Inode.i_dirty`'s clearing. `mark_inode_dirty_pages` (called by every page dirtying, `filemap::dirty_page`, through the mapping's `host`: Linux __folio_mark_dirty) and `mark_inode_dirty` (metadata: `Inode.i_dirty_inode` set first, an atomic flag cleared by `sync_inode_metadata` (from `write_inode_now`) only once it has the superblock and is about to call ->write_inode, so a change during the write marks it again; Linux I_DIRTY_SYNC under i_lock) set `i_dirty` first and, the first time, queue the inode at the tail under a page lock at most, then arms the periodic work after unlocking if the lists were empty (a block device's own inode is on its disk's lists too). A pass moves the expired inodes (of one superblock for a sync) to `b_io` in one hold (`InodeList::move_if`, grabbing none, Linux queue_io), then per inode: under the lock take a reference unless its last one went (`Inode::igrab`, Linux __iget; one being freed is skipped, its teardown writes it back), take it off `b_io` and clear `i_dirty`, unlock, write it, drop it with no lock held (its last reference may evict it). An inode's eviction takes it off its list under the lock (`inode_io_list_del`, Linux evict), before any field goes, so a linked entry is a live value. The mapping's `host` is the inode whose `i_data` it is (Linux mapping->host, a plain pointer): page dirtying grabs it (`Inode::igrab`, failing once its last reference went, as Linux skips an I_FREEING inode). `Inode.dirtied_when` (Linux dirtied_when) is stored (release) by whoever sets `i_dirty` from clean, before queuing the inode under `list_lock`, and read (acquire) under `list_lock` by the expiry test: a page or metadata dirtied while the inode is queued leaves it |
+| `BdiWriteback.pass` | mm/writeback.rs, fs/pageio/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync and syncfs (under the superblock's s_umount read, Linux iterate_supers / syncfs's down_read), a superblock's shutdown and vfat's remount (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step; an inode's metadata is written under it after its pages (`__writeback_single_inode` -> ->write_inode: pass -> the device's page cache (vfat's entry block, bread) -> vfat `VfatSbData.ipos` (spin); a sync(2)/syncfs pass is for_sync, so no ->sync_inode_metadata under it), a data-integrity pass sleeps under it on an inode another writer has (I_SYNC: that writer takes no `pass`), and an inode's last reference may go under it (eviction, which may write that inode back first). fsync and the write-back before an eviction write an inode without it (`writeback_single_inode`), under I_SYNC |
+| `BdiWriteback.list_lock` | mm/writeback.rs, fs/pageio/fs_writeback.rs | spin Mutex, a leaf but for an inode's `i_lock` (Linux wb->list_lock -> i_lock) | Linux wb->list_lock: the disk's dirty inodes, `b_dirty` (oldest first), `b_io` (the running pass's) and `b_more_io` (left for the next pass), `InodeList`s through `Inode.i_io_list` holding no reference (Linux), `Inode.i_io_on` (which list it is on) and `Inode.dirtied_when` (Linux dirtied_when: written under it and the inode's `i_lock` as it is queued or requeued, read under it by a pass's expiry test). An inode's dirty state is its `i_state` bits (Linux I_DIRTY_SYNC, I_DIRTY_DATASYNC, I_DIRTY_PAGES; I_SYNC, I_SYNC_QUEUED; I_METADATA_WRITEBACK, set by ->write_inode and cleared by a WB_SYNC_ALL write, not for sync, before it calls ->sync_inode_metadata with no lock held), written under `i_lock` only. `__mark_inode_dirty` (every page dirtying through the mapping's `host`, `filemap::dirty_page`, Linux __folio_mark_dirty; the filesystems' metadata) tests the bits lock-free after a full fence (Linux smp_mb, paired with the one `__writeback_single_inode` puts between clearing them and testing the cache's DIRTY mark: either side sees the other), sets them under `i_lock` and, for an inode going from clean to dirty, drops `i_lock`, takes `list_lock` then `i_lock` (Linux locked_inode_to_wb_and_lock_list) and queues it at `b_dirty`'s tail unless a pass has it (I_SYNC_QUEUED) or it is I_FREEING, then arms the periodic work after unlocking if the lists were empty; under a page lock at most. A pass moves the expired inodes (of one superblock for a sync) to `b_io` in one hold, marking each I_SYNC_QUEUED under its `i_lock` (Linux queue_io), then superblock by superblock: a pass for one superblock runs under its caller's s_umount; the periodic pass takes the front inode's superblock's s_umount for reading with trylock under `list_lock` (Linux __writeback_inodes_wb: super_trylock_shared, failing too for one not born or dying) and sends that inode back to `b_dirty` if it fails, else writes that superblock's inodes until another's comes first and releases it; per inode, under `list_lock` and its `i_lock`: one of another superblock (in a pass for one) or being freed back to `b_dirty` (Linux redirty_tail_locked; I_FREEING off the lists), one another writer has (I_SYNC) to `b_more_io` or, for a data-integrity pass, slept on with `i_lock` only (the eviction, which takes the inode off `b_io` under `list_lock` then `i_lock`, waits for it, so the inode stays live); else it sets I_SYNC and takes a reference (`Inode::__iget`: not I_FREEING/I_WILL_FREE under `i_lock`, so the count is above zero), unlocks, writes it, then under both locks requeues it by its state (Linux requeue_inode) and clears I_SYNC, waking its waiters under `i_lock` (Linux inode_sync_complete), and drops it with no lock held (its last reference may evict it). `writeback_single_inode` (fsync, sync_inode_metadata, the write-back before an eviction) sets I_SYNC under `i_lock` (waiting for a writer already at it, for WB_SYNC_ALL), writes, then under both locks takes a clean inode off the lists or puts a dirty one back on `b_dirty` unless a pass has it. An inode's eviction takes it off its list under the lock and its `i_lock` (`inode_io_list_del`, Linux evict), before any field goes, so a linked entry is a live value. The mapping's `host` is the inode whose `i_data` it is (Linux mapping->host, a plain pointer): page dirtying borrows it with no reference under the page's lock (Linux __folio_mark_dirty; eviction truncates every page under its lock before the inode goes, and the I_FREEING test keeps one being freed off the lists); a buffer's dirtying outside the page lock grabs it (`Inode::igrab`, failing once its last reference went) |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
 | `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu, the mempolicy syscalls (mbind copies the node spans before taking mmap_lock; get_mempolicy's page node with no lock held) and futex_waitv (FUTEX2_NUMA node checks, after `futex_mpol` drops mmap_lock) |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents; nothing allocates under them: hash elements are preallocated at create on a free list (Linux htab prealloc), lookups and get_next_key copy into a buffer the caller allocated before the lock (Linux bpf_map_copy_value) |
@@ -6119,6 +6459,12 @@ is `SCHED:FAIL scheduling while atomic`).
   (`IrqSpinlock`, leaf) to reap the virtqueue and restart dispatch, then
   `bio_endio` with no lock held; `end_io` completes a `Completion`
   (`IrqSpinlock` -> wait queue wakeup); the lock-free DMA API unmaps
+- Buffer head completion (`fs/pageio/buffer.rs` bh_end_*): the buffer's bits,
+  the ring's `b_uptodate_lock` (IrqSpinlock leaf), the page's flags,
+  the buffer's and the page's wait queues, and on a write error, under
+  an RCU read guard, the mapping's `wb_err` and its superblock's
+  `s_wb_err` (atomic errseqs; the superblock reached through the
+  inode's `Weak`, no reference taken: `superblock::sb_wb_err_set`)
 - AIO completion (a bio's end of an AIO request): `Kioctx.comp`
   (IrqSpinlock) to post the event into the shared ring, then the
   request's eventfd (`Eventfd.inner`), the io_getevents wakeup and the

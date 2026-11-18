@@ -42,6 +42,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use crate::fs::file::RwFlags;
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::mm::gup::{PageSeg, PinnedPages};
+use crate::mm::page::zero_frame_racy;
 use crate::sync::completion::Completion;
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_box as box_try;
@@ -142,7 +143,7 @@ pub fn direct_io<I: DioIter>(
     }
     let d = Dio::new::<I>(b, flags);
     // One extent: the device from `pos` on
-    let map = [(pos, count)];
+    let map = [(Some(pos), count)];
     let nr = it.npages(BIO_MAX_VECS + 1);
     if nr <= BIO_MAX_VECS {
         d.simple(it, &map, nr)
@@ -151,11 +152,15 @@ pub fn direct_io<I: DioIter>(
     }
 }
 
-/// A run of a file's bytes on the device: byte offset there, length
-pub type Extent = (u64, usize);
+/// A run of a file's bytes: its byte offset on the device, or None for
+/// a hole (a block get_block left unmapped), and its length. A read
+/// zeroes a hole's bytes (Linux do_direct_IO's "Handle holes":
+/// memzero_page); a write has none (Linux: -ENOTBLK before, the
+/// caller's buffered fallback).
+pub type Extent = (Option<u64>, usize);
 
 /// Direct I/O of `it` through the device extents `map`, in order, which
-/// cover exactly its bytes (Linux do_blockdev_direct_IO over a
+/// cover exactly its bytes, a read's holes zeroed (Linux do_blockdev_direct_IO over a
 /// filesystem's get_block mappings): pinned a bio's worth at a time and
 /// sent as bios cut at each extent's end and at the queue limits, all
 /// plugged and counted in one wait, without FUA (an O_DSYNC write is
@@ -188,10 +193,11 @@ struct MapPos {
 }
 
 impl MapPos {
-    /// The device byte offset here and the bytes left in its extent
-    fn cur(&self, map: &[Extent]) -> Option<(u64, usize)> {
+    /// The device byte offset here (None in a hole) and the bytes left
+    /// in its extent
+    fn cur(&self, map: &[Extent]) -> Option<(Option<u64>, usize)> {
         let &(off, len) = map.get(self.i)?;
-        Some((off + self.at as u64, len - self.at))
+        Some((off.map(|o| o + self.at as u64), len - self.at))
     }
 
     fn advance(&mut self, map: &[Extent], n: usize) {
@@ -368,7 +374,21 @@ impl<'a> Dio<'a> {
         let mut cur = Cursor::default();
         let mut sent = 0usize;
         while !cur.done(segs) {
+            // A read's hole: its bytes zeroed in place, no bio
+            if let Some((None, left)) = at.cur(map)
+                && self.op == BioOp::Read
+            {
+                // SAFETY: a read's pages, pinned for writing until its
+                // bios end: `DioIter::get_pages`' pins, kept by `send`'s
+                // callers, or `AsyncIo::segs` (that trait's contract)
+                let n = unsafe { cur.zero(segs, left) };
+                at.advance(map, n);
+                sent += n;
+                continue;
+            }
             let r = at.cur(map).ok_or(KernelError::Io).and_then(|(off, left)| {
+                // A write never has a hole
+                let off = off.ok_or(KernelError::Io)?;
                 // No bio past the extent's end
                 let l = QueueLimits {
                     max_sectors: (left >> SECTOR_SHIFT).min(lim.max_sectors as usize) as u32,
@@ -602,7 +622,7 @@ pub fn submit_async(
         return Err(KernelError::InvalidArgument);
     }
     // One extent: the device from `pos` on
-    submit_async_map(b, io, &[(pos, count)], count, write, flags)
+    submit_async_map(b, io, &[(Some(pos), count)], count, write, flags)
 }
 
 /// As [`submit_async`], `count` bytes through the device extents `map`
@@ -666,6 +686,31 @@ impl Cursor {
     /// Every byte was taken
     pub fn done(&self, segs: &[PageSeg]) -> bool {
         self.i >= segs.len()
+    }
+
+    /// Zero the next `max` bytes of `segs` at most, stepping over them
+    /// (a read's hole); the bytes
+    ///
+    /// # Safety
+    /// `segs` are pages pinned for writing while this runs (a read's
+    /// destination).
+    unsafe fn zero(&mut self, segs: &[PageSeg], max: usize) -> usize {
+        let mut done = 0;
+        while done < max
+            && let Some(s) = segs.get(self.i)
+        {
+            let n = (s.len as usize - self.at).min(max - done);
+            // SAFETY: a pinned page (contract above); the piece lies in
+            // it
+            unsafe { zero_frame_racy(s.phys, s.off as usize + self.at, n) };
+            done += n;
+            self.at += n;
+            if self.at == s.len as usize {
+                self.i += 1;
+                self.at = 0;
+            }
+        }
+        done
     }
 
     /// Bio segments the next bio takes before its cut back to whole

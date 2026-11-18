@@ -3,13 +3,14 @@
 //! Each mounted filesystem has a superblock that holds filesystem-wide
 //! state and provides operations for managing inodes.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
+use crate::sync::rcu::{RcuOnceArc, RcuReadGuard};
 use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::list::{Adapter, Link, WeakList};
 use ::core::mem::ManuallyDrop;
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync;
 
@@ -33,9 +34,28 @@ pub trait SuperOps: Send + Sync {
 
     /// Write a dirty inode's metadata (Linux ->write_inode): called by
     /// writeback, fsync and the write-back before an eviction, after
-    /// its pages, for an inode `mark_inode_dirty` marked. Default
-    /// nothing (no metadata of its own on a device).
-    fn write_inode(&self, _inode: &Inode) -> Result<(), KernelError> {
+    /// its pages, for an inode marked dirty other than by its pages;
+    /// `wbc` says how (a WB_SYNC_ALL caller waits through
+    /// `sync_inode_metadata` for what it marks I_METADATA_WRITEBACK).
+    /// Default nothing (no metadata of its own on a device).
+    fn write_inode(
+        &self,
+        _inode: &Inode,
+        _wbc: &super::pageio::fs_writeback::WritebackControl,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// Wait for the metadata `write_inode` put in flight (Linux
+    /// ->sync_inode_metadata): called by a data-integrity write
+    /// (WB_SYNC_ALL, not sync(2)'s) of an inode marked
+    /// I_METADATA_WRITEBACK, which only a filesystem having this sets.
+    /// Default nothing.
+    fn sync_inode_metadata(
+        &self,
+        _inode: &Inode,
+        _wbc: &super::pageio::fs_writeback::WritebackControl,
+    ) -> Result<(), KernelError> {
         Ok(())
     }
 
@@ -418,9 +438,16 @@ const SB_ACTIVE: u32 = 1 << 30;
 /// The last passive reference is gone (Linux put_super's final part):
 /// off super_blocks and its type's fs_supers (the lists' contract,
 /// `WeakList`: no walker reaches it once its fields start to go), then
-/// its memory. The filesystem was shut down already, by its last active
-/// reference ([`SbActive`]), so nothing here sleeps; it takes sb_lock,
-/// so a passive reference is never dropped under it.
+/// its memory. The filesystem was shut down already, by its last
+/// active reference ([`SbActive`]), its ->put_super or ->kill_sb
+/// releasing `s_fs_info` (Linux), so nothing here sleeps; it takes
+/// sb_lock, so a passive reference is never dropped under it. Only a
+/// superblock never listed (`destroy_unused_super`: sget's set failed)
+/// still holds its data, dropped here in sget's thread context, or one
+/// whose shutdown left an inode busy, poisoned, that may still borrow
+/// the data ->put_super then kept ([`SuperBlock::kill_fs_info_rcu`]):
+/// dropped here, after that inode's teardown (each keeps this memory),
+/// with no RCU reader left (one borrows it through a borrow of `self`).
 impl Drop for SuperBlock {
     fn drop(&mut self) {
         debug_assert!(
@@ -666,26 +693,37 @@ pub fn reconfigure_super(sb: &SuperBlock, ro: bool, data: &[u8]) -> Result<(), K
 /// What every filesystem's shutdown does (Linux generic_shutdown_super),
 /// under s_umount held for writing, which it releases: inotify watches
 /// get IN_UNMOUNT and go (fsnotify_sb_delete), the dentry tree is
-/// dropped (shrink_dcache_for_umount), what is dirty is written back
-/// while the device is still open (sync_filesystem) and the inodes
-/// leave s_inodes (evict_inodes); then SB_DYING tells walkers and
-/// mounters
+/// dropped (shrink_dcache_for_umount: each inode whose last reference
+/// was a dentry's is evicted there), what is dirty is written back
+/// while the device is still open (sync_filesystem) and SB_ACTIVE is
+/// cleared. Linux evict_inodes then evicts the unused inodes its LRU
+/// kept; hk keeps none (an inode is evicted at its last put), so none
+/// is left but what the filesystem itself holds, which its ->put_super
+/// puts. An inode still on s_inodes after it is a bug: one referenced
+/// past its superblock's end, reported as Linux ("Busy inodes after
+/// unmount", CHECK_DATA_CORRUPTION), and each such inode is poisoned
+/// so a later use panics (`inode::sb_poison`, one pass with the
+/// check). Then SB_DYING tells walkers and mounters. A superblock
+/// never given a root (a failed fill) has none of this: its fill put
+/// what it made (Linux).
 pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
-    sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
     let root = sb.root.write().take();
     if let Some(root) = root {
         crate::io::inotify::sb_delete(sb);
         super::dentry::d_drop_tree(&root);
         drop(root);
         // Linux ignores sync_filesystem's error here too
-        let _ = super::fs_writeback::writeback_sb(sb);
-        super::inode::sb_list_drain(&sb.s_inodes);
+        let _ = super::pageio::sync::sync_filesystem(sb);
+        sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
         sb.s_op.put_super(sb);
-    } else {
-        // A fill that failed before its root may have made inodes that
-        // outlive it: unlinked all the same, so their eviction never
-        // reaches this superblock's list once its memory goes
-        super::inode::sb_list_drain(&sb.s_inodes);
+        if super::inode::sb_poison(sb) {
+            let id = sb.bdev().map_or(sb.fs_type.name, |b| b.name.as_str());
+            crate::printkln!(
+                "VFS: Busy inodes after unmount of {} ({})",
+                id,
+                sb.fs_type.name
+            );
+        }
     }
     sb.super_wake(SB_DYING);
     drop(g);
@@ -809,8 +847,10 @@ fn super_lock_excl(sb: &SuperBlock) -> Option<sync::RwSemWriteGuard<'_, ()>> {
 }
 
 /// s_umount for reading if free at once, on a superblock born and not
-/// dying (Linux super_trylock_shared)
-fn super_trylock_shared(sb: &SuperBlock) -> Option<sync::RwSemReadGuard<'_, ()>> {
+/// dying (Linux super_trylock_shared): reclaim's walk, the writeback
+/// pass over every superblock (taken under `BdiWriteback.list_lock`,
+/// never waiting)
+pub(in crate::fs) fn super_trylock_shared(sb: &SuperBlock) -> Option<sync::RwSemReadGuard<'_, ()>> {
     let g = sb.s_umount.try_read()?;
     (sb.super_flags(SB_BORN) && !sb.super_flags(SB_DYING)).then_some(g)
 }
@@ -972,9 +1012,10 @@ fn lookup_bdev(path: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
 /// The superblock on the block device `fc.source` names (Linux
 /// get_tree_bdev): one per device (sget_dev, test_bdev_super), shared
 /// by every mount of it; a mount that would change its read-only state
-/// is EBUSY. A new one holds the device open (setup_bdev_super: under
-/// the disk's open_mutex, failing for a removed device; a rescan sees
-/// it in use), then `fill`
+/// is EBUSY. A new one holds the device open and claimed for its
+/// exclusive use (setup_bdev_super: holder the superblock; EBUSY if
+/// another holder has it; under the disk's open_mutex, failing for a
+/// removed device; a rescan sees it in use), then `fill`
 pub fn get_tree_bdev(
     fc: &FsContext<'_>,
     s_op: &'static dyn SuperOps,
@@ -1000,7 +1041,7 @@ pub fn get_tree_bdev(
     if fc.sb_flags & SB_RDONLY == 0 && bdev.ro() {
         return Err(KernelError::PermissionDenied);
     }
-    sb.set_bdev(bdev.open_handle()?);
+    sb.set_bdev(bdev.open_handle(Some(sb.bdev_holder()))?);
     fill(&sb)?;
     sb.set_active();
     Ok(sb)
@@ -1070,8 +1111,26 @@ pub struct SuperBlock {
     /// growing past it is EFBIG. Set by the filesystem at mount.
     s_maxbytes: AtomicU64,
 
-    /// Filesystem-specific private data
-    pub private: RwLock<Option<Arc<dyn SuperBlockData>>>,
+    /// log2 of its block size (Linux s_blocksize_bits; s_blocksize is
+    /// 1 << it): what its new inodes' i_blkbits start as. A page by
+    /// default (Linux: what the pseudo and memory file systems set); a
+    /// device filesystem sets it at mount (`sb_set_blocksize`), before
+    /// it makes inodes. Read lock-free.
+    s_blocksize_bits: core::sync::atomic::AtomicU8,
+
+    /// Its filesystem's data (Linux s_fs_info): set once, by its fill
+    /// or sget's set; released in thread context, a grace period after
+    /// it leaves the cell (`kill_fs_info`), where the filesystem's
+    /// Linux counterpart frees it: by ->put_super, every other inode
+    /// evicted (vfat, tmpfs); by ->kill_sb after kill_anon_super, every
+    /// inode evicted (sysfs, procfs, cgroupfs, tracefs: Linux
+    /// kernfs_kill_sb, proc_kill_sb, ...); by ->kill_sb before it, its
+    /// inodes still live (ramfs_kill_sb, which sets none); or by a
+    /// failed fill. Read under an RCU guard, as a reference
+    /// ([`SuperBlock::fs_info`]: None once released), or borrowed for
+    /// an inode's life ([`SuperBlock::fs_info_ref`]: only a filesystem
+    /// whose ->put_super releases it with `kill_fs_info_rcu`, vfat)
+    s_fs_info: RcuOnceArc<FsInfo>,
 
     /// The block device a device filesystem is mounted from (Linux
     /// s_bdev): a reference to the device, not an open
@@ -1080,8 +1139,13 @@ pub struct SuperBlock {
     /// (Linux s_bdev_file): a spin leaf, taken to set and to take it
     s_bdev_file: Mutex<Option<crate::block::blkdev::BdevHandle>>,
 
-    /// Its inodes (Linux s_inodes, under inode_sb_list_lock)
+    /// Its inodes (Linux s_inodes, under its s_inode_list_lock)
     pub(super) s_inodes: super::inode::SbInodes,
+    /// Inode references its inotify watches hold (Linux
+    /// fsnotify_sb_watched_objects, an atomic count): the shutdown
+    /// waits for zero (`inotify::sb_delete`), woken through the
+    /// count's `var_waitqueue` by the last put
+    pub(crate) s_fsnotify_watched: AtomicUsize,
 
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
@@ -1099,14 +1163,37 @@ pub struct SuperBlock {
     pub s_wb_err: crate::util::errseq::ErrSeq,
 }
 
-use super::inode::AsAny;
+/// A superblock's `s_wb_err` stays a valid atomic after the value is
+/// dropped (its last passive reference), while a `Weak` keeps the
+/// memory: `sb_wb_err_set`
+const _: () = assert!(!core::mem::needs_drop::<crate::util::errseq::ErrSeq>());
+
+/// Record a writeback error on the superblock `sb` names, taking no
+/// reference (Linux errseq_set(&inode->i_sb->s_wb_err), any context: a
+/// bio's completion in hardirq, where dropping a reference could free
+/// the superblock). A metadata buffer list (`MappingMetadataBhs`)
+/// names its superblock by such a `Weak`, which keeps the memory until
+/// the list's drop; a superblock already shut down takes the error
+/// harmlessly. A `Weak` of no superblock (`Weak::new`) does nothing.
+pub fn sb_wb_err_set(sb: &Weak<SuperBlock>, e: KernelError) {
+    if Weak::ptr_eq(sb, &Weak::new()) {
+        return;
+    }
+    let p = Weak::as_ptr(sb);
+    // SAFETY: the live `Weak` keeps the allocation (ArcInner) of a real
+    // superblock; `s_wb_err` is an atomic with no drop glue (asserted
+    // above), so its bytes stay a valid `ErrSeq` even once the value was
+    // dropped, and only atomic operations touch it
+    let err = unsafe { &(*p).s_wb_err };
+    err.set(e);
+}
 
 /// Largest file offset on a 64-bit kernel (Linux MAX_LFS_FILESIZE,
 /// LLONG_MAX): the default `s_maxbytes`
 pub const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
 
 /// Trait for filesystem-specific superblock data
-pub trait SuperBlockData: Send + Sync + AsAny {}
+pub trait SuperBlockData: core::any::Any + Send + Sync {}
 
 impl SuperBlock {
     /// Its dentries hash and compare names with `op` (Linux
@@ -1138,7 +1225,9 @@ impl SuperBlock {
             next_ino: crate::util::id_batch::IdBatch::new(),
             s_dev: AtomicU32::new(0),
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
-            private: RwLock::new(None),
+            s_blocksize_bits: core::sync::atomic::AtomicU8::new(crate::mm::page::PAGE_SHIFT as u8),
+            s_fs_info: RcuOnceArc::none(),
+            s_fsnotify_watched: AtomicUsize::new(0),
             s_bdev: spin::Once::new(),
             s_bdev_file: Mutex::new(None),
             s_inodes: super::inode::sb_inodes(),
@@ -1151,6 +1240,11 @@ impl SuperBlock {
     /// Filled (Linux sb->s_flags |= SB_ACTIVE after fill_super)
     pub fn set_active(&self) {
         self.s_flags.fetch_or(SB_ACTIVE, Ordering::Relaxed);
+    }
+
+    /// Filled and not yet shut down (Linux SB_ACTIVE)
+    pub fn active(&self) -> bool {
+        self.s_flags.load(Ordering::Relaxed) & SB_ACTIVE != 0
     }
 
     /// Its device number (Linux s_dev)
@@ -1202,6 +1296,12 @@ impl SuperBlock {
         crate::sync::waitqueue::var_waitqueue((&raw const self.s_flags).addr())
     }
 
+    /// Its shutdown ran (`generic_shutdown_super` after a mount set it
+    /// up: SB_BORN and SB_DYING)
+    pub(super) fn shut_down(&self) -> bool {
+        self.super_flags(SB_BORN) && self.super_flags(SB_DYING)
+    }
+
     /// Its mount set it up (Linux vfs_get_tree's SB_BORN): walkers and
     /// mounters waiting for it go on
     pub fn set_born(&self) {
@@ -1216,6 +1316,23 @@ impl SuperBlock {
     /// Set the largest file size (at mount)
     pub fn set_maxbytes(&self, max: u64) {
         self.s_maxbytes.store(max, Ordering::Relaxed);
+    }
+
+    /// log2 of its block size (Linux s_blocksize_bits)
+    pub fn s_blocksize_bits(&self) -> u8 {
+        self.s_blocksize_bits.load(Ordering::Relaxed)
+    }
+
+    /// Its block size (Linux s_blocksize)
+    pub fn s_blocksize(&self) -> u32 {
+        1 << self.s_blocksize_bits()
+    }
+
+    /// Set its block size (`sb_set_blocksize`, at mount)
+    pub(crate) fn set_s_blocksize(&self, size: u32) {
+        debug_assert!(size.is_power_of_two());
+        self.s_blocksize_bits
+            .store(size.trailing_zeros() as u8, Ordering::Relaxed);
     }
 
     /// True if mounted read-only (Linux sb_rdonly)
@@ -1340,6 +1457,11 @@ impl SuperBlock {
         self.next_ino.next()
     }
 
+    /// Its claim of its block device (Linux holder sb): its address
+    pub fn bdev_holder(&self) -> crate::block::claim::Holder {
+        core::ptr::from_ref(self) as usize
+    }
+
     /// The block device it is mounted from, held open until its
     /// shutdown (Linux s_bdev, s_bdev_file); once, at mount
     pub fn set_bdev(&self, h: crate::block::blkdev::BdevHandle) {
@@ -1353,14 +1475,89 @@ impl SuperBlock {
         self.s_bdev.get()
     }
 
-    /// Set filesystem-specific private data
-    pub fn set_private(&self, data: Arc<dyn SuperBlockData>) {
-        *self.private.write() = Some(data);
+    /// Give it its filesystem's data (Linux sb->s_fs_info = ...): once,
+    /// by its fill or sget's set, before anything reads it
+    pub fn set_fs_info(&self, data: Arc<FsInfo>) {
+        let set = self.s_fs_info.set(data);
+        debug_assert!(set.is_ok(), "superblock: fs info set twice");
     }
 
-    /// Get filesystem-specific private data
-    pub fn get_private(&self) -> Option<Arc<dyn SuperBlockData>> {
-        self.private.read().clone()
+    /// A reference to its filesystem's data as a `T` (Linux
+    /// MSDOS_SB(sb) etc.); None once its put_super or kill_sb released
+    /// it, or for another type. Dropped in thread context: the last
+    /// reference may be the one that frees it
+    pub fn fs_info<T: SuperBlockData>(&self) -> Option<Arc<T>> {
+        let a: Arc<dyn core::any::Any + Send + Sync> = self.fs_info_arc()?;
+        a.downcast::<T>().ok()
+    }
+
+    /// Its filesystem's data as a `T`, borrowed with no reference or
+    /// guard (Linux MSDOS_SB(sb) etc.: a plain load of s_fs_info); None
+    /// if unset or another type
+    ///
+    /// # Safety
+    /// The data is not released while the borrow lives: the caller
+    /// holds an active reference, or works for a live inode of `self`
+    /// (unpoisoned when the borrow was taken) of a filesystem that
+    /// releases its data only with [`SuperBlock::kill_fs_info_rcu`],
+    /// or is that release's caller.
+    pub unsafe fn fs_info_ref<T: SuperBlockData>(&self) -> Option<&T> {
+        // SAFETY: not released while the borrow lives (the caller)
+        let d: &dyn core::any::Any = &*unsafe { self.s_fs_info.get_unguarded() }?.0;
+        d.downcast_ref::<T>()
+    }
+
+    /// Its filesystem's data as a `T`, borrowed for the RCU read `g`
+    /// (Linux rcu_dereference(sb->s_fs_info): sget's tests)
+    pub fn fs_info_rcu<'a, T: SuperBlockData>(&'a self, g: &'a RcuReadGuard) -> Option<&'a T> {
+        let d: &dyn core::any::Any = &*self.s_fs_info.read(g)?.0;
+        d.downcast_ref::<T>()
+    }
+
+    /// A reference to its filesystem's data (an inode's RCU-read copy
+    /// of procfs's options)
+    pub fn fs_info_arc(&self) -> Option<Arc<dyn SuperBlockData>> {
+        let g = crate::sync::rcu::read_lock();
+        let d = self.s_fs_info.read(&g).map(|d| d.0.clone());
+        drop(g);
+        d
+    }
+
+    /// Release its filesystem's data (Linux the free of s_fs_info by
+    /// ->put_super, ->kill_sb or a failed fill_super): out of the cell,
+    /// then after a grace period (its RCU readers) its reference goes,
+    /// here, in thread context (the data's drop may sleep: an inode's
+    /// put, a namespace's); a reference still held elsewhere frees it
+    /// at its own drop
+    pub fn kill_fs_info(&self) {
+        drop(self.s_fs_info.take());
+    }
+
+    /// Release its filesystem's data from ->put_super (or a failed
+    /// fill), for a filesystem whose inodes borrow it
+    /// ([`Self::fs_info_ref`]; Linux fat_put_super's
+    /// call_rcu(delayed_free)): a grace period on (`kill_fs_info`),
+    /// unless an inode is still on `s_inodes`. That one is busy past
+    /// the shutdown, which then reports and poisons it
+    /// (`generic_shutdown_super`; nothing lists an inode in between,
+    /// s_umount held for writing), and it may hold a borrow taken before
+    /// its poison, which the data then outlives, going with the
+    /// superblock's memory (each inode keeps it); Linux frees it and a
+    /// late use of that borrow is a use after free.
+    pub fn kill_fs_info_rcu(&self) {
+        if !super::inode::sb_busy(self) {
+            self.kill_fs_info();
+        }
+    }
+}
+
+/// What `SuperBlock.s_fs_info` holds: sized, so an RCU pointer names
+/// it; made before `set_fs_info` (which may run under sb_lock)
+pub struct FsInfo(Arc<dyn SuperBlockData>);
+
+impl FsInfo {
+    pub fn new(data: Arc<dyn SuperBlockData>) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self(data))
     }
 }
 
@@ -1473,6 +1670,22 @@ mod tests {
 
     static EVICT_OPS: EvictOps = EvictOps;
 
+    /// A buffer write error reaches s_wb_err through a `Weak`
+    /// with no reference taken (syncfs reports it), and harmlessly once
+    /// the superblock's last passive reference went
+    #[test]
+    fn wb_err_through_weak() {
+        let sb = alloc_super(&T1, &NULL_SUPER_OPS, 0).unwrap();
+        let since = sb.s_wb_err.sample();
+        let w = Arc::downgrade(&sb);
+        sb_wb_err_set(&w, KernelError::Io);
+        assert_eq!(sb.s_wb_err.check(since), Some(KernelError::Io));
+        assert_eq!(Arc::strong_count(&sb), 1);
+        destroy_unused_super(sb);
+        sb_wb_err_set(&w, KernelError::Io);
+        sb_wb_err_set(&Weak::new(), KernelError::Io);
+    }
+
     /// A root directory whose eviction `EvictOps` checks
     fn t_fill(sb: &Arc<SuperBlock>, ops: &'static dyn InodeOps) -> Result<(), KernelError> {
         let root = Inode::alloc(Inode::new(
@@ -1482,7 +1695,7 @@ mod tests {
             0,
             0,
             crate::time::TIMEKEEPER.current_time(),
-            Arc::downgrade(sb),
+            Some(sb),
             ops,
         ))?;
         sb.set_root(DentryRef::new(Dentry::new_root(root, Arc::downgrade(sb)))?);
@@ -1532,13 +1745,11 @@ mod tests {
         fs_supers: FsSupers::new(WeakList::new()),
     };
 
-    /// An inode a failing fill made and kept, and a passive reference
-    /// to its superblock (`T3`)
-    static T3_KEPT: std::sync::Mutex<Option<(InodeRef, Arc<SuperBlock>)>> =
-        std::sync::Mutex::new(None);
+    /// An inode a failing fill made and kept (`T3`)
+    static T3_KEPT: std::sync::Mutex<Option<InodeRef>> = std::sync::Mutex::new(None);
 
-    /// A fill that makes an inode, keeps it, and fails before setting
-    /// a root
+    /// A fill that makes an inode, keeps it past the shutdown (a bug
+    /// Linux's busy check reports), and fails before setting a root
     fn t3_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
         get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| {
             let inode = Inode::alloc(Inode::new(
@@ -1548,10 +1759,10 @@ mod tests {
                 0,
                 0,
                 crate::time::TIMEKEEPER.current_time(),
-                Arc::downgrade(sb),
+                Some(sb),
                 &crate::fs::inode::NULL_INODE_OPS,
             ))?;
-            *T3_KEPT.lock().unwrap() = Some((inode, Arc::clone(sb)));
+            *T3_KEPT.lock().unwrap() = Some(inode);
             Err(KernelError::Io)
         })
     }
@@ -1566,12 +1777,177 @@ mod tests {
         fs_supers: FsSupers::new(WeakList::new()),
     };
 
+    /// Drops of `T4Data`
+    static T4_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A filesystem's data that counts its drop
+    struct T4Data;
+
+    impl SuperBlockData for T4Data {}
+
+    impl Drop for T4Data {
+        fn drop(&mut self) {
+            T4_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Another type's data
+    struct NullData;
+
+    impl SuperBlockData for NullData {}
+
+    fn t4_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        let info = FsInfo::new(try_arc(T4Data)?)?;
+        get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| {
+            sb.set_fs_info(info);
+            t_fill(sb, &crate::fs::inode::NULL_INODE_OPS)
+        })
+    }
+
+    /// Linux kernfs_kill_sb's shape: kill_anon_super, then the data
+    fn t4_kill_sb(sb: &SuperBlock, g: SbUmount<'_>) {
+        kill_anon_super(sb, g);
+        sb.kill_fs_info();
+    }
+
+    static T4: FileSystemType = FileSystemType {
+        name: "sbtest4",
+        fs_flags: 0,
+        mount: t4_mount,
+        kill_sb: t4_kill_sb,
+        file_ops: &crate::fs::RAMFS_FILE_OPS,
+        next: FsNext::new(None),
+        fs_supers: FsSupers::new(WeakList::new()),
+    };
+
+    /// Drops of `T5Data`
+    static T5_DROPS: AtomicUsize = AtomicUsize::new(0);
+    /// An inode `T5`'s fill made and a test keeps
+    static T5_KEPT: std::sync::Mutex<Option<InodeRef>> = std::sync::Mutex::new(None);
+
+    /// Data its inodes borrow (vfat's shape), counting its drop
+    struct T5Data;
+
+    impl SuperBlockData for T5Data {}
+
+    impl Drop for T5Data {
+        fn drop(&mut self) {
+            T5_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// vfat's put_super shape: the data released unless an inode is
+    /// busy (`kill_fs_info_rcu`)
+    struct T5Ops;
+
+    impl SuperOps for T5Ops {
+        fn alloc_inode(
+            &self,
+            _sb: &Arc<SuperBlock>,
+            _mode: InodeMode,
+            _i_op: &'static dyn InodeOps,
+        ) -> Result<InodeRef, KernelError> {
+            Err(KernelError::OperationNotSupported)
+        }
+
+        fn put_super(&self, sb: &SuperBlock) {
+            sb.kill_fs_info_rcu();
+        }
+    }
+
+    static T5_OPS: T5Ops = T5Ops;
+
+    /// A fill that sets the data, a root, and an inode kept in `T5_KEPT`
+    /// if `T5_KEEP`
+    fn t5_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        let info = FsInfo::new(try_arc(T5Data)?)?;
+        get_tree_nodev(fc, &T5_OPS, |sb| {
+            sb.set_fs_info(info);
+            t_fill(sb, &crate::fs::inode::NULL_INODE_OPS)?;
+            if T5_KEEP.load(Ordering::Relaxed) {
+                let inode = Inode::alloc(Inode::new(
+                    2,
+                    InodeMode::regular(0o644),
+                    0,
+                    0,
+                    0,
+                    crate::time::TIMEKEEPER.current_time(),
+                    Some(sb),
+                    &crate::fs::inode::NULL_INODE_OPS,
+                ))?;
+                *T5_KEPT.lock().unwrap() = Some(inode);
+            }
+            Ok(())
+        })
+    }
+
+    static T5_KEEP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    static T5: FileSystemType = FileSystemType {
+        name: "sbtest5",
+        fs_flags: 0,
+        mount: t5_mount,
+        kill_sb: kill_anon_super,
+        file_ops: &crate::fs::RAMFS_FILE_OPS,
+        next: FsNext::new(None),
+        fs_supers: FsSupers::new(WeakList::new()),
+    };
+
+    /// The active reference `T6Ops` drops from an eviction, and the
+    /// inode `T6`'s fill made
+    static T6_ACTIVE: std::sync::Mutex<Option<SbActive>> = std::sync::Mutex::new(None);
+    static T6_KEPT: std::sync::Mutex<Option<InodeRef>> = std::sync::Mutex::new(None);
+
+    /// An inode whose ->evict_inode runs its superblock's whole
+    /// shutdown: a put overlapping the shutdown (`inode::evict`)
+    struct T6Ops;
+
+    impl InodeOps for T6Ops {
+        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
+            Err(KernelError::NotFound)
+        }
+
+        fn evict_inode(&self, _inode: &Inode) {
+            let a = T6_ACTIVE.lock().unwrap().take();
+            drop(a);
+        }
+    }
+
+    static T6_IOPS: T6Ops = T6Ops;
+
+    fn t6_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| {
+            t_fill(sb, &crate::fs::inode::NULL_INODE_OPS)?;
+            let inode = Inode::alloc(Inode::new(
+                2,
+                InodeMode::regular(0o644),
+                0,
+                0,
+                0,
+                crate::time::TIMEKEEPER.current_time(),
+                Some(sb),
+                &T6_IOPS,
+            ))?;
+            *T6_KEPT.lock().unwrap() = Some(inode);
+            Ok(())
+        })
+    }
+
+    static T6: FileSystemType = FileSystemType {
+        name: "sbtest6",
+        fs_flags: 0,
+        mount: t6_mount,
+        kill_sb: kill_anon_super,
+        file_ops: &crate::fs::RAMFS_FILE_OPS,
+        next: FsNext::new(None),
+        fs_supers: FsSupers::new(WeakList::new()),
+    };
+
     fn get(t: &'static FileSystemType) -> Result<SbActive, KernelError> {
         vfs_get_tree(&FsContext::new(t, b"")).map(SbLocked::unlock)
     }
 
-    /// A temporary passive reference (an `evict_inode`'s upgrade, a
-    /// walker's) that outlives the last active one (the umount): the
+    /// A temporary passive reference (a walker's) that outlives the last active one (the umount): the
     /// shutdown runs in the active put, under s_umount, and the
     /// passive put afterwards only frees the memory
     #[test]
@@ -1600,18 +1976,85 @@ mod tests {
         assert_eq!(EVICTS.load(Ordering::Relaxed), 1);
     }
 
-    /// A fill that fails before its root leaves no inode on the
-    /// superblock's list once shut down (under INODE_SB_LIST_LOCK, not
-    /// by the list's drop with the memory, which an eviction racing it
-    /// would reach): checked while a passive reference keeps the memory
+    /// An inode keeps its superblock (a passive reference): one held
+    /// past the shutdown (a bug) still finds it, with its list, and its
+    /// eviction unlinks it there before the memory goes
     #[test]
-    fn failed_fill_unlinks_its_inodes() {
+    fn inode_keeps_its_superblock() {
         assert!(matches!(get(&T3), Err(KernelError::Io)));
-        let (inode, sb) = T3_KEPT.lock().unwrap().take().unwrap();
-        assert!(sb.super_flags(SB_DEAD));
-        assert!(!inode.i_sb_list.is_linked(), "left on s_inodes");
-        drop(sb);
+        let inode = T3_KEPT.lock().unwrap().take().unwrap();
+        let sb = Arc::downgrade(inode.superblock().unwrap());
+        assert!(sb.upgrade().unwrap().super_flags(SB_DEAD));
+        assert!(inode.i_sb_list.is_linked());
         drop(inode);
+        assert!(sb.upgrade().is_none());
+    }
+
+    /// Data its inodes borrow goes after put_super once no inode is
+    /// left; an inode held past the shutdown (a bug, reported as "Busy
+    /// inodes after unmount") is poisoned, any later use of it panics,
+    /// and the data stays for a borrow taken before (`kill_fs_info_rcu`).
+    /// One test: `T5_KEEP` is shared. The inode is taken out of
+    /// `T5_KEPT` and leaked, never put: its eviction would panic too
+    #[test]
+    // The busy report is a printk, whose aarch64 early console is a
+    // device register a host (EL0) test cannot write
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn busy_inode_poisoned() {
+        let sb = get(&T5).unwrap();
+        let passive = Arc::clone(&sb);
+        drop(sb);
+        assert!(passive.s_fs_info.is_none());
+        assert_eq!(T5_DROPS.load(Ordering::Relaxed), 1);
+        drop(passive);
+        T5_KEEP.store(true, Ordering::Relaxed);
+        let sb = get(&T5).unwrap();
+        T5_KEEP.store(false, Ordering::Relaxed);
+        let w = Arc::downgrade(&sb);
+        drop(sb);
+        let s = w.upgrade().unwrap();
+        assert!(s.super_flags(SB_DEAD));
+        // SAFETY: a passive reference is held, and the busy inode keeps
+        // the data T5's put_super left (`kill_fs_info_rcu`)
+        assert!(unsafe { s.fs_info_ref::<T5Data>() }.is_some());
+        drop(s);
+        assert_eq!(T5_DROPS.load(Ordering::Relaxed), 1);
+        let inode = T5_KEPT.lock().unwrap().take().unwrap();
+        assert_ne!(inode.state() & crate::fs::inode::istate::I_POISON, 0);
+        let poisoned = |f: &dyn Fn(&Inode)| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&inode)));
+            r.unwrap_err().downcast_ref::<&str>() == Some(&"VFS: poisoned inode")
+        };
+        assert!(poisoned(&|i| {
+            let _ = i.i_op();
+        }));
+        assert!(poisoned(&|i| {
+            let _ = i.i_mapping();
+        }));
+        assert!(poisoned(&|i| {
+            let _ = i.superblock();
+        }));
+        core::mem::forget(inode);
+    }
+
+    /// An inode put during its superblock's shutdown (a bug: nothing
+    /// may, LOCKING.md Inode cache) is off `s_inodes` in ->evict_inode,
+    /// so the shutdown finds no busy inode and releases what that
+    /// eviction may use; its eviction panics once it sees the shutdown
+    /// done (`inode::evict`). The inode is leaked by the panic
+    #[test]
+    fn evict_overlapping_shutdown_panics() {
+        let sb = get(&T6).unwrap();
+        let inode = T6_KEPT.lock().unwrap().take().unwrap();
+        let w = Arc::downgrade(&sb);
+        *T6_ACTIVE.lock().unwrap() = Some(sb);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inode)));
+        let msg = r.unwrap_err();
+        assert_eq!(
+            msg.downcast_ref::<&str>(),
+            Some(&"VFS: inode evicted across its superblock's shutdown")
+        );
+        assert!(w.upgrade().unwrap().super_flags(SB_DEAD));
     }
 
     /// `sget` shares a live superblock (Linux grab_super: one more
@@ -1637,5 +2080,25 @@ mod tests {
         assert!(!Arc::ptr_eq(&c, &passive));
         assert_eq!(c.s_active.load(Ordering::Relaxed), 1);
         assert_eq!(T2_FILLS.load(Ordering::Relaxed), 2);
+    }
+
+    /// s_fs_info goes at the filesystem's kill_sb (Linux: in thread
+    /// context, the shutdown's), not with the superblock's memory: a
+    /// passive reference outliving the umount finds none; a reference
+    /// taken before keeps the data until it drops
+    #[test]
+    fn fs_info_goes_at_kill_sb() {
+        let active = get(&T4).unwrap();
+        let passive = Arc::clone(&active);
+        let held = active.fs_info::<T4Data>().unwrap();
+        assert!(active.fs_info::<NullData>().is_none());
+        drop(active);
+        assert!(passive.fs_info::<T4Data>().is_none());
+        assert!(passive.s_fs_info.is_none());
+        assert_eq!(T4_DROPS.load(Ordering::Relaxed), 0);
+        drop(held);
+        assert_eq!(T4_DROPS.load(Ordering::Relaxed), 1);
+        drop(passive);
+        assert_eq!(T4_DROPS.load(Ordering::Relaxed), 1);
     }
 }

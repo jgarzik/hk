@@ -590,7 +590,7 @@ fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult
 fn setxattr_inode(inode: &InodeRef, name: &[u8], value: &[u8], flags: i32) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode
-        .i_op
+        .i_op()
         .setxattr(inode, name, value, flags as u32)
         .map_err(xattr_err)
 }
@@ -682,7 +682,10 @@ fn getxattr_inode(
 ) -> KernelResult<usize> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_READ)?;
     if size == 0 {
-        return inode.i_op.getxattr(inode, name, &mut []).map_err(xattr_err);
+        return inode
+            .i_op()
+            .getxattr(inode, name, &mut [])
+            .map_err(xattr_err);
     }
     // A larger buffer is clamped (Linux do_getxattr): no value is longer
     let size = size.min(XATTR_SIZE_MAX as u64) as usize;
@@ -690,7 +693,7 @@ fn getxattr_inode(
     // is only touched by the copy
     let mut value = crate::util::kmem::try_vec(size, 0u8)?;
     let n = inode
-        .i_op
+        .i_op()
         .getxattr(inode, name, &mut value)
         .map_err(|e| too_big(xattr_err(e), size, XATTR_SIZE_MAX))?;
     copy_out(value_ptr, &value[..n])
@@ -775,14 +778,14 @@ pub fn sys_fgetxattr(
 /// buffer (size 0: only their length)
 fn listxattr_inode(inode: &InodeRef, list_ptr: UserPtr<u8>, size: u64) -> KernelResult<usize> {
     if size == 0 {
-        return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
+        return inode.i_op().listxattr(inode, &mut []).map_err(xattr_err);
     }
     // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer; the
     // user buffer is only touched by the copy
     let size = size.min(XATTR_LIST_MAX as u64) as usize;
     let mut list = crate::util::kmem::try_vec(size, 0u8)?;
     let n = inode
-        .i_op
+        .i_op()
         .listxattr(inode, &mut list)
         .map_err(|e| too_big(xattr_err(e), size, XATTR_LIST_MAX))?;
     copy_out(list_ptr, &list[..n])
@@ -836,7 +839,7 @@ pub fn sys_flistxattr(fd: i32, list_ptr: UserPtr<u8>, size: u64) -> KernelResult
 /// Linux vfs_removexattr, write access already held
 fn removexattr_inode(inode: &InodeRef, name: &[u8]) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
-    inode.i_op.removexattr(inode, name).map_err(xattr_err)
+    inode.i_op().removexattr(inode, name).map_err(xattr_err)
 }
 
 /// sys_removexattr - remove an extended attribute
@@ -970,6 +973,6 @@ pub fn vfs_fallocate(file: &super::File, mode: i32, offset: i64, len: i64) -> Ke
     offset.checked_add(len).ok_or(KernelError::FileTooLarge)?;
     let _lock = inode.lock();
     inode
-        .i_op
+        .i_op()
         .fallocate(&inode, mode, offset as u64, len as u64)
 }

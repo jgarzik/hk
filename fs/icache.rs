@@ -36,8 +36,9 @@
 //!
 //! Locking: one `INODE_HASH_LOCK` (Linux inode_hash_lock), a spin leaf
 //! apart from `test` (which may take `Inode.private` and the
-//! filesystem's inode data lock) and `Inode::igrab` (a candidate's
-//! `i_lock`, Linux find_inode), thread context only: an inode's last
+//! filesystem's inode data lock), `Inode::igrab` (a candidate's
+//! `i_lock`, Linux find_inode) and a hash or unhash (the inode's
+//! `i_lock`, Linux __insert_inode_hash), thread context only: an inode's last
 //! reference never goes in an interrupt handler (pinned pages and files
 //! are released in thread context: `PinnedPages`, `fput`), and lockdep
 //! reports a tracked spin lock taken in one. The table is sized from RAM
@@ -122,10 +123,7 @@ fn find(
 ) -> Found {
     let mut dying = None;
     for i in b.access(l).iter() {
-        if core::ptr::eq(i.sb.as_ptr(), sb)
-            && i.i_hash.load(Ordering::Relaxed) == hashval
-            && test(i)
-        {
+        if core::ptr::eq(i.sb_ptr(), sb) && i.i_hash.load(Ordering::Relaxed) == hashval && test(i) {
             match i.igrab() {
                 Some(a) => return Found::Live(a),
                 None => dying = Some(core::ptr::from_ref(i) as usize),
@@ -208,11 +206,25 @@ pub fn iget5(
     }
 }
 
-/// Hash `i` under `hashval` on its bucket `b` (Linux
-/// __insert_inode_hash: hlist_add_head)
+/// Hash `i` under `hashval` on its bucket `b`, under its `i_lock` too
+/// (Linux __insert_inode_hash: hlist_add_head under inode_hash_lock and
+/// i_lock), so a test of its hashed state under `i_lock`
+/// (`__mark_inode_dirty`) sees it whole
 fn hash_locked(l: &mut InodeHash, b: &Bucket, i: &InodeRef, hashval: u64) {
+    let _il = i.i_lock.lock();
     i.i_hash.store(hashval, Ordering::Relaxed);
     b.access_mut(l).push_front(i);
+}
+
+/// Unhash the hashed `inode` (Linux __remove_inode_hash: under
+/// inode_hash_lock and its i_lock)
+fn unhash_locked(l: &mut InodeHash, inode: &Inode) {
+    let _il = inode.i_lock.lock();
+    let b = bucket(inode.sb_ptr(), inode.i_hash.load(Ordering::Relaxed));
+    // SAFETY: linked (the caller's check under this lock), so on the
+    // bucket of its superblock and hash value (both unchanged while
+    // hashed: `i_hash` is set before it is linked, under this lock)
+    unsafe { b.access_mut(l).remove(inode) };
 }
 
 /// Hash a new inode under `hashval` (Linux insert_inode_hash): for an
@@ -221,7 +233,7 @@ pub fn insert_inode_hash(inode: &InodeRef, hashval: u64) {
     if inode.superblock().is_none() {
         return;
     }
-    let b = bucket(inode.sb.as_ptr(), hashval);
+    let b = bucket(inode.sb_ptr(), hashval);
     hash_locked(&mut INODE_HASH_LOCK.lock(), b, inode, hashval);
 }
 
@@ -233,7 +245,7 @@ pub fn insert_inode_hash_once(inode: &InodeRef, hashval: u64) {
     if inode.superblock().is_none() || inode.i_hash_node.is_linked() {
         return;
     }
-    let b = bucket(inode.sb.as_ptr(), hashval);
+    let b = bucket(inode.sb_ptr(), hashval);
     let mut l = INODE_HASH_LOCK.lock();
     if !inode.i_hash_node.is_linked() {
         hash_locked(&mut l, b, inode, hashval);
@@ -258,18 +270,24 @@ fn unhash(inode: &Inode) -> bool {
     if !inode.i_hash_node.is_linked() {
         return false;
     }
-    let b = bucket(inode.sb.as_ptr(), inode.i_hash.load(Ordering::Relaxed));
-    // SAFETY: linked, so on the bucket of its superblock and hash value
-    // (both unchanged while hashed: `i_hash` is set before it is
-    // linked, under this lock)
-    unsafe { b.access_mut(&mut l).remove(inode) };
+    unhash_locked(&mut l, inode);
     true
 }
 
-/// Move `inode` to `hashval` (Linux fat_detach + fat_attach on rename)
+/// Move `inode` to `hashval` (Linux fat_detach + fat_attach on rename,
+/// which move it in fat's own position hash), in one hold of the lock
+/// and its `i_lock` each, so it never looks unhashed meanwhile (Linux
+/// leaves its VFS hash alone)
 pub fn rehash(inode: &InodeRef, hashval: u64) {
-    remove_inode_hash(inode);
-    insert_inode_hash(inode, hashval);
+    if inode.superblock().is_none() {
+        return;
+    }
+    let mut l = INODE_HASH_LOCK.lock();
+    if inode.i_hash_node.is_linked() {
+        unhash_locked(&mut l, inode);
+    }
+    let b = bucket(inode.sb_ptr(), hashval);
+    hash_locked(&mut l, b, inode, hashval);
 }
 
 /// The last reference to `inode` is gone (Linux iput_final -> evict):
@@ -280,7 +298,7 @@ pub fn rehash(inode: &InodeRef, hashval: u64) {
 /// might_sleep): the filesystem may do I/O (vfat frees an unlinked
 /// file's clusters).
 pub fn evict(inode: &Inode) {
-    inode.i_op.evict_inode(inode);
+    inode.i_op().evict_inode(inode);
     if unhash(inode) {
         // Its waiters queued under the hash lock this unhash took (Linux
         // evict: wake_up_bit(__I_NEW) on the inode's hashed queue)
@@ -314,7 +332,7 @@ mod tests {
 
         fn evict_inode(&self, inode: &Inode) {
             assert!(inode.state() & istate::I_FREEING != 0);
-            let sb = inode.sb.as_ptr();
+            let sb = inode.sb_ptr();
             let h = inode.i_hash.load(Ordering::Relaxed);
             let l = INODE_HASH_LOCK.lock();
             let me = core::ptr::from_ref(inode) as usize;
@@ -354,7 +372,7 @@ mod tests {
             0,
             0,
             Timespec::ZERO,
-            Arc::downgrade(&sb),
+            Some(&sb),
             &DYING_OPS,
         ))
         .unwrap();

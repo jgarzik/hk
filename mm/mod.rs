@@ -250,9 +250,11 @@ impl MmStruct {
         }
         if let Some(i) = v.inode() {
             if v.shared_maywrite() {
-                i.i_data.allow_writable();
+                i.i_mapping().allow_writable();
             }
-            i.i_data.i_mmap.link(file_avc_of(&self.owner, self.pgd, v));
+            i.i_mapping()
+                .i_mmap
+                .link(file_avc_of(&self.owner, self.pgd, v));
         }
     }
 
@@ -263,9 +265,9 @@ impl MmStruct {
         }
         if let Some(i) = v.inode() {
             if v.shared_maywrite() {
-                i.i_data.unmap_writable();
+                i.i_mapping().unmap_writable();
             }
-            i.i_data.i_mmap.unlink(self.pgd, v.start);
+            i.i_mapping().i_mmap.unlink(self.pgd, v.start);
         }
     }
 
@@ -278,7 +280,9 @@ impl MmStruct {
         }
         if let Some(i) = v.inode() {
             let new = file_avc_of(&self.owner, self.pgd, v);
-            i.i_data.i_mmap.update(self.pgd, old_start, |c| *c = new);
+            i.i_mapping()
+                .i_mmap
+                .update(self.pgd, old_start, |c| *c = new);
         }
     }
 
@@ -1173,7 +1177,7 @@ fn vma_needs_copy(v: &Vma) -> bool {
         .file
         .as_ref()
         .and_then(|f| f.mapping_inode())
-        .is_some_and(|i| i.i_op.maps_cache());
+        .is_some_and(|i| i.i_op().maps_cache());
     !(v.is_shared() && refaults)
 }
 

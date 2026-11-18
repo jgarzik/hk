@@ -74,7 +74,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering}
 
 use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
-use crate::fs::DentryRef;
+use crate::fs::path_ref::Path;
 use crate::fs::proc::seq::SeqBuf;
 use crate::io::fasync::{POLL_HUP, POLL_IN};
 use crate::io::poll::{POLLOUT, POLLWRBAND, POLLWRNORM};
@@ -110,18 +110,17 @@ pub const LISTEN: u8 = 10;
 /// pin unbounded memory
 const SKB_OVERHEAD: usize = 576;
 
-/// A bound name (Linux struct unix_address + unix_sock.path)
+/// A bound name (Linux struct unix_address)
 pub struct UnixAddr {
     /// The sockaddr_un getsockname returns (family + sun_path; Linux
     /// addr->len bytes)
     pub name: Vec<u8>,
-    /// The socket inode of a filesystem name
-    pub path: Option<DentryRef>,
 }
 
 impl UnixAddr {
+    /// Linux !addr->name->sun_path[0]
     fn is_abstract(&self) -> bool {
-        self.path.is_none()
+        self.name.get(SUN_PATH) == Some(&0)
     }
 }
 
@@ -271,6 +270,13 @@ pub struct UnixSock {
     /// `rq`'s lock
     inq_len: AtomicUsize,
     addr: RwLock<Option<Arc<UnixAddr>>>,
+    /// The socket inode a filesystem name binds, with its mount (Linux
+    /// unix_sock.path: a bound socket keeps the filesystem busy for
+    /// umount): set by bind before the socket is on its `BSD` bucket,
+    /// copied to an accepted socket, taken by the release after it left
+    /// the bucket. A spin leaf, taken under a `BSD` bucket's lock
+    /// (`find_bsd`) and under `st` (accept)
+    path: Mutex<Option<Path>>,
     iolock: SMutex<()>,
     bindlock: SMutex<()>,
     /// Writers waiting for room in our queue, connectors waiting for
@@ -498,13 +504,12 @@ fn find_bsd(inode: &crate::fs::Inode) -> Option<Arc<UnixSock>> {
         .iter()
         .find(|e| {
             e.is_live()
-                && e.get().addr.read().as_ref().is_some_and(|a| {
+                && e.get().path.lock().as_ref().is_some_and(|p| {
                     // Its inode compared, no reference taken under the
                     // bucket's spin lock (Linux d_backing_inode == i)
-                    a.path.as_ref().is_some_and(|d| {
-                        d.d_inode_rcu(&crate::sync::rcu::read_lock())
-                            .is_some_and(|i| core::ptr::eq(i, inode))
-                    })
+                    p.dentry
+                        .d_inode_rcu(&crate::sync::rcu::read_lock())
+                        .is_some_and(|i| core::ptr::eq(i, inode))
                 })
         })
         .and_then(|e| e.upgrade());
@@ -525,6 +530,7 @@ impl UnixSock {
             rq: SkbOwnedQueue::new(),
             inq_len: AtomicUsize::new(0),
             addr: RwLock::new(None),
+            path: Mutex::new(None),
             iolock: SMutex::new(()),
             bindlock: SMutex::new(()),
             peer_wait: WaitQueue::new(),
@@ -664,15 +670,12 @@ impl UnixSock {
     /// got bound meanwhile
     fn bind_bsd(&self, a: &[u8]) -> Result<(), KernelError> {
         let (path, name) = bsd_name(a)?;
-        let d = crate::fs::dir::mknod_sock(&path, 0o777).map_err(|e| match e {
+        let p = crate::fs::dir::mknod_sock(&path, 0o777).map_err(|e| match e {
             KernelError::AlreadyExists => KernelError::AddressInUse,
             e => e,
         })?;
-        let ino = d.get_inode().map(|i| i.ino);
-        let addr = match try_arc(UnixAddr {
-            name,
-            path: Some(d),
-        }) {
+        let ino = p.dentry.get_inode().map(|i| i.ino);
+        let addr = match try_arc(UnixAddr { name }) {
             Ok(a) => a,
             Err(e) => {
                 crate::fs::dir::unlink_sock(&path);
@@ -688,6 +691,7 @@ impl UnixSock {
             return Err(KernelError::InvalidArgument);
         };
         let me = self.arc();
+        *self.path.lock() = Some(p);
         let _ = self.sk.net.unix.set_addr(&me, addr, bsd_hash(ino), false);
         insert_bsd(&me, ino);
         Ok(())
@@ -697,7 +701,7 @@ impl UnixSock {
     /// bound, EADDRINUSE if the name is taken
     fn bind_abstract(&self, name: Vec<u8>) -> Result<(), KernelError> {
         let hash = abstract_hash(&name, self.sk.stype);
-        let addr = try_arc(UnixAddr { name, path: None })?;
+        let addr = try_arc(UnixAddr { name })?;
         let _b = self.bindlock.lock();
         if self.addr().is_some() {
             return Err(KernelError::InvalidArgument);
@@ -720,7 +724,7 @@ impl UnixSock {
         let me = self.arc();
         let mut name = crate::util::kmem::try_vec(SUN_PATH + 6, 0u8)?;
         name[..SUN_PATH].copy_from_slice(&AF_UNIX.to_ne_bytes());
-        let mut addr = try_arc(UnixAddr { name, path: None })?;
+        let mut addr = try_arc(UnixAddr { name })?;
         let mut n = crate::random::get_random_u32() & 0xFFFFF;
         let last = n;
         loop {
@@ -755,13 +759,17 @@ impl UnixSock {
     fn release_sock(&self, embryo: bool) {
         self.sk.net.unix.remove(self);
         self.unhash_bsd();
-        let (state, peer) = {
+        // The path taken under the state lock as Linux (off its bucket
+        // now, so no lookup reads it), put last (unix_release_sock's
+        // path_put)
+        let (state, peer, path) = {
             let mut st = self.st.lock();
             self.dead.store(true, Ordering::Release);
             self.sk.or_shutdown(SHUTDOWN_MASK);
+            let path = self.path.lock().take();
             let state = self.state();
             self.set_state(CLOSE);
-            (state, st.take())
+            (state, st.take(), path)
         };
         self.sk.state_change();
         self.peer_wait.wake_all();
@@ -790,6 +798,7 @@ impl UnixSock {
         }
         drop(q);
         self.relay_wake();
+        drop(path);
     }
 
     /// Take the whole receive queue off; the caller frees it unlocked

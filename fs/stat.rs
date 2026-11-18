@@ -31,8 +31,8 @@ fn blksize(attr: &super::inode::InodeAttr, bdev: Option<&crate::block::BlockDevi
 
 /// Fill a Stat structure from an inode
 fn fill_stat(inode: &Inode) -> Result<Stat, KernelError> {
-    inode.i_op.getattr_ok(inode)?;
-    let attr = inode.i_op.getattr(inode);
+    inode.i_op().getattr_ok(inode)?;
+    let attr = inode.i_op().getattr(inode);
 
     // Get device ID from superblock (filesystem device)
     let st_dev = inode.superblock().map_or(0, |sb| sb.st_dev());
@@ -363,8 +363,8 @@ fn fill_statx(
     mask: u32,
     mnt: Option<&super::mount::Mount>,
 ) -> Result<Statx, KernelError> {
-    inode.i_op.getattr_ok(inode)?;
-    let attr = inode.i_op.getattr(inode);
+    inode.i_op().getattr_ok(inode)?;
+    let attr = inode.i_op().getattr(inode);
     let sb = inode.superblock();
     let (dev_major, dev_minor) = sb.as_ref().map_or((0, 0), |sb| sb.dev_major_minor());
 

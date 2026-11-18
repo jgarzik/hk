@@ -26,10 +26,23 @@
 //!   directory's free slots at its end starts there and goes on into a
 //!   new cluster (Linux fat_add_entries): after a remount it is found,
 //!   with no end-of-directory slot before it
+//! - VFAT_HOLE_REUSE: a long name whose slots fit a hole that unlinks
+//!   left in a directory takes that hole (Linux fat_add_entries: the
+//!   first free run long enough, before any new cluster): after an
+//!   unmount its long-name slots and short entry are there on the
+//!   device, the directory still has one cluster, and it is found
 //! - VFAT_FSYNC_TIMES: utimensat marks the inode dirty (Linux
 //!   fat_setattr: mark_inode_dirty); fsync writes its entry (Linux
 //!   fat_file_fsync -> sync_inode_metadata -> fat_write_inode): the
 //!   device then holds the new date and time
+//! - VFAT_FDATASYNC_TIMES: an in-place overwrite (no size or cluster
+//!   change) dirties only the times (Linux fat_update_time:
+//!   I_DIRTY_SYNC); fdatasync skips them (Linux simple_fsync_noflush:
+//!   no I_DIRTY_DATASYNC), so the entry keeps its old time; fsync then
+//!   writes the new one
+//! - VFAT_ODSYNC_TIMES: the same for a synchronous write: O_DSYNC syncs
+//!   the data alone (Linux generic_write_sync: datasync unless
+//!   IOCB_SYNC), O_SYNC the times too
 //! - VFAT_REMOUNT_RO: a read-only remount writes the dirty inodes
 //!   back first (Linux fat_reconfigure: sync_filesystem): utimensat
 //!   just before it is in the entry on the device right after it, and
@@ -48,6 +61,12 @@
 //!   inode is iput with i_nlink 0 and fat_evict_inode truncates it, so
 //!   a crafted image loses a live directory's data there; hk checks
 //!   before any inode exists.
+//! - VFAT_DIR_NOMEM: a lookup in a directory whose block is not cached
+//!   yet (a fresh mount), with each of its allocations failing in turn
+//!   (fail-nth), finds the file or is ENOMEM, never ENOENT: a block
+//!   that cannot be read for want of memory is not skipped as an
+//!   unreadable one (Linux sb_bread cannot fail for memory,
+//!   __GFP_NOFAIL; fat__get_entry skips only a block that failed I/O)
 
 use crate::harness::T;
 use crate::helpers::{find_blkdev, host_mode};
@@ -197,11 +216,15 @@ pub fn run_tests() {
     atime_ro(dev);
     unlink_race(dev);
     dir_grow(dev);
+    hole_reuse(dev);
     fsync_times(dev);
+    fdatasync_times(dev);
+    odsync_times(dev);
     remount_ro(dev);
     dirty_expire(dev);
     dirsync(dev);
     bad_dir(dev);
+    dir_nomem(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
     t.done();
@@ -365,6 +388,82 @@ fn bad_dir(dev: &[u8]) {
     t.ok(b"restore", poke(dev, off, &saved), 0);
     t.eq(b"mount restored", mount(dev), 0);
     t.eq(b"rmdir", sys_rmdir(bad.as_ptr()), 0);
+    t.done();
+}
+
+/// VFAT_DIR_NOMEM: NM/F looked up after each remount with its 1st,
+/// 2nd, ... allocation failing; PAD's clusters, taken first, put NM's
+/// block in another page of the device than the root's, so the lookup
+/// in NM makes that page's buffers
+fn dir_nomem(dev: &[u8]) {
+    use crate::io::fault_inject::{get, set};
+    const ENOMEM: i64 = -12;
+    /// Most failure points tried
+    const MAX_NTH: u32 = 300;
+    let (pad, nm, f) = (b"/tmp/vdk/PAD\0", b"/tmp/vdk/NM\0", b"/tmp/vdk/NM/F\0");
+    let fd = sys_open(b"/proc/self/fail-nth\0".as_ptr(), O_RDWR, 0);
+    if fd < 0 {
+        crate::helpers::skip(b"VFAT_DIR_NOMEM", b"no /proc/self/fail-nth");
+        return;
+    }
+    let fd = fd as i32;
+    let mut t = T::new(b"VFAT_DIR_NOMEM");
+    let p = sys_open(pad.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if t.ok(b"create PAD", p >= 0, p) {
+        let buf = [0x5au8; 4096];
+        for _ in 0..8 {
+            sys_write(p as u64, buf.as_ptr(), buf.len() as u64);
+        }
+        sys_close(p as u64);
+    }
+    t.eq(b"mkdir", sys_mkdir(nm.as_ptr(), 0o755), 0);
+    let c = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if t.ok(b"create", c >= 0, c) {
+        sys_close(c as u64);
+    }
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    if !host_mode()
+        && let Some(fa) = Fat::open(dev)
+    {
+        // The test needs NM's block alone in its page (else the root's
+        // walk made its buffers)
+        let page = |c: u32| fa.cl_off(c) / 4096;
+        let at = fa.find(fa.root, b"NM         ").map(|e| page(start(&e)));
+        t.ok(b"NM on disk", at.is_some(), 0);
+        let mut c = Some(fa.root);
+        while let (Some(x), Some(at)) = (c, at) {
+            t.ok(b"NM's page apart from the root's", page(x) != at, at as i64);
+            c = fa.next(x);
+        }
+    }
+    let mut done = false;
+    for nth in 1..=MAX_NTH {
+        // A fresh mount: the device's cache is dropped with its last
+        // opener, so NM's block is read (and its buffers made) again
+        if !t.eq(b"mount", mount(dev), 0) {
+            break;
+        }
+        set(fd, nth);
+        let r = sys_stat(f.as_ptr(), &mut Stat::default());
+        let left = get(fd);
+        set(fd, 0);
+        if !t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0) {
+            break;
+        }
+        if !t.ok(b"stat 0 or ENOMEM", r == 0 || r == ENOMEM, r) {
+            break;
+        }
+        if left != 0 {
+            done = true;
+            break;
+        }
+    }
+    t.ok(b"all failure points run", done, 0);
+    sys_close(fd as u64);
+    t.eq(b"remount", mount(dev), 0);
+    sys_unlink(f.as_ptr());
+    sys_rmdir(nm.as_ptr());
+    sys_unlink(pad.as_ptr());
     t.done();
 }
 
@@ -707,6 +806,84 @@ fn dir_grow(dev: &[u8]) {
     t.done();
 }
 
+/// `/tmp/vdk/HD/F<n>` (one slot, as `grow_path`)
+fn hole_path(n: u64, out: &mut [u8; 32]) -> &[u8] {
+    let len = grow_path(n, out).len();
+    out[b"/tmp/vdk/".len()] = b'H';
+    &out[..len]
+}
+
+/// VFAT_HOLE_REUSE: HD's first cluster filled but for its last slot
+/// with one-slot names F0.., F1..F3 (slots 3..5) unlinked, then a name
+/// of 3 slots (2 long-name ones and its short entry)
+fn hole_reuse(dev: &[u8]) {
+    let mut t = T::new(b"VFAT_HOLE_REUSE");
+    let hd = b"/tmp/vdk/HD\0";
+    let long = b"/tmp/vdk/HD/a long name entry here.txt\0";
+    let per = Fat::open(dev).map_or(0, |f| f.spc * f.bps / 32);
+    if !t.ok(b"geometry", per >= 8, per as i64) {
+        t.done();
+        return;
+    }
+    t.eq(b"mkdir", sys_mkdir(hd.as_ptr(), 0o755), 0);
+    // "." and ".." take slots 0 and 1, F<n> slot n + 2; the last is free
+    let files = per - 3;
+    let mut path = [0u8; 32];
+    for n in 0..files {
+        let fd = sys_open(hole_path(n, &mut path).as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        if fd < 0 {
+            t.ok(b"create", false, fd);
+            break;
+        }
+        sys_close(fd as u64);
+    }
+    for n in 1..4 {
+        t.eq(b"unlink", sys_unlink(hole_path(n, &mut path).as_ptr()), 0);
+    }
+    let fd = sys_open(long.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create long", fd >= 0, fd);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    match Fat::open(dev) {
+        Some(f) => match f.find(f.root, b"HD         ") {
+            Some(e) => {
+                let c = start(&e);
+                t.ok(b"one cluster", f.next(c).is_none(), 0);
+                let attr = |i| f.entry(c, i).map_or(0xff, |e| e[11]);
+                let first = f.entry(c, 3).map_or(0, |e| e[0]);
+                t.eq(b"slot 3 last lfn", i64::from(first), 0x42);
+                t.eq(b"slot 4 lfn", i64::from(attr(4)), 0x0f);
+                let short = f.entry(c, 5).unwrap_or([0; 32]);
+                t.ok(
+                    b"slot 5 short",
+                    short[0] != 0 && short[0] != 0xe5 && short[11] == 0x20,
+                    i64::from(short[11]),
+                );
+            }
+            None => {
+                t.ok(b"HD entry", false, 0);
+            }
+        },
+        None => {
+            t.ok(b"open device", false, 0);
+        }
+    }
+    t.eq(b"remount", mount(dev), 0);
+    t.eq(
+        b"long found",
+        sys_stat(long.as_ptr(), &mut Stat::default()),
+        0,
+    );
+    sys_unlink(long.as_ptr());
+    for n in 0..files {
+        sys_unlink(hole_path(n, &mut path).as_ptr());
+    }
+    t.eq(b"rmdir", sys_rmdir(hd.as_ptr()), 0);
+    t.done();
+}
+
 /// VFAT_FSYNC_TIMES on FS in the root, mounted tz=UTC
 fn fsync_times(dev: &[u8]) {
     let mut t = T::new(b"VFAT_FSYNC_TIMES");
@@ -754,6 +931,96 @@ fn fsync_times(dev: &[u8]) {
         None => {
             t.ok(b"entry", false, 0);
         }
+    }
+    sys_unlink(f.as_ptr());
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
+    t.done();
+}
+
+/// 2017-07-14 02:40:00 UTC as a FAT (time, date): time h << 11 | m << 5
+/// | s / 2, date (year - 1980) << 9 | month << 5 | day
+const OLD_FAT: (i64, i64) = (2 << 11 | 40 << 5, 37 << 9 | 7 << 5 | 14);
+
+/// Give `f` (root entry `short`) a page of data and the mtime 2017-07-14
+/// 02:40:00 UTC, synced (fsync on `fd`): the entry holds that time
+fn old_synced(t: &mut T, dev: &[u8], fd: i32, f: &[u8], short: &[u8; 11]) {
+    let page = [b'a'; 4096];
+    t.eq(b"fill", sys_pwrite64(fd, page.as_ptr(), 4096, 0), 4096);
+    t.eq(b"utimensat old", utimes(f, 1_500_000_000), 0);
+    t.eq(b"fsync old", sys_fsync(fd), 0);
+    let got = disk_time(dev, short);
+    t.ok(b"old on disk", got == OLD_FAT, got.0);
+}
+
+/// Overwrite `fd`'s first bytes in place: no size or cluster change,
+/// only the times (now, unlike the entry's 2017)
+fn overwrite(t: &mut T, fd: i32) {
+    t.eq(b"overwrite", sys_pwrite64(fd, b"bb".as_ptr(), 2, 0), 2);
+}
+
+/// VFAT_FDATASYNC_TIMES on FD in the root, mounted tz=UTC
+fn fdatasync_times(dev: &[u8]) {
+    use hk_syscall::sys_fdatasync;
+    let mut t = T::new(b"VFAT_FDATASYNC_TIMES");
+    let (f, short) = (b"/tmp/vdk/FD\0", b"FD         ");
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(
+        b"mount tz=UTC",
+        mount_with(dev, b"iocharset=cp437,tz=UTC\0"),
+        0,
+    );
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    if fd >= 0 {
+        let fd = fd as i32;
+        old_synced(&mut t, dev, fd, f, short);
+        overwrite(&mut t, fd);
+        t.eq(b"fdatasync", sys_fdatasync(fd), 0);
+        let got = disk_time(dev, short);
+        t.ok(b"times not synced", got == OLD_FAT, got.0);
+        t.eq(b"fsync", sys_fsync(fd), 0);
+        let got = disk_time(dev, short);
+        t.ok(b"times synced", got.0 >= 0 && got != OLD_FAT, got.0);
+        sys_close(fd as u64);
+    }
+    sys_unlink(f.as_ptr());
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
+    t.done();
+}
+
+/// VFAT_ODSYNC_TIMES on OD in the root, mounted tz=UTC
+fn odsync_times(dev: &[u8]) {
+    const O_DSYNC: u32 = 0o10000;
+    const O_SYNC: u32 = 0o4010000;
+    let mut t = T::new(b"VFAT_ODSYNC_TIMES");
+    let (f, short) = (b"/tmp/vdk/OD\0", b"OD         ");
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(
+        b"mount tz=UTC",
+        mount_with(dev, b"iocharset=cp437,tz=UTC\0"),
+        0,
+    );
+    for (flag, name, synced) in [
+        (O_DSYNC, &b"O_DSYNC"[..], false),
+        (O_SYNC, &b"O_SYNC"[..], true),
+    ] {
+        let fd = sys_open(f.as_ptr(), O_CREAT | O_RDWR | flag, 0o644);
+        t.ok(name, fd >= 0, fd);
+        if fd < 0 {
+            continue;
+        }
+        let fd = fd as i32;
+        old_synced(&mut t, dev, fd, f, short);
+        overwrite(&mut t, fd);
+        let got = disk_time(dev, short);
+        if synced {
+            t.ok(b"O_SYNC: times synced", got.0 >= 0 && got != OLD_FAT, got.0);
+        } else {
+            t.ok(b"O_DSYNC: times not synced", got == OLD_FAT, got.0);
+        }
+        sys_close(fd as u64);
     }
     sys_unlink(f.as_ptr());
     t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);

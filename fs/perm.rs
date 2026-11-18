@@ -249,7 +249,7 @@ fn do_utimes(
     // checks too (setattr_prepare: owner, CAP_FOWNER or write access),
     // so a racing chown cannot leave the old owner's decision standing
     let lock = inode.lock();
-    inode.i_op.setattr_ok(&inode)?;
+    inode.i_op().setattr_ok(&inode)?;
     dac::may_utimes(&inode, times.is_some())?;
     // The time is taken in the hold, so ctime never goes backwards
     // between racing updates (Linux notify_change under inode_lock)

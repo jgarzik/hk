@@ -292,7 +292,7 @@ fn create_cgroup_dir_inode(parent: &Inode, cgroup: &Arc<Cgroup>) -> Result<Inode
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     inode.set_private(try_arc(CgroupfsInodeData::Directory {
@@ -320,7 +320,7 @@ fn create_control_file_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     inode.set_private(try_arc(CgroupfsInodeData::ControlFile {
@@ -357,7 +357,7 @@ fn create_subsys_file_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     inode.set_private(try_arc(CgroupfsInodeData::SubsysFile {
@@ -780,7 +780,7 @@ impl SuperOps for CgroupfsSuperOps {
             0,
             0,
             current_time(),
-            Arc::downgrade(sb),
+            Some(sb),
             i_op,
         ))?;
         inode.set_private(try_arc(CgroupfsInodeData::Directory {
@@ -804,20 +804,13 @@ struct CgSuper {
     root: Arc<crate::cgroup::CgroupRoot>,
 }
 
-impl AsAny for CgSuper {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-}
-
 impl crate::fs::superblock::SuperBlockData for CgSuper {}
 
 /// Whether `sb` shows the hierarchy `root` (Linux kernfs_test_super:
 /// the same kernfs root and namespace tag)
 fn shows(sb: &SuperBlock, root: &Arc<crate::cgroup::CgroupRoot>) -> bool {
-    let p = sb.private.read();
-    p.as_ref()
-        .and_then(|p| p.as_any().downcast_ref::<CgSuper>())
+    let g = crate::sync::rcu::read_lock();
+    sb.fs_info_rcu::<CgSuper>(&g)
         .is_some_and(|c| Arc::ptr_eq(&c.root, root))
 }
 
@@ -829,12 +822,11 @@ fn cgroupfs_mount(
     fc: &crate::fs::superblock::FsContext<'_>,
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     let root = CGROUP_ROOT.clone();
-    let info: Arc<dyn crate::fs::superblock::SuperBlockData> =
-        try_arc(CgSuper { root: root.clone() })?;
+    let info = crate::fs::superblock::FsInfo::new(try_arc(CgSuper { root: root.clone() })?)?;
     let test = |sb: &SuperBlock| shows(sb, &root);
     let sb = crate::fs::superblock::sget(fc, &CGROUPFS_SUPER_OPS, Some(&test), &|sb| {
         // Linux kernfs_set_super
-        sb.set_private(info.clone());
+        sb.set_fs_info(info.clone());
         crate::fs::superblock::set_anon_super(sb)
     })?;
     if !sb.has_root() {
@@ -917,7 +909,7 @@ fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
         0,
         0,
         current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &CGROUPFS_INODE_OPS,
     ))?;
     root_inode.set_private(try_arc(CgroupfsInodeData::Directory {
@@ -938,8 +930,7 @@ fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
 /// is never killed)
 fn cgroup_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
     crate::fs::superblock::kill_anon_super(sb, g);
-    let info = sb.private.write().take();
-    drop(info);
+    sb.kill_fs_info();
 }
 
 /// Cgroupfs filesystem type

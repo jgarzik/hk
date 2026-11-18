@@ -13,15 +13,17 @@
 //! unit starts with "HKD6TAG", a kind byte and its index.
 
 use crate::harness::{R, check, report_r};
-use crate::helpers::{BlkDev, find_blkdev};
+use crate::helpers::{BlkDev, find_blkdev, proc_kb, swap_off, swap_on};
 use hk_syscall::{
-    MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Stat, sys_close,
-    sys_fallocate, sys_fstat, sys_fsync, sys_ftruncate, sys_mkdir, sys_mmap, sys_mount, sys_munmap,
-    sys_open, sys_pread64, sys_pwrite64, sys_rmdir, sys_umount2, sys_unlink,
+    MADV_COLD, MADV_PAGEOUT, MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ,
+    PROT_WRITE, Stat, sys_close, sys_fallocate, sys_fstat, sys_fsync, sys_ftruncate, sys_madvise,
+    sys_mkdir, sys_mmap, sys_mount, sys_munmap, sys_open, sys_pread64, sys_pwrite64, sys_rmdir,
+    sys_umount2, sys_unlink,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
 const EINVAL: i64 = -22;
+const EBUSY: i64 = -16;
 const MNT: &[u8] = b"/tmp/vfat_dio\0";
 const UNIT: usize = 512;
 const MIB: usize = 1 << 20;
@@ -33,15 +35,8 @@ pub fn run_tests() {
         report_r(b"VFAT_DIO", check(b"no vda1", false, 0));
         return;
     };
-    let mut p = [0u8; 48];
     sys_mkdir(MNT.as_ptr(), 0o755);
-    let m = sys_mount(
-        p1.path(&mut p).as_ptr(),
-        MNT.as_ptr(),
-        b"vfat\0".as_ptr(),
-        0,
-        b"iocharset=cp437\0".as_ptr() as u64,
-    );
+    let m = mount(&p1);
     if m != 0 {
         report_r(b"VFAT_DIO", check(b"mount", false, m));
         return;
@@ -53,8 +48,24 @@ pub fn run_tests() {
     report_r(b"VFAT_DIO_FRAG", frag(&p1));
     report_r(b"VFAT_DIO_EOF_TAIL", eof_tail());
     report_r(b"VFAT_WRITE_SHORT", write_short());
+    report_r(b"VFAT_PARTIAL_WB", partial_wb(&p1));
+    report_r(b"VFAT_SWAPFILE_IO", swapfile_io());
+    report_r(b"VFAT_SWAPON_FULL", swapon_full());
+    report_r(b"VFAT_DIO_HOLE", hole(&p1));
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
+}
+
+/// Mount vda1 at MNT
+fn mount(p1: &BlkDev) -> i64 {
+    let mut p = [0u8; 48];
+    sys_mount(
+        p1.path(&mut p).as_ptr(),
+        MNT.as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    )
 }
 
 /// Anonymous memory (page aligned), unmapped when dropped
@@ -338,8 +349,6 @@ fn read_disk(p1: &BlkDev) -> R {
         poke(p1, &b, at[5], b'X', 5)?;
         poke(p1, &b, at[3000], b'X', 3000)?;
         // Buffered, not written back: the direct read writes it back
-        // (another page than the units changed on disk: hk writes a
-        // file page back whole, Linux only its dirty blocks)
         tag(b.bytes(0, UNIT), b'Y', 20);
         let w = sys_pwrite64(bf, b.ptr(0), UNIT as u64, 20 * UNIT as i64);
         check(b"buffered write", w == UNIT as i64, w)?;
@@ -490,4 +499,216 @@ fn write_short() -> R {
     check(b"short write", w == 4096, w)?;
     check(b"size", after.1 == 8192, after.1)?;
     check(b"blocks kept", after.0 == 128, after.0)
+}
+
+/// A vfat file is a swap area (Linux generic_swapfile_activate over
+/// fat's ->bmap: its page-aligned runs of blocks, written straight to
+/// the disk): anonymous pages paged out to it come back intact, before
+/// and after swapoff. The area is its file, whatever path names it
+/// (Linux: IS_SWAPFILE under the inode lock, swapoff by f_mapping):
+/// swapon by another spelling is EBUSY, swapoff by one works.
+fn swapfile_io() -> R {
+    const PAGES: usize = 256;
+    const ANON: usize = 64;
+    let b = Buf::new(PAGES * 4096)?;
+    let hdr = b.bytes(0, 4096);
+    hdr.fill(0);
+    // union swap_header: info.version at 1024, info.last_page at 1028
+    hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+    hdr[1028..1032].copy_from_slice(&(PAGES as u32 - 1).to_ne_bytes());
+    hdr[4086..].copy_from_slice(b"SWAPSPACE2");
+    put(b"SWAP.BIN", b.bytes(0, PAGES * 4096))?;
+    let mut p = [0u8; 64];
+    path(b"SWAP.BIN", &mut p);
+    // The same file through "//"
+    let mut q = [0u8; 64];
+    path(b"/SWAP.BIN", &mut q);
+    let on = swap_on(&p);
+    let mut again = -1;
+    let r = (|| {
+        check(b"swapon", on == 0, on)?;
+        again = swap_on(&q);
+        check(b"swapon other path", again == EBUSY, again)?;
+        let a = Buf::new(ANON * 4096)?;
+        let word = |i: usize| (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let words = |a: &Buf| {
+            // SAFETY: the mapping holds ANON pages of u64s, page aligned
+            unsafe { core::slice::from_raw_parts_mut(a.ptr(0) as *mut u64, ANON * 512) }
+        };
+        for (i, w) in words(&a).iter_mut().enumerate() {
+            *w = word(i);
+        }
+        sys_madvise(a.at, (ANON * 4096) as u64, MADV_COLD);
+        let m = sys_madvise(a.at, (ANON * 4096) as u64, MADV_PAGEOUT);
+        check(b"pageout", m == 0, m)?;
+        let vs = proc_kb(b"/proc/self/status ", b"VmSwap:");
+        check(b"swapped", vs > 0, vs)?;
+        let bad = words(&a)
+            .iter()
+            .enumerate()
+            .position(|(i, &w)| w != word(i));
+        check(b"data", bad.is_none(), bad.map_or(0, |i| i as i64))?;
+        sys_madvise(a.at, (ANON * 4096) as u64, MADV_PAGEOUT);
+        let off = swap_off(&q);
+        check(b"swapoff other path", off == 0, off)?;
+        let bad = words(&a)
+            .iter()
+            .enumerate()
+            .position(|(i, &w)| w != word(i));
+        check(
+            b"data after swapoff",
+            bad.is_none(),
+            bad.map_or(0, |i| i as i64),
+        )
+    })();
+    if on == 0 && r.is_err() {
+        swap_off(&p);
+    }
+    if again == 0 {
+        swap_off(&p);
+    }
+    sys_unlink(p.as_ptr());
+    r
+}
+
+/// swapon with every swap type taken is EPERM (Linux alloc_swap_info:
+/// no type below MAX_SWAPFILES without SWP_USED), not EBUSY: small vfat
+/// swap files go on one by one until one is refused. MAX_SWAPFILES is
+/// hk's 32, Linux's 32 less the special entry types its config has.
+fn swapon_full() -> R {
+    const N: usize = 40;
+    const PAGES: usize = 8;
+    const EPERM: i64 = -1;
+    let b = Buf::new(PAGES * 4096)?;
+    let hdr = b.bytes(0, 4096);
+    hdr.fill(0);
+    hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+    hdr[1028..1032].copy_from_slice(&(PAGES as u32 - 1).to_ne_bytes());
+    hdr[4086..].copy_from_slice(b"SWAPSPACE2");
+    let mut paths = [[0u8; 64]; N];
+    let (mut made, mut on, mut refused) = (0, 0, 0);
+    let mut r = Ok(());
+    for (i, p) in paths.iter_mut().enumerate() {
+        let name = [b'S', b'W', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8];
+        path(&name, p);
+        r = put(&name, b.bytes(0, PAGES * 4096));
+        if r.is_err() {
+            break;
+        }
+        made += 1;
+        let s = swap_on(p);
+        if s != 0 {
+            refused = s;
+            break;
+        }
+        on += 1;
+    }
+    for p in &paths[..on] {
+        swap_off(p);
+    }
+    for p in &paths[..made] {
+        sys_unlink(p.as_ptr());
+    }
+    r?;
+    check(b"none on", on > 0, on as i64)?;
+    check(b"refused", refused == EPERM, refused)
+}
+
+/// A file whose entry has a size but no cluster (Linux
+/// fat_bmap_cluster: i_start 0 maps nothing, so its blocks are holes)
+/// reads as zeros through O_DIRECT (Linux do_direct_IO zeroes a hole),
+/// not EIO
+fn hole(p1: &BlkDev) -> R {
+    const NAME: &[u8; 11] = b"HOLE    BIN";
+    put(b"HOLE.BIN", &[])?;
+    let r = entry_size(p1, NAME, 4096).and_then(|()| {
+        let fd = open(b"HOLE.BIN", O_RDWR | O_DIRECT);
+        check(b"open", fd >= 0, fd as i64)?;
+        let b = Buf::new(4096)?;
+        b.bytes(0, 4096).fill(0xa5);
+        let n = sys_pread64(fd, b.ptr(0), 4096, 0);
+        sys_close(fd as u64);
+        check(b"read", n == 4096, n)?;
+        let nz = b.bytes(0, 4096).iter().position(|&c| c != 0);
+        check(b"zeros", nz.is_none(), nz.map_or(0, |i| i as i64))
+    });
+    // Empty again before it goes
+    let back = entry_size(p1, NAME, 0);
+    sys_unlink(path(b"HOLE.BIN", &mut [0; 64]));
+    r.and(back)
+}
+
+/// Set the size in the directory entry `name` (8.3, padded) on the
+/// disk to `size`, vda1 unmounted meanwhile
+fn entry_size(p1: &BlkDev, name: &[u8; 11], size: u32) -> R {
+    let u = sys_umount2(MNT.as_ptr(), 0);
+    check(b"umount", u == 0, u)?;
+    let r = poke_entry(p1, name, size);
+    let m = mount(p1);
+    r?;
+    check(b"remount", m == 0, m)
+}
+
+/// The first live short entry `name` on vda1 (not deleted, not a long
+/// name piece) gets `size`, written straight to the disk
+fn poke_entry(p1: &BlkDev, name: &[u8; 11], size: u32) -> R {
+    let buf = Buf::new(MIB)?;
+    let mut p = [0u8; 48];
+    let fd = sys_open(p1.path(&mut p).as_ptr(), O_RDWR | O_DIRECT, 0) as i32;
+    check(b"open vda1", fd >= 0, fd as i64)?;
+    let r = (|| {
+        let mut off = 0;
+        while off < PART {
+            let n = sys_pread64(fd, buf.ptr(0), MIB as u64, off as i64);
+            check(b"entry scan", n == MIB as i64, n)?;
+            let hit = buf
+                .bytes(0, MIB)
+                .chunks(32)
+                .position(|e| &e[..11] == name && e[11] != 0x0f);
+            if let Some(k) = hit {
+                let e = k * 32;
+                buf.bytes(e + 28, 4).copy_from_slice(&size.to_le_bytes());
+                let unit = e / UNIT * UNIT;
+                let w = sys_pwrite64(fd, buf.ptr(unit), UNIT as u64, (off + unit) as i64);
+                return check(b"entry write", w == UNIT as i64, w);
+            }
+            off += MIB;
+        }
+        check(b"entry found", false, 0)
+    })();
+    sys_close(fd as u64);
+    r
+}
+
+/// Writeback writes only a page's dirty blocks (Linux buffer heads,
+/// __block_write_full_folio): a block of a cached page rewritten
+/// through the cache, its neighbour in the same page changed on the
+/// disk behind the cache, an fsync leaves the neighbour as the disk
+/// has it
+fn partial_wb(p1: &BlkDev) -> R {
+    const N: usize = 4096 / UNIT;
+    let b = Buf::new(MIB)?;
+    tag_all(b.bytes(0, N * UNIT), b'P', 0);
+    put(b"PARTWB.BIN", b.bytes(0, N * UNIT))?;
+    let fd = open(b"PARTWB.BIN", O_RDWR);
+    let r = (|| {
+        check(b"open", fd >= 0, fd as i64)?;
+        let mut at = [0i64; N];
+        scan(p1, &b, b'P', &mut at)?;
+        let missing = at.iter().filter(|&&o| o < 0).count();
+        check(b"found", missing == 0, missing as i64)?;
+        tag(b.bytes(0, UNIT), b'Q', 0);
+        let w = sys_pwrite64(fd, b.ptr(0), UNIT as u64, 0);
+        check(b"buffered write", w == UNIT as i64, w)?;
+        poke(p1, &b, at[1], b'Q', 1)?;
+        let s = sys_fsync(fd);
+        check(b"fsync", s == 0, s)?;
+        let mut got = [0i64; N];
+        scan(p1, &b, b'Q', &mut got)?;
+        check(b"written block", got[0] == at[0], got[0])?;
+        check(b"neighbour kept", got[1] == at[1], got[1])
+    })();
+    sys_close(fd as u64);
+    sys_unlink(path(b"PARTWB.BIN", &mut [0; 64]));
+    r
 }

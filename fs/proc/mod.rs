@@ -571,8 +571,8 @@ pub struct ProcRcu {
     pid: Option<ProcPid>,
     kind: RcuKind,
     ctl: Option<&'static crate::sysctl::Ctl>,
-    /// The superblock's options (`ProcOpts`)
-    opts: Option<Arc<dyn crate::fs::superblock::SuperBlockData>>,
+    /// The superblock's options
+    opts: Option<Arc<opts::ProcOpts>>,
 }
 
 impl AsAny for ProcRcu {
@@ -612,10 +612,7 @@ enum RcuKind {
 }
 
 impl ProcRcu {
-    fn of(
-        d: &ProcfsInodeData,
-        opts: Option<Arc<dyn crate::fs::superblock::SuperBlockData>>,
-    ) -> Self {
+    fn of(d: &ProcfsInodeData, opts: Option<Arc<opts::ProcOpts>>) -> Self {
         use ProcfsInodeData as D;
         let kind = match d {
             D::Directory { .. } | D::File { .. } | D::FixedLink(_) => RcuKind::Static,
@@ -649,10 +646,7 @@ impl ProcRcu {
 
     /// The superblock's options
     fn opts(&self) -> Option<&opts::ProcOpts> {
-        self.opts
-            .as_ref()?
-            .as_any()
-            .downcast_ref::<opts::ProcOpts>()
+        self.opts.as_deref()
     }
 
     /// The task, borrowed for `g` (Linux pid_task under rcu_read_lock)
@@ -664,7 +658,9 @@ impl ProcRcu {
 /// A new procfs inode's data, and what an RCU walk reads of it, before
 /// the inode is visible
 fn set_data(inode: &InodeRef, data: ProcfsInodeData) -> Result<(), KernelError> {
-    let opts = inode.superblock().and_then(|sb| sb.get_private());
+    let opts = inode
+        .superblock()
+        .and_then(|sb| sb.fs_info::<opts::ProcOpts>());
     inode.set_private_rcu(try_arc(ProcRcu::of(&data, opts))?);
     inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
     Ok(())
@@ -968,7 +964,7 @@ fn create_dir_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, data)?;
@@ -990,7 +986,7 @@ fn create_file_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, data)?;
@@ -1006,7 +1002,7 @@ fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<InodeRef, Kernel
         0,                           // gid: root
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::new_pid_dir(pid))?;
@@ -1030,7 +1026,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Some(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_ns_dir(p.clone()))?;
@@ -1046,7 +1042,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Some(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_fd_dir(p.clone()))?;
@@ -1073,7 +1069,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Some(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_fdinfo_dir(p.clone()))?;
@@ -1092,7 +1088,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Some(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(
@@ -1114,7 +1110,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 gid,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Some(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::FailNth { pid: p.clone() })?;
@@ -1131,7 +1127,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 gid,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Some(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_file(p.clone(), generator))?;
@@ -1163,7 +1159,7 @@ fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef,
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::new_ns_file(p.clone(), ns_type))?;
@@ -1218,7 +1214,7 @@ fn create_self_link(parent: &Inode) -> Result<InodeRef, KernelError> {
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::SelfLink)?;
@@ -1289,7 +1285,7 @@ fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef,
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     fd_update_inode(&inode, &file);
@@ -1341,7 +1337,7 @@ fn lookup_pid_fdinfo_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Inode
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::new_fdinfo_file(p.clone(), fd))?;
@@ -2469,7 +2465,7 @@ impl SuperOps for ProcfsSuperOps {
             0, // gid: root group
             0,
             current_time(),
-            Arc::downgrade(sb),
+            Some(sb),
             i_op,
         ))?;
 
@@ -2607,7 +2603,7 @@ fn mk_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(sb),
+        Some(sb),
         &PROCFS_INODE_OPS,
     ))?;
     // A fixed symlink's target in the inode (Linux proc_symlink's
@@ -2640,7 +2636,7 @@ impl DirBuild {
             0,
             0,
             current_time(),
-            Arc::downgrade(sb),
+            Some(sb),
             &PROCFS_INODE_OPS,
         ))?;
         Ok(Self {
@@ -2767,20 +2763,19 @@ pub fn proc_flush_pid(
 }
 
 /// procfs's kill_sb (Linux proc_kill_sb): kill_anon_super, then its
-/// options (the pid namespace reference) go
+/// options (the pid namespace reference) go, a grace period on
 fn proc_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
     crate::fs::superblock::kill_anon_super(sb, g);
-    let info = sb.private.write().take();
-    drop(info);
+    sb.kill_fs_info();
 }
 
 /// Mount function for procfs
 fn procfs_mount(
     fc: &crate::fs::superblock::FsContext<'_>,
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
-    let opts = try_arc(opts::ProcOpts::new(fc.data)?)?;
+    let opts = crate::fs::superblock::FsInfo::new(try_arc(opts::ProcOpts::new(fc.data)?)?)?;
     crate::fs::superblock::get_tree_nodev(fc, &PROCFS_SUPER_OPS, |sb| {
-        sb.set_private(opts);
+        sb.set_fs_info(opts);
         procfs_fill(sb)
     })
 }

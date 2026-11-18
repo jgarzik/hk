@@ -327,6 +327,7 @@ pub fn destroy_cache(si: &SwapInfo) {
 pub fn total_cached() -> u64 {
     super::swapfile::SWAP_INFO
         .read()
+        .dev
         .iter()
         .flatten()
         .map(|si| si.cached.load(Ordering::Relaxed))

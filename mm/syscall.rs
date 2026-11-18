@@ -90,7 +90,7 @@ impl WritableHold {
     fn new(v: &Vma) -> Result<Self, KernelError> {
         let inode = v.inode().filter(|_| v.shared_maywrite());
         if let Some(i) = &inode {
-            i.i_data.map_writable()?;
+            i.i_mapping().map_writable()?;
         }
         Ok(Self(inode))
     }
@@ -99,7 +99,7 @@ impl WritableHold {
 impl Drop for WritableHold {
     fn drop(&mut self) {
         if let Some(i) = &self.0 {
-            i.i_data.unmap_writable();
+            i.i_mapping().unmap_writable();
         }
     }
 }
@@ -1274,14 +1274,21 @@ fn msync_vmas(mm: &super::Mm, mut start: u64, end: u64, flags: i32) -> Result<()
             if flags & MS_INVALIDATE != 0 && vma.is_locked() {
                 return Err(KernelError::Busy);
             }
+            // The file bytes [fstart, fend] behind [start, min(end,
+            // vm_end)), start past a hole moved to vm_start (Linux
+            // linear_page_index)
+            let s = start.max(vma.start);
+            let fstart = vma.offset + (s - vma.start);
+            let fend = fstart + (end.min(vma.end) - s) - 1;
             start = vma.end;
             vma.file
                 .clone()
                 .filter(|_| flags & MS_SYNC != 0 && vma.is_shared())
+                .map(|f| (f, fstart, fend))
         };
-        // The whole file is written back (Linux: the range only)
-        if let Some(f) = file {
-            crate::fs::sync::vfs_fsync(&f, false)?;
+        // Linux msync: vfs_fsync_range(file, fstart, fend, 1)
+        if let Some((f, fstart, fend)) = file {
+            crate::fs::pageio::sync::vfs_fsync_range(&f, fstart, fend, true)?;
         }
     }
     if unmapped {
@@ -1626,7 +1633,7 @@ fn move_mapping(
     mm.insert_vma(new_vma);
     mm.add_total_vm(new_len / PAGE_SIZE);
     {
-        let _rmap = inode.as_ref().map(|i| i.i_data.i_mmap.lock_write());
+        let _rmap = inode.as_ref().map(|i| i.i_mapping().i_mmap.lock_write());
         let t = super::pgtable::PgTables::new(owner, mm);
         super::mremap::move_ptes(owner, t, old_addr, new_addr, old_len);
     }

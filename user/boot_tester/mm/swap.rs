@@ -18,6 +18,7 @@ pub fn run_tests() {
     println(b"=== Swap Tests ===");
 
     test_swapon_enoent();
+    test_swapon_bad_flags();
     test_swapoff_einval();
     test_swapon_invalid_header();
     test_swapon_size();
@@ -83,6 +84,21 @@ fn test_swapon_enoent() {
         print(b"FAIL (got ");
         print_num(ret);
         println(b")");
+    }
+}
+
+/// Flags outside SWAP_FLAGS_VALID (prio mask, PREFER, the three
+/// DISCARDs) are EINVAL before anything else (Linux: before the
+/// capability check and the path lookup, so not ENOENT here)
+fn test_swapon_bad_flags() {
+    print(b"  swapon bad flags: ");
+    let ret = sys_swapon(b"/nonexistent_swap\0".as_ptr(), 0x8_0000);
+    if ret == EINVAL {
+        println(b"PASS");
+    } else {
+        print(b"FAIL (got ");
+        print_num(ret);
+        println(b", expected -22)");
     }
 }
 

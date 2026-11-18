@@ -162,6 +162,12 @@ impl<T: ?Sized> Mutex<T> {
     pub fn get_mut(&mut self) -> &mut T {
         self.data.get_mut()
     }
+
+    /// Its data's address (std Mutex::data_ptr): a `&T` there is had
+    /// only through a guard of this mutex, or `get_mut`
+    pub fn data_ptr(&self) -> *const T {
+        self.data.get().cast_const()
+    }
 }
 
 impl<T: Default> Default for Mutex<T> {

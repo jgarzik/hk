@@ -38,12 +38,6 @@ pub struct ProcOpts {
 
 impl SuperBlockData for ProcOpts {}
 
-impl crate::fs::inode::AsAny for ProcOpts {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-}
-
 /// What one options string sets (None: left as it is)
 #[derive(Default)]
 struct Parsed {
@@ -194,13 +188,12 @@ impl ProcOpts {
 
 /// `f` on the options of the procfs superblock `sb`
 pub fn with_sb<R>(sb: &SuperBlock, f: impl FnOnce(&ProcOpts) -> R) -> Option<R> {
-    let p = sb.get_private()?;
-    p.as_any().downcast_ref::<ProcOpts>().map(f)
+    sb.fs_info::<ProcOpts>().map(|o| f(&o))
 }
 
 /// `f` on the options of the procfs superblock `inode` is on
 pub fn with<R>(inode: &Inode, f: impl FnOnce(&ProcOpts) -> R) -> Option<R> {
-    with_sb(&*inode.superblock()?, f)
+    with_sb(inode.superblock()?, f)
 }
 
 /// The pid namespace the procfs superblock `sb` shows
@@ -212,7 +205,7 @@ pub fn sb_pid_ns(sb: &SuperBlock) -> Arc<PidNamespace> {
 pub fn pid_ns(inode: &Inode) -> Arc<PidNamespace> {
     inode
         .superblock()
-        .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |sb| sb_pid_ns(&sb))
+        .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |sb| sb_pid_ns(sb))
 }
 
 #[cfg(test)]

@@ -167,6 +167,24 @@ pub fn on_each_cpu(func: fn(usize), info: usize) {
     local_irq_restore(irq);
 }
 
+/// Run `func(info)` on each active CPU for which `cond(cpu, info)`
+/// holds, this one included (interrupts off), and wait for all (Linux
+/// on_each_cpu_cond): `cond` runs here, for each CPU, before any call
+pub fn on_each_cpu_cond(cond: fn(u32, usize) -> bool, func: fn(usize), info: usize) {
+    let mut mask = CpuSet::new();
+    for cpu in ACTIVE.snapshot().iter() {
+        if cond(cpu, info) {
+            mask.set(cpu);
+        }
+    }
+    smp_call_function_many(&mask, func, info, true);
+    if mask.test(this_id()) {
+        let irq = local_irq_save();
+        func(info);
+        local_irq_restore(irq);
+    }
+}
+
 /// [`smp_call_function_many`] with a borrowed argument, waiting: the
 /// call returns once every target ran `func(arg)`, so `arg` outlives them
 pub fn smp_call_many_ref<T: Sync>(mask: &CpuSet, func: fn(&T), arg: &T) {

@@ -2,7 +2,13 @@
 //! DIO_LOCKING, called from generic_file_read_iter and
 //! generic_file_direct_write / direct_write_fallback): bios between the
 //! file's clusters and the caller's pinned pages (`block::dio`), the
-//! chain mapped once per I/O into disk extents (`cache::extents`).
+//! range mapped once per I/O into disk extents by fat_get_block (Linux
+//! do_blockdev_direct_IO's get_more_blocks, DIO_SKIP_HOLES: `create`
+//! only past the size, where a write's blocks lie below mmu_private).
+//! An unmapped block below the size (a file with no cluster, Linux
+//! fat_bmap_cluster's i_start 0: its only holes) reads as zeros; a
+//! write meeting one goes through the cache (Linux do_direct_IO:
+//! -ENOTBLK, then the buffered fallback).
 //!
 //! - Alignment: the position and every segment's address and length
 //!   are multiples of the filesystem's block (its logical sector), or
@@ -40,11 +46,13 @@
 //!   No RWF_NOWAIT (Linux fat has no FMODE_NOWAIT: EOPNOTSUPP).
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::block::dio::{self, AsyncIo, Extent};
 use crate::fs::file::{File, RwFlags};
 use crate::fs::inode::{Inode, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::pageio::buffer::BufferHead;
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::mm::gup::PageSeg;
 use crate::sync::IrqSpinlock;
@@ -52,7 +60,8 @@ use crate::task::workqueue::{SYSTEM_WQ, Work};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
-use super::{VfatSbData, cache, get_inode_data, get_sb_data, vfat_write, write_failed};
+use super::aops::{fat_get_block, fat_write_failed};
+use super::{VfatSbData, mmu_private, msdos_sb_of, vfat_write};
 
 /// Last byte of `count` (> 0) bytes at `pos`
 fn last(pos: u64, count: usize) -> u64 {
@@ -72,25 +81,52 @@ fn blocksize(sb: &VfatSbData, pos: u64, mem: u64) -> Result<u64, KernelError> {
         .ok_or(KernelError::InvalidArgument)
 }
 
-/// The disk extents of the file's `len` bytes at `pos`; EIO if the
-/// chain ends first (Linux fat_bmap: "request beyond EOF")
+/// The disk extents of the file's `len` bytes at `pos`, a run of
+/// blocks per fat_get_block, contiguous ones merged (Linux
+/// get_more_blocks with DIO_SKIP_HOLES: a write's blocks past the size
+/// mapped with `create`), an unmapped block a hole of one block (Linux
+/// do_direct_IO zeroes a hole block by block); None if a write meets
+/// one (Linux -ENOTBLK: vfat's holes are a whole file without a
+/// cluster, so nothing before it would go direct). EIO for a chain
+/// that ends first (fat_bmap: "request beyond EOF").
 fn map(
-    sb: &VfatSbData,
     inode: &Inode,
     pos: u64,
     len: usize,
-) -> Result<alloc::vec::Vec<Extent>, KernelError> {
-    let m = cache::extents(sb, inode, pos, len)?;
-    if m.iter().map(|e| e.1).sum::<usize>() != len {
-        return Err(KernelError::Io);
+    write: bool,
+) -> Result<Option<Vec<Extent>>, KernelError> {
+    let bits = inode.blkbits();
+    let bs = 1u64 << bits;
+    let (end, size) = (pos + len as u64, inode.get_size());
+    let map_bh = BufferHead::new_map(0);
+    let mut out: Vec<Extent> = Vec::new();
+    let mut at = pos;
+    while at < end {
+        let block = at >> bits;
+        let off = at & (bs - 1);
+        map_bh.clear_state();
+        map_bh.set_size(((end - (block << bits)).div_ceil(bs) << bits) as usize);
+        let create = write && (size == 0 || block > (size - 1) >> bits);
+        fat_get_block(inode, block, &map_bh, create)?;
+        let (disk, n) = if map_bh.mapped() {
+            let n = (map_bh.size() as u64 - off).min(end - at) as usize;
+            (Some((map_bh.blocknr() << bits) + off), n)
+        } else if write {
+            return Ok(None);
+        } else {
+            (None, (bs - off).min(end - at) as usize)
+        };
+        match (out.last_mut(), disk) {
+            (Some((Some(o), l)), Some(d)) if *o + *l as u64 == d => *l += n,
+            (Some((None, l)), None) => *l += n,
+            _ => {
+                out.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
+                out.push((disk, n));
+            }
+        }
+        at += n as u64;
     }
-    Ok(m)
-}
-
-/// The filesystem of `inode`
-fn sb_of(inode: &Inode) -> Result<VfatSbData, KernelError> {
-    let sb = inode.superblock().ok_or(KernelError::Io)?;
-    get_sb_data(&sb)
+    Ok(Some(out))
 }
 
 /// O_DIRECT read of `to` at `pos` (Linux generic_file_read_iter with
@@ -124,14 +160,14 @@ fn direct_read(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize, K
     if pos >= size {
         return Ok(0);
     }
-    let sb = sb_of(inode)?;
-    let bs = blocksize(&sb, pos, to.alignment())?;
+    let sb = msdos_sb_of(inode);
+    let bs = blocksize(sb, pos, to.alignment())?;
     filemap::write_and_wait_range(inode, pos, last(pos, count))?;
     // The block holding the last byte is read whole (Linux: up to
     // i_size aligned to the block)
     let len = (size.next_multiple_of(bs) - pos).min(count as u64) as usize;
     to.truncate(len);
-    let m = map(&sb, inode, pos, len)?;
+    let m = map(inode, pos, len, false)?.ok_or(KernelError::Io)?;
     // Counted until the last bio is done, after the lock is dropped: a
     // truncate waits for it before freeing clusters (Linux
     // inode_dio_begin in do_blockdev_direct_IO)
@@ -154,7 +190,7 @@ fn invalidate_pages(inode: &Inode, pos: u64, count: usize) -> Result<(), KernelE
 /// error but the mapping's (`filemap::dio_warn_stale_pagecache`)
 fn invalidate_post(inode: &Inode, pos: u64, count: usize) {
     let p = PAGE_SIZE as u64;
-    if inode.i_data.nrpages() != 0
+    if inode.i_mapping().nrpages() != 0
         && filemap::invalidate_pages2(inode, pos / p, last(pos, count) / p).is_err()
     {
         filemap::dio_warn_stale_pagecache(inode);
@@ -189,23 +225,24 @@ fn direct_write(
     let end = pos + count as u64;
     // Linux fat_direct_IO: blocks past mmu_private would need zeroing
     // first, so the whole write falls back to the cache
-    if get_inode_data(inode)?.mmu_private < end {
+    if mmu_private(inode)? < end {
         return Ok(0);
     }
-    let sb = sb_of(inode)?;
-    let r = blocksize(&sb, pos, from.alignment())
-        .and_then(|_| map(&sb, inode, pos, count))
-        .and_then(|m| {
-            let _dio = inode.dio_guard();
-            dio::direct_io_map(&sb.bdev, from, &m, ())
+    let sb = msdos_sb_of(inode);
+    let r = blocksize(sb, pos, from.alignment())
+        .and_then(|_| map(inode, pos, count, true))
+        .and_then(|m| match m {
+            Some(m) => {
+                let _dio = inode.dio_guard();
+                dio::direct_io_map(&sb.bdev, from, &m, ())
+            }
+            // A hole: all of it through the cache
+            None => Ok(0),
         });
     let n = match r {
         Ok(n) => n,
         Err(e) => {
-            // Linux fat_write_failed
-            if end > inode.get_size() {
-                let _ = write_failed(inode, &sb);
-            }
+            fat_write_failed(inode, end);
             return Err(e);
         }
     };
@@ -215,7 +252,7 @@ fn direct_write(
         if at > inode.get_size() {
             inode.set_size(at);
             // Linux generic_file_direct_write: mark_inode_dirty
-            crate::fs::fs_writeback::mark_inode_dirty(inode);
+            crate::fs::pageio::fs_writeback::mark_inode_dirty(inode);
         }
     }
     Ok(n)
@@ -379,7 +416,7 @@ unsafe impl AsyncIo for VfatAio {
 
     fn complete(self: Arc<Self>, res: Result<usize, KernelError>) {
         let res = res.map(|n| n.min(self.cut));
-        let cached = matches!(res, Ok(n) if n > 0) && self.inode().i_data.nrpages() != 0;
+        let cached = matches!(res, Ok(n) if n > 0) && self.inode().i_mapping().nrpages() != 0;
         if let Some(p) = self.post.as_ref().filter(|_| cached) {
             let (job, work) = (p.job.clone(), p.work.clone());
             *job.lock() = Some((self, res));
@@ -433,11 +470,11 @@ fn read_async(
     if pos >= size {
         return Ok(Some(0));
     }
-    let sb = sb_of(inode)?;
-    let bs = blocksize(&sb, pos, IovDest::async_io(&*io).alignment())?;
+    let sb = msdos_sb_of(inode);
+    let bs = blocksize(sb, pos, IovDest::async_io(&*io).alignment())?;
     filemap::write_and_wait_range(inode, pos, last(pos, count))?;
     let len = (size.next_multiple_of(bs) - pos).min(count as u64) as usize;
-    let m = map(&sb, inode, pos, len)?;
+    let m = map(inode, pos, len, false)?.ok_or(KernelError::Io)?;
     // Lossless: below `count`
     let cut = (size - pos).min(count as u64) as usize;
     let w = VfatAio::new(io, inode, cut, None)?;
@@ -463,29 +500,32 @@ fn write_async(
         file.write_iter(&mut IovSource::async_io(io), Some(pos), flags, append)
             .map(Some)
     };
-    let synchronous = inode.superblock().is_some_and(|sb| sb.synchronous());
     if count == 0
-        || synchronous
+        || inode.is_sync()
         || flags.intersects(RwFlags::APPEND | RwFlags::DSYNC | RwFlags::SYNC)
     {
         return sync(&*io);
     }
     let lock = inode.lock();
-    let sb = sb_of(inode)?;
+    let sb = msdos_sb_of(inode);
     let end = pos
         .checked_add(count as u64)
         .ok_or(KernelError::InvalidArgument)?;
     let fits = !inode.is_swapfile()
         && end <= inode.get_size()
-        && get_inode_data(inode)?.mmu_private >= end
-        && inode.i_data.nrpages() == 0
+        && mmu_private(inode)? >= end
+        && inode.i_mapping().nrpages() == 0
         && inode.write_limit(pos, count) == Ok(count)
-        && blocksize(&sb, pos, IovSource::async_io(&*io).alignment()).is_ok();
+        && blocksize(sb, pos, IovSource::async_io(&*io).alignment()).is_ok();
     if !fits {
         drop(lock);
         return sync(&*io);
     }
-    let m = map(&sb, inode, pos, count)?;
+    let Some(m) = map(inode, pos, count, true)? else {
+        // A hole: the whole write at once through the VFS
+        drop(lock);
+        return sync(&*io);
+    };
     // file_modified, before the data (Linux __generic_file_write_iter):
     // the times through the filesystem (fat_update_time)
     crate::fs::dac::remove_privs(inode);

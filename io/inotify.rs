@@ -47,7 +47,7 @@ use crate::io::fasync::{FasyncList, POLL_IN, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::IrqSpinlock;
 use crate::sync::spin::Mutex;
-use crate::sync::waitqueue::WaitQueue;
+use crate::sync::waitqueue::{WaitQueue, var_waitqueue};
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
 use crate::util::pod::IntoBytes;
@@ -173,7 +173,47 @@ struct InotifyWatch {
     /// The watched inode, held while the watch lives (Linux: the mark
     /// sits on the inode's fsnotify connector and pins it). Matched by
     /// identity: inode numbers repeat across filesystems.
-    inode: InodeRef,
+    inode: WatchedInode,
+}
+
+/// A watch's reference to its inode, counted on the inode's superblock
+/// (Linux fsnotify_get_inode_ref / fsnotify_put_inode_ref and
+/// fsnotify_sb_watched_objects): the shutdown waits for the count to
+/// reach zero (`sb_delete`), so no watch puts an inode after it
+struct WatchedInode(core::mem::ManuallyDrop<InodeRef>);
+
+impl WatchedInode {
+    fn new(i: InodeRef) -> Self {
+        if let Some(sb) = i.superblock() {
+            sb.s_fsnotify_watched.fetch_add(1, Ordering::Relaxed);
+        }
+        Self(core::mem::ManuallyDrop::new(i))
+    }
+}
+
+impl core::ops::Deref for WatchedInode {
+    type Target = InodeRef;
+    fn deref(&self) -> &InodeRef {
+        &self.0
+    }
+}
+
+/// The inode put, then the count dropped, the last waking the shutdown
+/// (Linux fsnotify_put_inode_ref: iput, then atomic_long_dec_and_test
+/// and wake_up_var); the superblock's memory kept across by a passive
+/// reference
+impl Drop for WatchedInode {
+    fn drop(&mut self) {
+        let sb = self.0.superblock().cloned();
+        // SAFETY: taken once, here; `self` is not used after
+        drop(unsafe { core::mem::ManuallyDrop::take(&mut self.0) });
+        if let Some(sb) = sb {
+            let c = &sb.s_fsnotify_watched;
+            if c.fetch_sub(1, Ordering::AcqRel) == 1 {
+                var_waitqueue(core::ptr::from_ref(c).addr()).wake_all();
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -382,6 +422,13 @@ pub fn sb_delete(sb: &crate::fs::SuperBlock) {
         }
         true
     });
+    // A watch a removal took out of its group before the walk may still
+    // hold its inode: wait for every watch's put (Linux
+    // wait_var_event(fsnotify_sb_watched_objects(sb), ...))
+    let c = &sb.s_fsnotify_watched;
+    if c.load(Ordering::Acquire) != 0 {
+        var_waitqueue(core::ptr::from_ref(c).addr()).wait_event(|| c.load(Ordering::Acquire) == 0);
+    }
 }
 
 /// A dentry lets go of `inode` (Linux dentry_unlink_inode): if no name
@@ -553,7 +600,7 @@ impl Inotify {
         }
         let watch = InotifyWatch {
             mask: mask & IN_ALL_EVENTS,
-            inode: inode.clone(),
+            inode: WatchedInode::new(inode.clone()),
         };
         // Published under the group's lock only if the mark is still on
         // (order Inotify.inner -> Marks; a removal never holds Marks

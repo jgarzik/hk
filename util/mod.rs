@@ -21,6 +21,7 @@ pub mod percpu_alloc;
 pub mod percpu_counter;
 pub mod percpu_ref;
 pub mod pod;
+pub mod ratelimit;
 pub mod rbtree;
 pub mod rcuhlist;
 pub mod rculist;

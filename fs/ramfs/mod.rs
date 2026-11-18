@@ -59,6 +59,7 @@ impl Aops for RamfsAops {
     fn read_folio(&self, _inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
         filemap::zero_page(phys, 0);
         filemap::set_uptodate(phys);
+        crate::mm::page::unlock_page(phys);
         Ok(())
     }
 
@@ -126,19 +127,19 @@ static TMPFS_AOPS: TmpfsAops = TmpfsAops;
 /// cache is the only copy; Linux ramfs mapping_set_unevictable and
 /// tmpfs, which has no swap here)
 fn file_mapping(sb: &SuperBlock, inode: &Inode) {
-    inode.i_data.set_flags(filemap::AS_UNEVICTABLE);
+    inode.i_mapping().set_flags(filemap::AS_UNEVICTABLE);
     // tmpfs charges its pages (Linux shmem_inode_acct_blocks)
     if let Some(a) = tmpfs::with(sb, |t| t.page_acct()) {
-        inode.i_data.set_aops(&TMPFS_AOPS, None);
-        inode.i_data.set_acct(a);
+        inode.i_mapping().set_aops(&TMPFS_AOPS, None);
+        inode.i_mapping().set_acct(a);
         // Every tmpfs file starts sealed against sealing (Linux
         // shmem_get_inode); memfd_create may clear it
         inode
-            .i_data
+            .i_mapping()
             .seals
             .store(crate::mm::memfd::F_SEAL_SEAL, Ordering::Relaxed);
     } else {
-        inode.i_data.set_aops(&RAMFS_AOPS, None);
+        inode.i_mapping().set_aops(&RAMFS_AOPS, None);
     }
 }
 
@@ -367,7 +368,7 @@ impl InodeData for RamfsInodeData {}
 /// The xattr space of `inode`'s file system (None: not counted)
 fn xattr_pool(inode: &Inode) -> Option<Arc<tmpfs::Acct>> {
     let sb = inode.superblock()?;
-    tmpfs::with(&sb, |t| t.xattr_pool())?
+    tmpfs::with(sb, |t| t.xattr_pool())?
 }
 
 /// The inode's file system has user.* xattrs: tmpfs does (Linux
@@ -375,7 +376,7 @@ fn xattr_pool(inode: &Inode) -> Option<Arc<tmpfs::Acct>> {
 fn has_xattrs(inode: &Inode) -> bool {
     inode
         .superblock()
-        .is_some_and(|sb| tmpfs::with(&sb, |_| ()).is_some())
+        .is_some_and(|sb| tmpfs::with(sb, |_| ()).is_some())
 }
 
 /// Take one of the file system's inodes (tmpfs: ENOSPC when none is
@@ -395,12 +396,12 @@ pub fn with_seals<R>(
     inode: &Inode,
     f: impl FnOnce(&core::sync::atomic::AtomicU32) -> R,
 ) -> Option<R> {
-    (inode.mode().is_file() && inode.i_data.charged()).then(|| f(&inode.i_data.seals))
+    (inode.mode().is_file() && inode.i_mapping().charged()).then(|| f(&inode.i_mapping().seals))
 }
 
 /// The seals of `inode` (0 for any but a tmpfs file): one load
 fn seals(inode: &Inode) -> u32 {
-    inode.i_data.seals.load(Ordering::Acquire)
+    inode.i_mapping().seals.load(Ordering::Acquire)
 }
 
 /// One name of `inode` goes (Linux shmem_unlink): on tmpfs a name
@@ -410,7 +411,7 @@ fn drop_link(inode: &Inode) {
         && !inode.mode().is_dir()
         && let Some(sb) = inode.superblock()
     {
-        free_inode(&sb);
+        free_inode(sb);
     }
     inode.dec_nlink();
 }
@@ -698,7 +699,7 @@ impl InodeOps for RamfsInodeOps {
     fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<InodeRef, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        let inode = new_inode(&sb, Kind::File, mode, uid, gid, current_time())?;
+        let inode = new_inode(sb, Kind::File, mode, uid, gid, current_time())?;
         inode.dec_nlink();
         Ok(inode)
     }
@@ -726,7 +727,7 @@ impl InodeOps for RamfsInodeOps {
     /// shmem_free_inode); a superblock already gone counts nothing
     fn evict_inode(&self, inode: &Inode) {
         if let Some(sb) = inode.superblock() {
-            free_inode(&sb);
+            free_inode(sb);
         }
     }
 
@@ -771,7 +772,7 @@ impl InodeOps for RamfsInodeOps {
         if target_inode.get_nlink() > 0
             && let Some(sb) = dir.superblock()
         {
-            reserve_inode(&sb)?;
+            reserve_inode(sb)?;
         }
         target_inode.inc_nlink();
 
@@ -812,7 +813,7 @@ impl InodeOps for RamfsInodeOps {
     ) -> Result<(), KernelError> {
         use super::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
         // ramfs has no fallocate (Linux ramfs_file_operations)
-        let max = inode.superblock().and_then(|sb| tmpfs::max_blocks(&sb));
+        let max = inode.superblock().and_then(|sb| tmpfs::max_blocks(sb));
         let Some(max) = max else {
             return Err(KernelError::OperationNotSupported);
         };
@@ -1264,11 +1265,10 @@ pub(crate) fn fill_root(
     Ok(())
 }
 
-/// ramfs's kill_sb (Linux ramfs_kill_sb): its private data, then
-/// kill_anon_super
+/// ramfs's kill_sb (Linux ramfs_kill_sb): its fs_info (none here, its
+/// options unkept), then kill_anon_super
 fn ramfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
-    let info = sb.private.write().take();
-    drop(info);
+    sb.kill_fs_info();
     crate::fs::superblock::kill_anon_super(sb, g);
 }
 
@@ -1323,7 +1323,7 @@ fn new_inode(
     time: Timespec,
 ) -> Result<InodeRef, KernelError> {
     reserve_inode(sb)?;
-    let (ino, w) = (sb.alloc_ino(), Arc::downgrade(sb));
+    let (ino, w) = (sb.alloc_ino(), Some(sb));
     let ops = &RAMFS_INODE_OPS;
     let mut i = match &kind {
         Kind::Dev(rdev) => Inode::new_device(ino, mode, uid, gid, *rdev, time, w, ops),
@@ -1383,7 +1383,7 @@ fn add_new(
     if dir_data.children.read().contains_key(name) {
         return Err(KernelError::AlreadyExists);
     }
-    let inode = new_inode(&sb, kind, mode, uid, gid, time)?;
+    let inode = new_inode(sb, kind, mode, uid, gid, time)?;
     dir_data
         .children
         .write()
@@ -1458,7 +1458,7 @@ pub fn ramfs_create_file_with_timestamp(
     }
     // Filled before it is entered: a failure leaves no partial file
     let sb = dir.superblock().ok_or(KernelError::Io)?;
-    let inode = new_inode(&sb, Kind::File, mode, uid, gid, mtime)?;
+    let inode = new_inode(sb, Kind::File, mode, uid, gid, mtime)?;
     fill_pages(&inode, content)?;
     inode.set_size(content.len() as u64);
     dir_data

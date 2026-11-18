@@ -154,7 +154,7 @@ pub fn fcntl(file: &FileRef, cmd: i32, arg: u64) -> KernelResult<i64> {
         }
         // No shared writable mapping may exist or be made after it
         if seals & F_SEAL_WRITE != 0 && now & F_SEAL_WRITE == 0 {
-            inode.i_data.deny_writable()?;
+            inode.i_mapping().deny_writable()?;
         }
         cur.fetch_or(seals, Ordering::AcqRel);
         Ok(0)

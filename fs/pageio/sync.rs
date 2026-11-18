@@ -6,8 +6,8 @@
 //! fadvise and readahead act on a file's page cache. All I/O here is
 //! synchronous: a write that was asked for has completed on return.
 
-use super::inode::Inode;
-use super::io::fget;
+use crate::fs::inode::Inode;
+use crate::fs::io::fget;
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -18,53 +18,79 @@ pub fn sys_sync() -> KernelResult<()> {
     Ok(())
 }
 
-/// fsync(2): the file's data and metadata (Linux vfs_fsync -> ->fsync);
-/// EIO for a write error, else EINVAL (no ->fsync)
+/// The last byte of a file (Linux LLONG_MAX)
+pub const LLONG_MAX: u64 = i64::MAX as u64;
+
+/// fsync(2) (Linux do_fsync: vfs_fsync with datasync 0)
 pub fn sys_fsync(fd: i32) -> KernelResult<()> {
     vfs_fsync(&*fget(fd)?, false)
 }
 
-/// Sync `file`'s data and, unless `datasync`, its metadata (Linux
-/// vfs_fsync; hk's filesystems write no metadata fdatasync could skip):
-/// EIO for a write error, else EINVAL (no ->fsync); a writeback error
-/// of its mapping since this file last looked, once (Linux
-/// file_check_and_advance_wb_err in the filesystems' fsync)
-pub fn vfs_fsync(file: &crate::fs::file::File, datasync: bool) -> KernelResult<()> {
-    let _ = datasync;
-    let r = file.f_op.fsync(file).map_err(|e| match e {
-        KernelError::Io => e,
-        _ => KernelError::InvalidArgument,
-    });
-    let seen = file.check_and_advance_wb_err();
-    r.and(seen)
-}
-
-/// Sync bytes [start, end] of `file` (Linux vfs_fsync_range from
-/// generic_write_sync), with its writeback error reported as `vfs_fsync`
-pub fn vfs_fsync_range(file: &crate::fs::file::File, start: u64, end: u64) -> KernelResult<()> {
-    let r = file.f_op.fsync_range(file, start, end);
-    let seen = file.check_and_advance_wb_err();
-    r.and(seen)
-}
-
-/// fdatasync(2): as fsync (hk's filesystems write no metadata that
-/// fdatasync could skip)
+/// fdatasync(2) (Linux do_fsync: vfs_fsync with datasync 1): the data
+/// and only the metadata needed to read it back
 pub fn sys_fdatasync(fd: i32) -> KernelResult<()> {
-    sys_fsync(fd)
+    vfs_fsync(&*fget(fd)?, true)
 }
 
-/// syncfs(2) (Linux sync_filesystem of the file's superblock): its
-/// dirty inodes, then its device's cache; a write error is EIO, as is
-/// a writeback error of the filesystem since this file last looked,
+/// Sync bytes [start, end] of `file` and its metadata, or with
+/// `datasync` only the metadata the data needs (Linux vfs_fsync_range:
+/// the file's ->fsync, whose error is returned as is)
+pub fn vfs_fsync_range(
+    file: &crate::fs::file::File,
+    start: u64,
+    end: u64,
+    datasync: bool,
+) -> KernelResult<()> {
+    file.f_op.fsync(file, start, end, datasync)
+}
+
+/// Sync all of `file` (Linux vfs_fsync)
+pub fn vfs_fsync(file: &crate::fs::file::File, datasync: bool) -> KernelResult<()> {
+    vfs_fsync_range(file, 0, LLONG_MAX, datasync)
+}
+
+/// syncfs(2) (Linux sync_filesystem of the file's superblock, under
+/// its s_umount for reading, so no remount or freeze runs meanwhile):
+/// its dirty inodes, then its device's cache; a write error is EIO, as
+/// is a writeback error of the filesystem since this file last looked,
 /// once (Linux s_wb_err against f_sb_err)
 pub fn sys_syncfs(fd: i32) -> KernelResult<()> {
     let file = fget(fd)?;
-    let Some(sb) = file.get_inode().and_then(|i| i.superblock()) else {
+    let Some(inode) = file.get_inode() else {
         return Ok(());
     };
-    let r = super::fs_writeback::writeback_sb(&sb).map_err(|_| KernelError::Io);
+    let Some(sb) = inode.superblock() else {
+        return Ok(());
+    };
+    let r = {
+        let _g = sb.s_umount.read();
+        sync_filesystem(sb)
+    };
     let seen = file.check_and_advance_sb_err();
     r.and(seen)
+}
+
+/// Write back what is dirty in `sb` and wait (Linux sync_filesystem):
+/// the inodes' writeback started (writeback_inodes_sb), the device's
+/// cache written (sync_blockdev_nowait: hk's writes are synchronous),
+/// the inodes written and waited for (sync_inodes_sb), the device's
+/// cache again (what ->write_inode put there); nothing for a read-only
+/// one. hk's filesystems have no ->sync_fs. Under s_umount.
+pub fn sync_filesystem(sb: &crate::fs::superblock::SuperBlock) -> KernelResult<()> {
+    use super::fs_writeback::{sync_inodes_sb, writeback_inodes_sb};
+    use crate::block::blkdev::sync_blockdev;
+    if sb.rdonly() {
+        return Ok(());
+    }
+    writeback_inodes_sb(sb);
+    if let Some(b) = sb.bdev() {
+        sync_blockdev(b)?;
+    }
+    sync_inodes_sb(sb);
+    match sb.bdev() {
+        Some(b) => sync_blockdev(b),
+        None => Ok(()),
+    }
 }
 
 /// sync_file_range flags (Linux include/uapi/linux/fs.h)

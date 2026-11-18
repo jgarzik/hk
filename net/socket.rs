@@ -205,7 +205,7 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelE
         cred.fsgid,
         0,
         now,
-        alloc::sync::Arc::downgrade(&crate::fs::pseudo::SOCKFS.sb()?),
+        Some(&crate::fs::pseudo::SOCKFS.sb()?),
         &NULL_INODE_OPS,
     ))?;
     inode.set_private(try_arc(SockInode(sock))?);

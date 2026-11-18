@@ -115,14 +115,16 @@ struct Rcu<'g> {
 /// the step before the next, or its own slot (the root's leftover;
 /// a mount alone only from the first that fails). A second fill would
 /// drop a value under the guard; it panics instead (`put`), in every
-/// build.
+/// build. Fields drop in order: the child first, before the path and
+/// mount it was found in (Linux try_to_unlazy_next's dput, then
+/// terminate_walk's path_put), so no dentry outlives its mount.
 #[derive(Default)]
 pub(super) struct Puts {
+    dentry: Option<DentryRef>,
     path: Option<Path>,
     link: Option<Path>,
     root: Option<Path>,
     mnt: Option<MountRef>,
-    dentry: Option<DentryRef>,
     /// The mount of the link a failed legitimize_links stopped at
     /// (Linux drop_links)
     links_mnt: Option<MountRef>,
@@ -198,11 +200,12 @@ pub(super) struct Lazy<'p> {
 /// held): the link, the body (an `i_link` read through `inode`, the
 /// link's inode, or one ->get_link made), where its rest begins, and
 /// whether nothing follows it below (its last component is the walk's
-/// last). The link is put as the level is popped (put_link).
+/// last). The link is put as the level is popped (put_link), its inode
+/// before its path (fields drop in order: no inode outlives its mount)
 pub(super) struct HeldFrame {
-    pub(super) link: Path,
-    pub(super) body: Option<Vec<u8>>,
     pub(super) inode: Option<InodeRef>,
+    pub(super) body: Option<Vec<u8>>,
+    pub(super) link: Path,
     pub(super) pos: usize,
     pub(super) tail_empty: bool,
 }
@@ -281,7 +284,8 @@ impl Held {
     }
 }
 
-/// What ref mode does first ([`Lazy`])
+/// What ref mode does first ([`Lazy`]); a child before the path it
+/// was found in (fields drop in order: no dentry outlives its mount)
 pub(super) enum To {
     /// The walk's end (complete_walk)
     Done(Path),
@@ -295,8 +299,8 @@ pub(super) enum To {
     /// its revalidation said): revalidated in ref mode, then stepped
     /// into
     Child {
-        cur: Path,
         child: DentryRef,
+        cur: Path,
         reval: Result<bool, KernelError>,
     },
     /// step_into's try_to_unlazy_next (handle_mounts): `child`, found
@@ -305,8 +309,8 @@ pub(super) enum To {
     /// (WALK_TRAILING); `dots`: the parent ".." gave (WALK_NOFOLLOW,
     /// then handle_dots' scoped check)
     Step {
-        cur: Path,
         child: DentryRef,
+        cur: Path,
         last: bool,
         dots: bool,
     },
@@ -1098,7 +1102,7 @@ impl Nd<'_> {
         }
         let body = match l.inode.i_link() {
             Some(b) => Body::Ref(b),
-            None => match l.inode.i_op.get_link(l.inode, true) {
+            None => match l.inode.i_op().get_link(l.inode, true) {
                 Ok(Link::Text(t)) => Body::Own(t),
                 Ok(Link::Jump(p)) => {
                     // RCU mode never jumps (procfs's magic links are
@@ -1297,7 +1301,7 @@ mod tests {
             0,
             0,
             Timespec::from_secs(0),
-            Weak::new(),
+            None,
             &NULL_INODE_OPS,
         ))
         .unwrap()

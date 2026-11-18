@@ -98,7 +98,7 @@ pub fn device_del(name: &str) {
     let Ok(d) = crate::fs::lookup_one(&r, name.as_bytes(), none) else {
         return;
     };
-    if dir.i_op.unlink(&dir, name.as_bytes(), &d).is_ok() {
+    if dir.i_op().unlink(&dir, name.as_bytes(), &d).is_ok() {
         r.remove_child(name.as_bytes());
     }
 }

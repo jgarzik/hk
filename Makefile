@@ -213,6 +213,10 @@ QEMU_LOG_DIR ?= $(CURDIR)/target/qemu
 export QEMU_LOG_DIR
 SERIAL_LOG = $(QEMU_LOG_DIR)/serial.log
 SERIAL_LOG_ARM = $(QEMU_LOG_DIR)/serial_arm.log
+# A boot fails on these in its serial log: a test's failure, a panic,
+# and an inode left past its superblock's shutdown (Linux
+# CHECK_DATA_CORRUPTION, a WARN: a bug the boot would hide)
+BOOT_FAIL_RE = FAIL|KERNEL PANIC|Busy inodes after unmount
 
 # NOBUILD=1: boot what is already built (make gate builds first, then
 # boots in parallel; rebuilding would race)
@@ -229,9 +233,9 @@ check: $(call nobuild,iso disk-image)
 		echo "Boot test FAILED - 'Powering off' not found in serial log:"; \
 		cat $(SERIAL_LOG); \
 		exit 1; \
-	elif grep -qE "FAIL|KERNEL PANIC" $(SERIAL_LOG); then \
+	elif grep -qE "$(BOOT_FAIL_RE)" $(SERIAL_LOG); then \
 		echo "Boot test FAILED - test failures or a panic detected:"; \
-		grep -E "FAIL|KERNEL PANIC" $(SERIAL_LOG); \
+		grep -E "$(BOOT_FAIL_RE)" $(SERIAL_LOG); \
 		exit 1; \
 	else \
 		echo "Boot test PASSED"; \
@@ -270,9 +274,9 @@ check-arm: $(call nobuild,build-arm vfat-image disk-image)
 		echo "ARM Boot test FAILED - shutdown message not found in serial log:"; \
 		cat $(SERIAL_LOG_ARM); \
 		exit 1; \
-	elif grep -qE "FAIL|KERNEL PANIC" $(SERIAL_LOG_ARM); then \
+	elif grep -qE "$(BOOT_FAIL_RE)" $(SERIAL_LOG_ARM); then \
 		echo "ARM Boot test FAILED - test failures or a panic detected:"; \
-		grep -E "FAIL|KERNEL PANIC" $(SERIAL_LOG_ARM); \
+		grep -E "$(BOOT_FAIL_RE)" $(SERIAL_LOG_ARM); \
 		exit 1; \
 	else \
 		echo "ARM Boot test PASSED"; \

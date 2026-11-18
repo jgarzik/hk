@@ -26,7 +26,12 @@ Most of their blocks belong in a missing wrapper:
 
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
   place of the `mm/page.rs` `frame_bytes` unsafe fn (callers: vfat,
-  pipe, fault, filemap, swap, blkdev_ops).
+  pipe, fault, filemap, swap, blkdev_ops) and `zero_frame_racy`
+  (callers: buffer, mpage), and in the safe fns that take a page they
+  require locked by its address alone (`fs/pageio/buffer.rs`
+  block_read_full_folio, block_write_full_folio,
+  folio_zero_new_buffers; `fs/pageio/mpage.rs`). `mm/filemap.rs`
+  `zero_page` is still a safe fn zeroing any frame.
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
@@ -126,10 +131,14 @@ fnhe_genid), so they are not flushed when a device goes down.
 
 ## Memory management gaps
 
-**Location**: `mm/`, `arch/*/paging.rs`, `ipc/shm.rs`
+**Location**: `mm/`, `arch/*/paging.rs`, `ipc/shm.rs`, `fs/inode.rs`
 
 Missing:
 
+- No inode LRU (Linux inode_lru, prune_icache_sb): an inode put to
+  zero while its superblock is active is evicted at once, so
+  `iput_final` writes it back first (WB_SYNC_NONE) where Linux keeps
+  it cached, dirty, for the flusher.
 - Writeback (J): the periodic pass writes every dirty inode of a
   device (Linux only those dirty for vm.dirty_expire_centisecs, which
   is stored but unused); past vm.dirty_ratio the writer writes its own
@@ -149,13 +158,16 @@ Missing:
   (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into (see the heap section) are not
-  on the reverse map (never swapped). Swap
-  files go through their filesystem's swap_rw,
-  a page at a time (walking the cluster chain each time; Linux maps
-  the extents once at swapon). Page faults, swapoff, page-cache, heap
+  on the reverse map (never swapped). Page faults, swapoff, page-cache, heap
   and pipe allocations that may sleep reclaim directly; atomic heap
   allocations never do, so with anonymous memory filling RAM they fail
   at the low watermark until kswapd (J) keeps free memory above it.
+- No readahead (Linux page_cache_ra_*, ->readahead): a page is read
+  by its own ->read_folio when first needed, so a vfat file has no
+  mpage_readahead (`fs/pageio/mpage.rs`). ->writepage is synchronous, a page
+  at a time (Linux ->writepages: mpage_writepages adds contiguous
+  pages to one bio and unlocks each once added): a vfat page goes to
+  the disk in a bio of its own, its writer waiting.
 - File mappings: no fault-around (Linux maps up to 16 cached pages
   per read fault); filesystems without a page cache (procfs) still
   map a private copy.
@@ -279,9 +291,30 @@ lo (hk has no checksum offload states).
   FAN_MARK_IGNORE, FAN_MARK_IGNORED_SURV_MODIFY and FAN_MARK_EVICTABLE
   are accepted but have no effect (Linux fanotify_add_mark).
 
+## vfat gaps
+
+**Location**: `fs/vfat/mod.rs`, `fs/vfat/fatent.rs`
+
+- FAT32 only: `vfat_fill_super` refuses FAT12/16 (Linux fat_ent_ops
+  fat12_ops / fat16_ops).
+- A directory whose cluster chain breaks mid-way is EIO; Linux
+  fat__get_entry ends the directory there.
+- No FAT attribute bits on the inode: write_inode does not write
+  them (Linux fat_make_attrs, ATTR_RO from the mode, ATTR_HIDDEN etc.
+  kept in MSDOS_I(inode)->i_attrs), and the first write after one is
+  cleared does not set ATTR_ARCH with the times (Linux fat_write_end).
+- No `sbi->s_lock` mutex around namespace operations (Linux
+  vfat_create, vfat_rename etc. take it).
+- A directory's i_size is 0 and its cluster count (`VfatInodeData.clusters`,
+  Linux i_blocks) not kept (Linux: its chain length, fat_calc_dir_size),
+  so `fat_chain_add` counts only a file's clusters (and checks them
+  against its chain).
+- No FSINFO: the free count and next-free hint are kept in memory
+  only (Linux fat_set_state / fat_clusters_flush).
+
 ## O_DIRECT gaps
 
-**Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
+**Location**: `fs/pageio/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
 `fs/vfat/`
 
 - Block-device and vfat O_DIRECT from kernel virtual memory (a kernel
@@ -289,10 +322,6 @@ lo (hk has no checksum offload states).
   and takes the cached path; Linux sends bios from it (ITER_KVEC) with
   the same alignment rules. Pinned pages (Linux ITER_BVEC: io_uring's
   registered buffers) go to bios through `dio::submit_async`.
-- vfat writes a file page back whole (`VfatAops::writepage`); Linux
-  writes only its dirty blocks (buffer heads), so a block of the page
-  changed on disk behind the cache (a raw device write) is overwritten
-  by hk with the cached copy.
 
 ## Linux AIO gaps
 
@@ -683,31 +712,30 @@ waiting).
 
 ## fsync and freeze gaps
 
-**Location**: `fs/file.rs` (`FileOps::fsync`), `fs/inode.rs` (`touch_atime`)
+**Location**: `fs/inode.rs` (`touch_atime`)
 
-- `FileOps::fsync` takes no datasync flag, so fdatasync writes a
-  times-only dirty inode too (Linux vfs_fsync_range(datasync) skips
-  I_DIRTY_SYNC unless I_DIRTY_DATASYNC).
 - No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
   such as touch_atime take mount write access only.
-- `SuperOps::write_inode` takes no wait argument (Linux
-  writeback_control sync_mode), so vfat's dirsync wait syncs the whole
-  device.
-- vfat `fat_add_entries` allocates a new directory cluster before it
-  writes the free slots it already has (Linux writes those first), so
-  a failed dirsync sync leaves the zeroed cluster linked in.
 
-## No buffer heads
+## Buffer head gaps
 
-**Location**: `fs/vfat/mod.rs` (`write_inode_sb`, `VfatSbData.ipos`), `fs/blkdev_ops.rs`
+**Location**: `fs/pageio/buffer.rs`, `mm/filemap.rs`
 
-Filesystem metadata goes through the block device's page cache by copy
-(`filemap::read`, `bdev_write_meta`); there is no buffer head to pin a
-block and patch it in place. So vfat's write_inode holds its `ipos`
-lock (a sleeping mutex) across the entry's read, patch and write, where
-Linux __fat_write_inode reads the block with sb_bread, then patches the
-pinned buffer under the inode_hash_lock spinlock after rechecking
-i_pos, and marks it dirty.
+- A page truncated while one of its buffers is still referenced (the
+  per-CPU LRU of another CPU, a holder) leaves its mapping with its
+  buffers and its frame (Linux frees both later in shrink_folio_list,
+  from the file LRU, which hk lacks: Memory management gaps).
+- hk's folios are a page: a block device's soft block size above a
+  page (BLKBSZSET up to 64K) gives its cache page-sized buffers, and
+  bdev_getblk of such a block is EINVAL (Linux makes large folios of
+  one block each, mapping_set_folio_min_order).
+- No __GFP_NOFAIL: bread and bdev_getblk fail ENOMEM when the
+  device-cache page or its buffers cannot be allocated
+  (`getblk_slow`), where Linux's (__bread_gfp, __getblk) retry until
+  they can; their callers return it.
+- No buffer-head count limit (Linux buffer_heads_over_limit, which
+  makes reclaim strip buffers), no page migration of buffered pages,
+  no BH_Delay / BH_Unwritten / BH_Boundary users.
 
 ## renameat2 flag gaps
 
@@ -982,7 +1010,7 @@ a reset register in PCI configuration space is ignored.
 
 ## Writeback of a superblock with no block device
 
-**Location**: `fs/fs_writeback.rs` (`mark_inode_dirty`, `writeback_sb`)
+**Location**: `fs/pageio/fs_writeback.rs` (`__mark_inode_dirty`, `sync_inodes_sb`)
 
 An inode dirtied on a superblock without a backing device (Linux
 noop_backing_dev_info) is marked dirty but queued nowhere, and
@@ -995,7 +1023,7 @@ its no-writeback skip, before it relies on sync.
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,
-`fs/blkdev_ops.rs`, `fs/vfat/`
+`fs/pageio/blkdev_ops.rs`, `fs/vfat/`
 
 - Partition tables are parsed in 512-byte sectors: on a disk with
   larger logical blocks, GPT LBAs and MBR sector counts are misread
@@ -1003,11 +1031,7 @@ its no-writeback skip, before it relies on sync.
   UnixWare, Minix, AIX or DM6 subpartitions. GPT: like Linux without
   the `gpt` parameter, a bad primary header is not replaced by the
   backup.
-- BLKRRPART is EBUSY while a partition is open, mounted or used for
-  swap (any holder of the partition besides the registry); Linux also
-  takes the whole disk for exclusive use during the scan
-  (bd_prepare_to_claim), so a rescan can race an exclusive opener.
-  BLKDISCARD, BLKZEROOUT, BLKSECDISCARD, BLKGETDISKSEQ, BLKROTATIONAL,
+- BLKDISCARD, BLKZEROOUT, BLKSECDISCARD, BLKGETDISKSEQ, BLKROTATIONAL,
   BLKDISCARDZEROES, BLKRAGET/BLKRASET, BLKFRAGET/BLKFRASET, BLKTRACE*,
   the zone, persistent reservation and BLKPG partition ioctls are
   ENOTTY. HDIO_GETGEO is ENOTTY on sd disks (Linux sd_getgeo:
@@ -1025,9 +1049,10 @@ its no-writeback skip, before it relies on sync.
 - No /proc/devices block section; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
-- A mounted filesystem or active swap opens its block device, but not
-  exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
-  are not refused.
+- Exclusive claims have no holder operations (Linux blk_holder_ops:
+  mark_dead, sync, freeze, thaw of a mounted filesystem when its device
+  goes away or is frozen), no BLK_OPEN_RESTRICT_WRITES and no
+  disk-event blocking for write holders.
 
 fallocate on a block device is EOPNOTSUPP (Linux blkdev_fallocate zeroes
 or discards the range).

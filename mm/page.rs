@@ -74,6 +74,11 @@ pub const PG_UPTODATE: u32 = 1 << 13;
 /// resets it.
 pub const PG_ANON_EXCL: u32 = 1 << 14;
 
+/// A page-cache page's `private` holds data of its filesystem (Linux
+/// PG_private: buffer heads), which holds a page reference
+/// (`filemap::folio_attach_private`)
+pub const PG_PRIVATE: u32 = 1 << 15;
+
 /// Page frame size
 pub const PAGE_SHIFT: u32 = 12;
 
@@ -103,7 +108,8 @@ pub struct Page {
     /// ([`Page::slab_rcu_head`])
     pub next: AtomicU64,
     pub prev: AtomicU64,
-    /// Compound tail: the head's pfn; slab: first free object
+    /// Compound tail: the head's pfn; slab: first free object;
+    /// page cache with PG_PRIVATE: its filesystem's data (buffer heads)
     pub private: AtomicU64,
     /// Slab: objects in use
     pub inuse: AtomicU32,
@@ -407,6 +413,18 @@ pub fn lock_page(phys: u64) {
     }
 }
 
+/// Wait until no one holds the page at `phys` locked (Linux
+/// folio_wait_locked): a read's end, which unlocks it. Thread context,
+/// no spinlock held; the caller holds a reference on the page.
+#[track_caller]
+pub fn wait_on_page_locked(phys: u64) {
+    crate::sync::might_sleep();
+    let Some(pg) = phys_to_page(phys) else {
+        return;
+    };
+    crate::sync::waitqueue::page_wait_queue(phys).wait_event(|| !pg.is_locked());
+}
+
 /// The page at `phys` is a private mapping's own, writable in place
 /// whatever its count ([`Page::reusable`]; Linux PageAnonExclusive)
 pub fn reusable(phys: u64) -> bool {
@@ -500,6 +518,25 @@ pub unsafe fn copy_to_frame_racy(phys: u64, off: usize, src: &[u8]) {
         // SAFETY: byte `off + i` of the frame, in it (the caller's
         // contract); volatile: another party may access it
         unsafe { d.add(i).write_volatile(b) };
+    }
+}
+
+/// Zero `len` bytes of the frame `phys` at `off`, which a mapping may
+/// access meanwhile (Linux folio_zero_range, memzero_page): volatile
+/// byte stores, as `copy_to_frame_racy`
+///
+/// # Safety
+/// `phys` is a RAM frame kept allocated meanwhile (a page-cache page
+/// locked or under its locked buffer's I/O, a pinned page) and meant
+/// to be written (no kernel data); [off, off + len) lies in it.
+pub unsafe fn zero_frame_racy(phys: u64, off: usize, len: usize) {
+    const Z: [u8; 64] = [0; 64];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(Z.len());
+        // SAFETY: the frame and range are the caller's (contract above)
+        unsafe { copy_to_frame_racy(phys, off + done, &Z[..n]) };
+        done += n;
     }
 }
 

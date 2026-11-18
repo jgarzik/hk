@@ -52,7 +52,7 @@ pub fn sys_symlinkat(
 ) -> KernelResult<()> {
     let target = getname(target_ptr, false)?;
     let p = filename_create(newdirfd, &getname(linkpath_ptr, false)?, false)?;
-    create_entry(&p, |dir, _| dir.i_op.symlink(dir, &p.name, &target)).map_err(no_op_eperm)?;
+    create_entry(&p, |dir, _| dir.i_op().symlink(dir, &p.name, &target)).map_err(no_op_eperm)?;
     Ok(())
 }
 
@@ -131,7 +131,7 @@ pub fn sys_readlinkat(
     // A target kept in the inode first (Linux vfs_readlink: i_link)
     let target = match inode.i_link() {
         Some(l) => l.to_vec(),
-        None => match inode.i_op.readlink(&inode) {
+        None => match inode.i_op().readlink(&inode) {
             Err(KernelError::OperationNotSupported) => return Err(KernelError::InvalidArgument),
             r => r?,
         },
@@ -172,7 +172,7 @@ fn link_locked(dir: &InodeRef, name: &[u8], inode: &InodeRef) -> Result<(), Kern
         return Err(KernelError::NotFound);
     }
     // The times are the filesystem's (Linux simple_link)
-    dir.i_op.link(dir, name, inode)?;
+    dir.i_op().link(dir, name, inode)?;
     inode.set_linkable(false);
     Ok(())
 }
@@ -490,7 +490,7 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
     {
         Err(KernelError::Busy)
     } else {
-        odir.i_op.rename(odir, oname, ndir, nname, flags)
+        odir.i_op().rename(odir, oname, ndir, nname, flags)
     };
     if let Some(d) = dead
         && r.is_ok()

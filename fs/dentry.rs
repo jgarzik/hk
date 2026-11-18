@@ -474,7 +474,13 @@ struct DentryInner {
 /// d_instantiate and dentry_unlink_inode under i_lock and d_lock), so
 /// it is unlinked before its memory is freed.
 pub struct Dentry {
-    /// Back pointer to superblock - immutable after creation
+    /// Its superblock (Linux d_sb), immutable: a `Weak`, keeping the
+    /// memory only, because the dentry's own memory goes in an RCU
+    /// callback (`d_free`, in `rcuc/N` with preemption off), where an
+    /// owning reference's last drop would run `Drop for SuperBlock`
+    /// (whose block device's last put puts its inode, which sleeps);
+    /// Linux's plain d_sb leans on the superblock's own RCU-delayed
+    /// free and work-item teardown (destroy_super_rcu)
     pub sb: Weak<SuperBlock>,
     /// Its superblock's name operations, for its children (Linux d_op,
     /// from s_d_op at d_alloc): immutable
@@ -1996,7 +2002,7 @@ mod tests {
             0,
             0,
             Timespec::from_secs(0),
-            Weak::new(),
+            None,
             &NULL_INODE_OPS,
         ))
         .unwrap()
@@ -2182,7 +2188,7 @@ mod tests {
             0,
             0,
             Timespec::from_secs(0),
-            Weak::new(),
+            None,
             &NULL_INODE_OPS,
         ))
         .unwrap();

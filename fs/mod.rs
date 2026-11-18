@@ -6,7 +6,6 @@
 pub mod chardev;
 
 // Core VFS modules
-pub mod blkdev_ops;
 pub mod dac;
 pub mod dentry;
 pub mod file;
@@ -29,7 +28,6 @@ pub mod exportfs;
 pub mod fd;
 pub mod fhandle;
 pub mod flock;
-pub mod fs_writeback;
 pub mod icache;
 pub mod io;
 pub mod iov;
@@ -40,13 +38,13 @@ pub mod locks;
 pub mod misc;
 pub mod nav;
 pub mod open;
+pub mod pageio;
 pub mod perm;
 #[path = "poll.rs"]
 pub mod pollsys;
 pub mod posix_lock;
 pub mod pseudo;
 pub mod stat;
-pub mod sync;
 
 // Filesystem implementations
 pub mod kernfs;
@@ -59,7 +57,6 @@ pub mod vfat;
 // Re-exports for convenience
 pub use crate::util::error::KernelError;
 use crate::util::error::KernelResult;
-pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, DentryRef, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, FileRef, RwFlags, flags, seek};
@@ -69,6 +66,7 @@ pub use inode::{
 };
 pub use mount::{Mount, do_umount, follow_mount, umount_flags};
 pub use namei::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
+pub use pageio::blkdev_ops::BLOCK_FILE_OPS;
 pub use path_ref::Path;
 pub use proc::{NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper};
 pub use ramfs::{

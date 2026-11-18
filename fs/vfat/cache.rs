@@ -4,9 +4,9 @@
 //! mapping a file position walks the FAT only from the nearest cached
 //! run at or before it, not from the first cluster.
 //!
-//! A walk reads its FAT entries from one FAT block kept for it (Linux
-//! fatent's buffer head), with no lock held, and caches the run it ends
-//! in. Every cluster it uses, the first one, a cached one or one read
+//! A walk reads its FAT entries in the FAT block's buffer it keeps
+//! pinned (`fatent::FatEnt`, Linux fat_get_cluster's fat_entry), with no
+//! lock held, and caches the run it ends in. Every cluster it uses, the first one, a cached one or one read
 //! from the FAT, is checked to be a data cluster (EIO otherwise, Linux
 //! fat_valid_entry), so a corrupt image never sends I/O outside the
 //! data area.
@@ -15,18 +15,19 @@
 //! set with the inode's): a walk takes the first cluster, the cache's
 //! id and its starting run in one hold, so they always belong to the
 //! same chain. A new first cluster (`set_start`) and a cut of the
-//! chain (`free_past`: before and again after the FAT is changed)
+//! chain (`fat_free`: before and again after the FAT is changed)
 //! invalidate the cache and bump its id (Linux fat_cache_inval_inode,
 //! cache_valid_id); a walk caches its run only if the id is unchanged,
 //! so nothing walked on a chain being cut outlives the cut.
 
-use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::fs::inode::Inode;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 
-use super::{VfatInode, VfatSbData, cluster_to_offset, is_end_of_chain, read_bytes, with_vi};
+use super::fatent::{FatEnt, fat_ent_read};
+use super::{VfatInode, VfatSbData, get_inode_data, is_end_of_chain, with_vi};
 
 /// Runs cached per file (Linux FAT_MAX_CACHE)
 const FAT_MAX_CACHE: usize = 8;
@@ -177,7 +178,8 @@ fn resume(max_cluster: u32, start: u32, hit: Hit) -> Result<(Run, u32, u32), Ker
 }
 
 /// The cluster after one whose FAT entry is `n`: None at the end of the
-/// chain; EIO for a free, bad, reserved or out-of-range entry
+/// chain (a bad mark reads as the end, `fatent::ent_get`); EIO for a
+/// free, reserved or out-of-range entry
 fn chain_next(max_cluster: u32, n: u32) -> Result<Option<u32>, KernelError> {
     if is_end_of_chain(n) {
         return Ok(None);
@@ -188,55 +190,14 @@ fn chain_next(max_cluster: u32, n: u32) -> Result<Option<u32>, KernelError> {
     Ok(Some(n))
 }
 
-/// The FAT block a walk reads its entries from (Linux fatent's buffer
-/// head): read again only when the chain leaves it
-struct FatBuf {
-    /// Device byte offset of `buf`, None before the first read
-    at: Option<u64>,
-    buf: [u8; FatBuf::SIZE],
-}
-
-impl FatBuf {
-    /// FAT entries are read 512 bytes at a time (a FAT sector at least)
-    const SIZE: usize = 512;
-
-    fn new() -> Self {
-        Self {
-            at: None,
-            buf: [0; Self::SIZE],
-        }
-    }
-
-    /// The FAT entry of `cluster` (Linux fat_ent_read): EIO for one
-    /// outside the data clusters
-    fn ent(&mut self, sb: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
-        if !valid(sb.max_cluster, cluster) {
-            return Err(KernelError::Io);
-        }
-        let off = sb.fat_start_sector * u64::from(sb.bytes_per_sector) + u64::from(cluster) * 4;
-        let base = off & !(Self::SIZE as u64 - 1);
-        if self.at != Some(base) {
-            self.at = None;
-            read_bytes(&sb.bdev, base, &mut self.buf)?;
-            self.at = Some(base);
-        }
-        let i = (off - base) as usize;
-        let e = u32::from_le_bytes([
-            self.buf[i],
-            self.buf[i + 1],
-            self.buf[i + 2],
-            self.buf[i + 3],
-        ]);
-        Ok(e & 0x0FFF_FFFF)
-    }
-}
-
 /// A walk along a file's chain (Linux fat_get_cluster's loop): at file
 /// cluster `f`, disk cluster `d`, in the contiguous run `cid`
 struct Walk<'a> {
     sb: &'a VfatSbData,
     vi: &'a VfatInode,
-    fat: FatBuf,
+    /// The FAT block it reads its entries from, pinned (Linux
+    /// fat_get_cluster's fat_entry)
+    fat: FatEnt,
     /// The cache's id when the walk began
     id: u32,
     cid: Run,
@@ -256,7 +217,7 @@ impl<'a> Walk<'a> {
         Ok(Some(Self {
             sb,
             vi,
-            fat: FatBuf::new(),
+            fat: FatEnt::new(),
             id,
             cid,
             f,
@@ -273,7 +234,7 @@ impl<'a> Walk<'a> {
         if u64::from(self.f) >= limit {
             return Err(KernelError::Io);
         }
-        let e = self.fat.ent(self.sb, self.d)?;
+        let e = fat_ent_read(self.sb, &mut self.fat, self.d)?;
         let Some(n) = chain_next(self.sb.max_cluster, e)? else {
             return Ok(false);
         };
@@ -339,49 +300,85 @@ pub fn last_cluster(sb: &VfatSbData, inode: &Inode) -> Result<Option<(u32, u32)>
     get_cluster(sb, inode, u32::MAX)
 }
 
+/// The first device block of data cluster `cluster` (Linux
+/// fat_clus_to_blknr)
+pub fn fat_clus_to_blknr(sb: &VfatSbData, cluster: u32) -> u64 {
+    u64::from(cluster - 2) * u64::from(sb.sectors_per_cluster) + sb.data_start_sector
+}
+
+/// The disk cluster of file cluster `cluster` (Linux fat_bmap_cluster):
+/// 0 for a file with no clusters; EIO past the chain's end
+fn fat_bmap_cluster(sb: &VfatSbData, inode: &Inode, cluster: u32) -> Result<u32, KernelError> {
+    match get_cluster(sb, inode, cluster)? {
+        None => Ok(0),
+        Some((f, _)) if f < cluster => {
+            crate::printkln!(
+                "FAT-fs: fat_bmap_cluster: request beyond EOF (i_pos {})",
+                get_inode_data(inode)?.i_pos
+            );
+            Err(KernelError::Io)
+        }
+        Some((_, d)) => Ok(d),
+    }
+}
+
+/// The device block of file block `sector` and the blocks mapped from
+/// it, within its cluster and below `last_block` (Linux
+/// fat_get_mapped_cluster); block 0 for none
+fn fat_get_mapped_cluster(
+    sb: &VfatSbData,
+    inode: &Inode,
+    sector: u64,
+    last_block: u64,
+) -> Result<(u64, u64), KernelError> {
+    let spc = u64::from(sb.sectors_per_cluster);
+    let cluster = u32::try_from(sector / spc).map_err(|_| KernelError::Io)?;
+    let offset = sector & (spc - 1);
+    match fat_bmap_cluster(sb, inode, cluster)? {
+        0 => Ok((0, 0)),
+        c => Ok((
+            fat_clus_to_blknr(sb, c) + offset,
+            (spc - offset).min(last_block - sector),
+        )),
+    }
+}
+
+/// The device block of file block `sector` and the blocks mapped from
+/// it (Linux fat_bmap, FAT32: no fixed root directory); block 0 for
+/// none. Mapped are the blocks below the size, with `create` those
+/// below mmu_private (which only the write paths read, under i_rwsem;
+/// Linux is_exceed_eof), with `from_bmap` all the file's clusters'.
+pub fn fat_bmap(
+    sb: &VfatSbData,
+    inode: &Inode,
+    sector: u64,
+    create: bool,
+    from_bmap: bool,
+) -> Result<(u64, u64), KernelError> {
+    let bs = u64::from(sb.bytes_per_sector);
+    let (clusters, mmu_private) = with_vi(inode, |v| {
+        (v.d.lock().clusters, v.mmu_private.load(Ordering::Relaxed))
+    })?;
+    let last_block = if from_bmap {
+        u64::from(clusters) * u64::from(sb.sectors_per_cluster)
+    } else {
+        let last = inode.get_size().div_ceil(bs);
+        if sector >= last && create {
+            mmu_private.div_ceil(bs)
+        } else {
+            last
+        }
+    };
+    if sector >= last_block {
+        return Ok((0, 0));
+    }
+    fat_get_mapped_cluster(sb, inode, sector, last_block)
+}
+
 /// Forget `inode`'s cached runs around a cut of its chain (Linux
 /// fat_cache_inval_inode)
 pub fn inval(inode: &Inode) -> Result<(), KernelError> {
     with_vi(inode, |vi| vi.cache.lock().inval())
-}
-
-/// The device extents (byte offset, length) holding bytes [pos, pos +
-/// len) of the file, contiguous clusters merged (Linux fat_bmap through
-/// fat_get_cluster): one walk from the nearest cached run; short where
-/// the chain ends
-pub fn extents(
-    sb: &VfatSbData,
-    inode: &Inode,
-    pos: u64,
-    len: usize,
-) -> Result<Vec<(u64, usize)>, KernelError> {
-    let mut out: Vec<(u64, usize)> = Vec::new();
-    if len == 0 {
-        return Ok(out);
-    }
-    let cs = u64::from(sb.cluster_size);
-    let first = u32::try_from(pos / cs).map_err(|_| KernelError::Io)?;
-    with_walk(sb, inode, first, |w| {
-        let (mut at, end) = (pos, pos + len as u64);
-        // Short if the chain ends before the first cluster
-        let mut more = w.f == first;
-        while more {
-            // The cluster reached holds byte `at`
-            let off = cluster_to_offset(sb, w.d) + at % cs;
-            let n = (cs - at % cs).min(end - at) as usize;
-            match out.last_mut() {
-                Some((o, l)) if *o + *l as u64 == off => *l += n,
-                _ => {
-                    out.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
-                    out.push((off, n));
-                }
-            }
-            at += n as u64;
-            more = at < end && w.next()?;
-        }
-        Ok(())
-    })?;
-    Ok(out)
 }
 
 /// The cache of a chain starting at `start`, for `VfatInode`

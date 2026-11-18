@@ -1466,7 +1466,7 @@ fn create_pipe_path() -> Result<crate::fs::Path, KernelError> {
         cred.fsgid,
         0,
         crate::time::TIMEKEEPER.current_time(),
-        Arc::downgrade(&PIPEFS.sb()?),
+        Some(&PIPEFS.sb()?),
         &NULL_INODE_OPS,
     ))?;
     PIPEFS.path("", inode)

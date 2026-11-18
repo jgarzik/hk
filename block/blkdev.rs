@@ -14,7 +14,7 @@
 //! block_device) is the whole disk (partno 0) or one partition of it.
 //! Each block device has an inode (`bd_inode`, Linux bdev inode) whose
 //! page cache serves device-file I/O and filesystem metadata
-//! (`fs::blkdev_ops`); its pages are read and written a page per bio.
+//! (`fs::pageio::blkdev_ops`) in buffer heads, a bio per block (`fs::pageio::buffer`).
 //! Partition scans are synchronous bios (`submit_bio_wait`).
 //!
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
@@ -52,9 +52,10 @@ use crate::util::kalloc::{arc_nofail, box_nofail, try_arc};
 use crate::util::smallvec::SmallVec;
 
 use super::blk_mq::BlkMq;
+use super::claim::{self, Holder};
 
 /// Largest soft block size (Linux BLK_MAX_BLOCK_SIZE: 64K since 6.15
-/// with CONFIG_TRANSPARENT_HUGEPAGE); the size is only reported
+/// with CONFIG_TRANSPARENT_HUGEPAGE)
 const BLK_MAX_BLOCK_SIZE: i32 = 64 * 1024;
 
 /// Fixed block major numbers (Linux include/uapi/linux/major.h)
@@ -883,6 +884,9 @@ pub struct Disk {
     /// Opens, releases and rescans (Linux open_mutex), and the state
     /// they share
     pub(super) open_mutex: crate::sync::Mutex<OpenState>,
+    /// Its devices' exclusive claims (Linux bd_holder, bd_holders,
+    /// bd_claiming), under `claim::BDEV_LOCK`
+    pub(super) claims: super::claim::DiskClaims,
     /// Sequence number, unique for the boot, set at allocation (Linux
     /// diskseq)
     pub seq: u64,
@@ -906,6 +910,7 @@ impl Disk {
     ) -> Result<Arc<Self>, KernelError> {
         let dev = DevId::new(major, first_minor);
         let part_tbl = crate::util::kmem::try_vec(usize::from(minors.max(1)), None)?;
+        let claims = super::claim::Claims::new(usize::from(minors))?;
         let bdi = bdi_register(dev);
         let wb = bdi.clone();
         try_arc(Self {
@@ -922,6 +927,7 @@ impl Disk {
                 open_partitions: 0,
                 part_tbl: part_tbl.into_boxed_slice(),
             }),
+            claims: crate::sync::LockedBy::new(claims),
             seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
             private: spin::Once::new(),
             getgeo: spin::Once::new(),
@@ -966,9 +972,6 @@ pub struct BlockDevice {
     /// Open files (Linux bd_openers): changed only under the disk's
     /// `open_mutex`, an atomic because it lives here, as in Linux
     openers: AtomicU32,
-    /// Soft block size (Linux i_blkbits of the bdev inode, BLKBSZGET):
-    /// set under the disk's `open_mutex`, read lock-free
-    bsize: AtomicU32,
     /// Removed (hot unplug or partition rescan): I/O fails
     dead: AtomicBool,
     /// A partition's BLKROSET flag (Linux BD_READ_ONLY; the whole
@@ -997,7 +1000,7 @@ impl BlockDevice {
         name: String,
     ) -> Result<Self, KernelError> {
         let dev = DevId::new(disk.major, disk.first_minor + partno);
-        let bd_inode = crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT)?;
+        let bd_inode = crate::fs::pageio::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT)?;
         Ok(Self {
             disk,
             partno,
@@ -1006,7 +1009,6 @@ impl BlockDevice {
             dev,
             name,
             openers: AtomicU32::new(0),
-            bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
             read_only: AtomicBool::new(false),
             ro_warned: AtomicBool::new(false),
@@ -1085,32 +1087,22 @@ impl BlockDevice {
         self.ro_flag().store(ro, Ordering::Relaxed);
     }
 
+    /// Soft block size (Linux block_size: 1 << the bdev inode's
+    /// i_blkbits; BLKBSZGET)
     pub fn block_size(&self) -> u32 {
-        self.bsize.load(Ordering::Relaxed)
-    }
-
-    /// BLKBSZSET (Linux set_blocksize): a power of two from the logical
-    /// block size to BLK_MAX_BLOCK_SIZE; under `open_mutex`, so it never
-    /// interleaves with the first open setting the initial size
-    pub fn set_block_size(&self, size: i32) -> Result<(), KernelError> {
-        let lbs = self.logical_block_size() as i32;
-        if !(lbs..=BLK_MAX_BLOCK_SIZE).contains(&size) || !(size as u32).is_power_of_two() {
-            return Err(KernelError::InvalidArgument);
-        }
-        let _g = self.disk.open_mutex.lock();
-        self.bsize.store(size as u32, Ordering::Relaxed);
-        Ok(())
+        self.bd_inode.blocksize()
     }
 
     /// Initial soft block size: the largest power of two up to a page
-    /// that divides the size (Linux set_init_blocksize)
+    /// that divides the size (Linux set_init_blocksize), at the first
+    /// open under `open_mutex`
     fn init_block_size(&self) {
         let size = self.capacity();
         let mut bs = u64::from(self.logical_block_size());
         while bs < PAGE as u64 && size & bs == 0 {
             bs <<= 1;
         }
-        self.bsize.store(bs as u32, Ordering::Relaxed);
+        self.bd_inode.set_blkbits(bs.trailing_zeros());
     }
 
     pub fn is_dead(&self) -> bool {
@@ -1121,8 +1113,24 @@ impl BlockDevice {
         self.dead.store(true, Ordering::Release);
     }
 
-    /// A file opened the device (Linux blkdev_get_whole/_part)
-    pub fn open(&self) -> Result<(), KernelError> {
+    /// Open the device (Linux bdev_open): with a `holder`, for its
+    /// exclusive use (EBUSY if another holder has it)
+    pub fn open(&self, holder: Option<Holder>) -> Result<(), KernelError> {
+        if let Some(h) = holder {
+            claim::prepare(self, h)?;
+        }
+        let r = self.open_locked(holder);
+        if r.is_err()
+            && let Some(h) = holder
+        {
+            claim::abort(self, h);
+        }
+        r
+    }
+
+    /// `open` under `open_mutex`, the claim prepared (Linux
+    /// blkdev_get_whole/_part, bd_finish_claiming)
+    fn open_locked(&self, holder: Option<Holder>) -> Result<(), KernelError> {
         let mut st = self.disk.open_mutex.lock();
         // Checked under open_mutex: a rescan or removal that replaced
         // this device (it holds the mutex) is seen, so an open never
@@ -1136,26 +1144,39 @@ impl BlockDevice {
                 st.open_partitions += 1;
             }
         }
+        if let Some(h) = holder {
+            claim::finish(self, h);
+        }
         Ok(())
     }
 
-    /// Open the device for the kernel (a mount, active swap; Linux
-    /// bdev_file_open_by_dev): counted like an open file, so a rescan
-    /// sees the partition in use, until the handle is dropped
-    pub fn open_handle(self: &Arc<Self>) -> Result<BdevHandle, KernelError> {
-        self.open()?;
-        Ok(BdevHandle(self.clone()))
+    /// Open the device for the kernel (a mount, active swap, BLKBSZSET;
+    /// Linux bdev_file_open_by_dev): counted like an open file, so a
+    /// rescan sees the partition in use, and claimed by `holder`, until
+    /// the handle is dropped
+    pub fn open_handle(
+        self: &Arc<Self>,
+        holder: Option<Holder>,
+    ) -> Result<BdevHandle, KernelError> {
+        self.open(holder)?;
+        Ok(BdevHandle {
+            bdev: self.clone(),
+            holder,
+        })
     }
 
-    /// The last reference of an open file went away; the last opener
-    /// writes the cache back and drops it (Linux blkdev_put_whole ->
-    /// blkdev_flush_mapping: sync_blockdev + kill_bdev), under
-    /// open_mutex, so the next opener reads the disk
-    pub fn release(&self) {
+    /// An opener is done (Linux bdev_release): its claim ends; the last
+    /// opener writes the cache back and drops it (Linux
+    /// blkdev_put_whole -> blkdev_flush_mapping: sync_blockdev +
+    /// kill_bdev), under open_mutex, so the next opener reads the disk
+    pub fn release(&self, holder: Option<Holder>) {
         let mut st = self.disk.open_mutex.lock();
+        if let Some(h) = holder {
+            claim::end(self, h);
+        }
         if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 {
             let _ = sync_blockdev(self);
-            crate::mm::filemap::invalidate(&self.bd_inode);
+            kill_bdev(self);
             if self.partno != 0 {
                 st.open_partitions -= 1;
             }
@@ -1163,19 +1184,28 @@ impl BlockDevice {
     }
 }
 
-/// A kernel open of a block device (`BlockDevice::open_handle`)
-pub struct BdevHandle(Arc<BlockDevice>);
+/// A kernel open of a block device (`BlockDevice::open_handle`; Linux
+/// a bdev file, its holder in private_data)
+pub struct BdevHandle {
+    bdev: Arc<BlockDevice>,
+    holder: Option<Holder>,
+}
 
 impl BdevHandle {
     pub fn bdev(&self) -> &Arc<BlockDevice> {
-        &self.0
+        &self.bdev
+    }
+
+    /// Its exclusive claim's holder, if it has one
+    pub fn holder(&self) -> Option<Holder> {
+        self.holder
     }
 }
 
 impl core::ops::Deref for BdevHandle {
     type Target = BlockDevice;
     fn deref(&self) -> &BlockDevice {
-        &self.0
+        &self.bdev
     }
 }
 
@@ -1184,7 +1214,7 @@ impl Drop for BdevHandle {
         // Host tests make superblocks but never open devices (and
         // cannot sleep on open_mutex)
         #[cfg(not(test))]
-        self.0.release();
+        self.bdev.release(self.holder);
     }
 }
 
@@ -1213,9 +1243,9 @@ pub(super) fn bdev_add(st: &mut OpenState, bdev: &Arc<BlockDevice>) -> Result<()
     // The device's inode does I/O on this device only (never a later
     // one with the same number)
     bdev.bd_inode
-        .set_private(try_arc(crate::fs::blkdev_ops::BdevOwner(Arc::downgrade(
-            bdev,
-        )))?);
+        .set_private(try_arc(crate::fs::pageio::blkdev_ops::BdevOwner(
+            Arc::downgrade(bdev),
+        ))?);
     *slot = Some(bdev.clone());
     crate::fs::icache::insert_inode_hash(&bdev.bd_inode, bdev_hash(bdev.dev));
     Ok(())
@@ -1230,8 +1260,8 @@ pub(super) fn bdev_del(st: &mut OpenState, partno: u16) -> Option<Arc<BlockDevic
     let b = st.part_tbl.get_mut(usize::from(partno))?.take()?;
     crate::fs::icache::remove_inode_hash(&b.bd_inode);
     b.mark_dead();
-    crate::mm::filemap::unmap_mapping_range(&b.bd_inode.i_data, 0);
-    crate::mm::filemap::invalidate(&b.bd_inode);
+    crate::mm::filemap::unmap_mapping_range(b.bd_inode.i_mapping(), 0);
+    kill_bdev(&b);
     Some(b)
 }
 
@@ -1240,7 +1270,7 @@ pub(super) fn bdev_del(st: &mut OpenState, partno: u16) -> Option<Arc<BlockDevic
 pub fn get_blkdev(dev: DevId) -> Option<Arc<BlockDevice>> {
     let sb = crate::fs::pseudo::BDEV.sb().ok()?;
     let inode = crate::fs::icache::ilookup5(&sb, bdev_hash(dev), &|i| i.rdev == dev)?;
-    crate::fs::blkdev_ops::inode_owner(&inode)
+    crate::fs::pageio::blkdev_ops::inode_owner(&inode)
 }
 
 /// `f` on each block device's inode (Linux: blockdev_superblock's
@@ -1258,7 +1288,7 @@ fn for_each_bdev_inode(mut f: impl FnMut(&crate::fs::InodeRef)) {
 /// `f` on each block device a disk has, with no lock held, in no order
 pub(super) fn for_each_bdev(mut f: impl FnMut(&Arc<BlockDevice>)) {
     for_each_bdev_inode(|i| {
-        if let Some(b) = crate::fs::blkdev_ops::inode_owner(i)
+        if let Some(b) = crate::fs::pageio::blkdev_ops::inode_owner(i)
             && !b.is_dead()
         {
             f(&b);
@@ -1270,7 +1300,7 @@ pub(super) fn for_each_bdev(mut f: impl FnMut(&Arc<BlockDevice>)) {
 /// meminfo's Buffers)
 pub fn nr_blockdev_pages() -> u64 {
     let mut n = 0;
-    for_each_bdev_inode(|i| n += i.i_data.nrpages());
+    for_each_bdev_inode(|i| n += i.i_mapping().nrpages());
     n
 }
 
@@ -1527,6 +1557,94 @@ pub fn bdev_rw_bytes(
     bdev_rw(bdev, BioOp::Write, first, &mut tmp)
 }
 
+/// Drop the device's whole cache, dirty or not (Linux kill_bdev: the
+/// per-CPU buffer LRUs emptied, truncate_inode_pages from 0)
+pub fn kill_bdev(bdev: &BlockDevice) {
+    if bdev.bd_inode.i_mapping().nrpages() == 0 {
+        return;
+    }
+    crate::fs::pageio::buffer::invalidate_bh_lrus();
+    crate::mm::filemap::invalidate(&bdev.bd_inode);
+}
+
+/// Drop the device cache's clean, unused pages (Linux invalidate_bdev:
+/// the buffer LRUs emptied first, then invalidate_mapping_pages)
+pub fn invalidate_bdev(bdev: &BlockDevice) {
+    if bdev.bd_inode.i_mapping().nrpages() == 0 {
+        return;
+    }
+    crate::fs::pageio::buffer::invalidate_bh_lrus();
+    crate::mm::swap::lru::lru_add_drain_all();
+    crate::mm::filemap::invalidate_clean(&bdev.bd_inode, 0, u64::MAX);
+}
+
+/// A soft block size the device takes (Linux bdev_validate_blocksize:
+/// blk_validate_block_size and at least the logical block size)
+fn validate_blocksize(bdev: &BlockDevice, size: i32) -> Result<(), KernelError> {
+    let ok = (512..=BLK_MAX_BLOCK_SIZE).contains(&size)
+        && (size as u32).is_power_of_two()
+        && size as u32 >= bdev.logical_block_size();
+    if ok {
+        Ok(())
+    } else {
+        Err(KernelError::InvalidArgument)
+    }
+}
+
+/// Change the soft block size of a device its caller holds
+/// exclusively (`holder`; EINVAL without: Linux set_blocksize, the
+/// bdev file's private_data), so no filesystem or other exclusive user
+/// has its cache in use: its cache is written back and dropped first, under the
+/// bdev inode's i_rwsem held for writing, which the device file's
+/// buffered reads and writes hold shared, and its mapping's
+/// invalidate_lock held for writing, which a read or fault filling a
+/// page holds shared (Linux), so none of them runs on the old geometry
+/// meanwhile.
+pub fn set_blocksize(
+    bdev: &BlockDevice,
+    holder: Option<Holder>,
+    size: i32,
+) -> Result<(), KernelError> {
+    validate_blocksize(bdev, size)?;
+    if holder.is_none() {
+        return Err(KernelError::InvalidArgument);
+    }
+    let bits = (size as u32).trailing_zeros();
+    let inode = &bdev.bd_inode;
+    if inode.blkbits() != bits {
+        let _g = inode.lock();
+        let _inv = inode.i_mapping().invalidate_lock.write();
+        let _ = sync_blockdev(bdev);
+        kill_bdev(bdev);
+        inode.set_blkbits(bits);
+    }
+    Ok(())
+}
+
+/// Set a device filesystem's block size and its device's (Linux
+/// sb_set_blocksize, at mount: set_blocksize on s_bdev_file, which the
+/// superblock claims): the new size, or 0 if the device does not take it
+pub fn sb_set_blocksize(sb: &crate::fs::superblock::SuperBlock, size: u32) -> u32 {
+    let Some(bdev) = sb.bdev() else {
+        return 0;
+    };
+    let Ok(n) = i32::try_from(size) else {
+        return 0;
+    };
+    if set_blocksize(bdev, Some(sb.bdev_holder()), n).is_err() {
+        return 0;
+    }
+    sb.set_s_blocksize(size);
+    size
+}
+
+/// `sb_set_blocksize` with at least the device's logical block size
+/// (Linux sb_min_blocksize)
+pub fn sb_min_blocksize(sb: &crate::fs::superblock::SuperBlock, size: u32) -> u32 {
+    let min = sb.bdev().map_or(size, |b| b.logical_block_size());
+    sb_set_blocksize(sb, size.max(min))
+}
+
 /// Write the device's dirty cache pages and wait (Linux sync_blockdev)
 pub fn sync_blockdev(bdev: &BlockDevice) -> Result<(), KernelError> {
     crate::mm::filemap::write_and_wait(&bdev.bd_inode)
@@ -1536,7 +1654,7 @@ pub fn sync_blockdev(bdev: &BlockDevice) -> Result<(), KernelError> {
 /// one at a time with no lock held
 pub fn sync_bdevs() {
     for_each_bdev_inode(|i| {
-        if i.i_data.nrpages() != 0 {
+        if i.i_mapping().nrpages() != 0 {
             let _ = crate::mm::filemap::write_and_wait(i);
         }
     });

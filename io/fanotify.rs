@@ -682,7 +682,8 @@ pub fn sys_fanotify_mark(
     let inode = dentry.get_inode();
     let target_id = if (mark_flags & (FAN_MARK_FILESYSTEM | FAN_MARK_MOUNT)) != 0 {
         inode
-            .and_then(|i| i.sb.upgrade())
+            .as_ref()
+            .and_then(|i| i.superblock())
             .map_or(0, |sb| sb.st_dev())
     } else {
         inode.ok_or(KernelError::NotFound)?.ino

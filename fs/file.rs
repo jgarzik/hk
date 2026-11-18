@@ -408,16 +408,14 @@ pub trait FileOps: Send + Sync {
         None
     }
 
-    /// Sync file data to backing store
-    fn fsync(&self, _file: &File) -> Result<(), KernelError> {
+    /// Sync bytes [start, end] of the file and, unless `datasync`, its
+    /// metadata, or with `datasync` only the metadata the data needs
+    /// (Linux f_op->fsync); its writeback error since this file last
+    /// looked is reported here too (file_check_and_advance_wb_err).
+    /// Default nothing to sync (Linux noop_fsync).
+    fn fsync(&self, file: &File, start: u64, end: u64, datasync: bool) -> Result<(), KernelError> {
+        let _ = (file, start, end, datasync);
         Ok(())
-    }
-
-    /// Sync the data of bytes [start, end] (Linux f_op->fsync with a
-    /// range, from generic_write_sync); default: the whole file
-    fn fsync_range(&self, file: &File, start: u64, end: u64) -> Result<(), KernelError> {
-        let _ = (start, end);
-        self.fsync(file)
     }
 
     /// A descriptor of the file is being closed (close, dup2 over it,
@@ -673,9 +671,11 @@ impl File {
     pub fn sample_wb_err(&self) {
         if let Some(i) = self.mapping_inode() {
             self.f_wb_err
-                .store(i.i_data.wb_err.sample(), Ordering::Relaxed);
+                .store(i.i_mapping().wb_err.sample(), Ordering::Relaxed);
         }
-        if let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) {
+        if let Some(i) = self.dentry.get_inode()
+            && let Some(sb) = i.superblock()
+        {
             self.f_sb_err.store(sb.s_wb_err.sample(), Ordering::Relaxed);
         }
     }
@@ -686,13 +686,16 @@ impl File {
         let Some(i) = self.mapping_inode() else {
             return Ok(());
         };
-        advance(&i.i_data.wb_err, &self.f_wb_err, &self.f_lock)
+        advance(&i.i_mapping().wb_err, &self.f_wb_err, &self.f_lock)
     }
 
     /// A writeback error of its filesystem since it last looked, once
     /// (Linux syncfs: errseq_check_and_advance of s_wb_err, f_sb_err)
     pub fn check_and_advance_sb_err(&self) -> Result<(), KernelError> {
-        let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) else {
+        let Some(i) = self.dentry.get_inode() else {
+            return Ok(());
+        };
+        let Some(sb) = i.superblock() else {
             return Ok(());
         };
         advance(&sb.s_wb_err, &self.f_sb_err, &self.f_lock)
@@ -728,8 +731,8 @@ impl File {
     /// f_mapping->host): a block device node's is the device's bdev
     /// inode, every other file's its own
     pub fn mapping_inode(&self) -> Option<InodeRef> {
-        if let Some(b) = self.private_ref::<crate::block::BlockDevice>() {
-            return Some(b.bd_inode.clone());
+        if let Some(b) = self.private_ref::<crate::fs::pageio::blkdev_ops::BdevFile>() {
+            return Some(b.bdev.bd_inode.clone());
         }
         self.get_inode()
     }
@@ -991,10 +994,8 @@ impl File {
                 .map(|n| (pos, n))
         })()?;
         drop(lock);
-        // After i_rwsem is released; a synchronous mount is Linux IS_SYNC
-        let sync =
-            flags.contains(RwFlags::DSYNC) || inode.superblock().is_some_and(|sb| sb.synchronous());
-        generic_write_sync(self, pos, n, sync)
+        // After i_rwsem is released
+        generic_write_sync(self, pos, n, flags)
     }
 
     /// Seek
@@ -1100,9 +1101,17 @@ impl File {
 /// A file is released when it goes: by its last `fput` for one in the
 /// file cache (`release`, which drops it there), or as dropped before
 /// `alloc` (an open that failed)
+/// Linux __fput's tail too: what the file holds goes before its dentry
+/// and mount (the fields' own drops, in order), so none holds its
+/// inode past the mount: the filesystem's per-open data (freed by
+/// ->release there), then put_file_access (the inode's write access,
+/// then the mount's)
 impl Drop for File {
     fn drop(&mut self) {
         self.__fput();
+        drop(core::mem::take(&mut self.private));
+        drop(self.i_write.take());
+        drop(self.write_access.take());
     }
 }
 
@@ -1496,18 +1505,30 @@ pub fn files_init() {
     }
 }
 
-/// After a write of `n` bytes at `pos` of `file` that must be
-/// synchronous (`dsync`: IOCB_DSYNC, or the inode IS_SYNC), those bytes
-/// reach the storage before the write returns, and an error doing so is
-/// the write's (Linux generic_write_sync: vfs_fsync_range over them)
+/// The write must be synchronous (Linux iocb_is_dsync): IOCB_DSYNC
+/// (O_DSYNC, O_SYNC, RWF_DSYNC, RWF_SYNC), or the inode holding its
+/// data IS_SYNC (f_mapping->host: a block device node's is the bdev
+/// inode, whatever the mount of the node)
+fn iocb_is_dsync(file: &File, flags: RwFlags) -> bool {
+    flags.contains(RwFlags::DSYNC) || file.mapping_inode().is_some_and(|i| i.is_sync())
+}
+
+/// After a write of `n` bytes at `pos` of `file` with I/O flags
+/// `flags`: for a synchronous one (`iocb_is_dsync`) those bytes reach
+/// the storage before the write returns, with all the metadata for
+/// IOCB_SYNC (O_SYNC, RWF_SYNC) and only what the data needs otherwise
+/// (datasync), and an error doing so is the write's (Linux
+/// generic_write_sync: vfs_fsync_range over them)
 pub fn generic_write_sync(
     file: &File,
     pos: u64,
     n: usize,
-    dsync: bool,
+    flags: RwFlags,
 ) -> Result<usize, KernelError> {
-    if n > 0 && dsync {
-        crate::fs::sync::vfs_fsync_range(file, pos, pos.saturating_add(n as u64 - 1))?;
+    if n > 0 && iocb_is_dsync(file, flags) {
+        let end = pos.saturating_add(n as u64 - 1);
+        let datasync = !flags.contains(RwFlags::SYNC);
+        crate::fs::pageio::sync::vfs_fsync_range(file, pos, end, datasync)?;
     }
     Ok(n)
 }

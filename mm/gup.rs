@@ -28,13 +28,19 @@ use super::pgtable::PgTables;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_READ, PROT_WRITE, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::paging;
-use crate::fs::InodeRef;
 use crate::util::error::KernelError;
 use crate::util::seg::trim_tail;
 use crate::util::smallvec::SmallVec;
 
 /// References one pin takes (Linux GUP_PIN_COUNTING_BIAS)
 pub const GUP_PIN_COUNTING_BIAS: u32 = 1024;
+
+/// Pin for writing: a read from a device lands in the pages (Linux
+/// FOLL_WRITE)
+pub const FOLL_WRITE: u32 = 1 << 0;
+/// The pin is held for long, past the call (Linux FOLL_LONGTERM: a
+/// registered buffer)
+pub const FOLL_LONGTERM: u32 = 1 << 1;
 
 /// The page at `phys` may be pinned for DMA (Linux
 /// folio_maybe_dma_pinned): it holds at least one pin's references; a
@@ -60,17 +66,17 @@ pub struct PageSeg {
 /// User memory pinned for DMA (Linux FOLL_PIN pages with their offsets
 /// and lengths, as iov_iter_extract_pages gives them): unpinned when
 /// dropped, and first marked dirty if `set_dirty` was called (Linux
-/// unpin_user_pages_dirty_lock). Dropped in thread context: dirtying a
-/// page-cache page takes its page lock, so a completion in an interrupt
-/// handler hands it to a thread (Linux bio_check_pages_dirty ->
-/// bio_dirty_work): its submitter's task_work, or a work item, which
-/// `Workqueue::queue_work` queues from any context.
+/// unpin_user_pages_dirty_lock). A pin holds the page only, never the
+/// inode or file whose cache it may be in (Linux: a folio reference):
+/// the unpin finds the page's mapping, if it is still in one, under its
+/// page lock. Dropped in thread context: dirtying a page takes its page
+/// lock, so a completion in an interrupt handler hands it to a thread
+/// (Linux bio_check_pages_dirty -> bio_dirty_work): its submitter's
+/// task_work, or a work item, which `Workqueue::queue_work` queues from
+/// any context.
 #[must_use]
 pub struct PinnedPages {
     segs: SmallVec<PageSeg, INLINE_PAGES>,
-    /// Per segment, the inode whose page cache its page belongs to (a
-    /// shared file mapping written through): a write dirties it there
-    owners: SmallVec<Option<InodeRef>, INLINE_PAGES>,
     dirty: bool,
 }
 
@@ -82,7 +88,6 @@ impl PinnedPages {
     pub fn new(max: usize) -> Result<Self, KernelError> {
         Ok(Self {
             segs: SmallVec::try_with_capacity(max)?,
-            owners: SmallVec::try_with_capacity(max)?,
             dirty: false,
         })
     }
@@ -109,17 +114,13 @@ impl PinnedPages {
     /// Give back the last `n` bytes, unpinning the pages left with none
     /// (Linux bio_iov_iter_align_down)
     pub fn trim(&mut self, n: usize) {
-        let owners = &mut self.owners;
         trim_tail(
             &mut self.segs,
             n,
             |s| s.len as usize,
             // Less than a page: lossless
             |s, l| s.len = l as u32,
-            |s| {
-                owners.pop();
-                unpin_page(s.phys);
-            },
+            |s| unpin_page(s.phys),
         );
     }
 
@@ -128,38 +129,19 @@ impl PinnedPages {
     pub fn set_dirty(&mut self) {
         self.dirty = true;
     }
-
-    /// Mark the page at `phys` dirty: anonymous memory by its flag, a
-    /// page-cache page in its `owner`'s mapping under the page lock
-    /// (Linux folio_mark_dirty)
-    fn dirty_page(phys: u64, owner: Option<&InodeRef>) {
-        match owner {
-            Some(inode) => {
-                super::page::lock_page(phys);
-                super::filemap::dirty_page(&inode.i_data, phys);
-                super::page::unlock_page(phys);
-            }
-            None => {
-                if let Some(pg) = super::page::phys_to_page(phys) {
-                    pg.set_flag(super::page::PG_DIRTY);
-                }
-            }
-        }
-    }
 }
 
 impl Drop for PinnedPages {
-    /// Unpin the pages, dirtying them first if written (thread context:
-    /// a page-cache page is dirtied under its page lock, Linux
-    /// bio_release_pages / set_page_dirty_lock, which an interrupt-time
-    /// end defers to bio_dirty_work)
+    /// Unpin the pages, dirtying them first if written (Linux
+    /// unpin_user_pages_dirty_lock: folio_mark_dirty_lock, thread
+    /// context, which an interrupt-time end defers to bio_dirty_work)
     fn drop(&mut self) {
         if self.dirty {
             crate::sync::might_sleep();
         }
-        for (s, owner) in self.segs.iter().zip(self.owners.iter()) {
+        for s in self.segs.iter() {
             if self.dirty {
-                Self::dirty_page(s.phys, owner.as_ref());
+                super::filemap::folio_mark_dirty_lock(s.phys);
             }
             unpin_page(s.phys);
         }
@@ -250,9 +232,8 @@ pub fn repin(
         if !FRAME_ALLOCATOR.get_refs(s.phys, GUP_PIN_COUNTING_BIAS) {
             return Err(KernelError::OutOfMemory);
         }
-        // Room was reserved for `n` pages in both: no allocation
+        // Room was reserved for `n` pages: no allocation
         out.segs.push(*s);
-        out.owners.push(None);
     }
     let excess = out.len() & len_mask;
     out.trim(excess);
@@ -262,19 +243,36 @@ pub fn repin(
     Ok(out)
 }
 
-/// The VMA of `addr` if pages of it may be pinned (Linux
+/// The VMA of `addr` if pages of it may be pinned with `flags` (Linux
 /// check_vma_flags): a write needs a writable mapping, a read a readable
-/// one; EFAULT otherwise
-fn pin_vma(map: &MmStruct, addr: u64, write: bool) -> Result<&Vma, KernelError> {
+/// one, and a long-term write one that does not track dirtying
+/// (writable_file_mapping_allowed); EFAULT otherwise
+fn pin_vma(map: &MmStruct, addr: u64, flags: u32) -> Result<&Vma, KernelError> {
     if addr >= super::TASK_SIZE {
         return Err(KernelError::BadAddress);
     }
     let vma = map.find_vma(addr).ok_or(KernelError::BadAddress)?;
+    let write = flags & FOLL_WRITE != 0;
     let need = if write { PROT_WRITE } else { PROT_READ };
     if vma.prot & need == 0 {
         return Err(KernelError::BadAddress);
     }
+    if write && flags & FOLL_LONGTERM != 0 && needs_dirty_tracking(vma) {
+        return Err(KernelError::BadAddress);
+    }
     Ok(vma)
+}
+
+/// Writes through the mapping must be seen by its filesystem, which a
+/// device writing a long-term pinned page would bypass (Linux
+/// vma_needs_dirty_tracking): a shared writable mapping of a file whose
+/// cache writes back (hk's write-notify condition, as the fault path's)
+fn needs_dirty_tracking(vma: &Vma) -> bool {
+    vma.is_shared()
+        && vma.is_writable()
+        && vma
+            .inode()
+            .is_some_and(|i| i.i_op().maps_cache() && i.i_mapping().aops().can_dirty())
 }
 
 /// The frame of the current task's page at `addr`, faulted in for
@@ -290,7 +288,7 @@ pub fn user_page_phys(addr: u64) -> Result<u64, KernelError> {
     loop {
         {
             let map = mm.mmap_read();
-            pin_vma(&map, page, false)?;
+            pin_vma(&map, page, 0)?;
             let t = PgTables::new(&mm, &map);
             if let Some(pmd) = t.pmd(page).filter(|p| p.huge()) {
                 let base = paging::pte_addr(pmd.settled()) & !HUGE_PAGE_MASK;
@@ -384,16 +382,6 @@ fn fault_in(mm: &Mm, addr: u64, access: Access) -> Result<(), KernelError> {
     })
 }
 
-/// The inode whose page cache a pinned page written through a shared
-/// file mapping belongs to
-fn cache_owner(vma: &Vma, write: bool) -> Option<InodeRef> {
-    if !write || !vma.is_shared() {
-        return None;
-    }
-    let inode = vma.file.as_ref()?.mapping_inode()?;
-    inode.i_op.maps_cache().then_some(inode)
-}
-
 /// What a run of pins under one mmap_lock hold ended with
 enum Step {
     /// Done, or stopped (with the error if nothing was pinned)
@@ -416,9 +404,10 @@ fn pin_locked(
     mm: &Mm,
     map: &MmStruct,
     (addr, len, mut done): (u64, usize, usize),
-    write: bool,
+    flags: u32,
     max: usize,
 ) -> Step {
+    let write = flags & FOLL_WRITE != 0;
     let t = PgTables::new(mm, map);
     let mut vma: Option<&Vma> = None;
     while done < len && out.segs.len() < max {
@@ -428,7 +417,7 @@ fn pin_locked(
         let page = a & !(PAGE_SIZE - 1);
         let v = match vma.filter(|v| v.contains(page)) {
             Some(v) => v,
-            None => match pin_vma(map, page, write) {
+            None => match pin_vma(map, page, flags) {
                 Ok(v) => *vma.insert(v),
                 Err(e) => return Step::Done(partial(done, e)),
             },
@@ -454,30 +443,29 @@ fn pin_locked(
             off: off as u32,
             len: n as u32,
         };
-        // Room was reserved for `max` pages in both: no allocation
+        // Room was reserved for `max` pages: no allocation
         out.segs.push(seg);
-        out.owners.push(cache_owner(v, write));
         done += n;
     }
     Step::Done(Ok(done))
 }
 
 /// Pin the pages of `mm`'s `len` bytes at `addr`, at most `max` pages,
-/// into `out` (Linux pin_user_pages_fast, FOLL_PIN, with FOLL_WRITE for
-/// `write`): the bytes pinned, short at the first page that cannot be
-/// pinned; that page's error if none was. The mmap_lock is held for
-/// reading across the run and dropped only to fault a page in.
+/// into `out` (Linux pin_user_pages_fast, FOLL_PIN, with `flags`): the
+/// bytes pinned, short at the first page that cannot be pinned; that
+/// page's error if none was. The mmap_lock is held for reading across
+/// the run and dropped only to fault a page in.
 fn pin_user_range(
     out: &mut PinnedPages,
     mm: &Mm,
     addr: u64,
     len: usize,
-    write: bool,
+    flags: u32,
     max: usize,
 ) -> Result<usize, KernelError> {
     let mut done = 0;
     loop {
-        let step = pin_locked(out, mm, &mm.mmap_read(), (addr, len, done), write, max);
+        let step = pin_locked(out, mm, &mm.mmap_read(), (addr, len, done), flags, max);
         let (page, acc) = match step {
             Step::Done(r) => return r,
             Step::Fault(page, acc) => (page, acc),
@@ -490,19 +478,19 @@ fn pin_user_range(
 }
 
 /// Pin the current task's pages of the `len` bytes at `addr`, at most
-/// `max` pages in all in `out`, for `write` (Linux pin_user_pages_fast,
-/// FOLL_PIN, with FOLL_WRITE for a read from a device): the bytes
-/// pinned, short at the first page that cannot be pinned; that page's
-/// error if none was
+/// `max` pages in all in `out`, with `flags` (Linux pin_user_pages_fast,
+/// FOLL_PIN: FOLL_WRITE for a read from a device, FOLL_LONGTERM for a
+/// registered buffer): the bytes pinned, short at the first page that
+/// cannot be pinned; that page's error if none was
 pub fn pin_user(
     out: &mut PinnedPages,
     addr: u64,
     len: usize,
-    write: bool,
+    flags: u32,
     max: usize,
 ) -> Result<usize, KernelError> {
     let mm = crate::task::percpu::current()
         .mm()
         .ok_or(KernelError::BadAddress)?;
-    pin_user_range(out, &mm, addr, len, write, max)
+    pin_user_range(out, &mm, addr, len, flags, max)
 }

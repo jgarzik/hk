@@ -55,12 +55,6 @@ pub struct KfSuper {
     pub ns: u64,
 }
 
-impl AsAny for KfSuper {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-}
-
 impl crate::fs::superblock::SuperBlockData for KfSuper {}
 
 /// The namespace of `inode`'s mount
@@ -68,8 +62,8 @@ fn sb_ns(inode: &Inode) -> u64 {
     let Some(sb) = inode.superblock() else {
         return 0;
     };
-    let Some(p) = sb.get_private() else { return 0 };
-    p.as_any().downcast_ref::<KfSuper>().map_or(0, |k| k.ns)
+    let g = crate::sync::rcu::read_lock();
+    sb.fs_info_rcu::<KfSuper>(&g).map_or(0, |k| k.ns)
 }
 
 /// The node behind `inode`
@@ -98,7 +92,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<InodeRef, KernelEr
         0,
         size,
         now,
-        Arc::downgrade(sb),
+        Some(sb),
         &KERNFS_IOPS,
     ))?;
     i.set_private_rcu(try_arc(KfInode(kn.clone()))?);
@@ -149,7 +143,7 @@ impl InodeOps for KernfsIops {
         }
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         Ok(Found {
-            inode: Some(inode(&sb, &kn)?),
+            inode: Some(inode(sb, &kn)?),
             d_time: rev,
         })
     }

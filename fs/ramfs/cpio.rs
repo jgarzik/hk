@@ -217,7 +217,7 @@ fn do_entry(root: &DentryRef, e: &Entry<'_>, links: &mut Links) -> Result<bool, 
     {
         let inode = inode.clone();
         clean_path(&parent, &dir, name, u32::MAX);
-        dir.i_op.link(&dir, name, &inode).map_err(fs_err)?;
+        dir.i_op().link(&dir, name, &inode).map_err(fs_err)?;
         if !e.body.is_empty() {
             ramfs_fill_file(&inode, e.body).map_err(fs_err)?;
         }
@@ -229,7 +229,7 @@ fn do_entry(root: &DentryRef, e: &Entry<'_>, links: &mut Links) -> Result<bool, 
             // Linux opens an existing file O_TRUNC and writes the body:
             // a later archive (an overlay) replaces it
             let old = existing.ok_or(CpioError::KernelError)?;
-            old.i_op.truncate(&old, 0).map_err(fs_err)?;
+            old.i_op().truncate(&old, 0).map_err(fs_err)?;
             ramfs_fill_file(&old, e.body).map_err(fs_err)?;
             old.set_mode_perm((e.mode & 0o7777) as u16);
             old.set_uid(e.uid);
@@ -265,7 +265,7 @@ fn do_entry(root: &DentryRef, e: &Entry<'_>, links: &mut Links) -> Result<bool, 
                 DevId::new(0, 0)
             };
             let inode = dir
-                .i_op
+                .i_op()
                 .mknod(&dir, name, InodeMode(e.mode as u16), rdev)
                 .map_err(fs_err)?;
             inode.set_uid(e.uid);
@@ -288,9 +288,9 @@ fn clean_path(parent: &DentryRef, dir: &Inode, name: &[u8], ty: u32) -> Option<I
         return Some(old);
     }
     let gone = if old.mode().is_dir() {
-        dir.i_op.rmdir(dir, name, &d)
+        dir.i_op().rmdir(dir, name, &d)
     } else {
-        dir.i_op.unlink(dir, name, &d)
+        dir.i_op().unlink(dir, name, &d)
     };
     if gone.is_ok() {
         parent.remove_child(name);

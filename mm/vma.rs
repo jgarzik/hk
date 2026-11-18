@@ -371,7 +371,7 @@ impl Vma {
         self.is_shared()
             && self
                 .inode()
-                .is_some_and(|i| i.i_op.maps_cache() && i.i_data.aops().can_dirty())
+                .is_some_and(|i| i.i_op().maps_cache() && i.i_mapping().aops().can_dirty())
     }
 
     /// The inode of the mapped file (its i_mmap lists this VMA)

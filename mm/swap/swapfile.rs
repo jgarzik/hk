@@ -1,6 +1,7 @@
 //! Swap devices and swap slots (Linux mm/swapfile.c)
 //!
-//! A swap area (a partition, or a file through its inode) is a
+//! A swap area (a partition, or a file whose blocks are mapped to its
+//! device at swapon, Linux swap extents) is a
 //! [`SwapInfo`]: its slots (one page each; slot 0 holds the mkswap
 //! header) are counted in `swap_map` like Linux: the number of swap
 //! PTEs referencing a slot, plus [`SWAP_HAS_CACHE`] while a swap-cache
@@ -11,8 +12,13 @@
 //! (`spin::Mutex`, thread context only) guards the counts and the
 //! allocation hint; it is a leaf taken under the PTE lock (fork, zap,
 //! swap-in), never with the swap cache's lock held. `SWAP_INFO` (a
-//! spin `RwLock`, read mostly) holds the devices; `SWAPON` (a sleeping
-//! `Mutex`) serializes swapon and swapoff.
+//! spin `RwLock`, read mostly; Linux swap_lock and swap_info[]) holds
+//! the devices and the types in use: swapon reserves a type under it
+//! first (alloc_swap_info), sets the area up under its file's i_rwsem
+//! and publishes it under it (enable_swap_info); swapoff takes
+//! SWP_WRITEOK away under it, empties the device with no swap lock
+//! held, and takes it out of the table under it, so swapons and
+//! swapoffs of different areas run in parallel.
 //!
 //! Lifetime (Linux si->users, get_swap_device / put_swap_device): every
 //! use of a device by swap entry or type holds a [`SwapDev`], one count
@@ -34,10 +40,11 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::{Mutex, RwLock};
 
 use super::swap_entry::{MAX_SWAPFILES, SwapEntry};
-use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
+use crate::block::BlockDevice;
+use crate::block::blkdev::{BioOp, bdev_rw_frame};
 use crate::fs::{Inode, InodeRef, LookupFlags, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
-use crate::mm::page::frame_bytes;
+use crate::mm::page::PAGE_SHIFT;
 use crate::mm::xarray::XArray;
 use crate::sync::IrqSpinlock;
 use crate::task::{CAP_SYS_ADMIN, capable};
@@ -61,6 +68,19 @@ pub const SWAP_FLAG_PRIO_MASK: i32 = 0x7FFF;
 
 /// Enable discard (TRIM) for SSD swap
 pub const SWAP_FLAG_DISCARD: i32 = 0x10000;
+
+/// Discard the whole area at swapon (Linux SWAP_FLAG_DISCARD_ONCE)
+const SWAP_FLAG_DISCARD_ONCE: i32 = 0x20000;
+
+/// Discard freed page clusters (Linux SWAP_FLAG_DISCARD_PAGES)
+const SWAP_FLAG_DISCARD_PAGES: i32 = 0x40000;
+
+/// The flags swapon accepts (Linux SWAP_FLAGS_VALID)
+const SWAP_FLAGS_VALID: i32 = SWAP_FLAG_PRIO_MASK
+    | SWAP_FLAG_PREFER
+    | SWAP_FLAG_DISCARD
+    | SWAP_FLAG_DISCARD_ONCE
+    | SWAP_FLAG_DISCARD_PAGES;
 
 /// The device takes new slots (Linux SWP_WRITEOK)
 const SWP_WRITEOK: u32 = 1 << 1;
@@ -105,18 +125,63 @@ struct SwapHeaderInfo {
 // Global swap state
 // ============================================================================
 
-/// Active swap devices, by type
-pub static SWAP_INFO: RwLock<[Option<Arc<SwapInfo>>; MAX_SWAPFILES]> =
-    RwLock::new([const { None }; MAX_SWAPFILES]);
+/// The swap types (Linux swap_info[] under swap_lock)
+pub struct SwapTable {
+    /// The enabled device of each type
+    pub(super) dev: [Option<Arc<SwapInfo>>; MAX_SWAPFILES],
+    /// Types in use, one bit each (Linux SWP_USED): reserved by swapon
+    /// before it opens anything, given back by a failed swapon or by
+    /// swapoff once the device is released
+    used: u32,
+}
 
-/// Usable slots of every device (Linux total_swap_pages)
+const _: () = assert!(MAX_SWAPFILES <= u32::BITS as usize);
+
+/// The swap types and their devices (Linux swap_lock, swap_info[])
+pub static SWAP_INFO: RwLock<SwapTable> = RwLock::new(SwapTable {
+    dev: [const { None }; MAX_SWAPFILES],
+    used: 0,
+});
+
+/// Usable slots of every device taking new ones (Linux
+/// total_swap_pages): changed under `SWAP_INFO` with SWP_WRITEOK
 pub static TOTAL_SWAP_PAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Slots in use (counted or cached)
 pub static TOTAL_SWAP_USED: AtomicU64 = AtomicU64::new(0);
 
-/// swapon and swapoff, one at a time (Linux swapon_mutex)
-static SWAPON: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+/// A swap type swapon reserved (Linux alloc_swap_info: SWP_USED under
+/// swap_lock), given back on drop (Linux bad_swap: flags = 0 under
+/// swap_lock, after the area's resources are freed) unless enabled
+struct SwapType(u8);
+
+impl SwapType {
+    /// The lowest type not in use; EPERM if there is none
+    fn alloc() -> KernelResult<Self> {
+        let mut t = SWAP_INFO.write();
+        let ty = (0..MAX_SWAPFILES)
+            .find(|&i| t.used & (1 << i) == 0)
+            .ok_or(KernelError::NotPermitted)?;
+        t.used |= 1 << ty;
+        Ok(Self(ty as u8))
+    }
+
+    /// The type stays in use, enabled, until swapoff frees it
+    fn keep(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for SwapType {
+    fn drop(&mut self) {
+        free_type(self.0);
+    }
+}
+
+/// Give swap type `t` back (Linux: si->flags = 0 under swap_lock)
+fn free_type(t: u8) {
+    SWAP_INFO.write().used &= !(1 << t);
+}
 
 // ============================================================================
 // SwapInfo - per-device state
@@ -130,14 +195,26 @@ struct SwapMap {
     next: u64,
 }
 
+/// A run of a swap file's slots on its device (Linux struct
+/// swap_extent): slots `start_page..start_page + nr_pages` are the
+/// device's pages from `start_block` on
+#[derive(Clone, Copy)]
+struct SwapExtent {
+    start_page: u64,
+    nr_pages: u64,
+    start_block: u64,
+}
+
 /// One swap area (Linux swap_info_struct)
 pub struct SwapInfo {
     /// Backing file (a swap file)
     pub inode: Option<InodeRef>,
     /// Backing block device (a swap partition)
     pub bdev: Option<crate::block::blkdev::BdevHandle>,
-    /// Path given to swapon
-    pub path: Vec<u8>,
+    /// A swap file's device, its filesystem's (Linux si->bdev =
+    /// i_sb->s_bdev), and its slots' runs there, mapped at swapon and
+    /// in slot order (Linux swap_extent_root)
+    file_map: Option<(Arc<BlockDevice>, Vec<SwapExtent>)>,
     /// Device state (SWP_WRITEOK)
     flags: AtomicU32,
     /// Allocation priority (higher first)
@@ -211,7 +288,7 @@ impl SwapInfo {
 
     fn new(
         backing: (Option<InodeRef>, Option<crate::block::blkdev::BdevHandle>),
-        path: Vec<u8>,
+        file_map: Option<(Arc<BlockDevice>, Vec<SwapExtent>)>,
         swap_type: u8,
         max: u64,
         priority: i16,
@@ -227,7 +304,7 @@ impl SwapInfo {
         Ok(Self {
             inode: backing.0,
             bdev: backing.1,
-            path,
+            file_map,
             flags: AtomicU32::new(SWP_WRITEOK),
             priority,
             swap_type,
@@ -322,7 +399,7 @@ impl SwapInfo {
 /// swapoff is tearing it down (Linux get_swap_device_info)
 fn get_device(t: u8) -> Option<SwapDev> {
     let tbl = SWAP_INFO.read();
-    let si = tbl.get(t as usize)?.as_ref()?;
+    let si = tbl.dev.get(t as usize)?.as_ref()?;
     // Counted while the table holds it: swapoff kills `users` before
     // it lets go
     si.users
@@ -341,13 +418,15 @@ pub fn get_swap_device(e: SwapEntry) -> Option<SwapDev> {
     (e.offset() < si.max).then_some(si)
 }
 
-/// The type of the device at `path`
-fn find_swap_by_path(path: &[u8]) -> Option<u8> {
-    let info = SWAP_INFO.read();
-    info.iter()
-        .flatten()
-        .find(|si| si.path == path)
-        .map(|si| si.swap_type)
+/// The inode whose mapping a swap area at `inode` uses (Linux
+/// file->f_mapping->host): a block device node's device inode, else
+/// the file's own
+fn mapping_host(inode: InodeRef) -> KernelResult<InodeRef> {
+    if !inode.mode().is_blkdev() {
+        return Ok(inode);
+    }
+    let b = crate::block::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
+    Ok(b.bd_inode.clone())
 }
 
 // ============================================================================
@@ -357,18 +436,12 @@ fn find_swap_by_path(path: &[u8]) -> Option<u8> {
 /// A free slot for a page entering the swap cache, its count
 /// SWAP_HAS_CACHE (Linux folio_alloc_swap): the writable device of
 /// highest priority with room
-///
-/// Direct reclaim (PF_MEMALLOC) takes only block-device areas: a swap
-/// file's pages go out through its filesystem's writepage, which may
-/// need locks the allocating task holds (Linux maps a swap file's
-/// blocks at swapon and bypasses the filesystem)
 pub fn get_swap_page() -> Option<SwapEntry> {
-    let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
     // Each device's priority (no reference kept past the table's lock),
     // then the usable ones in priority order, each in use while a slot
     // is taken from it (Linux swap_alloc_slow: get_swap_device_info)
     let mut prio: [Option<i16>; MAX_SWAPFILES] = [None; MAX_SWAPFILES];
-    for (p, d) in prio.iter_mut().zip(SWAP_INFO.read().iter()) {
+    for (p, d) in prio.iter_mut().zip(SWAP_INFO.read().dev.iter()) {
         *p = d.as_ref().map(|s| s.priority);
     }
     loop {
@@ -383,7 +456,7 @@ pub fn get_swap_page() -> Option<SwapEntry> {
         let Some(si) = get_device(best as u8) else {
             continue;
         };
-        if !si.writeok() || (reclaiming && si.inode.is_some()) {
+        if !si.writeok() {
             continue;
         }
         if let Some(off) = si.alloc_slot() {
@@ -470,22 +543,37 @@ pub fn free_swap_and_cache(e: SwapEntry) {
 // Swap I/O
 // ============================================================================
 
+/// The device and first sector of slot `off` (Linux swap_page_sector:
+/// a swap file's through its extents); None past them
+fn swap_page_sector(si: &SwapInfo, off: u64) -> Option<(&BlockDevice, u64)> {
+    if let Some(b) = &si.bdev {
+        return Some((b, off * SECTORS_PER_PAGE));
+    }
+    let (bdev, ext) = si.file_map.as_ref()?;
+    Some((bdev, extent_block(ext, off)? * SECTORS_PER_PAGE))
+}
+
+/// The device page of slot `off` in a swap file's extents (Linux
+/// offset_to_swap_extent)
+fn extent_block(ext: &[SwapExtent], off: u64) -> Option<u64> {
+    let i = ext.partition_point(|e| e.start_page + e.nr_pages <= off);
+    let e = ext.get(i).filter(|e| e.start_page <= off)?;
+    Some(e.start_block + off - e.start_page)
+}
+
+/// Transfer slot `entry` and the frame at `frame_phys` (may sleep):
+/// straight to the disk, a swap file's too (Linux swap_read_folio_bdev,
+/// __swap_writepage)
+fn swap_rw_frame(entry: SwapEntry, op: BioOp, frame_phys: u64) -> KernelResult<()> {
+    let si = get_swap_device(entry).ok_or(KernelError::InvalidArgument)?;
+    let (bdev, sector) =
+        swap_page_sector(&si, entry.offset()).ok_or(KernelError::InvalidArgument)?;
+    bdev_rw_frame(bdev, op, sector, frame_phys)
+}
+
 /// Read slot `entry` into the frame at `frame_phys` (may sleep)
 pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
-    let si = get_swap_device(entry).ok_or(KernelError::InvalidArgument)?;
-    let off = entry.offset();
-    if let Some(ref inode) = si.inode {
-        inode
-            .i_data
-            .aops()
-            // SAFETY: the locked swap-cache page being filled
-            .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, false)
-            .map_err(|_| KernelError::Io)
-    } else if let Some(ref bdev) = si.bdev {
-        bdev_rw_frame(bdev, BioOp::Read, off * SECTORS_PER_PAGE, frame_phys)
-    } else {
-        Err(KernelError::InvalidArgument)
-    }
+    swap_rw_frame(entry, BioOp::Read, frame_phys)
 }
 
 /// Write the frame at `frame_phys` to slot `entry` (may sleep)
@@ -494,32 +582,8 @@ pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
     // own) must not reclaim through swap I/O again (Linux: swap_writepage
     // under memalloc_noio / PF_MEMALLOC)
     crate::mm::memalloc_scope(crate::task::pf::MEMALLOC_NOIO, || {
-        write_page(entry, frame_phys)
+        swap_rw_frame(entry, BioOp::Write, frame_phys)
     })
-}
-
-/// `swap_write_page` with PF_MEMALLOC_NOIO set
-fn write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
-    let si = get_swap_device(entry).ok_or(KernelError::InvalidArgument)?;
-    let off = entry.offset();
-    if let Some(ref inode) = si.inode {
-        // Not from direct reclaim (PF_MEMALLOC): the file's writepage may
-        // need filesystem locks the allocating task holds. A page already
-        // in the swap cache of a swap file stays dirty and in memory.
-        if crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC) {
-            return Err(KernelError::WouldBlock);
-        }
-        inode
-            .i_data
-            .aops()
-            // SAFETY: the locked swap-cache page being written
-            .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, true)
-            .map_err(|_| KernelError::Io)
-    } else if let Some(ref bdev) = si.bdev {
-        bdev_rw_frame(bdev, BioOp::Write, off * SECTORS_PER_PAGE, frame_phys)
-    } else {
-        Err(KernelError::InvalidArgument)
-    }
 }
 
 // ============================================================================
@@ -554,54 +618,142 @@ fn parse_header(hdr: &[u8; PAGE_SIZE], size: u64) -> Result<u64, KernelError> {
     Ok(max)
 }
 
-/// swapon(2): activate a swap partition or file
+/// A swap area's header page, read through the page cache of its file
+/// or device inode (Linux read_mapping_folio); `hdr` is a page long
+fn read_header(inode: &Inode, hdr: &mut [u8]) -> Result<(), KernelError> {
+    let phys = crate::mm::filemap::read_page(inode, 0)?;
+    assert!(hdr.len() <= PAGE_SIZE);
+    // SAFETY: a page-cache page our reference keeps allocated; `hdr`
+    // is at most a page
+    unsafe { crate::mm::page::copy_from_frame_racy(hdr, phys, 0) };
+    crate::mm::filemap::put_page(phys);
+    Ok(())
+}
+
+/// Add slots `start_page..start_page + nr_pages` at device page
+/// `start_block` to a swap file's extents (Linux add_swap_extent),
+/// merged into the last one if they continue it
+fn add_swap_extent(
+    ext: &mut Vec<SwapExtent>,
+    start_page: u64,
+    nr_pages: u64,
+    start_block: u64,
+) -> Result<(), KernelError> {
+    if let Some(l) = ext.last_mut()
+        && l.start_page + l.nr_pages == start_page
+        && l.start_block + l.nr_pages == start_block
+    {
+        l.nr_pages += nr_pages;
+        return Ok(());
+    }
+    ext.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
+    ext.push(SwapExtent {
+        start_page,
+        nr_pages,
+        start_block,
+    });
+    Ok(())
+}
+
+/// The device block of a swap file's block `block` (Linux bmap): EINVAL
+/// for a hole or a file without ->bmap ("swapfile has holes")
+fn swap_bmap(inode: &Inode, block: u64) -> Result<u64, KernelError> {
+    match inode.i_mapping().aops().bmap(inode, block) {
+        Ok(b) if b != 0 => Ok(b),
+        _ => {
+            crate::printkln!("swapon: swapfile has holes");
+            Err(KernelError::InvalidArgument)
+        }
+    }
+}
+
+/// Map a swap file's pages to its device (Linux
+/// generic_swapfile_activate, under i_rwsem): every page-sized run of
+/// its blocks that is contiguous and page-aligned on the disk is a
+/// slot, in file order, up to `max` (a misaligned or broken run is
+/// skipped a block at a time). The extents and the slots mapped (at
+/// least 1, so an empty file is "Empty swap-file").
+fn generic_swapfile_activate(
+    inode: &Inode,
+    max: u64,
+) -> Result<(Vec<SwapExtent>, u64), KernelError> {
+    let blkbits = inode.blkbits();
+    let blocks_per_page = (PAGE_SIZE >> blkbits) as u64;
+    let last_block = inode.get_size() >> blkbits;
+    let mut ext = Vec::new();
+    let (mut probe_block, mut page_no) = (0, 0);
+    'probe: while probe_block + blocks_per_page <= last_block && page_no < max {
+        crate::task::percpu::cond_resched();
+        let first_block = swap_bmap(inode, probe_block)?;
+        // It must be PAGE_SIZE aligned on-disk
+        if first_block & (blocks_per_page - 1) != 0 {
+            probe_block += 1;
+            continue;
+        }
+        for block_in_page in 1..blocks_per_page {
+            if swap_bmap(inode, probe_block + block_in_page)? != first_block + block_in_page {
+                // Discontiguity
+                probe_block += 1;
+                continue 'probe;
+            }
+        }
+        add_swap_extent(&mut ext, page_no, 1, first_block >> (PAGE_SHIFT - blkbits))?;
+        page_no += 1;
+        probe_block += blocks_per_page;
+    }
+    Ok((ext, page_no.max(1)))
+}
+
+/// swapon(2): activate a swap partition or file (Linux
+/// SYSCALL_DEFINE2(swapon)). Under its mapping host's i_rwsem (the
+/// file's inode, or a device's bdev inode): an active swap area is
+/// EBUSY (IS_SWAPFILE, whatever path reached it), the header is read
+/// through the page cache, a file's pages are mapped to its disk, and
+/// S_SWAPFILE is set before its writes are drained, so no write or
+/// truncate of the file runs from the mapping to the swap's end. The
+/// type is reserved first (Linux alloc_swap_info), the area published
+/// under `SWAP_INFO` inside the i_rwsem (enable_swap_info). Unknown
+/// flags are EINVAL before anything else.
 pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
+    if swap_flags & !SWAP_FLAGS_VALID != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     if !capable(CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
+    // Given back after everything below is released (dropped last)
+    let ty = SwapType::alloc()?;
+    let swap_type = ty.0;
     let path = user_path(path)?;
     let swap_file =
         crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, LookupFlags::open())
             .map_err(|_| KernelError::NotFound)?;
-    let inode = swap_file.dentry.get_inode().ok_or(KernelError::NotFound)?;
-    let _g = SWAPON.lock();
-    if find_swap_by_path(&path).is_some() {
-        return Err(KernelError::Busy);
-    }
-    let swap_type = SWAP_INFO
-        .read()
-        .iter()
-        .position(|s| s.is_none())
-        .ok_or(KernelError::Busy)? as u8;
-    // A block device swaps through bios, a file through its inode
-    let bdev = if inode.mode().is_blkdev() {
-        // Opened for the swap's life (Linux swapon opens the device)
-        let b = crate::block::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
-        Some(b.open_handle()?)
+    let node = swap_file.dentry.get_inode().ok_or(KernelError::NotFound)?;
+    // claim_swapfile: a block device opened and claimed for the swap's
+    // life (Linux file_open_name O_EXCL: holder the swap area, EBUSY if
+    // another holder has it); the holder is the type's slot, unique
+    // while the area exists. A file swaps to its filesystem's device.
+    let bdev = if node.mode().is_blkdev() {
+        let b = crate::block::get_blkdev(node.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
+        let slot = core::ptr::from_ref(&SWAP_INFO) as usize + usize::from(swap_type);
+        Some(b.open_handle(Some(slot))?)
     } else {
         None
     };
-    // A swap file's pages go straight to the disk from now on: its page
-    // cache is written back and dropped so no cached copy diverges
-    // (Linux claim_swapfile / inode_drain_writes + invalidate)
-    if bdev.is_none() {
-        crate::mm::filemap::write_and_wait(&inode)?;
-        crate::mm::filemap::invalidate(&inode);
-    }
-    // The header page off the stack (Linux reads it into a page cache
-    // folio, read_mapping_folio)
-    let mut hdr = crate::util::kmem::try_vec(PAGE_SIZE, 0u8)?;
-    let read = match &bdev {
-        Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|()| PAGE_SIZE),
-        None => inode
-            .i_data
-            .aops()
-            .swap_rw(&inode, 0, &mut hdr, false)
-            .map(|()| PAGE_SIZE),
+    let inode = match &bdev {
+        Some(b) => b.bd_inode.clone(),
+        None => node,
     };
-    if read.unwrap_or(0) < PAGE_SIZE {
-        return Err(KernelError::InvalidArgument);
+    let lock = inode.lock();
+    if swap_file.dentry.d_unlinked() {
+        return Err(KernelError::NotFound);
     }
+    if inode.is_swapfile() {
+        return Err(KernelError::Busy);
+    }
+    // Read the swap header (Linux read_mapping_folio), off the stack
+    let mut hdr = crate::util::kmem::try_vec(PAGE_SIZE, 0u8)?;
+    read_header(&inode, &mut hdr)?;
     // No slots past the end of the file or device (Linux
     // read_swap_header: i_size of either)
     let size = bdev
@@ -611,51 +763,116 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         });
     let hdr =
         <&[u8; PAGE_SIZE]>::try_from(hdr.as_slice()).map_err(|_| KernelError::InvalidArgument)?;
-    let max = parse_header(hdr, size)?;
+    let mut max = parse_header(hdr, size)?;
+    // setup_swap_extents: a file's pages mapped to its disk
+    let file_map = match &bdev {
+        Some(_) => None,
+        None => {
+            let (ext, pages) = generic_swapfile_activate(&inode, max)?;
+            max = pages;
+            let sb = inode.superblock().ok_or(KernelError::InvalidArgument)?;
+            let b = sb.bdev().ok_or(KernelError::InvalidArgument)?.clone();
+            Some((b, ext))
+        }
+    };
+    // No usable slot past the header (Linux "Empty swap-file")
+    if max <= 1 {
+        return Err(KernelError::InvalidArgument);
+    }
     let priority = if swap_flags & SWAP_FLAG_PREFER != 0 {
         (swap_flags & SWAP_FLAG_PRIO_MASK) as i16
     } else {
         -1
     };
-    let backing = match bdev {
+    // Allocated before it takes its backing, whose release (a device's
+    // close, an iput) a failure leaves for after the unlock (Linux
+    // bad_swap: filp_close after inode_unlock)
+    let mut si = try_arc(SwapInfo::new(
+        (None, None),
+        file_map,
+        swap_type,
+        max,
+        priority,
+    )?)?;
+    let s = Arc::get_mut(&mut si).expect("swapon: a new area is unshared");
+    (s.inode, s.bdev) = match bdev {
         Some(b) => (None, Some(b)),
-        None => (Some(inode), None),
+        None => (Some(inode.clone()), None),
     };
-    let mut si = SwapInfo::new(backing, path, swap_type, max, priority)?;
-    si.swap_file = Some(swap_file);
-    let si = try_arc(si)?;
-    // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
-    // a write or truncate in flight finishes first, later ones see it
-    let si_inode = si.swapfile_inode();
-    let lock = si_inode.lock();
-    si_inode.set_swapfile(true);
+    s.swap_file = Some(swap_file);
+    // Flush any pending I/O and dirty pages before the area is used
+    // (Linux: S_SWAPFILE, then inode_drain_writes)
+    inode.set_swapfile(true);
+    if let Err(e) = inode_drain_writes(&inode) {
+        inode.set_swapfile(false);
+        drop(lock);
+        drop(si);
+        return Err(e);
+    }
+    // Linux enable_swap_info: listed, SWP_WRITEOK, its slots counted,
+    // under swap_lock
+    {
+        let mut t = SWAP_INFO.write();
+        t.dev[swap_type as usize] = Some(si);
+        TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
+    }
+    ty.keep();
     drop(lock);
-    SWAP_INFO.write()[swap_type as usize] = Some(si);
-    TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
     Ok(())
 }
 
+/// Wait out direct I/O and write back the dirty pages of `inode`
+/// (Linux inode_drain_writes); the caller holds its i_rwsem
+fn inode_drain_writes(inode: &Inode) -> KernelResult<()> {
+    inode.inode_dio_wait();
+    crate::mm::filemap::write_and_wait(inode)
+}
+
+/// The enabled device whose swap file (or device inode) is `inode`,
+/// SWP_WRITEOK taken from it so no other swapoff finds it and its
+/// slots no longer counted in the total (Linux swapoff under
+/// swap_lock: p->swap_file->f_mapping == mapping among the SWP_WRITEOK
+/// areas, then del_from_avail_list and total_swap_pages -= p->pages)
+fn swapoff_find(inode: &Inode) -> Option<Arc<SwapInfo>> {
+    let tbl = SWAP_INFO.write();
+    let si = tbl
+        .dev
+        .iter()
+        .flatten()
+        .find(|si| si.writeok() && core::ptr::eq(si.swapfile_inode(), inode))?;
+    si.set_writeok(false);
+    TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
+    Some(si.clone())
+}
+
+/// A swapoff that failed gives its device back (Linux
+/// reinsert_swap_info: SWP_WRITEOK and its slots in the total again,
+/// under swap_lock)
+fn reinsert_swap_info(si: &SwapInfo) {
+    let _tbl = SWAP_INFO.write();
+    si.set_writeok(true);
+    TOTAL_SWAP_PAGES.fetch_add(si.max - 1, Ordering::Relaxed);
+}
+
 /// swapoff(2): bring every page of a swap area back into memory and
-/// deactivate it (Linux try_to_unuse)
+/// deactivate it (Linux try_to_unuse), with no swapoff lock held while
+/// it empties the device
 pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     if !capable(CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
     let path = user_path(path)?;
-    // A nonexistent file is ENOENT, an existing non-swap file EINVAL
-    // (Linux swapoff: file_open_name first)
-    lookup_path(&path)?;
-    let _g = SWAPON.lock();
-    let t = find_swap_by_path(&path).ok_or(KernelError::InvalidArgument)?;
-    // Only swapoff takes a device out of the table, under SWAPON
-    let si = SWAP_INFO.read()[t as usize]
-        .clone()
-        .ok_or(KernelError::InvalidArgument)?;
-    // No new slots from it (Linux del_from_avail_list, under si->lock:
-    // an allocator past get_swap_page's filter rechecks under `map`)
-    si.set_writeok(false);
+    // A nonexistent file is ENOENT, an existing non-swap file EINVAL;
+    // the area is found by its mapping, whatever path names it (Linux
+    // swapoff: file_open_name, then f_mapping)
+    let dentry = lookup_path(&path)?;
+    let victim = mapping_host(dentry.get_inode().ok_or(KernelError::NotFound)?)?;
+    // No new slots from it (an allocator past get_swap_page's filter
+    // rechecks under `map`); only this swapoff takes it out of the table
+    let si = swapoff_find(&victim).ok_or(KernelError::InvalidArgument)?;
+    let t = si.swap_type;
     if let Err(e) = super::swap_state::try_to_unuse(&si) {
-        si.set_writeok(true);
+        reinsert_swap_info(&si);
         return Err(e);
     }
     // Wait for every use of the device to end (Linux percpu_ref_kill,
@@ -664,12 +881,11 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     // device is released here, in process context
     si.users.kill();
     si.users.wait();
-    let table = SWAP_INFO.write()[t as usize].take();
+    let table = SWAP_INFO.write().dev[t as usize].take();
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
     si_inode.set_swapfile(false);
     drop(lock);
-    TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);
     drop(table);
     debug_assert_eq!(
@@ -678,30 +894,39 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
         "swapoff: device still referenced"
     );
     drop(si);
+    // Last: a new area of this type may claim a device with its holder
+    free_type(t);
     Ok(())
+}
+
+/// Free slots of the devices taking new ones, less the slots a
+/// swapoff's device still holds (Linux nr_swap_pages: below zero while
+/// those outnumber the rest's free ones)
+fn nr_swap_pages() -> i64 {
+    TOTAL_SWAP_PAGES.load(Ordering::Relaxed) as i64 - TOTAL_SWAP_USED.load(Ordering::Relaxed) as i64
 }
 
 /// Over half of swap is in use (Linux vm_swap_full): a page read back
 /// gives its slot up at once rather than keep a clean copy
 pub fn swap_full() -> bool {
-    let (total, free) = swap_totals();
-    free * 2 < total
+    nr_swap_pages() * 2 < TOTAL_SWAP_PAGES.load(Ordering::Relaxed) as i64
 }
 
-/// A swap area on a block device is on (direct reclaim swaps only there)
-pub fn bdev_swap_active() -> bool {
-    SWAP_INFO
-        .read()
+/// Swap totals in pages: (total, free) (Linux si_swapinfo: meminfo,
+/// sysinfo): a swapoff's device counts its slots still in use in both
+pub fn swap_totals() -> (u64, u64) {
+    let tbl = SWAP_INFO.read();
+    let unused: u64 = tbl
+        .dev
         .iter()
         .flatten()
-        .any(|si| si.bdev.is_some())
-}
-
-/// Swap totals in pages: (total, free) (meminfo, sysinfo)
-pub fn swap_totals() -> (u64, u64) {
-    let total = TOTAL_SWAP_PAGES.load(Ordering::Relaxed);
-    let used = TOTAL_SWAP_USED.load(Ordering::Relaxed);
-    (total, total.saturating_sub(used))
+        .filter(|si| !si.writeok())
+        .map(|si| si.inuse.load(Ordering::Relaxed))
+        .sum();
+    let total = TOTAL_SWAP_PAGES.load(Ordering::Relaxed) + unused;
+    let free = (nr_swap_pages() + unused as i64).max(0) as u64;
+    drop(tbl);
+    (total, free)
 }
 
 #[cfg(test)]
@@ -731,7 +956,7 @@ mod tests {
 
     #[test]
     fn slot_counts_and_cache_bit() {
-        let si = SwapInfo::new((None, None), Vec::new(), 0, 4, 0).unwrap();
+        let si = SwapInfo::new((None, None), None, 0, 4, 0).unwrap();
         let a = si.alloc_slot().unwrap();
         let b = si.alloc_slot().unwrap();
         assert_eq!((a, b), (1, 2));
@@ -748,5 +973,20 @@ mod tests {
         assert_eq!(si.alloc_slot(), None);
         // The header slot is never touched
         assert_eq!(si.update(0, |_| Some(0)), None);
+    }
+
+    #[test]
+    fn swap_extents() {
+        let mut ext = Vec::new();
+        // Pages 0..3 at device pages 10..13, then 3 at 20, 4 at 21
+        for (page, block) in [(0, 10), (1, 11), (2, 12), (3, 20), (4, 21)] {
+            add_swap_extent(&mut ext, page, 1, block).unwrap();
+        }
+        assert_eq!(ext.len(), 2);
+        let got: Vec<_> = (0..6).map(|o| extent_block(&ext, o)).collect();
+        assert_eq!(
+            got,
+            [Some(10), Some(11), Some(12), Some(20), Some(21), None]
+        );
     }
 }
