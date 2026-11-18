@@ -10,7 +10,7 @@ use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::list::{Adapter, Link, WeakList};
 use ::core::mem::ManuallyDrop;
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync;
 
@@ -1137,6 +1137,11 @@ pub struct SuperBlock {
 
     /// Its inodes (Linux s_inodes, under its s_inode_list_lock)
     pub(super) s_inodes: super::inode::SbInodes,
+    /// Inode references its inotify watches hold (Linux
+    /// fsnotify_sb_watched_objects, an atomic count): the shutdown
+    /// waits for zero (`inotify::sb_delete`), woken through the
+    /// count's `var_waitqueue` by the last put
+    pub(crate) s_fsnotify_watched: AtomicUsize,
 
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
@@ -1218,6 +1223,7 @@ impl SuperBlock {
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
             s_blocksize_bits: core::sync::atomic::AtomicU8::new(crate::mm::page::PAGE_SHIFT as u8),
             s_fs_info: RcuOnceArc::none(),
+            s_fsnotify_watched: AtomicUsize::new(0),
             s_bdev: spin::Once::new(),
             s_bdev_file: Mutex::new(None),
             s_inodes: super::inode::sb_inodes(),
