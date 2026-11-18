@@ -823,6 +823,17 @@ fn with_vi<R>(inode: &Inode, f: impl FnOnce(&VfatInode) -> R) -> Result<R, Kerne
 // VFAT Helpers
 // ============================================================================
 
+/// `sb`'s VFAT data, borrowed for `f` (Linux MSDOS_SB(sb)): one
+/// reference to it, no copy
+fn with_sbi<R>(sb: &SuperBlock, f: impl FnOnce(&VfatSbData) -> R) -> Result<R, KernelError> {
+    let p = sb.get_private().ok_or(KernelError::Io)?;
+    let sbi = p
+        .as_any()
+        .downcast_ref::<VfatSbData>()
+        .ok_or(KernelError::Io)?;
+    Ok(f(sbi))
+}
+
 /// Get VFAT superblock data from superblock (cloned to avoid lifetime issues)
 fn get_sb_data(sb: &SuperBlock) -> Result<VfatSbData, KernelError> {
     let guard = sb.private.read();
@@ -2492,12 +2503,14 @@ impl InodeOps for VfatInodeOps {
         }
         if mode & FALLOC_FL_KEEP_SIZE != 0 {
             let sb = inode.superblock().ok_or(KernelError::Io)?;
-            let cs = u64::from(get_sb_data(&sb)?.cluster_size);
-            let ondisksize = u64::from(get_inode_data(inode)?.clusters) * cs;
-            for _ in 0..end.saturating_sub(ondisksize).div_ceil(cs) {
-                aops::fat_add_cluster(inode)?;
-            }
-            return Ok(());
+            return with_sbi(&sb, |sbi| {
+                let cs = u64::from(sbi.cluster_size);
+                let ondisksize = u64::from(get_inode_data(inode)?.clusters) * cs;
+                for _ in 0..end.saturating_sub(ondisksize).div_ceil(cs) {
+                    aops::fat_add_cluster(sbi, inode)?;
+                }
+                Ok(())
+            })?;
         }
         if end <= inode.get_size() {
             return Ok(());
