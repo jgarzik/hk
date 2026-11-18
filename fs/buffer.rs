@@ -2015,6 +2015,18 @@ impl MappingMetadataBhs {
     }
 }
 
+impl MappingMetadataBhs {
+    /// Its drop need not wait a grace period: one has passed since it
+    /// was emptied (in memory freed by RCU, as Linux's inode holding it)
+    ///
+    /// # Safety
+    /// A grace period has passed since the list was last emptied
+    /// (`mmb_invalidate`), and no buffer went on it since.
+    pub unsafe fn rcu_passed(&self) {
+        self.used.store(false, Ordering::Relaxed);
+    }
+}
+
 impl Drop for MappingMetadataBhs {
     /// Emptied, then a grace period, so a completion that read a
     /// buffer's `b_mmb` before is done with it before the memory and the

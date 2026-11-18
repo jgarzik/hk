@@ -26,6 +26,11 @@
 //!   directory's free slots at its end starts there and goes on into a
 //!   new cluster (Linux fat_add_entries): after a remount it is found,
 //!   with no end-of-directory slot before it
+//! - VFAT_HOLE_REUSE: a long name whose slots fit a hole that unlinks
+//!   left in a directory takes that hole (Linux fat_add_entries: the
+//!   first free run long enough, before any new cluster): after an
+//!   unmount its long-name slots and short entry are there on the
+//!   device, the directory still has one cluster, and it is found
 //! - VFAT_FSYNC_TIMES: utimensat marks the inode dirty (Linux
 //!   fat_setattr: mark_inode_dirty); fsync writes its entry (Linux
 //!   fat_file_fsync -> sync_inode_metadata -> fat_write_inode): the
@@ -205,6 +210,7 @@ pub fn run_tests() {
     atime_ro(dev);
     unlink_race(dev);
     dir_grow(dev);
+    hole_reuse(dev);
     fsync_times(dev);
     fdatasync_times(dev);
     odsync_times(dev);
@@ -714,6 +720,84 @@ fn dir_grow(dev: &[u8]) {
         sys_unlink(grow_path(n, &mut path).as_ptr());
     }
     t.eq(b"rmdir", sys_rmdir(gd.as_ptr()), 0);
+    t.done();
+}
+
+/// `/tmp/vdk/HD/F<n>` (one slot, as `grow_path`)
+fn hole_path(n: u64, out: &mut [u8; 32]) -> &[u8] {
+    let len = grow_path(n, out).len();
+    out[b"/tmp/vdk/".len()] = b'H';
+    &out[..len]
+}
+
+/// VFAT_HOLE_REUSE: HD's first cluster filled but for its last slot
+/// with one-slot names F0.., F1..F3 (slots 3..5) unlinked, then a name
+/// of 3 slots (2 long-name ones and its short entry)
+fn hole_reuse(dev: &[u8]) {
+    let mut t = T::new(b"VFAT_HOLE_REUSE");
+    let hd = b"/tmp/vdk/HD\0";
+    let long = b"/tmp/vdk/HD/a long name entry here.txt\0";
+    let per = Fat::open(dev).map_or(0, |f| f.spc * f.bps / 32);
+    if !t.ok(b"geometry", per >= 8, per as i64) {
+        t.done();
+        return;
+    }
+    t.eq(b"mkdir", sys_mkdir(hd.as_ptr(), 0o755), 0);
+    // "." and ".." take slots 0 and 1, F<n> slot n + 2; the last is free
+    let files = per - 3;
+    let mut path = [0u8; 32];
+    for n in 0..files {
+        let fd = sys_open(hole_path(n, &mut path).as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        if fd < 0 {
+            t.ok(b"create", false, fd);
+            break;
+        }
+        sys_close(fd as u64);
+    }
+    for n in 1..4 {
+        t.eq(b"unlink", sys_unlink(hole_path(n, &mut path).as_ptr()), 0);
+    }
+    let fd = sys_open(long.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    t.ok(b"create long", fd >= 0, fd);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    match Fat::open(dev) {
+        Some(f) => match f.find(f.root, b"HD         ") {
+            Some(e) => {
+                let c = start(&e);
+                t.ok(b"one cluster", f.next(c).is_none(), 0);
+                let attr = |i| f.entry(c, i).map_or(0xff, |e| e[11]);
+                let first = f.entry(c, 3).map_or(0, |e| e[0]);
+                t.eq(b"slot 3 last lfn", i64::from(first), 0x42);
+                t.eq(b"slot 4 lfn", i64::from(attr(4)), 0x0f);
+                let short = f.entry(c, 5).unwrap_or([0; 32]);
+                t.ok(
+                    b"slot 5 short",
+                    short[0] != 0 && short[0] != 0xe5 && short[11] == 0x20,
+                    i64::from(short[11]),
+                );
+            }
+            None => {
+                t.ok(b"HD entry", false, 0);
+            }
+        },
+        None => {
+            t.ok(b"open device", false, 0);
+        }
+    }
+    t.eq(b"remount", mount(dev), 0);
+    t.eq(
+        b"long found",
+        sys_stat(long.as_ptr(), &mut Stat::default()),
+        0,
+    );
+    sys_unlink(long.as_ptr());
+    for n in 0..files {
+        sys_unlink(hole_path(n, &mut path).as_ptr());
+    }
+    t.eq(b"rmdir", sys_rmdir(hd.as_ptr()), 0);
     t.done();
 }
 

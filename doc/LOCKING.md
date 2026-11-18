@@ -3068,22 +3068,38 @@ disk offset, 0 for none) changes under it (`attach`, Linux fat_attach;
 `fat_detach`, i_pos 0 before rename reuses a replaced object's slot),
 and an entry is read, patched and written under it (`fat_write_inode`,
 Linux __fat_write_inode, which marks the inode I_METADATA_WRITEBACK
-under its `i_lock` after the hold; rename's `write_entry`), so a write never
-lands on a slot its inode no longer owns. Every other change of a
-directory's slots is under it too: a new entry's slots written
-(`fat_add_entries`, after any cluster for them is allocated; on a
-dirsync mount they are synced with it released, and on failure marked
-deleted again under it), and an entry's removal (`fat_remove_entries`,
-synced likewise after the hold), whose unlink/rmdir detach of the cached inode
-(i_pos 0, Linux fat_detach) is in the same hold, so no write-back of
-an inode (an atime update of an open file, no `i_rwsem`) puts back a
-deleted entry. That inode is looked up before the lock: the lookup may
-wait for an inode being freed, whose write-back takes `ipos`. Linux
-patches the cached buffer under its spin lock and rechecks i_pos;
-here the patch is block I/O, so the lock sleeps and is held across
-it. Order: directory and inode `i_rwsem` -> `ipos` -> `VfatInode.d`
-(spin leaf), the device's page cache and I/O; never with
-`VfatSbData.fat`; no inode reference is put under it.
+under its `i_lock` after the hold; rename's `write_entry`, in the
+entry's buffer, its name untouched), so a write never lands on a slot
+its inode no longer owns. An entry's removal (`fat_remove_entries`'s
+first stage: the short entry's block) marks its slots deleted under
+it, with the unlink/rmdir detach of the cached inode (i_pos 0, Linux
+fat_detach) in the same hold, so no write-back of an inode (an atime
+update of an open file, no `i_rwsem`, whose read-patch-write copies
+the whole entry) puts back a deleted entry. A new entry's slots are
+written without it (Linux fat_add_entries, under the directory's
+`i_rwsem`): free slots no inode owns. That inode is looked up before
+the lock: the lookup may wait for an inode being freed, whose
+write-back takes `ipos`. Linux patches the cached buffer under its
+spin lock and rechecks i_pos; here write_inode's patch is block I/O,
+so the lock sleeps and is held across it. Order: directory and inode
+`i_rwsem` -> `ipos` -> `VfatInode.d` (spin leaf), the device's page
+cache and I/O; never with `VfatSbData.fat`; no inode reference is put
+under it.
+
+**vfat directory blocks** (`fs/vfat/mod.rs`, Linux fs/fat/dir.c): a
+directory is walked block by block in the device's buffers
+(`dir_walk`, Linux fat_get_entry: bread, each cluster read ahead) and
+its slots changed in them, under its `i_rwsem` (a rename's: both
+directories'); a changed block goes on that directory's metadata list
+(`VfatInodeRcu.i_metadata_bhs`, Linux i_metadata_bhs, which its
+->sync_inode_metadata and eviction write; `MappingMetadataBhs.lock`,
+a spin leaf), a moved directory's ".." block on the moved one's. The
+list is in the inode's RCU data (`Inode::private_rcu`), dropped a
+grace period after the eviction emptied it (Linux frees the inode by
+RCU), so its drop need not wait one (`rcu_passed`). A
+dirsync change writes and waits for exactly the buffers it changed
+(sync_dirty_buffer, fat_sync_bhs: buffer lock, no other lock held),
+where Linux does.
 
 **vfat chain cache** (`fs/vfat/cache.rs`, Linux fs/fat/cache.c):
 `VfatInode.cache` (spin Mutex, Linux cache_lru_lock), a leaf in

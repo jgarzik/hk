@@ -18,7 +18,7 @@ use crate::fs::buffer::{self, BhRef, MappingMetadataBhs};
 use crate::fs::inode::Inode;
 use crate::util::error::KernelError;
 
-use super::{VfatSbData, with_vi};
+use super::{VfatSbData, mmb_dirty, with_mmb};
 
 /// A free cluster's entry (Linux FAT_ENT_FREE)
 pub const FAT_ENT_FREE: u32 = 0;
@@ -80,21 +80,13 @@ pub fn with_fat_mmb<R>(
     sb: &VfatSbData,
     f: impl FnOnce(&MappingMetadataBhs) -> R,
 ) -> Result<R, KernelError> {
-    with_vi(&sb.fat_inode, |v| f(&v.i_metadata_bhs))
+    with_mmb(&sb.fat_inode, f)
 }
 
 /// Mark `bh` dirty on the FAT inode's list (Linux
 /// mmb_mark_buffer_dirty(bh, &MSDOS_I(fat_inode)->i_metadata_bhs))
 fn fat_mark_dirty(sb: &VfatSbData, bh: &BhRef) {
-    let r = with_fat_mmb(sb, |m| {
-        // SAFETY: the list is in the FAT inode's `VfatInode`, an `Arc`
-        // that never moves and is dropped (waiting a grace period)
-        // only with the inode, after its eviction emptied the list
-        unsafe { buffer::mmb_mark_buffer_dirty(bh, m) }
-    });
-    if r.is_err() {
-        buffer::mark_buffer_dirty(bh);
-    }
+    mmb_dirty(&sb.fat_inode, bh);
 }
 
 /// Linux fat_ent_blocknr: the entry's byte offset in its FAT block
