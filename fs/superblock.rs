@@ -1296,6 +1296,12 @@ impl SuperBlock {
         crate::sync::waitqueue::var_waitqueue((&raw const self.s_flags).addr())
     }
 
+    /// Its shutdown ran (`generic_shutdown_super` after a mount set it
+    /// up: SB_BORN and SB_DYING)
+    pub(super) fn shut_down(&self) -> bool {
+        self.super_flags(SB_BORN) && self.super_flags(SB_DYING)
+    }
+
     /// Its mount set it up (Linux vfs_get_tree's SB_BORN): walkers and
     /// mounters waiting for it go on
     pub fn set_born(&self) {
@@ -1887,6 +1893,56 @@ mod tests {
         fs_supers: FsSupers::new(WeakList::new()),
     };
 
+    /// The active reference `T6Ops` drops from an eviction, and the
+    /// inode `T6`'s fill made
+    static T6_ACTIVE: std::sync::Mutex<Option<SbActive>> = std::sync::Mutex::new(None);
+    static T6_KEPT: std::sync::Mutex<Option<InodeRef>> = std::sync::Mutex::new(None);
+
+    /// An inode whose ->evict_inode runs its superblock's whole
+    /// shutdown: a put overlapping the shutdown (`inode::evict`)
+    struct T6Ops;
+
+    impl InodeOps for T6Ops {
+        fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
+            Err(KernelError::NotFound)
+        }
+
+        fn evict_inode(&self, _inode: &Inode) {
+            let a = T6_ACTIVE.lock().unwrap().take();
+            drop(a);
+        }
+    }
+
+    static T6_IOPS: T6Ops = T6Ops;
+
+    fn t6_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| {
+            t_fill(sb, &crate::fs::inode::NULL_INODE_OPS)?;
+            let inode = Inode::alloc(Inode::new(
+                2,
+                InodeMode::regular(0o644),
+                0,
+                0,
+                0,
+                crate::time::TIMEKEEPER.current_time(),
+                Some(sb),
+                &T6_IOPS,
+            ))?;
+            *T6_KEPT.lock().unwrap() = Some(inode);
+            Ok(())
+        })
+    }
+
+    static T6: FileSystemType = FileSystemType {
+        name: "sbtest6",
+        fs_flags: 0,
+        mount: t6_mount,
+        kill_sb: kill_anon_super,
+        file_ops: &crate::fs::RAMFS_FILE_OPS,
+        next: FsNext::new(None),
+        fs_supers: FsSupers::new(WeakList::new()),
+    };
+
     fn get(t: &'static FileSystemType) -> Result<SbActive, KernelError> {
         vfs_get_tree(&FsContext::new(t, b"")).map(SbLocked::unlock)
     }
@@ -1979,6 +2035,26 @@ mod tests {
             let _ = i.superblock();
         }));
         core::mem::forget(inode);
+    }
+
+    /// An inode put during its superblock's shutdown (a bug: nothing
+    /// may, LOCKING.md Inode cache) is off `s_inodes` in ->evict_inode,
+    /// so the shutdown finds no busy inode and releases what that
+    /// eviction may use; its eviction panics once it sees the shutdown
+    /// done (`inode::evict`). The inode is leaked by the panic
+    #[test]
+    fn evict_overlapping_shutdown_panics() {
+        let sb = get(&T6).unwrap();
+        let inode = T6_KEPT.lock().unwrap().take().unwrap();
+        let w = Arc::downgrade(&sb);
+        *T6_ACTIVE.lock().unwrap() = Some(sb);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inode)));
+        let msg = r.unwrap_err();
+        assert_eq!(
+            msg.downcast_ref::<&str>(),
+            Some(&"VFS: inode evicted across its superblock's shutdown")
+        );
+        assert!(w.upgrade().unwrap().super_flags(SB_DEAD));
     }
 
     /// `sget` shares a live superblock (Linux grab_super: one more

@@ -2108,9 +2108,25 @@ unsafe fn evict(p: NonNull<Inode>) {
             i.i_lock.lock(),
         ));
         super::icache::evict(i);
+        if i.superblock().is_some_and(|sb| sb.shut_down()) {
+            overlapped();
+        }
     }
     // SAFETY: evicted, no borrow of it left here; called once
     unsafe { destroy_inode(p.as_ptr()) };
+}
+
+/// An eviction that overlapped its superblock's shutdown: nothing puts
+/// an inode during it (LOCKING.md, Inode cache), and Linux has no check
+/// (its ->evict_inode would use what put_super freed). Off `s_inodes`
+/// before ->evict_inode, the inode was not busy to the shutdown, which
+/// then released its filesystem's data (`SuperBlock::kill_fs_info_rcu`)
+/// with the eviction maybe still using it: reported once the eviction
+/// sees the shutdown done
+#[cold]
+#[inline(never)]
+fn overlapped() -> ! {
+    panic!("VFS: inode evicted across its superblock's shutdown");
 }
 
 /// Drop the `ManuallyDrop` field at `f`

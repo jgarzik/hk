@@ -3051,7 +3051,12 @@ inode before its path; writeback's under s_umount; the s_inodes walks'
 under s_umount), an inotify watch's is waited for by the shutdown
 (`s_fsnotify_watched`, Linux fsnotify_sb_watched_objects), and no
 inode's RCU-freed data holds another inode (tracefs reads its root
-through the superblock). Each busy inode is poisoned, as Linux, under the
+through the superblock). Linux relies on this with no check (no count
+of evictions in flight; its ->evict_inode would use what put_super
+freed); hk's `evict` panics ("VFS: inode evicted across its
+superblock's shutdown") if, after ->evict_inode, it finds its
+superblock shut down (SB_BORN and SB_DYING), so an overlap that ran
+past the shutdown is caught rather than left a silent use after free. Each busy inode is poisoned, as Linux, under the
 s_inodes lock and its `i_lock`, in the one pass that finds it (`inode::sb_poison`: `I_POISON` stands
 for VFS_PTR_POISON in i_op, i_sb and i_mapping, so `Inode::i_op`,
 `Inode::superblock` and `Inode::i_mapping` panic "VFS: poisoned
