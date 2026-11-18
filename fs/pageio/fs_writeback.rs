@@ -658,7 +658,16 @@ fn writeback_sb_inodes(wb: &BdiWriteback, wbc: &WritebackControl, sb: &SuperBloc
 /// inodes written, then released; one whose s_umount is not free at
 /// once, or that is not set up or is being shut down, has the inode
 /// sent back to `b_dirty` (Linux redirty_tail: no busy retry), so no
-/// pass writes an inode of a superblock a shutdown or remount holds
+/// pass writes an inode of a superblock a shutdown or remount holds.
+/// Each inode leaves `b_io` per step, so the pass ends; a failed
+/// trylock is transient, as on Linux: an inode is queued only with a
+/// superblock and a device (`inode_attach_wb`), one of a superblock
+/// being set up waits for SB_BORN, and a dying superblock's shutdown
+/// writes its inodes (sync_filesystem, under the s_umount the trylock
+/// fails on) and evicts them, which takes each off the lists; one left
+/// after is the busy inode the shutdown reports (a boot failure). The
+/// periodic work re-arms while an inode is listed (Linux wb_workfn:
+/// wb_has_dirty_io).
 fn __writeback_inodes_wb(wb: &BdiWriteback, wbc: &WritebackControl) {
     loop {
         let mut lists = wb.list_lock.lock();
