@@ -20,8 +20,13 @@
 //!
 //! ## Locking (thread context only)
 //!
-//! `PacketTable.socks` (`crate::sync::spin::RwLock`, per namespace, leaf): delivery
-//! clones the matching `Arc`s and queues after dropping it. Per socket:
+//! `PacketTable.sklist` (`util::rculist`, per namespace; its writers'
+//! spin leaf taken by create and release only): the device tap, the
+//! NETDEV_DOWN notifier and /proc/net/packet walk it under RCU (Linux
+//! sk_for_each_rcu), queueing GFP_ATOMIC copies; the unregister
+//! notifier, which sleeps per socket, takes a snapshot first. A
+//! released socket's list reference goes a grace period later (Linux
+//! SOCK_RCU_FREE), possibly in `rcuc/N`. Per socket:
 //! `bind` is one atomic word, changed only by compare-exchange (bind,
 //! device unregister); `rxq` (an `SkbQueue`, spin leaf: frames are
 //! copied into skbs GFP_ATOMIC before it, freed after it) and `filter`
@@ -143,6 +148,10 @@ pub struct PacketSock {
     drops: AtomicU32,
     /// PACKET_ADD_MEMBERSHIP entries (changed under RTNL)
     mclist: crate::sync::Mutex<Vec<opts::Mreq>>,
+    /// Link on its namespace's list (Linux sk_node)
+    link: crate::util::list::Link,
+    /// The list reference's deferred release
+    rcu: crate::sync::rcu::RcuHead,
 }
 
 /// socket(AF_PACKET, type, protocol) (Linux packet_create: EPERM
@@ -167,6 +176,8 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         packets: AtomicU32::new(0),
         drops: AtomicU32::new(0),
         mclist: crate::sync::Mutex::new(Vec::new()),
+        link: crate::util::list::Link::new(),
+        rcu: crate::sync::rcu::RcuHead::new(),
     })?;
     net.packet.insert(&s);
     Ok(s)
@@ -181,11 +192,11 @@ fn bound_to(s: &PacketSock, dev: &NetDevice) -> Option<u16> {
 /// `dev` went down (Linux packet_notifier NETDEV_DOWN, RTNL held): a
 /// socket receiving on it gets ENETDOWN
 pub fn netdev_down(net: &crate::net::NetNamespace, dev: &NetDevice) {
-    for s in net.packet.all() {
-        if bound_to(&s, dev).is_some_and(|n| n != 0) {
+    net.packet.for_each(|s| {
+        if bound_to(s, dev).is_some_and(|n| n != 0) {
             s.sk.set_err(KernelError::NetworkDown);
         }
-    }
+    });
 }
 
 /// `dev` is unregistered (Linux packet_notifier NETDEV_UNREGISTER):
@@ -199,7 +210,7 @@ pub fn netdev_unregister(
     // The device is unlisted already (unregister_netdevice): a bind
     // that still found it stored first and is seen here; one that
     // missed it moves itself to -1
-    for s in net.packet.all() {
+    for s in net.packet.snapshot() {
         opts::mclist_delete(r, &s, dev);
         let mut w = s.bind.load(Ordering::Acquire);
         loop {

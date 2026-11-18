@@ -106,7 +106,7 @@ whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
 a group's pick at once (with no connected members), before scoring
 the rest of the hash2 chain.
 
-A socket on RCU hash chains (ping, raw, UDP) leaves "sockets: used" a grace
+A socket on RCU lists (ping, raw, UDP, packet) leaves "sockets: used" a grace
 period after its close: the chain's `Arc` is released by
 `RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
 drops the count at sk_free (the last reference, at unhash) and defers
@@ -831,8 +831,8 @@ Phase A2 (net) remaining:
   GFP_ATOMIC.
 - ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
   with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
-- Packet and netlink socket tables still allocate under their spin
-  locks: packet RCU sklist, netlink RCU portid table.
+- The netlink socket table still allocates under its spin lock
+  (Linux: an RCU portid table).
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
 - TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the

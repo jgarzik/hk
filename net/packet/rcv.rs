@@ -1,8 +1,7 @@
-//! AF_PACKET receive side: the per-namespace socket table, the device
+//! AF_PACKET receive side: the per-namespace socket list, the device
 //! tap (Linux packet_rcv via ptype_all/ptype_base), the bounded receive
 //! queue and recvmsg delivery (Linux packet_recvmsg)
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -10,8 +9,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mm::page_alloc::Gfp;
 use crate::net::skb::{SkBuff, SkbCb, SkbQueue};
-use crate::sync::spin::RwLock;
 use crate::util::kalloc::try_arc_gfp;
+use crate::util::rculist::RcuList;
 
 use super::{ETH_P_802_2, ETH_P_802_3, ETH_P_ALL, PacketSock, SLL_LEN, Sll, pf};
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
@@ -198,38 +197,42 @@ fn auxdata(f: &PktCb, snaplen: usize) -> [u8; 20] {
 // Table (per namespace) and the device tap
 // ============================================================================
 
-/// Packet sockets of a namespace
+crate::adapter!(pub(super) PacketLink, PacketSock, link);
+crate::rcu_head!(PacketSock, rcu);
+
+/// Packet sockets of a namespace (Linux net->packet.sklist: an RCU list
+/// the device tap and notifiers walk, changed by create and release)
 #[derive(Default)]
 pub struct PacketTable {
-    socks: RwLock<Vec<Arc<PacketSock>>>,
+    sklist: RcuList<PacketLink>,
 }
 
 impl PacketTable {
+    /// Linux packet_create's sk_add_node_tail_rcu
     pub(super) fn insert(&self, s: &Arc<PacketSock>) {
-        self.socks.write().push(s.clone());
+        self.sklist.push_back(s.clone());
         NSOCKS.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Linux packet_release's sk_del_node_init_rcu: the list's
+    /// reference goes after a grace period
     pub(super) fn remove(&self, s: &PacketSock) {
-        let mut t = self.socks.write();
-        let n = t.len();
-        t.retain(|o| !core::ptr::eq(Arc::as_ptr(o), s));
-        if t.len() != n {
+        if let Some(u) = self.sklist.remove_first(|o| core::ptr::eq(o, s)) {
+            u.defer();
             NSOCKS.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
-    fn matching(&self, t: &Tap<'_>, proto: u16) -> Vec<Arc<PacketSock>> {
-        self.socks
-            .read()
-            .iter()
-            .filter(|s| s.wants(t, proto))
-            .cloned()
-            .collect()
+    /// Call `f` on each socket under RCU (Linux sk_for_each_rcu)
+    pub(super) fn for_each(&self, mut f: impl FnMut(&PacketSock)) {
+        let g = crate::sync::rcu::read_lock();
+        self.sklist.iter_ref(&g).for_each(|s| f(&s));
     }
 
-    pub(super) fn all(&self) -> Vec<Arc<PacketSock>> {
-        self.socks.read().clone()
+    /// References to every socket, for work that sleeps per socket
+    /// (allocated before the walk, not under it)
+    pub(super) fn snapshot(&self) -> Vec<Arc<PacketSock>> {
+        self.sklist.snapshot()
     }
 }
 
@@ -338,29 +341,36 @@ pub fn tap(t: &Tap<'_>) {
         return;
     };
     let proto = eth_proto(t.frame);
-    for s in net.packet.matching(t, proto) {
-        s.rcv(t, proto);
-    }
+    net.packet.for_each(|s| {
+        if s.wants(t, proto) {
+            s.rcv(t, proto);
+        }
+    });
 }
 
-/// `/proc/net/packet` (Linux packet_seq_show; socket addresses hidden)
+/// `/proc/net/packet` (Linux packet_seq_show; socket addresses
+/// hidden), generated under RCU into a buffer that never grows
 pub fn proc_net_packet(net: &crate::net::NetNamespace) -> Vec<u8> {
-    let mut out = String::from("sk               RefCnt Type Proto  Iface R Rmem   User   Inode\n");
-    for s in net.packet.all() {
-        let (num, ifindex) = s.bound();
-        let _ = writeln!(
-            out,
-            "{:016x} {:<6} {:<4} {:04x}   {:<5} {:1} {:<6} {:<6} {:<6}",
-            0,
-            Arc::strong_count(&s),
-            s.sk.stype,
-            num,
-            ifindex,
-            u8::from(num != 0),
-            s.rxq.rmem(),
-            s.sk.cred.fsuid,
-            s.sk.ino.load(Ordering::Acquire),
-        );
-    }
-    out.into_bytes()
+    crate::fs::proc::seq::generate(|m| {
+        let _ = m.write_str("sk               RefCnt Type Proto  Iface R Rmem   User   Inode\n");
+        let g = crate::sync::rcu::read_lock();
+        for s in net.packet.sklist.iter_ref(&g) {
+            let (num, ifindex) = s.bound();
+            // The walk's own reference not counted
+            let refs = Arc::strong_count(&s.get()) - 1;
+            let _ = writeln!(
+                m,
+                "{:016x} {:<6} {:<4} {:04x}   {:<5} {:1} {:<6} {:<6} {:<6}",
+                0,
+                refs,
+                s.sk.stype,
+                num,
+                ifindex,
+                u8::from(num != 0),
+                s.rxq.rmem(),
+                s.sk.cred.fsuid,
+                s.sk.ino.load(Ordering::Acquire),
+            );
+        }
+    })
 }
