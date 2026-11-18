@@ -365,7 +365,7 @@ struct Softnet {
     backlog: SkbQueue<Box<SkBuff>>,
     /// The backlog's NAPI (Linux sd->backlog): scheduled by the netif_rx
     /// that finds the queue empty, completed by the poll that empties
-    /// it, both under the queue's lock; made on first use
+    /// it, both under the queue's lock; made at boot (`net_dev_init`)
     backlog_napi: Once<Arc<Napi>>,
     /// The NAPI this CPU's poll completed with MISSED (Linux
     /// __napi_schedule from napi_complete_done): put back on the list by
@@ -445,6 +445,14 @@ fn this_softnet() -> &'static Softnet {
 /// Start one `softnet/N` thread per CPU that runs a scheduler (after
 /// scheduling is enabled). Work queued earlier (IRQs during boot) is
 /// picked up on the threads' first pass.
+/// Each possible CPU's backlog NAPI, made at boot (Linux net_dev_init
+/// sets up every softnet_data's backlog), so `netif_rx` never allocates
+pub fn net_dev_init() {
+    for cpu in 0..crate::cpu::nr_cpu_ids() {
+        SOFTNET.get(cpu).backlog_napi(cpu);
+    }
+}
+
 pub fn softnet_init() {
     let mut started = 0;
     for cpu in 0..crate::cpu::nr_cpu_ids() as usize {
