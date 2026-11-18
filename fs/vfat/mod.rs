@@ -3189,21 +3189,17 @@ impl FileOps for VfatFileOps {
         Ok(n)
     }
 
-    /// Write the file's pages, the FAT and directory blocks, then flush
-    /// the disk (Linux fat_file_fsync: generic_file_fsync + blkdev flush)
-    fn fsync(
-        &self,
-        file: &File,
-        _start: u64,
-        _end: u64,
-        _datasync: bool,
-    ) -> Result<(), KernelError> {
+    /// Linux fat_file_fsync: the range's pages and the inode's entry
+    /// unless `datasync` may skip it (simple_fsync_noflush), the FAT's
+    /// blocks (mmb_sync of the FAT inode's metadata buffers: with no
+    /// buffer heads the device's whole cache, BUGS.md "No buffer
+    /// heads"), then the disk's write cache flushed
+    fn fsync(&self, file: &File, start: u64, end: u64, datasync: bool) -> Result<(), KernelError> {
+        super::libfs::simple_fsync_noflush(file, start, end, datasync)?;
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        let r = super::fs_writeback::write_inode_now(&inode, true);
-        r.and(file.check_and_advance_wb_err())?;
-        crate::block::blkdev::sync_blockdev(&sb_data.bdev)?;
+        sync_buffers(&sb_data)?;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
 

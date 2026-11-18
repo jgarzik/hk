@@ -683,11 +683,8 @@ waiting).
 
 ## fsync and freeze gaps
 
-**Location**: `fs/vfat/mod.rs` (`VfatFileOps::fsync`), `fs/inode.rs` (`touch_atime`)
+**Location**: `fs/inode.rs` (`touch_atime`), `fs/vfat/mod.rs`
 
-- vfat's fsync ignores datasync, so fdatasync and an O_DSYNC write
-  write a times-only dirty inode too (Linux simple_fsync_noflush skips
-  I_DIRTY_SYNC unless I_DIRTY_DATASYNC).
 - No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
   such as touch_atime take mount write access only.
 - vfat `fat_add_entries` allocates a new directory cluster before it
@@ -708,8 +705,10 @@ pinned buffer under the inode_hash_lock spinlock after rechecking
 i_pos, and marks it dirty. With no buffer to wait on, every wait for
 vfat metadata syncs the device's whole cache (`sync_buffers`):
 ->sync_inode_metadata (Linux sync_dirty_buffer of the entry's block +
-mmb_sync of the inode's metadata blocks) and a dirsync directory
-change (Linux sync_dirty_buffer / mmb_sync of the blocks it touched).
+mmb_sync of the inode's metadata blocks), fsync's FAT step (Linux
+fat_file_fsync: mmb_sync of the FAT inode's metadata blocks) and a
+dirsync directory change (Linux sync_dirty_buffer / mmb_sync of the
+blocks it touched).
 
 ## renameat2 flag gaps
 

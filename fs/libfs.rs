@@ -30,6 +30,32 @@ use crate::fs::superblock::{FileSystemType, FsContext, vfs_get_tree};
 use crate::sync::spin::Mutex as SpinMutex;
 use crate::util::kalloc::try_arc;
 
+/// The generic fsync of a simple filesystem, with no disk flush (Linux
+/// simple_fsync_noflush): bytes [start, end] of the file written and
+/// waited for, then its inode's metadata if dirty
+/// (sync_inode_metadata with wait) and not only in ways `datasync`
+/// may skip (I_DIRTY_SYNC alone: times), or under writeback; then the
+/// mapping's writeback error since this file last looked, once
+pub fn simple_fsync_noflush(
+    file: &File,
+    start: u64,
+    end: u64,
+    datasync: bool,
+) -> Result<(), KernelError> {
+    use crate::fs::inode::istate::{I_DIRTY_ALL, I_DIRTY_DATASYNC, I_METADATA_WRITEBACK, I_SYNC};
+    let inode = file.mapping_inode().ok_or(KernelError::BadFd)?;
+    crate::mm::filemap::file_write_and_wait_range(file, start, end)?;
+    let st = inode.state();
+    let busy = I_SYNC | I_METADATA_WRITEBACK;
+    let r = if st & (I_DIRTY_ALL | busy) == 0 || (datasync && st & (I_DIRTY_DATASYNC | busy) == 0) {
+        Ok(())
+    } else {
+        crate::fs::fs_writeback::sync_inode_metadata(&inode, true)
+    };
+    // Again, for errors of the buffers just synced
+    r.and(file.check_and_advance_wb_err())
+}
+
 /// Linux simple_unlink's and simple_link's times: the inode's ctime,
 /// the directory's ctime and mtime, all one `now`
 pub fn simple_link_times(dir: &Inode, inode: &Inode) {

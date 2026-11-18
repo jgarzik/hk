@@ -30,6 +30,14 @@
 //!   fat_setattr: mark_inode_dirty); fsync writes its entry (Linux
 //!   fat_file_fsync -> sync_inode_metadata -> fat_write_inode): the
 //!   device then holds the new date and time
+//! - VFAT_FDATASYNC_TIMES: an in-place overwrite (no size or cluster
+//!   change) dirties only the times (Linux fat_update_time:
+//!   I_DIRTY_SYNC); fdatasync skips them (Linux simple_fsync_noflush:
+//!   no I_DIRTY_DATASYNC), so the entry keeps its old time; fsync then
+//!   writes the new one
+//! - VFAT_ODSYNC_TIMES: the same for a synchronous write: O_DSYNC syncs
+//!   the data alone (Linux generic_write_sync: datasync unless
+//!   IOCB_SYNC), O_SYNC the times too
 //! - VFAT_REMOUNT_RO: a read-only remount writes the dirty inodes
 //!   back first (Linux fat_reconfigure: sync_filesystem): utimensat
 //!   just before it is in the entry on the device right after it, and
@@ -198,6 +206,8 @@ pub fn run_tests() {
     unlink_race(dev);
     dir_grow(dev);
     fsync_times(dev);
+    fdatasync_times(dev);
+    odsync_times(dev);
     remount_ro(dev);
     dirty_expire(dev);
     dirsync(dev);
@@ -754,6 +764,96 @@ fn fsync_times(dev: &[u8]) {
         None => {
             t.ok(b"entry", false, 0);
         }
+    }
+    sys_unlink(f.as_ptr());
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
+    t.done();
+}
+
+/// 2017-07-14 02:40:00 UTC as a FAT (time, date): time h << 11 | m << 5
+/// | s / 2, date (year - 1980) << 9 | month << 5 | day
+const OLD_FAT: (i64, i64) = (2 << 11 | 40 << 5, 37 << 9 | 7 << 5 | 14);
+
+/// Give `f` (root entry `short`) a page of data and the mtime 2017-07-14
+/// 02:40:00 UTC, synced (fsync on `fd`): the entry holds that time
+fn old_synced(t: &mut T, dev: &[u8], fd: i32, f: &[u8], short: &[u8; 11]) {
+    let page = [b'a'; 4096];
+    t.eq(b"fill", sys_pwrite64(fd, page.as_ptr(), 4096, 0), 4096);
+    t.eq(b"utimensat old", utimes(f, 1_500_000_000), 0);
+    t.eq(b"fsync old", sys_fsync(fd), 0);
+    let got = disk_time(dev, short);
+    t.ok(b"old on disk", got == OLD_FAT, got.0);
+}
+
+/// Overwrite `fd`'s first bytes in place: no size or cluster change,
+/// only the times (now, unlike the entry's 2017)
+fn overwrite(t: &mut T, fd: i32) {
+    t.eq(b"overwrite", sys_pwrite64(fd, b"bb".as_ptr(), 2, 0), 2);
+}
+
+/// VFAT_FDATASYNC_TIMES on FD in the root, mounted tz=UTC
+fn fdatasync_times(dev: &[u8]) {
+    use hk_syscall::sys_fdatasync;
+    let mut t = T::new(b"VFAT_FDATASYNC_TIMES");
+    let (f, short) = (b"/tmp/vdk/FD\0", b"FD         ");
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(
+        b"mount tz=UTC",
+        mount_with(dev, b"iocharset=cp437,tz=UTC\0"),
+        0,
+    );
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    t.ok(b"create", fd >= 0, fd);
+    if fd >= 0 {
+        let fd = fd as i32;
+        old_synced(&mut t, dev, fd, f, short);
+        overwrite(&mut t, fd);
+        t.eq(b"fdatasync", sys_fdatasync(fd), 0);
+        let got = disk_time(dev, short);
+        t.ok(b"times not synced", got == OLD_FAT, got.0);
+        t.eq(b"fsync", sys_fsync(fd), 0);
+        let got = disk_time(dev, short);
+        t.ok(b"times synced", got.0 >= 0 && got != OLD_FAT, got.0);
+        sys_close(fd as u64);
+    }
+    sys_unlink(f.as_ptr());
+    t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(b"mount again", mount(dev), 0);
+    t.done();
+}
+
+/// VFAT_ODSYNC_TIMES on OD in the root, mounted tz=UTC
+fn odsync_times(dev: &[u8]) {
+    const O_DSYNC: u32 = 0o10000;
+    const O_SYNC: u32 = 0o4010000;
+    let mut t = T::new(b"VFAT_ODSYNC_TIMES");
+    let (f, short) = (b"/tmp/vdk/OD\0", b"OD         ");
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    t.eq(
+        b"mount tz=UTC",
+        mount_with(dev, b"iocharset=cp437,tz=UTC\0"),
+        0,
+    );
+    for (flag, name, synced) in [
+        (O_DSYNC, &b"O_DSYNC"[..], false),
+        (O_SYNC, &b"O_SYNC"[..], true),
+    ] {
+        let fd = sys_open(f.as_ptr(), O_CREAT | O_RDWR | flag, 0o644);
+        t.ok(name, fd >= 0, fd);
+        if fd < 0 {
+            continue;
+        }
+        let fd = fd as i32;
+        old_synced(&mut t, dev, fd, f, short);
+        overwrite(&mut t, fd);
+        let got = disk_time(dev, short);
+        if synced {
+            t.ok(b"O_SYNC: times synced", got.0 >= 0 && got != OLD_FAT, got.0);
+        } else {
+            t.ok(b"O_DSYNC: times not synced", got == OLD_FAT, got.0);
+        }
+        sys_close(fd as u64);
     }
     sys_unlink(f.as_ptr());
     t.eq(b"umount 2", sys_umount2(MNT.as_ptr(), 0), 0);
