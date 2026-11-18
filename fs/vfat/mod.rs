@@ -271,66 +271,76 @@ fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> 
     // No direct I/O still reads clusters about to be freed
     inode.inode_dio_wait();
     mmu_truncate(inode, inode.get_size())?;
-    let start0 = get_inode_data(inode)?.start_cluster;
     let keep = inode.get_size().div_ceil(u64::from(sb_data.cluster_size)) as usize;
-    let start = free_past(sb_data, inode, start0, keep)?;
-    if start != start0 {
-        let d = get_inode_data(inode)?;
-        set_inode_data(
-            inode,
-            VfatInodeData {
-                start_cluster: start,
-                ..d
-            },
-        )?;
-        super::fs_writeback::mark_inode_dirty(inode);
-    }
-    Ok(())
+    fat_free(sb_data, inode, keep)
 }
 
-/// Free the clusters of `inode`'s chain at `start` past its first
-/// `keep`, its cached positions forgotten first (Linux fat_free from
-/// fat_truncate_blocks); the chain's new first cluster (0: none left)
-fn free_past(
-    sb_data: &VfatSbData,
-    inode: &Inode,
-    start: u32,
-    keep: usize,
-) -> Result<u32, KernelError> {
-    if start == 0 {
-        return Ok(0);
+/// Point `inode` at the chain at `start` (Linux MSDOS_I(inode)->i_start
+/// and i_logstart)
+fn set_start(inode: &Inode, start: u32) -> Result<(), KernelError> {
+    with_vi(inode, |v| {
+        v.d.lock().start_cluster = start;
+        // After the data: a walk that sees the new id sees the new chain
+        v.cache.lock().set_start(start);
+    })
+}
+
+/// Free the clusters of `inode`'s chain past its first `skip` (Linux
+/// fat_free from fat_truncate_blocks), its cached positions forgotten
+/// first: the new size written first (with `skip` 0 the inode's first
+/// cluster cleared; its times; the inode dirty, synced at once on a
+/// dirsync mount, IS_DIRSYNC, its first cluster put back if that
+/// fails), then a new end written past the kept clusters, then the
+/// rest of the chain freed
+fn fat_free(sb_data: &VfatSbData, inode: &Inode, skip: usize) -> Result<(), KernelError> {
+    let i_start = get_inode_data(inode)?.start_cluster;
+    if i_start == 0 {
+        return Ok(());
     }
     cache::inval(inode)?;
-    if keep == 0 {
-        fat_free_clusters(sb_data, inode, start)?;
-        set_clusters(inode, 0)?;
-        return Ok(0);
+    let wait = inode.superblock().is_some_and(|sb| sb.dirsync());
+    let mut free_start = i_start;
+    // First, we write the new file size (Linux)
+    if skip == 0 {
+        set_start(inode, 0)?;
     }
-    let want = u32::try_from(keep - 1).map_err(|_| KernelError::Io)?;
-    let Some((f, last)) = cache::get_cluster(sb_data, inode, want)? else {
-        return Ok(start);
-    };
-    if f < want {
-        return Ok(start);
+    fat_truncate_time(inode, None, false, true);
+    super::fs_writeback::mark_inode_dirty(inode);
+    if wait && let Err(e) = super::fs_writeback::sync_inode_metadata(inode, true) {
+        set_start(inode, i_start)?;
+        return Err(e);
     }
-    // Linux fat_free: a new end written (synced on a dirsync mount,
-    // IS_DIRSYNC), the rest of the chain freed
-    let mut fe = fatent::FatEnt::new();
-    let next = fatent::fat_ent_read(sb_data, &mut fe, last)?;
-    if next == fatent::FAT_ENT_FREE {
-        return Err(KernelError::Io);
-    }
-    if next != FAT_ENT_EOF {
-        let wait = inode.superblock().is_some_and(|sb| sb.dirsync());
+    // Write a new EOF, and get the remaining cluster chain for freeing
+    if skip > 0 {
+        let want = u32::try_from(skip - 1).map_err(|_| KernelError::Io)?;
+        let Some((f, dclus)) = cache::get_cluster(sb_data, inode, want)? else {
+            return Ok(());
+        };
+        if f < want {
+            return Ok(());
+        }
+        let mut fe = fatent::FatEnt::new();
+        let next = fatent::fat_ent_read(sb_data, &mut fe, dclus)?;
+        if next == FAT_ENT_EOF {
+            return Ok(());
+        }
+        if next == fatent::FAT_ENT_FREE {
+            crate::printkln!(
+                "FAT-fs: fat_free: invalid cluster chain (i_pos {})",
+                get_inode_data(inode)?.i_pos
+            );
+            return Err(KernelError::Io);
+        }
         fatent::fat_ent_write(sb_data, inode, &fe, FAT_ENT_EOF, wait)?;
         fe.brelse();
         // Again once the chain is cut: a walk that began in between
         // may have cached clusters past the new end
         cache::inval(inode)?;
-        fat_free_clusters(sb_data, inode, next)?;
+        free_start = next;
     }
-    set_clusters(inode, want + 1)?;
-    Ok(start)
+    set_clusters(inode, u32::try_from(skip).unwrap_or(u32::MAX))?;
+    // Freeing the remained cluster chain
+    fat_free_clusters(sb_data, inode, free_start)
 }
 
 /// The file has `n` clusters left after a cut (Linux fat_free: i_blocks)
@@ -941,15 +951,6 @@ fn new_private(inode: &Inode, d: VfatInodeData) -> Result<Arc<VfatInode>, Kernel
     try_arc(VfatInode {
         d: crate::sync::spin::Mutex::new(d),
         cache: cache::new_cache(d.start_cluster),
-    })
-}
-
-/// Replace `inode`'s data (Linux updates msdos_inode_info in place)
-fn set_inode_data(inode: &Inode, d: VfatInodeData) -> Result<(), KernelError> {
-    with_vi(inode, |v| {
-        *v.d.lock() = d;
-        // After the data: a walk that sees the new id sees the new chain
-        v.cache.lock().set_start(d.start_cluster);
     })
 }
 
@@ -2655,18 +2656,8 @@ impl InodeOps for VfatInodeOps {
             filemap::truncate_setsize(inode, length);
             // Before anything is freed (Linux fat_truncate_blocks)
             mmu_truncate(inode, length)?;
-            let keep = length.div_ceil(cs) as usize;
-            let start = free_past(&sb_data, inode, d.start_cluster, keep)?;
-            let d = get_inode_data(inode)?;
-            // The clusters are freed on disk: the inode follows
-            set_inode_data(
-                inode,
-                VfatInodeData {
-                    start_cluster: start,
-                    file_size: length as u32,
-                    ..d
-                },
-            )?;
+            fat_free(&sb_data, inode, length.div_ceil(cs) as usize)?;
+            with_vi(inode, |v| v.d.lock().file_size = length as u32)?;
         } else if length > old {
             ensure_clusters(inode, &sb_data, length)?;
             mmu_extend(inode, &sb_data, length)?;

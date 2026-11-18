@@ -15,7 +15,7 @@
 //! set with the inode's): a walk takes the first cluster, the cache's
 //! id and its starting run in one hold, so they always belong to the
 //! same chain. A new first cluster (`set_start`) and a cut of the
-//! chain (`free_past`: before and again after the FAT is changed)
+//! chain (`fat_free`: before and again after the FAT is changed)
 //! invalidate the cache and bump its id (Linux fat_cache_inval_inode,
 //! cache_valid_id); a walk caches its run only if the id is unchanged,
 //! so nothing walked on a chain being cut outlives the cut.
