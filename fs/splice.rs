@@ -932,7 +932,7 @@ fn copy_len(
 ) -> Result<u64, KernelError> {
     let (iin, iout) = copy_files_ok(fin, fout)?;
     let same_sb = match (iin.superblock(), iout.superblock()) {
-        (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         _ => false,
     };
     if !same_sb {

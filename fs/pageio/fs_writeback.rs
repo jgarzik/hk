@@ -535,7 +535,7 @@ fn queue_io(l: &mut WbLists, cutoff: u64, sb: Option<&SuperBlock>) {
         true
     });
     l.b_dirty.move_if(&mut l.b_io, |i| {
-        let take = expired(i, cutoff) && sb.is_none_or(|s| core::ptr::eq(i.sb.as_ptr(), s));
+        let take = expired(i, cutoff) && sb.is_none_or(|s| core::ptr::eq(i.sb_ptr(), s));
         if take {
             let il = i.i_lock.lock();
             i.set_state(&il, I_SYNC_QUEUED);
@@ -599,7 +599,7 @@ fn next_inode(wb: &BdiWriteback, wbc: &WritebackControl, sb: &SuperBlock, only: 
     // list under `list_lock` then `i_lock` before any field goes. The
     // borrow is detached from the list's so the list can be changed.
     let w: &Inode = unsafe { &*core::ptr::from_ref(w) };
-    let other = !core::ptr::eq(w.sb.as_ptr(), sb);
+    let other = !core::ptr::eq(w.sb_ptr(), sb);
     if other && !only {
         return Next::Done;
     }
@@ -667,7 +667,7 @@ fn __writeback_inodes_wb(wb: &BdiWriteback, wbc: &WritebackControl) {
         // contract); detached from the list's borrow so it can change
         let w: &Inode = unsafe { &*core::ptr::from_ref(w) };
         // A passive reference, dropped with `list_lock` released
-        let sb = w.superblock();
+        let sb = w.superblock().cloned();
         let g = sb.as_deref().and_then(super_trylock_shared);
         let Some(g) = g else {
             let il = w.i_lock.lock();

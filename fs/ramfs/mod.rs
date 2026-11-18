@@ -368,7 +368,7 @@ impl InodeData for RamfsInodeData {}
 /// The xattr space of `inode`'s file system (None: not counted)
 fn xattr_pool(inode: &Inode) -> Option<Arc<tmpfs::Acct>> {
     let sb = inode.superblock()?;
-    tmpfs::with(&sb, |t| t.xattr_pool())?
+    tmpfs::with(sb, |t| t.xattr_pool())?
 }
 
 /// The inode's file system has user.* xattrs: tmpfs does (Linux
@@ -376,7 +376,7 @@ fn xattr_pool(inode: &Inode) -> Option<Arc<tmpfs::Acct>> {
 fn has_xattrs(inode: &Inode) -> bool {
     inode
         .superblock()
-        .is_some_and(|sb| tmpfs::with(&sb, |_| ()).is_some())
+        .is_some_and(|sb| tmpfs::with(sb, |_| ()).is_some())
 }
 
 /// Take one of the file system's inodes (tmpfs: ENOSPC when none is
@@ -411,7 +411,7 @@ fn drop_link(inode: &Inode) {
         && !inode.mode().is_dir()
         && let Some(sb) = inode.superblock()
     {
-        free_inode(&sb);
+        free_inode(sb);
     }
     inode.dec_nlink();
 }
@@ -699,7 +699,7 @@ impl InodeOps for RamfsInodeOps {
     fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<InodeRef, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        let inode = new_inode(&sb, Kind::File, mode, uid, gid, current_time())?;
+        let inode = new_inode(sb, Kind::File, mode, uid, gid, current_time())?;
         inode.dec_nlink();
         Ok(inode)
     }
@@ -727,7 +727,7 @@ impl InodeOps for RamfsInodeOps {
     /// shmem_free_inode); a superblock already gone counts nothing
     fn evict_inode(&self, inode: &Inode) {
         if let Some(sb) = inode.superblock() {
-            free_inode(&sb);
+            free_inode(sb);
         }
     }
 
@@ -772,7 +772,7 @@ impl InodeOps for RamfsInodeOps {
         if target_inode.get_nlink() > 0
             && let Some(sb) = dir.superblock()
         {
-            reserve_inode(&sb)?;
+            reserve_inode(sb)?;
         }
         target_inode.inc_nlink();
 
@@ -813,7 +813,7 @@ impl InodeOps for RamfsInodeOps {
     ) -> Result<(), KernelError> {
         use super::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
         // ramfs has no fallocate (Linux ramfs_file_operations)
-        let max = inode.superblock().and_then(|sb| tmpfs::max_blocks(&sb));
+        let max = inode.superblock().and_then(|sb| tmpfs::max_blocks(sb));
         let Some(max) = max else {
             return Err(KernelError::OperationNotSupported);
         };
@@ -1383,7 +1383,7 @@ fn add_new(
     if dir_data.children.read().contains_key(name) {
         return Err(KernelError::AlreadyExists);
     }
-    let inode = new_inode(&sb, kind, mode, uid, gid, time)?;
+    let inode = new_inode(sb, kind, mode, uid, gid, time)?;
     dir_data
         .children
         .write()
@@ -1458,7 +1458,7 @@ pub fn ramfs_create_file_with_timestamp(
     }
     // Filled before it is entered: a failure leaves no partial file
     let sb = dir.superblock().ok_or(KernelError::Io)?;
-    let inode = new_inode(&sb, Kind::File, mode, uid, gid, mtime)?;
+    let inode = new_inode(sb, Kind::File, mode, uid, gid, mtime)?;
     fill_pages(&inode, content)?;
     inode.set_size(content.len() as u64);
     dir_data

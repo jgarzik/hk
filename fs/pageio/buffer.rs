@@ -756,7 +756,7 @@ pub fn mark_buffer_write_io_error(bh: &BufferHead) {
         if bh.locked() {
             // SAFETY: a locked buffer of a page in `m`: the teardown of
             // `m`'s inode waits for its lock before it drops `i_data`,
-            // then its superblock `Weak`
+            // then its superblock
             unsafe { filemap::mapping_set_error_raw(m, KernelError::Io) };
         } else if let Some(i) = filemap::host_igrab(m) {
             // Not under I/O: a caller in thread context (an unlocked

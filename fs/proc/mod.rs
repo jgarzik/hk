@@ -964,7 +964,7 @@ fn create_dir_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, data)?;
@@ -986,7 +986,7 @@ fn create_file_inode(
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, data)?;
@@ -1002,7 +1002,7 @@ fn create_pid_dir_inode(parent: &Inode, pid: ProcPid) -> Result<InodeRef, Kernel
         0,                           // gid: root
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::new_pid_dir(pid))?;
@@ -1026,7 +1026,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Arc::downgrade(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_ns_dir(p.clone()))?;
@@ -1042,7 +1042,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Arc::downgrade(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_fd_dir(p.clone()))?;
@@ -1069,7 +1069,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Arc::downgrade(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_fdinfo_dir(p.clone()))?;
@@ -1088,7 +1088,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 0,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Arc::downgrade(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(
@@ -1110,7 +1110,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 gid,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Arc::downgrade(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::FailNth { pid: p.clone() })?;
@@ -1127,7 +1127,7 @@ fn lookup_pid_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef, Ke
                 gid,
                 0,
                 current_time(),
-                Arc::downgrade(&sb),
+                Arc::downgrade(sb),
                 &PROCFS_INODE_OPS,
             ))?;
             set_data(&inode, ProcfsInodeData::new_pid_file(p.clone(), generator))?;
@@ -1159,7 +1159,7 @@ fn lookup_pid_ns_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef,
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::new_ns_file(p.clone(), ns_type))?;
@@ -1214,7 +1214,7 @@ fn create_self_link(parent: &Inode) -> Result<InodeRef, KernelError> {
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::SelfLink)?;
@@ -1285,7 +1285,7 @@ fn lookup_pid_fd_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<InodeRef,
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
     fd_update_inode(&inode, &file);
@@ -1337,7 +1337,7 @@ fn lookup_pid_fdinfo_entry(dir: &Inode, p: &ProcPid, name: &str) -> Result<Inode
         0,
         0,
         current_time(),
-        Arc::downgrade(&sb),
+        Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
     ))?;
     set_data(&inode, ProcfsInodeData::new_fdinfo_file(p.clone(), fd))?;

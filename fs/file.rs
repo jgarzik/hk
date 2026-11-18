@@ -673,7 +673,11 @@ impl File {
             self.f_wb_err
                 .store(i.i_data.wb_err.sample(), Ordering::Relaxed);
         }
-        if let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) {
+        if let Some(sb) = self
+            .dentry
+            .get_inode()
+            .and_then(|i| i.superblock().cloned())
+        {
             self.f_sb_err.store(sb.s_wb_err.sample(), Ordering::Relaxed);
         }
     }
@@ -690,7 +694,11 @@ impl File {
     /// A writeback error of its filesystem since it last looked, once
     /// (Linux syncfs: errseq_check_and_advance of s_wb_err, f_sb_err)
     pub fn check_and_advance_sb_err(&self) -> Result<(), KernelError> {
-        let Some(sb) = self.dentry.get_inode().and_then(|i| i.superblock()) else {
+        let Some(sb) = self
+            .dentry
+            .get_inode()
+            .and_then(|i| i.superblock().cloned())
+        else {
             return Ok(());
         };
         advance(&sb.s_wb_err, &self.f_sb_err, &self.f_lock)

@@ -10,7 +10,6 @@ use core::ptr::NonNull;
 
 use crate::sync::rcu::RcuHead;
 use crate::sync::spin::{Mutex, MutexGuard, RwLock};
-use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::kalloc::try_box_uninit;
 use crate::util::list;
 use ::core::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -784,7 +783,6 @@ unsafe fn iput_final(p: NonNull<Inode>, l: MutexGuard<'_, ILocked>) {
     } else {
         i.set_state(&l, I_WILL_FREE);
         core::mem::drop(l);
-        // The superblock's Arc is dropped with no lock held
         let sync = !i.superblock().is_some_and(|sb| sb.active());
         let _ = super::pageio::fs_writeback::write_inode_now(i, sync);
         let l = i.i_lock.lock();
@@ -1012,8 +1010,13 @@ pub struct Inode {
     /// Last status change time
     ctime: InodeTime,
 
-    /// Pointer back to superblock
-    pub sb: ManuallyDrop<Weak<SuperBlock>>,
+    /// Its superblock (Linux i_sb), None for an inode of none: a
+    /// passive reference (`Arc`, which keeps only the memory; the
+    /// filesystem runs on its active references), valid for the
+    /// inode's whole life with the superblock's fields and its
+    /// filesystem's data, as Linux's plain pointer: the shutdown evicts
+    /// every inode before ->put_super (`generic_shutdown_super`)
+    sb: ManuallyDrop<Option<Arc<SuperBlock>>>,
 
     /// Inode operations (filesystem-specific)
     pub i_op: &'static dyn InodeOps,
@@ -1105,82 +1108,59 @@ pub(super) struct ILocked {
 
 crate::adapter!(pub SbInodeA, Inode, i_sb_list);
 
-/// What `INODE_SB_LIST_LOCK` guards: every superblock's `s_inodes`
-pub struct InodeSbLists(());
-
-// SAFETY: one instance, `INODE_SB_LIST_LOCK`'s, made here (the field is
-// private)
-unsafe impl UniqueOwner for InodeSbLists {}
-
-/// A superblock's inodes (Linux s_inodes): an [`InodeList`] through
-/// `Inode.i_sb_list`
-pub type SbInodes = LockedBy<InodeList<SbInodeA>, InodeSbLists>;
+/// A superblock's inodes (Linux s_inodes under its s_inode_list_lock):
+/// an [`InodeList`] through `Inode.i_sb_list`, under its own spin lock,
+/// a leaf in thread context only (an inode's last reference never goes
+/// in an interrupt handler: pinned pages and files are released in
+/// thread context, `PinnedPages`, `fput`; lockdep reports a tracked
+/// spin lock taken in one); under it only an inode's `i_lock` (igrab).
+/// An inode is linked by `Inode::alloc` and unlinked by its eviction,
+/// which runs while its superblock is (the inode's reference keeps the
+/// memory, its shutdown evicts every inode before it ends).
+pub type SbInodes = Mutex<InodeList<SbInodeA>>;
 
 /// A superblock's empty `s_inodes`
+#[track_caller]
 pub fn sb_inodes() -> SbInodes {
-    // SAFETY: an inode's eviction unlinks it under INODE_SB_LIST_LOCK
-    // (`sb_list_del`), unless the superblock's shutdown drained it
-    LockedBy::new(unsafe { InodeList::new() })
+    // SAFETY: an inode's eviction unlinks it under this lock
+    // (`sb_list_del`) before its memory goes
+    Mutex::new(unsafe { InodeList::new() })
 }
-
-/// Linux inode_sb_list_lock (one lock for every superblock's s_inodes,
-/// as Linux had before s_inode_list_lock went per superblock): an
-/// inode holds only a `Weak` to its superblock (Linux i_sb, a pointer
-/// the shutdown keeps valid by evicting first) and may be evicted after
-/// the superblock's shutdown (`generic_shutdown_super`), which drains
-/// its list under this lock; an inode still linked under it therefore
-/// has a superblock whose fields are intact. A spin leaf, thread context
-/// only: an inode's last reference never goes in an interrupt handler
-/// (pinned pages and files are released in thread context:
-/// `PinnedPages`, `fput`), and lockdep reports a tracked spin lock taken
-/// in one.
-static INODE_SB_LIST_LOCK: Mutex<InodeSbLists> = Mutex::new(InodeSbLists(()));
 
 /// List a new inode on its superblock (Linux inode_sb_list_add)
 fn sb_list_add(sb: &SuperBlock, inode: &InodeRef) {
-    let mut l = INODE_SB_LIST_LOCK.lock();
-    sb.s_inodes.access_mut(&mut l).push_front(inode);
+    sb.s_inodes.lock().push_front(inode);
 }
 
 /// Take an evicted inode off its superblock's list (Linux
-/// inode_sb_list_del), unless the superblock's shutdown drained it
+/// inode_sb_list_del); one of no superblock is on none
 fn sb_list_del(inode: &Inode) {
-    let mut l = INODE_SB_LIST_LOCK.lock();
-    if !inode.i_sb_list.is_linked() {
+    let Some(sb) = inode.superblock() else {
         return;
-    }
-    // SAFETY: linked, so `sb` is the superblock `alloc` listed it on
-    // (alive then), whose shutdown drains s_inodes under this lock
-    // before its last passive put frees any field: they are intact,
-    // and the inode's Weak keeps the allocation
-    let sb = unsafe { &*inode.sb.as_ptr() };
-    // SAFETY: linked on its superblock's list
-    unsafe { sb.s_inodes.access_mut(&mut l).remove(inode) }
+    };
+    let mut l = sb.s_inodes.lock();
+    // SAFETY: on its superblock's list from `alloc` until here
+    unsafe { l.remove(inode) }
 }
 
-/// Unlink every inode of a superblock in its shutdown (Linux
-/// evict_inodes' list walk; here an inode may outlive its superblock's
-/// shutdown, so its later eviction finds itself unlinked)
-pub(super) fn sb_list_drain(list: &SbInodes) {
-    let mut l = INODE_SB_LIST_LOCK.lock();
-    list.access_mut(&mut l).clear();
+/// Some inode is still on `sb`'s list (Linux !list_empty(&sb->s_inodes)
+/// after put_super: generic_shutdown_super's busy check)
+pub(super) fn sb_busy(sb: &SuperBlock) -> bool {
+    !sb.s_inodes.lock().is_empty()
 }
 
 /// `f` on each live inode of `sb` until it returns false (Linux
-/// drop_pagecache_sb's walk): each taken under `INODE_SB_LIST_LOCK`
-/// and held while `f` runs with no lock, released after the next one is
+/// drop_pagecache_sb's walk): each taken under the list's lock and
+/// held while `f` runs with no lock, released after the next one is
 /// taken; allocates nothing. False if `f` stopped the walk.
 pub fn for_each_sb_inode(sb: &SuperBlock, f: &mut dyn FnMut(&InodeRef) -> bool) -> bool {
     let mut cur: Option<InodeRef> = None;
     loop {
         let next = {
-            let l = INODE_SB_LIST_LOCK.lock();
-            let list = sb.s_inodes.access(&l);
+            let list = sb.s_inodes.lock();
             match &cur {
-                // SAFETY: `c` is alive (held) and `sb` too (the caller's
-                // reference, or its shutdown before the drain): neither
-                // its eviction nor the drain has unlinked it, and nothing
-                // else does
+                // SAFETY: `c` is alive (held), so its eviction has not
+                // unlinked it, and nothing else does
                 Some(c) => unsafe { list.iter_after(c) }.find_map(Inode::igrab),
                 None => list.iter().find_map(Inode::igrab),
             }
@@ -1334,12 +1314,12 @@ impl Inode {
             .map_or(crate::mm::page::PAGE_SHIFT as u8, |s| s.s_blocksize_bits());
         let p = Box::into_raw(try_box_uninit::<Self>()?).cast::<Self>();
         // SAFETY: `p` is the new block, unshared and not yet initialized
-        unsafe { Self::init_at(p, init, blkbits) };
+        unsafe { Self::init_at(p, init, sb, blkbits) };
         // INVARIANT: `init_at` wrote every field, `i_count` 1: this
         // reference; the block is freed only by `i_callback`
         // SAFETY: from `Box::into_raw`, never null
         let i = InodeRef(unsafe { NonNull::new_unchecked(p) });
-        if let Some(sb) = &sb {
+        if let Some(sb) = i.superblock() {
             sb_list_add(sb, &i);
         }
         Ok(i)
@@ -1351,7 +1331,7 @@ impl Inode {
     ///
     /// # Safety
     /// `p` is valid for writes of an `Inode`, unshared.
-    unsafe fn init_at(p: *mut Self, i: InodeInit, blkbits: u8) {
+    unsafe fn init_at(p: *mut Self, i: InodeInit, sb: Option<Arc<SuperBlock>>, blkbits: u8) {
         // Each field written once, and every field: the pattern names
         // the same list without `..`, so a field missed or named twice
         // fails to build
@@ -1386,7 +1366,7 @@ impl Inode {
             atime: InodeTime::new(t),
             mtime: InodeTime::new(t),
             ctime: InodeTime::new(t),
-            sb: ManuallyDrop::new(i.sb),
+            sb: ManuallyDrop::new(sb),
             i_op: i.i_op,
             i_rwsem: RwSem::new(()),
             i_dio_count: AtomicU32::new(0),
@@ -1675,9 +1655,15 @@ impl Inode {
         self.ctime.set(crate::time::TIMEKEEPER.current_time());
     }
 
-    /// Get the superblock this inode belongs to
-    pub fn superblock(&self) -> Option<Arc<SuperBlock>> {
-        self.sb.upgrade()
+    /// Its superblock (Linux inode->i_sb), borrowed: live with its
+    /// fields while the inode is (`sb`)
+    pub fn superblock(&self) -> Option<&Arc<SuperBlock>> {
+        self.sb.as_ref()
+    }
+
+    /// Its superblock's address, to compare only; null for none
+    pub fn sb_ptr(&self) -> *const SuperBlock {
+        self.sb.as_ref().map_or(core::ptr::null(), Arc::as_ptr)
     }
 
     /// Its writes are synchronous (Linux IS_SYNC): a synchronous mount
@@ -1698,8 +1684,7 @@ impl Inode {
 
     /// Largest size this inode's filesystem allows (s_maxbytes)
     pub fn maxbytes(&self) -> u64 {
-        self.sb
-            .upgrade()
+        self.superblock()
             .map_or(super::superblock::MAX_LFS_FILESIZE, |sb| sb.maxbytes())
     }
 

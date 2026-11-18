@@ -589,7 +589,7 @@ VFS locks (detailed order):
                    only the mountpoint path then, no VFS lock), and
                    for the last active reference's shutdown (taken with
                    nothing held: generic_shutdown_super takes d_locks,
-                   INODE_SB_LIST_LOCK, inotify locks, the writeback
+                   SuperBlock.s_inodes, inotify locks, the writeback
                    pass (BdiWriteback.pass and what writeback takes)
                    and what eviction takes under it), read for a bind
                    remount and the superblock walks; trylock-read for
@@ -627,7 +627,7 @@ VFS locks (detailed order):
                    (i_dentry) and its i_state writes, the dirty bits
                    and I_SYNC included; taken before the d_locks of
                    the dentry it links or unlinks and its parent; under
-                   INODE_HASH_LOCK by igrab and (un)hashing, INODE_SB_LIST_LOCK by igrab, under
+                   INODE_HASH_LOCK by igrab and (un)hashing, SuperBlock.s_inodes by igrab, under
                    BdiWriteback.list_lock by igrab and writeback; under
                    it a wait queue head (I_SYNC's, var_waitqueue) and
                    AddressSpace.i_pages (writeback's mapping_tagged))
@@ -2809,8 +2809,7 @@ buffer lock.)
   reference taken (`filemap::mapping_set_error_raw`): the buffer is
   locked, and an inode's teardown waits for every buffer lock of its
   pages (truncation's discard_buffer) before it drops `i_data` and
-  then its superblock `Weak`, which keeps the superblock's memory
-  (`s_wb_err` has no drop glue). A list's (`MappingMetadataBhs`)
+  then its superblock reference, which keeps the superblock. A list's (`MappingMetadataBhs`)
   mapping and superblock likewise, under the RCU read guard: its drop
   empties it, then waits a grace period before its `Weak` goes, and of
   its mapping only `wb_err` (no drop glue) is touched, valid while the
@@ -3009,15 +3008,25 @@ writer holds a reference, so there is none) and its superblock list,
 `->evict_inode` runs while it is still hashed (may sleep and do I/O:
 vfat frees an unlinked file's clusters at once, Linux
 fat_evict_inode), and `INODE_HASH_LOCK` is taken to unhash it, the
-waiters woken after (Linux evict's remove_inode_hash, wake_up_bit). `->evict_inode` may upgrade
-the inode's `Weak` superblock: that is a passive reference (`Arc`,
-Linux s_passive), which keeps only the memory, so its drop never
-shuts the filesystem down, whatever the context (it takes `SB_LOCK`
-if it is the last, so none is dropped under that lock). The shutdown
+waiters woken after (Linux evict's remove_inode_hash, wake_up_bit). An
+inode's superblock (`Inode.sb`, Linux i_sb) is a passive reference
+(`Arc`, Linux s_passive: Linux takes none per inode, its plain pointer
+staying valid by the order below), which keeps only the memory, so
+its drop, the teardown's last, never shuts the filesystem down (it
+takes `SB_LOCK` if it is the last, so none is dropped under that
+lock). The superblock and its filesystem's data are there for the
+inode's whole life: the shutdown evicts every inode before ->put_super
+releases the data. The shutdown
 belongs to the last active reference (`SbActive`, Linux s_active:
 each mount's, devtmpfs's): its drop (Linux deactivate_super) takes
 s_umount for writing and runs `generic_shutdown_super` (inotify
-watches, the dentry tree, s_inodes) and the device's release, in
+watches; the dentry tree, whose drop evicts the inodes its dentries
+held; sync_filesystem; ->put_super, which puts the filesystem's own
+inodes; then any inode left on s_inodes is a bug, reported as Linux's
+"Busy inodes after unmount": one referenced past its superblock's
+end, which nothing that pins the filesystem (a mount, an open file, a
+writeback pass under s_umount, a walk under s_umount) leaves) and the
+device's release, in
 thread context with nothing atomic held (mount teardown drops its
 reference after MOUNT_LOCK and NAMESPACE_SEM): `might_sleep` there
 reports one that does not. Deviation from Linux: no
@@ -3045,7 +3054,7 @@ this inode's (`Inode::assert_locked`), `__iget` that neither bit is
 set. `i_lock` is
 a spin leaf above the d_locks (it guards the inode's dentries too,
 Linux i_dentry): taken by igrab under `INODE_HASH_LOCK`,
-`INODE_SB_LIST_LOCK` or a `BdiWriteback.list_lock` (Linux:
+`SuperBlock.s_inodes` or a `BdiWriteback.list_lock` (Linux:
 inode_hash_lock, s_inode_list_lock and wb->list_lock before i_lock),
 and never held while any of those is taken (iput_final drops it before
 the eviction takes them). Every put may sleep (Linux iput's
@@ -3081,16 +3090,12 @@ it too. No lock is added.
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
 superblock's `s_inodes` (an `InodeList` through `Inode.i_sb_list`,
 holding no reference) until
-its eviction (`evict`, after the writeback lists) unlinks it. One global
-`INODE_SB_LIST_LOCK` (spin Mutex leaf, thread context; Linux
-inode_sb_list_lock as it was before s_inode_list_lock went per
-superblock) guards every list: an inode holds only a `Weak` to its
-superblock and may be evicted after that superblock's shutdown, which
-drains the list under this lock, before the last passive put frees any
-field, so an inode still linked under the lock has a superblock with
-intact fields (a per-superblock lock would live in memory the last put
-may already have freed). Taken by an inode's eviction, with nothing
-held; under it only an inode's `i_lock` (igrab's slow path). The
+its eviction (`evict`, after the writeback lists) unlinks it, under
+the list's own lock (`SuperBlock.s_inodes`, a spin Mutex leaf, thread
+context; Linux s_inode_list_lock): the inode's superblock reference
+keeps the lock's memory, and the shutdown evicts every inode while the
+superblock runs (Inode cache, above). Taken by an inode's eviction, with
+nothing held; under it only an inode's `i_lock` (igrab's slow path). The
 reclaim and drop_caches walks and the inotify shutdown
 (`for_each_sb_inode`, Linux drop_pagecache_sb, fsnotify_unmount_inodes)
 take each inode's reference under it (`Inode::igrab`) and work with it
@@ -5615,7 +5620,7 @@ Rules:
   open files still hold. sync(2) (`sync_bdevs`), meminfo's Buffers
   (`nr_blockdev_pages`), reclaim and /proc/partitions walk the bdev
   superblock's `s_inodes` (`for_each_sb_inode`: one inode per
-  `INODE_SB_LIST_LOCK` hold, the work done with no lock);
+  hold of its lock, the work done with no lock);
   /proc/partitions gathers references that way and sorts and formats
   them with no lock held. No global map of devices.
 - **Disk removal (`del_gendisk`, Linux):** under `open_mutex` every
@@ -6060,7 +6065,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock; a POSIX owner is a descriptor table's id; nothing allocates for a POSIX change under it: room for the two locks one change can add is reserved before it is taken, Linux posix_lock_inode's new_fl/new_fl2, and splits, inserts and merges are done in place; a flock change likewise reserves room for one more shared holder, Linux flock_lock_inode's new_fl),  leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK). A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves; `locks::BLOCKED` (Linux blocked_hash) is an rbtree whose node the waiter allocates before taking it and frees after it |
 | `cmdline::SAVED` | cmdline.rs | `spin::Once` | the saved kernel command line (Linux saved_command_line): set once while parsing, before SMP; read lock-free (init's arguments, /proc/cmdline) |
 | `FILE_SYSTEMS`, `SB_LOCK` | fs/superblock.rs | spin RwLock, spin Mutex | the registered filesystem types (Linux file_systems_lock) and the superblock lists (Linux sb_lock); 3.3 Superblock lists |
-| `INODE_SB_LIST_LOCK` | fs/inode.rs | spin Mutex | every superblock's `s_inodes` (Linux inode_sb_list_lock); 3.3 Superblock inode lists |
+| `SuperBlock.s_inodes` | fs/inode.rs, fs/superblock.rs | spin Mutex (per superblock) | the superblock's inodes (Linux s_inodes under s_inode_list_lock); 3.3 Superblock inode lists |
 | `INODE_HASH_LOCK` | fs/icache.rs | spin Mutex | the inode cache's buckets (Linux inode_hash_lock); 3.3 Inode cache: under it `Inode.private` -> `VfatInode.d` (vfat's `test`) |
 | `CHARDEV_REGISTRY` | fs/chardev.rs | sleeping `sync::RwSem` (Linux chrdevs_lock, cdev_map->lock: mutexes) | character device registry: registered at probe, looked up at open and mmap (under mmap_lock); never under a spin lock |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf but for `FASYNC_LOCK` under it (O_ASYNC is set or cleared only with the file's fasync entry, Linux fasync_insert_entry). `File.f_iocb` (the flags' I/O part, Linux f_iocb_flags: O_APPEND, O_DIRECT, O_DSYNC, __O_SYNC) is an atomic written only under it with the flags (F_SETFL), read lock-free by each read and write: an I/O racing an F_SETFL sees the old or the new word, as Linux's unlocked read of f_iocb_flags. `File.f_wb_err` / `f_sb_err` (Linux f_wb_err, f_sb_err: the writeback errors of the file's mapping and filesystem it has seen) are atomics sampled at open and advanced only under it (`errseq` check-and-advance, Linux file_check_and_advance_wb_err), read lock-free first. `AddressSpace.wb_err`, `SuperBlock.s_wb_err` (`util::errseq::ErrSeq`, Linux errseq_t) are lock-free words set by a failed writeback and a stale page cache after a direct write |

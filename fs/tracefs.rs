@@ -179,7 +179,13 @@ fn create(
             None => Inode::igrab(dir).ok_or(KernelError::NotFound)?,
         };
         let ids = (dir.uid(), dir.gid());
-        let i = new_inode((*dir.sb).clone(), ino, mode, ids, (f, Some(root)))?;
+        let i = new_inode(
+            dir.superblock().map_or_else(Weak::new, Arc::downgrade),
+            ino,
+            mode,
+            ids,
+            (f, Some(root)),
+        )?;
         if mode.is_dir() {
             dir.inc_nlink();
         }

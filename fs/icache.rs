@@ -123,10 +123,7 @@ fn find(
 ) -> Found {
     let mut dying = None;
     for i in b.access(l).iter() {
-        if core::ptr::eq(i.sb.as_ptr(), sb)
-            && i.i_hash.load(Ordering::Relaxed) == hashval
-            && test(i)
-        {
+        if core::ptr::eq(i.sb_ptr(), sb) && i.i_hash.load(Ordering::Relaxed) == hashval && test(i) {
             match i.igrab() {
                 Some(a) => return Found::Live(a),
                 None => dying = Some(core::ptr::from_ref(i) as usize),
@@ -223,7 +220,7 @@ fn hash_locked(l: &mut InodeHash, b: &Bucket, i: &InodeRef, hashval: u64) {
 /// inode_hash_lock and its i_lock)
 fn unhash_locked(l: &mut InodeHash, inode: &Inode) {
     let _il = inode.i_lock.lock();
-    let b = bucket(inode.sb.as_ptr(), inode.i_hash.load(Ordering::Relaxed));
+    let b = bucket(inode.sb_ptr(), inode.i_hash.load(Ordering::Relaxed));
     // SAFETY: linked (the caller's check under this lock), so on the
     // bucket of its superblock and hash value (both unchanged while
     // hashed: `i_hash` is set before it is linked, under this lock)
@@ -236,7 +233,7 @@ pub fn insert_inode_hash(inode: &InodeRef, hashval: u64) {
     if inode.superblock().is_none() {
         return;
     }
-    let b = bucket(inode.sb.as_ptr(), hashval);
+    let b = bucket(inode.sb_ptr(), hashval);
     hash_locked(&mut INODE_HASH_LOCK.lock(), b, inode, hashval);
 }
 
@@ -248,7 +245,7 @@ pub fn insert_inode_hash_once(inode: &InodeRef, hashval: u64) {
     if inode.superblock().is_none() || inode.i_hash_node.is_linked() {
         return;
     }
-    let b = bucket(inode.sb.as_ptr(), hashval);
+    let b = bucket(inode.sb_ptr(), hashval);
     let mut l = INODE_HASH_LOCK.lock();
     if !inode.i_hash_node.is_linked() {
         hash_locked(&mut l, b, inode, hashval);
@@ -289,7 +286,7 @@ pub fn rehash(inode: &InodeRef, hashval: u64) {
     if inode.i_hash_node.is_linked() {
         unhash_locked(&mut l, inode);
     }
-    let b = bucket(inode.sb.as_ptr(), hashval);
+    let b = bucket(inode.sb_ptr(), hashval);
     hash_locked(&mut l, b, inode, hashval);
 }
 
@@ -335,7 +332,7 @@ mod tests {
 
         fn evict_inode(&self, inode: &Inode) {
             assert!(inode.state() & istate::I_FREEING != 0);
-            let sb = inode.sb.as_ptr();
+            let sb = inode.sb_ptr();
             let h = inode.i_hash.load(Ordering::Relaxed);
             let l = INODE_HASH_LOCK.lock();
             let me = core::ptr::from_ref(inode) as usize;

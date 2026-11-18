@@ -693,11 +693,17 @@ pub fn reconfigure_super(sb: &SuperBlock, ro: bool, data: &[u8]) -> Result<(), K
 /// What every filesystem's shutdown does (Linux generic_shutdown_super),
 /// under s_umount held for writing, which it releases: inotify watches
 /// get IN_UNMOUNT and go (fsnotify_sb_delete), the dentry tree is
-/// dropped (shrink_dcache_for_umount), what is dirty is written back
-/// while the device is still open (sync_filesystem), SB_ACTIVE is
-/// cleared (an inode put from then on is written back with wait
-/// before its eviction, `inode::iput_final`) and the inodes leave
-/// s_inodes (evict_inodes); then SB_DYING tells walkers and mounters
+/// dropped (shrink_dcache_for_umount: each inode whose last reference
+/// was a dentry's is evicted there), what is dirty is written back
+/// while the device is still open (sync_filesystem) and SB_ACTIVE is
+/// cleared. Linux evict_inodes then evicts the unused inodes its LRU
+/// kept; hk keeps none (an inode is evicted at its last put), so none
+/// is left but what the filesystem itself holds, which its ->put_super
+/// puts. An inode still on s_inodes after it is a bug: one referenced
+/// past its superblock's end, reported as Linux ("Busy inodes after
+/// unmount", CHECK_DATA_CORRUPTION). Then SB_DYING tells walkers and
+/// mounters. A superblock never given a root (a failed fill) has none
+/// of this: its fill put what it made (Linux).
 pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
     let root = sb.root.write().take();
     if let Some(root) = root {
@@ -707,14 +713,15 @@ pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
         // Linux ignores sync_filesystem's error here too
         let _ = super::pageio::sync::sync_filesystem(sb);
         sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
-        super::inode::sb_list_drain(&sb.s_inodes);
         sb.s_op.put_super(sb);
-    } else {
-        sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
-        // A fill that failed before its root may have made inodes that
-        // outlive it: unlinked all the same, so their eviction never
-        // reaches this superblock's list once its memory goes
-        super::inode::sb_list_drain(&sb.s_inodes);
+        if super::inode::sb_busy(sb) {
+            let id = sb.bdev().map_or(sb.fs_type.name, |b| b.name.as_str());
+            crate::printkln!(
+                "VFS: Busy inodes after unmount of {} ({})",
+                id,
+                sb.fs_type.name
+            );
+        }
     }
     sb.super_wake(SB_DYING);
     drop(g);
@@ -1124,7 +1131,7 @@ pub struct SuperBlock {
     /// (Linux s_bdev_file): a spin leaf, taken to set and to take it
     s_bdev_file: Mutex<Option<crate::block::blkdev::BdevHandle>>,
 
-    /// Its inodes (Linux s_inodes, under inode_sb_list_lock)
+    /// Its inodes (Linux s_inodes, under its s_inode_list_lock)
     pub(super) s_inodes: super::inode::SbInodes,
 
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
@@ -1151,10 +1158,10 @@ const _: () = assert!(!core::mem::needs_drop::<crate::util::errseq::ErrSeq>());
 /// Record a writeback error on the superblock `sb` names, taking no
 /// reference (Linux errseq_set(&inode->i_sb->s_wb_err), any context: a
 /// bio's completion in hardirq, where dropping a reference could free
-/// the superblock). An inode names its superblock by such a `Weak`,
-/// which keeps the memory until the inode's teardown drops it; a
-/// superblock already shut down takes the error harmlessly. A `Weak`
-/// of no superblock (`Weak::new`) does nothing.
+/// the superblock). A metadata buffer list (`MappingMetadataBhs`)
+/// names its superblock by such a `Weak`, which keeps the memory until
+/// the list's drop; a superblock already shut down takes the error
+/// harmlessly. A `Weak` of no superblock (`Weak::new`) does nothing.
 pub fn sb_wb_err_set(sb: &Weak<SuperBlock>, e: KernelError) {
     if Weak::ptr_eq(sb, &Weak::new()) {
         return;
@@ -1610,7 +1617,7 @@ mod tests {
 
     static EVICT_OPS: EvictOps = EvictOps;
 
-    /// A buffer write error reaches s_wb_err through the inode's `Weak`
+    /// A buffer write error reaches s_wb_err through a `Weak`
     /// with no reference taken (syncfs reports it), and harmlessly once
     /// the superblock's last passive reference went
     #[test]
@@ -1685,13 +1692,11 @@ mod tests {
         fs_supers: FsSupers::new(WeakList::new()),
     };
 
-    /// An inode a failing fill made and kept, and a passive reference
-    /// to its superblock (`T3`)
-    static T3_KEPT: std::sync::Mutex<Option<(InodeRef, Arc<SuperBlock>)>> =
-        std::sync::Mutex::new(None);
+    /// An inode a failing fill made and kept (`T3`)
+    static T3_KEPT: std::sync::Mutex<Option<InodeRef>> = std::sync::Mutex::new(None);
 
-    /// A fill that makes an inode, keeps it, and fails before setting
-    /// a root
+    /// A fill that makes an inode, keeps it past the shutdown (a bug
+    /// Linux's busy check reports), and fails before setting a root
     fn t3_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
         get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| {
             let inode = Inode::alloc(Inode::new(
@@ -1704,7 +1709,7 @@ mod tests {
                 Arc::downgrade(sb),
                 &crate::fs::inode::NULL_INODE_OPS,
             ))?;
-            *T3_KEPT.lock().unwrap() = Some((inode, Arc::clone(sb)));
+            *T3_KEPT.lock().unwrap() = Some(inode);
             Err(KernelError::Io)
         })
     }
@@ -1766,8 +1771,7 @@ mod tests {
         vfs_get_tree(&FsContext::new(t, b"")).map(SbLocked::unlock)
     }
 
-    /// A temporary passive reference (an `evict_inode`'s upgrade, a
-    /// walker's) that outlives the last active one (the umount): the
+    /// A temporary passive reference (a walker's) that outlives the last active one (the umount): the
     /// shutdown runs in the active put, under s_umount, and the
     /// passive put afterwards only frees the memory
     #[test]
@@ -1796,18 +1800,18 @@ mod tests {
         assert_eq!(EVICTS.load(Ordering::Relaxed), 1);
     }
 
-    /// A fill that fails before its root leaves no inode on the
-    /// superblock's list once shut down (under INODE_SB_LIST_LOCK, not
-    /// by the list's drop with the memory, which an eviction racing it
-    /// would reach): checked while a passive reference keeps the memory
+    /// An inode keeps its superblock (a passive reference): one held
+    /// past the shutdown (a bug) still finds it, with its list, and its
+    /// eviction unlinks it there before the memory goes
     #[test]
-    fn failed_fill_unlinks_its_inodes() {
+    fn inode_keeps_its_superblock() {
         assert!(matches!(get(&T3), Err(KernelError::Io)));
-        let (inode, sb) = T3_KEPT.lock().unwrap().take().unwrap();
-        assert!(sb.super_flags(SB_DEAD));
-        assert!(!inode.i_sb_list.is_linked(), "left on s_inodes");
-        drop(sb);
+        let inode = T3_KEPT.lock().unwrap().take().unwrap();
+        let sb = Arc::downgrade(inode.superblock().unwrap());
+        assert!(sb.upgrade().unwrap().super_flags(SB_DEAD));
+        assert!(inode.i_sb_list.is_linked());
         drop(inode);
+        assert!(sb.upgrade().is_none());
     }
 
     /// `sget` shares a live superblock (Linux grab_super: one more

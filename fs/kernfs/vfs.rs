@@ -143,7 +143,7 @@ impl InodeOps for KernfsIops {
         }
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         Ok(Found {
-            inode: Some(inode(&sb, &kn)?),
+            inode: Some(inode(sb, &kn)?),
             d_time: rev,
         })
     }
