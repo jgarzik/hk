@@ -1089,6 +1089,13 @@ pub struct SuperBlock {
     /// growing past it is EFBIG. Set by the filesystem at mount.
     s_maxbytes: AtomicU64,
 
+    /// log2 of its block size (Linux s_blocksize_bits; s_blocksize is
+    /// 1 << it): what its new inodes' i_blkbits start as. A page by
+    /// default (Linux: what the pseudo and memory file systems set); a
+    /// device filesystem sets it at mount (`sb_set_blocksize`), before
+    /// it makes inodes. Read lock-free.
+    s_blocksize_bits: core::sync::atomic::AtomicU8,
+
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn SuperBlockData>>>,
 
@@ -1157,6 +1164,7 @@ impl SuperBlock {
             next_ino: crate::util::id_batch::IdBatch::new(),
             s_dev: AtomicU32::new(0),
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
+            s_blocksize_bits: core::sync::atomic::AtomicU8::new(crate::mm::page::PAGE_SHIFT as u8),
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
             s_bdev_file: Mutex::new(None),
@@ -1235,6 +1243,23 @@ impl SuperBlock {
     /// Set the largest file size (at mount)
     pub fn set_maxbytes(&self, max: u64) {
         self.s_maxbytes.store(max, Ordering::Relaxed);
+    }
+
+    /// log2 of its block size (Linux s_blocksize_bits)
+    pub fn s_blocksize_bits(&self) -> u8 {
+        self.s_blocksize_bits.load(Ordering::Relaxed)
+    }
+
+    /// Its block size (Linux s_blocksize)
+    pub fn s_blocksize(&self) -> u32 {
+        1 << self.s_blocksize_bits()
+    }
+
+    /// Set its block size (`sb_set_blocksize`, at mount)
+    pub(crate) fn set_s_blocksize(&self, size: u32) {
+        debug_assert!(size.is_power_of_two());
+        self.s_blocksize_bits
+            .store(size.trailing_zeros() as u8, Ordering::Relaxed);
     }
 
     /// True if mounted read-only (Linux sb_rdonly)

@@ -736,6 +736,8 @@ SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fa_lock,
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem, INODE_HASH_LOCK
     (bdev_add/bdev_del), MAJORS; I/O sleeps under open_mutex only
+    SuperBlock.s_umount → bdev inode i_rwsem (sleeping; set_blocksize
+    writes it, device-file buffered I/O reads it) → mmap_lock, page lock
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
     hardware queue also from the driver ISR, under its line's IrqDesc.lock;
     a poll queue is a hardware queue no interrupt reaches: taken by the
@@ -5346,7 +5348,7 @@ thread context, the driver completes it from its interrupt handler and
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
-| `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain) and the disk's `part_tbl` (its block devices by partition number, one slot per minor, each a reference; Linux disk->part_tbl), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) and soft block size (BLKBSZSET) change only under it: block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev_file`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `INODE_HASH_LOCK` (`bdev_add` hashes a device's inode, `bdev_del` unhashes it), `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
+| `Disk.open_mutex` | `sync::Mutex<OpenState>` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock; holds the count of open partitions (Linux open_partitions, plain) and the disk's `part_tbl` (its block devices by partition number, one slot per minor, each a reference; Linux disk->part_tbl), and each `BlockDevice.openers` (an atomic on the device, as Linux bd_openers) changes only under it, as does the soft block size's initial value at the first open (Linux set_init_blocksize; BLKBSZSET changes it under the bdev inode's `i_rwsem`, Rules): block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev_file`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `INODE_HASH_LOCK` (`bdev_add` hashes a device's inode, `bdev_del` unhashes it), `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `MAJORS` | sleeping `sync::Mutex` (block majors, register_blkdev; Linux major_names_lock) | thread only | leaf |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) and hardirq (a FUA write's post-flush, sent from the write's completion after the hardware queue lock is dropped) | leaf: never taken with the hardware queue lock held; in the ISR it nests under the line's `IrqDesc.lock` (IrqDesc.lock -> ctx lock; nothing allocates under it: the flush is preallocated with its post-flush queue, and the completions free bios and the `FlushSeq` to the heap under `IrqDesc.lock` only, outside every queue lock); its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
 | Post-flush queue (`RequestQueue.fqs[h]`, `block/blkdev.rs`, one per hardware queue; Linux blk_flush_queue->mq_flush_lock) | `IrqSpinlock` | thread (a FUA write's submission) and hardirq (its data's and the shared flush's completions) | leaf: writes waiting for a flush, the writes the flush in flight serves, the FUA data in flight and the preallocated flush; the flush is sent and the writes are ended after it is dropped |
@@ -5472,6 +5474,20 @@ Rules:
   under their page lock, never under a spinlock. The last opener's
   release writes it back and drops it under `open_mutex` (Linux
   blkdev_flush_mapping): open_mutex -> page lock -> i_pages.
+- **Soft block size (the bdev inode's `Inode.i_blkbits`, Linux
+  i_blkbits; BLKBSZGET):** set at the first open under `open_mutex`
+  (Linux set_init_blocksize) and changed by `set_blocksize` (BLKBSZSET,
+  and a device filesystem's mount through `sb_set_blocksize`: under its
+  `s_umount`) under the bdev inode's `i_rwsem` held for writing, across
+  the cache's write-back and drop (sync_blockdev, kill_bdev): `s_umount`
+  -> bdev `i_rwsem` -> page lock. Buffered reads and writes of the
+  device file hold that `i_rwsem` shared (Linux blkdev_read_iter,
+  blkdev_write_iter), across their user copies: bdev `i_rwsem` ->
+  mmap_lock; direct I/O and filesystem metadata take none. Read
+  lock-free elsewhere (READ_ONCE). Linux takes the invalidate lock with
+  it too, for a large folio's order: order-0 folios have none to
+  protect (a page given buffers of the old size by a racing fault has
+  them replaced by the next lookup of the new size).
 
 #### Network Subsystem
 

@@ -966,6 +966,13 @@ pub struct Inode {
     /// Release, read lock-free with Acquire, through `set_size`/`get_size`
     size: AtomicU64,
 
+    /// log2 of its block size (Linux i_blkbits): from its superblock's
+    /// s_blocksize_bits at creation; a block device inode's is the
+    /// device's soft block size (BLKBSZGET), changed by `set_blocksize`
+    /// under i_rwsem and at the first open under the disk's open_mutex,
+    /// read lock-free (READ_ONCE)
+    i_blkbits: core::sync::atomic::AtomicU8,
+
     /// Link count (atomic for thread-safe hard link management)
     pub nlink: AtomicU32,
 
@@ -1298,9 +1305,13 @@ impl Inode {
     /// after its last reference's teardown (`i_callback`).
     pub fn alloc(init: InodeInit) -> Result<InodeRef, KernelError> {
         let sb = init.sb.upgrade();
+        // Linux inode_init_always: i_blkbits = sb->s_blocksize_bits
+        let blkbits = sb
+            .as_ref()
+            .map_or(crate::mm::page::PAGE_SHIFT as u8, |s| s.s_blocksize_bits());
         let p = Box::into_raw(try_box_uninit::<Self>()?).cast::<Self>();
         // SAFETY: `p` is the new block, unshared and not yet initialized
-        unsafe { Self::init_at(p, init) };
+        unsafe { Self::init_at(p, init, blkbits) };
         // INVARIANT: `init_at` wrote every field, `i_count` 1: this
         // reference; the block is freed only by `i_callback`
         // SAFETY: from `Box::into_raw`, never null
@@ -1317,7 +1328,7 @@ impl Inode {
     ///
     /// # Safety
     /// `p` is valid for writes of an `Inode`, unshared.
-    unsafe fn init_at(p: *mut Self, i: InodeInit) {
+    unsafe fn init_at(p: *mut Self, i: InodeInit, blkbits: u8) {
         // Each field written once, and every field: the pattern names
         // the same list without `..`, so a field missed or named twice
         // fails to build
@@ -1343,6 +1354,7 @@ impl Inode {
             uid: AtomicU32::new(i.uid),
             gid: AtomicU32::new(i.gid),
             size: AtomicU64::new(i.size),
+            i_blkbits: core::sync::atomic::AtomicU8::new(blkbits),
             nlink: AtomicU32::new(1),
             i_generation: i.i_generation,
             i_version: AtomicU64::new(0),
@@ -1725,6 +1737,24 @@ impl Inode {
         self.size.load(Ordering::Acquire)
     }
 
+    /// log2 of its block size (Linux READ_ONCE(inode->i_blkbits))
+    pub fn blkbits(&self) -> u32 {
+        u32::from(self.i_blkbits.load(Ordering::Relaxed))
+    }
+
+    /// Its block size in bytes (Linux i_blocksize)
+    pub fn blocksize(&self) -> u32 {
+        1 << self.blkbits()
+    }
+
+    /// Set its block size's log2 (Linux inode->i_blkbits = ...): the
+    /// caller holds what its user documents (a block device inode:
+    /// i_rwsem or, at the first open, the disk's open_mutex)
+    pub fn set_blkbits(&self, bits: u32) {
+        debug_assert!((9..=16).contains(&bits));
+        self.i_blkbits.store(bits as u8, Ordering::Relaxed);
+    }
+
     /// Get current link count
     pub fn get_nlink(&self) -> u32 {
         self.nlink.load(Ordering::Relaxed)
@@ -2100,6 +2130,7 @@ const _: () = {
         uid,
         gid,
         size,
+        i_blkbits,
         nlink,
         i_generation,
         i_version,

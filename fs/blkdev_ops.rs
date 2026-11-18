@@ -7,8 +7,10 @@
 //! which also drops it (Linux blkdev_flush_mapping). mmap maps it.
 //! O_DIRECT I/O from user memory bypasses it (`block::dio`): the range
 //! is written back first, and for a write dropped before and after;
-//! what the bios could not take goes through the cache. No i_rwsem, as
-//! Linux (block devices are not regular files).
+//! what the bios could not take goes through the cache. Buffered reads
+//! and writes hold the bdev inode's i_rwsem shared, which
+//! `set_blocksize` takes for writing (Linux blkdev_read_iter,
+//! blkdev_write_iter); direct I/O takes none.
 //! The open file holds its block device (`File.private`), counted as an
 //! opener (BLKRRPART, BLKBSZGET's initial value).
 
@@ -17,7 +19,7 @@ use alloc::sync::Arc;
 use crate::block::DevId;
 use crate::block::blkdev::{
     BioOp, BlockDevice, HdGeometry, SECTOR_SHIFT, bdev_rw_bytes, bdev_rw_frame, blkdev_issue_flush,
-    get_blkdev, sync_blockdev,
+    get_blkdev, set_blocksize, sync_blockdev,
 };
 use crate::block::genhd;
 use crate::fs::inode::{Inode, InodeMode, InodeRef, Timespec};
@@ -77,13 +79,16 @@ fn read_at(
     cache_read(&b, to, pos, nowait)
 }
 
-/// Linux filemap_read, with IOCB_NOWAIT for `nowait`
+/// Linux filemap_read, with IOCB_NOWAIT for `nowait`, under the bdev
+/// inode's i_rwsem shared (Linux blkdev_read_iter: no `set_blocksize`
+/// meanwhile)
 fn cache_read(
     b: &BlockDevice,
     to: &mut IovDest<'_>,
     pos: u64,
     nowait: bool,
 ) -> Result<usize, KernelError> {
+    let _g = b.bd_inode.lock_shared();
     if nowait {
         filemap::read_iter_nowait(&b.bd_inode, to, pos)
     } else {
@@ -590,7 +595,7 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
                 return Err(KernelError::InvalidArgument);
             }
             let n = get_user::<i32>(arg).map_err(|_| KernelError::BadAddress)?;
-            b.set_block_size(n).map(|()| 0)
+            set_blocksize(b, n).map(|()| 0)
         }
         ioc::BLKRRPART => {
             need_admin()?;
@@ -712,8 +717,8 @@ impl FileOps for BlockFileOps {
     /// O_DIRECT from user memory straight out of it (`dio_write`), else
     /// through the device's page cache (RWF_NOWAIT: EOPNOTSUPP); on the
     /// disk before return for O_DSYNC, O_SYNC, RWF_DSYNC and RWF_SYNC
-    /// (Linux blkdev_write_iter: generic_write_sync). No i_rwsem, as
-    /// Linux.
+    /// (Linux blkdev_write_iter: generic_write_sync). The buffered write
+    /// holds the bdev inode's i_rwsem shared, as Linux.
     fn write_iter(
         &self,
         file: &File,
@@ -736,7 +741,9 @@ impl FileOps for BlockFileOps {
             dio_write(file, from, pos, flags)?
         } else {
             // Its dirtied pages mark the device's inode dirty, for its
-            // periodic writeback (`filemap::dirty_page`)
+            // periodic writeback (`filemap::dirty_page`); i_rwsem shared
+            // keeps `set_blocksize` out (Linux blkdev_write_iter)
+            let _g = b.bd_inode.lock_shared();
             filemap::write_iter(&b.bd_inode, from, pos)?
         };
         if at.is_none() {

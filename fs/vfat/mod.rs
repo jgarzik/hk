@@ -3354,6 +3354,11 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
     let bdev = sb.bdev().ok_or(KernelError::NotBlockDevice)?.clone();
     // Options first: a bad one is EINVAL before any I/O
     let opts = VfatOpts::parse(opts)?;
+    // The device's blocks at least 512 bytes (Linux fat_fill_super:
+    // sb_min_blocksize(sb, 512))
+    if crate::block::blkdev::sb_min_blocksize(sb, 512) == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     // Read boot sector
     let mut boot_sector_buf = [0u8; 512];
     read_bytes(&bdev, 0, &mut boot_sector_buf)?;
@@ -3367,11 +3372,18 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
     if !(512..=4096).contains(&bytes_per_sector) || !bytes_per_sector.is_power_of_two() {
         return Err(KernelError::InvalidArgument);
     }
-    // A FAT sector smaller than the device's logical block (Linux
+    // A FAT sector smaller than the device's block (Linux
     // fat_fill_super: "logical sector size too small for device"): a
     // metadata write-back of one block would cover other sectors
-    if u32::from(bytes_per_sector) < bdev.logical_block_size() {
-        return Err(KernelError::InvalidArgument);
+    if u32::from(bytes_per_sector) < sb.s_blocksize() {
+        return Err(KernelError::Io);
+    }
+    // Metadata blocks of one FAT sector (Linux fat_fill_super:
+    // sb_set_blocksize(sb, logical_sector_size))
+    if u32::from(bytes_per_sector) > sb.s_blocksize()
+        && crate::block::blkdev::sb_set_blocksize(sb, u32::from(bytes_per_sector)) == 0
+    {
+        return Err(KernelError::Io);
     }
 
     // Check for FAT32 (fat_size_16 == 0 and fat_size_32 != 0)

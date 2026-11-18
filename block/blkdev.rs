@@ -54,7 +54,7 @@ use crate::util::smallvec::SmallVec;
 use super::blk_mq::BlkMq;
 
 /// Largest soft block size (Linux BLK_MAX_BLOCK_SIZE: 64K since 6.15
-/// with CONFIG_TRANSPARENT_HUGEPAGE); the size is only reported
+/// with CONFIG_TRANSPARENT_HUGEPAGE)
 const BLK_MAX_BLOCK_SIZE: i32 = 64 * 1024;
 
 /// Fixed block major numbers (Linux include/uapi/linux/major.h)
@@ -966,9 +966,6 @@ pub struct BlockDevice {
     /// Open files (Linux bd_openers): changed only under the disk's
     /// `open_mutex`, an atomic because it lives here, as in Linux
     openers: AtomicU32,
-    /// Soft block size (Linux i_blkbits of the bdev inode, BLKBSZGET):
-    /// set under the disk's `open_mutex`, read lock-free
-    bsize: AtomicU32,
     /// Removed (hot unplug or partition rescan): I/O fails
     dead: AtomicBool,
     /// A partition's BLKROSET flag (Linux BD_READ_ONLY; the whole
@@ -1006,7 +1003,6 @@ impl BlockDevice {
             dev,
             name,
             openers: AtomicU32::new(0),
-            bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
             read_only: AtomicBool::new(false),
             ro_warned: AtomicBool::new(false),
@@ -1085,32 +1081,22 @@ impl BlockDevice {
         self.ro_flag().store(ro, Ordering::Relaxed);
     }
 
+    /// Soft block size (Linux block_size: 1 << the bdev inode's
+    /// i_blkbits; BLKBSZGET)
     pub fn block_size(&self) -> u32 {
-        self.bsize.load(Ordering::Relaxed)
-    }
-
-    /// BLKBSZSET (Linux set_blocksize): a power of two from the logical
-    /// block size to BLK_MAX_BLOCK_SIZE; under `open_mutex`, so it never
-    /// interleaves with the first open setting the initial size
-    pub fn set_block_size(&self, size: i32) -> Result<(), KernelError> {
-        let lbs = self.logical_block_size() as i32;
-        if !(lbs..=BLK_MAX_BLOCK_SIZE).contains(&size) || !(size as u32).is_power_of_two() {
-            return Err(KernelError::InvalidArgument);
-        }
-        let _g = self.disk.open_mutex.lock();
-        self.bsize.store(size as u32, Ordering::Relaxed);
-        Ok(())
+        self.bd_inode.blocksize()
     }
 
     /// Initial soft block size: the largest power of two up to a page
-    /// that divides the size (Linux set_init_blocksize)
+    /// that divides the size (Linux set_init_blocksize), at the first
+    /// open under `open_mutex`
     fn init_block_size(&self) {
         let size = self.capacity();
         let mut bs = u64::from(self.logical_block_size());
         while bs < PAGE as u64 && size & bs == 0 {
             bs <<= 1;
         }
-        self.bsize.store(bs as u32, Ordering::Relaxed);
+        self.bd_inode.set_blkbits(bs.trailing_zeros());
     }
 
     pub fn is_dead(&self) -> bool {
@@ -1155,7 +1141,7 @@ impl BlockDevice {
         let mut st = self.disk.open_mutex.lock();
         if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 {
             let _ = sync_blockdev(self);
-            crate::mm::filemap::invalidate(&self.bd_inode);
+            kill_bdev(self);
             if self.partno != 0 {
                 st.open_partitions -= 1;
             }
@@ -1231,7 +1217,7 @@ pub(super) fn bdev_del(st: &mut OpenState, partno: u16) -> Option<Arc<BlockDevic
     crate::fs::icache::remove_inode_hash(&b.bd_inode);
     b.mark_dead();
     crate::mm::filemap::unmap_mapping_range(&b.bd_inode.i_data, 0);
-    crate::mm::filemap::invalidate(&b.bd_inode);
+    kill_bdev(&b);
     Some(b)
 }
 
@@ -1525,6 +1511,73 @@ pub fn bdev_rw_bytes(
     }
     tmp[head..head + buf.len()].copy_from_slice(buf);
     bdev_rw(bdev, BioOp::Write, first, &mut tmp)
+}
+
+/// Drop the device's whole cache, dirty or not (Linux kill_bdev:
+/// truncate_inode_pages from 0)
+pub fn kill_bdev(bdev: &BlockDevice) {
+    if bdev.bd_inode.i_data.nrpages() == 0 {
+        return;
+    }
+    crate::mm::filemap::invalidate(&bdev.bd_inode);
+}
+
+/// A soft block size the device takes (Linux bdev_validate_blocksize:
+/// blk_validate_block_size and at least the logical block size)
+fn validate_blocksize(bdev: &BlockDevice, size: i32) -> Result<(), KernelError> {
+    let ok = (512..=BLK_MAX_BLOCK_SIZE).contains(&size)
+        && (size as u32).is_power_of_two()
+        && size as u32 >= bdev.logical_block_size();
+    if ok {
+        Ok(())
+    } else {
+        Err(KernelError::InvalidArgument)
+    }
+}
+
+/// Change the soft block size of an open device (Linux set_blocksize,
+/// BLKBSZSET): its cache is written back and dropped first, under the
+/// bdev inode's i_rwsem held for writing, which the device file's
+/// buffered reads and writes hold shared, so none of them runs on the
+/// old geometry meanwhile. Linux also takes the invalidate lock there
+/// for a large folio's order; order-0 folios need none, and a page
+/// given buffers of the old size meanwhile (a fault) has them replaced
+/// on the next lookup of the new size.
+pub fn set_blocksize(bdev: &BlockDevice, size: i32) -> Result<(), KernelError> {
+    validate_blocksize(bdev, size)?;
+    let bits = (size as u32).trailing_zeros();
+    let inode = &bdev.bd_inode;
+    if inode.blkbits() != bits {
+        let _g = inode.lock();
+        let _ = sync_blockdev(bdev);
+        kill_bdev(bdev);
+        inode.set_blkbits(bits);
+    }
+    Ok(())
+}
+
+/// Set a device filesystem's block size and its device's (Linux
+/// sb_set_blocksize, at mount): the new size, or 0 if the device does
+/// not take it
+pub fn sb_set_blocksize(sb: &crate::fs::superblock::SuperBlock, size: u32) -> u32 {
+    let Some(bdev) = sb.bdev() else {
+        return 0;
+    };
+    let Ok(n) = i32::try_from(size) else {
+        return 0;
+    };
+    if set_blocksize(bdev, n).is_err() {
+        return 0;
+    }
+    sb.set_s_blocksize(size);
+    size
+}
+
+/// `sb_set_blocksize` with at least the device's logical block size
+/// (Linux sb_min_blocksize)
+pub fn sb_min_blocksize(sb: &crate::fs::superblock::SuperBlock, size: u32) -> u32 {
+    let min = sb.bdev().map_or(size, |b| b.logical_block_size());
+    sb_set_blocksize(sb, size.max(min))
 }
 
 /// Write the device's dirty cache pages and wait (Linux sync_blockdev)
