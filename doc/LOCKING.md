@@ -2604,8 +2604,9 @@ and directory blocks through them, in the device's block size, which
 its mount sets to the FAT sector size (`sb_set_blocksize`), and the
 device's writepage writes only dirty buffers: a device-cache page may
 also hold file-data clusters, which the file's own cache writes. (A
-newly allocated cluster's device-cache pages are dropped before and
-after it is zeroed on the disk.)
+new directory cluster is zeroed in its buffers, Linux
+fat_zeroed_cluster; a new file cluster's buffers are cleaned, Linux
+clean_bdev_aliases: page lock -> buffer lock.)
 
 - `AddressSpace.i_pages` (`spin::Mutex<XArray>`, Linux xa_lock): the
   cached pages by index. Thread context only (no I/O completion or
@@ -2725,8 +2726,8 @@ after it is zeroed on the disk.)
   a reference; taken by its CPU's lookups (the lock replaces the
   interrupt masking) and by its CPU's call of `invalidate_bh_lrus`
   (a cross-CPU call on every CPU, interrupts off, as Linux
-  on_each_cpu_cond), which kill_bdev, invalidate_bdev and
-  `filemap::invalidate_range` make first, so the pages' buffers can go.
+  on_each_cpu_cond), which kill_bdev and invalidate_bdev make first,
+  so the pages' buffers can go.
 - `MappingMetadataBhs.lock` (spin, thread context; Linux mmb->lock):
   the list of a mapping's metadata buffers (`b_assoc_buffers`, `b_mmb`)
   and a sync's private list (`mmb_sync`); a buffer's `b_mmb` is read

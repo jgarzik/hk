@@ -699,7 +699,7 @@ waiting).
 
 **Location**: `fs/vfat/mod.rs` (`read_bytes`, `write_bytes`,
 `fat_write_inode`, `fat_sync_inode_metadata`, `sync_buffers`,
-`VfatSbData.ipos`, `zero_cluster`)
+`VfatSbData.ipos`)
 
 vfat reads its metadata by copy through the block device's page cache
 (`read_bytes`: `filemap::read`) and writes it through a byte-range
@@ -725,9 +725,6 @@ cache (`sync_buffers`):
 - A dirsync directory change (Linux sync_dirty_buffer / mmb_sync of
   the blocks it touched).
 
-A new cluster's zeroing writes the disk directly and drops the
-device cache's pages around it (`filemap::invalidate_range`), where Linux
-fat_zeroed_cluster zeroes the buffers (sb_getblk, mark_buffer_dirty).
 
 ## Buffer head gaps
 

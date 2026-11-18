@@ -1137,58 +1137,6 @@ fn wait_writeback(m: &AddressSpace, first: u64, last: u64) {
     }
 }
 
-/// Write back and drop the pages holding bytes [start, end) of `inode`
-/// (Linux clean_bdev_aliases on the device's cache): a dirty page is
-/// written first, since it may hold other blocks too
-pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
-    let m = &inode.i_data;
-    let (first, last) = (start / PAGE_SIZE as u64, end.div_ceil(PAGE_SIZE as u64));
-    if first >= last {
-        return Ok(());
-    }
-    // Unmapped (a mapping of the device node) before the pages go
-    unmap_pages(m, first, last - 1);
-    // The per-CPU buffer LRUs hold buffers: emptied first, so pages with
-    // buffers can drop them (as kill_bdev)
-    if range_has_page(m, start, end - 1) {
-        crate::fs::buffer::invalidate_bh_lrus();
-    }
-    let mut at = first;
-    while at < last {
-        let next = {
-            let pages = m.i_pages.lock();
-            pages
-                .find(at, last - 1, None)
-                .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
-        };
-        let Some((index, phys)) = next else {
-            return Ok(());
-        };
-        lock_page(phys);
-        let pg = page(phys);
-        let mut r = Ok(());
-        if pg.mapping.load(Ordering::Acquire) == m.key() {
-            if test_clear_dirty(pg) {
-                m.i_pages.lock().clear_mark(index, MARK_DIRTY);
-                r = m.aops().writepage(inode, phys, index);
-                if let Err(e) = r {
-                    mapping_set_error(inode, e);
-                }
-            }
-            if r.is_ok() {
-                truncate_folio(m, phys);
-            } else {
-                dirty_page(m, phys);
-            }
-        }
-        unlock_page(phys);
-        put_page(phys);
-        r?;
-        at = index + 1;
-    }
-    Ok(())
-}
-
 /// Drop the clean, unmapped, unused pages of `inode` with index in
 /// [first, last] (Linux invalidate_mapping_pages: best effort; dirty,
 /// locked, mapped or otherwise referenced pages stay)
