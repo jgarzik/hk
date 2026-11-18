@@ -12,13 +12,11 @@
 //! Allocation, freeing and the free count run under the FAT lock
 //! (`VfatSbData.fat`, Linux sbi->fat_lock / lock_fat).
 
-use alloc::vec::Vec;
-
-use crate::fs::buffer::{self, BhRef, MappingMetadataBhs};
+use crate::fs::buffer::{self, BhRef};
 use crate::fs::inode::Inode;
 use crate::util::error::KernelError;
 
-use super::{VfatSbData, mmb_dirty, with_mmb};
+use super::{VfatSbData, mmb_dirty};
 
 /// A free cluster's entry (Linux FAT_ENT_FREE)
 pub const FAT_ENT_FREE: u32 = 0;
@@ -35,6 +33,70 @@ pub const MAX_BUF_PER_PAGE: usize = crate::mm::filemap::PAGE_SIZE / 512;
 
 /// FAT32 entries are 4 bytes (Linux sbi->fatent_shift)
 const FATENT_SHIFT: u32 = 2;
+
+/// Up to a page's buffers, held on the stack (Linux struct buffer_head
+/// *bhs[MAX_BUF_PER_PAGE])
+pub struct Bhs {
+    b: [Option<BhRef>; MAX_BUF_PER_PAGE],
+    n: usize,
+}
+
+impl Bhs {
+    pub const fn new() -> Self {
+        Self {
+            b: [const { None }; MAX_BUF_PER_PAGE],
+            n: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.n == MAX_BUF_PER_PAGE
+    }
+
+    /// Add `bh`; the caller keeps to the capacity
+    pub fn push(&mut self, bh: BhRef) {
+        assert!(!self.is_full(), "vfat: more buffers than a page holds");
+        self.b[self.n] = Some(bh);
+        self.n += 1;
+    }
+
+    /// Release them all (Linux brelse of each)
+    pub fn clear(&mut self) {
+        self.b[..self.n].fill(None);
+        self.n = 0;
+    }
+
+    /// Forget them all (Linux bforget of each)
+    pub fn forget(&mut self) {
+        for bh in self.b[..self.n].iter_mut().filter_map(Option::take) {
+            buffer::bforget(bh);
+        }
+        self.n = 0;
+    }
+
+    pub fn iter(&self) -> impl Clone + Iterator<Item = &BhRef> {
+        self.b[..self.n].iter().flatten()
+    }
+
+    pub fn get(&self, i: usize) -> Option<&BhRef> {
+        self.b[..self.n].get(i)?.as_ref()
+    }
+
+    pub fn last(&self) -> Option<&BhRef> {
+        self.n.checked_sub(1).and_then(|i| self.get(i))
+    }
+
+    /// Add `bh` unless the last one is the same buffer
+    pub fn push_new(&mut self, bh: &BhRef) {
+        if self.last().is_none_or(|b| !BhRef::ptr_eq(b, bh)) {
+            self.push(bh.clone());
+        }
+    }
+}
 
 /// An entry and the FAT block holding it (Linux struct fat_entry)
 pub struct FatEnt {
@@ -72,21 +134,6 @@ impl FatEnt {
 /// `c` is a data cluster (Linux fat_valid_entry)
 fn fat_valid_entry(sb: &VfatSbData, c: u32) -> bool {
     (FAT_START_ENT..sb.max_cluster).contains(&c)
-}
-
-/// Run `f` on the FAT inode's metadata list (Linux
-/// MSDOS_I(sbi->fat_inode)->i_metadata_bhs)
-pub fn with_fat_mmb<R>(
-    sb: &VfatSbData,
-    f: impl FnOnce(&MappingMetadataBhs) -> R,
-) -> Result<R, KernelError> {
-    with_mmb(&sb.fat_inode, f)
-}
-
-/// Mark `bh` dirty on the FAT inode's list (Linux
-/// mmb_mark_buffer_dirty(bh, &MSDOS_I(fat_inode)->i_metadata_bhs))
-fn fat_mark_dirty(sb: &VfatSbData, bh: &BhRef) {
-    mmb_dirty(&sb.fat_inode, bh);
 }
 
 /// Linux fat_ent_blocknr: the entry's byte offset in its FAT block
@@ -136,7 +183,7 @@ fn ent_put(sb: &VfatSbData, fe: &FatEnt, new: u32) {
     debug_assert!(new & 0xF000_0000 == 0);
     let v = new | (ent_raw(fe) & !0x0FFF_FFFF);
     bh.write_data(off, &v.to_le_bytes());
-    fat_mark_dirty(sb, bh);
+    mmb_dirty(&sb.fat_inode, bh);
 }
 
 /// Linux fat32_ent_next: on to the next entry; false past the block
@@ -183,8 +230,8 @@ pub fn fat_ent_read(sb: &VfatSbData, fe: &mut FatEnt, entry: u32) -> Result<u32,
 }
 
 /// Write `bhs` and wait (Linux fat_sync_bhs): EIO if one failed
-pub fn fat_sync_bhs(bhs: &[BhRef]) -> Result<(), KernelError> {
-    for bh in bhs {
+pub fn fat_sync_bhs<'a>(bhs: impl Clone + Iterator<Item = &'a BhRef>) -> Result<(), KernelError> {
+    for bh in bhs.clone() {
         buffer::write_dirty_buffer(bh);
     }
     let mut err = Ok(());
@@ -202,12 +249,16 @@ pub fn fat_sync_bhs(bhs: &[BhRef]) -> Result<(), KernelError> {
 /// device-node read sees old or new), uptodate, dirty on the FAT
 /// inode's list; on a synchronous mount written at once. `inode` is
 /// the one whose change it is.
-fn fat_mirror_bhs(sb: &VfatSbData, inode: &Inode, bhs: &[BhRef]) -> Result<(), KernelError> {
+fn fat_mirror_bhs<'a>(
+    sb: &VfatSbData,
+    inode: &Inode,
+    bhs: impl Clone + Iterator<Item = &'a BhRef>,
+) -> Result<(), KernelError> {
     let bs = sb.bytes_per_sector as usize;
     let sync = inode.is_sync();
     for copy in 1..sb.num_fats {
         let backup_fat = sb.fat_sectors * copy;
-        for bh in bhs {
+        for bh in bhs.clone() {
             let c_bh = buffer::bdev_getblk(&sb.bdev, backup_fat + bh.blocknr(), bs)?;
             // Avoid race with userspace read via bdev (Linux)
             buffer::lock_buffer(&c_bh);
@@ -218,7 +269,7 @@ fn fat_mirror_bhs(sb: &VfatSbData, inode: &Inode, bhs: &[BhRef]) -> Result<(), K
             }
             c_bh.set_uptodate();
             buffer::unlock_buffer(&c_bh);
-            fat_mark_dirty(sb, &c_bh);
+            mmb_dirty(&sb.fat_inode, &c_bh);
             if sync {
                 buffer::sync_dirty_buffer(&c_bh)?;
             }
@@ -240,11 +291,10 @@ pub fn fat_ent_write(
     let Some(bh) = &fe.bh else {
         return Err(KernelError::Io);
     };
-    let bhs = core::slice::from_ref(bh);
     if wait {
-        fat_sync_bhs(bhs)?;
+        fat_sync_bhs(core::iter::once(bh))?;
     }
-    fat_mirror_bhs(sb, inode, bhs)
+    fat_mirror_bhs(sb, inode, core::iter::once(bh))
 }
 
 /// Linux fat_ent_next: on to the next entry while in the block and
@@ -261,14 +311,9 @@ fn fat_ent_read_block(sb: &VfatSbData, fe: &mut FatEnt) -> Result<(), KernelErro
 }
 
 /// Add `fe`'s buffer to `bhs` unless there (Linux fat_collect_bhs)
-fn fat_collect_bhs(bhs: &mut Vec<BhRef>, fe: &FatEnt) {
+fn fat_collect_bhs(bhs: &mut Bhs, fe: &FatEnt) {
     if let Some(bh) = &fe.bh
-        && !bhs.iter().any(|b| {
-            core::ptr::eq(
-                core::ptr::from_ref::<buffer::BufferHead>(b),
-                core::ptr::from_ref(bh),
-            )
-        })
+        && !bhs.iter().any(|b| BhRef::ptr_eq(b, bh))
     {
         bhs.push(bh.clone());
     }
@@ -293,9 +338,7 @@ pub fn fat_alloc_clusters(
 ) -> Result<(), KernelError> {
     let nr_cluster = cluster.len();
     assert!(nr_cluster <= MAX_BUF_PER_PAGE / 2, "fixed limit");
-    let mut bhs: Vec<BhRef> = Vec::new();
-    bhs.try_reserve(MAX_BUF_PER_PAGE)
-        .map_err(|_| KernelError::OutOfMemory)?;
+    let mut bhs = Bhs::new();
     let mut idx_clus = 0;
     let mut fatent = FatEnt::new();
     let mut err = {
@@ -360,10 +403,10 @@ pub fn fat_alloc_clusters(
     fatent.brelse();
     if err.is_ok() {
         if inode_needs_sync(inode) {
-            err = fat_sync_bhs(&bhs);
+            err = fat_sync_bhs(bhs.iter());
         }
         if err.is_ok() {
-            err = fat_mirror_bhs(sb, inode, &bhs);
+            err = fat_mirror_bhs(sb, inode, bhs.iter());
         }
     }
     drop(bhs);
@@ -378,9 +421,7 @@ pub fn fat_alloc_clusters(
 /// synced on a synchronous mount) a page's worth at a time. EIO for a
 /// chain running into a free entry ("deleting FAT entry beyond EOF").
 pub fn fat_free_clusters(sb: &VfatSbData, inode: &Inode, cluster: u32) -> Result<(), KernelError> {
-    let mut bhs: Vec<BhRef> = Vec::new();
-    bhs.try_reserve(MAX_BUF_PER_PAGE)
-        .map_err(|_| KernelError::OutOfMemory)?;
+    let mut bhs = Bhs::new();
     let sync = inode.is_sync();
     let mut fatent = FatEnt::new();
     let mut st = sb.fat.lock();
@@ -396,11 +437,11 @@ pub fn fat_free_clusters(sb: &VfatSbData, inode: &Inode, cluster: u32) -> Result
             if st.free != -1 {
                 st.free += 1;
             }
-            if bhs.len() + 1 > MAX_BUF_PER_PAGE {
-                if sync && let Err(e) = fat_sync_bhs(&bhs) {
+            if bhs.is_full() {
+                if sync && let Err(e) = fat_sync_bhs(bhs.iter()) {
                     break 'error Err(e);
                 }
-                if let Err(e) = fat_mirror_bhs(sb, inode, &bhs) {
+                if let Err(e) = fat_mirror_bhs(sb, inode, bhs.iter()) {
                     break 'error Err(e);
                 }
                 bhs.clear();
@@ -410,10 +451,10 @@ pub fn fat_free_clusters(sb: &VfatSbData, inode: &Inode, cluster: u32) -> Result
                 break;
             }
         }
-        if sync {
-            fat_sync_bhs(&bhs)?;
+        if sync && let Err(e) = fat_sync_bhs(bhs.iter()) {
+            break 'error Err(e);
         }
-        fat_mirror_bhs(sb, inode, &bhs)
+        fat_mirror_bhs(sb, inode, bhs.iter())
     };
     fatent.brelse();
     drop(bhs);

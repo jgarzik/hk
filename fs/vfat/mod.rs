@@ -56,6 +56,9 @@ use fatent::{FAT_ENT_EOF, fat_alloc_clusters, fat_free_clusters};
 /// allocated, Linux clean_bdev_aliases of a new block)
 pub struct VfatAops;
 
+/// Zeros to copy into a page or a buffer (Linux memset / zero_user)
+static ZEROS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+
 /// A page's device and the disk runs holding its bytes
 type PageRuns = (Arc<BlockDevice>, Vec<(u64, usize)>);
 
@@ -152,8 +155,6 @@ pub static VFAT_FILE_AOPS: VfatAops = VfatAops;
 /// clusters new ones (allocation does not zero them, Linux
 /// fat_alloc_clusters)
 fn cont_expand(inode: &Inode, from: u64, to: u64) -> Result<(), KernelError> {
-    /// The bytes written (Linux zeroes the page cache pages in place)
-    static ZEROS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
     let mut at = from;
     while at < to {
         let n = ((to - at) as usize).min(PAGE_SIZE - (at % PAGE_SIZE as u64) as usize);
@@ -1107,9 +1108,8 @@ fn fat_zeroed_cluster(
     dir: &Inode,
     blknr: u64,
     nr_used: u64,
-    mut bhs: Vec<BhRef>,
+    mut bhs: fatent::Bhs,
 ) -> Result<(), KernelError> {
-    static ZEROS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
     let bs = sb_data.bytes_per_sector as usize;
     let dirsync = dir.superblock().is_some_and(|sb| sb.dirsync());
     let last_blknr = blknr + u64::from(sb_data.sectors_per_cluster);
@@ -1122,24 +1122,21 @@ fn fat_zeroed_cluster(
             bh.set_uptodate();
             buffer::unlock_buffer(&bh);
             mmb_dirty(dir, &bh);
-            bhs.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
             bhs.push(bh);
-            if bhs.len() == fatent::MAX_BUF_PER_PAGE {
+            if bhs.is_full() {
                 if dirsync {
-                    fatent::fat_sync_bhs(&bhs)?;
+                    fatent::fat_sync_bhs(bhs.iter())?;
                 }
                 bhs.clear();
             }
         }
         if dirsync {
-            fatent::fat_sync_bhs(&bhs)?;
+            fatent::fat_sync_bhs(bhs.iter())?;
         }
         Ok(())
     })();
     if r.is_err() {
-        for bh in bhs.drain(..) {
-            buffer::bforget(bh);
-        }
+        bhs.forget();
     }
     r
 }
@@ -1587,7 +1584,6 @@ fn dir_walk<B>(
     let bs = sb_data.bytes_per_sector as usize;
     let spc = u64::from(sb_data.sectors_per_cluster);
     let per = bs as u64 / 32;
-    let mut buf = crate::util::kmem::try_vec(bs, 0u8)?;
     for (ci, c) in (0u64..).zip(fat_chain(sb_data, start)) {
         let first = cluster_to_offset(sb_data, c?) / bs as u64;
         for k in 0..spc {
@@ -1606,12 +1602,13 @@ fn dir_walk<B>(
                 }
                 Err(e) => return Err(e),
             };
-            bh.read_data(0, &mut buf);
-            for (i, b) in (0u64..).zip(buf.as_chunks::<32>().0) {
+            for i in 0..per {
+                let mut b = [0u8; 32];
+                bh.read_data(i as usize * 32, &mut b);
                 let s = Slot {
                     off: phys * bs as u64 + i * 32,
                     idx: (ci * spc + k) * per + i,
-                    b,
+                    b: &b,
                     bh: &bh,
                 };
                 if let ControlFlow::Break(r) = f(&s)? {
@@ -1881,14 +1878,6 @@ fn is_free(b0: u8) -> bool {
     b0 == END_MARKER || b0 == DELETED_MARKER
 }
 
-/// The same buffer
-fn same_bh(a: &BhRef, b: &BhRef) -> bool {
-    core::ptr::eq(
-        core::ptr::from_ref::<buffer::BufferHead>(a),
-        core::ptr::from_ref(b),
-    )
-}
-
 /// Mark `bh` dirty on `inode`'s metadata list (Linux
 /// mmb_mark_buffer_dirty(bh, &MSDOS_I(inode)->i_metadata_bhs))
 fn mmb_dirty(inode: &Inode, bh: &BhRef) {
@@ -1925,13 +1914,13 @@ fn fat_chain_add(sb_data: &VfatSbData, dir: &Inode, cluster: u32) -> Result<(), 
 /// clusters for `dir` (Linux fat_add_new_entries): at most two (a
 /// 512-byte cluster), allocated as a chain, filled in buffers got
 /// without a read, the rest of the clusters zeroed (`fat_zeroed_cluster`,
-/// which syncs them on a dirsync mount). The first new cluster, how
-/// many, and the slots' disk offsets.
+/// which syncs them on a dirsync mount). The first new cluster and the
+/// slots' disk offsets.
 fn fat_add_new_entries(
     sb_data: &VfatSbData,
     dir: &Inode,
     slots: &[[u8; 32]],
-) -> Result<(u32, usize, Vec<u64>), KernelError> {
+) -> Result<(u32, Vec<u64>), KernelError> {
     let bs = sb_data.bytes_per_sector as usize;
     let cs = sb_data.cluster_size as usize;
     let spc = u64::from(sb_data.sectors_per_cluster);
@@ -1941,9 +1930,7 @@ fn fat_add_new_entries(
     let mut offs: Vec<u64> = Vec::new();
     offs.try_reserve(slots.len())
         .map_err(|_| KernelError::OutOfMemory)?;
-    let mut bhs: Vec<BhRef> = Vec::new();
-    bhs.try_reserve(fatent::MAX_BUF_PER_PAGE)
-        .map_err(|_| KernelError::OutOfMemory)?;
+    let mut bhs = fatent::Bhs::new();
     let mut cluster = [0u32; 2];
     fat_alloc_clusters(sb_data, dir, &mut cluster[..nr_cluster])?;
     // First stage: fill the directory entries (these clusters are not
@@ -1957,9 +1944,7 @@ fn fat_add_new_entries(
             let bh = match buffer::bdev_getblk(&sb_data.bdev, blknr, bs) {
                 Ok(bh) => bh,
                 Err(e) => {
-                    for b in bhs.drain(..) {
-                        buffer::bforget(b);
-                    }
+                    bhs.forget();
                     let _ = fat_free_clusters(sb_data, dir, cluster[0]);
                     return Err(e);
                 }
@@ -1982,7 +1967,6 @@ fn fat_add_new_entries(
             }
         }
     }
-    static ZEROS: [u8; 4096] = [0; 4096];
     if let Some(last) = bhs.last() {
         last.write_data(copy, &ZEROS[..bs - copy]);
     }
@@ -1992,7 +1976,7 @@ fn fat_add_new_entries(
         let _ = fat_free_clusters(sb_data, dir, cluster[0]);
         return Err(e);
     }
-    Ok((cluster[0], nr_cluster, offs))
+    Ok((cluster[0], offs))
 }
 
 /// Add the slots `slots` (long-name ones, then the short one) to `dir`
@@ -2016,9 +2000,9 @@ fn fat_add_entries(
     let mut run: Vec<u64> = Vec::new();
     run.try_reserve(MAX_SLOTS)
         .map_err(|_| KernelError::OutOfMemory)?;
-    // 32 * MAX_SLOTS bytes span three 512-byte blocks at most
-    let mut bhs: Vec<BhRef> = Vec::new();
-    bhs.try_reserve(3).map_err(|_| KernelError::OutOfMemory)?;
+    // 32 * MAX_SLOTS bytes span three 512-byte blocks at most (Linux
+    // bhs[3])
+    let mut bhs = fatent::Bhs::new();
     let mut saw_eod = false;
     // First stage: search free directory entries
     let found = dir_walk(sb_data, start, |s| {
@@ -2030,9 +2014,7 @@ fn fat_add_entries(
             if s.b[0] == END_MARKER {
                 saw_eod = true;
             }
-            if bhs.last().is_none_or(|b| !same_bh(b, s.bh)) {
-                bhs.push(s.bh.clone());
-            }
+            bhs.push_new(s.bh);
             run.push(s.off);
             if run.len() == nr_slots {
                 return Ok(ControlFlow::Break(()));
@@ -2059,26 +2041,28 @@ fn fat_add_entries(
         let bh_of = |off: u64| bhs.iter().position(|b| b.blocknr() == off / bs);
         let fill = |which: core::ops::Range<usize>| {
             for (k, &off) in run.iter().enumerate() {
-                if let Some(i) = bh_of(off)
-                    && which.contains(&i)
+                if let Some(i) = bh_of(off).filter(|i| which.contains(i))
+                    && let Some(bh) = bhs.get(i)
                 {
-                    bhs[i].write_data((off % bs) as usize, &slots[k]);
+                    bh.write_data((off % bs) as usize, &slots[k]);
                 }
             }
         };
         fill(0..long_bhs);
-        for bh in &bhs[..long_bhs] {
+        for bh in bhs.iter().take(long_bhs) {
             mmb_dirty(dir, bh);
         }
         let mut err = Ok(());
         if long_bhs > 0 && dirsync {
-            err = fatent::fat_sync_bhs(&bhs[..long_bhs]);
+            err = fatent::fat_sync_bhs(bhs.iter().take(long_bhs));
         }
-        if err.is_ok() && long_bhs < bhs.len() {
+        if err.is_ok()
+            && let Some(short_bh) = bhs.get(long_bhs)
+        {
             fill(long_bhs..bhs.len());
-            mmb_dirty(dir, &bhs[long_bhs]);
+            mmb_dirty(dir, short_bh);
             if dirsync {
-                err = buffer::sync_dirty_buffer(&bhs[long_bhs]);
+                err = buffer::sync_dirty_buffer(short_bh);
             }
         }
         bhs.clear();
@@ -2092,7 +2076,7 @@ fn fat_add_entries(
         // Third stage: a cluster for the new entries, initialized with
         // them, then added to the directory
         let added =
-            fat_add_new_entries(sb_data, dir, &slots[free_slots..]).and_then(|(c, _, offs)| {
+            fat_add_new_entries(sb_data, dir, &slots[free_slots..]).and_then(|(c, offs)| {
                 if let Err(e) = fat_chain_add(sb_data, dir, c) {
                     let _ = fat_free_clusters(sb_data, dir, c);
                     return Err(e);
@@ -2238,7 +2222,6 @@ fn fat_alloc_new_dir(
     parent_cluster: u32,
     et: &EntryTimes,
 ) -> Result<u32, KernelError> {
-    static ZEROS: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
     let bs = sb_data.bytes_per_sector as usize;
     let mut c = [0u32];
     fat_alloc_clusters(sb_data, dir, &mut c)?;
@@ -2264,9 +2247,7 @@ fn fat_alloc_new_dir(
         bh.set_uptodate();
         buffer::unlock_buffer(&bh);
         mmb_dirty(dir, &bh);
-        let mut bhs = Vec::new();
-        bhs.try_reserve(fatent::MAX_BUF_PER_PAGE)
-            .map_err(|_| KernelError::OutOfMemory)?;
+        let mut bhs = fatent::Bhs::new();
         bhs.push(bh);
         fat_zeroed_cluster(sb_data, dir, blknr, 1, bhs)
     };
@@ -2740,7 +2721,7 @@ impl InodeOps for VfatInodeOps {
             .clone();
         // The moved object's inode (Linux d_inode(old_dentry): the VFS
         // holds it, so this finds it cached)
-        let old_inode = Some(vfat_iget(&sb, &old_entry, op)?);
+        let old_inode = vfat_iget(&sb, &old_entry, op)?;
         let old_ipos = old_entry.i_pos;
         // A directory moved to another one: its ".." entry
         // (vfat_get_dotdot_de)
@@ -2806,25 +2787,17 @@ impl InodeOps for VfatInodeOps {
             target: existing.map(|t| (&new_inode, t)),
             new_ipos,
         };
-        // A cached inode's own extent and times (Linux __fat_write_inode
-        // after fat_attach), else the old entry's
+        // The inode's own extent and times (Linux __fat_write_inode
+        // after fat_attach)
         let sync_ipos = || {
-            let e = &old_entry;
-            let (ext, times) = match &old_inode {
-                Some(i) => {
-                    attach(i, &sb_data, np, new_short, new_ipos)?;
-                    inode_entry(i, &get_inode_data(i)?, &sb_data)
-                }
-                None => ((e.start_cluster, e.file_size), e.times),
-            };
-            write_entry(&sb_data, new_ipos, e.attr, ext, &times)?;
+            attach(&old_inode, &sb_data, np, new_short, new_ipos)?;
+            let (ext, times) = inode_entry(&old_inode, &get_inode_data(&old_inode)?, &sb_data);
+            write_entry(&sb_data, new_ipos, old_entry.attr, ext, &times)?;
             // vfat_sync_ipos: mark_inode_dirty, on a dirsync mount
             // sync_inode_metadata at once
-            if let Some(i) = &old_inode {
-                super::fs_writeback::mark_inode_dirty(i);
-                if sb.dirsync() {
-                    super::fs_writeback::sync_inode_metadata(i, true)?;
-                }
+            super::fs_writeback::mark_inode_dirty(&old_inode);
+            if sb.dirsync() {
+                super::fs_writeback::sync_inode_metadata(&old_inode, true)?;
             }
             Ok(())
         };
@@ -2835,11 +2808,7 @@ impl InodeOps for VfatInodeOps {
         if let Some(off) = dotdot {
             // vfat_update_dotdot_de: the parent is new_dir now, synced
             // at once on a dirsync mount
-            let r = match &old_inode {
-                Some(i) => vfat_update_dotdot_de(&sb, &sb_data, np, i, off),
-                None => Err(KernelError::Io),
-            };
-            if let Err(e) = r {
+            if let Err(e) = vfat_update_dotdot_de(&sb, &sb_data, np, &old_inode, off) {
                 unwind.dotdot(dotdot, op);
                 return Err(e);
             }
@@ -3008,7 +2977,7 @@ struct Unwind<'a> {
     /// The slots of the entry rename added (none if it reused one)
     added: &'a [u64],
     /// The moved object's inode, its old directory, entry and i_pos
-    old: (&'a Option<InodeRef>, u32, [u8; 11], u64),
+    old: (&'a InodeRef, u32, [u8; 11], u64),
     /// The replaced object: its inode and entry
     target: Option<(&'a Option<InodeRef>, &'a ParsedDirEntry)>,
     /// The new entry's i_pos (the replaced object's slot)
@@ -3020,7 +2989,8 @@ impl Unwind<'_> {
     /// corruption): ".." back to the old parent, then as `inode`
     fn dotdot(&self, dotdot: Option<u64>, old_parent: u32) {
         let mut failed = false;
-        if let (Some(off), Some(i)) = (dotdot, self.old.0) {
+        if let Some(off) = dotdot {
+            let i = self.old.0;
             failed |= vfat_update_dotdot_de(self.sb, self.sb_data, old_parent, i, off).is_err();
         }
         self.inode(Some(failed));
@@ -3033,9 +3003,7 @@ impl Unwind<'_> {
     /// (fat_fs_error)
     fn inode(&self, corrupt: Option<bool>) {
         let (old_inode, op, old_short, old_ipos) = self.old;
-        if let Some(i) = old_inode {
-            let _ = attach(i, self.sb_data, op, old_short, old_ipos);
-        }
+        let _ = attach(old_inode, self.sb_data, op, old_short, old_ipos);
         let mut failed = corrupt.unwrap_or(false);
         match self.target {
             Some((ni, t)) => {
@@ -3401,7 +3369,7 @@ impl FileOps for VfatFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        fatent::with_fat_mmb(&sb_data, crate::fs::buffer::mmb_sync)??;
+        with_mmb(&sb_data.fat_inode, crate::fs::buffer::mmb_sync)??;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
 

@@ -371,6 +371,13 @@ fn ring(head: &BufferHead) -> impl Iterator<Item = &BufferHead> {
 #[must_use]
 pub struct BhRef(NonNull<BufferHead>);
 
+impl BhRef {
+    /// Both reference the same buffer
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.0 == b.0
+    }
+}
+
 // SAFETY: the buffer is all atomics and locks (Sync); the reference
 // only counts it, from any thread (Linux get_bh/put_bh are atomic)
 unsafe impl Send for BhRef {}
