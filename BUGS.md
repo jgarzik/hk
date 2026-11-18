@@ -135,11 +135,6 @@ fnhe_genid), so they are not flushed when a device goes down.
 
 Missing:
 
-- `mm/swap/swapfile.rs` sys_swapon / sys_swapoff run whole under
-  `SWAPON`: Linux reserves a type under swap_lock (alloc_swap_info,
-  SWP_USED) and takes swapon_mutex
-  only around enable and teardown, so swapoffs of different areas run
-  try_to_unuse in parallel and the order is i_rwsem -> swapon_mutex.
 - No inode LRU (Linux inode_lru, prune_icache_sb): an inode put to
   zero while its superblock is active is evicted at once, so
   `iput_final` writes it back first (WB_SYNC_NONE) where Linux keeps

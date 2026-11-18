@@ -12,8 +12,14 @@
 //! (`spin::Mutex`, thread context only) guards the counts and the
 //! allocation hint; it is a leaf taken under the PTE lock (fork, zap,
 //! swap-in), never with the swap cache's lock held. `SWAP_INFO` (a
-//! spin `RwLock`, read mostly) holds the devices; `SWAPON` (a sleeping
-//! `Mutex`) serializes swapon and swapoff.
+//! spin `RwLock`, read mostly; Linux swap_lock and swap_info[]) holds
+//! the devices and the types in use: swapon reserves a type under it
+//! first (alloc_swap_info), sets the area up under its file's i_rwsem
+//! and publishes it under `SWAPON` (a sleeping `Mutex`, swapon_mutex:
+//! enable_swap_info); swapoff takes SWP_WRITEOK away under it, empties
+//! the device with neither held, and takes it out of the table under
+//! `SWAPON`, so swapons and swapoffs of different areas run in
+//! parallel.
 //!
 //! Lifetime (Linux si->users, get_swap_device / put_swap_device): every
 //! use of a device by swap entry or type holds a [`SwapDev`], one count
@@ -107,9 +113,23 @@ struct SwapHeaderInfo {
 // Global swap state
 // ============================================================================
 
-/// Active swap devices, by type
-pub static SWAP_INFO: RwLock<[Option<Arc<SwapInfo>>; MAX_SWAPFILES]> =
-    RwLock::new([const { None }; MAX_SWAPFILES]);
+/// The swap types (Linux swap_info[] under swap_lock)
+pub struct SwapTable {
+    /// The enabled device of each type
+    pub(super) dev: [Option<Arc<SwapInfo>>; MAX_SWAPFILES],
+    /// Types in use, one bit each (Linux SWP_USED): reserved by swapon
+    /// before it opens anything, given back by a failed swapon or by
+    /// swapoff once the device is released
+    used: u32,
+}
+
+const _: () = assert!(MAX_SWAPFILES <= u32::BITS as usize);
+
+/// The swap types and their devices (Linux swap_lock, swap_info[])
+pub static SWAP_INFO: RwLock<SwapTable> = RwLock::new(SwapTable {
+    dev: [const { None }; MAX_SWAPFILES],
+    used: 0,
+});
 
 /// Usable slots of every device (Linux total_swap_pages)
 pub static TOTAL_SWAP_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -117,8 +137,42 @@ pub static TOTAL_SWAP_PAGES: AtomicU64 = AtomicU64::new(0);
 /// Slots in use (counted or cached)
 pub static TOTAL_SWAP_USED: AtomicU64 = AtomicU64::new(0);
 
-/// swapon and swapoff, one at a time (Linux swapon_mutex)
+/// A device entering or leaving the table (Linux swapon_mutex:
+/// enable_swap_info, swapoff's teardown); under a swap file's i_rwsem
 static SWAPON: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+/// A swap type swapon reserved (Linux alloc_swap_info: SWP_USED under
+/// swap_lock), given back on drop (Linux bad_swap: flags = 0 under
+/// swap_lock, after the area's resources are freed) unless enabled
+struct SwapType(u8);
+
+impl SwapType {
+    /// The lowest type not in use; EPERM if there is none
+    fn alloc() -> KernelResult<Self> {
+        let mut t = SWAP_INFO.write();
+        let ty = (0..MAX_SWAPFILES)
+            .find(|&i| t.used & (1 << i) == 0)
+            .ok_or(KernelError::NotPermitted)?;
+        t.used |= 1 << ty;
+        Ok(Self(ty as u8))
+    }
+
+    /// The type stays in use, enabled, until swapoff frees it
+    fn keep(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for SwapType {
+    fn drop(&mut self) {
+        free_type(self.0);
+    }
+}
+
+/// Give swap type `t` back (Linux: si->flags = 0 under swap_lock)
+fn free_type(t: u8) {
+    SWAP_INFO.write().used &= !(1 << t);
+}
 
 // ============================================================================
 // SwapInfo - per-device state
@@ -336,7 +390,7 @@ impl SwapInfo {
 /// swapoff is tearing it down (Linux get_swap_device_info)
 fn get_device(t: u8) -> Option<SwapDev> {
     let tbl = SWAP_INFO.read();
-    let si = tbl.get(t as usize)?.as_ref()?;
+    let si = tbl.dev.get(t as usize)?.as_ref()?;
     // Counted while the table holds it: swapoff kills `users` before
     // it lets go
     si.users
@@ -353,16 +407,6 @@ pub fn get_swap_device(e: SwapEntry) -> Option<SwapDev> {
     }
     let si = get_device(e.swap_type())?;
     (e.offset() < si.max).then_some(si)
-}
-
-/// The type of the device whose swap file (or device inode) is
-/// `inode` (Linux swapoff: p->swap_file->f_mapping == mapping)
-fn find_swap_by_inode(inode: &Inode) -> Option<u8> {
-    let info = SWAP_INFO.read();
-    info.iter()
-        .flatten()
-        .find(|si| core::ptr::eq(si.swapfile_inode(), inode))
-        .map(|si| si.swap_type)
 }
 
 /// The inode whose mapping a swap area at `inode` uses (Linux
@@ -388,7 +432,7 @@ pub fn get_swap_page() -> Option<SwapEntry> {
     // then the usable ones in priority order, each in use while a slot
     // is taken from it (Linux swap_alloc_slow: get_swap_device_info)
     let mut prio: [Option<i16>; MAX_SWAPFILES] = [None; MAX_SWAPFILES];
-    for (p, d) in prio.iter_mut().zip(SWAP_INFO.read().iter()) {
+    for (p, d) in prio.iter_mut().zip(SWAP_INFO.read().dev.iter()) {
         *p = d.as_ref().map(|s| s.priority);
     }
     loop {
@@ -657,25 +701,21 @@ fn generic_swapfile_activate(
 /// EBUSY (IS_SWAPFILE, whatever path reached it), the header is read
 /// through the page cache, a file's pages are mapped to its disk, and
 /// S_SWAPFILE is set before its writes are drained, so no write or
-/// truncate of the file runs from the mapping to the swap's end.
-/// `SWAPON` is held throughout (hk's slot reservation; Linux
-/// alloc_swap_info under swap_lock, swapon_mutex around enable only).
+/// truncate of the file runs from the mapping to the swap's end. The
+/// type is reserved first (Linux alloc_swap_info), the area published
+/// under `SWAPON` inside the i_rwsem (enable_swap_info).
 pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
     if !capable(CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
+    // Given back after everything below is released (dropped last)
+    let ty = SwapType::alloc()?;
+    let swap_type = ty.0;
     let path = user_path(path)?;
     let swap_file =
         crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, LookupFlags::open())
             .map_err(|_| KernelError::NotFound)?;
     let node = swap_file.dentry.get_inode().ok_or(KernelError::NotFound)?;
-    let _g = SWAPON.lock();
-    let swap_type = SWAP_INFO
-        .read()
-        .iter()
-        .position(|s| s.is_none())
-        // Linux alloc_swap_info: no free type is EPERM
-        .ok_or(KernelError::NotPermitted)? as u8;
     // claim_swapfile: a block device opened and claimed for the swap's
     // life (Linux file_open_name O_EXCL: holder the swap area, EBUSY if
     // another holder has it); the holder is the type's slot, unique
@@ -756,8 +796,12 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         drop(si);
         return Err(e);
     }
-    SWAP_INFO.write()[swap_type as usize] = Some(si);
+    // Linux enable_swap_info, under swapon_mutex
+    let g = SWAPON.lock();
+    SWAP_INFO.write().dev[swap_type as usize] = Some(si);
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
+    drop(g);
+    ty.keep();
     drop(lock);
     Ok(())
 }
@@ -769,8 +813,24 @@ fn inode_drain_writes(inode: &Inode) -> KernelResult<()> {
     crate::mm::filemap::write_and_wait(inode)
 }
 
+/// The enabled device whose swap file (or device inode) is `inode`,
+/// SWP_WRITEOK taken from it so no other swapoff finds it (Linux
+/// swapoff under swap_lock: p->swap_file->f_mapping == mapping among
+/// the SWP_WRITEOK areas, then del_from_avail_list under si->lock)
+fn swapoff_find(inode: &Inode) -> Option<Arc<SwapInfo>> {
+    let tbl = SWAP_INFO.write();
+    let si = tbl
+        .dev
+        .iter()
+        .flatten()
+        .find(|si| si.writeok() && core::ptr::eq(si.swapfile_inode(), inode))?;
+    si.set_writeok(false);
+    Some(si.clone())
+}
+
 /// swapoff(2): bring every page of a swap area back into memory and
-/// deactivate it (Linux try_to_unuse)
+/// deactivate it (Linux try_to_unuse), with no swapoff lock held while
+/// it empties the device
 pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     if !capable(CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
@@ -781,16 +841,13 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     // swapoff: file_open_name, then f_mapping)
     let dentry = lookup_path(&path)?;
     let victim = mapping_host(dentry.get_inode().ok_or(KernelError::NotFound)?)?;
-    let _g = SWAPON.lock();
-    let t = find_swap_by_inode(&victim).ok_or(KernelError::InvalidArgument)?;
-    // Only swapoff takes a device out of the table, under SWAPON
-    let si = SWAP_INFO.read()[t as usize]
-        .clone()
-        .ok_or(KernelError::InvalidArgument)?;
-    // No new slots from it (Linux del_from_avail_list, under si->lock:
-    // an allocator past get_swap_page's filter rechecks under `map`)
-    si.set_writeok(false);
+    // No new slots from it (an allocator past get_swap_page's filter
+    // rechecks under `map`); only this swapoff takes it out of the table
+    let si = swapoff_find(&victim).ok_or(KernelError::InvalidArgument)?;
+    let t = si.swap_type;
     if let Err(e) = super::swap_state::try_to_unuse(&si) {
+        // Linux reinsert_swap_info, under swap_lock
+        let _tbl = SWAP_INFO.write();
         si.set_writeok(true);
         return Err(e);
     }
@@ -800,7 +857,10 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     // device is released here, in process context
     si.users.kill();
     si.users.wait();
-    let table = SWAP_INFO.write()[t as usize].take();
+    let table = {
+        let _g = SWAPON.lock();
+        SWAP_INFO.write().dev[t as usize].take()
+    };
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
     si_inode.set_swapfile(false);
@@ -814,6 +874,8 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
         "swapoff: device still referenced"
     );
     drop(si);
+    // Last: a new area of this type may claim a device with its holder
+    free_type(t);
     Ok(())
 }
 
