@@ -701,8 +701,10 @@ waiting).
 `fat_write_inode`, `fat_sync_inode_metadata`, `sync_buffers`,
 `VfatSbData.ipos`)
 
-vfat reads its metadata by copy through the block device's page cache
-(`read_bytes`: `filemap::read`) and writes it through a byte-range
+vfat's FAT goes through pinned buffers (`fs/vfat/fatent.rs`), but its
+directories and boot sector do not: it reads them by copy through the
+block device's page cache (`read_bytes`: `filemap::read`) and writes
+them through a byte-range
 adapter over the device's buffer heads (`write_bytes`: bread or
 bdev_getblk, patch, mark_buffer_dirty), not by holding buffers (Linux
 sb_bread, the buffer kept and patched in place). So vfat's write_inode
@@ -719,9 +721,6 @@ cache (`sync_buffers`):
   syncs any inode so marked, clean or not, as Linux), O_SYNC/O_DSYNC
   writes, and the write-back with wait of an inode put after its
   superblock's SB_ACTIVE went (`iput_final`).
-- `VfatFileOps::fsync`'s FAT step (Linux fat_file_fsync: mmb_sync of
-  the FAT inode's i_metadata_bhs), a second whole-cache sync right
-  after the first.
 - A dirsync directory change (Linux sync_dirty_buffer / mmb_sync of
   the blocks it touched).
 

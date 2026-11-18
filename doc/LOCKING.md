@@ -3036,18 +3036,29 @@ reclaim and drop_caches walks and the inotify shutdown
 take each inode's reference under it (`Inode::igrab`) and work with it
 released, dropping the previous reference unlocked.
 
-**vfat FAT lock** (`fs/vfat/mod.rs`, Linux fs/fat/fatent.c):
+**vfat FAT lock** (`fs/vfat/fatent.rs`, Linux fs/fat/fatent.c):
 `VfatSbData.fat` (sleeping `sync::Mutex`, Linux sbi->fat_lock /
 lock_fat), one per filesystem, thread context only, serializes a
-free cluster's search and claim (`allocate_cluster`, Linux
-fat_alloc_clusters), freeing a chain (`free_cluster_chain`, Linux
-fat_free_clusters, an unlinked file's from its eviction included) and
-the free count (`FatState.free`, Linux sbi->free_clusters: counted by
-the first statfs, then kept by both). Taken under the inodes'
-`i_rwsem` (write and truncate paths) or with nothing held (eviction);
-the FAT is read and written through the device under it (page locks,
-block I/O), a claimed cluster zeroed after it is released; never held
-with `VfatInode.cache` or `VfatInode.d`.
+free cluster's search and claim (`fat_alloc_clusters`), freeing a
+chain (`fat_free_clusters`, an unlinked file's from its eviction
+included) and the free count (`FatState.free`, Linux
+sbi->free_clusters: counted by the first statfs,
+`fat_count_free_clusters`, then kept by both). Taken under the inodes'
+`i_rwsem` (write and truncate paths) or with nothing held (eviction).
+Under it the FAT's blocks are read (`bread`: page lock, buffer lock,
+block I/O) and changed in their pinned buffers, which go on the FAT
+inode's metadata list (`MappingMetadataBhs.lock`, spin leaf; Linux
+MSDOS_I(sbi->fat_inode)->i_metadata_bhs, which fsync writes) and are
+copied into the other FATs (`fat_mirror_bhs`: buffer lock) by
+`fat_free_clusters` under it and by `fat_alloc_clusters` after it is
+released, as Linux. A claimed cluster is zeroed after it is released;
+never held with `VfatInode.cache` or `VfatInode.d`. A single entry read
+or written outside it (a chain walk, `fat_ent_link` linking a new
+cluster, `free_past` writing a new end; Linux fat_ent_read /
+fat_ent_write) changes only its own inode's chain, which that inode's
+`i_rwsem` keeps; an entry's four bytes are copied in and out of the
+pinned buffer, so writers of other entries of the block never clobber
+it.
 
 **vfat entry location lock** (`fs/vfat/mod.rs`, Linux
 sbi->inode_hash_lock over i_pos): `VfatSbData.ipos` (sleeping

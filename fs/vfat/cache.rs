@@ -4,9 +4,9 @@
 //! mapping a file position walks the FAT only from the nearest cached
 //! run at or before it, not from the first cluster.
 //!
-//! A walk reads its FAT entries from one FAT block kept for it (Linux
-//! fatent's buffer head), with no lock held, and caches the run it ends
-//! in. Every cluster it uses, the first one, a cached one or one read
+//! A walk reads its FAT entries in the FAT block's buffer it keeps
+//! pinned (`fatent::FatEnt`, Linux fat_get_cluster's fat_entry), with no
+//! lock held, and caches the run it ends in. Every cluster it uses, the first one, a cached one or one read
 //! from the FAT, is checked to be a data cluster (EIO otherwise, Linux
 //! fat_valid_entry), so a corrupt image never sends I/O outside the
 //! data area.
@@ -26,7 +26,8 @@ use crate::fs::inode::Inode;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 
-use super::{VfatInode, VfatSbData, cluster_to_offset, is_end_of_chain, read_bytes, with_vi};
+use super::fatent::{FatEnt, fat_ent_read};
+use super::{VfatInode, VfatSbData, cluster_to_offset, is_end_of_chain, with_vi};
 
 /// Runs cached per file (Linux FAT_MAX_CACHE)
 const FAT_MAX_CACHE: usize = 8;
@@ -177,7 +178,8 @@ fn resume(max_cluster: u32, start: u32, hit: Hit) -> Result<(Run, u32, u32), Ker
 }
 
 /// The cluster after one whose FAT entry is `n`: None at the end of the
-/// chain; EIO for a free, bad, reserved or out-of-range entry
+/// chain (a bad mark reads as the end, `fatent::ent_get`); EIO for a
+/// free, reserved or out-of-range entry
 fn chain_next(max_cluster: u32, n: u32) -> Result<Option<u32>, KernelError> {
     if is_end_of_chain(n) {
         return Ok(None);
@@ -188,55 +190,14 @@ fn chain_next(max_cluster: u32, n: u32) -> Result<Option<u32>, KernelError> {
     Ok(Some(n))
 }
 
-/// The FAT block a walk reads its entries from (Linux fatent's buffer
-/// head): read again only when the chain leaves it
-struct FatBuf {
-    /// Device byte offset of `buf`, None before the first read
-    at: Option<u64>,
-    buf: [u8; FatBuf::SIZE],
-}
-
-impl FatBuf {
-    /// FAT entries are read 512 bytes at a time (a FAT sector at least)
-    const SIZE: usize = 512;
-
-    fn new() -> Self {
-        Self {
-            at: None,
-            buf: [0; Self::SIZE],
-        }
-    }
-
-    /// The FAT entry of `cluster` (Linux fat_ent_read): EIO for one
-    /// outside the data clusters
-    fn ent(&mut self, sb: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
-        if !valid(sb.max_cluster, cluster) {
-            return Err(KernelError::Io);
-        }
-        let off = sb.fat_start_sector * u64::from(sb.bytes_per_sector) + u64::from(cluster) * 4;
-        let base = off & !(Self::SIZE as u64 - 1);
-        if self.at != Some(base) {
-            self.at = None;
-            read_bytes(&sb.bdev, base, &mut self.buf)?;
-            self.at = Some(base);
-        }
-        let i = (off - base) as usize;
-        let e = u32::from_le_bytes([
-            self.buf[i],
-            self.buf[i + 1],
-            self.buf[i + 2],
-            self.buf[i + 3],
-        ]);
-        Ok(e & 0x0FFF_FFFF)
-    }
-}
-
 /// A walk along a file's chain (Linux fat_get_cluster's loop): at file
 /// cluster `f`, disk cluster `d`, in the contiguous run `cid`
 struct Walk<'a> {
     sb: &'a VfatSbData,
     vi: &'a VfatInode,
-    fat: FatBuf,
+    /// The FAT block it reads its entries from, pinned (Linux
+    /// fat_get_cluster's fat_entry)
+    fat: FatEnt,
     /// The cache's id when the walk began
     id: u32,
     cid: Run,
@@ -256,7 +217,7 @@ impl<'a> Walk<'a> {
         Ok(Some(Self {
             sb,
             vi,
-            fat: FatBuf::new(),
+            fat: FatEnt::new(),
             id,
             cid,
             f,
@@ -273,7 +234,7 @@ impl<'a> Walk<'a> {
         if u64::from(self.f) >= limit {
             return Err(KernelError::Io);
         }
-        let e = self.fat.ent(self.sb, self.d)?;
+        let e = fat_ent_read(self.sb, &mut self.fat, self.d)?;
         let Some(n) = chain_next(self.sb.max_cluster, e)? else {
             return Ok(false);
         };

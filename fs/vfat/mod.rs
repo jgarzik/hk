@@ -21,6 +21,7 @@ use core::ops::ControlFlow;
 
 use crate::block::BlockDevice;
 use crate::block::blkdev::{BioOp, bdev_rw_bytes};
+use crate::fs::buffer::MappingMetadataBhs;
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::mm::page::frame_bytes;
 use crate::util::pod::{FromBytes, IntoBytes};
@@ -40,7 +41,10 @@ use crate::util::kalloc::try_arc;
 
 mod cache;
 mod direct;
+mod fatent;
 mod fattime;
+
+use fatent::{FAT_ENT_EOF, fat_alloc_clusters, fat_free_clusters};
 
 // ============================================================================
 // VFAT file pages (Linux fat_aops: fat_read_folio, fat_writepages)
@@ -179,7 +183,7 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
     if need <= have {
         return Ok(());
     }
-    let first = extend_cluster_chain(sb_data, last, need - have, |c| {
+    let first = extend_cluster_chain(sb_data, inode, last, need - have, |c| {
         clean_cluster_aliases(sb_data, c);
         Ok(())
     })?;
@@ -298,7 +302,7 @@ fn free_past(
     }
     cache::inval(inode)?;
     if keep == 0 {
-        free_cluster_chain(sb_data, start)?;
+        fat_free_clusters(sb_data, inode, start)?;
         set_clusters(inode, 0)?;
         return Ok(0);
     }
@@ -309,13 +313,21 @@ fn free_past(
     if f < want {
         return Ok(start);
     }
-    let next = get_fat_entry(sb_data, last)?;
-    if !is_end_of_chain(next) {
-        set_fat_entry(sb_data, last, FAT_EOC)?;
+    // Linux fat_free: a new end written (synced on a dirsync mount,
+    // IS_DIRSYNC), the rest of the chain freed
+    let mut fe = fatent::FatEnt::new();
+    let next = fatent::fat_ent_read(sb_data, &mut fe, last)?;
+    if next == fatent::FAT_ENT_FREE {
+        return Err(KernelError::Io);
+    }
+    if next != FAT_ENT_EOF {
+        let wait = inode.superblock().is_some_and(|sb| sb.dirsync());
+        fatent::fat_ent_write(sb_data, inode, &fe, FAT_ENT_EOF, wait)?;
+        fe.brelse();
         // Again once the chain is cut: a walk that began in between
         // may have cached clusters past the new end
         cache::inval(inode)?;
-        free_cluster_chain(sb_data, next)?;
+        fat_free_clusters(sb_data, inode, next)?;
     }
     set_clusters(inode, want + 1)?;
     Ok(start)
@@ -577,6 +589,9 @@ pub struct VfatSbData {
     /// sleeping and held across the write (Linux patches the buffer
     /// under its spin lock and rechecks i_pos instead)
     pub ipos: Arc<crate::sync::Mutex<()>>,
+    /// The FAT's own inode (Linux sbi->fat_inode): its metadata list
+    /// holds the dirty FAT blocks fsync writes; never hashed or dirtied
+    pub fat_inode: Arc<InodeRef>,
 }
 
 impl SuperBlockData for VfatSbData {}
@@ -872,6 +887,9 @@ pub struct VfatInode {
     /// Cluster chain positions (Linux cache_lru_lock): a leaf, held
     /// only to look a run up or add one, never with `d`
     cache: crate::sync::spin::Mutex<cache::FatCache>,
+    /// The device's buffers its fsync writes (Linux i_metadata_bhs): a
+    /// directory's changed blocks, the FAT inode's FAT blocks
+    pub i_metadata_bhs: MappingMetadataBhs,
 }
 
 impl InodeData for VfatInode {}
@@ -882,11 +900,15 @@ impl AsAny for VfatInode {
     }
 }
 
-/// A new inode's private data
-fn new_private(d: VfatInodeData) -> Result<Arc<VfatInode>, KernelError> {
+/// `inode`'s private data (Linux fat_alloc_inode: mmb_init on its
+/// i_data)
+fn new_private(inode: &Inode, d: VfatInodeData) -> Result<Arc<VfatInode>, KernelError> {
     try_arc(VfatInode {
         d: crate::sync::spin::Mutex::new(d),
         cache: cache::new_cache(d.start_cluster),
+        // SAFETY: the list goes in `inode`'s private data, dropped
+        // before its memory (`destroy_inode`), so its mapping outlives it
+        i_metadata_bhs: unsafe { MappingMetadataBhs::new(&inode.i_data) },
     })
 }
 
@@ -984,31 +1006,10 @@ fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, KernelError> {
     with_vi(inode, |v| *v.d.lock())
 }
 
-/// Read a FAT entry for a cluster
-fn get_fat_entry(sb_data: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
-    // Linux fat_ent_read: "invalid access to FAT" is EIO
-    if !(2..sb_data.max_cluster).contains(&cluster) {
-        return Err(KernelError::Io);
-    }
-    let fat_offset = u64::from(cluster) * 4;
-    let fat_sector = sb_data.fat_start_sector + fat_offset / u64::from(sb_data.bytes_per_sector);
-    let offset_in_sector = (fat_offset % u64::from(sb_data.bytes_per_sector)) as usize;
-
-    let byte_offset = fat_sector * u64::from(sb_data.bytes_per_sector) + offset_in_sector as u64;
-    let mut buf = [0u8; 4];
-    read_bytes(&sb_data.bdev, byte_offset, &mut buf)?;
-
-    Ok(u32::from_le_bytes(buf) & 0x0FFF_FFFF)
-}
-
 /// Check if cluster number indicates end of chain
 fn is_end_of_chain(cluster: u32) -> bool {
     cluster >= 0x0FFF_FFF8
 }
-
-/// The bad-cluster mark: cluster numbers stay below it (Linux
-/// BAD_FAT32)
-const FAT_BAD: u32 = 0x0FFF_FFF7;
 
 /// Check if cluster is valid (not reserved, free, or bad)
 fn is_valid_cluster(cluster: u32) -> bool {
@@ -1056,8 +1057,9 @@ fn fat_chain(
     sb_data: &VfatSbData,
     start: u32,
 ) -> Chain<impl FnMut(u32) -> Result<u32, KernelError> + '_> {
+    let mut fe = fatent::FatEnt::new();
     Chain::with(
-        move |c| get_fat_entry(sb_data, c),
+        move |c| fatent::fat_ent_read(sb_data, &mut fe, c),
         sb_data.max_cluster,
         sb_data.cluster_size,
         start,
@@ -1100,93 +1102,8 @@ fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u3
 }
 
 // ============================================================================
-// FAT Table Write Operations
+// Clusters (Linux fat_alloc_clusters / fat_free_clusters: fatent.rs)
 // ============================================================================
-
-/// End of chain marker for FAT32
-const FAT_EOC: u32 = 0x0FFF_FFF8;
-
-/// Free cluster marker
-const FAT_FREE: u32 = 0x0000_0000;
-
-/// Write a FAT entry for a cluster (updates all FAT copies)
-fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), KernelError> {
-    let fat_offset = u64::from(cluster) * 4;
-    let offset_in_fat = fat_offset % (sb_data.fat_sectors * u64::from(sb_data.bytes_per_sector));
-
-    // Preserve high 4 bits of existing entry (reserved bits in FAT32)
-    let existing = get_fat_entry(sb_data, cluster)?;
-    let new_value = (existing & 0xF000_0000) | (value & 0x0FFF_FFFF);
-    let buf = new_value.to_le_bytes();
-
-    // Every FAT copy the boot sector declares (Linux fat_mirror_bhs)
-    for fat_num in 0..sb_data.num_fats {
-        let fat_start = sb_data.fat_start_sector + fat_num * sb_data.fat_sectors;
-        let byte_offset = fat_start * u64::from(sb_data.bytes_per_sector) + offset_in_fat;
-        write_bytes(&sb_data.bdev, byte_offset, &buf)?;
-    }
-
-    Ok(())
-}
-
-/// Find and allocate a free cluster
-///
-/// Searches the FAT for a free cluster (value 0), marks it as end-of-chain,
-/// and returns the cluster number.
-fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
-    // The search and the claim as one (Linux fat_alloc_clusters under
-    // lock_fat): no two allocations take one cluster
-    let mut fat = sb_data.fat.lock();
-    // Next fit among the data clusters (the BPB's size, not the
-    // device's): after the last one taken, then from the start
-    let after = fat.prev_free.max(1) + 1;
-    let found = match fat_scan(sb_data, after, sb_data.max_cluster, |_, e| e == FAT_FREE)? {
-        Some(c) => Some(c),
-        None => fat_scan(sb_data, 2, after.min(sb_data.max_cluster), |_, e| {
-            e == FAT_FREE
-        })?,
-    };
-    let Some(cluster) = found else {
-        return Err(KernelError::NoSpace);
-    };
-    // Marked end-of-chain
-    set_fat_entry(sb_data, cluster, FAT_EOC)?;
-    fat.prev_free = cluster;
-    if fat.free > 0 {
-        fat.free -= 1;
-    }
-    Ok(cluster)
-}
-
-/// The first cluster in [from, to) whose FAT entry `f` picks, the FAT
-/// read a page at a time (Linux fat_ent_next over its blocks, not an
-/// entry at a time)
-fn fat_scan(
-    sb_data: &VfatSbData,
-    from: u32,
-    to: u32,
-    mut f: impl FnMut(u32, u32) -> bool,
-) -> Result<Option<u32>, KernelError> {
-    const PER: u32 = 1024; // 4-byte entries in 4 KiB
-    let base = sb_data.fat_start_sector * u64::from(sb_data.bytes_per_sector);
-    // Off the stack: the allocation path below it goes deep (Linux reads
-    // the FAT through buffer heads, no copy on the stack)
-    let mut buf = crate::util::kmem::try_vec(4096, 0u8)?;
-    let mut c = from;
-    while c < to {
-        let n = (PER - c % PER).min(to - c);
-        let bytes = &mut buf[..n as usize * 4];
-        read_bytes(&sb_data.bdev, base + u64::from(c) * 4, bytes)?;
-        for (k, e) in bytes.as_chunks::<4>().0.iter().enumerate() {
-            let v = u32::from_le_bytes(*e) & 0x0FFF_FFFF;
-            if f(c + k as u32, v) {
-                return Ok(Some(c + k as u32));
-            }
-        }
-        c += n;
-    }
-    Ok(None)
-}
 
 /// The device blocks of `cluster`: the first and how many, in the
 /// device's block size (the FAT sector size, set at mount)
@@ -1226,43 +1143,6 @@ fn clean_cluster_aliases(sb_data: &VfatSbData, cluster: u32) {
     crate::fs::buffer::clean_bdev_aliases(&sb_data.bdev, first, n);
 }
 
-/// Free a cluster chain starting from start_cluster (Linux
-/// fat_free_clusters, under lock_fat)
-fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), KernelError> {
-    let mut fat = sb_data.fat.lock();
-    let mut cluster = start_cluster;
-
-    while is_valid_cluster(cluster) {
-        let next = get_fat_entry(sb_data, cluster)?;
-        set_fat_entry(sb_data, cluster, FAT_FREE)?;
-        if fat.free >= 0 {
-            fat.free += 1;
-        }
-
-        if is_end_of_chain(next) {
-            break;
-        }
-        cluster = next;
-    }
-
-    Ok(())
-}
-
-/// The free data clusters, counted from the FAT the first time (Linux
-/// fat_count_free_clusters, under lock_fat)
-fn free_clusters(sb_data: &VfatSbData) -> Result<u64, KernelError> {
-    let mut fat = sb_data.fat.lock();
-    if fat.free < 0 {
-        let mut n = 0i64;
-        fat_scan(sb_data, 2, sb_data.max_cluster, |_, e| {
-            n += i64::from(e == FAT_FREE);
-            false
-        })?;
-        fat.free = n;
-    }
-    Ok(fat.free as u64)
-}
-
 /// Extend a cluster chain by `count` clusters, linking them as it goes
 /// (no buffer the size of the file), each prepared by `init` before it
 /// is linked (a directory's zeroed, a file's device-cache aliases
@@ -1271,31 +1151,37 @@ fn free_clusters(sb_data: &VfatSbData) -> Result<u64, KernelError> {
 /// is freed, so no clusters leak.
 fn extend_cluster_chain(
     sb_data: &VfatSbData,
+    inode: &Inode,
     last_cluster: u32,
     count: usize,
     init: impl Fn(u32) -> Result<(), KernelError>,
 ) -> Result<u32, KernelError> {
+    // Linux fat_chain_add: the link synced if the inode's changes are
+    let wait = fatent::inode_needs_sync(inode);
     // Undo a partial extension: free the clusters already linked from
     // the first new one, and point the existing chain's tail back at
     // end-of-chain
     let mut first = ScopeGuard::new_with_data(0u32, |first| {
         if first != 0 {
-            let _ = free_cluster_chain(sb_data, first);
+            let _ = fat_free_clusters(sb_data, inode, first);
         }
         if last_cluster != 0 {
-            let _ = set_fat_entry(sb_data, last_cluster, FAT_EOC);
+            let _ = fatent::fat_ent_link(sb_data, inode, last_cluster, FAT_ENT_EOF, wait);
         }
     });
     let mut prev = last_cluster;
     for _ in 0..count {
-        let cluster = allocate_cluster(sb_data)?;
+        // Linux fat_add_cluster: one cluster, then fat_chain_add
+        let mut c = [0u32];
+        fat_alloc_clusters(sb_data, inode, &mut c)?;
+        let cluster = c[0];
         if let Err(e) = init(cluster).and_then(|()| match prev {
             0 => Ok(()),
-            p => set_fat_entry(sb_data, p, cluster),
+            p => fatent::fat_ent_link(sb_data, inode, p, cluster, wait),
         }) {
             // `cluster` is allocated but not yet linked: a chain of its own
             // (end of chain), freed under the FAT lock with the count
-            let _ = free_cluster_chain(sb_data, cluster);
+            let _ = fat_free_clusters(sb_data, inode, cluster);
             return Err(e);
         }
         if *first == 0 {
@@ -1958,6 +1844,7 @@ fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
 /// the directory.
 fn find_free_dir_slots(
     sb_data: &VfatSbData,
+    dir: &Inode,
     free: &FreeSlots,
     n: usize,
 ) -> Result<Vec<u64>, KernelError> {
@@ -1992,10 +1879,11 @@ fn find_free_dir_slots(
     }
     let last = *free.clusters.last().ok_or(KernelError::Io)?;
     let more = (n - run.len()).div_ceil(per as usize);
-    let mut c = extend_cluster_chain(sb_data, last, more, |c| fat_zeroed_cluster(sb_data, c))?;
+    let mut c = extend_cluster_chain(sb_data, dir, last, more, |c| fat_zeroed_cluster(sb_data, c))?;
+    let mut fe = fatent::FatEnt::new();
     for k in 0..more {
         if k > 0 {
-            c = get_fat_entry(sb_data, c)?;
+            c = fatent::fat_ent_read(sb_data, &mut fe, c)?;
         }
         let base = cluster_to_offset(sb_data, c);
         let take = (n - run.len()).min(per as usize);
@@ -2022,6 +1910,7 @@ struct NewEntry<'a> {
 /// offsets, the short entry's (its i_pos) last.
 fn fat_add_entries(
     sb_data: &VfatSbData,
+    dir: &Inode,
     dirsync: bool,
     existing: &[ParsedDirEntry],
     free: &FreeSlots,
@@ -2052,7 +1941,7 @@ fn fat_add_entries(
 
     // The LFN entries and the short one (any new cluster allocated
     // before `ipos`, which is never held with the FAT lock)
-    let offs = find_free_dir_slots(sb_data, free, lfn_entries.len() + 1)?;
+    let offs = find_free_dir_slots(sb_data, dir, free, lfn_entries.len() + 1)?;
     let i_pos = *offs.last().ok_or(KernelError::Io)?;
 
     let mut short_bytes = [0u8; 32];
@@ -2171,10 +2060,13 @@ fn fat_remove_entries(
 /// (Linux fat_alloc_new_dir); freed again if a write fails
 fn fat_alloc_new_dir(
     sb_data: &VfatSbData,
+    dir: &Inode,
     parent_cluster: u32,
     et: &EntryTimes,
 ) -> Result<u32, KernelError> {
-    let c = allocate_cluster(sb_data)?;
+    let mut c = [0u32];
+    fat_alloc_clusters(sb_data, dir, &mut c)?;
+    let c = c[0];
     let fill = || {
         let off = cluster_to_offset(sb_data, c);
         fat_zeroed_cluster(sb_data, c)?;
@@ -2193,7 +2085,7 @@ fn fat_alloc_new_dir(
         Ok(())
     };
     if let Err(e) = fill() {
-        let _ = free_cluster_chain(sb_data, c);
+        let _ = fat_free_clusters(sb_data, dir, c);
         return Err(e);
     }
     Ok(c)
@@ -2297,22 +2189,25 @@ impl InodeOps for VfatInodeOps {
         a
     }
 
-    /// An unlinked file's clusters are freed with its inode, at once
-    /// (Linux fat_evict_inode: fat_truncate_blocks(inode, 0); the last
-    /// reference goes where sleeping is allowed, as Linux iput)
+    /// Linux fat_evict_inode: an unlinked file's clusters are freed with
+    /// its inode, at once (fat_truncate_blocks(inode, 0); the last
+    /// reference goes where sleeping is allowed, as Linux iput); a linked
+    /// one's metadata buffers are written first (mmb_sync); then its list
+    /// is emptied (mmb_invalidate)
     fn evict_inode(&self, inode: &Inode) {
-        if inode.get_nlink() != 0 {
-            return;
+        if inode.get_nlink() == 0 {
+            if let (Ok(d), Some(sb)) = (get_inode_data(inode), inode.superblock())
+                && let Ok(sb_data) = get_sb_data(&sb)
+                && d.start_cluster != 0
+            {
+                let _ = fat_free_clusters(&sb_data, inode, d.start_cluster);
+            }
+        } else {
+            let _ = with_vi(inode, |v| crate::fs::buffer::mmb_sync(&v.i_metadata_bhs));
         }
-        let (Ok(d), Some(sb)) = (get_inode_data(inode), inode.superblock()) else {
-            return;
-        };
-        let Ok(sb_data) = get_sb_data(&sb) else {
-            return;
-        };
-        if d.start_cluster != 0 {
-            let _ = free_cluster_chain(&sb_data, d.start_cluster);
-        }
+        let _ = with_vi(inode, |v| {
+            crate::fs::buffer::mmb_invalidate(&v.i_metadata_bhs)
+        });
     }
 
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
@@ -2371,17 +2266,20 @@ impl InodeOps for VfatInodeOps {
         inode.inc_iversion();
 
         let crtime = fill_times(&inode, sb_data.opts.tz(), &et);
-        inode.set_private(new_private(VfatInodeData {
-            start_cluster,
-            file_size,
-            is_dir: false,
-            parent_cluster,
-            short_name,
-            mmu_private: 0,
-            clusters: 0,
-            crtime,
-            i_pos,
-        })?);
+        inode.set_private(new_private(
+            &inode,
+            VfatInodeData {
+                start_cluster,
+                file_size,
+                is_dir: false,
+                parent_cluster,
+                short_name,
+                mmu_private: 0,
+                clusters: 0,
+                crtime,
+                i_pos,
+            },
+        )?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         Ok(inode)
     }
@@ -2410,7 +2308,7 @@ impl InodeOps for VfatInodeOps {
         let ts = crate::time::TIMEKEEPER.current_time();
         let et = EntryTimes::at(sb_data.opts.tz(), ts);
         let parent_cluster = dir_inode_data.start_cluster;
-        let new_cluster = fat_alloc_new_dir(&sb_data, parent_cluster, &et)?;
+        let new_cluster = fat_alloc_new_dir(&sb_data, dir, parent_cluster, &et)?;
         let e = NewEntry {
             name,
             attr: attr::DIRECTORY,
@@ -2422,7 +2320,7 @@ impl InodeOps for VfatInodeOps {
             Ok(m) => m,
             Err(e) => {
                 // Linux vfat_mkdir: out_free
-                let _ = free_cluster_chain(&sb_data, new_cluster);
+                let _ = fat_free_clusters(&sb_data, dir, new_cluster);
                 return Err(e);
             }
         };
@@ -2450,17 +2348,20 @@ impl InodeOps for VfatInodeOps {
         inode.nlink.store(2, core::sync::atomic::Ordering::Relaxed);
 
         let crtime = fill_times(&inode, sb_data.opts.tz(), &et);
-        inode.set_private(new_private(VfatInodeData {
-            start_cluster: new_cluster,
-            file_size: 0,
-            is_dir: true,
-            parent_cluster,
-            short_name,
-            mmu_private: 0,
-            clusters: 0,
-            crtime,
-            i_pos,
-        })?);
+        inode.set_private(new_private(
+            &inode,
+            VfatInodeData {
+                start_cluster: new_cluster,
+                file_size: 0,
+                is_dir: true,
+                parent_cluster,
+                short_name,
+                mmu_private: 0,
+                clusters: 0,
+                crtime,
+                i_pos,
+            },
+        )?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
         Ok(inode)
     }
@@ -2785,7 +2686,9 @@ impl InodeOps for VfatInodeOps {
         if let Some(t) = existing {
             match &new_inode {
                 Some(i) => i.nlink.store(0, core::sync::atomic::Ordering::Release),
-                None if t.start_cluster != 0 => free_cluster_chain(&sb_data, t.start_cluster)?,
+                None if t.start_cluster != 0 => {
+                    fat_free_clusters(&sb_data, new_dir, t.start_cluster)?
+                }
                 None => {}
             }
         }
@@ -2994,7 +2897,7 @@ fn vfat_add_entry(
     free: &FreeSlots,
     e: &NewEntry<'_>,
 ) -> Result<([u8; 11], Vec<u64>), KernelError> {
-    let made = fat_add_entries(sb_data, sb.dirsync(), existing, free, e)?;
+    let made = fat_add_entries(sb_data, dir, sb.dirsync(), existing, free, e)?;
     dir_update(dir, sb, Some(e.ts), false);
     Ok(made)
 }
@@ -3069,7 +2972,7 @@ fn unlink_entry(
     fat_remove_entries(dir, sb, sb_data, &offs, inode.as_deref())?;
     match inode {
         Some(i) => i.nlink.store(0, core::sync::atomic::Ordering::Release),
-        None if entry.start_cluster != 0 => free_cluster_chain(sb_data, entry.start_cluster)?,
+        None if entry.start_cluster != 0 => fat_free_clusters(sb_data, dir, entry.start_cluster)?,
         None => {}
     }
     Ok(())
@@ -3127,18 +3030,21 @@ fn create_inode_for_entry(
         .store(nlink, core::sync::atomic::Ordering::Relaxed);
 
     let crtime = fill_times(&inode, o.tz(), &entry.times);
-    inode.set_private(new_private(VfatInodeData {
-        crtime,
-        i_pos: entry.i_pos,
-        start_cluster: entry.start_cluster,
-        file_size: entry.file_size,
-        is_dir: entry.is_dir(),
-        parent_cluster,
-        short_name: entry.short_name,
-        mmu_private: u64::from(entry.file_size),
-        // Linux fat_fill_inode: i_blocks from the size
-        clusters: entry.file_size.div_ceil(sb_data.cluster_size),
-    })?);
+    inode.set_private(new_private(
+        &inode,
+        VfatInodeData {
+            crtime,
+            i_pos: entry.i_pos,
+            start_cluster: entry.start_cluster,
+            file_size: entry.file_size,
+            is_dir: entry.is_dir(),
+            parent_cluster,
+            short_name: entry.short_name,
+            mmu_private: u64::from(entry.file_size),
+            // Linux fat_fill_inode: i_blocks from the size
+            clusters: entry.file_size.div_ceil(sb_data.cluster_size),
+        },
+    )?);
 
     Ok(inode)
 }
@@ -3246,15 +3152,14 @@ impl FileOps for VfatFileOps {
 
     /// Linux fat_file_fsync: the range's pages and the inode's entry
     /// unless `datasync` may skip it (simple_fsync_noflush), the FAT's
-    /// blocks (mmb_sync of the FAT inode's metadata buffers: with no
-    /// buffer heads the device's whole cache, BUGS.md "No buffer
-    /// heads"), then the disk's write cache flushed
+    /// dirty blocks (mmb_sync of the FAT inode's metadata buffers), then
+    /// the disk's write cache flushed
     fn fsync(&self, file: &File, start: u64, end: u64, datasync: bool) -> Result<(), KernelError> {
         super::libfs::simple_fsync_noflush(file, start, end, datasync)?;
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        sync_buffers(&sb_data)?;
+        fatent::with_fat_mmb(&sb_data, crate::fs::buffer::mmb_sync)??;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
 
@@ -3357,7 +3262,7 @@ impl SuperOps for VfatSuperOps {
         let d = get_sb_data(sb)?;
         // A FAT that cannot be read fails the call (Linux
         // fat_count_free_clusters' error)
-        let free = free_clusters(&d)?;
+        let free = fatent::fat_count_free_clusters(&d)?;
         Ok(StatFs {
             f_type: MSDOS_SUPER_MAGIC,
             f_bsize: u64::from(d.cluster_size),
@@ -3490,9 +3395,35 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
     }
     // FAT32 numbers clusters in 28 bits (Linux MAX_FAT32: "count of
     // clusters too big")
-    if total_clusters + 2 > u64::from(FAT_BAD) {
+    if total_clusters + 2 > u64::from(fatent::BAD_FAT32) {
         return Err(KernelError::InvalidArgument);
     }
+
+    // The FAT's inode (Linux fat_fill_super: new_inode, i_pos 0)
+    let fat_inode = Inode::alloc(Inode::new(
+        sb.alloc_ino(),
+        InodeMode::regular(0),
+        0,
+        0,
+        0,
+        Timespec::ZERO,
+        Arc::downgrade(sb),
+        &VFAT_INODE_OPS,
+    ))?;
+    fat_inode.set_private(new_private(
+        &fat_inode,
+        VfatInodeData {
+            start_cluster: 0,
+            file_size: 0,
+            is_dir: false,
+            parent_cluster: 0,
+            short_name: [b' '; 11],
+            mmu_private: 0,
+            clusters: 0,
+            crtime: Timespec::ZERO,
+            i_pos: 0,
+        },
+    )?);
 
     // Create superblock data
     let sb_data = try_arc(VfatSbData {
@@ -3508,6 +3439,7 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         cluster_size,
         opts,
         ipos: try_arc(crate::sync::Mutex::new(()))?,
+        fat_inode: try_arc(fat_inode)?,
         fat: try_arc(crate::sync::Mutex::new(FatState {
             free: -1,
             prev_free: 2,
@@ -3545,17 +3477,20 @@ fn vfat_fill_super(sb: &Arc<SuperBlock>, opts: &[u8]) -> Result<(), KernelError>
         .nlink
         .store(n, core::sync::atomic::Ordering::Relaxed);
 
-    root_inode.set_private(new_private(VfatInodeData {
-        start_cluster: boot_sector.root_cluster,
-        file_size: 0,
-        is_dir: true,
-        parent_cluster: 0,      // Root has no parent
-        short_name: [b' '; 11], // Root has no short name
-        mmu_private: 0,
-        clusters: 0,
-        crtime: Timespec::ZERO,
-        i_pos: 0,
-    })?);
+    root_inode.set_private(new_private(
+        &root_inode,
+        VfatInodeData {
+            start_cluster: boot_sector.root_cluster,
+            file_size: 0,
+            is_dir: true,
+            parent_cluster: 0,      // Root has no parent
+            short_name: [b' '; 11], // Root has no short name
+            mmu_private: 0,
+            clusters: 0,
+            crtime: Timespec::ZERO,
+            i_pos: 0,
+        },
+    )?);
     // Linux fat_fill_super: insert_inode_hash(root_inode); no lookup
     // finds it (no entry, `is_obj`), the hash makes it a writeback
     // candidate
@@ -3613,7 +3548,7 @@ mod tests {
         assert_eq!(walk(&[0, 0, 0, 0], 2), (vec![2], true));
         assert_eq!(walk(&[0, 0, 1, 0], 2), (vec![2], true));
         assert_eq!(walk(&[0, 0, 9, 0], 2), (vec![2], true));
-        assert_eq!(walk(&[0, 0, FAT_BAD, 0], 2), (vec![2], true));
+        assert_eq!(walk(&[0, 0, fatent::BAD_FAT32, 0], 2), (vec![2], true));
         // A loop: EIO once more clusters than the FAT has were walked
         assert!(walk(&[0, 0, 3, 2], 2).1);
         // A bad start
