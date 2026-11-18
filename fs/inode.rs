@@ -786,7 +786,7 @@ unsafe fn iput_final(p: NonNull<Inode>, l: MutexGuard<'_, ILocked>) {
         core::mem::drop(l);
         // The superblock's Arc is dropped with no lock held
         let sync = !i.superblock().is_some_and(|sb| sb.active());
-        let _ = super::fs_writeback::write_inode_now(i, sync);
+        let _ = super::pageio::fs_writeback::write_inode_now(i, sync);
         let l = i.i_lock.lock();
         i.i_state
             .store((i.state() & !I_WILL_FREE) | I_FREEING, Ordering::Release);
@@ -2058,10 +2058,10 @@ unsafe fn evict(p: NonNull<Inode>) {
     {
         // SAFETY: live until the free queued below
         let i = unsafe { p.as_ref() };
-        super::fs_writeback::inode_io_list_del(i);
+        super::pageio::fs_writeback::inode_io_list_del(i);
         // Linux evict: inode_wait_for_writeback (a writer holds a
         // reference here, so none is left to wait for)
-        drop(super::fs_writeback::inode_wait_for_writeback(
+        drop(super::pageio::fs_writeback::inode_wait_for_writeback(
             i,
             i.i_lock.lock(),
         ));

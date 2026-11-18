@@ -22,11 +22,11 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::block::blkdev::{Bio, BioOp, BlockDevice, SECTOR_SHIFT, submit_bio};
-use crate::fs::buffer::{
+use crate::fs::inode::Inode;
+use crate::fs::pageio::buffer::{
     self, BufferHead, GetBlock, folio_buffers, folio_end_read, folio_end_writeback,
     folio_start_writeback, folio_wait_writeback, guard_bio_eod, ring, zero_frame,
 };
-use crate::fs::inode::Inode;
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::util::error::KernelError;
 

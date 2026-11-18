@@ -20,7 +20,7 @@ use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::block::BlockDevice;
-use crate::fs::buffer::{self, BhRef, MappingMetadataBhs};
+use crate::fs::pageio::buffer::{self, BhRef, MappingMetadataBhs};
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -77,7 +77,7 @@ fn fat_cont_expand(inode: &Inode, size: u64) -> Result<(), KernelError> {
     let start = inode.get_size();
     buffer::generic_cont_expand_simple(inode, size)?;
     fat_truncate_time(inode, None, false, true);
-    super::fs_writeback::mark_inode_dirty(inode);
+    super::pageio::fs_writeback::mark_inode_dirty(inode);
     if !inode.is_sync() {
         return Ok(());
     }
@@ -85,7 +85,7 @@ fn fat_cont_expand(inode: &Inode, size: u64) -> Result<(), KernelError> {
     // fsync path (Linux)
     let r = filemap::write_and_wait_range(inode, start, size - 1);
     let r2 = with_mmb(inode, buffer::mmb_sync).and_then(|r| r);
-    let r3 = super::fs_writeback::write_inode_now(inode, true);
+    let r3 = super::pageio::fs_writeback::write_inode_now(inode, true);
     r.and(r2).and(r3)
 }
 
@@ -119,7 +119,9 @@ fn fat_free_eofblocks(inode: &Inode) {
         return;
     }
     let _ = fat_truncate_blocks(inode, mmu);
-    if super::fs_writeback::sync_inode_metadata(inode, fatent::inode_needs_sync(inode)).is_err() {
+    if super::pageio::fs_writeback::sync_inode_metadata(inode, fatent::inode_needs_sync(inode))
+        .is_err()
+    {
         crate::printkln!(
             "FAT-fs: Failed to update on disk inode for unused fallocated blocks, inode could be corrupted. Please run fsck"
         );
@@ -156,8 +158,8 @@ fn fat_free(sb_data: &VfatSbData, inode: &Inode, skip: usize) -> Result<(), Kern
         set_start(inode, 0)?;
     }
     fat_truncate_time(inode, None, false, true);
-    super::fs_writeback::mark_inode_dirty(inode);
-    if wait && let Err(e) = super::fs_writeback::sync_inode_metadata(inode, true) {
+    super::pageio::fs_writeback::mark_inode_dirty(inode);
+    if wait && let Err(e) = super::pageio::fs_writeback::sync_inode_metadata(inode, true) {
         set_start(inode, i_start)?;
         return Err(e);
     }
@@ -1117,7 +1119,7 @@ fn put_inode_entry(bh: &BhRef, at: usize, inode: &Inode, d: &VfatInodeData, sb_d
 /// the same; an inode with no entry left (unlinked) is neither.
 fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
     if is_root(inode) {
-        super::fs_writeback::set_inode_metadata_writeback(inode);
+        super::pageio::fs_writeback::set_inode_metadata_writeback(inode);
         return Ok(());
     }
     let sb = inode.superblock().ok_or(KernelError::Io)?;
@@ -1144,7 +1146,7 @@ fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
         }
         buffer::mark_buffer_dirty(&bh);
         drop(bh);
-        super::fs_writeback::set_inode_metadata_writeback(inode);
+        super::pageio::fs_writeback::set_inode_metadata_writeback(inode);
         return Ok(());
     }
 }
@@ -1708,10 +1710,10 @@ fn fat_chain_add(
         }
         None => {
             set_start(inode, new_dclus)?;
-            super::fs_writeback::mark_inode_dirty(inode);
+            super::pageio::fs_writeback::mark_inode_dirty(inode);
             // generic_write_sync syncs a regular file later (Linux)
             if inode.mode().is_dir() && inode.superblock().is_some_and(|sb| sb.dirsync()) {
-                super::fs_writeback::sync_inode_metadata(inode, true)?;
+                super::pageio::fs_writeback::sync_inode_metadata(inode, true)?;
             }
         }
     }
@@ -2138,7 +2140,7 @@ impl InodeOps for VfatInodeOps {
         }
         let atime = what == TimeUpdate::Atime;
         fat_truncate_time(inode, None, atime, !atime);
-        super::fs_writeback::mark_inode_dirty_sync(inode);
+        super::pageio::fs_writeback::mark_inode_dirty_sync(inode);
     }
 
     /// Linux fat_setattr's end: atime to the day, mtime to 2 s with
@@ -2157,7 +2159,7 @@ impl InodeOps for VfatInodeOps {
         if let Some(t) = mtime {
             fat_truncate_time(inode, Some(t), false, true);
         }
-        super::fs_writeback::mark_inode_dirty(inode);
+        super::pageio::fs_writeback::mark_inode_dirty(inode);
     }
 
     /// The preferred I/O size is the cluster size (Linux fat_getattr)
@@ -2465,7 +2467,7 @@ impl InodeOps for VfatInodeOps {
         fat_truncate_blocks(inode, length)?;
         with_vi(inode, |v| v.d.lock().file_size = length as u32)?;
         // Linux fat_setattr: mark_inode_dirty
-        super::fs_writeback::mark_inode_dirty(inode);
+        super::pageio::fs_writeback::mark_inode_dirty(inode);
         Ok(())
     }
 
@@ -2610,9 +2612,9 @@ impl InodeOps for VfatInodeOps {
             write_entry(&sb_data, new_ipos, old_entry.attr, ext, &times)?;
             // vfat_sync_ipos: mark_inode_dirty, on a dirsync mount
             // sync_inode_metadata at once
-            super::fs_writeback::mark_inode_dirty(&old_inode);
+            super::pageio::fs_writeback::mark_inode_dirty(&old_inode);
             if sb.dirsync() {
-                super::fs_writeback::sync_inode_metadata(&old_inode, true)?;
+                super::pageio::fs_writeback::sync_inode_metadata(&old_inode, true)?;
             }
             Ok(())
         };
@@ -2855,9 +2857,9 @@ pub static VFAT_INODE_OPS: VfatInodeOps = VfatInodeOps;
 /// with wait, its error ignored as Linux's (void))
 fn dir_update(dir: &Inode, sb: &SuperBlock, ts: Option<Timespec>, atime: bool) {
     fat_truncate_time(dir, ts, atime, true);
-    super::fs_writeback::mark_inode_dirty(dir);
+    super::pageio::fs_writeback::mark_inode_dirty(dir);
     if sb.dirsync() {
-        let _ = super::fs_writeback::sync_inode_metadata(dir, true);
+        let _ = super::pageio::fs_writeback::sync_inode_metadata(dir, true);
     }
 }
 
@@ -3183,7 +3185,7 @@ impl FileOps for VfatFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        with_mmb(&sb_data.fat_inode, crate::fs::buffer::mmb_sync)??;
+        with_mmb(&sb_data.fat_inode, crate::fs::pageio::buffer::mmb_sync)??;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
 
@@ -3251,7 +3253,7 @@ impl SuperOps for VfatSuperOps {
     fn write_inode(
         &self,
         inode: &Inode,
-        _wbc: &super::fs_writeback::WritebackControl,
+        _wbc: &super::pageio::fs_writeback::WritebackControl,
     ) -> Result<(), KernelError> {
         fat_write_inode(inode)
     }
@@ -3260,7 +3262,7 @@ impl SuperOps for VfatSuperOps {
     fn sync_inode_metadata(
         &self,
         inode: &Inode,
-        _wbc: &super::fs_writeback::WritebackControl,
+        _wbc: &super::pageio::fs_writeback::WritebackControl,
     ) -> Result<(), KernelError> {
         fat_sync_inode_metadata(inode)
     }
@@ -3269,7 +3271,7 @@ impl SuperOps for VfatSuperOps {
     /// (sync_filesystem, its error ignored), before a switch to
     /// read-only; the options are kept
     fn remount(&self, sb: &SuperBlock, _data: &[u8]) -> Result<(), KernelError> {
-        let _ = super::sync::sync_filesystem(sb);
+        let _ = super::pageio::sync::sync_filesystem(sb);
         Ok(())
     }
 

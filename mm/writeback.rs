@@ -20,8 +20,8 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::block::blkdev::DevId;
-use crate::fs::fs_writeback::IoListA;
 use crate::fs::inode::InodeList;
+use crate::fs::pageio::fs_writeback::IoListA;
 use crate::sync::spin::Mutex;
 use crate::task::workqueue::{DelayedWork, Workqueue, wq_flags};
 
@@ -129,7 +129,7 @@ fn wb_workfn(wb: &BdiWriteback) {
     };
     // Younger data waits for a later pass (Linux wb_workfn re-arms
     // while the wb has dirty I/O)
-    if crate::fs::fs_writeback::wb_do_writeback(wb, cutoff) {
+    if crate::fs::pageio::fs_writeback::wb_do_writeback(wb, cutoff) {
         wb.wakeup_delayed();
     }
 }
@@ -230,7 +230,7 @@ pub fn balance_dirty_pages(inode: &crate::fs::Inode) {
     }
     let dirty = crate::mm::filemap::nr_dirty();
     if dirty > limit(&DIRTY_RATIO, &DIRTY_BYTES) {
-        let _ = crate::fs::fs_writeback::writeback_inode(inode);
+        let _ = crate::fs::pageio::fs_writeback::writeback_inode(inode);
     } else if dirty > limit(&BG_RATIO, &BG_BYTES)
         && let Some(b) = inode.superblock().and_then(|sb| sb.bdev().cloned())
     {
@@ -333,7 +333,7 @@ pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
 /// Write back everything (sync(2), Linux ksys_sync): every
 /// filesystem's dirty inodes, then the devices' caches
 pub fn sync_all() {
-    crate::fs::fs_writeback::sync_all_sbs();
+    crate::fs::pageio::fs_writeback::sync_all_sbs();
     crate::block::blkdev::sync_bdevs();
 }
 

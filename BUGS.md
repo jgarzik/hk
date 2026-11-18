@@ -159,7 +159,7 @@ Missing:
   at the low watermark until kswapd (J) keeps free memory above it.
 - No readahead (Linux page_cache_ra_*, ->readahead): a page is read
   by its own ->read_folio when first needed, so a vfat file has no
-  mpage_readahead (`fs/mpage.rs`). ->writepage is synchronous, a page
+  mpage_readahead (`fs/pageio/mpage.rs`). ->writepage is synchronous, a page
   at a time (Linux ->writepages: mpage_writepages adds contiguous
   pages to one bio and unlocks each once added): a vfat page goes to
   the disk in a bio of its own, its writer waiting.
@@ -309,7 +309,7 @@ lo (hk has no checksum offload states).
 
 ## O_DIRECT gaps
 
-**Location**: `fs/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
+**Location**: `fs/pageio/blkdev_ops.rs`, `block/dio.rs`, `block/blkdev.rs`,
 `fs/vfat/`
 
 - Block-device and vfat O_DIRECT from kernel virtual memory (a kernel
@@ -714,7 +714,7 @@ waiting).
 
 ## Buffer head gaps
 
-**Location**: `fs/buffer.rs`, `mm/filemap.rs`
+**Location**: `fs/pageio/buffer.rs`, `mm/filemap.rs`
 
 - A page truncated while one of its buffers is still referenced (the
   per-CPU LRU of another CPU, a holder) leaves its mapping with its
@@ -1005,7 +1005,7 @@ a reset register in PCI configuration space is ignored.
 
 ## Writeback of a superblock with no block device
 
-**Location**: `fs/fs_writeback.rs` (`__mark_inode_dirty`, `sync_inodes_sb`)
+**Location**: `fs/pageio/fs_writeback.rs` (`__mark_inode_dirty`, `sync_inodes_sb`)
 
 An inode dirtied on a superblock without a backing device (Linux
 noop_backing_dev_info) is marked dirty but queued nowhere, and
@@ -1018,7 +1018,7 @@ its no-writeback skip, before it relies on sync.
 ## Block layer gaps
 
 **Location**: `block/`, `hw/virtio/blk.rs`,
-`fs/blkdev_ops.rs`, `fs/vfat/`
+`fs/pageio/blkdev_ops.rs`, `fs/vfat/`
 
 - Partition tables are parsed in 512-byte sectors: on a disk with
   larger logical blocks, GPT LBAs and MBR sector counts are misread

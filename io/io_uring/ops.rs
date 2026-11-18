@@ -172,7 +172,7 @@ pub fn open(r: &IoRing, a: &OpenArgs, held: Option<&mut Submit>) -> KernelResult
 /// the end for an end past LLONG_MAX or a zero len at 0), data only
 /// with IORING_FSYNC_DATASYNC
 fn fsync(sqe: &IoUringSqe) -> KernelResult<i32> {
-    use crate::fs::sync::{LLONG_MAX, vfs_fsync_range};
+    use crate::fs::pageio::sync::{LLONG_MAX, vfs_fsync_range};
     if sqe.addr != 0
         || sqe.buf_index != 0
         || sqe.splice_fd_in != 0

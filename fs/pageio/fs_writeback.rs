@@ -63,12 +63,12 @@ const ON_DIRTY: u8 = 1;
 const ON_IO: u8 = 2;
 const ON_MORE_IO: u8 = 3;
 
-use super::inode::istate::{
+use crate::fs::inode::istate::{
     I_DIRTY, I_DIRTY_ALL, I_DIRTY_PAGES, I_DIRTY_SYNC, I_FREEING, I_METADATA_WRITEBACK, I_SYNC,
     I_SYNC_QUEUED, I_WILL_FREE,
 };
-use super::inode::{ILocked, Inode, InodeList, InodeRef};
-use super::superblock::{SuperBlock, iterate_supers};
+use crate::fs::inode::{ILocked, Inode, InodeList, InodeRef};
+use crate::fs::superblock::{SuperBlock, iterate_supers};
 use crate::mm::writeback::{BdiWriteback, WbLists};
 use crate::mm::xarray::{MARK_DIRTY, MARK_WRITEBACK};
 use crate::sync::spin::MutexGuard;
@@ -117,7 +117,7 @@ impl WritebackControl {
 fn inode_to_wb(inode: &Inode) -> Option<Arc<BdiWriteback>> {
     let sb = inode.superblock()?;
     if core::ptr::eq(sb.fs_type, crate::fs::pseudo::BDEV.fs_type()) {
-        return crate::fs::blkdev_ops::inode_bdev(inode)
+        return crate::fs::pageio::blkdev_ops::inode_bdev(inode)
             .ok()
             .map(|b| b.disk.bdi.clone());
     }
@@ -305,7 +305,7 @@ unsafe fn redirty_tail_locked(l: &mut WbLists, inode: &Inode, il: &ILocked) {
 /// The last reference to `inode` went: off its device's writeback list
 /// if it is on one (Linux evict -> inode_io_list_del), before any of
 /// its fields go (the lists' `InodeList` contract)
-pub(super) fn inode_io_list_del(inode: &Inode) {
+pub(in crate::fs) fn inode_io_list_del(inode: &Inode) {
     let Some(wb) = inode.i_wb.get() else {
         return;
     };
@@ -332,7 +332,7 @@ fn inode_sync_complete(inode: &Inode, il: &ILocked) {
 /// Wait until `inode` is not under writeback (Linux
 /// inode_wait_for_writeback): its `i_lock` (`l`) is held, dropped while
 /// asleep and held again on return. The caller keeps the inode live.
-pub(super) fn inode_wait_for_writeback<'a>(
+pub(in crate::fs) fn inode_wait_for_writeback<'a>(
     inode: &'a Inode,
     mut l: MutexGuard<'a, ILocked>,
 ) -> MutexGuard<'a, ILocked> {

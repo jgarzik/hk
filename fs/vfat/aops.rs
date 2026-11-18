@@ -8,9 +8,9 @@
 
 use core::sync::atomic::Ordering;
 
-use crate::fs::buffer::{self, BufferHead};
 use crate::fs::inode::Inode;
-use crate::fs::mpage;
+use crate::fs::pageio::buffer::{self, BufferHead};
+use crate::fs::pageio::mpage;
 use crate::mm::filemap::{self, AddressSpace, Aops};
 use crate::util::error::KernelError;
 

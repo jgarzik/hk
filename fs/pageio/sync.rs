@@ -6,8 +6,8 @@
 //! fadvise and readahead act on a file's page cache. All I/O here is
 //! synchronous: a write that was asked for has completed on return.
 
-use super::inode::Inode;
-use super::io::fget;
+use crate::fs::inode::Inode;
+use crate::fs::io::fget;
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -69,7 +69,7 @@ pub fn sys_syncfs(fd: i32) -> KernelResult<()> {
 /// the inodes written and waited for (sync_inodes_sb), the device's
 /// cache again (what ->write_inode put there); nothing for a read-only
 /// one. hk's filesystems have no ->sync_fs. Under s_umount.
-pub fn sync_filesystem(sb: &super::superblock::SuperBlock) -> KernelResult<()> {
+pub fn sync_filesystem(sb: &crate::fs::superblock::SuperBlock) -> KernelResult<()> {
     use super::fs_writeback::{sync_inodes_sb, writeback_inodes_sb};
     use crate::block::blkdev::sync_blockdev;
     if sb.rdonly() {

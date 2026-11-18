@@ -40,7 +40,7 @@ pub trait SuperOps: Send + Sync {
     fn write_inode(
         &self,
         _inode: &Inode,
-        _wbc: &super::fs_writeback::WritebackControl,
+        _wbc: &super::pageio::fs_writeback::WritebackControl,
     ) -> Result<(), KernelError> {
         Ok(())
     }
@@ -53,7 +53,7 @@ pub trait SuperOps: Send + Sync {
     fn sync_inode_metadata(
         &self,
         _inode: &Inode,
-        _wbc: &super::fs_writeback::WritebackControl,
+        _wbc: &super::pageio::fs_writeback::WritebackControl,
     ) -> Result<(), KernelError> {
         Ok(())
     }
@@ -697,7 +697,7 @@ pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
         super::dentry::d_drop_tree(&root);
         drop(root);
         // Linux ignores sync_filesystem's error here too
-        let _ = super::sync::sync_filesystem(sb);
+        let _ = super::pageio::sync::sync_filesystem(sb);
         sb.s_flags.fetch_and(!SB_ACTIVE, Ordering::Relaxed);
         super::inode::sb_list_drain(&sb.s_inodes);
         sb.s_op.put_super(sb);

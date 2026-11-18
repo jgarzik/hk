@@ -15,10 +15,10 @@ pub use super::link::*;
 pub use super::misc::*;
 pub use super::nav::*;
 pub use super::open::*;
+pub use super::pageio::sync::*;
 pub use super::perm::*;
 pub use super::pollsys::*;
 pub use super::stat::*;
-pub use super::sync::*;
 
 // =============================================================================
 // RWF flags for preadv2/pwritev2

@@ -50,7 +50,7 @@ pub fn simple_fsync_noflush(
     let r = if st & (I_DIRTY_ALL | busy) == 0 || (datasync && st & (I_DIRTY_DATASYNC | busy) == 0) {
         Ok(())
     } else {
-        crate::fs::fs_writeback::sync_inode_metadata(&inode, true)
+        crate::fs::pageio::fs_writeback::sync_inode_metadata(&inode, true)
     };
     // Again, for errors of the buffers just synced
     r.and(file.check_and_advance_wb_err())

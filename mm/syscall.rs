@@ -1288,7 +1288,7 @@ fn msync_vmas(mm: &super::Mm, mut start: u64, end: u64, flags: i32) -> Result<()
         };
         // Linux msync: vfs_fsync_range(file, fstart, fend, 1)
         if let Some((f, fstart, fend)) = file {
-            crate::fs::sync::vfs_fsync_range(&f, fstart, fend, true)?;
+            crate::fs::pageio::sync::vfs_fsync_range(&f, fstart, fend, true)?;
         }
     }
     if unmapped {

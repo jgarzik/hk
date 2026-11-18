@@ -47,10 +47,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::block::dio::{self, AsyncIo, Extent};
-use crate::fs::buffer::BufferHead;
 use crate::fs::file::{File, RwFlags};
 use crate::fs::inode::{Inode, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::pageio::buffer::BufferHead;
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::mm::gup::PageSeg;
 use crate::sync::IrqSpinlock;
@@ -240,7 +240,7 @@ fn direct_write(
         if at > inode.get_size() {
             inode.set_size(at);
             // Linux generic_file_direct_write: mark_inode_dirty
-            crate::fs::fs_writeback::mark_inode_dirty(inode);
+            crate::fs::pageio::fs_writeback::mark_inode_dirty(inode);
         }
     }
     Ok(n)

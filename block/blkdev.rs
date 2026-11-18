@@ -14,7 +14,7 @@
 //! block_device) is the whole disk (partno 0) or one partition of it.
 //! Each block device has an inode (`bd_inode`, Linux bdev inode) whose
 //! page cache serves device-file I/O and filesystem metadata
-//! (`fs::blkdev_ops`) in buffer heads, a bio per block (`fs::buffer`).
+//! (`fs::pageio::blkdev_ops`) in buffer heads, a bio per block (`fs::pageio::buffer`).
 //! Partition scans are synchronous bios (`submit_bio_wait`).
 //!
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
@@ -1000,7 +1000,7 @@ impl BlockDevice {
         name: String,
     ) -> Result<Self, KernelError> {
         let dev = DevId::new(disk.major, disk.first_minor + partno);
-        let bd_inode = crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT)?;
+        let bd_inode = crate::fs::pageio::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT)?;
         Ok(Self {
             disk,
             partno,
@@ -1243,9 +1243,9 @@ pub(super) fn bdev_add(st: &mut OpenState, bdev: &Arc<BlockDevice>) -> Result<()
     // The device's inode does I/O on this device only (never a later
     // one with the same number)
     bdev.bd_inode
-        .set_private(try_arc(crate::fs::blkdev_ops::BdevOwner(Arc::downgrade(
-            bdev,
-        )))?);
+        .set_private(try_arc(crate::fs::pageio::blkdev_ops::BdevOwner(
+            Arc::downgrade(bdev),
+        ))?);
     *slot = Some(bdev.clone());
     crate::fs::icache::insert_inode_hash(&bdev.bd_inode, bdev_hash(bdev.dev));
     Ok(())
@@ -1270,7 +1270,7 @@ pub(super) fn bdev_del(st: &mut OpenState, partno: u16) -> Option<Arc<BlockDevic
 pub fn get_blkdev(dev: DevId) -> Option<Arc<BlockDevice>> {
     let sb = crate::fs::pseudo::BDEV.sb().ok()?;
     let inode = crate::fs::icache::ilookup5(&sb, bdev_hash(dev), &|i| i.rdev == dev)?;
-    crate::fs::blkdev_ops::inode_owner(&inode)
+    crate::fs::pageio::blkdev_ops::inode_owner(&inode)
 }
 
 /// `f` on each block device's inode (Linux: blockdev_superblock's
@@ -1288,7 +1288,7 @@ fn for_each_bdev_inode(mut f: impl FnMut(&crate::fs::InodeRef)) {
 /// `f` on each block device a disk has, with no lock held, in no order
 pub(super) fn for_each_bdev(mut f: impl FnMut(&Arc<BlockDevice>)) {
     for_each_bdev_inode(|i| {
-        if let Some(b) = crate::fs::blkdev_ops::inode_owner(i)
+        if let Some(b) = crate::fs::pageio::blkdev_ops::inode_owner(i)
             && !b.is_dead()
         {
             f(&b);
@@ -1563,7 +1563,7 @@ pub fn kill_bdev(bdev: &BlockDevice) {
     if bdev.bd_inode.i_data.nrpages() == 0 {
         return;
     }
-    crate::fs::buffer::invalidate_bh_lrus();
+    crate::fs::pageio::buffer::invalidate_bh_lrus();
     crate::mm::filemap::invalidate(&bdev.bd_inode);
 }
 
@@ -1573,7 +1573,7 @@ pub fn invalidate_bdev(bdev: &BlockDevice) {
     if bdev.bd_inode.i_data.nrpages() == 0 {
         return;
     }
-    crate::fs::buffer::invalidate_bh_lrus();
+    crate::fs::pageio::buffer::invalidate_bh_lrus();
     crate::mm::swap::lru::lru_add_drain_all();
     crate::mm::filemap::invalidate_clean(&bdev.bd_inode, 0, u64::MAX);
 }

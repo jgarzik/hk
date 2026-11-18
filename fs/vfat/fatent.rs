@@ -12,8 +12,8 @@
 //! Allocation, freeing and the free count run under the FAT lock
 //! (`VfatSbData.fat`, Linux sbi->fat_lock / lock_fat).
 
-use crate::fs::buffer::{self, BhRef};
 use crate::fs::inode::Inode;
+use crate::fs::pageio::buffer::{self, BhRef};
 use crate::util::error::KernelError;
 
 use super::{VfatSbData, mmb_dirty};

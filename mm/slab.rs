@@ -689,8 +689,10 @@ pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", box_of::<crate::fs::
 pub static INODE_CACHE: KmemCache =
     named_cache!("inode_cache", box_of::<crate::fs::inode::Inode>());
 /// Buffer heads (`Box<BufferHead>`; Linux bh_cachep, buffer_init)
-pub static BH_CACHE: KmemCache =
-    named_cache!("buffer_head", box_of::<crate::fs::buffer::BufferHead>());
+pub static BH_CACHE: KmemCache = named_cache!(
+    "buffer_head",
+    box_of::<crate::fs::pageio::buffer::BufferHead>()
+);
 
 /// Pages for the caches made here (host tests: their own)
 #[cfg(not(test))]

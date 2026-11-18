@@ -726,7 +726,7 @@ impl File {
     /// f_mapping->host): a block device node's is the device's bdev
     /// inode, every other file's its own
     pub fn mapping_inode(&self) -> Option<InodeRef> {
-        if let Some(b) = self.private_ref::<crate::fs::blkdev_ops::BdevFile>() {
+        if let Some(b) = self.private_ref::<crate::fs::pageio::blkdev_ops::BdevFile>() {
             return Some(b.bdev.bd_inode.clone());
         }
         self.get_inode()
@@ -1515,7 +1515,7 @@ pub fn generic_write_sync(
     if n > 0 && iocb_is_dsync(file, flags) {
         let end = pos.saturating_add(n as u64 - 1);
         let datasync = !flags.contains(RwFlags::SYNC);
-        crate::fs::sync::vfs_fsync_range(file, pos, end, datasync)?;
+        crate::fs::pageio::sync::vfs_fsync_range(file, pos, end, datasync)?;
     }
     Ok(n)
 }

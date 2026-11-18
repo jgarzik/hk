@@ -35,9 +35,9 @@ use crate::uaccess::{copy_to_user, get_user, put_user};
 use crate::util::error::KernelError;
 
 use super::buffer::{self, BufferHead};
-use super::file::{File, FileOps, RwFlags, generic_write_sync, seek};
-use super::iov_iter::{IovDest, IovSource};
 use crate::block::dio;
+use crate::fs::file::{File, FileOps, RwFlags, generic_write_sync, seek};
+use crate::fs::iov_iter::{IovDest, IovSource};
 
 /// Block device ioctls (Linux include/uapi/linux/fs.h, hdreg.h)
 pub mod ioc {
@@ -365,7 +365,7 @@ fn write_ok(file: &File, len: usize, pos: u64) -> Result<bool, KernelError> {
 
 /// A block device's cache in buffer heads (Linux def_blk_aops with
 /// CONFIG_BUFFER_HEAD): pages read and written block by block, the
-/// device's soft block size each (`fs::buffer`), so writeback writes
+/// device's soft block size each (`fs::pageio::buffer`), so writeback writes
 /// only the dirty buffers: a filesystem's metadata buffers (vfat) dirty
 /// just their blocks of a page that may also hold its file data
 struct BdevAops;
@@ -692,7 +692,7 @@ impl FileOps for BlockFileOps {
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let b = get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
-        let excl = file.get_flags() & super::file::flags::O_EXCL != 0;
+        let excl = file.get_flags() & crate::fs::file::flags::O_EXCL != 0;
         let f = crate::util::kalloc::try_arc(BdevFile { bdev: b, excl })?;
         f.bdev.open(f.holder())?;
         file.private.call_once(|| f);

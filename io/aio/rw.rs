@@ -152,7 +152,7 @@ pub fn aio_fsync(b: Base, iocb: &Iocb, datasync: bool) -> KernelResult<()> {
         if let Some((k, creds)) = job.take() {
             let r = {
                 let _c = crate::task::override_creds(creds);
-                crate::fs::sync::vfs_fsync(k.file(), datasync)
+                crate::fs::pageio::sync::vfs_fsync(k.file(), datasync)
             };
             k.done(r.map(|()| 0));
         }

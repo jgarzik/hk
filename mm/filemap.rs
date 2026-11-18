@@ -112,7 +112,7 @@ pub trait Aops: Sync {
     /// use. Default: the page's buffers (Linux filemap_release_folio
     /// without ->release_folio: try_to_free_buffers).
     fn release_folio(&self, m: &AddressSpace, phys: u64) -> bool {
-        crate::fs::buffer::try_to_free_buffers(Some(m), phys)
+        crate::fs::pageio::buffer::try_to_free_buffers(Some(m), phys)
     }
 
     /// Pages get dirty (false: Linux noop_dirty_folio, a mapping with
@@ -830,7 +830,7 @@ pub fn dirty_folio(m: &AddressSpace, phys: u64) {
 /// last went (Linux skips an I_FREEING inode)
 pub fn mark_host_dirty(m: &AddressSpace) {
     if let Some(inode) = host_igrab(m) {
-        crate::fs::fs_writeback::mark_inode_dirty_pages(&inode);
+        crate::fs::pageio::fs_writeback::mark_inode_dirty_pages(&inode);
     }
 }
 

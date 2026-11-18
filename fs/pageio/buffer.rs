@@ -1294,7 +1294,7 @@ pub fn mark_buffer_dirty(bh: &BufferHead) {
         // Outside the RCU read section: the reference's drop may be the
         // inode's last
         if let Some(i) = host {
-            crate::fs::fs_writeback::mark_inode_dirty_pages(&i);
+            crate::fs::pageio::fs_writeback::mark_inode_dirty_pages(&i);
         }
     }
 }
@@ -1884,7 +1884,7 @@ pub fn generic_write_end(inode: &Inode, pos: u64, len: usize, copied: usize, phy
     crate::mm::page::unlock_page(phys);
     filemap::put_page(phys);
     if grown {
-        crate::fs::fs_writeback::mark_inode_dirty(inode);
+        crate::fs::pageio::fs_writeback::mark_inode_dirty(inode);
     }
     copied
 }
