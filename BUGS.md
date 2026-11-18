@@ -126,10 +126,14 @@ fnhe_genid), so they are not flushed when a device goes down.
 
 ## Memory management gaps
 
-**Location**: `mm/`, `arch/*/paging.rs`, `ipc/shm.rs`
+**Location**: `mm/`, `arch/*/paging.rs`, `ipc/shm.rs`, `fs/inode.rs`
 
 Missing:
 
+- No inode LRU (Linux inode_lru, prune_icache_sb): an inode put to
+  zero while its superblock is active is evicted at once, so
+  `iput_final` writes it back first (WB_SYNC_NONE) where Linux keeps
+  it cached, dirty, for the flusher.
 - Writeback (J): the periodic pass writes every dirty inode of a
   device (Linux only those dirty for vm.dirty_expire_centisecs, which
   is stored but unused); past vm.dirty_ratio the writer writes its own
@@ -740,10 +744,6 @@ fat_zeroed_cluster zeroes the buffers (sb_getblk, mark_buffer_dirty).
 - No buffer-head count limit (Linux buffer_heads_over_limit, which
   makes reclaim strip buffers), no page migration of buffered pages,
   no BH_Delay / BH_Unwritten / BH_Boundary users.
-- No inode LRU (Linux inode_lru, prune_icache_sb): an inode put to
-  zero while its superblock is active is evicted at once, so
-  `iput_final` writes it back first (WB_SYNC_NONE) where Linux keeps
-  it cached, dirty, for the flusher.
 
 ## renameat2 flag gaps
 
