@@ -674,7 +674,8 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         .read()
         .iter()
         .position(|s| s.is_none())
-        .ok_or(KernelError::Busy)? as u8;
+        // Linux alloc_swap_info: no free type is EPERM
+        .ok_or(KernelError::NotPermitted)? as u8;
     // claim_swapfile: a block device opened and claimed for the swap's
     // life (Linux file_open_name O_EXCL: holder the swap area, EBUSY if
     // another holder has it); the holder is the type's slot, unique

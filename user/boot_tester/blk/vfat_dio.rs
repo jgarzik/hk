@@ -50,6 +50,7 @@ pub fn run_tests() {
     report_r(b"VFAT_WRITE_SHORT", write_short());
     report_r(b"VFAT_PARTIAL_WB", partial_wb(&p1));
     report_r(b"VFAT_SWAPFILE_IO", swapfile_io());
+    report_r(b"VFAT_SWAPON_FULL", swapon_full());
     report_r(b"VFAT_DIO_HOLE", hole(&p1));
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
@@ -568,6 +569,49 @@ fn swapfile_io() -> R {
     }
     sys_unlink(p.as_ptr());
     r
+}
+
+/// swapon with every swap type taken is EPERM (Linux alloc_swap_info:
+/// no type below MAX_SWAPFILES without SWP_USED), not EBUSY: small vfat
+/// swap files go on one by one until one is refused. MAX_SWAPFILES is
+/// hk's 32, Linux's 32 less the special entry types its config has.
+fn swapon_full() -> R {
+    const N: usize = 40;
+    const PAGES: usize = 8;
+    const EPERM: i64 = -1;
+    let b = Buf::new(PAGES * 4096)?;
+    let hdr = b.bytes(0, 4096);
+    hdr.fill(0);
+    hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+    hdr[1028..1032].copy_from_slice(&(PAGES as u32 - 1).to_ne_bytes());
+    hdr[4086..].copy_from_slice(b"SWAPSPACE2");
+    let mut paths = [[0u8; 64]; N];
+    let (mut made, mut on, mut refused) = (0, 0, 0);
+    let mut r = Ok(());
+    for (i, p) in paths.iter_mut().enumerate() {
+        let name = [b'S', b'W', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8];
+        path(&name, p);
+        r = put(&name, b.bytes(0, PAGES * 4096));
+        if r.is_err() {
+            break;
+        }
+        made += 1;
+        let s = swap_on(p);
+        if s != 0 {
+            refused = s;
+            break;
+        }
+        on += 1;
+    }
+    for p in &paths[..on] {
+        swap_off(p);
+    }
+    for p in &paths[..made] {
+        sys_unlink(p.as_ptr());
+    }
+    r?;
+    check(b"none on", on > 0, on as i64)?;
+    check(b"refused", refused == EPERM, refused)
 }
 
 /// A file whose entry has a size but no cluster (Linux

@@ -137,7 +137,7 @@ Missing:
 
 - `mm/swap/swapfile.rs` sys_swapon / sys_swapoff run whole under
   `SWAPON`: Linux reserves a type under swap_lock (alloc_swap_info,
-  SWP_USED; a full table is EPERM, hk EBUSY) and takes swapon_mutex
+  SWP_USED) and takes swapon_mutex
   only around enable and teardown, so swapoffs of different areas run
   try_to_unuse in parallel and the order is i_rwsem -> swapon_mutex.
 - No inode LRU (Linux inode_lru, prune_icache_sb): an inode put to
