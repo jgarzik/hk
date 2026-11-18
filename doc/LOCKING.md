@@ -2278,6 +2278,9 @@ pub struct Zone {
   I/O happens under the page lock, never under a spinlock.
 - `SWAP_INFO` (spin `RwLock`, read mostly): the devices; `SWAPON`
   (sleeping `Mutex`, Linux swapon_mutex) serializes swapon/swapoff.
+  swapon holds the swap file's (or device inode's) `i_rwsem` from the
+  extents' mapping to S_SWAPFILE (Linux swapon's inode_lock):
+  `SWAPON` -> `i_rwsem` -> page and buffer locks (->bmap's FAT reads).
   swapoff (`try_to_unuse`) clears SWP_WRITEOK, then walks `MMLIST`
   and faults the device's swap PTEs of each address space in, its
   mmap_lock held for reading.
@@ -2590,10 +2593,11 @@ layout in `doc/MEMORY.md`
   allocations take GFP_ATOMIC and never reclaim again; swap writeback
   runs with PF_MEMALLOC_NOIO (Linux memalloc_noio_save). The reverse map
   only tries the AnonVma chain lock under PF_MEMALLOC (Linux rmap_walk
-  with try_lock): an allocating task may hold it for writing. Direct
-  reclaim swaps only to block-device areas (`swap::get_swap_page`
-  skips swap files under PF_MEMALLOC), since a file's swap_rw may
-  need filesystem locks the allocating task holds. A page table
+  with try_lock): an allocating task may hold it for writing. Swap
+  I/O takes no filesystem lock: a swap file's slots are its blocks,
+  mapped at swapon (->bmap under its i_rwsem, Linux
+  generic_swapfile_activate) and written straight to its device, as
+  a partition's. A page table
   is allocated before the page_table_lock is taken (Linux
   pte_alloc_one), so it may reclaim; a fault whose table still cannot
   be allocated reclaims again and retries.
@@ -3126,8 +3130,8 @@ the FAT reads. It holds the cached runs, their id (Linux
 cache_valid_id) and the chain's first cluster, a copy of
 `VfatInodeData.start_cluster` that `set_start` updates after the
 data. A walk (fat_get_block under a page lock: reads, writeback,
-->write_begin; `swap_rw`, direct I/O, the write and truncate paths
-under `i_rwsem`) takes, in
+->write_begin; direct I/O, ->bmap at swapon, the write and truncate
+paths under `i_rwsem`) takes, in
 one hold, the first cluster, the id and its starting run, so the three
 always belong to one chain; it reads the FAT through the device cache
 with no lock held, then caches its run only if the id is unchanged. A

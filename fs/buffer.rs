@@ -2008,6 +2008,14 @@ pub fn block_truncate_page(
     r
 }
 
+/// The device block of file block `block` through `get_block`, without
+/// allocating; 0 for a hole or an error (Linux generic_block_bmap)
+pub fn generic_block_bmap(inode: &Inode, block: u64, get_block: GetBlock) -> u64 {
+    let tmp = BufferHead::new_map(buffer_size(inode));
+    let _ = get_block(inode, block, &tmp, false);
+    if tmp.mapped() { tmp.blocknr() } else { 0 }
+}
+
 /// Grow the file to `size` through an empty write there (Linux
 /// generic_cont_expand_simple): ->write_begin zeroes up to it and
 /// ->write_end raises i_size

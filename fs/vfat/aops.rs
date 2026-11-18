@@ -6,16 +6,12 @@
 //! to mmu_private are allocated and initialized, so a write past them
 //! first zeroes the gap through the cache (cont_write_begin).
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::block::BlockDevice;
-use crate::block::blkdev::{BioOp, bdev_rw_bytes};
 use crate::fs::buffer::{self, BufferHead};
 use crate::fs::inode::Inode;
 use crate::fs::mpage;
-use crate::mm::filemap::{self, AddressSpace, Aops, PAGE_SIZE};
+use crate::mm::filemap::{self, AddressSpace, Aops};
 use crate::util::error::KernelError;
 
 use super::fatent::{fat_alloc_clusters, fat_free_clusters};
@@ -113,6 +109,28 @@ pub fn fat_get_block(
     Ok(())
 }
 
+/// The file's get_block for bmap (Linux fat_get_block_bmap): no
+/// allocation, every cluster the file has mapped (fallocated ones too)
+fn fat_get_block_bmap(
+    inode: &Inode,
+    iblock: u64,
+    bh: &BufferHead,
+    create: bool,
+) -> Result<(), KernelError> {
+    debug_assert!(!create);
+    let sb = inode.superblock().ok_or(KernelError::Io)?;
+    let sb_data = get_sb_data(&sb)?;
+    let bits = inode.blkbits();
+    let mut max_blocks = (bh.size() >> bits) as u64;
+    let (bmap, mapped) = cache::fat_bmap(&sb_data, inode, iblock, false, true)?;
+    if bmap != 0 {
+        buffer::map_bh(bh, &sb, bmap)?;
+        max_blocks = max_blocks.min(mapped);
+    }
+    bh.set_size((max_blocks << bits) as usize);
+    Ok(())
+}
+
 /// A write to `to` that failed or came up short past the size (Linux
 /// fat_write_failed): the pages and clusters past the size go again.
 /// Direct I/O still in flight (a read past its lock) ends first, so no
@@ -132,35 +150,6 @@ pub fn fat_write_failed(inode: &Inode, to: u64) {
 /// that block on the disk never shows if the file grows again
 pub fn fat_block_truncate_page(inode: &Inode, from: u64) -> Result<(), KernelError> {
     buffer::block_truncate_page(inode, from, fat_get_block)
-}
-
-/// A page's device and the disk runs holding its bytes
-type PageRuns = (Arc<BlockDevice>, Vec<(u64, usize)>);
-
-/// The runs on disk holding the page's bytes within the file (one walk
-/// of its chain from the nearest cached position, `cache::extents`)
-fn page_runs(inode: &Inode, index: u64) -> Result<PageRuns, KernelError> {
-    let sb = inode.superblock().ok_or(KernelError::Io)?;
-    let sb_data = get_sb_data(&sb)?;
-    let pos = index * PAGE_SIZE as u64;
-    let len = inode.get_size().saturating_sub(pos).min(PAGE_SIZE as u64);
-    let runs = cache::extents(&sb_data, inode, pos, len as usize)?;
-    Ok((sb_data.bdev.clone(), runs))
-}
-
-/// Transfer `runs` between the disk and `page` (in order from its start)
-fn page_io(
-    bdev: &BlockDevice,
-    op: BioOp,
-    page: &mut [u8],
-    runs: &[(u64, usize)],
-) -> Result<(), KernelError> {
-    let mut at = 0;
-    for &(off, n) in runs {
-        bdev_rw_bytes(bdev, op, off, &mut page[at..at + n])?;
-        at += n;
-    }
-    Ok(())
 }
 
 impl Aops for VfatAops {
@@ -218,25 +207,10 @@ impl Aops for VfatAops {
         buffer::block_invalidate_folio(m, phys, offset, len);
     }
 
-    /// Swap files: the slot's clusters, read or written directly (Linux
-    /// generic_swapfile_activate maps the file's blocks)
-    fn swap_rw(
-        &self,
-        inode: &Inode,
-        index: u64,
-        buf: &mut [u8],
-        write: bool,
-    ) -> Result<(), KernelError> {
-        let (bdev, runs) = page_runs(inode, index)?;
-        // A slot is a whole page of the file (swapon checks the header
-        // against the size); never part of one
-        if runs.iter().map(|r| r.1).sum::<usize>() != PAGE_SIZE {
-            return Err(KernelError::Io);
-        }
-        if write {
-            return page_io(&bdev, BioOp::Write, buf, &runs);
-        }
-        buf.fill(0);
-        page_io(&bdev, BioOp::Read, buf, &runs)
+    /// Linux _fat_bmap: generic_block_bmap over all the file's
+    /// clusters (fat_get_block_bmap); the caller's i_rwsem keeps the
+    /// chain (Linux takes truncate_lock)
+    fn bmap(&self, inode: &Inode, block: u64) -> Result<u64, KernelError> {
+        Ok(buffer::generic_block_bmap(inode, block, fat_get_block_bmap))
     }
 }

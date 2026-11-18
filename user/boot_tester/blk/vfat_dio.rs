@@ -13,11 +13,12 @@
 //! unit starts with "HKD6TAG", a kind byte and its index.
 
 use crate::harness::{R, check, report_r};
-use crate::helpers::{BlkDev, find_blkdev};
+use crate::helpers::{BlkDev, find_blkdev, proc_kb, swap_off, swap_on};
 use hk_syscall::{
-    MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Stat, sys_close,
-    sys_fallocate, sys_fstat, sys_fsync, sys_ftruncate, sys_mkdir, sys_mmap, sys_mount, sys_munmap,
-    sys_open, sys_pread64, sys_pwrite64, sys_rmdir, sys_umount2, sys_unlink,
+    MADV_COLD, MADV_PAGEOUT, MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ,
+    PROT_WRITE, Stat, sys_close, sys_fallocate, sys_fstat, sys_fsync, sys_ftruncate, sys_madvise,
+    sys_mkdir, sys_mmap, sys_mount, sys_munmap, sys_open, sys_pread64, sys_pwrite64, sys_rmdir,
+    sys_umount2, sys_unlink,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -54,6 +55,7 @@ pub fn run_tests() {
     report_r(b"VFAT_DIO_EOF_TAIL", eof_tail());
     report_r(b"VFAT_WRITE_SHORT", write_short());
     report_r(b"VFAT_PARTIAL_WB", partial_wb(&p1));
+    report_r(b"VFAT_SWAPFILE_IO", swapfile_io());
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
 }
@@ -489,6 +491,65 @@ fn write_short() -> R {
     check(b"short write", w == 4096, w)?;
     check(b"size", after.1 == 8192, after.1)?;
     check(b"blocks kept", after.0 == 128, after.0)
+}
+
+/// A vfat file is a swap area (Linux generic_swapfile_activate over
+/// fat's ->bmap: its page-aligned runs of blocks, written straight to
+/// the disk): anonymous pages paged out to it come back intact, before
+/// and after swapoff
+fn swapfile_io() -> R {
+    const PAGES: usize = 256;
+    const ANON: usize = 64;
+    let b = Buf::new(PAGES * 4096)?;
+    let hdr = b.bytes(0, 4096);
+    hdr.fill(0);
+    // union swap_header: info.version at 1024, info.last_page at 1028
+    hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+    hdr[1028..1032].copy_from_slice(&(PAGES as u32 - 1).to_ne_bytes());
+    hdr[4086..].copy_from_slice(b"SWAPSPACE2");
+    put(b"SWAP.BIN", b.bytes(0, PAGES * 4096))?;
+    let mut p = [0u8; 64];
+    path(b"SWAP.BIN", &mut p);
+    let on = swap_on(&p);
+    let r = (|| {
+        check(b"swapon", on == 0, on)?;
+        let a = Buf::new(ANON * 4096)?;
+        let word = |i: usize| (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let words = |a: &Buf| {
+            // SAFETY: the mapping holds ANON pages of u64s, page aligned
+            unsafe { core::slice::from_raw_parts_mut(a.ptr(0) as *mut u64, ANON * 512) }
+        };
+        for (i, w) in words(&a).iter_mut().enumerate() {
+            *w = word(i);
+        }
+        sys_madvise(a.at, (ANON * 4096) as u64, MADV_COLD);
+        let m = sys_madvise(a.at, (ANON * 4096) as u64, MADV_PAGEOUT);
+        check(b"pageout", m == 0, m)?;
+        let vs = proc_kb(b"/proc/self/status ", b"VmSwap:");
+        check(b"swapped", vs > 0, vs)?;
+        let bad = words(&a)
+            .iter()
+            .enumerate()
+            .position(|(i, &w)| w != word(i));
+        check(b"data", bad.is_none(), bad.map_or(0, |i| i as i64))?;
+        sys_madvise(a.at, (ANON * 4096) as u64, MADV_PAGEOUT);
+        let off = swap_off(&p);
+        check(b"swapoff", off == 0, off)?;
+        let bad = words(&a)
+            .iter()
+            .enumerate()
+            .position(|(i, &w)| w != word(i));
+        check(
+            b"data after swapoff",
+            bad.is_none(),
+            bad.map_or(0, |i| i as i64),
+        )
+    })();
+    if on == 0 && r.is_err() {
+        swap_off(&p);
+    }
+    sys_unlink(p.as_ptr());
+    r
 }
 
 /// Writeback writes only a page's dirty blocks (Linux buffer heads,

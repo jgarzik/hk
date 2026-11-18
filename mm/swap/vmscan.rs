@@ -170,7 +170,7 @@ pub fn try_to_free_pages(nr: usize) -> usize {
     }
     let nr = nr - cached;
     let (total, free) = super::swapfile::swap_totals();
-    if total == 0 || free == 0 || !super::swapfile::bdev_swap_active() {
+    if total == 0 || free == 0 {
         return cached;
     }
     lru::lru_add_drain_all();

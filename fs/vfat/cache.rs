@@ -20,7 +20,6 @@
 //! cache_valid_id); a walk caches its run only if the id is unchanged,
 //! so nothing walked on a chain being cut outlives the cut.
 
-use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::fs::inode::Inode;
@@ -28,7 +27,7 @@ use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 
 use super::fatent::{FatEnt, fat_ent_read};
-use super::{VfatInode, VfatSbData, cluster_to_offset, get_inode_data, is_end_of_chain, with_vi};
+use super::{VfatInode, VfatSbData, get_inode_data, is_end_of_chain, with_vi};
 
 /// Runs cached per file (Linux FAT_MAX_CACHE)
 const FAT_MAX_CACHE: usize = 8;
@@ -380,45 +379,6 @@ pub fn fat_bmap(
 /// fat_cache_inval_inode)
 pub fn inval(inode: &Inode) -> Result<(), KernelError> {
     with_vi(inode, |vi| vi.cache.lock().inval())
-}
-
-/// The device extents (byte offset, length) holding bytes [pos, pos +
-/// len) of the file, contiguous clusters merged (Linux fat_bmap through
-/// fat_get_cluster): one walk from the nearest cached run; short where
-/// the chain ends
-pub fn extents(
-    sb: &VfatSbData,
-    inode: &Inode,
-    pos: u64,
-    len: usize,
-) -> Result<Vec<(u64, usize)>, KernelError> {
-    let mut out: Vec<(u64, usize)> = Vec::new();
-    if len == 0 {
-        return Ok(out);
-    }
-    let cs = u64::from(sb.cluster_size);
-    let first = u32::try_from(pos / cs).map_err(|_| KernelError::Io)?;
-    with_walk(sb, inode, first, |w| {
-        let (mut at, end) = (pos, pos + len as u64);
-        // Short if the chain ends before the first cluster
-        let mut more = w.f == first;
-        while more {
-            // The cluster reached holds byte `at`
-            let off = cluster_to_offset(sb, w.d) + at % cs;
-            let n = (cs - at % cs).min(end - at) as usize;
-            match out.last_mut() {
-                Some((o, l)) if *o + *l as u64 == off => *l += n,
-                _ => {
-                    out.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
-                    out.push((off, n));
-                }
-            }
-            at += n as u64;
-            more = at < end && w.next()?;
-        }
-        Ok(())
-    })?;
-    Ok(out)
 }
 
 /// The cache of a chain starting at `start`, for `VfatInode`

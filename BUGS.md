@@ -153,10 +153,7 @@ Missing:
   (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into (see the heap section) are not
-  on the reverse map (never swapped). Swap
-  files go through their filesystem's swap_rw,
-  a page at a time (walking the cluster chain each time; Linux maps
-  the extents once at swapon). Page faults, swapoff, page-cache, heap
+  on the reverse map (never swapped). Page faults, swapoff, page-cache, heap
   and pipe allocations that may sleep reclaim directly; atomic heap
   allocations never do, so with anonymous memory filling RAM they fail
   at the low watermark until kswapd (J) keeps free memory above it.
