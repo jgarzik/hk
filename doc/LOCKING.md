@@ -2407,6 +2407,8 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
 No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
 info, wait)` runs `func(info)` on other CPUs from their call-function
 IPI (x86 vector 0xfc, arm64 SGI 1); `on_each_cpu` adds this CPU;
+`on_each_cpu_cond` calls only the CPUs its condition picks, run on the
+caller for each CPU first (Linux on_each_cpu_cond);
 `smp_send_reschedule` (x86 0xfd, arm64 SGI 0) makes a remote CPU
 reschedule (`resched_curr` after queueing a task on its run queue,
 `kick_process`); its handler flags the running task NEED_RESCHED.
@@ -2734,10 +2736,11 @@ clean_bdev_aliases: page lock -> buffer lock.)
 - Per-CPU LRU of looked-up buffers (`lru::BH_LRUS`, an `IrqSpinlock`
   per CPU, leaf; Linux bh_lrus under local_irq_disable): each slot holds
   a reference; taken by its CPU's lookups (the lock replaces the
-  interrupt masking) and by its CPU's call of `invalidate_bh_lrus`
-  (a cross-CPU call on every CPU, interrupts off, as Linux
-  on_each_cpu_cond), which kill_bdev and invalidate_bdev make first,
-  so the pages' buffers can go.
+  interrupt masking), by any CPU's `invalidate_bh_lrus` to see whether
+  it holds a buffer (`has_bh_in_lru`; Linux reads it unlocked) and by
+  its CPU's call of it (a cross-CPU call on those CPUs, interrupts off,
+  Linux on_each_cpu_cond), which kill_bdev and invalidate_bdev make
+  first, so the pages' buffers can go.
 - `MappingMetadataBhs.lock` (spin, thread context; Linux mmb->lock):
   the list of a mapping's metadata buffers (`b_assoc_buffers`, `b_mmb`)
   and a sync's private list (`mmb_sync`); a buffer's `b_mmb` is read

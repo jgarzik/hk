@@ -2209,10 +2209,17 @@ mod lru {
         }
     }
 
-    /// Empty every CPU's LRU (Linux invalidate_bh_lrus: on_each_cpu_cond
-    /// over has_bh_in_lru; a CPU with an empty LRU does nothing)
+    /// Whether `cpu`'s LRU holds a buffer (Linux has_bh_in_lru): read
+    /// under that CPU's lock, stale once it is dropped, as Linux's
+    /// unlocked read
+    fn has_bh_in_lru(cpu: u32, _: usize) -> bool {
+        BH_LRUS.get(cpu).lock().bhs.iter().any(|p| !p.is_null())
+    }
+
+    /// Empty every CPU's LRU (Linux invalidate_bh_lrus): a cross-CPU
+    /// call only on those holding a buffer (on_each_cpu_cond)
     pub fn invalidate_bh_lrus() {
-        crate::smp::on_each_cpu(invalidate_cpu, 0);
+        crate::smp::on_each_cpu_cond(has_bh_in_lru, invalidate_cpu, 0);
     }
 }
 
