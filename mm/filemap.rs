@@ -727,6 +727,11 @@ pub fn write_and_wait_range(inode: &Inode, start: u64, end: u64) -> Result<(), K
     write_range(inode, start / p, end / p)
 }
 
+/// Some page of `m` has mark `mark` (Linux mapping_tagged)
+pub fn mapping_tagged(m: &AddressSpace, mark: usize) -> bool {
+    m.i_pages.lock().marked(mark)
+}
+
 /// A page is cached for bytes [start, end] (Linux
 /// filemap_range_has_page)
 pub fn range_has_page(m: &AddressSpace, start: u64, end: u64) -> bool {

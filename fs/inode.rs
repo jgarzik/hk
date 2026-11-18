@@ -592,14 +592,37 @@ pub mod iflags {
     pub const I_LINKABLE: u32 = 1 << 16;
 }
 
-/// Bits of `Inode.i_state` (Linux i_state), each set under `i_lock`
+/// Bits of `Inode.i_state` (Linux i_state, the same values), each set
+/// and cleared under `i_lock`
 pub mod istate {
+    /// Its writeback is running (Linux I_SYNC): set by the writer, which
+    /// pins the inode, cleared with a wakeup of its waiters
+    /// (`fs_writeback`)
+    pub const I_SYNC: u32 = 1 << 1;
+    /// Metadata fdatasync may skip is dirty: times (Linux I_DIRTY_SYNC)
+    pub const I_DIRTY_SYNC: u32 = 1 << 4;
+    /// Metadata the data needs is dirty: size, clusters (Linux
+    /// I_DIRTY_DATASYNC)
+    pub const I_DIRTY_DATASYNC: u32 = 1 << 5;
+    /// A page of its cache is dirty (Linux I_DIRTY_PAGES)
+    pub const I_DIRTY_PAGES: u32 = 1 << 6;
     /// The last reference went and the inode is being written back
     /// before its eviction (Linux I_WILL_FREE)
-    pub const I_WILL_FREE: u32 = 1 << 4;
+    pub const I_WILL_FREE: u32 = 1 << 7;
     /// The last reference went and the inode is being evicted and freed
     /// (Linux I_FREEING)
-    pub const I_FREEING: u32 = 1 << 5;
+    pub const I_FREEING: u32 = 1 << 8;
+    /// On a writeback pass's `b_io` or `b_more_io` (Linux
+    /// I_SYNC_QUEUED): a dirtying leaves it there for the pass to
+    /// requeue
+    pub const I_SYNC_QUEUED: u32 = 1 << 17;
+    /// Linux I_DIRTY_INODE
+    pub const I_DIRTY_INODE: u32 = I_DIRTY_SYNC | I_DIRTY_DATASYNC;
+    /// Linux I_DIRTY
+    pub const I_DIRTY: u32 = I_DIRTY_INODE | I_DIRTY_PAGES;
+    /// Linux I_DIRTY_ALL: I_DIRTY, there being no lazytime
+    /// (I_DIRTY_TIME)
+    pub const I_DIRTY_ALL: u32 = I_DIRTY;
 }
 
 use istate::{I_FREEING, I_WILL_FREE};
@@ -753,9 +776,7 @@ unsafe fn iput_final(p: NonNull<Inode>, l: MutexGuard<'_, ILocked>) {
     } else {
         i.set_state(&l, I_WILL_FREE);
         core::mem::drop(l);
-        if i.i_dirty.load(Ordering::Acquire) {
-            let _ = super::fs_writeback::write_inode_now(i);
-        }
+        let _ = super::fs_writeback::write_inode_now(i);
         let l = i.i_lock.lock();
         i.i_state
             .store((i.state() & !I_WILL_FREE) | I_FREEING, Ordering::Release);
@@ -795,6 +816,25 @@ impl<A: list::Adapter<Item = Inode>> InodeList<A> {
 
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
+    }
+
+    /// Append `inode`, borrowed with no reference (Linux list_move_tail
+    /// of an inode found on a list under its lock)
+    ///
+    /// # Safety
+    /// `inode` is unlinked here, and its eviction has not yet unlinked
+    /// it under this list's lock, which the caller holds (a reference is
+    /// held, or it is not I_FREEING under its `i_lock`).
+    pub unsafe fn push_back_unref(&mut self, inode: &Inode) {
+        // SAFETY: live and unlinked (the caller)
+        unsafe { self.list.push_back(core::ptr::from_ref(inode)) };
+    }
+
+    /// The last inode, live while the list is borrowed
+    pub fn back(&self) -> Option<&Inode> {
+        // SAFETY: linked, so live (type invariant) while the list's lock
+        // (the borrow) is held
+        self.list.back().map(|p| unsafe { &*p })
     }
 
     /// Append `inode` (Linux list_add_tail); panics if it is on a list
@@ -988,23 +1028,17 @@ pub struct Inode {
     /// The inotify watches on it (Linux i_fsnotify_marks)
     pub fsnotify: ManuallyDrop<crate::io::inotify::Marks>,
 
-    /// Queued on its device's writeback lists (fs_writeback): set by
-    /// `mark_inode_dirty_pages` and `mark_inode_dirty`, cleared under
-    /// the list lock by the pass that takes it off `b_io`
-    pub(crate) i_dirty: core::sync::atomic::AtomicBool,
-    /// When it went from clean to dirty (`i_dirty` set), monotonic ns
-    /// (Linux dirtied_when): stored before it is queued, read under the
-    /// list lock by the periodic writeback (vm.dirty_expire_centisecs)
+    /// When it went from clean to dirty, monotonic ns (Linux
+    /// dirtied_when): written under its wb's list_lock and `i_lock` as
+    /// it is queued on `b_dirty` or requeued, read under the list lock
+    /// by a pass (vm.dirty_expire_centisecs)
     pub(crate) dirtied_when: AtomicU64,
-    /// Its metadata awaits its filesystem's `write_inode` (Linux
-    /// I_DIRTY_SYNC | I_DIRTY_DATASYNC): set by `mark_inode_dirty`,
-    /// cleared by the writer just before it calls `write_inode`
-    pub(crate) i_dirty_inode: core::sync::atomic::AtomicBool,
-    /// On its device's `b_dirty` or `b_io` (Linux i_io_list, under the
+    /// On its device's `b_dirty`, `b_io` or `b_more_io` (Linux
+    /// i_io_list, under the
     /// wb's list_lock), which hold no reference to it: its eviction takes
     /// it off (Linux evict's inode_io_list_del)
     pub(crate) i_io_list: list::Link,
-    /// Which of the two (`fs_writeback::ON_*`), changed with the link
+    /// Which of them (`fs_writeback::ON_*`), changed with the link
     /// under the wb's list_lock
     pub(crate) i_io_on: core::sync::atomic::AtomicU8,
     /// The writeback state it was queued on (Linux inode->i_wb), set
@@ -1173,8 +1207,30 @@ impl Inode {
     }
 
     /// Set `bits` of `i_state`, under `i_lock` (`_l`)
-    fn set_state(&self, _l: &ILocked, bits: u32) {
+    pub(super) fn set_state(&self, _l: &ILocked, bits: u32) {
         self.i_state.fetch_or(bits, Ordering::Release);
+    }
+
+    /// Clear `bits` of `i_state`, under `i_lock` (`_l`)
+    pub(super) fn clear_state(&self, _l: &ILocked, bits: u32) {
+        self.i_state.fetch_and(!bits, Ordering::Release);
+    }
+
+    /// The address of `i_state`, keying its waiters' queue (Linux
+    /// inode_bit_waitqueue)
+    pub(super) fn state_addr(&self) -> usize {
+        core::ptr::from_ref(&self.i_state) as usize
+    }
+
+    /// A reference to an inode borrowed with none, under its `i_lock`
+    /// (`_l`) with neither I_FREEING nor I_WILL_FREE set, so its count
+    /// is above zero (Linux __iget: those bits are set in the hold that
+    /// drops it to zero)
+    pub(super) fn __iget(&self, _l: &ILocked) -> InodeRef {
+        debug_assert!(self.state() & (I_FREEING | I_WILL_FREE) == 0);
+        self.i_count.fetch_add(1, Ordering::Relaxed);
+        // INVARIANT: the reference just taken
+        InodeRef(NonNull::from(self))
     }
 
     /// What a new inode starts with (Linux new_inode's caller filling
@@ -1299,9 +1355,7 @@ impl Inode {
             i_pipe: ManuallyDrop::new(Mutex::new(None)),
             i_data: ManuallyDrop::new(crate::mm::filemap::AddressSpace::new()),
             fsnotify: ManuallyDrop::new(crate::io::inotify::Marks::default()),
-            i_dirty: core::sync::atomic::AtomicBool::new(false),
             dirtied_when: AtomicU64::new(0),
-            i_dirty_inode: core::sync::atomic::AtomicBool::new(false),
             i_io_list: list::Link::new(),
             i_io_on: core::sync::atomic::AtomicU8::new(0),
             i_wb: ManuallyDrop::new(spin::Once::new()),
@@ -1942,6 +1996,12 @@ unsafe fn evict(p: NonNull<Inode>) {
         // SAFETY: live until the free queued below
         let i = unsafe { p.as_ref() };
         super::fs_writeback::inode_io_list_del(i);
+        // Linux evict: inode_wait_for_writeback (a writer holds a
+        // reference here, so none is left to wait for)
+        drop(super::fs_writeback::inode_wait_for_writeback(
+            i,
+            i.i_lock.lock(),
+        ));
         sb_list_del(i);
         super::icache::evict(i);
     }
@@ -2052,9 +2112,7 @@ const _: () = {
         i_pipe,
         i_data,
         fsnotify,
-        i_dirty,
         dirtied_when,
-        i_dirty_inode,
         i_io_list,
         i_io_on,
         i_wb,

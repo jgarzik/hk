@@ -2180,16 +2180,16 @@ impl InodeOps for VfatInodeOps {
     }
 
     /// Linux fat_update_time: the times truncated to FAT's
-    /// (fat_truncate_time), the inode marked dirty (__mark_inode_dirty
-    /// with I_DIRTY_SYNC: its entry written back later); nothing for the
-    /// root
+    /// (fat_truncate_time), the inode marked dirty for times only
+    /// (__mark_inode_dirty(inode_time_dirty_flag): I_DIRTY_SYNC, there
+    /// being no lazytime; fdatasync skips it); nothing for the root
     fn update_time(&self, inode: &Inode, what: TimeUpdate, _now: Timespec) {
         if is_root(inode) {
             return;
         }
         let atime = what == TimeUpdate::Atime;
         fat_truncate_time(inode, None, atime, !atime);
-        super::fs_writeback::mark_inode_dirty(inode);
+        super::fs_writeback::mark_inode_dirty_sync(inode);
     }
 
     /// Linux fat_setattr's end: atime to the day, mtime to 2 s with

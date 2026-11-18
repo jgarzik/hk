@@ -3,7 +3,7 @@
 //!
 //! Each disk has a [`BdiWriteback`] (Linux bdi_writeback): the dirty
 //! inodes of the filesystems on it and of its block devices' caches
-//! (`b_dirty`, `b_io`: `fs_writeback`), and a delayed work item on
+//! (`b_dirty`, `b_io`, `b_more_io`: `fs_writeback`), and a delayed work item on
 //! `BDI_WORKQUEUE` that writes them back about every 5 seconds (Linux
 //! dirty_writeback_centisecs 500): what became dirty over 30 seconds
 //! before (dirty_expire_centisecs 3000; everything past the background
@@ -65,7 +65,7 @@ pub struct BdiWriteback {
 }
 
 /// A disk's dirty inodes, linked through `Inode.i_io_list`, holding no
-/// reference to them (Linux wb->b_dirty, b_io): an inode's last
+/// reference to them (Linux wb->b_dirty, b_io, b_more_io): an inode's last
 /// reference evicts it whether dirty or not, its eviction unlinking it
 pub(crate) struct WbLists {
     /// Dirtied and not yet taken by a pass, oldest first (Linux b_dirty,
@@ -73,6 +73,9 @@ pub(crate) struct WbLists {
     pub b_dirty: InodeList<IoListA>,
     /// Taken by the running pass, to write in order (Linux b_io)
     pub b_io: InodeList<IoListA>,
+    /// Taken by a pass while another writer had them (I_SYNC): the next
+    /// pass takes them first (Linux b_more_io)
+    pub b_more_io: InodeList<IoListA>,
 }
 
 impl BdiWriteback {
@@ -86,12 +89,13 @@ impl BdiWriteback {
         })));
         Self {
             dev_id,
-            // SAFETY: an inode's eviction takes it off either list under
+            // SAFETY: an inode's eviction takes it off any list under
             // `list_lock` (`fs_writeback::inode_io_list_del`)
             list_lock: Mutex::new(unsafe {
                 WbLists {
                     b_dirty: InodeList::new(),
                     b_io: InodeList::new(),
+                    b_more_io: InodeList::new(),
                 }
             }),
             pass: crate::sync::Mutex::new(()),
