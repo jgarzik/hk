@@ -93,9 +93,6 @@ pub struct NetNamespace {
     /// Ping sockets by echo identifier
     pub ping: crate::net::ping::PingNet,
 
-    /// Raw sockets by protocol
-    pub raw: crate::net::raw::RawTable,
-
     /// AF_UNIX sockets and abstract names
     pub unix: crate::net::unix::UnixTable,
 
@@ -210,7 +207,6 @@ impl NetNamespace {
             frags: Default::default(),
             icmp: Default::default(),
             ping: Default::default(),
-            raw: Default::default(),
             unix: Default::default(),
             packet: Default::default(),
             ip_id_key: [

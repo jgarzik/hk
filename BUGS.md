@@ -98,6 +98,12 @@ so memory pressure does not clamp windows), no orphan count limit
 (tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
+
+A socket on RCU hash chains (ping, raw) leaves "sockets: used" a grace
+period after its close: the chain's `Arc` is released by
+`RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
+drops the count at sk_free (the last reference, at unhash) and defers
+only the memory (SOCK_RCU_FREE).
 No SYN cookies (a full listener drops SYNs). Echo and timestamp
 replies skip the ICMP rate limits (Linux icmp_reply applies them when
 icmp_ratemask names the reply type, which the default does not).
@@ -818,7 +824,7 @@ Phase A2 (net) remaining:
   GFP_ATOMIC.
 - ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
   with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
-- Raw, UDP, packet and netlink socket tables still allocate under their
+- UDP, packet and netlink socket tables still allocate under their
   spin locks: hslot/RCU tables, sock_reuseport groups (GFP_ATOMIC under
   reuseport_lock), packet RCU sklist, netlink RCU portid table.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`

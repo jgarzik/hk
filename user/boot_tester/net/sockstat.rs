@@ -189,6 +189,9 @@ fn counts() {
         Stat::read().map_or(-1, |s| s.val(b"RAW:", b"inuse")),
         0,
     );
+    // Freed after a grace period (Linux SOCK_RCU_FREE)
+    let s = settle(|s| used(s) == base).unwrap_or_else(Stat::empty);
+    t.eq(b"raw closed used", used(&s) - base, 0);
 
     // TCP: listener, connection, accepted; the client closes first
     let (l, p) = listener(1);
