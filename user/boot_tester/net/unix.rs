@@ -10,10 +10,10 @@ use hk_syscall::{
     SHUT_RD, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK,
     SOCK_STREAM, Stat, sys_accept, sys_bind, sys_chmod, sys_connect, sys_epoll_create1,
     sys_epoll_ctl, sys_epoll_wait, sys_exit, sys_fcntl, sys_fork, sys_getpeername, sys_getpid,
-    sys_getsockname, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe, sys_read, sys_recvfrom,
-    sys_rt_sigaction, sys_sendmsg, sys_sendto, sys_setgroups, sys_setresgid, sys_setresuid,
-    sys_shutdown, sys_socket, sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4,
-    sys_write,
+    sys_getsockname, sys_ioctl, sys_listen, sys_mkdir, sys_mknod, sys_mount, sys_open, sys_pipe,
+    sys_read, sys_recvfrom, sys_rmdir, sys_rt_sigaction, sys_sendmsg, sys_sendto, sys_setgroups,
+    sys_setresgid, sys_setresuid, sys_shutdown, sys_socket, sys_socketpair, sys_stat, sys_umask,
+    sys_umount2, sys_unlink, sys_wait4, sys_write,
 };
 
 use crate::harness::T;
@@ -37,6 +37,7 @@ const POLLRDHUP: i16 = 0x2000;
 
 const ENOENT: i64 = -2;
 const ENXIO: i64 = -6;
+const EBUSY: i64 = -16;
 const ERANGE: i64 = -34;
 const ENODATA: i64 = -61;
 const EPROTOTYPE: i64 = -91;
@@ -48,6 +49,7 @@ pub fn run_tests() {
     crate::helpers::println(b"=== AF_UNIX Tests ===");
     test_create();
     test_fs_bind();
+    test_fs_bind_busy();
     test_fs_connect_errors();
     test_perm();
     test_abstract();
@@ -398,6 +400,35 @@ fn test_fs_bind() {
     for f in [s, s2, c, acc, c2, s3, s4] {
         close(f);
     }
+    t.done();
+}
+
+/// A socket bound to a filesystem name keeps that filesystem busy
+/// (Linux unix_sock.path holds the mount), as does a socket accepted
+/// from it (unix_stream_connect's path_get), until each is closed;
+/// unlinking the name does not free it
+fn test_fs_bind_busy() {
+    let mut t = T::new(b"UNIX_FS_BIND_BUSY");
+    let mp = b"/tmp/ux_mnt\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    let r = sys_mount(b"none\0".as_ptr(), mp.as_ptr(), b"tmpfs\0".as_ptr(), 0, 0);
+    t.eq(b"mount", r, 0);
+    let p: &[u8] = b"/tmp/ux_mnt/s";
+    let a = sun_path(p);
+    let s = listener(SOCK_STREAM, &a, 1);
+    t.ok(b"bind", s >= 0, s as i64);
+    t.eq(b"umount bound EBUSY", sys_umount2(mp.as_ptr(), 0), EBUSY);
+    let c = ux(SOCK_STREAM);
+    t.eq(b"connect", uconnect(c, &a), 0);
+    let acc = sys_accept(s, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+    t.ok(b"accept", acc >= 0, acc as i64);
+    unlink(p);
+    close(s);
+    t.eq(b"umount accepted EBUSY", sys_umount2(mp.as_ptr(), 0), EBUSY);
+    close(acc);
+    close(c);
+    t.eq(b"umount", sys_umount2(mp.as_ptr(), 0), 0);
+    sys_rmdir(mp.as_ptr());
     t.done();
 }
 

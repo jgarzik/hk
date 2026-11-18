@@ -153,6 +153,8 @@ fn try_connect(
     newsk.sk.set_flag(sf::PASSCRED, pass);
     newsk.sk.set_flag(sf::PASSSEC, other.sk.flag(sf::PASSSEC));
     *newsk.addr.write() = other.addr();
+    // Linux unix_stream_connect: path_get(&otheru->path)
+    *newsk.path.lock() = other.path.lock().clone();
     let pc = other.peercred.lock().clone();
     *s.peercred.lock() = pc;
     s.set_state(ESTABLISHED);

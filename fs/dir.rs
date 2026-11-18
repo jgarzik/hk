@@ -264,15 +264,17 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32, dev: u64) -
 /// Create the socket inode an AF_UNIX bind names (Linux unix_bind_bsd:
 /// filename_create at AT_FDCWD + vfs_mknod(S_IFSOCK)): `perm` is
 /// reduced by the umask, DAC on the parent applies, an existing name is
-/// EEXIST; returns the new dentry
-pub fn mknod_sock(path: &[u8], perm: u16) -> Result<super::DentryRef, KernelError> {
+/// EEXIST; returns the new dentry with its mount (Linux unix_bind_bsd's
+/// u->path)
+pub fn mknod_sock(path: &[u8], perm: u16) -> Result<super::path_ref::Path, KernelError> {
     let p = filename_create(AT_FDCWD, path, false)?;
-    create_entry(&p, |dir, c| {
+    let d = create_entry(&p, |dir, c| {
         let perm = dac::create_mode(c, dir, perm);
         dir.i_op
             .mknod(dir, &p.name, InodeMode::socket(perm), DevId::from_user(0))
     })
-    .map_err(no_op_eperm)
+    .map_err(no_op_eperm)?;
+    Ok(super::path_ref::Path::new(p.mnt, d))
 }
 
 /// Remove the entry `mknod_sock` created when the bind then failed
