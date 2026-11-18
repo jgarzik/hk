@@ -4582,6 +4582,15 @@ so it never wakes readers itself: it sets `WAKE_PENDING`, and the
 scheduler tick (no locks held) wakes them (Linux defers the klogd
 wakeup through irq_work).
 
+**Rate limits** (`util/ratelimit.rs`, Linux lib/ratelimit.c): a
+`RatelimitState` (a caller's static: `buffer_io_error`,
+`__find_get_block_slow`'s report) keeps its interval's start under an
+`IrqSpinlock` leaf, any context (bio completions call it in hardirq),
+only tried: a caller that finds it held decides from the burst left
+(an atomic, as Linux's rs_n_left) without it. The suppressed-count
+report is printed after the lock is dropped (Linux printk_deferred
+under it), so OUTPUT_LOCK never nests under it.
+
 **Why IRQ-Safe:**
 
 All three locks use `IrqSpinlock` because printk can be called from:

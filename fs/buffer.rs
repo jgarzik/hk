@@ -573,11 +573,21 @@ fn bio_endio_bh<'a>(bio: Box<Bio>) -> (&'a BufferHead, bool) {
     (unsafe { &*p }, ok)
 }
 
-/// "Buffer I/O error on dev ..." (Linux buffer_io_error), from a bio's
-/// completion: the device named by its number, the page's mapping's
-/// (a block device's inode) read under an RCU read guard, as taking a
-/// reference on the device there could drop its last
+/// "Buffer I/O error on dev ..." (Linux buffer_io_error), rate
+/// limited (its printk_ratelimited's state), from a bio's completion: the device
+/// named by its number, the page's mapping's (a block device's inode)
+/// read under an RCU read guard, as taking a reference on the device
+/// there could drop its last. (Linux skips it for a BH_Quiet buffer,
+/// set from a BIO_QUIET bio: no hk driver marks a bio quiet.)
 fn buffer_io_error(bh: &BufferHead, msg: &str) {
+    use crate::util::ratelimit::{
+        DEFAULT_RATELIMIT_BURST, DEFAULT_RATELIMIT_INTERVAL, RatelimitState,
+    };
+    static RS: RatelimitState =
+        RatelimitState::new(DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST);
+    if !RS.ratelimit("buffer_io_error") {
+        return;
+    }
     let dev = {
         let g = crate::sync::rcu::read_lock();
         filemap::folio_mapping(bh.folio(), &g).and_then(|m| m.host_rdev())
@@ -1011,7 +1021,10 @@ fn getblk_slow(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> Result<BhRef
 }
 
 /// Look `block` up in the device's cache (Linux __find_get_block_slow):
-/// `atomic` under `i_private_lock` instead of the page lock
+/// `atomic` under `i_private_lock` instead of the page lock. Buffers of
+/// another size match by number as in Linux (a block size change drops
+/// the cache, under its holder's claim); a page whose buffers are all
+/// mapped yet miss the block is reported, rate limited (Linux).
 fn find_get_block_slow(bdev: &BlockDevice, block: u64, atomic: bool) -> Option<BhRef> {
     let inode = &bdev.bd_inode;
     let m = &inode.i_data;
@@ -1023,9 +1036,7 @@ fn find_get_block_slow(bdev: &BlockDevice, block: u64, atomic: bool) -> Option<B
             crate::mm::page::lock_page(phys);
         }
         // SAFETY: under the page lock or `i_private_lock`
-        let r = unsafe { folio_buffers(phys) }
-            .and_then(|h| ring(h).find(|bh| bh.mapped() && bh.blocknr() == block))
-            .map(get_bh);
+        let r = unsafe { folio_buffers(phys) }.and_then(|h| ring_find(bdev, inode, h, block));
         if !atomic {
             crate::mm::page::unlock_page(phys);
         }
@@ -1033,6 +1044,38 @@ fn find_get_block_slow(bdev: &BlockDevice, block: u64, atomic: bool) -> Option<B
     };
     filemap::put_page(phys);
     found
+}
+
+/// The mapped buffer of `block` in the ring at `head`, referenced
+/// (`find_get_block_slow`'s walk, under the page lock or
+/// `i_private_lock`)
+fn ring_find(bdev: &BlockDevice, inode: &Inode, head: &BufferHead, block: u64) -> Option<BhRef> {
+    /// Linux last_warned: once a second, no suppressed-count report
+    static LAST_WARNED: crate::util::ratelimit::RatelimitState =
+        crate::util::ratelimit::RatelimitState::new(1000 / crate::task::percpu::TICK_MS, 1)
+            .msg_on_release();
+    let mut all_mapped = true;
+    for bh in ring(head) {
+        if !bh.mapped() {
+            all_mapped = false;
+        } else if bh.blocknr() == block {
+            return Some(get_bh(bh));
+        }
+    }
+    // Some buffers unmapped: races between file I/O on the device and
+    // getblk, dealt with elsewhere (Linux)
+    if all_mapped && LAST_WARNED.ratelimit("__find_get_block_slow") {
+        crate::printkln!(
+            "__find_get_block_slow() failed. block={}, b_blocknr={}, b_state={:#010x}, b_size={}, device {} blocksize: {}",
+            block,
+            head.blocknr(),
+            head.b_state.load(Ordering::Relaxed),
+            head.size(),
+            bdev.name,
+            inode.blocksize()
+        );
+    }
+    None
 }
 
 fn find_get_block_common(
