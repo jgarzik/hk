@@ -465,9 +465,10 @@ static RAW_TABLE: RawTable = RawTable {
     lock: Mutex::new(RawLocked(())),
 };
 
-/// Linux raw_hashfunc: hash_32 of the namespace mixed with the protocol
+/// Linux raw_hashfunc: hash_32 of the namespace's random mix and the
+/// protocol
 fn slot(net: &NetNamespace, proto: u16) -> &'static RcuHList<RawNode, RawLocked> {
-    let h = (net.id as u32 ^ u32::from(proto)).wrapping_mul(0x61C8_8647) >> (32 - RAW_HTABLE_LOG);
+    let h = (net.hash_mix ^ u32::from(proto)).wrapping_mul(0x61C8_8647) >> (32 - RAW_HTABLE_LOG);
     &RAW_TABLE.hash[h as usize]
 }
 

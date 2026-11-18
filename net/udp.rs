@@ -597,9 +597,9 @@ fn table() -> &'static [NullsHead<UdpHash>] {
     UDP_TABLE.get().expect("udp table not initialized")
 }
 
-/// Linux udp_hashfn: the port plus the namespace's mix, masked
+/// Linux udp_hashfn: the port plus the namespace's random mix, masked
 fn slot_index(net: &crate::net::NetNamespace, port: u16) -> usize {
-    (usize::from(port).wrapping_add(net.id as usize)) & (table().len() - 1)
+    (usize::from(port).wrapping_add(net.hash_mix as usize)) & (table().len() - 1)
 }
 
 fn slot(net: &crate::net::NetNamespace, port: u16) -> &'static NullsHead<UdpHash> {

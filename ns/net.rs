@@ -52,6 +52,11 @@ pub struct NetNamespace {
     /// namespace tag of its devices
     pub id: u64,
 
+    /// Random value mixed into the hashes of tables every namespace
+    /// shares (Linux net->hash_mix, net_hash_mix): another namespace
+    /// cannot tell which slot one of this namespace's keys takes
+    pub hash_mix: u32,
+
     /// Its inode number and nsfs dentry (Linux ns)
     pub ns: super::NsCommon,
 
@@ -190,6 +195,8 @@ impl NetNamespace {
         Ok(Self {
             // Linux net->net_cookie: the namespace's id
             id: ns.ns_id,
+            // Linux preinit_net
+            hash_mix: crate::random::get_random_u32(),
             ns,
             user_ns,
             devices: RcuList::new(),
