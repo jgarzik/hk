@@ -1101,9 +1101,17 @@ impl File {
 /// A file is released when it goes: by its last `fput` for one in the
 /// file cache (`release`, which drops it there), or as dropped before
 /// `alloc` (an open that failed)
+/// Linux __fput's tail too: what the file holds goes before its dentry
+/// and mount (the fields' own drops, in order), so none holds its
+/// inode past the mount: the filesystem's per-open data (freed by
+/// ->release there), then put_file_access (the inode's write access,
+/// then the mount's)
 impl Drop for File {
     fn drop(&mut self) {
         self.__fput();
+        drop(core::mem::take(&mut self.private));
+        drop(self.i_write.take());
+        drop(self.write_access.take());
     }
 }
 

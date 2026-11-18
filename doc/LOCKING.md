@@ -2938,8 +2938,10 @@ lock is released: `Workqueue.inner`), under `DELAYED_FPUT_RUN`
 (sleeping, outermost: 2). So a `FileRef` may be dropped under any
 lock, spin or sleeping, in any context. Only close(2) releases inline
 (`fput_close_sync`, Linux the same), with no lock held. The release
-drops the file's fields (dentry, mount: Linux __fput's dput and
-mntput) and gives its memory back to the file cache at once
+drops the file's fields, in Linux __fput's order: its filesystem's
+per-open data and write accesses (put_file_access) before the dentry
+and mount (dput, mntput), so no inode reference of the file outlives
+its mount reference, and gives its memory back to the file cache at once
 (`file_free`, Linux kmem_cache_free(filp_cache)): every file is a
 `FileObj` of `FILP_CACHE` (`File::alloc`, the one way to a `FileRef`),
 whose count stays 0 there and is set last, Release, by the next file
