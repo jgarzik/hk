@@ -740,7 +740,9 @@ Block locks (3.10 Block Device Subsystem):
     (bdev_add/bdev_del), MAJORS, BDEV_LOCK (claims; sleeping leaf, also
     taken alone to prepare a claim); I/O sleeps under open_mutex only
     SuperBlock.s_umount → bdev inode i_rwsem (sleeping; set_blocksize
-    writes it, device-file buffered I/O reads it) → mmap_lock, page lock
+    writes it, device-file buffered I/O reads it) → mmap_lock,
+    AddressSpace.invalidate_lock (sleeping; set_blocksize writes it, a
+    read or fault filling a page reads it, mmap_lock → it) → page lock
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
     hardware queue also from the driver ISR, under its line's IrqDesc.lock;
     a poll queue is a hardware queue no interrupt reaches: taken by the
@@ -2620,6 +2622,14 @@ clean_bdev_aliases: page lock -> buffer lock.)
   removed (truncate) under it. Order: i_rwsem -> page lock ->
   i_pages. Removal also needs `i_pages`; a lookup that then locks the
   page rechecks `Page.mapping` (truncated meanwhile: retry).
+- `AddressSpace.invalidate_lock` (sleeping `RwSem`, thread context;
+  Linux invalidate_lock): held shared by a read or fault that creates
+  or fills a page (`read_page`, Linux filemap_create_folio,
+  filemap_update_page, filemap_fault), exclusive by `set_blocksize`
+  across a device cache's write-back and drop, so no page is filled
+  on the old geometry meanwhile. i_rwsem -> it (buffered reads of a
+  device file, `set_blocksize`), mmap_lock -> it (faults), it -> page
+  lock.
 - `AddressSpace.writable` (atomic, Linux i_mmap_writable): the
   shared writable mappings (VM_SHARED, file open for writing, not
   `VM_NOMAYWRITE`), counted by the VMA link/unlink (mmap_lock held for
@@ -5569,15 +5579,14 @@ Rules:
   file's or one taken for the call; a device filesystem's mount through
   `sb_set_blocksize`, its superblock's: under its `s_umount`), so no
   mounted filesystem's buffers change size under it, under the bdev inode's `i_rwsem` held for writing, across
-  the cache's write-back and drop (sync_blockdev, kill_bdev): `s_umount`
-  -> bdev `i_rwsem` -> page lock. Buffered reads and writes of the
+  the cache's write-back and drop (sync_blockdev, kill_bdev), with the
+  mapping's `invalidate_lock` held for writing inside it (a fault or
+  read filling a page waits): `s_umount` -> bdev `i_rwsem` ->
+  invalidate_lock -> page lock. Buffered reads and writes of the
   device file hold that `i_rwsem` shared (Linux blkdev_read_iter,
   blkdev_write_iter), across their user copies: bdev `i_rwsem` ->
   mmap_lock; direct I/O and filesystem metadata take none. Read
-  lock-free elsewhere (READ_ONCE). Linux takes the invalidate lock with
-  it too, for a large folio's order: order-0 folios have none to
-  protect (a page given buffers of the old size by a racing fault has
-  them replaced by the next lookup of the new size).
+  lock-free elsewhere (READ_ONCE).
 
 #### Network Subsystem
 

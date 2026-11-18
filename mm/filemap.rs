@@ -17,8 +17,8 @@
 //! (Linux xa_lock), a leaf apart from the heap (index nodes) and page
 //! reference counts; thread context only (I/O completion is waited for
 //! in the submitting thread, so nothing touches it in an interrupt).
-//! Order: i_rwsem -> invalidate_lock -> page lock -> i_private_lock ->
-//! i_pages. A lookup
+//! Order: i_rwsem -> invalidate_lock (mmap_lock -> it in a fault) ->
+//! page lock -> i_private_lock -> i_pages. A lookup
 //! takes its page reference under `i_pages` (get_page_unless_zero), so
 //! a page removed meanwhile is never returned. A page is inserted and
 //! removed locked; removal happens under the page lock and `i_pages`.
@@ -186,6 +186,12 @@ pub struct AddressSpace {
     /// dirtied against each other (Linux i_private_lock): spin, thread
     /// context; page lock -> it -> `i_pages`
     pub i_private_lock: Mutex<()>,
+    /// Keeps pages from being created and filled while the mapping's
+    /// geometry changes (Linux invalidate_lock): read held by a read or
+    /// fault that must fill a page (`read_page`), written by
+    /// `set_blocksize` across its write-back and drop; i_rwsem ->
+    /// it, mmap_lock -> it, it -> page lock
+    pub invalidate_lock: crate::sync::RwSem<()>,
 }
 
 impl AddressSpace {
@@ -203,6 +209,7 @@ impl AddressSpace {
             host: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             wb_err: crate::util::errseq::ErrSeq::new(),
             i_private_lock: Mutex::new(()),
+            invalidate_lock: crate::sync::RwSem::new(()),
         }
     }
 
@@ -656,7 +663,9 @@ pub fn grab(m: &AddressSpace, index: u64) -> Result<u64, KernelError> {
 }
 
 /// The page at `index` of `inode`, uptodate, unlocked, with a
-/// reference (Linux read_mapping_folio)
+/// reference (Linux read_mapping_folio); one it must create or fill is,
+/// under the mapping's invalidate_lock read (Linux filemap_create_folio,
+/// filemap_update_page, filemap_fault)
 pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
     let m = &inode.i_data;
     loop {
@@ -666,6 +675,7 @@ pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
             }
             put_page(phys);
         }
+        let _inv = m.invalidate_lock.read();
         let phys = grab(m, index)?;
         if !uptodate(phys)
             && let Err(e) = m.aops().read_folio(inode, phys, index)

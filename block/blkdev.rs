@@ -1596,11 +1596,10 @@ fn validate_blocksize(bdev: &BlockDevice, size: i32) -> Result<(), KernelError> 
 /// bdev file's private_data), so no filesystem or other exclusive user
 /// has its cache in use: its cache is written back and dropped first, under the
 /// bdev inode's i_rwsem held for writing, which the device file's
-/// buffered reads and writes hold shared, so none of them runs on the
-/// old geometry meanwhile. Linux also takes the invalidate lock there
-/// for a large folio's order; order-0 folios need none, and a page
-/// given buffers of the old size meanwhile (a fault) has them replaced
-/// on the next lookup of the new size.
+/// buffered reads and writes hold shared, and its mapping's
+/// invalidate_lock held for writing, which a read or fault filling a
+/// page holds shared (Linux), so none of them runs on the old geometry
+/// meanwhile.
 pub fn set_blocksize(
     bdev: &BlockDevice,
     holder: Option<Holder>,
@@ -1614,6 +1613,7 @@ pub fn set_blocksize(
     let inode = &bdev.bd_inode;
     if inode.blkbits() != bits {
         let _g = inode.lock();
+        let _inv = inode.i_data.invalidate_lock.write();
         let _ = sync_blockdev(bdev);
         kill_bdev(bdev);
         inode.set_blkbits(bits);
