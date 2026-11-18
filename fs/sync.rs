@@ -62,9 +62,32 @@ pub fn sys_syncfs(fd: i32) -> KernelResult<()> {
     let Some(sb) = file.get_inode().and_then(|i| i.superblock()) else {
         return Ok(());
     };
-    let r = super::fs_writeback::writeback_sb(&sb).map_err(|_| KernelError::Io);
+    let r = sync_filesystem(&sb);
     let seen = file.check_and_advance_sb_err();
     r.and(seen)
+}
+
+/// Write back what is dirty in `sb` and wait (Linux sync_filesystem):
+/// the inodes' writeback started (writeback_inodes_sb), the device's
+/// cache written (sync_blockdev_nowait: hk's writes are synchronous),
+/// the inodes written and waited for (sync_inodes_sb), the device's
+/// cache again (what ->write_inode put there); nothing for a read-only
+/// one. hk's filesystems have no ->sync_fs. Under s_umount.
+pub fn sync_filesystem(sb: &super::superblock::SuperBlock) -> KernelResult<()> {
+    use super::fs_writeback::{sync_inodes_sb, writeback_inodes_sb};
+    use crate::block::blkdev::sync_blockdev;
+    if sb.rdonly() {
+        return Ok(());
+    }
+    writeback_inodes_sb(sb);
+    if let Some(b) = sb.bdev() {
+        sync_blockdev(b)?;
+    }
+    sync_inodes_sb(sb);
+    match sb.bdev() {
+        Some(b) => sync_blockdev(b),
+        None => Ok(()),
+    }
 }
 
 /// sync_file_range flags (Linux include/uapi/linux/fs.h)

@@ -690,16 +690,14 @@ waiting).
   I_DIRTY_SYNC unless I_DIRTY_DATASYNC).
 - No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
   such as touch_atime take mount write access only.
-- `SuperOps::write_inode` takes no wait argument (Linux
-  writeback_control sync_mode), so vfat's dirsync wait syncs the whole
-  device.
 - vfat `fat_add_entries` allocates a new directory cluster before it
   writes the free slots it already has (Linux writes those first), so
   a failed dirsync sync leaves the zeroed cluster linked in.
 
 ## No buffer heads
 
-**Location**: `fs/vfat/mod.rs` (`write_inode_sb`, `VfatSbData.ipos`), `fs/blkdev_ops.rs`
+**Location**: `fs/vfat/mod.rs` (`fat_write_inode`,
+`fat_sync_inode_metadata`, `sync_buffers`, `VfatSbData.ipos`), `fs/blkdev_ops.rs`
 
 Filesystem metadata goes through the block device's page cache by copy
 (`filemap::read`, `bdev_write_meta`); there is no buffer head to pin a
@@ -707,7 +705,11 @@ block and patch it in place. So vfat's write_inode holds its `ipos`
 lock (a sleeping mutex) across the entry's read, patch and write, where
 Linux __fat_write_inode reads the block with sb_bread, then patches the
 pinned buffer under the inode_hash_lock spinlock after rechecking
-i_pos, and marks it dirty.
+i_pos, and marks it dirty. With no buffer to wait on, every wait for
+vfat metadata syncs the device's whole cache (`sync_buffers`):
+->sync_inode_metadata (Linux sync_dirty_buffer of the entry's block +
+mmb_sync of the inode's metadata blocks) and a dirsync directory
+change (Linux sync_dirty_buffer / mmb_sync of the blocks it touched).
 
 ## renameat2 flag gaps
 
@@ -982,7 +984,7 @@ a reset register in PCI configuration space is ignored.
 
 ## Writeback of a superblock with no block device
 
-**Location**: `fs/fs_writeback.rs` (`mark_inode_dirty`, `writeback_sb`)
+**Location**: `fs/fs_writeback.rs` (`__mark_inode_dirty`, `sync_inodes_sb`)
 
 An inode dirtied on a superblock without a backing device (Linux
 noop_backing_dev_info) is marked dirty but queued nowhere, and

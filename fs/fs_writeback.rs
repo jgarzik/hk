@@ -35,10 +35,17 @@
 //! write-back before an eviction): under I_SYNC too, waiting for a
 //! writer already at it, then off the lists if it is clean.
 //!
-//! `writeback_sb` (Linux sync_filesystem: sync_inodes_sb +
-//! sync_blockdev) runs for sync(2), syncfs(2) and umount; the periodic
-//! writeback (`wb_writeback`) for every superblock of the device and
-//! its own cache (the block device's inode is on the same lists).
+//! `WritebackControl` (Linux writeback_control) says how: WB_SYNC_NONE
+//! (the periodic and background writeback, writeback_inodes_sb) starts
+//! the writes, WB_SYNC_ALL (fsync, sync_inodes_sb) waits for them, the
+//! metadata's through ->sync_inode_metadata for what ->write_inode
+//! marked I_METADATA_WRITEBACK (not for sync(2), whose device sync
+//! follows). `sync::sync_filesystem` (writeback_inodes_sb, the
+//! device's cache, sync_inodes_sb, the device's cache again) runs for
+//! syncfs(2), umount and a remount; sync(2) runs sync_inodes_sb on
+//! each, then the block devices; the periodic writeback
+//! (`wb_writeback`) runs for every superblock of the device and its
+//! own cache (the block device's inode is on the same lists).
 //!
 //! Locking (Linux): `BdiWriteback.list_lock` -> `Inode.i_lock`, both
 //! spin, thread context only; `i_state` is written under `i_lock` and
@@ -57,8 +64,8 @@ const ON_IO: u8 = 2;
 const ON_MORE_IO: u8 = 3;
 
 use super::inode::istate::{
-    I_DIRTY, I_DIRTY_ALL, I_DIRTY_PAGES, I_DIRTY_SYNC, I_FREEING, I_SYNC, I_SYNC_QUEUED,
-    I_WILL_FREE,
+    I_DIRTY, I_DIRTY_ALL, I_DIRTY_PAGES, I_DIRTY_SYNC, I_FREEING, I_METADATA_WRITEBACK, I_SYNC,
+    I_SYNC_QUEUED, I_WILL_FREE,
 };
 use super::inode::{ILocked, Inode, InodeList, InodeRef};
 use super::superblock::{SuperBlock, iterate_supers};
@@ -357,23 +364,33 @@ fn do_writepages(inode: &Inode, wbc: &WritebackControl) -> Result<(), KernelErro
 }
 
 /// Its filesystem's ->write_inode (Linux write_inode)
-fn write_inode(inode: &Inode) -> Result<(), KernelError> {
+fn write_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(), KernelError> {
     match inode.superblock() {
-        Some(sb) => sb.s_op.write_inode(inode),
+        Some(sb) => sb.s_op.write_inode(inode, wbc),
         None => Ok(()),
     }
+}
+
+/// `inode`'s ->write_inode put metadata in flight for a later
+/// data-integrity write to wait for (Linux set_inode_metadata_writeback)
+pub fn set_inode_metadata_writeback(inode: &Inode) {
+    let l = inode.i_lock.lock();
+    inode.set_state(&l, I_METADATA_WRITEBACK);
 }
 
 /// Write one inode under I_SYNC (Linux __writeback_single_inode): its
 /// pages, then its dirty bits are taken under `i_lock` (I_DIRTY_PAGES
 /// set again if a page is still dirty) and its metadata written if any
 /// but the pages' were set; a change meanwhile marks it again. A failed
-/// write leaves it clean, as Linux. The first error is returned after
-/// both were tried. List handling is the caller's.
+/// write leaves it clean, as Linux. A data-integrity write other than
+/// sync(2)'s (which syncs the device after) then waits for metadata in
+/// flight (I_METADATA_WRITEBACK: ->sync_inode_metadata). The first
+/// error is returned after all were tried. List handling is the
+/// caller's.
 fn __writeback_single_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(), KernelError> {
     debug_assert!(inode.state() & I_SYNC != 0);
     // WB_SYNC_ALL's filemap_fdatawait: written is waited for here
-    let r = do_writepages(inode, wbc);
+    let mut r = do_writepages(inode, wbc);
     let dirty = {
         let l = inode.i_lock.lock();
         let dirty = inode.state() & I_DIRTY;
@@ -388,7 +405,17 @@ fn __writeback_single_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(),
     };
     // Not for the pages alone
     if dirty & !I_DIRTY_PAGES != 0 {
-        return r.and(write_inode(inode));
+        r = r.and(write_inode(inode, wbc));
+    }
+    if wbc.sync_mode == SyncMode::All && !wbc.for_sync && inode.state() & I_METADATA_WRITEBACK != 0
+    {
+        {
+            let l = inode.i_lock.lock();
+            inode.clear_state(&l, I_METADATA_WRITEBACK);
+        }
+        if let Some(sb) = inode.superblock() {
+            r = r.and(sb.s_op.sync_inode_metadata(inode, wbc));
+        }
     }
     r
 }
@@ -396,7 +423,8 @@ fn __writeback_single_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(),
 /// Write one inode on demand, outside the passes (Linux
 /// writeback_single_inode): a writer already at it (I_SYNC) is enough
 /// for WB_SYNC_NONE and waited for with WB_SYNC_ALL; a clean inode is
-/// left, unless WB_SYNC_ALL finds pages still under writeback. Written
+/// left, unless WB_SYNC_ALL finds pages or metadata still under
+/// writeback (from a WB_SYNC_NONE write) to wait for. Written
 /// under I_SYNC, then off the lists if it is clean now, else back on
 /// `b_dirty` unless a pass has it. The caller holds a reference, or it
 /// is I_WILL_FREE (the write-back before its eviction).
@@ -409,7 +437,11 @@ fn writeback_single_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(), K
         }
         l = inode_wait_for_writeback(inode, l);
     }
-    if inode.state() & I_DIRTY_ALL == 0 && (!all || !mapping_tagged(inode, MARK_WRITEBACK)) {
+    if inode.state() & I_DIRTY_ALL == 0
+        && (!all
+            || (!mapping_tagged(inode, MARK_WRITEBACK)
+                && inode.state() & I_METADATA_WRITEBACK == 0))
+    {
         return Ok(());
     }
     inode.set_state(&l, I_SYNC);
@@ -434,15 +466,16 @@ fn writeback_single_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(), K
     r
 }
 
-/// Write back one inode whole and wait (Linux write_inode_now with
-/// sync): its dirty pages, then its metadata. For fsync and the
-/// write-back before an eviction. The first error is returned after
-/// both were tried.
-pub fn write_inode_now(inode: &Inode) -> Result<(), KernelError> {
+/// Write back one inode whole (Linux write_inode_now): its dirty pages,
+/// then its metadata; with `sync` a data-integrity write (WB_SYNC_ALL),
+/// waiting for a writer already at it and for the metadata. The first
+/// error is returned after both were tried. The caller holds a
+/// reference, or it is I_WILL_FREE.
+pub fn write_inode_now(inode: &Inode, sync: bool) -> Result<(), KernelError> {
     let can = inode.i_data.aops().can_dirty();
     let wbc = WritebackControl {
         nr_to_write: if can { i64::MAX } else { 0 },
-        sync_mode: SyncMode::All,
+        sync_mode: if sync { SyncMode::All } else { SyncMode::None },
         for_sync: false,
         tagged_writepages: false,
     };
@@ -451,12 +484,12 @@ pub fn write_inode_now(inode: &Inode) -> Result<(), KernelError> {
 }
 
 /// Write `inode`'s metadata if it is dirty, no pages (Linux
-/// sync_inode_metadata with wait). Waiting for the write to reach the
-/// disk is the caller's (vfat syncs its device).
-pub fn sync_inode_metadata(inode: &Inode) -> Result<(), KernelError> {
+/// sync_inode_metadata); with `wait` a data-integrity write, waiting
+/// for it to reach the disk (its filesystem's ->sync_inode_metadata)
+pub fn sync_inode_metadata(inode: &Inode, wait: bool) -> Result<(), KernelError> {
     let wbc = WritebackControl {
         nr_to_write: 0,
-        sync_mode: SyncMode::All,
+        sync_mode: if wait { SyncMode::All } else { SyncMode::None },
         for_sync: false,
         tagged_writepages: false,
     };
@@ -589,17 +622,30 @@ fn wb_writeback(wb: &BdiWriteback, wbc: &WritebackControl, cutoff: u64, sb: Opti
     }
 }
 
-/// Write back every dirty inode of `sb`, then its device's cache
-/// (Linux sync_filesystem: sync_inodes_sb + sync_blockdev); nothing
-/// for a read-only one (a read-only remount wrote it back first). A
-/// write error of the device's cache is returned; the inodes' are
-/// their mappings'.
-pub fn writeback_sb(sb: &SuperBlock) -> Result<(), KernelError> {
-    if sb.rdonly() {
-        return Ok(());
-    }
+/// Start writeback of every dirty inode of `sb` (Linux
+/// writeback_inodes_sb: WB_SYNC_NONE, tag-and-write, those dirtied
+/// before now); for sync_filesystem, under s_umount
+pub fn writeback_inodes_sb(sb: &SuperBlock) {
     let Some(b) = sb.bdev() else {
-        return Ok(());
+        return;
+    };
+    let wbc = WritebackControl {
+        nr_to_write: i64::MAX,
+        sync_mode: SyncMode::None,
+        for_sync: false,
+        tagged_writepages: true,
+    };
+    wb_writeback(&b.disk.bdi, &wbc, crate::time::monotonic_ns(), Some(sb));
+}
+
+/// Write every dirty inode of `sb` and wait (Linux sync_inodes_sb:
+/// WB_SYNC_ALL for sync, those dirtied before now; the metadata's wait
+/// is the caller's sync of the device); nothing for a filesystem with
+/// no device (Linux noop_backing_dev_info). Write errors are the
+/// mappings'.
+pub fn sync_inodes_sb(sb: &SuperBlock) {
+    let Some(b) = sb.bdev() else {
+        return;
     };
     let wbc = WritebackControl {
         nr_to_write: i64::MAX,
@@ -607,15 +653,18 @@ pub fn writeback_sb(sb: &SuperBlock) -> Result<(), KernelError> {
         for_sync: true,
         tagged_writepages: false,
     };
-    wb_writeback(&b.disk.bdi, &wbc, u64::MAX, Some(sb));
-    crate::block::blkdev::sync_blockdev(b)
+    wb_writeback(&b.disk.bdi, &wbc, crate::time::monotonic_ns(), Some(sb));
 }
 
-/// Write back every device filesystem (sync(2): Linux ksys_sync, the
-/// inodes; the block devices follow)
+/// sync(2)'s inode part (Linux ksys_sync: iterate_supers of
+/// sync_inodes_one_sb): every writable filesystem's inodes written and
+/// waited for; the block devices follow. Linux first wakes the flusher
+/// threads to start every device at once; hk writes each in turn.
 pub fn sync_all_sbs() {
     iterate_supers(|sb| {
-        let _ = writeback_sb(sb);
+        if !sb.rdonly() {
+            sync_inodes_sb(sb);
+        }
     });
 }
 

@@ -33,9 +33,28 @@ pub trait SuperOps: Send + Sync {
 
     /// Write a dirty inode's metadata (Linux ->write_inode): called by
     /// writeback, fsync and the write-back before an eviction, after
-    /// its pages, for an inode `mark_inode_dirty` marked. Default
-    /// nothing (no metadata of its own on a device).
-    fn write_inode(&self, _inode: &Inode) -> Result<(), KernelError> {
+    /// its pages, for an inode marked dirty other than by its pages;
+    /// `wbc` says how (a WB_SYNC_ALL caller waits through
+    /// `sync_inode_metadata` for what it marks I_METADATA_WRITEBACK).
+    /// Default nothing (no metadata of its own on a device).
+    fn write_inode(
+        &self,
+        _inode: &Inode,
+        _wbc: &super::fs_writeback::WritebackControl,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// Wait for the metadata `write_inode` put in flight (Linux
+    /// ->sync_inode_metadata): called by a data-integrity write
+    /// (WB_SYNC_ALL, not sync(2)'s) of an inode marked
+    /// I_METADATA_WRITEBACK, which only a filesystem having this sets.
+    /// Default nothing.
+    fn sync_inode_metadata(
+        &self,
+        _inode: &Inode,
+        _wbc: &super::fs_writeback::WritebackControl,
+    ) -> Result<(), KernelError> {
         Ok(())
     }
 
@@ -678,7 +697,7 @@ pub fn generic_shutdown_super(sb: &SuperBlock, g: SbUmount<'_>) {
         super::dentry::d_drop_tree(&root);
         drop(root);
         // Linux ignores sync_filesystem's error here too
-        let _ = super::fs_writeback::writeback_sb(sb);
+        let _ = super::sync::sync_filesystem(sb);
         super::inode::sb_list_drain(&sb.s_inodes);
         sb.s_op.put_super(sb);
     } else {

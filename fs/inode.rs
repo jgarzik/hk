@@ -616,6 +616,10 @@ pub mod istate {
     /// I_SYNC_QUEUED): a dirtying leaves it there for the pass to
     /// requeue
     pub const I_SYNC_QUEUED: u32 = 1 << 17;
+    /// Its ->write_inode put metadata in flight that a data-integrity
+    /// write must wait for through ->sync_inode_metadata (Linux
+    /// I_METADATA_WRITEBACK)
+    pub const I_METADATA_WRITEBACK: u32 = 1 << 19;
     /// Linux I_DIRTY_INODE
     pub const I_DIRTY_INODE: u32 = I_DIRTY_SYNC | I_DIRTY_DATASYNC;
     /// Linux I_DIRTY
@@ -776,7 +780,7 @@ unsafe fn iput_final(p: NonNull<Inode>, l: MutexGuard<'_, ILocked>) {
     } else {
         i.set_state(&l, I_WILL_FREE);
         core::mem::drop(l);
-        let _ = super::fs_writeback::write_inode_now(i);
+        let _ = super::fs_writeback::write_inode_now(i, true);
         let l = i.i_lock.lock();
         i.i_state
             .store((i.state() & !I_WILL_FREE) | I_FREEING, Ordering::Release);

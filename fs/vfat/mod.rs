@@ -1358,29 +1358,46 @@ fn fat_truncate_time(inode: &Inode, now: Option<Timespec>, atime: bool, cmtime: 
 
 /// Linux fat_write_inode / __fat_write_inode (->write_inode, from
 /// writeback, fsync, sync, unmount and the write-back before an
-/// eviction): size (0 for a directory), first cluster and times into
-/// the inode's entry; nothing for the root or an inode with no entry
-/// left (unlinked)
+/// eviction, whatever its sync mode): size (0 for a directory), first
+/// cluster and times into the inode's entry in the device's cache,
+/// then marked I_METADATA_WRITEBACK for a data-integrity write to wait
+/// for (`fat_sync_inode_metadata`); the root has no entry but is
+/// marked all the same, an inode with no entry left (unlinked) is
+/// neither
 fn fat_write_inode(inode: &Inode) -> Result<(), KernelError> {
-    let sb = inode.superblock().ok_or(KernelError::Io)?;
-    write_inode_sb(inode, &get_sb_data(&sb)?)
-}
-
-/// [`fat_write_inode`] with the superblock's data at hand
-fn write_inode_sb(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
-    // i_pos and the entry it names, unchanged until the write is done
-    let _l = sb_data.ipos.lock();
-    let d = get_inode_data(inode)?;
-    if d.i_pos == 0 {
+    if is_root(inode) {
+        super::fs_writeback::set_inode_metadata_writeback(inode);
         return Ok(());
     }
-    let off = d.i_pos;
-    let mut b = [0u8; 32];
-    read_bytes(&sb_data.bdev, off, &mut b)?;
-    let ((start, size), times) = inode_entry(inode, &d, sb_data);
-    entry_set_extent(&mut b, start, size);
-    times.put(&mut b);
-    write_bytes(&sb_data.bdev, off, &b)
+    let sb = inode.superblock().ok_or(KernelError::Io)?;
+    let sb_data = get_sb_data(&sb)?;
+    {
+        // i_pos and the entry it names, unchanged until the write is done
+        let _l = sb_data.ipos.lock();
+        let d = get_inode_data(inode)?;
+        if d.i_pos == 0 {
+            return Ok(());
+        }
+        let off = d.i_pos;
+        let mut b = [0u8; 32];
+        read_bytes(&sb_data.bdev, off, &mut b)?;
+        let ((start, size), times) = inode_entry(inode, &d, &sb_data);
+        entry_set_extent(&mut b, start, size);
+        times.put(&mut b);
+        write_bytes(&sb_data.bdev, off, &b)?;
+    }
+    super::fs_writeback::set_inode_metadata_writeback(inode);
+    Ok(())
+}
+
+/// Linux fat_sync_inode_metadata (->sync_inode_metadata): the entry's
+/// block on the disk (sync_dirty_buffer), then the inode's other
+/// metadata blocks (mmb_sync of i_metadata_bhs). With no buffer heads
+/// the device's whole cache stands in for both (BUGS.md "No buffer
+/// heads").
+fn fat_sync_inode_metadata(inode: &Inode) -> Result<(), KernelError> {
+    let sb = inode.superblock().ok_or(KernelError::Io)?;
+    sync_buffers(&get_sb_data(&sb)?)
 }
 
 /// Parsed directory entry with long name support
@@ -2087,7 +2104,7 @@ fn fat_remove_entries(
         sync_buffers(sb_data)?;
     }
     dir.inc_iversion();
-    dir_update(dir, sb, sb_data, None, true);
+    dir_update(dir, sb, None, true);
     Ok(())
 }
 
@@ -2708,7 +2725,7 @@ impl InodeOps for VfatInodeOps {
             unwind.dotdot(dotdot, op);
             return Err(e);
         }
-        vfat_update_dir_metadata(old_dir, &sb, &sb_data, ts);
+        vfat_update_dir_metadata(old_dir, &sb, ts);
 
         // The replaced object loses its name (drop_nlink): its clusters
         // go with its inode, or now if none is cached
@@ -2900,30 +2917,16 @@ fn sync_buffers(sb_data: &VfatSbData) -> Result<(), KernelError> {
     crate::block::blkdev::sync_blockdev(&sb_data.bdev)
 }
 
-/// Linux sync_inode_metadata(inode, 1) on vfat: its entry written if
-/// it is dirty (->write_inode), then on the disk (fat_write_inode's
-/// wait: sync_dirty_buffer)
-fn sync_inode_metadata(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
-    super::fs_writeback::sync_inode_metadata(inode)?;
-    sync_buffers(sb_data)
-}
-
 /// The end of a change to directory `dir` (Linux vfat_add_entry's,
 /// fat_remove_entries', vfat_update_dir_metadata's): its mtime and
 /// ctime `ts` (else now) and with `atime` its atime, the inode marked
-/// dirty, and on a dirsync mount synced at once (sync_inode_metadata,
-/// its error ignored as Linux's (void))
-fn dir_update(
-    dir: &Inode,
-    sb: &SuperBlock,
-    sb_data: &VfatSbData,
-    ts: Option<Timespec>,
-    atime: bool,
-) {
+/// dirty, and on a dirsync mount synced at once (sync_inode_metadata
+/// with wait, its error ignored as Linux's (void))
+fn dir_update(dir: &Inode, sb: &SuperBlock, ts: Option<Timespec>, atime: bool) {
     fat_truncate_time(dir, ts, atime, true);
     super::fs_writeback::mark_inode_dirty(dir);
     if sb.dirsync() {
-        let _ = sync_inode_metadata(dir, sb_data);
+        let _ = super::fs_writeback::sync_inode_metadata(dir, true);
     }
 }
 
@@ -2939,15 +2942,15 @@ fn vfat_add_entry(
     e: &NewEntry<'_>,
 ) -> Result<([u8; 11], Vec<u64>), KernelError> {
     let made = fat_add_entries(sb_data, sb.dirsync(), existing, free, e)?;
-    dir_update(dir, sb, sb_data, Some(e.ts), false);
+    dir_update(dir, sb, Some(e.ts), false);
     Ok(made)
 }
 
 /// Linux vfat_update_dir_metadata: a rename's source directory, its
 /// version, then its end of change at `ts`
-fn vfat_update_dir_metadata(dir: &Inode, sb: &SuperBlock, sb_data: &VfatSbData, ts: Timespec) {
+fn vfat_update_dir_metadata(dir: &Inode, sb: &SuperBlock, ts: Timespec) {
     dir.inc_iversion();
-    dir_update(dir, sb, sb_data, Some(ts), false);
+    dir_update(dir, sb, Some(ts), false);
 }
 
 /// Inode cache key of the entry `short` in the directory at `parent`
@@ -3192,7 +3195,7 @@ impl FileOps for VfatFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        super::fs_writeback::write_inode_now(&inode)?;
+        super::fs_writeback::write_inode_now(&inode, true)?;
         crate::block::blkdev::sync_blockdev(&sb_data.bdev)?;
         crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
@@ -3258,15 +3261,28 @@ pub struct VfatSuperOps;
 
 impl SuperOps for VfatSuperOps {
     /// Linux fat_write_inode
-    fn write_inode(&self, inode: &Inode) -> Result<(), KernelError> {
+    fn write_inode(
+        &self,
+        inode: &Inode,
+        _wbc: &super::fs_writeback::WritebackControl,
+    ) -> Result<(), KernelError> {
         fat_write_inode(inode)
+    }
+
+    /// Linux fat_sync_inode_metadata
+    fn sync_inode_metadata(
+        &self,
+        inode: &Inode,
+        _wbc: &super::fs_writeback::WritebackControl,
+    ) -> Result<(), KernelError> {
+        fat_sync_inode_metadata(inode)
     }
 
     /// Linux fat_reconfigure: what is dirty is written back first
     /// (sync_filesystem, its error ignored), before a switch to
     /// read-only; the options are kept
     fn remount(&self, sb: &SuperBlock, _data: &[u8]) -> Result<(), KernelError> {
-        let _ = super::fs_writeback::writeback_sb(sb);
+        let _ = super::sync::sync_filesystem(sb);
         Ok(())
     }
 
