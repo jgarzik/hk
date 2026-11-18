@@ -38,6 +38,7 @@ const POLLRDHUP: i16 = 0x2000;
 const ENOENT: i64 = -2;
 const ENXIO: i64 = -6;
 const EBUSY: i64 = -16;
+const MNT_DETACH: u64 = 2;
 const ERANGE: i64 = -34;
 const ENODATA: i64 = -61;
 const EPROTOTYPE: i64 = -91;
@@ -412,7 +413,11 @@ fn test_fs_bind_busy() {
     let mp = b"/tmp/ux_mnt\0";
     sys_mkdir(mp.as_ptr(), 0o755);
     let r = sys_mount(b"none\0".as_ptr(), mp.as_ptr(), b"tmpfs\0".as_ptr(), 0, 0);
-    t.eq(b"mount", r, 0);
+    if !t.eq(b"mount", r, 0) {
+        sys_rmdir(mp.as_ptr());
+        t.done();
+        return;
+    }
     let p: &[u8] = b"/tmp/ux_mnt/s";
     let a = sun_path(p);
     let s = listener(SOCK_STREAM, &a, 1);
@@ -427,7 +432,11 @@ fn test_fs_bind_busy() {
     t.eq(b"umount accepted EBUSY", sys_umount2(mp.as_ptr(), 0), EBUSY);
     close(acc);
     close(c);
-    t.eq(b"umount", sys_umount2(mp.as_ptr(), 0), 0);
+    // A failure above must not leave the mount for later tests: one
+    // still busy is detached lazily
+    if !t.eq(b"umount", sys_umount2(mp.as_ptr(), 0), 0) {
+        sys_umount2(mp.as_ptr(), MNT_DETACH);
+    }
     sys_rmdir(mp.as_ptr());
     t.done();
 }
