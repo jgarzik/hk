@@ -74,6 +74,11 @@ pub const PG_UPTODATE: u32 = 1 << 13;
 /// resets it.
 pub const PG_ANON_EXCL: u32 = 1 << 14;
 
+/// A page-cache page's `private` holds data of its filesystem (Linux
+/// PG_private: buffer heads), which holds a page reference
+/// (`filemap::folio_attach_private`)
+pub const PG_PRIVATE: u32 = 1 << 15;
+
 /// Page frame size
 pub const PAGE_SHIFT: u32 = 12;
 
@@ -103,7 +108,8 @@ pub struct Page {
     /// ([`Page::slab_rcu_head`])
     pub next: AtomicU64,
     pub prev: AtomicU64,
-    /// Compound tail: the head's pfn; slab: first free object
+    /// Compound tail: the head's pfn; slab: first free object;
+    /// page cache with PG_PRIVATE: its filesystem's data (buffer heads)
     pub private: AtomicU64,
     /// Slab: objects in use
     pub inuse: AtomicU32,

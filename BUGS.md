@@ -691,24 +691,53 @@ waiting).
   writes the free slots it already has (Linux writes those first), so
   a failed dirsync sync leaves the zeroed cluster linked in.
 
-## No buffer heads
+## vfat metadata does not use buffer heads yet
 
-**Location**: `fs/vfat/mod.rs` (`fat_write_inode`,
-`fat_sync_inode_metadata`, `sync_buffers`, `VfatSbData.ipos`), `fs/blkdev_ops.rs`
+**Location**: `fs/vfat/mod.rs` (`read_bytes`, `write_bytes`,
+`fat_write_inode`, `fat_sync_inode_metadata`, `sync_buffers`,
+`VfatSbData.ipos`, `zero_cluster`)
 
-Filesystem metadata goes through the block device's page cache by copy
-(`filemap::read`, `bdev_write_meta`); there is no buffer head to pin a
-block and patch it in place. So vfat's write_inode holds its `ipos`
-lock (a sleeping mutex) across the entry's read, patch and write, where
-Linux __fat_write_inode reads the block with sb_bread, then patches the
-pinned buffer under the inode_hash_lock spinlock after rechecking
-i_pos, and marks it dirty. With no buffer to wait on, every wait for
-vfat metadata syncs the device's whole cache (`sync_buffers`):
-->sync_inode_metadata (Linux sync_dirty_buffer of the entry's block +
-mmb_sync of the inode's metadata blocks), fsync's FAT step (Linux
-fat_file_fsync: mmb_sync of the FAT inode's metadata blocks) and a
-dirsync directory change (Linux sync_dirty_buffer / mmb_sync of the
-blocks it touched).
+vfat reads its metadata by copy through the block device's page cache
+(`read_bytes`: `filemap::read`) and writes it through a byte-range
+adapter over the device's buffer heads (`write_bytes`: bread or
+bdev_getblk, patch, mark_buffer_dirty), not by holding buffers (Linux
+sb_bread, the buffer kept and patched in place). So vfat's write_inode
+holds its `ipos` lock (a sleeping mutex) across the entry's read,
+patch and write, where Linux __fat_write_inode reads the block with
+sb_bread, then patches the pinned buffer under the inode_hash_lock
+spinlock after rechecking i_pos, and marks it dirty. With no buffer
+held to wait on, every wait for vfat metadata syncs the device's whole
+cache (`sync_buffers`): ->sync_inode_metadata (Linux sync_dirty_buffer
+of the entry's block + mmb_sync of the inode's metadata blocks),
+fsync's FAT step (Linux fat_file_fsync: mmb_sync of the FAT inode's
+metadata blocks) and a dirsync directory change (Linux
+sync_dirty_buffer / mmb_sync of the blocks it touched). A new
+cluster's zeroing writes the disk directly and drops the device
+cache's pages around it (`filemap::invalidate_range`), where Linux
+fat_zeroed_cluster zeroes the buffers (sb_getblk, mark_buffer_dirty).
+
+## Buffer head gaps
+
+**Location**: `fs/buffer.rs`, `mm/filemap.rs`
+
+- A page truncated while one of its buffers is still referenced (the
+  per-CPU LRU of another CPU, a holder) leaves its mapping with its
+  buffers and its frame (Linux frees both later in shrink_folio_list,
+  from the file LRU, which hk lacks: Memory management gaps).
+- A write error in a bio's completion (`mark_buffer_write_io_error`,
+  hardirq) reaches the mapping's `wb_err` only; the superblock's
+  `s_wb_err` (syncfs) gets it when the thread that sees the failure
+  records it (`filemap::write_range` on ->writepage's EIO), not from
+  sync_dirty_buffer's or mmb_sync's EIO (Linux mapping_set_error sets
+  both in the completion: hk reaches the superblock through a `Weak`,
+  whose reference hardirq cannot drop).
+- hk's folios are a page: a block device's soft block size above a
+  page (BLKBSZSET up to 64K) gives its cache page-sized buffers, and
+  bdev_getblk of such a block is EINVAL (Linux makes large folios of
+  one block each, mapping_set_folio_min_order).
+- No buffer-head count limit (Linux buffer_heads_over_limit, which
+  makes reclaim strip buffers), no page migration of buffered pages,
+  no BH_Delay / BH_Unwritten / BH_Boundary users.
 
 ## renameat2 flag gaps
 

@@ -2,9 +2,11 @@
 //!
 //! Reads and writes go through the device's page cache: the page cache
 //! of its inode in the bdev pseudo filesystem (`BlockDevice.bd_inode`,
-//! Linux bd_mapping), shared with filesystems' metadata on the device
-//! (vfat), written back by fsync, sync, BLKFLSBUF and the last close,
-//! which also drops it (Linux blkdev_flush_mapping). mmap maps it.
+//! Linux bd_mapping), in buffer heads of the soft block size
+//! (`BdevAops`, Linux def_blk_aops), shared with filesystems' metadata
+//! on the device (vfat), written back by fsync, sync, BLKFLSBUF and the
+//! last close, which also drops it (Linux blkdev_flush_mapping). mmap
+//! maps it.
 //! O_DIRECT I/O from user memory bypasses it (`block::dio`): the range
 //! is written back first, and for a write dropped before and after;
 //! what the bios could not take goes through the cache. Buffered reads
@@ -18,16 +20,16 @@ use alloc::sync::Arc;
 
 use crate::block::DevId;
 use crate::block::blkdev::{
-    BioOp, BlockDevice, HdGeometry, SECTOR_SHIFT, bdev_rw_bytes, bdev_rw_frame, blkdev_issue_flush,
-    get_blkdev, set_blocksize, sync_blockdev,
+    BlockDevice, HdGeometry, SECTOR_SHIFT, blkdev_issue_flush, get_blkdev, invalidate_bdev,
+    set_blocksize, sync_blockdev,
 };
 use crate::block::genhd;
 use crate::fs::inode::{Inode, InodeMode, InodeRef, Timespec};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::uaccess::{copy_to_user, get_user, put_user};
 use crate::util::error::KernelError;
-use core::sync::atomic::Ordering;
 
+use super::buffer::{self, BufferHead};
 use super::file::{File, FileOps, RwFlags, generic_write_sync, seek};
 use super::iov_iter::{IovDest, IovSource};
 use crate::block::dio;
@@ -337,9 +339,11 @@ fn write_ok(file: &File, len: usize, pos: u64) -> Result<bool, KernelError> {
     Ok(true)
 }
 
-/// The pages of a block device's inode are its sectors (Linux
-/// def_blk_aops: blkdev_read_folio, blkdev_writepages), read and
-/// written a page per bio straight into the cache frame
+/// A block device's cache in buffer heads (Linux def_blk_aops with
+/// CONFIG_BUFFER_HEAD): pages read and written block by block, the
+/// device's soft block size each (`fs::buffer`), so writeback writes
+/// only the dirty buffers: a filesystem's metadata buffers (vfat) dirty
+/// just their blocks of a page that may also hold its file data
 struct BdevAops;
 
 /// The bdev inode's device: its own, never another one registered
@@ -372,112 +376,82 @@ impl crate::fs::inode::AsAny for BdevOwner {
     }
 }
 
-/// Dirty 512-byte sectors of a device-cache page (`Page.private` bits,
-/// Linux's dirty buffer heads): metadata writes mark just what they
-/// change, and writeback writes only those, since the page may also
-/// hold blocks the device cache does not own (vfat file-data clusters
-/// smaller than a page, written from the file's own cache). No bits:
-/// the whole page (device-node writes).
-const SECTORS: usize = PAGE_SIZE / 512;
-
-fn page_struct(phys: u64) -> Result<&'static crate::mm::page::Page, KernelError> {
-    crate::mm::page::phys_to_page(phys).ok_or(KernelError::Io)
-}
-
-/// Write `buf` at byte `pos` of the device into its cache, dirtying
-/// only the sectors it touches (Linux mark_buffer_dirty); written back
-/// by fsync, sync, umount (the last close) and the periodic writeback
-pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), KernelError> {
-    let inode = &b.bd_inode;
-    let mut done = 0;
-    while done < buf.len() {
-        let at = pos + done as u64;
-        let index = at / PAGE_SIZE as u64;
-        let off = (at % PAGE_SIZE as u64) as usize;
-        let n = (PAGE_SIZE - off).min(buf.len() - done);
-        let phys = filemap::grab(&inode.i_data, index)?;
-        let r = if filemap::uptodate(phys) {
-            Ok(())
-        } else {
-            BDEV_AOPS.read_folio(inode, phys, index)
-        };
-        if let Err(e) = r {
-            filemap::remove(&inode.i_data, phys);
-            crate::mm::page::unlock_page(phys);
-            filemap::put_page(phys);
-            return Err(e);
-        }
-        // The locked, uptodate page with our reference
-        // SAFETY: the locked page with our reference
-        let bytes = unsafe { crate::mm::page::frame_bytes(phys) };
-        bytes[off..off + n].copy_from_slice(&buf[done..done + n]);
-        let bits: u64 = (off / 512..(off + n).div_ceil(512)).fold(0, |a, s| a | 1 << s);
-        page_struct(phys)?.private.fetch_or(bits, Ordering::Relaxed);
-        // Not through the aops: they mark the whole page
-        filemap::dirty_folio(&inode.i_data, phys);
-        crate::mm::page::unlock_page(phys);
-        filemap::put_page(phys);
-        done += n;
-    }
-    crate::fs::fs_writeback::mark_inode_dirty_pages(&b.bd_inode);
+/// Block `iblock` of the device is its own block (Linux
+/// blkdev_get_block)
+fn blkdev_get_block(
+    inode: &Inode,
+    iblock: u64,
+    bh: &BufferHead,
+    _create: bool,
+) -> Result<(), KernelError> {
+    let b = inode_bdev(inode)?;
+    bh.set_bdev(&b);
+    bh.set_blocknr(iblock);
+    bh.set_mapped();
     Ok(())
 }
 
 impl Aops for BdevAops {
-    /// A whole-page dirtying (a device-node write, a store through a
-    /// mapping): every sector is written back, whatever metadata
-    /// marked before
+    /// Linux block_dirty_folio
     fn dirty_folio(&self, m: &filemap::AddressSpace, phys: u64) {
-        if let Ok(p) = page_struct(phys) {
-            p.private.fetch_or((1u64 << SECTORS) - 1, Ordering::Relaxed);
-        }
-        filemap::dirty_folio(m, phys);
+        buffer::block_dirty_folio(m, phys);
     }
 
-    fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
-        let b = inode_bdev(inode)?;
-        bdev_rw_frame(&b, BioOp::Read, index << (12 - SECTOR_SHIFT), phys)?;
-        filemap::set_uptodate(phys);
-        Ok(())
+    /// Linux blkdev_read_folio: block_read_full_folio, which unlocks the
+    /// page when the read ends; hk's ->read_folio returns it locked, so
+    /// it is locked again once the read has ended. The device is held
+    /// meanwhile.
+    fn read_folio(&self, inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
+        let _b = inode_bdev(inode)?;
+        buffer::block_read_full_folio(inode, phys, blkdev_get_block);
+        crate::mm::page::lock_page(phys);
+        if filemap::uptodate(phys) {
+            Ok(())
+        } else {
+            Err(KernelError::Io)
+        }
     }
 
-    fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
-        let b = inode_bdev(inode)?;
-        let bits = page_struct(phys)?.private.swap(0, Ordering::Relaxed);
-        if bits == 0 {
-            return bdev_rw_frame(&b, BioOp::Write, index << (12 - SECTOR_SHIFT), phys);
+    /// Linux blkdev_writepages: block_write_full_folio, the dirty
+    /// buffers only
+    fn writepage(&self, inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
+        let _b = inode_bdev(inode)?;
+        buffer::block_write_full_folio(inode, phys, blkdev_get_block)
+    }
+
+    /// Linux blkdev_buffered_write's iomap_write_begin with
+    /// IOMAP_F_BUFFER_HEAD: the blocks the write covers in part read in
+    fn write_begin(&self, inode: &Inode, pos: u64, len: usize) -> Result<u64, KernelError> {
+        buffer::block_write_begin(inode, pos, len, blkdev_get_block)
+    }
+
+    /// Linux iomap_write_end with IOMAP_F_BUFFER_HEAD: block_write_end,
+    /// the written buffers dirty (a short copy into a page not uptodate
+    /// never gets here: `filemap::write_iter` retries it); the device's
+    /// size is fixed
+    fn write_end(&self, _inode: &Inode, pos: u64, copied: usize, phys: u64) -> usize {
+        let n = buffer::block_write_end(phys, pos, copied, copied);
+        crate::mm::page::unlock_page(phys);
+        filemap::put_page(phys);
+        n
+    }
+
+    /// The page without waiting (Linux FGP_NOWAIT), then its blocks: a
+    /// page it returns is uptodate or wholly written, so no block is
+    /// read
+    fn write_begin_nowait(&self, inode: &Inode, pos: u64, len: usize) -> Result<u64, KernelError> {
+        let phys = filemap::grab_nowait(inode, pos, len)?;
+        if let Err(e) = buffer::block_write_begin_int(inode, phys, pos, len, blkdev_get_block) {
+            crate::mm::page::unlock_page(phys);
+            filemap::put_page(phys);
+            return Err(e);
         }
-        // Just the dirty sectors, in runs rounded out to logical blocks
-        let lbs = (b.logical_block_size() as usize / 512).clamp(1, SECTORS);
-        // The locked page with our reference
-        // SAFETY: the locked page with our reference
-        let page = unsafe { crate::mm::page::frame_bytes(phys) };
-        let base = index * PAGE_SIZE as u64;
-        let mut s = 0;
-        while s < SECTORS {
-            if bits & 1 << s == 0 {
-                s += 1;
-                continue;
-            }
-            let mut e = s;
-            while e < SECTORS && bits & 1 << e != 0 {
-                e += 1;
-            }
-            let (a, z) = (s / lbs * lbs, e.next_multiple_of(lbs).min(SECTORS));
-            let r = bdev_rw_bytes(
-                &b,
-                BioOp::Write,
-                base + a as u64 * 512,
-                &mut page[a * 512..z * 512],
-            );
-            if r.is_err() {
-                // Keep what was not written dirty
-                page_struct(phys)?.private.fetch_or(bits, Ordering::Relaxed);
-                return r;
-            }
-            s = z;
-        }
-        Ok(())
+        Ok(phys)
+    }
+
+    /// Linux block_invalidate_folio
+    fn invalidate_folio(&self, m: &filemap::AddressSpace, phys: u64, offset: usize, len: usize) {
+        buffer::block_invalidate_folio(m, phys, offset, len);
     }
 }
 
@@ -601,12 +575,12 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
             need_admin()?;
             genhd::rescan(b).map(|()| 0)
         }
-        // No buffer cache to write back or drop yet
-        // Write the cache back and drop it (Linux blkdev_flushbuf)
+        // Write the cache back and drop its clean pages (Linux
+        // blkdev_flushbuf: sync_blockdev, invalidate_bdev)
         ioc::BLKFLSBUF => {
             need_admin()?;
             sync_blockdev(b)?;
-            filemap::invalidate(&b.bd_inode);
+            invalidate_bdev(b);
             Ok(0)
         }
         _ => Err(KernelError::NotTty),

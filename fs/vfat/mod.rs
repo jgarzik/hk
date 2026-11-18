@@ -915,11 +915,37 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), Ker
     }
 }
 
-/// Write bytes of the device through its cache, only the sectors
-/// touched dirtied (`bdev_write_meta`): a cache page may also hold
-/// file-data clusters, which the file's own cache writes
-fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), KernelError> {
-    super::blkdev_ops::bdev_write_meta(bdev, offset, buf)
+/// Write bytes of the device through its buffer cache: each block
+/// touched read (unless written whole), patched and marked dirty (Linux
+/// sb_bread / sb_getblk, mark_buffer_dirty), in the device's block size,
+/// which mount set to the FAT sector size (`sb_set_blocksize`): only
+/// metadata blocks are dirtied, as a cache page may also hold file-data
+/// clusters, which the file's own cache writes
+fn write_bytes(bdev: &Arc<BlockDevice>, offset: u64, buf: &[u8]) -> Result<(), KernelError> {
+    use crate::fs::buffer;
+    let size = bdev.block_size() as usize;
+    let mut done = 0;
+    while done < buf.len() {
+        let at = offset + done as u64;
+        let (block, off) = (at / size as u64, (at % size as u64) as usize);
+        let n = (size - off).min(buf.len() - done);
+        let src = &buf[done..done + n];
+        let bh = if n == size {
+            let bh = buffer::bdev_getblk(bdev, block, size)?;
+            buffer::lock_buffer(&bh);
+            bh.write_data(0, src);
+            bh.set_uptodate();
+            buffer::unlock_buffer(&bh);
+            bh
+        } else {
+            let bh = buffer::bread(bdev, block, size)?;
+            bh.write_data(off, src);
+            bh
+        };
+        buffer::mark_buffer_dirty(&bh);
+        done += n;
+    }
+    Ok(())
 }
 
 // ============================================================================

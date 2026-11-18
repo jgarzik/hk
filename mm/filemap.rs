@@ -17,7 +17,8 @@
 //! (Linux xa_lock), a leaf apart from the heap (index nodes) and page
 //! reference counts; thread context only (I/O completion is waited for
 //! in the submitting thread, so nothing touches it in an interrupt).
-//! Order: i_rwsem -> invalidate_lock -> page lock -> i_pages. A lookup
+//! Order: i_rwsem -> invalidate_lock -> page lock -> i_private_lock ->
+//! i_pages. A lookup
 //! takes its page reference under `i_pages` (get_page_unless_zero), so
 //! a page removed meanwhile is never returned. A page is inserted and
 //! removed locked; removal happens under the page lock and `i_pages`.
@@ -29,7 +30,8 @@ use spin::Once;
 use super::anon_vma::AnonVma;
 use super::fault::VmFault;
 use super::page::{
-    PG_DIRTY, PG_LOCKED, PG_UPTODATE, Page, frame_bytes, lock_page, phys_to_page, unlock_page,
+    PG_ANON, PG_DIRTY, PG_LOCKED, PG_PRIVATE, PG_SLAB, PG_UPTODATE, PG_WRITEBACK, Page,
+    frame_bytes, lock_page, phys_to_page, unlock_page,
 };
 use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, XArray};
 use crate::FRAME_ALLOCATOR;
@@ -88,9 +90,33 @@ pub trait Aops: Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// The page for a write of `len` bytes at `pos` without waiting
+    /// (Linux ->write_begin with FGP_NOWAIT): EAGAIN where that would
+    /// wait for a page lock or a read; default `grab_nowait`
+    /// (simple_write_begin's page)
+    fn write_begin_nowait(&self, inode: &Inode, pos: u64, len: usize) -> Result<u64, KernelError> {
+        grab_nowait(inode, pos, len)
+    }
+
     /// Dirty the page (Linux ->dirty_folio); default `filemap::dirty_folio`
     fn dirty_folio(&self, m: &AddressSpace, phys: u64) {
         dirty_folio(m, phys);
+    }
+
+    /// Bytes [offset, offset + len) of the locked page `phys`, which has
+    /// private data, are being truncated (Linux ->invalidate_folio):
+    /// the private data must stop referring to them, and goes if the
+    /// whole page does. Default: nothing (no private data).
+    fn invalidate_folio(&self, m: &AddressSpace, phys: u64, offset: usize, len: usize) {
+        let _ = (m, phys, offset, len);
+    }
+
+    /// Release the private data of the locked page `phys`, so the page
+    /// can leave the cache (Linux ->release_folio); false if it is in
+    /// use. Default: the page's buffers (Linux filemap_release_folio
+    /// without ->release_folio: try_to_free_buffers).
+    fn release_folio(&self, m: &AddressSpace, phys: u64) -> bool {
+        crate::fs::buffer::try_to_free_buffers(Some(m), phys)
     }
 
     /// Pages get dirty (false: Linux noop_dirty_folio, a mapping with
@@ -156,6 +182,10 @@ pub struct AddressSpace {
     /// Writeback errors, reported once to each open file by fsync
     /// (Linux mapping->wb_err)
     pub wb_err: crate::util::errseq::ErrSeq,
+    /// Its pages' private data (buffer heads) attached, freed and
+    /// dirtied against each other (Linux i_private_lock): spin, thread
+    /// context; page lock -> it -> `i_pages`
+    pub i_private_lock: Mutex<()>,
 }
 
 impl AddressSpace {
@@ -172,6 +202,7 @@ impl AddressSpace {
             i_mmap: AnonVma::default(),
             host: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             wb_err: crate::util::errseq::ErrSeq::new(),
+            i_private_lock: Mutex::new(()),
         }
     }
 
@@ -198,6 +229,14 @@ impl AddressSpace {
         // SAFETY: null or the inode this mapping is the `i_data` of
         // (`set_aops`), so its memory outlives this borrow of the mapping
         (!p.is_null()).then(|| unsafe { &*p })
+    }
+
+    /// The device number of its inode, if a device's (a block device's
+    /// cache): read with the mapping borrowed
+    pub fn host_rdev(&self) -> Option<crate::fs::chardev::DevId> {
+        self.host()
+            .map(|i| i.rdev)
+            .filter(|d| *d != crate::fs::chardev::DevId::null())
     }
 
     pub fn aops(&self) -> &'static dyn Aops {
@@ -330,6 +369,41 @@ pub fn nr_dirty() -> u64 {
     vm_read(Item::FileDirty)
 }
 
+/// Set the page's dirty bit; true if it was set already (Linux
+/// folio_test_set_dirty)
+pub fn test_set_page_dirty(phys: u64) -> bool {
+    page(phys).flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY != 0
+}
+
+/// The page's dirty bit (Linux folio_test_dirty)
+pub fn page_dirty(phys: u64) -> bool {
+    page(phys).flags.load(Ordering::Acquire) & PG_DIRTY != 0
+}
+
+/// A page of `m` just got its dirty bit: count it and set its DIRTY
+/// mark, if it is still in `m` (Linux __folio_mark_dirty, under the
+/// i_pages lock)
+pub fn account_dirtied(m: &AddressSpace, phys: u64) {
+    let pg = page(phys);
+    if pg.mapping.load(Ordering::Acquire) != m.key() {
+        return;
+    }
+    let mut pages = m.i_pages.lock();
+    if pg.mapping.load(Ordering::Acquire) == m.key() {
+        count_dirty(1);
+        pages.set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
+    }
+}
+
+/// Clear the dirty bit of a page of `m` whose data needs no writing
+/// any more (Linux folio_cancel_dirty)
+pub fn cancel_dirty(m: &AddressSpace, phys: u64) {
+    let pg = page(phys);
+    if pg.mapping.load(Ordering::Acquire) == m.key() {
+        test_clear_dirty(pg);
+    }
+}
+
 /// Clear the page's dirty bit; true (and uncounted) if it was set
 fn test_clear_dirty(pg: &Page) -> bool {
     let was = pg.flags.fetch_and(!PG_DIRTY, Ordering::AcqRel) & PG_DIRTY != 0;
@@ -367,6 +441,118 @@ fn zero_bytes(phys: u64, from: usize, to: usize) {
         let bytes = unsafe { frame_bytes(phys) };
         bytes[from..to].fill(0);
     }
+}
+
+/// The page's private data, if it has some (Linux folio_get_private
+/// under folio_test_private)
+pub fn folio_private(phys: u64) -> Option<u64> {
+    let pg = page(phys);
+    (pg.flags.load(Ordering::Acquire) & PG_PRIVATE != 0).then(|| pg.private.load(Ordering::Acquire))
+}
+
+/// Hang `data` on the locked page, which takes a reference for it
+/// (Linux folio_attach_private)
+pub fn folio_attach_private(phys: u64, data: u64) {
+    let pg = page(phys);
+    debug_assert!(pg.flags.load(Ordering::Relaxed) & PG_PRIVATE == 0);
+    FRAME_ALLOCATOR.incref(phys);
+    pg.private.store(data, Ordering::Release);
+    pg.flags.fetch_or(PG_PRIVATE, Ordering::Release);
+}
+
+/// Take the locked page's private data off, with its reference (Linux
+/// folio_detach_private); the data
+pub fn folio_detach_private(phys: u64) -> u64 {
+    let pg = page(phys);
+    if pg.flags.fetch_and(!PG_PRIVATE, Ordering::AcqRel) & PG_PRIVATE == 0 {
+        return 0;
+    }
+    let data = pg.private.swap(0, Ordering::AcqRel);
+    put_page(phys);
+    data
+}
+
+/// The page is under writeback (Linux folio_test_writeback)
+pub fn writeback(phys: u64) -> bool {
+    page(phys).flags.load(Ordering::Acquire) & PG_WRITEBACK != 0
+}
+
+/// Set or clear the page's writeback flag (Linux
+/// folio_start_writeback / folio_end_writeback's flag); any context
+pub fn set_writeback(phys: u64, on: bool) {
+    let f = &page(phys).flags;
+    if on {
+        f.fetch_or(PG_WRITEBACK, Ordering::Release);
+    } else {
+        f.fetch_and(!PG_WRITEBACK, Ordering::Release);
+    }
+}
+
+/// Byte offset of the page in its file (Linux folio_pos)
+pub fn folio_pos(phys: u64) -> u64 {
+    page(phys).index.load(Ordering::Relaxed) * PAGE_SIZE as u64
+}
+
+/// The page-cache mapping the page is in, if any (Linux
+/// folio->mapping), for the guard's life: a mapping is part of an
+/// inode, whose memory is freed a grace period after its teardown, and
+/// the teardown takes every page out first. As Linux, a caller that
+/// changes the mapping keeps the page from being truncated meanwhile.
+pub fn folio_mapping(phys: u64, _rcu: &crate::sync::rcu::RcuReadGuard) -> Option<&AddressSpace> {
+    let pg = page(phys);
+    if pg.flags.load(Ordering::Acquire) & (PG_ANON | PG_SLAB) != 0 {
+        return None;
+    }
+    let key = pg.mapping.load(Ordering::Acquire);
+    if key == 0 || key & 1 != 0 {
+        return None;
+    }
+    // SAFETY: a page-cache page's mapping word is its AddressSpace's
+    // address (`insert`), cleared before the inode holding it is torn
+    // down; read under the guard, the inode's memory outlives it
+    // (freed by RCU, `i_callback`)
+    Some(unsafe { &*(key as *const AddressSpace) })
+}
+
+/// The first cached page with index in [from, last], with a reference
+pub fn find_get_range(m: &AddressSpace, from: u64, last: u64) -> Option<(u64, u64)> {
+    let pages = m.i_pages.lock();
+    pages
+        .find(from, last, None)
+        .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
+}
+
+/// Release the locked page's private data so it can leave the cache
+/// (Linux filemap_release_folio): true if it has none left; never
+/// while under writeback
+pub fn filemap_release_folio(m: &AddressSpace, phys: u64) -> bool {
+    if folio_private(phys).is_none() {
+        return true;
+    }
+    if writeback(phys) {
+        return false;
+    }
+    m.aops().release_folio(m, phys)
+}
+
+/// Bytes [offset, offset + len) of the locked page are truncated
+/// (Linux folio_invalidate)
+fn folio_invalidate(m: &AddressSpace, phys: u64, offset: usize, len: usize) {
+    m.aops().invalidate_folio(m, phys, offset, len);
+}
+
+/// Truncate the locked page `phys` out of `m` (Linux
+/// truncate_inode_folio: truncate_cleanup_folio, then
+/// filemap_remove_folio): its private data invalidated whole first; a
+/// page whose data stays busy leaves the cache with it
+fn truncate_folio(m: &AddressSpace, phys: u64) {
+    if page(phys).mapping.load(Ordering::Acquire) != m.key() {
+        return;
+    }
+    if folio_private(phys).is_some() {
+        folio_invalidate(m, phys, 0, PAGE_SIZE);
+    }
+    remove(m, phys);
 }
 
 /// Drop a page reference (Linux folio_put)
@@ -467,26 +653,35 @@ pub fn grab(m: &AddressSpace, index: u64) -> Result<u64, KernelError> {
 /// reference (Linux read_mapping_folio)
 pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
     let m = &inode.i_data;
-    if let Some(phys) = find_get(m, index) {
-        if uptodate(phys) {
-            return Ok(phys);
+    loop {
+        if let Some(phys) = find_get(m, index) {
+            if uptodate(phys) {
+                return Ok(phys);
+            }
+            put_page(phys);
         }
-        put_page(phys);
-    }
-    let phys = grab(m, index)?;
-    if !uptodate(phys)
-        && let Err(e) = m.aops().read_folio(inode, phys, index)
-    {
-        // A failed read leaves no page behind (Linux filemap_read_folio
-        // error: the folio stays !uptodate and is retried; hk drops it
-        // so a later read starts over)
-        remove(m, phys);
+        let phys = grab(m, index)?;
+        if !uptodate(phys)
+            && let Err(e) = m.aops().read_folio(inode, phys, index)
+        {
+            // Truncated while the read was in flight (a ->read_folio may
+            // unlock at the end of the read and lock again): again (Linux
+            // filemap_read's retry of a folio that lost its mapping)
+            let gone = page(phys).mapping.load(Ordering::Acquire) != m.key();
+            // A failed read leaves no page behind (Linux
+            // filemap_read_folio error: the folio stays !uptodate and is
+            // retried; hk drops it so a later read starts over)
+            truncate_folio(m, phys);
+            unlock_page(phys);
+            put_page(phys);
+            if gone {
+                continue;
+            }
+            return Err(e);
+        }
         unlock_page(phys);
-        put_page(phys);
-        return Err(e);
+        return Ok(phys);
     }
-    unlock_page(phys);
-    Ok(phys)
 }
 
 /// Remove the locked page `phys` from `m` (Linux
@@ -507,7 +702,6 @@ pub fn remove(m: &AddressSpace, phys: u64) {
     }
     test_clear_dirty(pg);
     pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
-    pg.private.store(0, Ordering::Relaxed);
     count_file(m, -1);
     m.uncharge(1);
     put_page(phys);
@@ -534,7 +728,7 @@ fn truncate_pages(m: &AddressSpace, from: u64, last: u64) {
             return;
         };
         lock_page(phys);
-        remove(m, phys);
+        truncate_folio(m, phys);
         unlock_page(phys);
         put_page(phys);
         match index.checked_add(1) {
@@ -545,8 +739,13 @@ fn truncate_pages(m: &AddressSpace, from: u64, last: u64) {
 }
 
 /// Drop every page of a mapping nobody else can reach any more (Linux
-/// truncate_inode_pages_final, from eviction): no page lock, no sleep
+/// truncate_inode_pages_final, from eviction): pages with private data
+/// (buffers) through ->invalidate_folio under their lock, as Linux
+/// truncates every page; the rest with no page lock and no sleep. A
+/// page whose buffers stay busy (a reference held elsewhere) leaves
+/// with them.
 fn truncate_final(m: &AddressSpace) {
+    truncate_private(m);
     count_file(m, -(m.nrpages() as i64));
     m.uncharge(m.nrpages());
     let mut pages = m.i_pages.lock();
@@ -555,10 +754,43 @@ fn truncate_final(m: &AddressSpace) {
         pg.mapping.store(0, Ordering::Release);
         test_clear_dirty(pg);
         pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
-        pg.private.store(0, Ordering::Relaxed);
         put_page(phys);
     });
     m.nrpages.store(0, Ordering::Relaxed);
+}
+
+/// Truncate the pages of `m` that have private data (`truncate_final`)
+fn truncate_private(m: &AddressSpace) {
+    let mut at = 0;
+    while m.nrpages() != 0 {
+        let next = {
+            let pages = m.i_pages.lock();
+            let mut i = at;
+            loop {
+                match pages.find(i, u64::MAX, None) {
+                    Some((index, p)) if folio_private(p).is_some() => {
+                        break FRAME_ALLOCATOR.incref(p).then_some((index, p));
+                    }
+                    Some((index, _)) => match index.checked_add(1) {
+                        Some(n) => i = n,
+                        None => break None,
+                    },
+                    None => break None,
+                }
+            }
+        };
+        let Some((index, phys)) = next else {
+            return;
+        };
+        lock_page(phys);
+        truncate_folio(m, phys);
+        unlock_page(phys);
+        put_page(phys);
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => return,
+        }
+    }
 }
 
 /// Set the page's dirty bit and the mapping's DIRTY mark, and mark its
@@ -570,25 +802,30 @@ pub fn dirty_page(m: &AddressSpace, phys: u64) {
         return;
     }
     m.aops().dirty_folio(m, phys);
-    // A reference unless its last went (Linux __mark_inode_dirty skips
-    // an I_FREEING inode)
-    if let Some(inode) = m.host().and_then(Inode::igrab) {
-        crate::fs::fs_writeback::mark_inode_dirty_pages(&inode);
-    }
+    mark_host_dirty(m);
 }
 
 /// The generic dirtying (Linux filemap_dirty_folio): PG_dirty and the
 /// DIRTY mark, counted
 pub fn dirty_folio(m: &AddressSpace, phys: u64) {
-    let pg = page(phys);
-    if pg.mapping.load(Ordering::Acquire) == m.key()
-        && pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
-    {
-        count_dirty(1);
-        m.i_pages
-            .lock()
-            .set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
+    if !test_set_page_dirty(phys) {
+        account_dirtied(m, phys);
     }
+}
+
+/// Mark the mapping's inode dirty for its pages (Linux
+/// __mark_inode_dirty(I_DIRTY_PAGES)), a reference taken unless its
+/// last went (Linux skips an I_FREEING inode)
+pub fn mark_host_dirty(m: &AddressSpace) {
+    if let Some(inode) = host_igrab(m) {
+        crate::fs::fs_writeback::mark_inode_dirty_pages(&inode);
+    }
+}
+
+/// A reference on the mapping's inode, unless it has none or its last
+/// went
+pub fn host_igrab(m: &AddressSpace) -> Option<InodeRef> {
+    m.host().and_then(Inode::igrab)
 }
 
 /// Write-protect every writable PTE mapping page `index` (`phys`) of
@@ -836,16 +1073,15 @@ pub fn invalidate_pages2(inode: &Inode, first: u64, last: u64) -> Result<(), Ker
 }
 
 /// Drop the locked page `phys`, index `index` of `m`, unmapped first
-/// (Linux folio_unmap_invalidate): EBUSY if it is dirty (no
-/// ->launder_folio; a device page's dirty sectors are Linux's dirty
-/// buffers, which try_to_free_buffers keeps). Unmapped again under the
-/// page lock: a fault maps a file page under it, so none can have
-/// mapped it since.
+/// (Linux folio_unmap_invalidate): EBUSY if its private data stays (a
+/// dirty or busy buffer) or it is dirty (no ->launder_folio). Unmapped
+/// again under the page lock: a fault maps a file page under it, so
+/// none can have mapped it since.
 fn unmap_invalidate(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
     if !m.i_mmap.is_empty() {
         unmap_pages(m, index, index);
     }
-    if page(phys).flags.load(Ordering::Acquire) & PG_DIRTY != 0 {
+    if !filemap_release_folio(m, phys) || page_dirty(phys) {
         return Err(KernelError::Busy);
     }
     remove(m, phys);
@@ -888,6 +1124,11 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
     }
     // Unmapped (a mapping of the device node) before the pages go
     unmap_pages(m, first, last - 1);
+    // The per-CPU buffer LRUs hold buffers: emptied first, so pages with
+    // buffers can drop them (as kill_bdev)
+    if range_has_page(m, start, end - 1) {
+        crate::fs::buffer::invalidate_bh_lrus();
+    }
     let mut at = first;
     while at < last {
         let next = {
@@ -911,7 +1152,7 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
                 }
             }
             if r.is_ok() {
-                remove(m, phys);
+                truncate_folio(m, phys);
             } else {
                 dirty_page(m, phys);
             }
@@ -947,13 +1188,7 @@ pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) -> u64 {
             return freed;
         };
         if super::page::trylock_page(phys) {
-            let pg = page(phys);
-            // The cache's reference and ours: no PTE or user holds it
-            if pg.mapping.load(Ordering::Acquire) == m.key()
-                && pg.flags.load(Ordering::Acquire) & PG_DIRTY == 0
-                && FRAME_ALLOCATOR.refcount(phys) == 2
-            {
-                remove(m, phys);
+            if evict_folio(m, phys) {
                 freed += 1;
             }
             unlock_page(phys);
@@ -965,6 +1200,32 @@ pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) -> u64 {
         }
     }
     freed
+}
+
+/// Drop the locked page `phys` of `m` if clean and used by nobody
+/// else (Linux mapping_evict_folio): its private data released first
+fn evict_folio(m: &AddressSpace, phys: u64) -> bool {
+    let pg = page(phys);
+    if pg.mapping.load(Ordering::Acquire) != m.key()
+        || pg.flags.load(Ordering::Acquire) & (PG_DIRTY | PG_WRITEBACK) != 0
+    {
+        return false;
+    }
+    // The cache's reference, ours, and the private data's: no PTE or
+    // user holds it
+    let private = u32::from(folio_private(phys).is_some());
+    if FRAME_ALLOCATOR.refcount(phys) > 2 + private {
+        return false;
+    }
+    if !filemap_release_folio(m, phys) {
+        return false;
+    }
+    // Linux remove_mapping: the count frozen at the cache's and ours
+    if FRAME_ALLOCATOR.refcount(phys) != 2 || page_dirty(phys) {
+        return false;
+    }
+    remove(m, phys);
+    true
 }
 
 /// Drop every page of `inode` (Linux kill_bdev / truncate_inode_pages
@@ -1133,19 +1394,22 @@ pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<u
 /// `write_iter` that waits for nothing (Linux generic_perform_write
 /// with IOCB_NOWAIT: FGP_NOWAIT pages): a page another holds locked,
 /// or one a partial write would first have to read, ends it with
-/// EAGAIN (the bytes before it written). For a mapping with the
-/// default write_begin (simple_write_begin): block devices.
+/// EAGAIN (the bytes before it written), through ->write_begin_nowait:
+/// block devices (an O_DIRECT write's buffered rest).
 pub fn write_iter_nowait(
     inode: &Inode,
     from: &mut IovSource<'_>,
     pos: u64,
 ) -> Result<usize, KernelError> {
-    write_with(inode, from, pos, &|at, n| grab_nowait(inode, at, n))
+    let a = inode.i_data.aops();
+    write_with(inode, from, pos, &|at, n| {
+        a.write_begin_nowait(inode, at, n)
+    })
 }
 
 /// simple_write_begin's page for a write of `n` bytes at `at`, without
 /// waiting: EAGAIN where that would wait for a page lock or a read
-fn grab_nowait(inode: &Inode, at: u64, n: usize) -> Result<u64, KernelError> {
+pub fn grab_nowait(inode: &Inode, at: u64, n: usize) -> Result<u64, KernelError> {
     let m = &inode.i_data;
     let index = at / PAGE_SIZE as u64;
     let whole = n == PAGE_SIZE || index * PAGE_SIZE as u64 >= inode.get_size();
@@ -1290,6 +1554,11 @@ pub fn truncate_setsize(inode: &Inode, size: u64) {
         lock_page(phys);
         if uptodate(phys) {
             zero_page(phys, off);
+        }
+        // Linux truncate_inode_partial_folio: the private data past the
+        // size goes too
+        if page(phys).mapping.load(Ordering::Acquire) == m.key() && folio_private(phys).is_some() {
+            folio_invalidate(m, phys, off, PAGE_SIZE - off);
         }
         unlock_page(phys);
         put_page(phys);

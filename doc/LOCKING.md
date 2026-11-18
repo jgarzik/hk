@@ -666,7 +666,9 @@ Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
-    [→ AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
+    [→ buffer lock (BH_Lock bit, sleeping) | AddressSpace.i_private_lock
+    (spin, Linux i_private_lock) → MappingMetadataBhs.lock (spin);
+    → AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
     → AddressSpace.i_mmap (sleeping RwSem, Linux i_mmap_rwsem)
     → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
     → page_table_lock → PTE lock (spin) [→ MMLIST (spin leaf)]
@@ -2594,16 +2596,15 @@ layout in `doc/MEMORY.md`
 #### Per-inode page cache (Linux i_pages)
 
 **Location:** `mm/filemap.rs` (`AddressSpace`, the inode's
-`i_data`); users: ramfs, tmpfs, vfat files, block devices
-(`BlockDevice.bd_inode`). vfat writes its FAT and directory blocks
-into the device cache marking only the 512-byte sectors it changes
-(`bdev_write_meta`: bits in `Page.private`, set under the page lock;
-Linux dirty buffer heads), and the device's writepage writes only
-those: a device-cache page may also hold file-data clusters, which
-the file's own cache writes. (A write-back widened to the device's logical
-block stays inside one FAT sector: vfat refuses a FAT sector smaller
-than that block. A newly allocated cluster's device-cache pages are
-dropped before and after it is zeroed on the disk.)
+`i_data`), `fs/buffer.rs` (buffer heads); users: ramfs, tmpfs, vfat
+files, block devices (`BlockDevice.bd_inode`). The device cache holds
+its blocks in buffer heads (Buffer heads, below): vfat writes its FAT
+and directory blocks through them, in the device's block size, which
+its mount sets to the FAT sector size (`sb_set_blocksize`), and the
+device's writepage writes only dirty buffers: a device-cache page may
+also hold file-data clusters, which the file's own cache writes. (A
+newly allocated cluster's device-cache pages are dropped before and
+after it is zeroed on the disk.)
 
 - `AddressSpace.i_pages` (`spin::Mutex<XArray>`, Linux xa_lock): the
   cached pages by index. Thread context only (no I/O completion or
@@ -2668,8 +2669,74 @@ dropped before and after it is zeroed on the disk.)
   held but each page's, taken with trylock (reclaim never waits for
   one); an unevictable mapping (ramfs) is never touched.
 - Eviction (`Drop for AddressSpace`, the inode's last reference)
-  empties `i_pages` without page locks: nothing else can reach the
-  mapping any more.
+  truncates the pages with private data (buffers) under their page
+  locks, as any truncate, then empties `i_pages` without page locks:
+  nothing else can reach the mapping any more.
+- Private data (`PG_private`, `Page.private`; Linux folio private):
+  attached and detached under the page lock and `i_private_lock`
+  (`folio_attach_private` takes a page reference for it). Truncation
+  (`truncate_folio`, Linux truncate_inode_folio) calls the
+  filesystem's ->invalidate_folio under the page lock, eviction from
+  the cache (`evict_folio`, Linux mapping_evict_folio, and
+  `invalidate_pages2`) its ->release_folio (`filemap_release_folio`;
+  default try_to_free_buffers): the expected count is the cache's,
+  the caller's and the private data's.
+
+#### Buffer heads (fs/buffer.rs; Linux fs/buffer.c)
+
+- A page's buffers (a ring through `b_this_page`, on the page's
+  private word) are made under the page lock and attached under
+  `i_private_lock` too (create_empty_buffers, grow_dev_folio); they
+  are freed only by `try_to_free_buffers`, under both, when none is
+  referenced (`b_count`), dirty or locked. So the page lock,
+  `i_private_lock` or a reference on any buffer of the ring keeps the
+  whole ring; `__find_get_block` looks up under `i_private_lock`
+  alone (it may not sleep), the rest under the page lock.
+- `AddressSpace.i_private_lock` (spin `Mutex`, thread context; Linux
+  i_private_lock): page lock -> it -> `i_pages` (block_dirty_folio
+  dirties every buffer and the page under it, so a ring attached
+  meanwhile comes dirty and try_to_free_buffers never frees a dirty
+  one) -> `MappingMetadataBhs.lock` (drop_buffers takes buffers off
+  their list). Nothing sleeps or allocates under it (the ring is
+  allocated before it is taken).
+- Buffer lock (BH_Lock, a sleeping bit lock over `var_waitqueue`;
+  Linux lock_buffer): held across a buffer's I/O; taken under the page
+  lock (block_write_full_folio, discard_buffer, clean_bdev_aliases)
+  or alone (bread, sync_dirty_buffer, write_dirty_buffer), never under
+  a spin lock. Unlocked from the bio's completion (hardirq), which
+  touches nothing of the buffer after the bit clears.
+- `b_uptodate_lock` of a ring's first buffer (`IrqSpinlock` leaf;
+  Linux): the async read and write completions (hardirq) of a page's
+  buffers, so exactly one ends the page's read (unlocks it,
+  folio_end_read) or writeback (folio_end_writeback); the page stays
+  locked (read) or under writeback, so its ring stays, until then.
+  hk's ->writepage is synchronous: it keeps the page locked and waits
+  for the writeback to end (`PG_writeback`, the page's wait queue),
+  where Linux unlocks it after submitting; ->read_folio locks the page
+  again after block_read_full_folio's completion unlocked it.
+- A buffer's `b_bdev` holds a `Weak` of its device, changed only while
+  unmapped (page lock) or under the buffer lock: a locked, mapped
+  buffer's is stable for its bio's submission. A buffer's I/O holds no
+  reference on the device: its submitter keeps it (a mounted
+  filesystem's `s_bdev`, or the caller across its wait).
+- Per-CPU LRU of looked-up buffers (`lru::BH_LRUS`, an `IrqSpinlock`
+  per CPU, leaf; Linux bh_lrus under local_irq_disable): each slot holds
+  a reference; taken by its CPU's lookups (the lock replaces the
+  interrupt masking) and by its CPU's call of `invalidate_bh_lrus`
+  (a cross-CPU call on every CPU, interrupts off, as Linux
+  on_each_cpu_cond), which kill_bdev, invalidate_bdev and
+  `filemap::invalidate_range` make first, so the pages' buffers can go.
+- `MappingMetadataBhs.lock` (spin, thread context; Linux mmb->lock):
+  the list of a mapping's metadata buffers (`b_assoc_buffers`, `b_mmb`)
+  and a sync's private list (`mmb_sync`); a buffer's `b_mmb` is read
+  without it under an RCU read guard (`remove_assoc_queue`,
+  `mark_buffer_write_io_error`): the list's memory is freed a grace
+  period after its last buffer left (`mmb_mark_buffer_dirty`'s
+  contract, Linux's RCU-freed inode).
+- `mark_buffer_dirty` never sleeps: the page's mapping is reached under
+  an RCU read guard (`filemap::folio_mapping`: a mapping is part of an
+  inode freed by RCU) for its count and DIRTY mark (`i_pages`); the
+  inode is queued for writeback after the guard drops.
 
 ### 3.3 Virtual File System (VFS)
 
@@ -5469,11 +5536,13 @@ Rules:
   accounting); a remount reconfigures it under its `s_umount` held
   for writing, like any tmpfs.
 - **Block device page cache (`BlockDevice.bd_inode`, Linux
-  bd_mapping):** device-file I/O and vfat metadata go through it (3.2
-  Per-inode page cache); pages are read and written synchronously
-  under their page lock, never under a spinlock. The last opener's
-  release writes it back and drops it under `open_mutex` (Linux
-  blkdev_flush_mapping): open_mutex -> page lock -> i_pages.
+  bd_mapping):** device-file I/O and vfat metadata go through it, in
+  buffer heads (3.2 Per-inode page cache, Buffer heads); pages are
+  read and written synchronously under their page lock, never under a
+  spinlock. The last opener's release writes it back and drops it
+  under `open_mutex` (Linux blkdev_flush_mapping: sync_blockdev,
+  kill_bdev, which empties the per-CPU buffer LRUs first): open_mutex
+  -> page lock -> buffer lock, i_private_lock -> i_pages.
 - **Soft block size (the bdev inode's `Inode.i_blkbits`, Linux
   i_blkbits; BLKBSZGET):** set at the first open under `open_mutex`
   (Linux set_init_blocksize) and changed by `set_blocksize` (BLKBSZSET,
@@ -6148,6 +6217,10 @@ is `SCHED:FAIL scheduling while atomic`).
   (`IrqSpinlock`, leaf) to reap the virtqueue and restart dispatch, then
   `bio_endio` with no lock held; `end_io` completes a `Completion`
   (`IrqSpinlock` -> wait queue wakeup); the lock-free DMA API unmaps
+- Buffer head completion (`fs/buffer.rs` bh_end_*): the buffer's bits,
+  the ring's `b_uptodate_lock` (IrqSpinlock leaf), the page's flags,
+  the buffer's and the page's wait queues, and, under an RCU read
+  guard, the mapping's `wb_err` (an atomic errseq) on a write error
 - AIO completion (a bio's end of an AIO request): `Kioctx.comp`
   (IrqSpinlock) to post the event into the shared ring, then the
   request's eventfd (`Eventfd.inner`), the io_getevents wakeup and the

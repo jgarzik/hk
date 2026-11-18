@@ -14,7 +14,7 @@
 //! block_device) is the whole disk (partno 0) or one partition of it.
 //! Each block device has an inode (`bd_inode`, Linux bdev inode) whose
 //! page cache serves device-file I/O and filesystem metadata
-//! (`fs::blkdev_ops`); its pages are read and written a page per bio.
+//! (`fs::blkdev_ops`) in buffer heads, a bio per block (`fs::buffer`).
 //! Partition scans are synchronous bios (`submit_bio_wait`).
 //!
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
@@ -1513,13 +1513,25 @@ pub fn bdev_rw_bytes(
     bdev_rw(bdev, BioOp::Write, first, &mut tmp)
 }
 
-/// Drop the device's whole cache, dirty or not (Linux kill_bdev:
-/// truncate_inode_pages from 0)
+/// Drop the device's whole cache, dirty or not (Linux kill_bdev: the
+/// per-CPU buffer LRUs emptied, truncate_inode_pages from 0)
 pub fn kill_bdev(bdev: &BlockDevice) {
     if bdev.bd_inode.i_data.nrpages() == 0 {
         return;
     }
+    crate::fs::buffer::invalidate_bh_lrus();
     crate::mm::filemap::invalidate(&bdev.bd_inode);
+}
+
+/// Drop the device cache's clean, unused pages (Linux invalidate_bdev:
+/// the buffer LRUs emptied first, then invalidate_mapping_pages)
+pub fn invalidate_bdev(bdev: &BlockDevice) {
+    if bdev.bd_inode.i_data.nrpages() == 0 {
+        return;
+    }
+    crate::fs::buffer::invalidate_bh_lrus();
+    crate::mm::swap::lru::lru_add_drain_all();
+    crate::mm::filemap::invalidate_clean(&bdev.bd_inode, 0, u64::MAX);
 }
 
 /// A soft block size the device takes (Linux bdev_validate_blocksize:

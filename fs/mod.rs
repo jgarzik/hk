@@ -7,6 +7,7 @@ pub mod chardev;
 
 // Core VFS modules
 pub mod blkdev_ops;
+pub mod buffer;
 pub mod dac;
 pub mod dentry;
 pub mod file;

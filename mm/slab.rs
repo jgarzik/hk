@@ -688,6 +688,9 @@ pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", box_of::<crate::fs::
 /// Inodes (`InodeRef`; Linux inode_cache)
 pub static INODE_CACHE: KmemCache =
     named_cache!("inode_cache", box_of::<crate::fs::inode::Inode>());
+/// Buffer heads (`Box<BufferHead>`; Linux bh_cachep, buffer_init)
+pub static BH_CACHE: KmemCache =
+    named_cache!("buffer_head", box_of::<crate::fs::buffer::BufferHead>());
 
 /// Pages for the caches made here (host tests: their own)
 #[cfg(not(test))]
@@ -727,7 +730,7 @@ static OWN: [&KmemCache; 1] = [&FILP_CACHE];
 /// allocation of exactly their type's layout (another type of the same
 /// size and alignment shares it, like Linux slab merging); keeps them
 /// out of the kmalloc caches and counted per type.
-static NAMED: [&KmemCache; 3] = [&VMA_CACHE, &DENTRY_CACHE, &INODE_CACHE];
+static NAMED: [&KmemCache; 4] = [&VMA_CACHE, &DENTRY_CACHE, &INODE_CACHE, &BH_CACHE];
 
 /// The cache that serves a layout: a named cache of exactly that
 /// layout, else the kmalloc class
