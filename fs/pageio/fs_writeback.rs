@@ -149,7 +149,7 @@ fn mapping_tagged(inode: &Inode, mark: usize) -> bool {
 /// `inode` has a new dirty page (Linux __folio_mark_dirty ->
 /// __mark_inode_dirty(I_DIRTY_PAGES)), for a mapping that writes back
 /// (Linux mapping_can_writeback)
-pub fn mark_inode_dirty_pages(inode: &InodeRef) {
+pub fn mark_inode_dirty_pages(inode: &Inode) {
     if !inode.i_data.aops().can_dirty() {
         return;
     }
@@ -176,8 +176,10 @@ pub fn mark_inode_dirty_sync(inode: &Inode) {
 /// state) or it is being freed, and the periodic writeback is armed if
 /// the lists were empty. An unhashed inode (but a block device's) and
 /// one with no device to write to (Linux noop_backing_dev_info) stay
-/// marked and unqueued. The caller holds a reference; may run under a
-/// page lock, never a spinlock.
+/// marked and unqueued. The caller holds a reference, or the lock of a
+/// page in its cache (Linux __folio_mark_dirty: its teardown waits for
+/// that lock, and the I_FREEING check here keeps one being freed off
+/// the lists); may run under a page lock, never a spinlock.
 pub fn __mark_inode_dirty(inode: &Inode, flags: u32) {
     // Linux smp_mb, paired with the one in __writeback_single_inode:
     // either this test sees the bits cleared or that one sees the

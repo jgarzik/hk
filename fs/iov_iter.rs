@@ -174,7 +174,8 @@ impl<'a> Segs<'a> {
                 self.off = 0;
                 continue;
             }
-            match pin_user(&mut pp, addr, want, write, max) {
+            let flags = if write { crate::mm::gup::FOLL_WRITE } else { 0 };
+            match pin_user(&mut pp, addr, want, flags, max) {
                 Ok(n) => {
                     self.advance(n);
                     if n < want {

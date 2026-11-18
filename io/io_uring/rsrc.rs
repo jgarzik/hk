@@ -13,8 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::iov::IoVec;
-use crate::fs::iov_iter::IovDest;
-use crate::mm::gup::{PinnedPages, PinnedSlice};
+use crate::mm::gup::{FOLL_LONGTERM, FOLL_WRITE, PinnedPages, PinnedSlice, pin_user};
 use crate::task::{Ucount, UcountsRef};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -84,15 +83,15 @@ impl RegBuf {
             return Err(KernelError::BadAddress);
         }
         base.checked_add(len).ok_or(KernelError::Overflow)?;
-        let segs = [IoVec {
-            iov_base: base,
-            iov_len: len,
-        }];
-        // Pinned writable, as Linux (FOLL_WRITE): reads land in it
-        let mut it = IovDest::user(&segs, usize::MAX);
-        let n = it.npages(usize::MAX);
-        let pins = it.get_pages(n, 0, 0).map_err(|_| KernelError::BadAddress)?;
-        if pins.len() as u64 != len {
+        // Pinned writable and long-term, as Linux io_pin_pages
+        // (FOLL_WRITE | FOLL_LONGTERM): reads land in it, and a mapping
+        // that tracks dirtying is refused
+        let n = (base % PAGE + len).div_ceil(PAGE) as usize;
+        let mut pins = PinnedPages::new(n)?;
+        // At most 1 GiB: lossless
+        let got = pin_user(&mut pins, base, len as usize, FOLL_WRITE | FOLL_LONGTERM, n)
+            .map_err(|_| KernelError::BadAddress)?;
+        if got as u64 != len {
             return Err(KernelError::BadAddress);
         }
         account(user, pins.nr_pages() as u64)?;

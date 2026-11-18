@@ -788,13 +788,15 @@ fn truncate_pages(m: &AddressSpace, from: u64, last: u64) {
 }
 
 /// Drop every page of a mapping nobody else can reach any more (Linux
-/// truncate_inode_pages_final, from eviction): pages with private data
-/// (buffers) through ->invalidate_folio under their lock, as Linux
-/// truncates every page; the rest with no page lock and no sleep. A
-/// page whose buffers stay busy (a reference held elsewhere) leaves
-/// with them.
+/// truncate_inode_pages_final, from eviction): every page locked and
+/// truncated, as Linux, so a holder of a page's lock
+/// (`folio_mark_dirty_lock`) keeps the mapping and its inode until it
+/// unlocks. A page whose buffers stay busy (a reference held elsewhere)
+/// leaves with them. Nothing adds a page meanwhile (no reference is
+/// left): the tree is empty after, and its nodes go.
 fn truncate_final(m: &AddressSpace) {
-    truncate_private(m);
+    truncate_pages(m, 0, u64::MAX);
+    debug_assert_eq!(m.nrpages(), 0, "filemap: a page added in teardown");
     count_file(m, -(m.nrpages() as i64));
     m.uncharge(m.nrpages());
     let mut pages = m.i_pages.lock();
@@ -807,44 +809,10 @@ fn truncate_final(m: &AddressSpace) {
     m.nrpages.store(0, Ordering::Relaxed);
 }
 
-/// Truncate the pages of `m` that have private data (`truncate_final`)
-fn truncate_private(m: &AddressSpace) {
-    let mut at = 0;
-    while m.nrpages() != 0 {
-        let next = {
-            let pages = m.i_pages.lock();
-            let mut i = at;
-            loop {
-                match pages.find(i, u64::MAX, None) {
-                    Some((index, p)) if folio_private(p).is_some() => {
-                        break FRAME_ALLOCATOR.incref(p).then_some((index, p));
-                    }
-                    Some((index, _)) => match index.checked_add(1) {
-                        Some(n) => i = n,
-                        None => break None,
-                    },
-                    None => break None,
-                }
-            }
-        };
-        let Some((index, phys)) = next else {
-            return;
-        };
-        lock_page(phys);
-        truncate_folio(m, phys);
-        unlock_page(phys);
-        put_page(phys);
-        match index.checked_add(1) {
-            Some(n) => at = n,
-            None => return,
-        }
-    }
-}
-
 /// Set the page's dirty bit and the mapping's DIRTY mark, and mark its
 /// inode dirty (Linux folio_mark_dirty: ->dirty_folio, whose
 /// __folio_mark_dirty calls __mark_inode_dirty(I_DIRTY_PAGES)). Under
-/// the page lock at most
+/// the page lock, the page in `m` or truncated from it.
 pub fn dirty_page(m: &AddressSpace, phys: u64) {
     if !m.aops().can_dirty() {
         return;
@@ -862,12 +830,59 @@ pub fn dirty_folio(m: &AddressSpace, phys: u64) {
 }
 
 /// Mark the mapping's inode dirty for its pages (Linux
-/// __mark_inode_dirty(I_DIRTY_PAGES)), a reference taken unless its
-/// last went (Linux skips an I_FREEING inode)
-pub fn mark_host_dirty(m: &AddressSpace) {
-    if let Some(inode) = host_igrab(m) {
-        crate::fs::pageio::fs_writeback::mark_inode_dirty_pages(&inode);
+/// __mark_inode_dirty(mapping->host, I_DIRTY_PAGES)), borrowed with the
+/// mapping, no reference taken: one being freed is skipped there
+fn mark_host_dirty(m: &AddressSpace) {
+    if let Some(inode) = m.host() {
+        crate::fs::pageio::fs_writeback::mark_inode_dirty_pages(inode);
     }
+}
+
+/// Dirty the page at `phys` under its lock (Linux folio_mark_dirty_lock,
+/// as unpin_user_pages_dirty_lock calls it for a page not yet dirty): a
+/// page-cache page through its mapping (`dirty_page`), which the lock
+/// keeps (removal from a cache takes the page lock, and an inode's
+/// teardown truncates every page under it before the mapping goes); a
+/// page in no mapping (anonymous, or truncated meanwhile) gets its
+/// dirty bit only (Linux noop_dirty_folio). Thread context; the caller
+/// holds a reference on the page.
+pub fn folio_mark_dirty_lock(phys: u64) {
+    if page_dirty(phys) {
+        return;
+    }
+    lock_page(phys);
+    // SAFETY: locked here until after the borrow's last use
+    match unsafe { locked_mapping(phys) } {
+        Some(m) => dirty_page(m, phys),
+        None => {
+            test_set_page_dirty(phys);
+        }
+    }
+    unlock_page(phys);
+}
+
+/// The page-cache mapping of the locked page at `phys` (Linux
+/// folio->mapping under the folio lock)
+///
+/// # Safety
+/// The caller holds the page's lock as long as the borrow lives.
+unsafe fn locked_mapping<'a>(phys: u64) -> Option<&'a AddressSpace> {
+    let pg = page(phys);
+    if pg.flags.load(Ordering::Acquire) & (PG_ANON | PG_SLAB) != 0 {
+        return None;
+    }
+    let key = pg.mapping.load(Ordering::Acquire);
+    if key == 0 || key & 1 != 0 {
+        return None;
+    }
+    // SAFETY: a page-cache page's mapping word is its AddressSpace's
+    // address (`insert`); it is cleared only under the page lock
+    // (`remove`, `truncate_final`'s truncation, an insert undone on a
+    // page its inserter locked), and the inode holding the mapping is
+    // torn down only after `truncate_final` locked every page, so the
+    // mapping lives while the caller holds this page's lock (its
+    // contract)
+    Some(unsafe { &*(key as *const AddressSpace) })
 }
 
 /// A reference on the mapping's inode, unless it has none or its last

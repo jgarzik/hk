@@ -8,6 +8,11 @@
 //! - IO_URING_REG_BUFFERS: registering twice is EBUSY, none EINVAL, a
 //!   buffer past 1 GiB or a null one with a length EFAULT; unregistering
 //!   with none is ENXIO
+//! - IO_URING_REG_FILE_MAP: a shared writable mapping of a vda1 vfat
+//!   file (a filesystem that writes back) is EFAULT, its pages never
+//!   pinned long-term behind the filesystem's back (Linux check_vma_flags:
+//!   writable_file_mapping_allowed); a shared anonymous one (shmem,
+//!   which does not) registers. The vfat then unmounts.
 //! - IO_URING_MEMLOCK: without CAP_IPC_LOCK the pinned pages count
 //!   against RLIMIT_MEMLOCK (ENOMEM past it)
 //! - IO_URING_MEMLOCK_NTH (hk only: Linux 6.8 does not charge the
@@ -22,9 +27,10 @@ use crate::helpers::{BlkDev, find_blkdev, host_mode, skip};
 use crate::io::fault_inject::{get, set};
 use hk_syscall::{
     IORING_OP_READ_FIXED, IORING_OP_WRITE_FIXED, IORING_REGISTER_BUFFERS,
-    IORING_UNREGISTER_BUFFERS, IoUringParams, IoVec, O_RDWR, RLIMIT_MEMLOCK, RLimit, sys_close,
-    sys_exit, sys_fork, sys_io_uring_register, sys_io_uring_setup, sys_open, sys_setrlimit,
-    sys_wait4,
+    IORING_UNREGISTER_BUFFERS, IoUringParams, IoVec, MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_RDWR,
+    O_TRUNC, PROT_READ, PROT_WRITE, RLIMIT_MEMLOCK, RLimit, sys_close, sys_exit, sys_fork,
+    sys_io_uring_register, sys_io_uring_setup, sys_mkdir, sys_mmap, sys_mount, sys_munmap,
+    sys_open, sys_pwrite64, sys_rmdir, sys_setrlimit, sys_umount2, sys_unlink, sys_wait4,
 };
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
@@ -44,6 +50,10 @@ pub fn run_tests() {
     }
     report_r(b"IO_URING_FIXED_EFAULT", efault());
     report_r(b"IO_URING_REG_BUFFERS", reg_errors());
+    match find_blkdev(b"vd", 32768) {
+        Some(p1) => report_r(b"IO_URING_REG_FILE_MAP", reg_file_map(&p1)),
+        None => report_r(b"IO_URING_REG_FILE_MAP", check(b"no vda1", false, 0)),
+    }
     memlock();
     if host_mode() {
         skip(
@@ -155,6 +165,65 @@ fn reg_errors() -> R {
     check(b"unregister", n == 0, n)?;
     let n = unreg();
     check(b"unregister none", n == ENXIO, n)
+}
+
+const MNT: &[u8] = b"/tmp/uring_vfat\0";
+const FILE: &[u8] = b"/tmp/uring_vfat/reg.dat\0";
+const MAP: usize = 8192;
+
+fn reg_file_map(p1: &BlkDev) -> R {
+    let mut p = [0u8; 48];
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(MNT.as_ptr(), 0o755);
+    let m = sys_mount(
+        p1.path(&mut p).as_ptr(),
+        MNT.as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        // A charset every Linux config has (its default may be absent)
+        b"iocharset=cp437\0".as_ptr() as u64,
+    );
+    check(b"mount", m == 0, m)?;
+    let r = reg_file_map_in();
+    sys_unlink(FILE.as_ptr());
+    let u = sys_umount2(MNT.as_ptr(), 0);
+    sys_rmdir(MNT.as_ptr());
+    r?;
+    check(b"umount", u == 0, u)
+}
+
+/// Register `len` bytes at `addr` alone in a new ring: its result, the
+/// buffer unregistered again on success
+fn register_one(addr: u64, len: usize) -> Result<i64, (&'static [u8], i64)> {
+    let r = Ring::simple(4).map_err(|e| (&b"ring"[..], e))?;
+    let n = register(&r, &[iov(addr, len)]);
+    if n == 0 {
+        sys_io_uring_register(r.fd as u32, IORING_UNREGISTER_BUFFERS, 0, 0);
+    }
+    Ok(n)
+}
+
+/// A shared mapping of `fd`'s first `MAP` bytes registered: its result
+fn register_map(fd: i32, flags: u32) -> Result<i64, (&'static [u8], i64)> {
+    let a = sys_mmap(0, MAP as u64, PROT_READ | PROT_WRITE, flags, fd, 0);
+    check(b"mmap", a >= 0, a)?;
+    let n = register_one(a as u64, MAP);
+    sys_munmap(a as u64, MAP as u64);
+    n
+}
+
+fn reg_file_map_in() -> R {
+    let fd = sys_open(FILE.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    check(b"open", fd >= 0, fd)?;
+    let fd = fd as i32;
+    let data = [0x5au8; MAP];
+    let w = sys_pwrite64(fd, data.as_ptr(), MAP as u64, 0);
+    let n = register_map(fd, MAP_SHARED);
+    sys_close(fd as u64);
+    check(b"write", w == MAP as i64, w)?;
+    check(b"vfat shared", n? == EFAULT, 0)?;
+    let n = register_map(-1, MAP_SHARED | MAP_ANONYMOUS)?;
+    check(b"shared anonymous", n == 0, n)
 }
 
 /// In a child: no capabilities, RLIMIT_MEMLOCK 64 KiB; a 256 KiB buffer
