@@ -14,6 +14,7 @@ use crate::block::BlockDevice;
 use crate::block::blkdev::{BioOp, bdev_rw_bytes};
 use crate::fs::buffer::{self, BufferHead};
 use crate::fs::inode::Inode;
+use crate::fs::mpage;
 use crate::mm::filemap::{self, AddressSpace, Aops, PAGE_SIZE};
 use crate::util::error::KernelError;
 
@@ -168,10 +169,11 @@ impl Aops for VfatAops {
         buffer::block_dirty_folio(m, phys);
     }
 
-    /// Linux block_read_full_folio, which unlocks the page when the read
-    /// ends; hk's ->read_folio returns it locked, so it is locked again
+    /// Linux fat_read_folio: mpage_read_folio, which unlocks the page
+    /// when the read ends; hk's ->read_folio returns it locked, so it is
+    /// locked again
     fn read_folio(&self, inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
-        buffer::block_read_full_folio(inode, phys, fat_get_block);
+        mpage::mpage_read_folio(inode, phys, fat_get_block);
         crate::mm::page::lock_page(phys);
         if filemap::uptodate(phys) {
             Ok(())
@@ -180,9 +182,11 @@ impl Aops for VfatAops {
         }
     }
 
-    /// Linux block_write_full_folio: the dirty buffers only
+    /// Linux fat_writepages: mpage_writepages, a page at a time
+    /// (`mpage_write_folio`): one bio for a page of contiguous dirty
+    /// blocks, else its dirty buffers only
     fn writepage(&self, inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
-        buffer::block_write_full_folio(inode, phys, fat_get_block)
+        mpage::mpage_write_folio(inode, phys, fat_get_block)
     }
 
     /// Linux fat_write_begin: cont_write_begin over mmu_private, a

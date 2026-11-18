@@ -39,6 +39,7 @@ pub mod libfs;
 pub mod link;
 pub mod locks;
 pub mod misc;
+pub mod mpage;
 pub mod nav;
 pub mod open;
 pub mod perm;

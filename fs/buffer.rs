@@ -90,7 +90,9 @@ const MAX_BUF_PER_PAGE: usize = PAGE_SIZE / 512;
 
 /// The block mapping of a filesystem (Linux get_block_t): map block
 /// `iblock` of `inode` into `bh` (b_bdev, b_blocknr, BH_Mapped), with
-/// `create` allocating it (and setting BH_New) if it has none
+/// `create` allocating it (and setting BH_New) if it has none; `bh`'s
+/// size in, the bytes mapped from there out (a map buffer's, from
+/// `BufferHead::new_map`, may span blocks)
 pub type GetBlock =
     fn(inode: &Inode, iblock: u64, bh: &BufferHead, create: bool) -> Result<(), KernelError>;
 
@@ -104,7 +106,9 @@ pub type GetBlock =
 /// - Alive from `folio_alloc_buffers` to `free_buffer_head`, which only
 ///   `try_to_free_buffers` (no buffer of the ring busy, page lock and
 ///   `i_private_lock` held, ring detached) and the unwinding of a ring
-///   never attached call.
+///   never attached call. A map buffer (`new_map`) is its owner's
+///   value instead, of no page and no ring, never shared: the rest
+///   holds for a page's buffers.
 /// - `b_this_page` links the ring of its page; set before the ring is
 ///   attached, fixed until it is freed.
 /// - `b_folio` and `b_data` are fixed; while alive, its page is held by
@@ -140,7 +144,27 @@ pub struct BufferHead {
     b_uptodate_lock: IrqSpinlock<()>,
 }
 
+impl Drop for BufferHead {
+    /// Its `b_bdev` Weak goes with it
+    fn drop(&mut self) {
+        put_bdev(*self.b_bdev.get_mut());
+    }
+}
+
 impl BufferHead {
+    /// A buffer of no page, for a get_block to map up to `size` bytes
+    /// into (Linux a buffer_head on the stack: mpage's map_bh,
+    /// generic_block_bmap's): never in a ring, locked or submitted
+    pub fn new_map(size: usize) -> Self {
+        Self::new(0, 0, size)
+    }
+
+    /// Forget a map buffer's mapping before the next get_block (Linux
+    /// map_bh->b_state = 0)
+    pub fn clear_state(&self) {
+        self.b_state.store(0, Ordering::Relaxed);
+    }
+
     fn new(folio: u64, offset: usize, size: usize) -> Self {
         Self {
             b_state: AtomicU32::new(0),
@@ -286,7 +310,7 @@ impl BufferHead {
     }
 
     /// Its device, if set and still there
-    fn bdev(&self) -> Option<Arc<BlockDevice>> {
+    pub(crate) fn bdev(&self) -> Option<Arc<BlockDevice>> {
         let p = self.b_bdev.load(Ordering::Acquire);
         if p.is_null() {
             return None;
@@ -332,7 +356,7 @@ fn put_bdev(p: *mut BlockDevice) {
 
 /// Zero `len` bytes of page `phys` at `off`, which a mapping may access
 /// meanwhile (Linux folio_zero_range)
-fn zero_frame(phys: u64, off: usize, len: usize) {
+pub(crate) fn zero_frame(phys: u64, off: usize, len: usize) {
     const Z: [u8; 64] = [0; 64];
     let mut done = 0;
     while done < len {
@@ -349,7 +373,7 @@ fn zero_frame(phys: u64, off: usize, len: usize) {
 /// # Safety
 /// The caller holds the page lock, the mapping's `i_private_lock`, or a
 /// reference on a buffer of the page, for `'a`.
-unsafe fn folio_buffers<'a>(phys: u64) -> Option<&'a BufferHead> {
+pub(crate) unsafe fn folio_buffers<'a>(phys: u64) -> Option<&'a BufferHead> {
     let p = filemap::folio_private(phys)? as *const BufferHead;
     // SAFETY: a page's private word holds the head of its ring (only
     // this module attaches one), freed only under both the page lock
@@ -359,7 +383,7 @@ unsafe fn folio_buffers<'a>(phys: u64) -> Option<&'a BufferHead> {
 }
 
 /// The buffers of a ring, from `head` around
-fn ring(head: &BufferHead) -> impl Iterator<Item = &BufferHead> {
+pub(crate) fn ring(head: &BufferHead) -> impl Iterator<Item = &BufferHead> {
     let mut cur = Some(head);
     core::iter::from_fn(move || {
         let bh = cur?;
@@ -496,7 +520,7 @@ pub fn wait_on_buffer(bh: &BufferHead) {
 /// The read of the locked page `phys` ended (Linux folio_end_read):
 /// uptodate if it worked, then unlocked. Any context; the page is not
 /// touched after
-fn folio_end_read(phys: u64, uptodate: bool) {
+pub(crate) fn folio_end_read(phys: u64, uptodate: bool) {
     if uptodate {
         filemap::set_uptodate(phys);
     }
@@ -505,13 +529,13 @@ fn folio_end_read(phys: u64, uptodate: bool) {
 
 /// The locked page `phys` goes under writeback (Linux
 /// folio_start_writeback)
-fn folio_start_writeback(phys: u64) {
+pub(crate) fn folio_start_writeback(phys: u64) {
     filemap::set_writeback(phys, true);
 }
 
 /// Its writeback ended (Linux folio_end_writeback): any context; the
 /// page is not touched after the flag clears
-fn folio_end_writeback(phys: u64) {
+pub(crate) fn folio_end_writeback(phys: u64) {
     let q = page_wait_queue(phys);
     filemap::set_writeback(phys, false);
     fence(Ordering::SeqCst);
@@ -519,7 +543,7 @@ fn folio_end_writeback(phys: u64) {
 }
 
 /// Wait for its writeback to end (Linux folio_wait_writeback)
-fn folio_wait_writeback(phys: u64) {
+pub(crate) fn folio_wait_writeback(phys: u64) {
     page_wait_queue(phys).wait_event(|| !filemap::writeback(phys));
 }
 
@@ -532,7 +556,7 @@ type BhEndIo = fn(Box<Bio>);
 
 /// Cut a bio that runs past the end of its device to the device's end
 /// (Linux guard_bio_eod, bio_truncate): a read's part past it zeroed
-fn guard_bio_eod(bdev: &BlockDevice, bio: &mut Bio) {
+pub(crate) fn guard_bio_eod(bdev: &BlockDevice, bio: &mut Bio) {
     let max = bdev.nr_sects();
     if max == 0 || bio.sector >= max {
         return;
@@ -786,7 +810,6 @@ unsafe fn free_buffer_head(p: *const BufferHead) {
     // access
     let bh = unsafe { &*p };
     debug_assert!(!bh.b_assoc_buffers.is_listed());
-    put_bdev(bh.b_bdev.swap(null_mut(), Ordering::Relaxed));
     // SAFETY: from `Box::into_raw` in `folio_alloc_buffers`, freed once
     drop(unsafe { Box::from_raw(p.cast_mut()) });
 }
@@ -1662,7 +1685,7 @@ pub fn block_write_full_folio(
 
 /// A newly allocated block's device-cache alias stops being written
 /// (Linux clean_bdev_bh_alias)
-fn clean_bdev_bh_alias(bh: &BufferHead) {
+pub(crate) fn clean_bdev_bh_alias(bh: &BufferHead) {
     if let Some(b) = bh.bdev() {
         clean_bdev_aliases(&b, bh.blocknr(), 1);
     }

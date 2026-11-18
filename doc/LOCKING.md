@@ -2731,6 +2731,14 @@ buffer lock.)
   for the writeback to end (`PG_writeback`, the page's wait queue),
   where Linux unlocks it after submitting; ->read_folio locks the page
   again after block_read_full_folio's completion unlocked it.
+- mpage (`fs/mpage.rs`, Linux fs/mpage.c; vfat files): a page whose
+  blocks are contiguous on the disk is read or written in one bio of
+  its own, mapped under its page lock through a map buffer (a
+  `BufferHead::new_map` value of the caller's, Linux an on-stack
+  buffer_head, never shared); the bio's completion (hardirq) ends the
+  page's read (unlocks it) or writeback. The synchronous ->writepage
+  waits for the writeback to end under the page lock; its outcome,
+  on the writer's stack, is written by the completion before that.
 - A buffer's `b_size` is its block size, which get_block stores again
   (Linux map_bh) under the page lock, never another value.
 - A buffer's `b_bdev` holds a `Weak` of its device, changed only while

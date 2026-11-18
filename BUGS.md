@@ -160,6 +160,12 @@ Missing:
   and pipe allocations that may sleep reclaim directly; atomic heap
   allocations never do, so with anonymous memory filling RAM they fail
   at the low watermark until kswapd (J) keeps free memory above it.
+- No readahead (Linux page_cache_ra_*, ->readahead): a page is read
+  by its own ->read_folio when first needed, so a vfat file has no
+  mpage_readahead (`fs/mpage.rs`). ->writepage is synchronous, a page
+  at a time (Linux ->writepages: mpage_writepages adds contiguous
+  pages to one bio and unlocks each once added): a vfat page goes to
+  the disk in a bio of its own, its writer waiting.
 - File mappings: no fault-around (Linux maps up to 16 cached pages
   per read fault); filesystems without a page cache (procfs) still
   map a private copy.
