@@ -3041,7 +3041,17 @@ inodes; then any inode left on s_inodes is a bug, reported as Linux's
 past its superblock's end, which nothing that pins the filesystem (a
 mount, an open file, a writeback pass under s_umount, a walk under
 s_umount) leaves, and no pinned page does (a pin holds the page, not
-its inode); each such inode is poisoned, as Linux, under the
+its inode). Nor does any put an inode during the shutdown, so none is
+mid-eviction (off s_inodes, in ->evict_inode) when put_super's queued
+release runs: every inode reference is held under a mount, an active
+reference or s_umount and put before it (a file's write access and
+per-open data before its dentry and mount, Linux __fput; a bound
+AF_UNIX socket's path, mount included, Linux u->path; a link level's
+inode before its path; writeback's under s_umount; the s_inodes walks'
+under s_umount), an inotify watch's is waited for by the shutdown
+(`s_fsnotify_watched`, Linux fsnotify_sb_watched_objects), and no
+inode's RCU-freed data holds another inode (tracefs reads its root
+through the superblock). Each busy inode is poisoned, as Linux, under the
 s_inodes lock and its `i_lock` (`inode::sb_poison`: `I_POISON` stands
 for VFS_PTR_POISON in i_op, i_sb and i_mapping, so `Inode::i_op`,
 `Inode::superblock` and `Inode::i_mapping` panic "VFS: poisoned
@@ -3116,16 +3126,15 @@ it too. No lock is added.
 inode_sb_list_add/del): every inode made with `Inode::alloc` is on its
 superblock's `s_inodes` (an `InodeList` through `Inode.i_sb_list`,
 holding no reference) until
-its teardown (`destroy_inode`, its superblock reference's drop next)
-unlinks it, under the list's own lock (`SuperBlock.s_inodes`, a spin Mutex leaf, thread
+its eviction (`evict`) unlinks it, under the list's own lock (`SuperBlock.s_inodes`, a spin Mutex leaf, thread
 context; Linux s_inode_list_lock): the inode's superblock reference
 keeps the lock's memory, and the shutdown evicts every inode while the
-superblock runs (Inode cache, above). Deviation from Linux (evict's
-inode_sb_list_del comes before ->evict_inode): unlinked last, so a
-listed inode is any that may still use its filesystem's data, which
-the shutdown's busy check tests under this lock (walkers skip one
-being freed either way: igrab fails). Taken by an inode's teardown,
-with nothing held, and by the shutdown's busy check and poisoning
+superblock runs (Inode cache, above). Unlinked as Linux evict's
+inode_sb_list_del: after the writeback list, before ->evict_inode, so
+an inode mid-eviction is not listed; none is when the shutdown's busy
+check runs (Inode cache, above: nothing puts an inode during the
+shutdown). Taken by an inode's eviction, with nothing held, and by the
+shutdown's busy check and poisoning
 (`sb_busy`, `sb_poison`); under it only an inode's `i_lock` (igrab's
 slow path, the poison bit). The
 reclaim and drop_caches walks and the inotify shutdown

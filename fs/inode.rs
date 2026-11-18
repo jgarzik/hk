@@ -1096,7 +1096,7 @@ pub struct Inode {
     /// Identity for shared futex keys (Linux i_sequence)
     pub(crate) i_sequence: crate::task::futex::KeySeq,
     /// On its superblock's `s_inodes` (Linux i_sb_list), from
-    /// [`Inode::alloc`] to its teardown (`destroy_inode`)
+    /// [`Inode::alloc`] to its eviction
     pub(super) i_sb_list: list::Link,
     /// A symlink's target, set before the inode is visible and fixed
     /// from then on (Linux i_link, inode_set_cached_link: tmpfs's
@@ -1130,10 +1130,10 @@ crate::adapter!(pub SbInodeA, Inode, i_sb_list);
 /// in an interrupt handler: pinned pages and files are released in
 /// thread context, `PinnedPages`, `fput`; lockdep reports a tracked
 /// spin lock taken in one); under it only an inode's `i_lock` (igrab).
-/// An inode is linked by `Inode::alloc` and unlinked by its teardown
-/// (`destroy_inode`), past any use of its filesystem's data, which runs
-/// while its superblock is (the inode's reference keeps the memory, its
-/// shutdown evicts every inode before it ends).
+/// An inode is linked by `Inode::alloc` and unlinked by its eviction,
+/// before ->evict_inode (Linux), which runs while its superblock is (the
+/// inode's reference keeps the memory, its shutdown evicts every inode
+/// before it ends).
 pub type SbInodes = Mutex<InodeList<SbInodeA>>;
 
 /// A superblock's empty `s_inodes`
@@ -2086,11 +2086,11 @@ pub struct InodeInit {
 }
 
 /// Linux evict: the inode, I_FREEING with no reference left, leaves the
-/// writeback lists (the lists' contract, `InodeList`), its filesystem
-/// releases what it still owns while it is still hashed and it is
-/// unhashed, the cache's waiters woken (`icache::evict`); then its
-/// fields go and it leaves its superblock's list (`destroy_inode`), and
-/// its memory is freed a grace period later (`i_callback`).
+/// writeback and superblock lists (the lists' contract, `InodeList`),
+/// its filesystem releases what it still owns while it is still hashed
+/// and it is unhashed, the cache's waiters woken (`icache::evict`);
+/// then its fields go (`destroy_inode`) and its memory is freed a grace
+/// period later (`i_callback`).
 ///
 /// # Safety
 /// `p` is I_FREEING with its count at zero; called once.
@@ -2099,6 +2099,7 @@ unsafe fn evict(p: NonNull<Inode>) {
         // SAFETY: live until the free queued below
         let i = unsafe { p.as_ref() };
         super::pageio::fs_writeback::inode_io_list_del(i);
+        sb_list_del(i);
         // Linux evict: inode_wait_for_writeback (a writer holds a
         // reference here, so none is left to wait for)
         drop(super::pageio::fs_writeback::inode_wait_for_writeback(
@@ -2147,13 +2148,6 @@ unsafe fn destroy_inode(i: *mut Inode) {
     unsafe { drop_field(&raw mut (*i).private) };
     // SAFETY: as above
     unsafe { drop_field(&raw mut (*i).i_pipe) };
-    // Off s_inodes with only its superblock reference left (Linux
-    // evict's inode_sb_list_del, before ->evict_inode there): a listed
-    // inode is one that may still use its filesystem's data
-    // (`generic_shutdown_super`'s busy check, `kill_fs_info_rcu`)
-    // SAFETY: live memory until `i_callback`; the fields read (its
-    // superblock, its list link) are not dropped yet
-    sb_list_del(unsafe { &*i });
     // SAFETY: as above
     unsafe { drop_field(&raw mut (*i).sb) };
     let p = i.cast_const().cast::<()>();

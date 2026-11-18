@@ -907,10 +907,13 @@ unsafe fn msdos_sb(sb: &SuperBlock) -> &VfatSbData {
 /// The VFAT data of `inode`'s filesystem (Linux
 /// MSDOS_SB(inode->i_sb)): borrowed with the inode
 fn msdos_sb_of(inode: &Inode) -> &VfatSbData {
-    // SAFETY: `inode` is live for the borrow and was not poisoned when
-    // it was taken (`i_sb` panics on one): the shutdown evicts every
-    // inode before put_super, whose queued release runs only if none is
-    // left on s_inodes, else poisons them and keeps the data with the
+    // SAFETY: `inode` is live (or being evicted) for the borrow and was
+    // not poisoned when it was taken (`i_sb` panics on one): the
+    // shutdown evicts every inode before put_super, and nothing puts one
+    // during it (every inode reference is held under a mount, an active
+    // reference or s_umount: LOCKING.md, Inode cache), so put_super's
+    // queued release runs only with no inode live or mid-eviction; with
+    // one left on s_inodes it poisons them and keeps the data with the
     // superblock's memory, which `inode` keeps (`kill_fs_info_rcu`)
     unsafe { msdos_sb(i_sb(inode)) }
 }
