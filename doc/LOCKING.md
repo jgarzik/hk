@@ -3651,7 +3651,11 @@ class), replaced by a mount or remount and read by show_options; the
 owner an inode takes from the root (Linux set_tracefs_inode_owner) is
 written with no lock, by permission (an RCU walk's too) and getattr,
 from the root's ids and the inode's PERM_SET flags (atomics, as Linux
-writes i_uid there); a uid=/gid= remount walks the superblock's inodes
+writes i_uid there), the root's inode borrowed with no reference under
+`SuperBlock.root` (a spin RwLock leaf: written only by the fill's
+`set_root` and the shutdown's take) and an RCU guard (Linux
+ti->private, a plain pointer: no inode holds another, so none is put
+from an inode's RCU-freed data); a uid=/gid= remount walks the superblock's inodes
 (`for_each_sb_inode`, Linux the tracefs_inodes RCU list) setting them.
 
 #### kernfs / sysfs (fs/kernfs/, fs/kernfs/sysfs.rs; Linux fs/kernfs)
