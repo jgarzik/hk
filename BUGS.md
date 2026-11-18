@@ -293,10 +293,13 @@ lo (hk has no checksum offload states).
   fat__get_entry ends the directory there.
 - No FAT attribute bits on the inode: write_inode does not write
   them (Linux fat_make_attrs, ATTR_RO from the mode, ATTR_HIDDEN etc.
-  kept in MSDOS_I(inode)->i_attrs).
+  kept in MSDOS_I(inode)->i_attrs), and the first write after one is
+  cleared does not set ATTR_ARCH with the times (Linux fat_write_end).
 - No `sbi->s_lock` mutex around namespace operations (Linux
   vfat_create, vfat_rename etc. take it).
-- A directory's i_size is 0 (Linux: its chain length, fat_calc_dir_size).
+- A directory's i_size is 0 and its cluster count (`VfatInodeData.clusters`,
+  Linux i_blocks) not kept (Linux: its chain length, fat_calc_dir_size),
+  so `fat_chain_add` checks only a file's count against its chain.
 - No FSINFO: the free count and next-free hint are kept in memory
   only (Linux fat_set_state / fat_clusters_flush).
 
@@ -310,10 +313,6 @@ lo (hk has no checksum offload states).
   and takes the cached path; Linux sends bios from it (ITER_KVEC) with
   the same alignment rules. Pinned pages (Linux ITER_BVEC: io_uring's
   registered buffers) go to bios through `dio::submit_async`.
-- vfat writes a file page back whole (`VfatAops::writepage`); Linux
-  writes only its dirty blocks (buffer heads), so a block of the page
-  changed on disk behind the cache (a raw device write) is overwritten
-  by hk with the cached copy.
 
 ## Linux AIO gaps
 

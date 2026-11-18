@@ -1524,17 +1524,21 @@ pub fn unmap_pages(m: &AddressSpace, from: u64, last: u64) {
     }
 }
 
-/// Set i_size and drop the cache beyond it (Linux truncate_setsize +
-/// truncate_pagecache): mappings of the pages past the new size are
-/// zapped (before and after, catching a fault that raced), the pages
-/// removed, and the partial last page zeroed past the size. The
-/// caller holds i_rwsem.
+/// Set i_size and drop the cache beyond it (Linux truncate_setsize):
+/// `truncate_pagecache` when it shrinks. The caller holds i_rwsem.
 pub fn truncate_setsize(inode: &Inode, size: u64) {
     let old = inode.get_size();
     inode.set_size(size);
-    if size >= old {
-        return;
+    if size < old {
+        truncate_pagecache(inode, size);
     }
+}
+
+/// Drop the cache beyond byte `size` (Linux truncate_pagecache):
+/// mappings of the pages past it are zapped (before and after, catching
+/// a fault that raced), the pages removed, and the partial last page
+/// zeroed past it. The caller holds i_rwsem.
+pub fn truncate_pagecache(inode: &Inode, size: u64) {
     let m = &inode.i_data;
     let from = size.div_ceil(PAGE_SIZE as u64);
     unmap_mapping_range(m, from);

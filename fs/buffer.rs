@@ -107,8 +107,9 @@ pub type GetBlock =
 ///   never attached call.
 /// - `b_this_page` links the ring of its page; set before the ring is
 ///   attached, fixed until it is freed.
-/// - `b_folio`, `b_size` and `b_data` are fixed; while alive, its page
-///   is held by the ring's page reference.
+/// - `b_folio` and `b_data` are fixed; while alive, its page is held by
+///   the ring's page reference. `b_size` is the block size, which a
+///   get_block may store again (Linux map_bh) but never changes.
 /// - `b_bdev` is null or a `Weak<BlockDevice>` from `Weak::into_raw`,
 ///   owned by the buffer. It changes only while BH_Mapped is clear
 ///   (under the page lock) or under the buffer lock (`discard_buffer`),
@@ -125,7 +126,7 @@ pub struct BufferHead {
     /// Start block number, in units of `b_size` (Linux b_blocknr)
     b_blocknr: AtomicU64,
     /// Size of the mapping (Linux b_size)
-    b_size: u32,
+    b_size: AtomicU32,
     /// Offset of the data in the page (Linux b_data - folio address)
     b_data: u32,
     /// The device (Linux b_bdev), a `Weak` (see Invariants)
@@ -147,7 +148,7 @@ impl BufferHead {
             b_this_page: AtomicPtr::new(null_mut()),
             b_folio: folio,
             b_blocknr: AtomicU64::new(u64::MAX),
-            b_size: size as u32,
+            b_size: AtomicU32::new(size as u32),
             b_data: offset as u32,
             b_bdev: AtomicPtr::new(null_mut()),
             b_assoc_buffers: AssocLink::new(),
@@ -249,7 +250,13 @@ impl BufferHead {
 
     /// Size in bytes (Linux b_size)
     pub fn size(&self) -> usize {
-        self.b_size as usize
+        self.b_size.load(Ordering::Relaxed) as usize
+    }
+
+    /// The bytes a get_block mapped (Linux bh->b_size = ...): a page
+    /// buffer's block size again, under its page lock
+    pub fn set_size(&self, size: usize) {
+        self.b_size.store(size as u32, Ordering::Relaxed);
     }
 
     /// Offset of its data in its page (Linux bh_offset)
@@ -1223,6 +1230,16 @@ pub fn sb_breadahead(sb: &SuperBlock, block: u64) {
     }
 }
 
+/// A get_block's mapping of `bh` to block `block` of the filesystem's
+/// device, one block long (Linux map_bh)
+pub fn map_bh(bh: &BufferHead, sb: &SuperBlock, block: u64) -> Result<(), KernelError> {
+    bh.set_bdev(sb_bdev(sb)?);
+    bh.set_mapped();
+    bh.set_blocknr(block);
+    bh.set_size(sb.s_blocksize() as usize);
+    Ok(())
+}
+
 // ============================================================================
 // Dirtying (Linux mark_buffer_dirty, block_dirty_folio)
 // ============================================================================
@@ -1828,6 +1845,103 @@ pub fn block_write_end(phys: u64, pos: u64, len: usize, copied: usize) -> usize 
     }
     block_commit_write(phys, start, start + copied);
     copied
+}
+
+/// Linux generic_write_end: block_write_end, i_size raised under the
+/// page lock (writeback zeroes past it), the page released, then the
+/// inode dirtied if its size changed. (Linux's pagecache_isize_extended
+/// write-protects the old last page for a ->page_mkwrite that allocates
+/// blocks: hk has none.) The bytes committed.
+pub fn generic_write_end(inode: &Inode, pos: u64, len: usize, copied: usize, phys: u64) -> usize {
+    let copied = block_write_end(phys, pos, len, copied);
+    let grown = pos + copied as u64 > inode.get_size();
+    if grown {
+        inode.set_size(pos + copied as u64);
+    }
+    crate::mm::page::unlock_page(phys);
+    filemap::put_page(phys);
+    if grown {
+        crate::fs::fs_writeback::mark_inode_dirty(inode);
+    }
+    copied
+}
+
+/// Round `bytes` up to the next block boundary (cont_expand_zero's
+/// `*bytes |= blocksize - 1; (*bytes)++` for an unaligned value)
+fn round_bytes(bytes: &AtomicU64, blocksize: u64) {
+    let b = bytes.load(Ordering::Relaxed);
+    if b & (blocksize - 1) != 0 {
+        bytes.store((b | (blocksize - 1)) + 1, Ordering::Relaxed);
+    }
+}
+
+/// Write `len` zeros at `pos` (one page) through the mapping's own
+/// ->write_begin and ->write_end (cont_expand_zero's step)
+fn cont_zero(inode: &Inode, pos: u64, len: usize) -> Result<(), KernelError> {
+    let a = inode.i_data.aops();
+    let phys = a.write_begin(inode, pos, len)?;
+    zero_frame(phys, (pos % PAGE_SIZE as u64) as usize, len);
+    let n = a.write_end(inode, pos, len, len, phys);
+    // Linux BUG_ON(err != len): a whole copy is always committed
+    debug_assert_eq!(n, len);
+    Ok(())
+}
+
+/// Zero the file from `bytes` (its initialized end) up to `pos` through
+/// the page cache, a page at a time (Linux cont_expand_zero): `bytes`
+/// is raised by the get_block of each block it allocates
+fn cont_expand_zero(inode: &Inode, pos: u64, bytes: &AtomicU64) -> Result<(), KernelError> {
+    let blocksize = buffer_size(inode) as u64;
+    let ps = PAGE_SIZE as u64;
+    let (index, offset) = (pos / ps, pos % ps);
+    let mut curpos = bytes.load(Ordering::Relaxed);
+    while index > curpos / ps {
+        let zerofrom = curpos % ps;
+        round_bytes(bytes, blocksize);
+        cont_zero(inode, curpos, (ps - zerofrom) as usize)?;
+        crate::mm::writeback::balance_dirty_pages(inode);
+        if crate::signal::fatal_signal_pending() {
+            return Err(KernelError::Interrupted);
+        }
+        curpos = bytes.load(Ordering::Relaxed);
+    }
+    // The page covers the boundary: zero up to `pos` in it, unless the
+    // write itself fills the last block
+    if index == curpos / ps && offset > curpos % ps {
+        round_bytes(bytes, blocksize);
+        cont_zero(inode, curpos, (offset - curpos % ps) as usize)?;
+    }
+    Ok(())
+}
+
+/// ->write_begin of a filesystem without holes (Linux cont_write_begin):
+/// the bytes from its initialized end `bytes` up to `pos` zeroed first
+/// (`cont_expand_zero`), then the page for the write; `bytes` is the
+/// filesystem's (vfat mmu_private), changed only under i_rwsem
+pub fn cont_write_begin(
+    inode: &Inode,
+    pos: u64,
+    len: usize,
+    get_block: GetBlock,
+    bytes: &AtomicU64,
+) -> Result<u64, KernelError> {
+    cont_expand_zero(inode, pos, bytes)?;
+    if pos + len as u64 > bytes.load(Ordering::Relaxed) {
+        round_bytes(bytes, buffer_size(inode) as u64);
+    }
+    block_write_begin(inode, pos, len, get_block)
+}
+
+/// Grow the file to `size` through an empty write there (Linux
+/// generic_cont_expand_simple): ->write_begin zeroes up to it and
+/// ->write_end raises i_size
+pub fn generic_cont_expand_simple(inode: &Inode, size: u64) -> Result<(), KernelError> {
+    inode.newsize_ok(size)?;
+    let a = inode.i_data.aops();
+    let phys = a.write_begin(inode, size, 0)?;
+    let n = a.write_end(inode, size, 0, 0, phys);
+    debug_assert_eq!(n, 0);
+    Ok(())
 }
 
 /// The bytes [from, from + count) of the page are all in uptodate

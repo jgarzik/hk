@@ -52,7 +52,8 @@ use crate::task::workqueue::{SYSTEM_WQ, Work};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
-use super::{VfatSbData, cache, get_inode_data, get_sb_data, vfat_write, write_failed};
+use super::aops::fat_write_failed;
+use super::{VfatSbData, cache, get_sb_data, mmu_private, vfat_write};
 
 /// Last byte of `count` (> 0) bytes at `pos`
 fn last(pos: u64, count: usize) -> u64 {
@@ -189,7 +190,7 @@ fn direct_write(
     let end = pos + count as u64;
     // Linux fat_direct_IO: blocks past mmu_private would need zeroing
     // first, so the whole write falls back to the cache
-    if get_inode_data(inode)?.mmu_private < end {
+    if mmu_private(inode)? < end {
         return Ok(0);
     }
     let sb = sb_of(inode)?;
@@ -202,10 +203,7 @@ fn direct_write(
     let n = match r {
         Ok(n) => n,
         Err(e) => {
-            // Linux fat_write_failed
-            if end > inode.get_size() {
-                let _ = write_failed(inode, &sb);
-            }
+            fat_write_failed(inode, end);
             return Err(e);
         }
     };
@@ -476,7 +474,7 @@ fn write_async(
         .ok_or(KernelError::InvalidArgument)?;
     let fits = !inode.is_swapfile()
         && end <= inode.get_size()
-        && get_inode_data(inode)?.mmu_private >= end
+        && mmu_private(inode)? >= end
         && inode.i_data.nrpages() == 0
         && inode.write_limit(pos, count) == Ok(count)
         && blocksize(&sb, pos, IovSource::async_io(&*io).alignment()).is_ok();

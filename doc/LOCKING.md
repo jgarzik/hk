@@ -2607,10 +2607,13 @@ its blocks in buffer heads (Buffer heads, below): vfat reads and
 writes all its metadata (FAT, directories, boot sector) in them, in the device's block size, which
 its mount sets to the FAT sector size (`sb_set_blocksize`), and the
 device's writepage writes only dirty buffers: a device-cache page may
-also hold file-data clusters, which the file's own cache writes. (A
-new directory cluster is zeroed in its buffers, Linux
-fat_zeroed_cluster; a new file cluster's buffers are cleaned, Linux
-clean_bdev_aliases: page lock -> buffer lock.)
+also hold file-data clusters, which the file's own cache writes. A
+vfat file's pages hold buffers of the same block size, mapped by
+fat_get_block (`fs/vfat/aops.rs`) under the file page's lock. (A new
+directory cluster is zeroed in its buffers, Linux fat_zeroed_cluster;
+a file block get_block maps new has its device-cache alias cleaned,
+Linux clean_bdev_bh_alias: file page lock -> device page lock ->
+buffer lock.)
 
 - `AddressSpace.i_pages` (`spin::Mutex<XArray>`, Linux xa_lock): the
   cached pages by index. Thread context only (no I/O completion or
@@ -2728,6 +2731,8 @@ clean_bdev_aliases: page lock -> buffer lock.)
   for the writeback to end (`PG_writeback`, the page's wait queue),
   where Linux unlocks it after submitting; ->read_folio locks the page
   again after block_read_full_folio's completion unlocked it.
+- A buffer's `b_size` is its block size, which get_block stores again
+  (Linux map_bh) under the page lock, never another value.
 - A buffer's `b_bdev` holds a `Weak` of its device, changed only while
   unmapped (page lock) or under the buffer lock: a locked, mapped
   buffer's is stable for its bio's submission. A buffer's I/O holds no
@@ -3048,7 +3053,10 @@ chain (`fat_free_clusters`, an unlinked file's from its eviction
 included) and the free count (`FatState.free`, Linux
 sbi->free_clusters: counted by the first statfs,
 `fat_count_free_clusters`, then kept by both). Taken under the inodes'
-`i_rwsem` (write and truncate paths) or with nothing held (eviction).
+`i_rwsem` (write, truncate and fallocate paths), under a file page's
+lock too where fat_get_block allocates the cluster a write reaches
+(->write_begin; Linux fat_add_cluster under the folio lock: page lock
+-> FAT lock), or with nothing held (eviction).
 Under it the FAT's blocks are read (`bread`: page lock, buffer lock,
 block I/O) and changed in their pinned buffers, which go on the FAT
 inode's metadata list (`MappingMetadataBhs.lock`, spin leaf; Linux
@@ -3108,8 +3116,9 @@ thread context only, never held with `VfatInode.d` and never across
 the FAT reads. It holds the cached runs, their id (Linux
 cache_valid_id) and the chain's first cluster, a copy of
 `VfatInodeData.start_cluster` that `set_start` updates after the
-data. A walk (`read_folio`/`writepage`/`swap_rw` under a page lock,
-direct I/O, the write and truncate paths under `i_rwsem`) takes, in
+data. A walk (fat_get_block under a page lock: reads, writeback,
+->write_begin; `swap_rw`, direct I/O, the write and truncate paths
+under `i_rwsem`) takes, in
 one hold, the first cluster, the id and its starting run, so the three
 always belong to one chain; it reads the FAT through the device cache
 with no lock held, then caches its run only if the id is unchanged. A
@@ -3121,7 +3130,17 @@ caches nothing, and one that begins after it stops at the new end, so
 no cached run can name a freed cluster. Walks that use what they find
 for I/O and can race a cut: writes, truncate and direct I/O are
 excluded by `i_rwsem`; page-cache reads past a shrinking end are the
-pages truncate drops first (`truncate_setsize` before `fat_free`).
+pages truncate drops first (`truncate_setsize` before `fat_free`),
+which discards their mapped buffers (block_invalidate_folio), so no
+buffer names a freed cluster.
+
+**vfat mmu_private** (`VfatInode.mmu_private`, Linux mmu_private):
+the bytes allocated and initialized, changed only under the inode's
+`i_rwsem` (cont_write_begin's zeroing and fat_get_block's allocation
+from ->write_begin, truncate, a failed write) and read under it (the
+direct I/O checks; fat_bmap with `create`, which only the write paths
+pass for blocks past the size). An atomic only so the shared inode
+can hold it; `i_rwsem` orders every access.
 
 **Dentry** (`fs/dentry.rs`):
 

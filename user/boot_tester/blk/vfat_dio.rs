@@ -53,6 +53,7 @@ pub fn run_tests() {
     report_r(b"VFAT_DIO_FRAG", frag(&p1));
     report_r(b"VFAT_DIO_EOF_TAIL", eof_tail());
     report_r(b"VFAT_WRITE_SHORT", write_short());
+    report_r(b"VFAT_PARTIAL_WB", partial_wb(&p1));
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
 }
@@ -338,8 +339,6 @@ fn read_disk(p1: &BlkDev) -> R {
         poke(p1, &b, at[5], b'X', 5)?;
         poke(p1, &b, at[3000], b'X', 3000)?;
         // Buffered, not written back: the direct read writes it back
-        // (another page than the units changed on disk: hk writes a
-        // file page back whole, Linux only its dirty blocks)
         tag(b.bytes(0, UNIT), b'Y', 20);
         let w = sys_pwrite64(bf, b.ptr(0), UNIT as u64, 20 * UNIT as i64);
         check(b"buffered write", w == UNIT as i64, w)?;
@@ -490,4 +489,37 @@ fn write_short() -> R {
     check(b"short write", w == 4096, w)?;
     check(b"size", after.1 == 8192, after.1)?;
     check(b"blocks kept", after.0 == 128, after.0)
+}
+
+/// Writeback writes only a page's dirty blocks (Linux buffer heads,
+/// __block_write_full_folio): a block of a cached page rewritten
+/// through the cache, its neighbour in the same page changed on the
+/// disk behind the cache, an fsync leaves the neighbour as the disk
+/// has it
+fn partial_wb(p1: &BlkDev) -> R {
+    const N: usize = 4096 / UNIT;
+    let b = Buf::new(MIB)?;
+    tag_all(b.bytes(0, N * UNIT), b'P', 0);
+    put(b"PARTWB.BIN", b.bytes(0, N * UNIT))?;
+    let fd = open(b"PARTWB.BIN", O_RDWR);
+    let r = (|| {
+        check(b"open", fd >= 0, fd as i64)?;
+        let mut at = [0i64; N];
+        scan(p1, &b, b'P', &mut at)?;
+        let missing = at.iter().filter(|&&o| o < 0).count();
+        check(b"found", missing == 0, missing as i64)?;
+        tag(b.bytes(0, UNIT), b'Q', 0);
+        let w = sys_pwrite64(fd, b.ptr(0), UNIT as u64, 0);
+        check(b"buffered write", w == UNIT as i64, w)?;
+        poke(p1, &b, at[1], b'Q', 1)?;
+        let s = sys_fsync(fd);
+        check(b"fsync", s == 0, s)?;
+        let mut got = [0i64; N];
+        scan(p1, &b, b'Q', &mut got)?;
+        check(b"written block", got[0] == at[0], got[0])?;
+        check(b"neighbour kept", got[1] == at[1], got[1])
+    })();
+    sys_close(fd as u64);
+    sys_unlink(path(b"PARTWB.BIN", &mut [0; 64]));
+    r
 }

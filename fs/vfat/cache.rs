@@ -21,13 +21,14 @@
 //! so nothing walked on a chain being cut outlives the cut.
 
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::fs::inode::Inode;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 
 use super::fatent::{FatEnt, fat_ent_read};
-use super::{VfatInode, VfatSbData, cluster_to_offset, is_end_of_chain, with_vi};
+use super::{VfatInode, VfatSbData, cluster_to_offset, get_inode_data, is_end_of_chain, with_vi};
 
 /// Runs cached per file (Linux FAT_MAX_CACHE)
 const FAT_MAX_CACHE: usize = 8;
@@ -298,6 +299,81 @@ pub fn get_cluster(
 /// (file cluster, disk cluster); None for a file with no clusters
 pub fn last_cluster(sb: &VfatSbData, inode: &Inode) -> Result<Option<(u32, u32)>, KernelError> {
     get_cluster(sb, inode, u32::MAX)
+}
+
+/// The first device block of data cluster `cluster` (Linux
+/// fat_clus_to_blknr)
+pub fn fat_clus_to_blknr(sb: &VfatSbData, cluster: u32) -> u64 {
+    u64::from(cluster - 2) * u64::from(sb.sectors_per_cluster) + sb.data_start_sector
+}
+
+/// The disk cluster of file cluster `cluster` (Linux fat_bmap_cluster):
+/// 0 for a file with no clusters; EIO past the chain's end
+fn fat_bmap_cluster(sb: &VfatSbData, inode: &Inode, cluster: u32) -> Result<u32, KernelError> {
+    match get_cluster(sb, inode, cluster)? {
+        None => Ok(0),
+        Some((f, _)) if f < cluster => {
+            crate::printkln!(
+                "FAT-fs: fat_bmap_cluster: request beyond EOF (i_pos {})",
+                get_inode_data(inode)?.i_pos
+            );
+            Err(KernelError::Io)
+        }
+        Some((_, d)) => Ok(d),
+    }
+}
+
+/// The device block of file block `sector` and the blocks mapped from
+/// it, within its cluster and below `last_block` (Linux
+/// fat_get_mapped_cluster); block 0 for none
+fn fat_get_mapped_cluster(
+    sb: &VfatSbData,
+    inode: &Inode,
+    sector: u64,
+    last_block: u64,
+) -> Result<(u64, u64), KernelError> {
+    let spc = u64::from(sb.sectors_per_cluster);
+    let cluster = u32::try_from(sector / spc).map_err(|_| KernelError::Io)?;
+    let offset = sector & (spc - 1);
+    match fat_bmap_cluster(sb, inode, cluster)? {
+        0 => Ok((0, 0)),
+        c => Ok((
+            fat_clus_to_blknr(sb, c) + offset,
+            (spc - offset).min(last_block - sector),
+        )),
+    }
+}
+
+/// The device block of file block `sector` and the blocks mapped from
+/// it (Linux fat_bmap, FAT32: no fixed root directory); block 0 for
+/// none. Mapped are the blocks below the size, with `create` those
+/// below mmu_private (which only the write paths read, under i_rwsem;
+/// Linux is_exceed_eof), with `from_bmap` all the file's clusters'.
+pub fn fat_bmap(
+    sb: &VfatSbData,
+    inode: &Inode,
+    sector: u64,
+    create: bool,
+    from_bmap: bool,
+) -> Result<(u64, u64), KernelError> {
+    let bs = u64::from(sb.bytes_per_sector);
+    let (clusters, mmu_private) = with_vi(inode, |v| {
+        (v.d.lock().clusters, v.mmu_private.load(Ordering::Relaxed))
+    })?;
+    let last_block = if from_bmap {
+        u64::from(clusters) * u64::from(sb.sectors_per_cluster)
+    } else {
+        let last = inode.get_size().div_ceil(bs);
+        if sector >= last && create {
+            mmu_private.div_ceil(bs)
+        } else {
+            last
+        }
+    };
+    if sector >= last_block {
+        return Ok((0, 0));
+    }
+    fat_get_mapped_cluster(sb, inode, sector, last_block)
 }
 
 /// Forget `inode`'s cached runs around a cut of its chain (Linux
