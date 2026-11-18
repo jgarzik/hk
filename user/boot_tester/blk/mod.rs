@@ -1,5 +1,6 @@
 //! Block devices and direct I/O tests
 
+pub mod bufhead;
 pub mod dio;
 pub mod dio_alias;
 pub mod dio_bench;
