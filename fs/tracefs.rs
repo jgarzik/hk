@@ -96,7 +96,12 @@ fn fops(file: &File) -> Option<Arc<dyn TraceFops>> {
 /// Linux set_tracefs_inode_owner: an inode whose owner or group chown
 /// never set takes the root's (no instances here: the root is the
 /// mount's, d_inode(sb->s_root)), read with no reference, under the
-/// superblock's root lock and an RCU guard (Linux's plain pointer)
+/// superblock's root lock and an RCU guard (Linux's plain pointer).
+/// Linux always has the root here: every tracefs inode has a
+/// superblock, whose s_root is cleared by the shutdown only once no
+/// inode is in use (a busy one is poisoned: `Inode::superblock` panics).
+/// An inode with neither (a unit test's, with no superblock) keeps its
+/// owner.
 fn set_owner(inode: &Inode) {
     let Some(t) = ti(inode).filter(|t| t.child) else {
         return;
@@ -598,5 +603,47 @@ mod tests {
         assert!(matches!(late, Err(KernelError::NotFound)));
         // The name may be made again
         assert!(create(&root, b"events", dir, None).is_ok());
+        // With no superblock there is no root to follow: kept as made
+        let t = root.lookup_child(b"trace").unwrap().get_inode().unwrap();
+        ri.set_uid(7);
+        set_owner(&t);
+        assert_eq!(t.uid(), 0);
+    }
+
+    /// Linux set_tracefs_inode_owner: an entry follows the root's owner
+    /// and group (d_inode(sb->s_root)) at each permission check and
+    /// getattr, each unless chown set its own (PERM_SET); the root
+    /// keeps its own
+    #[test]
+    // The i_rwsem reads the current task, an aarch64 per-CPU register a
+    // host (EL0) test cannot read
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn owner_follows_root() {
+        let fc = crate::fs::superblock::FsContext::new(&TRACEFS_TYPE, b"");
+        let sb = crate::fs::superblock::vfs_get_tree(&fc).unwrap().unlock();
+        let root = sb.get_root().unwrap();
+        let ri = root.get_inode().unwrap();
+        let nop: Arc<dyn TraceFops> = Arc::new(Nop);
+        let d = create(&root, b"d", InodeMode::directory(0o755), None).unwrap();
+        let f = create(&d, b"f", InodeMode::regular(0o644), Some(nop)).unwrap();
+        let (di, fi) = (d.get_inode().unwrap(), f.get_inode().unwrap());
+        ri.set_uid(1000);
+        ri.set_gid(2000);
+        let cred = Cred::root();
+        assert!(TRACEFS_IOPS.permission(&fi, &cred, 0).is_ok());
+        assert_eq!((fi.uid(), fi.gid()), (1000, 2000));
+        let a = TRACEFS_IOPS.getattr(&di);
+        assert_eq!((a.uid, a.gid), (1000, 2000));
+        // chown of the owner alone pins it; the group still follows
+        TRACEFS_IOPS.setattr_ids(&fi, true, false);
+        fi.set_uid(5);
+        ri.set_uid(3000);
+        ri.set_gid(4000);
+        set_owner(&fi);
+        assert_eq!((fi.uid(), fi.gid()), (5, 4000));
+        set_owner(&ri);
+        assert_eq!((ri.uid(), ri.gid()), (3000, 4000));
+        drop((di, fi, ri, f, d, root));
+        drop(sb);
     }
 }
