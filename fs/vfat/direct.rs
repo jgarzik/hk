@@ -463,9 +463,8 @@ fn write_async(
         file.write_iter(&mut IovSource::async_io(io), Some(pos), flags, append)
             .map(Some)
     };
-    let synchronous = inode.superblock().is_some_and(|sb| sb.synchronous());
     if count == 0
-        || synchronous
+        || inode.is_sync()
         || flags.intersects(RwFlags::APPEND | RwFlags::DSYNC | RwFlags::SYNC)
     {
         return sync(&*io);

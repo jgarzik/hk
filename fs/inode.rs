@@ -1674,6 +1674,12 @@ impl Inode {
         self.sb.upgrade()
     }
 
+    /// Its writes are synchronous (Linux IS_SYNC): a synchronous mount
+    /// (SB_SYNCHRONOUS; there is no per-inode S_SYNC, chattr +S)
+    pub fn is_sync(&self) -> bool {
+        self.superblock().is_some_and(|sb| sb.synchronous())
+    }
+
     /// Set filesystem-specific private data
     pub fn set_private(&self, data: Arc<dyn InodeData>) {
         *self.private.write() = Some(data);

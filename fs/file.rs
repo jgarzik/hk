@@ -1493,14 +1493,11 @@ pub fn files_init() {
 }
 
 /// The write must be synchronous (Linux iocb_is_dsync): IOCB_DSYNC
-/// (O_DSYNC, O_SYNC, RWF_DSYNC, RWF_SYNC), or the file's inode IS_SYNC
-/// (a synchronous mount)
+/// (O_DSYNC, O_SYNC, RWF_DSYNC, RWF_SYNC), or the inode holding its
+/// data IS_SYNC (f_mapping->host: a block device node's is the bdev
+/// inode, whatever the mount of the node)
 fn iocb_is_dsync(file: &File, flags: RwFlags) -> bool {
-    flags.contains(RwFlags::DSYNC)
-        || file
-            .get_inode()
-            .and_then(|i| i.superblock())
-            .is_some_and(|sb| sb.synchronous())
+    flags.contains(RwFlags::DSYNC) || file.mapping_inode().is_some_and(|i| i.is_sync())
 }
 
 /// After a write of `n` bytes at `pos` of `file` with I/O flags
