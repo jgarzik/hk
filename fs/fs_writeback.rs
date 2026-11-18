@@ -98,6 +98,19 @@ pub struct WritebackControl {
     pub tagged_writepages: bool,
 }
 
+impl WritebackControl {
+    /// `sync_mode`, `nr_to_write` pages, the flags clear (Linux's
+    /// designated initializer, the rest zero)
+    pub const fn new(sync_mode: SyncMode, nr_to_write: i64) -> Self {
+        Self {
+            nr_to_write,
+            sync_mode,
+            for_sync: false,
+            tagged_writepages: false,
+        }
+    }
+}
+
 /// The writeback state of `inode`'s device (Linux inode_to_wb,
 /// inode_to_bdi): its filesystem's, or the block device's own for its
 /// cache inode (sb_is_blkdev_sb)
@@ -486,12 +499,8 @@ fn writeback_single_inode(inode: &Inode, wbc: &WritebackControl) -> Result<(), K
 /// reference, or it is I_WILL_FREE.
 pub fn write_inode_now(inode: &Inode, sync: bool) -> Result<(), KernelError> {
     let can = inode.i_data.aops().can_dirty();
-    let wbc = WritebackControl {
-        nr_to_write: if can { i64::MAX } else { 0 },
-        sync_mode: if sync { SyncMode::All } else { SyncMode::None },
-        for_sync: false,
-        tagged_writepages: false,
-    };
+    let mode = if sync { SyncMode::All } else { SyncMode::None };
+    let wbc = WritebackControl::new(mode, if can { i64::MAX } else { 0 });
     crate::sync::might_sleep();
     writeback_single_inode(inode, &wbc)
 }
@@ -500,12 +509,8 @@ pub fn write_inode_now(inode: &Inode, sync: bool) -> Result<(), KernelError> {
 /// sync_inode_metadata); with `wait` a data-integrity write, waiting
 /// for it to reach the disk (its filesystem's ->sync_inode_metadata)
 pub fn sync_inode_metadata(inode: &Inode, wait: bool) -> Result<(), KernelError> {
-    let wbc = WritebackControl {
-        nr_to_write: 0,
-        sync_mode: if wait { SyncMode::All } else { SyncMode::None },
-        for_sync: false,
-        tagged_writepages: false,
-    };
+    let mode = if wait { SyncMode::All } else { SyncMode::None };
+    let wbc = WritebackControl::new(mode, 0);
     writeback_single_inode(inode, &wbc)
 }
 
@@ -643,10 +648,8 @@ pub fn writeback_inodes_sb(sb: &SuperBlock) {
         return;
     };
     let wbc = WritebackControl {
-        nr_to_write: i64::MAX,
-        sync_mode: SyncMode::None,
-        for_sync: false,
         tagged_writepages: true,
+        ..WritebackControl::new(SyncMode::None, i64::MAX)
     };
     wb_writeback(&b.disk.bdi, &wbc, crate::time::monotonic_ns(), Some(sb));
 }
@@ -661,10 +664,8 @@ pub fn sync_inodes_sb(sb: &SuperBlock) {
         return;
     };
     let wbc = WritebackControl {
-        nr_to_write: i64::MAX,
-        sync_mode: SyncMode::All,
         for_sync: true,
-        tagged_writepages: false,
+        ..WritebackControl::new(SyncMode::All, i64::MAX)
     };
     wb_writeback(&b.disk.bdi, &wbc, crate::time::monotonic_ns(), Some(sb));
 }
@@ -688,12 +689,7 @@ pub fn sync_all_sbs() {
 /// True if dirty inodes are left for a later pass (Linux
 /// wb_has_dirty_io)
 pub fn wb_do_writeback(wb: &BdiWriteback, cutoff: u64) -> bool {
-    let wbc = WritebackControl {
-        nr_to_write: i64::MAX,
-        sync_mode: SyncMode::None,
-        for_sync: false,
-        tagged_writepages: false,
-    };
+    let wbc = WritebackControl::new(SyncMode::None, i64::MAX);
     wb_writeback(wb, &wbc, cutoff, None);
     has_dirty_io(&wb.list_lock.lock())
 }
