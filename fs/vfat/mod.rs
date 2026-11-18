@@ -1167,16 +1167,22 @@ fn extend_cluster_chain(
 ) -> Result<u32, KernelError> {
     // Linux fat_chain_add: the link synced if the inode's changes are
     let wait = fatent::inode_needs_sync(inode);
-    // Undo a partial extension: free the clusters already linked from
-    // the first new one, and point the existing chain's tail back at
-    // end-of-chain
+    // Undo a partial extension in Linux's order (fat_chain_add puts the
+    // old end back, then fat_add_cluster frees): the existing chain's
+    // tail made its end again, then the clusters linked from the first
+    // new one freed, so the chain never runs into free clusters. If the
+    // end cannot be put back they stay allocated: lost clusters, not a
+    // chain into ones another file may take.
     let mut first = ScopeGuard::new_with_data(0u32, |first| {
-        if first != 0 {
-            let _ = fat_free_clusters(sb_data, inode, first);
+        if first == 0 {
+            return;
         }
-        if last_cluster != 0 {
-            let _ = fatent::fat_ent_link(sb_data, inode, last_cluster, FAT_ENT_EOF, wait);
+        if last_cluster != 0
+            && fatent::fat_ent_link(sb_data, inode, last_cluster, FAT_ENT_EOF, wait).is_err()
+        {
+            return;
         }
+        let _ = fat_free_clusters(sb_data, inode, first);
     });
     let mut prev = last_cluster;
     for _ in 0..count {
