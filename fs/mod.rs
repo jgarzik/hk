@@ -34,6 +34,7 @@ pub mod icache;
 pub mod io;
 pub mod iov;
 pub mod iov_iter;
+pub mod libfs;
 pub mod link;
 pub mod locks;
 pub mod misc;
@@ -52,6 +53,7 @@ pub mod kernfs;
 pub mod nullfs;
 pub mod proc;
 pub mod ramfs;
+pub mod tracefs;
 pub mod vfat;
 
 // Re-exports for convenience
@@ -62,7 +64,9 @@ pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, DentryRef, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, FileRef, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, exit_task_fs, get_task_fs, init_task_fs};
-pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
+pub use inode::{
+    DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, InodeRef, Uid,
+};
 pub use mount::{Mount, do_umount, follow_mount, umount_flags};
 pub use namei::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;
@@ -87,11 +91,7 @@ use alloc::sync::Arc;
 ///
 /// Returns a read-only file, or ENOENT, EACCES, ...
 pub fn kernel_open_exec(path: &[u8]) -> KernelResult<FileRef> {
-    let p = namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        path,
-        LookupFlags::open(),
-    )?;
+    let p = namei::path_lookup(crate::fs::namei::Start::Cwd, path, LookupFlags::open())?;
     open_exec(p)
 }
 
@@ -215,20 +215,17 @@ impl Drop for RenameLock {
 /// one inode (bind mounts) - its i_rwsem must be taken once
 fn same_dir(p1: &DentryRef, p2: &DentryRef) -> bool {
     DentryRef::ptr_eq(p1, p2)
-        || matches!((p1.get_inode(), p2.get_inode()), (Some(a), Some(b)) if Arc::ptr_eq(&a, &b))
+        || matches!((p1.get_inode(), p2.get_inode()), (Some(a), Some(b)) if InodeRef::ptr_eq(&a, &b))
 }
 
 /// The non-directories of `a` and `b`, each once, lowest address first
 /// (Linux lock_two_nondirectories order)
-fn nondirs<'a>(
-    a: Option<&'a Arc<Inode>>,
-    b: Option<&'a Arc<Inode>>,
-) -> [Option<&'a Arc<Inode>>; 2] {
-    let nd = |i: Option<&'a Arc<Inode>>| i.filter(|i| !i.mode().is_dir());
+fn nondirs<'a>(a: Option<&'a InodeRef>, b: Option<&'a InodeRef>) -> [Option<&'a InodeRef>; 2] {
+    let nd = |i: Option<&'a InodeRef>| i.filter(|i| !i.mode().is_dir());
     let (a, b) = (nd(a), nd(b));
     match (a, b) {
-        (Some(x), Some(y)) if Arc::ptr_eq(x, y) => [Some(x), None],
-        (Some(x), Some(y)) if Arc::as_ptr(y) < Arc::as_ptr(x) => [Some(y), Some(x)],
+        (Some(x), Some(y)) if InodeRef::ptr_eq(x, y) => [Some(x), None],
+        (Some(x), Some(y)) if InodeRef::as_ptr(y) < InodeRef::as_ptr(x) => [Some(y), Some(x)],
         _ => [a, b],
     }
 }
@@ -237,10 +234,7 @@ fn nondirs<'a>(
 /// locks (Linux vfs_rename -> lock_two_nondirectories): the non-directory
 /// source and target, by address. Directories are skipped: they have no
 /// hard links to race with.
-pub fn lock_two_nondirs<'a>(
-    a: Option<&'a Arc<Inode>>,
-    b: Option<&'a Arc<Inode>>,
-) -> NondirsLock<'a> {
+pub fn lock_two_nondirs<'a>(a: Option<&'a InodeRef>, b: Option<&'a InodeRef>) -> NondirsLock<'a> {
     let [x, y] = nondirs(a, b);
     let first = x.map(|i| i.lock());
     NondirsLock([first, y.map(|i| i.lock())])

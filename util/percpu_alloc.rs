@@ -54,7 +54,7 @@ static GROW: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 fn areas() -> &'static [CpuArea] {
     AREAS.call_once(|| {
-        let n = crate::cpu::nr_cpu_ids().max(1) as usize;
+        let n = crate::cpu::nr_possible() as usize;
         (0..n).map(|_| CpuArea::new()).collect()
     })
 }
@@ -101,7 +101,7 @@ impl PcpSlot {
                 let chunk: Box<Chunk> = if nofail {
                     crate::util::kalloc::box_nofail([const { AtomicIsize::new(0) }; SLOTS])
                 } else {
-                    crate::util::kalloc::try_box([const { AtomicIsize::new(0) }; SLOTS])?
+                    crate::util::kalloc::try_box_array(|| AtomicIsize::new(0))?
                 };
                 // Published once, under GROW, never freed
                 a.chunks[c].store(Box::into_raw(chunk), Ordering::Release);
@@ -124,11 +124,30 @@ impl PcpSlot {
         unsafe { &(*a.chunks[c].load(Ordering::Acquire))[i] }
     }
 
-    /// Add `n` to this CPU's word (Linux this_cpu_add); any CPU's would
-    /// do, so preemption may move the caller meanwhile
+    /// CPU `cpu`'s word, for a user that keeps a value rather than a
+    /// count in it (`util::id_batch`); None past the table
+    pub fn word(&self, cpu: usize) -> Option<&AtomicIsize> {
+        (cpu < areas().len()).then(|| self.part(cpu))
+    }
+
+    /// The number of per-CPU words (possible CPUs)
+    pub fn nr_words() -> usize {
+        areas().len()
+    }
+
+    /// Add `n` to this CPU's word (Linux this_cpu_add: no lock prefix
+    /// when the word is its own; a CPU past the table shares the first's
+    /// and adds atomically)
     pub fn add(&self, n: isize) {
-        let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
-        self.part(cpu).fetch_add(n, Ordering::Relaxed);
+        use crate::cpu::LocalWord;
+        match crate::cpu::own_slot(areas().len()) {
+            // SAFETY: own_slot: this CPU's word alone, nothing schedules
+            Some(c) => unsafe { self.part(c).local_add(n as i64) },
+            None => {
+                let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
+                self.part(cpu).fetch_add(n, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The words of every CPU, summed (Linux's per_cpu_ptr loop): exact

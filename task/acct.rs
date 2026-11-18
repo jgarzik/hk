@@ -266,12 +266,9 @@ fn open_acct_file(path: &[u8]) -> KernelResult<FileRef> {
     use crate::fs::{LookupFlags, dac};
 
     // Any lookup error as is (Linux filp_open)
-    let (mnt, dentry) = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        path,
-        LookupFlags::open(),
-    )?
-    .into_parts();
+    let (mnt, dentry) =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, path, LookupFlags::open())?
+            .into_parts();
 
     // file_open_name(O_WRONLY | O_APPEND): may_open, then a regular file
     if let Some(inode) = dentry.get_inode() {
@@ -417,8 +414,7 @@ fn get_task_info(t: &Task) -> TaskInfo {
     // Its name (NUL-terminated, Linux get_task_comm)
     let comm = t.task_lock().comm();
 
-    // SAFETY: TASKLIST is held
-    let cred = unsafe { t.cred() };
+    let cred = t.cred();
     let (uid, gid) = (cred.uid, cred.gid);
 
     // Calculate elapsed time using t.start_time (monotonic ns since boot)
@@ -441,12 +437,12 @@ fn get_task_info(t: &Task) -> TaskInfo {
     let start_time = (realtime_start_ns / 1_000_000_000) as u32;
 
     // Taken under TASKLIST, released after it (3.1.1 rule 4)
-    let pid_of = |p| table.get(p).and_then(|v| v.thread_pid.clone());
+    let pid_of = |p| table.get(p).and_then(|v| v.thread_pid());
     TaskInfo {
         uid,
         gid,
         tgid: pid_of(t.pid),
-        parent: pid_of(t.ppid()),
+        parent: pid_of(table.view(t).map_or(0, |v| v.ppid())),
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,

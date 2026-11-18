@@ -18,7 +18,8 @@
 //!   so removing or stepping from any given item is safe in O(1): a
 //!   dentry's children.
 //! - [`WeakList`]: the list holds a `Weak` per entry, which leaves it in
-//!   its own teardown: superblocks, a superblock's mounts and inodes.
+//!   its own teardown: superblocks, a superblock's mounts (inodes are on
+//!   `fs::inode::InodeList`s, which hold no reference).
 //!
 //! A list and the links of its entries are only touched under the lock
 //! that owns the list (the caller's: `&mut List` is that proof); the
@@ -64,6 +65,14 @@ impl Link {
     /// On a list (read under the lock of the list it may be on)
     pub fn is_linked(&self) -> bool {
         self.next.load(Relaxed) != UNLINKED
+    }
+
+    /// On an RCU list and not removed from it (Linux: list_del_rcu
+    /// poisons `prev` at once, keeping `next` for readers): false from
+    /// the removal on, not only once the link is free again a grace
+    /// period later (read under the list's writers' lock)
+    pub fn is_listed(&self) -> bool {
+        self.is_linked() && self.prev.load(Relaxed) != UNLINKED
     }
 
     /// Claim an unlinked link for an insert: false if it is on a list or
@@ -123,9 +132,10 @@ impl Link {
             .is_ok()
     }
 
-    /// On a hash chain (`util::hlist_bl`; read under its lock)
-    #[cfg(test)]
-    pub(super) fn is_hashed(&self) -> bool {
+    /// On a hash chain (`util::hlist_bl`; Linux !hlist_bl_unhashed):
+    /// exact under the chain's lock, else a lockless snapshot that the
+    /// caller confirms by other means (a dentry's `d_seq`)
+    pub fn is_hashed(&self) -> bool {
         self.prev.load(Relaxed) != UNLINKED
     }
 
@@ -573,6 +583,21 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> PtrList<A, P> {
         self.list.pop_front().map(|p| unsafe { P::from_raw(p) })
     }
 
+    /// Insert `item` right after `at` (Linux list_add(item, at)); panics
+    /// if `item` is on a list through this link
+    ///
+    /// # Safety
+    /// `at` is on this list.
+    pub unsafe fn insert_after(&mut self, at: &A::Item, item: P) {
+        assert!(A::link(&item).claim(), "list: item already linked");
+        // SAFETY: `at` on this list (the caller); `item` unlinked and
+        // claimed for this insert, live while the list owns it
+        unsafe {
+            self.list
+                .insert_after(core::ptr::from_ref(at), P::into_raw(item))
+        };
+    }
+
     /// Remove and return the last entry
     pub fn pop_back(&mut self) -> Option<P> {
         // SAFETY: entries were inserted with into_raw
@@ -716,8 +741,14 @@ macro_rules! owned_adapter {
     };
 }
 
-/// Ids of [`OwnedList`]s: each list its own, never reused (64 bits)
-static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+/// Ids of [`OwnedList`]s: each list its own, never reused (64 bits),
+/// handed out in per-CPU batches (`util::id_batch`)
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
+
+crate::percpu! {
+    /// Each CPU's last [`OwnedList`] id handed out
+    static OWNER_LAST: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
+}
 
 /// A [`PtrList`] of counted references (`P`, an `Arc` by default)
 /// that knows its items by their [`Owner`] mark, so removing or
@@ -736,7 +767,11 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
     pub fn new() -> Self {
         Self {
             list: PtrList::new(),
-            id: NEXT_OWNER.fetch_add(1, Relaxed),
+            id: crate::util::id_batch::next_from(
+                &NEXT_OWNER,
+                |c| Some(OWNER_LAST.get(c as u32)),
+                crate::cpu::nr_possible() as usize,
+            ),
         }
     }
 
@@ -778,6 +813,19 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         A::owner(item).0.store(self.id, Relaxed);
     }
 
+    /// Insert `item` right after `at` (Linux hlist_add_behind); panics
+    /// if `at` is not on this list or `item` is on a list
+    pub fn insert_after(&mut self, at: &A::Item, item: P) {
+        assert!(self.mine(at), "list: insert after an item not on it");
+        let p = core::ptr::from_ref::<A::Item>(&item);
+        // SAFETY: `at` is marked with this list's id, so on it
+        unsafe { self.list.insert_after(at, item) };
+        // SAFETY: on this list now, which keeps it live
+        let item = unsafe { &*p };
+        // INVARIANT: on this list from here (the insert claimed its link)
+        A::owner(item).0.store(self.id, Relaxed);
+    }
+
     /// Take `item` off and hand back the list's reference; None if it
     /// is not on this list
     pub fn remove(&mut self, item: &A::Item) -> Option<P> {
@@ -788,6 +836,15 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         A::owner(item).0.store(0, Relaxed);
         // SAFETY: marked with this list's id, so on it (type invariant)
         Some(unsafe { self.list.remove(item) })
+    }
+
+    /// Take the first entry `f` picks off and hand back the list's
+    /// reference
+    pub fn remove_first(&mut self, f: impl Fn(&A::Item) -> bool) -> Option<P> {
+        let item = self.list.remove_first(f)?;
+        // INVARIANT: off the list
+        A::owner(&item).0.store(0, Relaxed);
+        Some(item)
     }
 
     /// Take the first entry off and hand back the list's reference

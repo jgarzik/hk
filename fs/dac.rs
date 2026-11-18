@@ -33,6 +33,11 @@ pub const MAY_ACCESS: u32 = 16;
 pub const MAY_OPEN: u32 = 32;
 /// Permission mask: check comes from chdir()
 pub const MAY_CHDIR: u32 = 64;
+/// Permission mask: an RCU path walk asks, with no reference to the
+/// inode (Linux MAY_NOT_BLOCK): the check may read only fields an RCU
+/// reader may (atomics, `i_op`; `inode::Inode`) and must not block;
+/// anything else is ECHILD, and the walk asks again in ref mode
+pub const MAY_NOT_BLOCK: u32 = 128;
 
 pub use super::file::flags::O_NOATIME;
 
@@ -91,7 +96,8 @@ fn mode_ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, mask: u32) -> bool {
 /// generic_permission: mode bits, then capability overrides.
 /// CAP_DAC_READ_SEARCH reads files and reads/searches directories;
 /// CAP_DAC_OVERRIDE grants everything except exec of a file with no
-/// x bit at all.
+/// x bit at all. Reads only the mode, owner and group (atomics), so
+/// it answers MAY_NOT_BLOCK too (Linux: rcu-walk aware).
 pub fn generic_permission(c: &Cred, inode: &Inode, mask: u32) -> Result<(), KernelError> {
     let mode = inode.mode();
     permission_ids(
@@ -147,18 +153,24 @@ pub fn want_write(inode: &Inode) -> Result<WriteAccess, KernelError> {
 }
 
 /// sb_permission: writing a regular file, directory or symlink of a
-/// read-only file system is EROFS (devices, FIFOs, sockets are fine)
+/// read-only file system is EROFS (devices, FIFOs, sockets are fine).
+/// The superblock is read for a write only, as Linux: an RCU walk's
+/// MAY_EXEC must not touch `Inode.sb`, which a teardown releases.
 fn sb_permission(inode: &Inode, mask: u32) -> Result<(), KernelError> {
+    if mask & MAY_WRITE == 0 {
+        return Ok(());
+    }
     let m = inode.mode();
     let ro = inode.superblock().is_some_and(|sb| sb.rdonly());
-    if mask & MAY_WRITE != 0 && ro && (m.is_file() || m.is_dir() || m.is_symlink()) {
+    if ro && (m.is_file() || m.is_dir() || m.is_symlink()) {
         return Err(KernelError::ReadOnlyFs);
     }
     Ok(())
 }
 
 /// inode_permission with explicit credentials: sb_permission, then the
-/// inode's InodeOps::permission (generic_permission unless overridden)
+/// inode's InodeOps::permission (generic_permission unless overridden);
+/// with MAY_NOT_BLOCK, `inode` may be one an RCU walk borrowed
 pub fn permission_as(c: &Cred, inode: &Inode, mask: u32) -> Result<(), KernelError> {
     sb_permission(inode, mask)?;
     inode.i_op.permission(inode, c, mask)
@@ -248,10 +260,7 @@ pub fn may_delete(c: &Cred, dir: &Inode, victim: &Inode, isdir: bool) -> Result<
     }
     // An active swap file is neither unlinked nor renamed (Linux
     // vfs_unlink / vfs_rename: IS_SWAPFILE -> EPERM)
-    if victim
-        .i_swapfile
-        .load(core::sync::atomic::Ordering::Acquire)
-    {
+    if victim.is_swapfile() {
         return Err(KernelError::NotPermitted);
     }
     let is_dir = victim.mode().is_dir();
@@ -349,8 +358,7 @@ pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     }
     inode.i_op.chmod_ok(inode, perm)?;
     inode.set_mode_perm(perm);
-    inode.set_ctime(crate::time::TIMEKEEPER.current_time());
-    inode.i_op.setattr_done(inode);
+    inode.set_times(None, None, Some(crate::time::TIMEKEEPER.current_time()));
     Ok(())
 }
 
@@ -396,6 +404,11 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
     if uid.is_some() || gid.is_some() {
         inode.i_op.chown_ok(inode)?;
     }
+    // The filesystem learns which ids change before they do (Linux
+    // tracefs_setattr sets its PERM_SET flags, then simple_setattr)
+    if uid.is_some() || gid.is_some() {
+        inode.i_op.setattr_ids(inode, uid.is_some(), gid.is_some());
+    }
     if let Some(u) = uid {
         inode.set_uid(u);
     }
@@ -406,8 +419,7 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
         inode.clear_mode_bits(kill);
     }
     // chown_common: ATTR_CTIME even when no id changes
-    inode.set_ctime(crate::time::TIMEKEEPER.current_time());
-    inode.i_op.setattr_done(inode);
+    inode.set_times(None, None, Some(crate::time::TIMEKEEPER.current_time()));
     Ok(())
 }
 
@@ -510,7 +522,8 @@ pub static PROTECTED_CTLS: &[crate::sysctl::Ctl] = &[
 const S_IWOTH: u16 = 0o002;
 const S_IWGRP: u16 = 0o020;
 
-/// Following symlink `link` found in `dir` (Linux may_follow_link): with
+/// Following symlink `link` found in `dir` as the last component of a
+/// walk (Linux may_follow_link, under WALK_TRAILING only): with
 /// fs.protected_symlinks, a link in a sticky world-writable directory
 /// is followed only by its owner or when the directory's owner owns it
 /// (EACCES)
@@ -546,13 +559,18 @@ pub fn may_linkat(c: &Cred, inode: &Inode) -> Result<(), KernelError> {
     }
 }
 
-/// An O_CREAT open of the existing `inode` in `dir` (Linux
-/// may_create_in_sticky): with fs.protected_fifos / _regular, a FIFO or
-/// regular file in a sticky directory owned by neither the directory's
-/// owner nor the caller is refused if the directory is world-writable
-/// (level 1), or group-writable (level 2) (EACCES)
-pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), KernelError> {
-    let dmode = dir.mode().raw();
+/// An O_CREAT open of `inode`, its last name looked up in a directory
+/// of mode `dmode` owned by `duid` (Linux may_create_in_sticky with
+/// nd->dir_mode, nd->dir_vfsuid): with fs.protected_fifos / _regular, a
+/// FIFO or regular file in a sticky directory owned by neither the
+/// directory's owner nor the caller is refused if the directory is
+/// world-writable (level 1), or group-writable (level 2) (EACCES)
+pub fn may_create_in_sticky(
+    c: &Cred,
+    dmode: u16,
+    duid: Uid,
+    inode: &Inode,
+) -> Result<(), KernelError> {
     let mode = inode.mode();
     // A regular file or FIFO only when its knob is on; any other type
     // is checked whatever the knobs (Linux may_create_in_sticky)
@@ -566,7 +584,7 @@ pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), 
     if dmode & S_ISVTX == 0 || level == Some(0) {
         return Ok(());
     }
-    if inode.uid() == dir.uid() || inode.uid() == c.fsuid {
+    if inode.uid() == duid || inode.uid() == c.fsuid {
         return Ok(());
     }
     // World-writable: refused; group-writable: only at level 2
@@ -644,7 +662,7 @@ mod tests {
         let a = access_cred(&c);
         assert_eq!((a.fsuid, a.fsgid), (1000, 1000));
         assert!(!a.cap_effective.has(CAP_DAC_OVERRIDE));
-        let r = access_cred(&Cred::ROOT);
+        let r = access_cred(&Cred::root());
         assert!(r.cap_effective.has(CAP_DAC_OVERRIDE));
     }
 }

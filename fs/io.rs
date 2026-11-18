@@ -35,7 +35,12 @@ pub fn fget_raw(fd: i32) -> Result<FileRef, KernelError> {
 /// `flags` (Linux get_unused_fd_flags): EMFILE at RLIMIT_NOFILE, ENOMEM
 /// if the table cannot grow
 pub fn get_unused_fd_flags(flags: u32) -> Result<UnusedFd, KernelError> {
-    let nofile = super::syscall::get_nofile_limit();
+    get_unused_fd_nofile(flags, super::syscall::get_nofile_limit())
+}
+
+/// A free descriptor below `nofile`, reserved (Linux
+/// __get_unused_fd_flags): EMFILE, ENOMEM
+pub fn get_unused_fd_nofile(flags: u32, nofile: u64) -> Result<UnusedFd, KernelError> {
     UnusedFd::alloc(current_fd_table(), 0, flags, nofile)
 }
 

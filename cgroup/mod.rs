@@ -110,6 +110,13 @@ pub struct Cgroup {
 
     /// Inode number for cgroupfs
     pub ino: u64,
+
+    /// Its directory's revision (Linux kernfs dir.rev of the cgroup's
+    /// kernfs node): bumped as a child cgroup or a controller's files
+    /// come or go (kernfs_inc_rev at each link and unlink), under the
+    /// lock of what changed; a negative cgroupfs dentry in it is valid
+    /// while it stands
+    rev: AtomicU64,
 }
 
 crate::adapter!(CgTask, Task, cg_node);
@@ -172,6 +179,7 @@ impl Cgroup {
             subtree_control: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
             ino,
+            rev: AtomicU64::new(0),
         }
     }
 
@@ -224,12 +232,29 @@ impl Cgroup {
             return Err(KernelError::AlreadyExists);
         }
         children.insert(name, child);
+        self.inc_rev();
         Ok(())
     }
 
     /// Remove a child cgroup
     pub fn remove_child(&self, name: &[u8]) -> Option<Arc<Cgroup>> {
-        self.children.write().remove(name)
+        let mut children = self.children.write();
+        let c = children.remove(name);
+        if c.is_some() {
+            self.inc_rev();
+        }
+        c
+    }
+
+    /// The directory's revision (Linux kernfs dir.rev)
+    pub fn rev(&self) -> u64 {
+        self.rev.load(Ordering::Acquire)
+    }
+
+    /// An entry came or went (Linux kernfs_inc_rev), under the lock of
+    /// what changed, held for writing
+    fn inc_rev(&self) {
+        self.rev.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Get CSS for a controller (if enabled)
@@ -238,13 +263,22 @@ impl Cgroup {
     }
 
     /// Set CSS for a controller
+    /// Its files come with it (Linux css_populate_dir)
     pub fn set_css(&self, controller: ControllerType, css: Arc<CgroupSubsysState>) {
-        self.subsys.write().insert(controller, css);
+        let mut s = self.subsys.write();
+        s.insert(controller, css);
+        self.inc_rev();
     }
 
-    /// Remove CSS for a controller
+    /// Remove CSS for a controller; its files go with it (Linux
+    /// css_clear_dir)
     pub fn remove_css(&self, controller: ControllerType) -> Option<Arc<CgroupSubsysState>> {
-        self.subsys.write().remove(&controller)
+        let mut s = self.subsys.write();
+        let c = s.remove(&controller);
+        if c.is_some() {
+            self.inc_rev();
+        }
+        c
     }
 
     /// Get all enabled controllers for this cgroup
@@ -581,16 +615,23 @@ pub fn remove_task_cgroup(t: &Task) -> Option<Arc<Cgroup>> {
     t.cgroup.lock().take()
 }
 
-/// Initialize the cgroup subsystem
-///
-/// Called during kernel init to set up the root cgroup and register controllers.
+/// The default hierarchy's root cgroup (Linux cgroup_init_early:
+/// init_cgroup_root of cgrp_dfl_root, which the initial cgroup
+/// namespace points at), once at boot before anything reaches a cgroup;
+/// every cgroup2 mount shows this one hierarchy
+pub fn cgroup_init_early() {
+    let root = CGROUP_ROOT.clone();
+    root.set_root_cgroup(Cgroup::new_root(root.alloc_cg_id(), Vec::new(), &root));
+}
+
+/// The controllers' states in the root cgroup (Linux cgroup_init:
+/// cgroup_init_subsys for each), once at boot after
+/// [`cgroup_init_early`]
 pub fn cgroup_init() {
     let root = CGROUP_ROOT.clone();
-
-    // Create root cgroup
-    let root_cg = Cgroup::new_root(root.alloc_cg_id(), Vec::new(), &root);
-
-    root.set_root_cgroup(root_cg.clone());
+    let root_cg = root
+        .root_cgroup()
+        .expect("cgroup: cgroup_init_early runs first");
 
     // Initialize CSS for root cgroup for each controller
     for controller in root.registered_controllers() {

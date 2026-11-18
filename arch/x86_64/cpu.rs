@@ -14,8 +14,6 @@ use ::core::cell::UnsafeCell;
 use ::core::mem::size_of;
 use ::core::sync::atomic::Ordering;
 
-use crate::cpu::PerCpu;
-
 /// IST indices (1-based as used in IDT): the exceptions that must not
 /// run on the interrupted stack (it may be the one that overflowed, or
 /// not yet the kernel's: Linux DOUBLE_FAULT_STACK, NMI_STACK, MCE_STACK)
@@ -178,10 +176,12 @@ struct TablesCell(UnsafeCell<CpuTables>);
 // SAFETY: see TablesCell
 unsafe impl Sync for TablesCell {}
 
-static TABLES: PerCpu<TablesCell> = crate::percpu![TablesCell(UnsafeCell::new(CpuTables {
+crate::percpu! {
+    static TABLES: TablesCell = TablesCell(UnsafeCell::new(CpuTables {
     gdt: Gdt::new(),
     tss: TaskStateSegment::new(),
-}))];
+}));
+}
 
 /// Size of each IST stack (16KB: the double-fault handler reports a
 /// kernel stack overflow and panics on it)

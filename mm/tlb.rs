@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use super::Mm;
 use crate::arch::{CurrentArch, paging};
-use crate::cpu::{PerCpu, this_id};
+use crate::cpu::this_id;
 use crate::sync::{local_irq_restore, local_irq_save};
 use crate::util::cpumask::CpuMask;
 
@@ -93,11 +93,13 @@ pub struct TlbState {
     loaded_gen: AtomicU64,
 }
 
-/// Per-CPU TLB state: each CPU's own, no cross-CPU traffic
-static TLB_STATE: PerCpu<TlbState> = crate::percpu![TlbState {
+crate::percpu! {
+    /// Per-CPU TLB state: each CPU's own, no cross-CPU traffic
+    static TLB_STATE: TlbState = TlbState {
     loaded_mm: AtomicUsize::new(0),
     loaded_gen: AtomicU64::new(0),
-}];
+};
+}
 
 fn this_state() -> &'static TlbState {
     TLB_STATE.this()

@@ -135,23 +135,27 @@ extern "C" fn handle_stack_overflow(sp: u64, elr: u64, far: u64) -> ! {
 /// Handle IRQ from EL1 (kernel mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el1_irq(_frame: *mut Aarch64TrapFrame) {
-    irq_body();
+    irq_body(false);
 }
 
-/// An interrupt, from either level
-fn irq_body() {
+/// An interrupt, from EL0 (`user`) or EL1
+fn irq_body(user: bool) {
+    // Where it came from, for the tick (Linux set_irq_regs; arm64
+    // el0_interrupt vs el1_interrupt)
+    let old = super::percpu::irq_regs_enter(user);
     // In an interrupt handler from here to the end (in_atomic(), the
     // signal-context check)
     let depth = super::percpu::try_current_cpu().map(|p| &p.interrupt_depth);
     if let Some(d) = depth {
-        d.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        super::percpu::this_cpu_add(d, 1);
     }
     // On this CPU's IRQ stack, from either level (Linux
     // do_interrupt_handler)
     crate::irq_stack::run(irq_dispatch);
     if let Some(d) = depth {
-        d.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        super::percpu::this_cpu_add(d, u32::MAX);
     }
+    super::percpu::irq_regs_exit(old);
 }
 
 /// Acknowledge, handle and end one interrupt
@@ -409,7 +413,7 @@ extern "C" fn handle_el0_irq(frame: &UserFrame) {
     super::ptrace::enter_from_user();
     // SAFETY: a field store
     unsafe { frame.with(|f| f.syscallno = super::NO_SYSCALL) };
-    irq_body();
+    irq_body(true);
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode)
     crate::entry::exit_to_user_mode(frame);

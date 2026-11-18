@@ -3,7 +3,6 @@
 
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::Ordering;
 
 /// `/proc/net/dev`: per-interface counters in Linux's format
 /// (net/core/net-procfs.c dev_seq_show), the devices walked under RCU
@@ -23,26 +22,27 @@ pub fn proc_net_dev(net: &crate::net::NetNamespace) -> Vec<u8> {
 
 /// One device's line of `/proc/net/dev` (Linux dev_seq_printf_stats)
 fn dev_seq_show(m: &mut crate::fs::proc::seq::SeqBuf, dev: &crate::net::device::NetDevice) {
+    use crate::net::device::stat::*;
     let s = &dev.stats;
-    let g = |a: &core::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    let g = |f: usize| s.get(f);
     let _ = writeln!(
         m,
         "{:>6}:{:8} {:7} {:4} {:4} {:4} {:5} {:10} {:9} {:8} {:7} {:4} {:4} {:4} {:5} {:7} {:10}",
         dev.name(),
-        g(&s.rx_bytes),
-        g(&s.rx_packets),
-        g(&s.rx_errors),
-        g(&s.rx_dropped),
+        g(RX_BYTES),
+        g(RX_PACKETS),
+        g(RX_ERRORS),
+        g(RX_DROPPED),
         0, // fifo
         0, // frame
         0, // compressed
-        g(&s.multicast),
-        g(&s.tx_bytes),
-        g(&s.tx_packets),
-        g(&s.tx_errors),
-        g(&s.tx_dropped),
+        g(MULTICAST),
+        g(TX_BYTES),
+        g(TX_PACKETS),
+        g(TX_ERRORS),
+        g(TX_DROPPED),
         0, // fifo
-        g(&s.collisions),
+        g(COLLISIONS),
         0, // carrier
         0, // compressed
     );

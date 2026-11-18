@@ -452,7 +452,7 @@ impl E1000 {
                         skb.dev = Some(Arc::clone(dev));
                         dev.stats.rx_packet(len);
                         if src[0] & 1 != 0 {
-                            dev.stats.multicast.fetch_add(1, Ordering::Relaxed);
+                            dev.stats.inc_multicast();
                         }
                         out.push_back(skb);
                         n += 1;
@@ -540,11 +540,10 @@ impl NapiPoll for E1000 {
             net::dev::netif_receive_skb(skb);
         }
 
-        if work < budget {
-            napi_complete_done(napi, work);
-            if self.rearm() {
-                napi_schedule(&self.napi);
-            }
+        // Interrupts back on only if done (Linux e1000_clean: a MISSED
+        // completion polls again with them masked)
+        if work < budget && napi_complete_done(napi, work) && self.rearm() {
+            napi_schedule(&self.napi);
         }
         work
     }

@@ -87,14 +87,36 @@ pub use aarch64::barrier;
 pub use x86_64::barrier;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
+pub use x86_64::percpu::{
+    local_add_u64, local_xadd_u64, preempt_count, preempt_disable, preempt_enable,
+};
+
+// Queued spin lock word accesses (sync::qspinlock)
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::qspin;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::qspin;
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
+pub use aarch64::percpu::{
+    local_add_u64, local_xadd_u64, preempt_count, preempt_disable, preempt_enable,
+};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::ptrace;
+
+// A task's arch thread state and its switch, fork, exec and return to
+// user mode work (Linux thread_struct, __switch_to, arch_dup_task_struct,
+// flush_thread, arch_exit_to_user_mode_work)
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::fpsimd::{
+    EXIT_WORK, ThreadStruct, dup_thread, exit_to_user_mode_work, flush_thread, thread_switch,
+};
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::process::{
+    EXIT_WORK, ThreadStruct, dup_thread, exit_to_user_mode_work, flush_thread, thread_switch,
+};
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::ptrace;
@@ -382,6 +404,11 @@ pub trait PerCpuOps {
 
     /// Get the interrupt nesting depth
     fn interrupt_depth() -> u32;
+
+    /// The interrupt this CPU is handling arrived from user mode (Linux
+    /// user_mode(get_irq_regs())): set at interrupt entry from the
+    /// interrupted frame; false outside an interrupt
+    fn irq_from_user() -> bool;
 
     /// Whether logical CPU `cpu` has been brought online
     fn cpu_online(cpu: u32) -> bool;

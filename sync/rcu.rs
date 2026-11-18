@@ -55,8 +55,8 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
-use crate::sync::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
+use crate::sync::{IrqSpinlock, UniqueOwner};
 use crate::util::cpumask::{CpuMask, CpuSet};
 
 #[cfg(not(test))]
@@ -90,10 +90,12 @@ static GP_KICK: WaitQueue = WaitQueue::new();
 /// `synchronize` callers wait here for their grace period's end
 static GP_DONE: WaitQueue = WaitQueue::new();
 
-/// A CPU's view (Linux struct rcu_data): the grace period in which a
-/// context switch passed a quiescent state (written by its CPU with
-/// interrupts off)
-static SWITCHED: crate::cpu::PerCpu<AtomicU64> = crate::percpu![AtomicU64::new(0)];
+crate::percpu! {
+    /// A CPU's view (Linux struct rcu_data): the grace period in which a
+    /// context switch passed a quiescent state (written by its CPU with
+    /// interrupts off)
+    static SWITCHED: AtomicU64 = AtomicU64::new(0);
+}
 
 /// `GP_SEQ` value after which a grace period begun after now has ended
 /// (Linux rcu_seq_snap)
@@ -322,6 +324,12 @@ impl<T> RcuArc<T> {
         a
     }
 
+    /// The current version's address, to compare only (Linux
+    /// rcu_access_pointer)
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.load(Ordering::Acquire)
+    }
+
     /// Publish `new` (Linux rcu_assign_pointer); the old version is
     /// released after a grace period, when the result drops
     pub fn replace(&self, new: Arc<T>) -> RcuRetired<T> {
@@ -359,12 +367,175 @@ impl<T: HasRcuHead + Send + Sync> RcuRetired<T> {
     }
 }
 
+impl<T: HasRcuPuts + Send + Sync> RcuRetired<T> {
+    /// Release it after a grace period without waiting, for an object
+    /// whose references may be retired several times within one grace
+    /// period ([`put_rcu`]'s rules)
+    pub fn defer_put(mut self) {
+        if let Some(a) = self.0.take() {
+            put_rcu(a);
+        }
+    }
+}
+
 impl<T> Drop for RcuRetired<T> {
     fn drop(&mut self) {
         if let Some(a) = self.0.take() {
             synchronize();
             drop(a);
         }
+    }
+}
+
+/// An RCU-protected `Option<Arc<T>>` whose updaters hold the lock that
+/// owns `O` (Linux a `__rcu` pointer that may be NULL, written by
+/// rcu_assign_pointer under its lock: signal->pids[] under
+/// tasklist_lock). Readers borrow the current version under an
+/// [`RcuReadGuard`] (rcu_dereference) or under a borrow of `O`
+/// (rcu_dereference_protected); [`replace`](Self::replace), under a
+/// mutable borrow of `O`, hands the old version back as [`RcuRetired`],
+/// released a grace period later.
+///
+/// # Invariants
+/// `ptr` is null or the `Arc::into_raw` of the current version, which
+/// the cell owns; a version taken out leaves only as an `RcuRetired`.
+pub struct RcuLockedArc<T, O: UniqueOwner> {
+    ptr: AtomicPtr<T>,
+    _owner: PhantomData<fn(&O)>,
+}
+
+// SAFETY: an `Arc<T>` moves between threads and is shared through it
+unsafe impl<T: Send + Sync, O: UniqueOwner> Send for RcuLockedArc<T, O> {}
+// SAFETY: as above
+unsafe impl<T: Send + Sync, O: UniqueOwner> Sync for RcuLockedArc<T, O> {}
+
+impl<T, O: UniqueOwner> RcuLockedArc<T, O> {
+    /// Holding nothing
+    pub const fn none() -> Self {
+        // INVARIANT: null
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+            _owner: PhantomData,
+        }
+    }
+
+    /// Holding `v`
+    pub fn new(v: Option<Arc<T>>) -> Self {
+        // INVARIANT: the cell owns the reference `into_raw` leaks
+        Self {
+            ptr: AtomicPtr::new(v.map_or(core::ptr::null_mut(), |a| Arc::into_raw(a).cast_mut())),
+            _owner: PhantomData,
+        }
+    }
+
+    /// The current version, valid while `g` is held (Linux
+    /// rcu_dereference)
+    pub fn read<'a>(&'a self, _g: &'a RcuReadGuard) -> Option<&'a T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a version the cell owns (type invariant); one
+        // taken out since stays allocated until a grace period after
+        // (`RcuRetired`), which `_g` keeps from ending while 'a lasts
+        unsafe { p.as_ref() }
+    }
+
+    /// The current version, valid while `O` is borrowed (Linux
+    /// rcu_dereference_protected)
+    pub fn protected<'a>(&'a self, _o: &'a O) -> Option<&'a T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a version the cell owns (type invariant); a
+        // replace needs `&mut O`, which cannot coexist with `_o`, so it
+        // stays the cell's for 'a
+        unsafe { p.as_ref() }
+    }
+
+    /// A reference to the current version (Linux get_pid(rcu_dereference()))
+    pub fn get(&self, g: &RcuReadGuard) -> Option<Arc<T>> {
+        self.read(g).map(Self::counted)
+    }
+
+    /// A reference to the current version, `O` borrowed
+    pub fn get_protected(&self, o: &O) -> Option<Arc<T>> {
+        self.protected(o).map(Self::counted)
+    }
+
+    /// A new reference to `v`, a version borrowed from the cell
+    fn counted(v: &T) -> Arc<T> {
+        let p = core::ptr::from_ref(v);
+        // SAFETY: `v` is borrowed from a version the cell owns or
+        // retired (`read`, `protected`), an `Arc::into_raw` still
+        // allocated, so its count is live
+        unsafe {
+            Arc::increment_strong_count(p);
+            Arc::from_raw(p)
+        }
+    }
+
+    /// The current version's address, to compare only (Linux
+    /// rcu_access_pointer); null for none
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.load(Ordering::Relaxed)
+    }
+
+    /// Publish `new` (Linux rcu_assign_pointer under the lock); the old
+    /// version comes back, released after a grace period
+    pub fn replace(&self, new: Option<Arc<T>>, _o: &mut O) -> RcuRetired<T> {
+        let new = new.map_or(core::ptr::null_mut(), |a| Arc::into_raw(a).cast_mut());
+        // INVARIANT: the cell owns `new`; the old leaves as RcuRetired
+        let old = self.ptr.swap(new, Ordering::AcqRel);
+        // SAFETY: null or a version the swap took out of the cell, whose
+        // one owner this is (type invariant)
+        RcuRetired((!old.is_null()).then(|| unsafe { Arc::from_raw(old) }))
+    }
+}
+
+impl<T, O: UniqueOwner> Drop for RcuLockedArc<T, O> {
+    fn drop(&mut self) {
+        let p = *self.ptr.get_mut();
+        if !p.is_null() {
+            // SAFETY: no reader borrows `self` any more (`&mut`), so the
+            // current version has its one owner here (type invariant)
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
+/// An RCU-protected pointer that owns nothing (Linux a `__rcu` pointer
+/// to an object its own owner frees a grace period after no reader can
+/// reach it any more: task->real_parent). Storing is safe; a read
+/// borrows the target only on the caller's argument that it is still
+/// allocated.
+pub struct RcuPtr<T> {
+    ptr: AtomicPtr<T>,
+}
+
+impl<T> RcuPtr<T> {
+    /// Naming nothing
+    pub const fn null() -> Self {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Name `p` (null: nothing) (Linux rcu_assign_pointer): what the
+    /// target's fields held before is seen by a reader that finds it
+    pub fn set(&self, p: *const T) {
+        self.ptr.store(p.cast_mut(), Ordering::Release);
+    }
+
+    /// The target's address, to compare only (Linux
+    /// rcu_access_pointer); null for none
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.load(Ordering::Relaxed)
+    }
+
+    /// The target, if any (Linux rcu_dereference)
+    ///
+    /// # Safety
+    /// The target, whichever this loads, stays allocated for 'a.
+    pub unsafe fn get<'a>(&self) -> Option<&'a T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a target allocated for 'a (the caller)
+        unsafe { p.as_ref() }
     }
 }
 
@@ -382,13 +553,18 @@ impl<T> Drop for RcuRetired<T> {
 /// by the one queueing that claimed the head (`next` from `IDLE` to
 /// null), before it is linked under its list's lock, and read only by
 /// the `rcuc/N` that took it off under that lock, before it sets `next`
-/// back to `IDLE` (Release; a claim is an Acquire).
+/// back to `IDLE` (Release; a claim is an Acquire); `arg` likewise.
+/// Every field is a plain word with no padding and no niche left
+/// uninitialized, so a head may lie over integer fields a user reads
+/// again after its callback (a slab's struct page, `Page::slab_rcu_head`).
 pub struct RcuHead {
     next: AtomicPtr<RcuHead>,
     /// The `GP_SEQ` value it waits for (rcu_seq_snap when queued)
     gp: AtomicU64,
-    /// What to run, on what (an object reference taken by the queueing)
-    func: UnsafeCell<Option<(RcuFn, *const ())>>,
+    /// What to run
+    func: UnsafeCell<Option<RcuFn>>,
+    /// On what (an object reference taken by the queueing)
+    arg: UnsafeCell<*const ()>,
 }
 
 // SAFETY: `func` is touched only by the claimant, then by the runner,
@@ -412,7 +588,20 @@ impl RcuHead {
             next: AtomicPtr::new(IDLE),
             gp: AtomicU64::new(0),
             func: UnsafeCell::new(None),
+            arg: UnsafeCell::new(core::ptr::null()),
         }
+    }
+
+    /// Set what its callback runs
+    ///
+    /// # Safety
+    /// The caller claimed the head (`next` from `IDLE` to null) and has
+    /// not linked it yet.
+    unsafe fn set(&self, func: RcuFn, arg: *const ()) {
+        // SAFETY: claimed by the caller: only it writes (type invariant)
+        unsafe { *self.func.get() = Some(func) };
+        // SAFETY: as above
+        unsafe { *self.arg.get() = arg };
     }
 }
 
@@ -469,19 +658,26 @@ struct RcuData {
     /// The grace period the first callback waits for (u64::MAX: none),
     /// written under `cbs`, read by the clock interrupt
     next_gp: AtomicU64,
+    /// The latest grace period this CPU asked `rcu_gp` for (Linux
+    /// rdp->gp_seq_needed), under `cbs`: a callback that needs no later
+    /// one asks nothing
+    needed: AtomicU64,
     /// `rcuc/N` waits here
     wq: WaitQueue,
 }
 
-static RDP: crate::cpu::PerCpu<RcuData> = crate::percpu![RcuData {
+crate::percpu! {
+    static RDP: RcuData = RcuData {
     cbs: IrqSpinlock::new(CbList {
         head: core::ptr::null_mut(),
         tail: core::ptr::null_mut(),
         pending: 0,
     }),
     next_gp: AtomicU64::new(u64::MAX),
+    needed: AtomicU64::new(0),
     wq: WaitQueue::new(),
-}];
+};
+}
 
 /// Callbacks run per batch at least (Linux DEFAULT_RCU_BLIMIT)
 const BLIMIT: usize = 10;
@@ -564,10 +760,10 @@ pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
         )
         .is_ok();
     assert!(claimed, "call_rcu: head already queued");
-    // SAFETY: claimed: only this queueing writes it (type invariant)
-    unsafe { *h.func.get() = Some((func, arg)) };
+    // SAFETY: claimed just now, not linked yet
+    unsafe { h.set(func, arg) };
     let d = RDP.this();
-    let want = {
+    let (want, ask) = {
         let mut l = d.cbs.lock();
         // The caller's unlink is seen before the grace period sampled
         // (Linux's full barrier in __call_rcu_common)
@@ -580,12 +776,30 @@ pub unsafe fn call_rcu(h: &RcuHead, func: RcuFn, arg: *const ()) {
         if first {
             d.next_gp.store(want, Ordering::Release);
         }
-        want
+        // Linux rcu_start_this_gp: nothing to ask if this CPU asked for
+        // this grace period (or a later one) already
+        let ask = d.needed.load(Ordering::Relaxed) < want;
+        if ask {
+            d.needed.store(want, Ordering::Relaxed);
+        }
+        (want, ask)
     };
-    // Ask rcu_gp for the grace period (Linux rcu_start_this_gp)
-    if GP_REQ.fetch_max(want, Ordering::SeqCst) < want {
+    // Ask rcu_gp for it, unless someone already did (a request for a
+    // later grace period covers this one): the global word is written
+    // only when it is behind
+    if ask
+        && GP_REQ.load(Ordering::Relaxed) < want
+        && GP_REQ.fetch_max(want, Ordering::SeqCst) < want
+    {
         GP_KICK.wake_all();
     }
+}
+
+/// Callbacks can be queued here: false in host unit tests and at the
+/// start of boot (no CPU id yet), when no other CPU runs a reader, so a
+/// release may happen at once
+pub fn can_queue() -> bool {
+    !cfg!(test) && crate::cpu::try_this_id().is_some()
 }
 
 /// Release one reference to `a` after a grace period (Linux
@@ -757,10 +971,12 @@ fn do_batch(d: &RcuData) {
         // SAFETY: the claimant wrote it before queueing; this runner
         // took the head off under the lock (type invariant)
         let f = unsafe { (*h.func.get()).take() };
+        // SAFETY: as above
+        let arg = unsafe { *h.arg.get() };
         // INVARIANT: on no list again; `h` is not touched after this
         // (the callback may free it)
         h.next.store(IDLE, Ordering::Release);
-        if let Some((func, arg)) = f {
+        if let Some(func) = f {
             // SAFETY: call_rcu's contract: a grace period has passed
             // since it was queued, preemption is off
             unsafe { func(arg) };
@@ -806,8 +1022,10 @@ static BARRIER_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 static BARRIER_LEFT: AtomicUsize = AtomicUsize::new(0);
 static BARRIER_DONE: crate::sync::completion::Completion =
     crate::sync::completion::Completion::new();
-/// Each CPU's barrier callback (Linux rcu_data.barrier_head)
-static BARRIER_HEAD: crate::cpu::PerCpu<RcuHead> = crate::percpu![RcuHead::new()];
+crate::percpu! {
+    /// Each CPU's barrier callback (Linux rcu_data.barrier_head)
+    static BARRIER_HEAD: RcuHead = RcuHead::new();
+}
 
 /// A barrier callback ran
 ///
@@ -840,8 +1058,8 @@ fn barrier_entrain(cpu: u32) {
             )
             .is_ok();
         assert!(claimed, "rcu_barrier: barrier head queued");
-        // SAFETY: claimed just now (type invariant)
-        unsafe { *h.func.get() = Some((barrier_cb, core::ptr::null())) };
+        // SAFETY: claimed just now, not linked yet
+        unsafe { h.set(barrier_cb, core::ptr::null()) };
         // The last one's grace period, or none if all were taken off
         // to run: then it is ready at once
         // SAFETY: the tail is a queued head (CbList invariant)

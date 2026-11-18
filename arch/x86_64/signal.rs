@@ -16,7 +16,7 @@ use crate::signal::siginfo::UserSigInfo;
 use crate::signal::{
     AltStack, SigAction, SigHandler, SigInfo, SigSet, Signal, Trap, UserStack, sa_flags,
 };
-use crate::uaccess::{access_ok, copy_from_user, copy_to_user};
+use crate::uaccess::{access_ok, copy_from_user, copy_to_user, get_user, put_user};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -220,7 +220,6 @@ pub fn setup_rt_frame(
     let regs = &mut r;
 
     // The interrupted user context (the task's pt_regs)
-    let user_rip = regs.rip;
     let user_rflags = regs.rflags;
     let user_rsp = regs.rsp;
 
@@ -241,7 +240,6 @@ pub fn setup_rt_frame(
         return Err(KernelError::InvalidArgument);
     };
 
-    let frame_size = signal_frame_size();
     let fp_size = fpu::sigframe_size();
     let (fpstate_addr, frame_addr) = get_sigframe(user_rsp, action, alt)?;
     let total = (fpstate_addr + fp_size as u64 - frame_addr) as usize;
@@ -251,66 +249,17 @@ pub fn setup_rt_frame(
         return Err(KernelError::BadAddress);
     }
 
-    // FP image of the interrupted code (live in the registers: the kernel
-    // does not use them)
-    let mut fp_area = fpu::FpuArea::init();
-    let fp_len = fpu::save_sigframe(&mut fp_area);
-    if copy_to_user(fpstate_addr, &fp_area.0[..fp_len]).is_err() {
-        return Err(KernelError::BadAddress);
-    }
+    copy_fpstate_to_sigframe(fpstate_addr)?;
 
-    // Build SigContext from saved registers
-    let sigctx = SigContext {
-        r8: regs.r8,
-        r9: regs.r9,
-        r10: regs.r10,
-        r11: regs.r11,
-        r12: regs.r12,
-        r13: regs.r13,
-        r14: regs.r14,
-        r15: regs.r15,
-        rdi: regs.rdi,
-        rsi: regs.rsi,
-        rbp: regs.rbp,
-        rbx: regs.rbx,
-        rdx: regs.rdx,
-        rax: regs.rax,
-        rcx: regs.rcx,
-        rsp: user_rsp,
-        rip: user_rip,
-        eflags: user_rflags,
-        cs: USER_CS,
-        ss: USER_SS,
-        err: trap.error,
-        trapno: trap.trapno,
-        oldmask: blocked.bits(),
-        cr2: trap.addr,
-        fpstate: fpstate_addr,
-        ..FromBytes::zeroed()
-    };
-
-    let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
-    if fpu::use_xsave() {
-        uc_flags |= UC_FP_XSTATE;
-    }
-
-    // Build the complete frame
-    let frame = RtSigFrame {
-        pretcode: restorer,
-        uc: UContext {
-            uc_flags,
-            uc_link: 0,
-            uc_stack: alt.save(),
-            uc_mcontext: sigctx,
-            uc_sigmask: blocked,
-        },
-        info: info.to_user(),
-    };
-
-    // Copy frame to user stack
-    if copy_to_user(frame_addr, &frame.as_bytes()[..frame_size]).is_err() {
-        return Err(KernelError::BadAddress);
-    }
+    put_rt_frame(
+        (fpstate_addr, frame_addr),
+        restorer,
+        regs,
+        blocked,
+        info,
+        trap,
+        alt,
+    )?;
 
     // Calculate addresses of info and ucontext within the frame
     let info_addr = frame_addr + core::mem::offset_of!(RtSigFrame, info) as u64;
@@ -337,6 +286,106 @@ pub fn setup_rt_frame(
     uframe.set(r);
 
     Ok(())
+}
+
+/// Write the handler frame at `frame`, its sigcontext pointing at the
+/// FP image at `fpstate`: the interrupted registers `regs`, mask
+/// `blocked`, `info` and `alt`'s settings (Linux __setup_rt_frame's puts
+/// and setup_sigcontext). Out of line, beside the FP image's writer.
+#[inline(never)]
+fn put_rt_frame(
+    (fpstate_addr, frame_addr): (u64, u64),
+    restorer: u64,
+    regs: &super::PtRegs,
+    blocked: SigSet,
+    info: &SigInfo,
+    trap: &Trap,
+    alt: &AltStack,
+) -> KernelResult<()> {
+    // Build SigContext from saved registers
+    let sigctx = SigContext {
+        r8: regs.r8,
+        r9: regs.r9,
+        r10: regs.r10,
+        r11: regs.r11,
+        r12: regs.r12,
+        r13: regs.r13,
+        r14: regs.r14,
+        r15: regs.r15,
+        rdi: regs.rdi,
+        rsi: regs.rsi,
+        rbp: regs.rbp,
+        rbx: regs.rbx,
+        rdx: regs.rdx,
+        rax: regs.rax,
+        rcx: regs.rcx,
+        rsp: regs.rsp,
+        rip: regs.rip,
+        eflags: regs.rflags,
+        cs: USER_CS,
+        ss: USER_SS,
+        err: trap.error,
+        trapno: trap.trapno,
+        oldmask: blocked.bits(),
+        cr2: trap.addr,
+        fpstate: fpstate_addr,
+        ..FromBytes::zeroed()
+    };
+
+    let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+    if super::fpu::use_xsave() {
+        uc_flags |= UC_FP_XSTATE;
+    }
+
+    // Build the complete frame
+    let frame = RtSigFrame {
+        pretcode: restorer,
+        uc: UContext {
+            uc_flags,
+            uc_link: 0,
+            uc_stack: alt.save(),
+            uc_mcontext: sigctx,
+            uc_sigmask: blocked,
+        },
+        info: info.to_user(),
+    };
+
+    // Copy frame to user stack
+    copy_to_user(frame_addr, frame.as_bytes())
+        .map(|_| ())
+        .map_err(|_| KernelError::BadAddress)
+}
+
+/// Save the FP state of the interrupted code (live in the registers:
+/// the kernel does not use them) straight into the user frame's image
+/// at `buf`, which passed access_ok (Linux copy_fpstate_to_sigframe):
+/// XSAVE or FXSAVE with page faults disabled, the frame faulted in and
+/// the save retried after a fault; then the software bytes, the end
+/// magic and the x87/SSE bits (save_xstate_epilog)
+fn copy_fpstate_to_sigframe(buf: u64) -> KernelResult<()> {
+    use super::fpu;
+    let efault = |_| KernelError::BadAddress;
+    if fpu::use_xsave() {
+        // The header first, so its reserved fields are zero
+        let hdr = buf + fpu::XSAVE_HDR as u64;
+        copy_to_user(hdr, &[0u8; fpu::XSAVE_HDR_SIZE]).map_err(efault)?;
+    }
+    while !fpu::save_to_user(buf) {
+        let size = fpu::sigframe_size();
+        if crate::uaccess::fault_in_writeable(buf, size) != 0 {
+            return Err(KernelError::BadAddress);
+        }
+    }
+    let sw = fpu::sw_bytes();
+    copy_to_user(buf + fpu::FXSAVE_SW_BYTES as u64, &sw).map_err(efault)?;
+    if !fpu::use_xsave() {
+        return Ok(());
+    }
+    let size = fpu::xstate_size() as u64;
+    put_user(buf + size, fpu::FP_XSTATE_MAGIC2).map_err(efault)?;
+    let bv = buf + fpu::XSAVE_HDR as u64;
+    let x: u32 = get_user(bv).map_err(efault)?;
+    put_user(bv, x | fpu::XFEATURE_MASK_FPSSE).map_err(efault)
 }
 
 /// Where a handler frame for `action` goes when `rsp` is interrupted
@@ -367,34 +416,71 @@ fn get_sigframe(rsp: u64, action: &SigAction, alt: &AltStack) -> KernelResult<(u
 }
 
 /// Load the FP state saved at `fpstate` by [`setup_rt_frame`] (0 = none:
-/// initial state). False for an unreadable or malformed image.
+/// initial state) straight from the user frame (Linux fpu__restore_sig).
+/// False for an unreadable or malformed image, the initial state then
+/// loaded (fpu__clear_user_states).
 fn restore_sigframe_fpu(fpstate: u64) -> bool {
-    use super::fpu;
-
-    if fpstate == 0 {
-        fpu::load_init_state();
-        return true;
+    let ok = fpstate == 0 || fpu_restore_sig(fpstate);
+    if fpstate == 0 || !ok {
+        super::fpu::load_init_state();
     }
-    let mut area = fpu::FpuArea::init();
-    // The legacy 512 bytes always; the XSAVE part if the frame says so
-    if copy_from_user(&mut area.0[..512], fpstate, 512).is_err() {
+    ok
+}
+
+/// Linux __fpu_restore_sig for a 64-bit frame: the features its
+/// software bytes claim (`check_xstate_in_sigframe`; x87 and SSE
+/// without XSAVE), restored straight from the image; a page fault is
+/// resolved (fault_in_readable) and the restore retried, any other trap
+/// fails it
+fn fpu_restore_sig(buf: u64) -> bool {
+    use super::fpu;
+    if !access_ok(buf, fpu::sigframe_size()) {
         return false;
     }
-    let sw = &area.0[464..468];
-    if fpu::use_xsave() && u32::from_le_bytes(sw.try_into().unwrap()) == fpu::FP_XSTATE_MAGIC1 {
-        let size = fpu::sigframe_size();
-        let Some(rest) = fpstate.checked_add(512) else {
-            return false;
-        };
-        if copy_from_user(&mut area.0[512..size], rest, size - 512).is_err() {
-            return false;
+    let (features, fx_only) = if fpu::use_xsave() {
+        match check_xstate_in_sigframe(buf) {
+            Some(f) => f,
+            None => return false,
+        }
+    } else {
+        (u64::from(fpu::XFEATURE_MASK_FPSSE), false)
+    };
+    let xrestore = features & fpu::xfeatures();
+    loop {
+        match fpu::restore_from_user(buf, xrestore, fx_only) {
+            Ok(()) => return true,
+            Err(14) if crate::uaccess::fault_in_readable(buf, fpu::xstate_size()) == 0 => {}
+            Err(_) => return false,
         }
     }
-    if !fpu::sanitize_sigframe(&mut area) {
-        return false;
+}
+
+/// Linux check_xstate_in_sigframe: what the image at `buf` holds, from
+/// its software bytes: an XSAVE image when they say so with a size this
+/// kernel saves and the end magic follows it, (its features, false);
+/// else the legacy part only, (x87 | SSE, true). None when they cannot
+/// be read.
+fn check_xstate_in_sigframe(buf: u64) -> Option<(u64, bool)> {
+    use super::fpu;
+    // magic1, extended_size, xfeatures, xstate_size
+    let mut sw = [0u8; 20];
+    copy_from_user(&mut sw, buf + fpu::FXSAVE_SW_BYTES as u64, 20).ok()?;
+    let word = |i: usize| u32::from_le_bytes([sw[i], sw[i + 1], sw[i + 2], sw[i + 3]]);
+    let (magic1, extended, size) = (word(0), word(4), word(16));
+    let features = u64::from(word(8)) | u64::from(word(12)) << 32;
+    let fx_only = Some((u64::from(fpu::XFEATURE_MASK_FPSSE), true));
+    // The legacy region and the XSAVE header at least
+    let min = (fpu::XSAVE_HDR + fpu::XSAVE_HDR_SIZE) as u32;
+    let max = fpu::xstate_size() as u32;
+    if magic1 != fpu::FP_XSTATE_MAGIC1 || size < min || size > max || size > extended {
+        return fx_only;
     }
-    fpu::restore(&area);
-    true
+    let magic2: u32 = get_user(buf + u64::from(size)).ok()?;
+    if magic2 == fpu::FP_XSTATE_MAGIC2 {
+        Some((features, false))
+    } else {
+        fx_only
+    }
 }
 
 /// Restore context from signal frame (sys_rt_sigreturn)

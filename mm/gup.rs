@@ -23,14 +23,12 @@
 //! munmap and exit drop the entries' references only: a pinned page
 //! stays allocated until its last unpin.
 
-use alloc::sync::Arc;
-
 use super::fault::{Access, handle_mm_fault, unshare_for_write};
 use super::pgtable::PgTables;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_READ, PROT_WRITE, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::paging;
-use crate::fs::Inode;
+use crate::fs::InodeRef;
 use crate::util::error::KernelError;
 use crate::util::seg::trim_tail;
 use crate::util::smallvec::SmallVec;
@@ -72,7 +70,7 @@ pub struct PinnedPages {
     segs: SmallVec<PageSeg, INLINE_PAGES>,
     /// Per segment, the inode whose page cache its page belongs to (a
     /// shared file mapping written through): a write dirties it there
-    owners: SmallVec<Option<Arc<Inode>>, INLINE_PAGES>,
+    owners: SmallVec<Option<InodeRef>, INLINE_PAGES>,
     dirty: bool,
 }
 
@@ -134,7 +132,7 @@ impl PinnedPages {
     /// Mark the page at `phys` dirty: anonymous memory by its flag, a
     /// page-cache page in its `owner`'s mapping under the page lock
     /// (Linux folio_mark_dirty)
-    fn dirty_page(phys: u64, owner: Option<&Arc<Inode>>) {
+    fn dirty_page(phys: u64, owner: Option<&InodeRef>) {
         match owner {
             Some(inode) => {
                 super::page::lock_page(phys);
@@ -279,6 +277,37 @@ fn pin_vma(map: &MmStruct, addr: u64, write: bool) -> Result<&Vma, KernelError> 
     Ok(vma)
 }
 
+/// The frame of the current task's page at `addr`, faulted in for
+/// reading if missing (Linux get_user_pages_fast without FOLL_WRITE,
+/// the page released at once): neither pinned nor unshared; EFAULT
+/// with no readable VMA there
+pub fn user_page_phys(addr: u64) -> Result<u64, KernelError> {
+    use super::huge_page::HUGE_PAGE_MASK;
+    let mm = crate::task::percpu::current()
+        .mm()
+        .ok_or(KernelError::BadAddress)?;
+    let page = addr & !(PAGE_SIZE - 1);
+    loop {
+        {
+            let map = mm.mmap_read();
+            pin_vma(&map, page, false)?;
+            let t = PgTables::new(&mm, &map);
+            if let Some(pmd) = t.pmd(page).filter(|p| p.huge()) {
+                let base = paging::pte_addr(pmd.settled()) & !HUGE_PAGE_MASK;
+                return Ok(base + (page & HUGE_PAGE_MASK));
+            }
+            if let Some(ptep) = t.pte(page) {
+                let l = ptep.lock();
+                let pte = l.get(page);
+                if paging::pte_present(pte) && !paging::pte_protnone(pte) {
+                    return Ok(paging::pte_addr(pte));
+                }
+            }
+        }
+        fault_in(&mm, page, Access::Read)?;
+    }
+}
+
 /// What pinning one page found
 enum Follow {
     /// Pinned: its frame
@@ -357,7 +386,7 @@ fn fault_in(mm: &Mm, addr: u64, access: Access) -> Result<(), KernelError> {
 
 /// The inode whose page cache a pinned page written through a shared
 /// file mapping belongs to
-fn cache_owner(vma: &Vma, write: bool) -> Option<Arc<Inode>> {
+fn cache_owner(vma: &Vma, write: bool) -> Option<InodeRef> {
     if !write || !vma.is_shared() {
         return None;
     }

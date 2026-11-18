@@ -69,11 +69,16 @@ pub fn sys_getpriority(which: i32, who: i32) -> KernelResult<i64> {
     // 20 - nice (range 1-40) to avoid negative return values; of a
     // group, the highest (Linux: the largest 20 - nice)
     // 0 is the calling thread (Linux: current)
+    let nice = |t: &Task| super::percpu::lookup_task_nice(t).map(|n| i64::from(20 - n));
+    if which == PRIO_USER {
+        let mut best = None;
+        for_each_user_task(who, |t| best = best.max(nice(t)));
+        return best.ok_or(KernelError::NoProcess);
+    }
     let tasks = prio_tasks(which, who)?;
     tasks
         .iter()
-        .filter_map(|t| super::percpu::lookup_task_nice(t))
-        .map(|n| i64::from(20 - n))
+        .filter_map(|t| nice(t))
         .max()
         .ok_or(KernelError::NoProcess)
 }
@@ -81,7 +86,7 @@ pub fn sys_getpriority(which: i32, who: i32) -> KernelResult<i64> {
 /// The threads `which` and `who` name for getpriority/setpriority (the
 /// caller's numbers, 0 the caller's own): EINVAL for a bad `which`
 fn prio_tasks(which: i32, who: u64) -> KernelResult<alloc::vec::Vec<TaskRef>> {
-    use super::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
+    use super::{PRIO_PGRP, PRIO_PROCESS};
     Ok(match which {
         PRIO_PROCESS => {
             let tid = super::pid::from_vnr_or(who, current_tid()).ok_or(KernelError::NoProcess)?;
@@ -92,23 +97,28 @@ fn prio_tasks(which: i32, who: u64) -> KernelResult<alloc::vec::Vec<TaskRef>> {
                 .ok_or(KernelError::NoProcess)?;
             super::percpu::pgrp_tasks(pgid)
         }
-        PRIO_USER => tasks_of_user(who),
         _ => return Err(KernelError::InvalidArgument),
     })
 }
 
-/// The threads whose real uid is `who` (0: the caller's), for PRIO_USER
-/// (Linux for_each_process_thread with uid_eq(task_uid(p), uid))
-fn tasks_of_user(who: u64) -> alloc::vec::Vec<TaskRef> {
+/// Run `f` on each thread whose real uid is `who` (0: the caller's) and
+/// that the caller's pid namespace numbers, for PRIO_USER: the task
+/// list walked under RCU alone (Linux set/getpriority:
+/// for_each_process_thread under rcu_read_lock, uid_eq(task_uid(p),
+/// uid) && task_pid_vnr(p)); `f` takes only spin locks
+fn for_each_user_task(who: u64, mut f: impl FnMut(&Task)) {
     let uid = if who == 0 {
         super::percpu::current_cred().uid
     } else {
         who as super::Uid
     };
-    super::percpu::GlobalTaskTable::collect_tasks(|_, t| {
-        (!t.task.has_flag(super::pf::KTHREAD) && t.cred().uid == uid)
-            .then(|| super::percpu::task_ref(t.task))
-    })
+    let ns = super::percpu::current_pid_ns();
+    let g = crate::sync::rcu::read_lock();
+    for t in super::percpu::for_each_task_rcu(&g) {
+        if t.cred_rcu(&g).uid == uid && t.pid_nr_ns(ns, &g) != 0 {
+            f(t);
+        }
+    }
 }
 
 /// Set task `t`'s nice value (Linux set_one_prio): EPERM unless the
@@ -125,11 +135,13 @@ fn set_one_prio(
     let Some(cur_nice) = super::percpu::lookup_task_nice(t) else {
         return error;
     };
-    let target = super::percpu::TASKLIST.read().view(t).map(|v| v.cred());
-    let Some(c) = target else {
-        return error;
+    // Linux set_one_prio: __task_cred under rcu_read_lock
+    let owner = {
+        let g = crate::sync::rcu::read_lock();
+        let c = t.cred_rcu(&g);
+        c.uid == caller_euid || c.euid == caller_euid
     };
-    if c.uid != caller_euid && c.euid != caller_euid && !capable(CAP_SYS_NICE) {
+    if !owner && !capable(CAP_SYS_NICE) {
         return Err(KernelError::NotPermitted);
     }
     // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
@@ -176,8 +188,12 @@ pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> KernelResult<()> {
 
     // Every thread named (Linux set_one_prio each): the first success
     // clears ESRCH, an error stays
-    let tasks = prio_tasks(which, who)?;
     let mut ret = Err(KernelError::NoProcess);
+    if which == PRIO_USER {
+        for_each_user_task(who, |t| ret = set_one_prio(t, niceval, caller_euid, ret));
+        return ret;
+    }
+    let tasks = prio_tasks(which, who)?;
     for t in &tasks {
         ret = set_one_prio(t, niceval, caller_euid, ret);
     }
@@ -286,21 +302,18 @@ fn check_setscheduler(
     }
     let reset = policy & SCHED_RESET_ON_FORK != 0;
     let policy = policy & !SCHED_RESET_ON_FORK;
-    // One snapshot of the task (Linux reads p's fields under its locks)
-    let snap = super::percpu::TASKLIST.read().view(t).map(|v| {
-        let se = &v.task.se;
-        (
-            v.cred(),
-            se.policy(),
-            se.reset_on_fork(),
-            i32::from(se.rt_priority()),
-            se.nice(),
-        )
-    });
-    let Some((c, cur, cur_reset, cur_prio, nice)) = snap else {
-        return Err(KernelError::NoProcess);
+    // One setting of the parameters (one load)
+    let se = &t.se;
+    let p = se.params();
+    let (cur, cur_reset) = (p.policy(), se.reset_on_fork());
+    let (cur_prio, nice) = (i32::from(p.rt_priority()), p.nice());
+    // Linux check_same_owner: __task_cred under rcu_read_lock
+    let owner = {
+        let g = crate::sync::rcu::read_lock();
+        let c = t.cred_rcu(&g);
+        c.uid == euid || c.euid == euid
     };
-    if c.uid != euid && c.euid != euid {
+    if !owner {
         return Err(KernelError::NotPermitted);
     }
     if cur_reset && !reset {
@@ -526,12 +539,12 @@ pub fn sys_sched_setaffinity(pid: i64, cpusetsize: u64, mask_ptr: UserPtr<u8>) -
     // Linux sched_setaffinity: the caller's own tasks (check_same_owner:
     // its euid is their uid or euid) or CAP_SYS_NICE
     let euid = super::percpu::current_cred().euid;
-    let owner = super::percpu::TASKLIST
-        .read()
-        .view(&t)
-        .map(|t| t.cred())
-        .map(|c| c.uid == euid || c.euid == euid);
-    if !owner.ok_or(KernelError::NoProcess)? && !super::capable(super::CAP_SYS_NICE) {
+    let owner = {
+        let g = crate::sync::rcu::read_lock();
+        let c = t.cred_rcu(&g);
+        c.uid == euid || c.euid == euid
+    };
+    if !owner && !super::capable(super::CAP_SYS_NICE) {
         return Err(KernelError::NotPermitted);
     }
 
@@ -618,11 +631,10 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
             let tid =
                 super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
             let t = super::percpu::find_task(tid).ok_or(KernelError::NoProcess)?;
-            match ioprio_owner_ok(&t) {
-                None => Err(KernelError::NoProcess),
-                Some(false) => Err(KernelError::NotPermitted),
-                Some(true) => super::set_task_ioprio(&t, ioprio),
+            if !ioprio_owner_ok(&t) {
+                return Err(KernelError::NotPermitted);
             }
+            super::set_task_ioprio(&t, ioprio)
         }
         IOPRIO_WHO_PGRP => {
             // Set ioprio for all processes in a process group
@@ -634,11 +646,13 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
             // it); ESRCH if none was left
             let mut found = false;
             for t in &super::percpu::pgrp_tasks(pgid) {
-                match ioprio_owner_ok(t) {
-                    None => continue,
-                    Some(false) => return Err(KernelError::NotPermitted),
-                    Some(true) => super::set_task_ioprio(t, ioprio)?,
+                if super::percpu::TASKLIST.read().view(t).is_none() {
+                    continue;
                 }
+                if !ioprio_owner_ok(t) {
+                    return Err(KernelError::NotPermitted);
+                }
+                super::set_task_ioprio(t, ioprio)?;
                 found = true;
             }
             if found {
@@ -658,14 +672,15 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
 
 /// May the caller change task `t`'s I/O priority (Linux
 /// set_task_ioprio): its uid is the caller's euid or uid, or the caller
-/// has CAP_SYS_NICE; None once `t` is reaped
-fn ioprio_owner_ok(t: &Task) -> Option<bool> {
+/// has CAP_SYS_NICE; its credentials read under RCU (__task_cred)
+fn ioprio_owner_ok(t: &Task) -> bool {
     let me = super::percpu::current_cred();
-    let ok = super::percpu::TASKLIST
-        .read()
-        .view(t)
-        .map(|t| t.cred().uid == me.euid || t.cred().uid == me.uid)?;
-    Some(ok || super::capable(super::CAP_SYS_NICE))
+    let ok = {
+        let g = crate::sync::rcu::read_lock();
+        let tc = t.cred_rcu(&g);
+        tc.uid == me.euid || tc.uid == me.uid
+    };
+    ok || super::capable(super::CAP_SYS_NICE)
 }
 
 /// sys_ioprio_get - get I/O scheduling class and priority

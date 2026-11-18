@@ -142,10 +142,14 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> K
     if pid1 <= 0 || pid2 <= 0 {
         return Err(KernelError::NoProcess);
     }
-    // The caller's numbers (Linux find_task_by_vpid)
-    let from = |p: i32| crate::task::pid::from_vnr(p as u64);
-    let (Some(pid1), Some(pid2)) = (from(pid1), from(pid2)) else {
-        return Err(KernelError::NoProcess);
+    // Both tasks by the caller's numbers, under RCU (Linux
+    // find_task_by_vpid and get_task_struct under rcu_read_lock)
+    let (t1, t2) = {
+        let g = crate::sync::rcu::read_lock();
+        let find = |p: i32| crate::task::percpu::vpid_task(p as u64, &g);
+        let task1 = find(pid1).ok_or(KernelError::NoProcess)?;
+        let task2 = find(pid2).ok_or(KernelError::NoProcess)?;
+        (task_ref(task1), task_ref(task2))
     };
 
     // Validate type
@@ -157,14 +161,6 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> K
     if kcmp_type == KCMP_EPOLL_TFD {
         return Err(KernelError::OperationNotSupported);
     }
-
-    // Look up both tasks
-    let (t1, t2) = {
-        let table = TASKLIST.read();
-        let task1 = table.get(pid1).ok_or(KernelError::NoProcess)?;
-        let task2 = table.get(pid2).ok_or(KernelError::NoProcess)?;
-        (task_ref(task1.task), task_ref(task2.task))
-    };
     // Both thread groups' exec_update_lock for reading across the access
     // checks and everything compared, so neither execs (a set-id program,
     // a new mm, file table or signal handlers) in between (Linux
@@ -188,7 +184,7 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> K
             return Err(KernelError::NoProcess);
         };
         (
-            (arc_key(&a.sighand), arc_key(&b.sighand)),
+            (arc_key(&a.sighand()), arc_key(&b.sighand())),
             (arc_key(&a.sysvsem), arc_key(&b.sysvsem)),
         )
     };

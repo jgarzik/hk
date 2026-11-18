@@ -5,7 +5,7 @@
 //!
 //! Reference: include/uapi/asm-generic/ioctls.h
 
-use super::termios::{CLOCAL, N_TTY, Termios, Winsize};
+use super::termios::{CLOCAL, KTermios, N_TTY, Termio, Termios, Winsize};
 use super::{Tty, jobctrl};
 use crate::fs::File;
 use crate::uaccess::{get_user, put_user};
@@ -24,6 +24,14 @@ pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 /// Set termios structure (after flush)
 pub const TCSETSF: u32 = 0x5404;
+/// Get termios2 (struct termios2 with the speeds: _IOR('T', 0x2A))
+pub const TCGETS2: u32 = 0x802C_542A;
+/// Set termios2 (immediately)
+pub const TCSETS2: u32 = 0x402C_542B;
+/// Set termios2 (after drain)
+pub const TCSETSW2: u32 = 0x402C_542C;
+/// Set termios2 (after drain, flushing input)
+pub const TCSETSF2: u32 = 0x402C_542D;
 /// Get termios using termio struct (old interface)
 pub const TCGETA: u32 = 0x5405;
 /// Set termios using termio struct
@@ -48,6 +56,8 @@ const TCION: u64 = 3;
 pub const TIOCEXCL: u32 = 0x540C;
 /// Clear exclusive mode
 pub const TIOCNXCL: u32 = 0x540D;
+/// Get exclusive mode (_IOR('T', 0x40, int))
+pub const TIOCGEXCL: u32 = 0x8004_5440;
 /// Set controlling terminal
 pub const TIOCSCTTY: u32 = 0x540E;
 /// Get foreground process group
@@ -135,6 +145,7 @@ fn tty_own(cmd: u32) -> bool {
             | TIOCSWINSZ
             | TIOCEXCL
             | TIOCNXCL
+            | TIOCGEXCL
             | TIOCGETD
             | TIOCSETD
             | TIOCSBRK
@@ -181,22 +192,30 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
     // tty_check_change in set_termios, n_tty_ioctl_helper, tty_ioctl)
     if matches!(
         cmd,
-        TCSETS | TCSETSW | TCSETSF | TCFLSH | TCXONC | TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK
+        TCSETS
+            | TCSETSW
+            | TCSETSF
+            | TCSETS2
+            | TCSETSW2
+            | TCSETSF2
+            | TCSETA
+            | TCSETAW
+            | TCSETAF
+            | TCFLSH
+            | TCXONC
+            | TCSBRK
+            | TCSBRKP
+            | TIOCSBRK
+            | TIOCCBRK
     ) {
         jobctrl::check_change(tty, crate::signal::SIGTTOU)?;
     }
     match cmd {
-        TCGETS => put(arg, tty.get_termios()),
-        TCSETS | TCSETSW | TCSETSF => {
-            let t: Termios = get(arg)?;
-            if cmd != TCSETS {
-                drain(tty)?;
-            }
-            if cmd == TCSETSF {
-                tty.flush_input();
-            }
-            tty.set_termios(t);
-            Ok(0)
+        TCGETS => put(arg, tty.get_termios().termios()),
+        TCGETS2 => put(arg, tty.get_termios()),
+        TCGETA => put(arg, tty.get_termios().termio()),
+        TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 | TCSETA | TCSETAW | TCSETAF => {
+            set_termios(tty, cmd, arg)
         }
         TIOCGWINSZ => put(arg, tty.get_winsize()),
         TIOCSWINSZ => {
@@ -257,7 +276,11 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             Ok(0)
         }
         TIOCSBRK | TIOCCBRK => hw(tty).map(|()| 0),
-        TIOCEXCL | TIOCNXCL => Ok(0),
+        TIOCEXCL | TIOCNXCL => {
+            tty.set_exclusive(cmd == TIOCEXCL);
+            Ok(0)
+        }
+        TIOCGEXCL => put(arg, i32::from(tty.exclusive())),
         // No modem control: the lines read as asserted, sets are ignored
         TIOCMGET => {
             hw(tty)?;
@@ -279,6 +302,28 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
         }
         _ => Err(KernelError::NotTty),
     }
+}
+
+/// TCSETS*, TCSETS*2, TCSETA* (Linux set_termios): the user's struct
+/// termios, termios2 or termio over the tty's settings, the speeds
+/// loaded from the baud bits; the W and F forms wait for the output to
+/// drain, the F forms then flush input
+fn set_termios(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    let mut k = tty.get_termios();
+    match cmd {
+        TCSETS | TCSETSW | TCSETSF => k.set_termios(&get::<Termios>(arg)?),
+        TCSETA | TCSETAW | TCSETAF => k.set_termio(&get::<Termio>(arg)?),
+        _ => k = get::<KTermios>(arg)?,
+    }
+    k.set_speeds();
+    if !matches!(cmd, TCSETS | TCSETS2 | TCSETA) {
+        drain(tty)?;
+    }
+    if matches!(cmd, TCSETSF | TCSETSF2 | TCSETAF) {
+        tty.flush_input();
+    }
+    tty.set_termios(k);
+    Ok(0)
 }
 
 /// TCXONC (Linux n_tty_ioctl_helper): stop or restart output, or send

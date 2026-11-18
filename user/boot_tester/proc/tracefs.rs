@@ -16,12 +16,26 @@
 //!   mode=, uid=, gid= sets them on the one shared superblock and
 //!   /proc/mounts shows them; an unknown option is EINVAL since Linux
 //!   6.10 (the new mount API; ignored before)
+//! - TRACEFS_RESOLVE_CACHED: a looked-up file resolves with
+//!   RESOLVE_CACHED, a name never looked up is EAGAIN
+//! - TRACEFS_READDIR: getdents lists the root's `trace` (DT_REG) and
+//!   `events` (DT_DIR), and events/'s `enable` (Linux dcache_readdir;
+//!   eventfs's on Linux)
+//! - TRACEFS_OWNER: every tracefs inode takes the root's owner and
+//!   group (Linux set_tracefs_inode_owner): a mount with uid=/gid= shows
+//!   them on `trace` and `events`; one chown made sticks until a later
+//!   uid= (gid=) mount resets it (tracefs_apply_options)
+//! - TRACEFS_CHOWN: after a mount with uid=1000,gid=1001,mode=0750, a
+//!   chown of `trace` is judged against that owner: uid 1000 may give
+//!   it to itself, uid 1001 (group member, not the owner) is EPERM
 
 use crate::harness::{R, check, report_r};
 use crate::helpers::{host_mode, linux_at_least, msleep, read_file, skip};
+use crate::proc::sysfs::each_entry;
 use hk_syscall::{
-    LinuxStatFs, O_DIRECT, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount,
-    sys_open, sys_pread64, sys_stat, sys_statfs, sys_umount2, sys_write,
+    LinuxStatFs, O_DIRECT, O_DIRECTORY, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY, Stat, sys_chown,
+    sys_close, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_open, sys_openat2, sys_pread64,
+    sys_setresgid, sys_setresuid, sys_stat, sys_statfs, sys_umount2, sys_wait4, sys_write,
 };
 
 const MP: &[u8] = b"/sys/kernel/tracing\0";
@@ -44,6 +58,10 @@ pub fn run_tests() {
         skip(b"TRACEFS_TRUNC", b"host kernel without tracefs");
         skip(b"TRACEFS_EVENTS", b"host kernel without tracefs");
         skip(b"TRACEFS_OPTS", b"host kernel without tracefs");
+        skip(b"TRACEFS_RESOLVE_CACHED", b"host kernel without tracefs");
+        skip(b"TRACEFS_READDIR", b"host kernel without tracefs");
+        skip(b"TRACEFS_OWNER", b"host kernel without tracefs");
+        skip(b"TRACEFS_CHOWN", b"host kernel without tracefs");
         return;
     }
     report_r(b"TRACEFS_TRACE", mounted(r));
@@ -53,8 +71,51 @@ pub fn run_tests() {
         write_str(EV, b"0");
         report_r(b"TRACEFS_EVENTS", r);
         report_r(b"TRACEFS_OPTS", opts());
+        report_r(b"TRACEFS_RESOLVE_CACHED", cached());
+        report_r(b"TRACEFS_READDIR", readdir());
+        let r = owner();
+        // Back to the defaults, for the shared superblock's later users
+        if mount_tr2(b"uid=0,gid=0\0") == 0 {
+            sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+        }
+        report_r(b"TRACEFS_OWNER", r);
+        let r = chown_owner();
+        if mount_tr2(b"uid=0,gid=0,mode=0700\0") == 0 {
+            sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+        }
+        report_r(b"TRACEFS_CHOWN", r);
         sys_umount2(MP.as_ptr(), 0);
     }
+}
+
+/// openat2(`dfd`, `p`, O_PATH, RESOLVE_CACHED)
+fn open_cached(dfd: i32, p: &[u8]) -> i64 {
+    const RESOLVE_CACHED: u64 = 0x20;
+    let mut how = [0u8; 24];
+    how[..8].copy_from_slice(&u64::from(O_PATH).to_ne_bytes());
+    how[16..].copy_from_slice(&RESOLVE_CACHED.to_ne_bytes());
+    let r = sys_openat2(dfd, p.as_ptr(), how.as_ptr(), how.len());
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    r
+}
+
+/// RESOLVE_CACHED below the tracefs root (Linux tracefs_d_revalidate
+/// answers in RCU mode): a file the dcache holds opens; a name never
+/// looked up is EAGAIN
+fn cached() -> R {
+    const EAGAIN: i64 = -11;
+    let dfd = sys_open(MP.as_ptr(), O_PATH | O_DIRECTORY, 0);
+    check(b"open root", dfd >= 0, dfd)?;
+    let mut st = Stat::default();
+    let r = sys_stat(TRACE.as_ptr(), &mut st);
+    let fd = open_cached(dfd as i32, b"trace\0");
+    let miss = open_cached(dfd as i32, b"nosuch\0");
+    sys_close(dfd as u64);
+    check(b"warm", r == 0, r)?;
+    check(b"cached file", fd >= 0, fd)?;
+    check(b"never looked up", miss == EAGAIN, miss)
 }
 
 /// A second tracefs mount at /tmp/tr2 with options `data`
@@ -257,4 +318,96 @@ fn events() -> R {
         )?;
     }
     Ok(())
+}
+
+/// Whether directory `dir` lists `name` with d_type `ty`
+fn lists(dir: &[u8], name: &'static [u8], ty: u8) -> R {
+    let mut seen = false;
+    let n = each_entry(dir, &mut |e, t| seen |= e == name && t == ty);
+    check(b"getdents", n > 0, n)?;
+    check(name, seen, n)
+}
+
+fn readdir() -> R {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    lists(MP, b"trace", DT_REG)?;
+    lists(MP, b"events", DT_DIR)?;
+    lists(b"/sys/kernel/tracing/events\0", b"enable", DT_REG)
+}
+
+/// (uid, gid) of `p`
+fn ids(p: &[u8]) -> (u32, u32) {
+    let mut st = Stat::default();
+    sys_stat(p.as_ptr(), &mut st);
+    (st.st_uid, st.st_gid)
+}
+
+/// A second tracefs mount with `data`, unmounted again: its result
+fn remount_with(data: &[u8]) -> i64 {
+    let m = mount_tr2(data);
+    if m == 0 {
+        sys_umount2(b"/tmp/tr2\0".as_ptr(), 0);
+    }
+    m
+}
+
+fn owner() -> R {
+    const EV_DIR: &[u8] = b"/sys/kernel/tracing/events\0";
+    let m = remount_with(b"uid=1,gid=2\0");
+    check(b"mount uid gid", m == 0, m)?;
+    check(
+        b"trace follows",
+        ids(TRACE) == (1, 2),
+        i64::from(ids(TRACE).0),
+    )?;
+    check(
+        b"events follows",
+        ids(EV_DIR) == (1, 2),
+        i64::from(ids(EV_DIR).0),
+    )?;
+    let c = sys_chown(TRACE.as_ptr(), 3, 4);
+    check(b"chown", c == 0, c)?;
+    check(
+        b"chown sticks",
+        ids(TRACE) == (3, 4),
+        i64::from(ids(TRACE).0),
+    )?;
+    let m = remount_with(b"uid=5\0");
+    check(b"mount uid", m == 0, m)?;
+    check(
+        b"uid reset, gid kept",
+        ids(TRACE) == (5, 4),
+        i64::from(ids(TRACE).1),
+    )
+}
+
+/// chown(trace, `to`, -1) by a child running as `uid`:`gid`: its
+/// result (a negative errno), -200 if the ids could not be taken
+fn chown_as(uid: u32, gid: u32, to: u32) -> i64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresgid(gid, gid, gid) != 0 || sys_setresuid(uid, uid, uid) != 0 {
+            sys_exit(200);
+        }
+        let r = sys_chown(TRACE.as_ptr(), to, u32::MAX);
+        sys_exit((-r) as u64 & 0xff);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    -i64::from((st >> 8) & 0xff)
+}
+
+fn chown_owner() -> R {
+    const EPERM: i64 = -1;
+    let m = remount_with(b"uid=1000,gid=1001,mode=0750\0");
+    check(b"mount", m == 0, m)?;
+    // check-linux's 6.8 brings the ids up to date only lazily
+    // (set_tracefs_inode_owner at getattr and permission): a stat first,
+    // so both kernels judge the new owner
+    let _ = ids(TRACE);
+    let r = chown_as(1000, 1001, 1000);
+    check(b"owner", r == 0, r)?;
+    let r = chown_as(1001, 1001, 1001);
+    check(b"not owner", r == EPERM, r)
 }

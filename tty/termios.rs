@@ -78,10 +78,14 @@ impl Termios {
     }
 }
 
-/// Extended termios structure with explicit baud rates (Linux termios2)
+/// The kernel's termios, with the speeds (Linux struct ktermios). On
+/// asm-generic (x86-64, arm64) it is also the layout of the user's
+/// struct termios2 (TCGETS2, TCSETS2: Linux copies one to the other
+/// whole); its first fields are a struct termios (TCGETS, TCSETS copy
+/// those). Size: 36 + 4 + 4 = 44 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct Termios2 {
+pub struct KTermios {
     /// Input mode flags
     pub c_iflag: u32,
     /// Output mode flags
@@ -99,6 +103,181 @@ pub struct Termios2 {
     /// Output speed
     pub c_ospeed: u32,
 }
+crate::pod!(KTermios {
+    c_iflag,
+    c_oflag,
+    c_cflag,
+    c_lflag,
+    c_line,
+    c_cc,
+    c_ispeed,
+    c_ospeed
+});
+
+impl KTermios {
+    /// `t` with the speeds its baud bits name
+    pub const fn from_termios(t: Termios) -> Self {
+        let mut k = Self {
+            c_iflag: t.c_iflag,
+            c_oflag: t.c_oflag,
+            c_cflag: t.c_cflag,
+            c_lflag: t.c_lflag,
+            c_line: t.c_line,
+            c_cc: t.c_cc,
+            c_ispeed: 0,
+            c_ospeed: 0,
+        };
+        k.set_speeds();
+        k
+    }
+
+    /// The struct termios part (Linux kernel_termios_to_user_termios_1)
+    pub const fn termios(&self) -> Termios {
+        Termios {
+            c_iflag: self.c_iflag,
+            c_oflag: self.c_oflag,
+            c_cflag: self.c_cflag,
+            c_lflag: self.c_lflag,
+            c_line: self.c_line,
+            c_cc: self.c_cc,
+        }
+    }
+
+    /// Take a struct termios, keeping the speeds (Linux
+    /// user_termios_to_kernel_termios_1)
+    pub const fn set_termios(&mut self, t: &Termios) {
+        self.c_iflag = t.c_iflag;
+        self.c_oflag = t.c_oflag;
+        self.c_cflag = t.c_cflag;
+        self.c_lflag = t.c_lflag;
+        self.c_line = t.c_line;
+        self.c_cc = t.c_cc;
+    }
+
+    /// The old struct termio: the flags' low halves and the first NCC
+    /// control characters (Linux kernel_termios_to_user_termio)
+    pub const fn termio(&self) -> Termio {
+        let mut c_cc = [0u8; NCC];
+        let mut i = 0;
+        while i < NCC {
+            c_cc[i] = self.c_cc[i];
+            i += 1;
+        }
+        Termio {
+            c_iflag: self.c_iflag as u16,
+            c_oflag: self.c_oflag as u16,
+            c_cflag: self.c_cflag as u16,
+            c_lflag: self.c_lflag as u16,
+            c_line: self.c_line,
+            c_cc,
+            _pad: 0,
+        }
+    }
+
+    /// Take a struct termio: its flags replace the low halves (Linux
+    /// user_termio_to_kernel_termios)
+    pub const fn set_termio(&mut self, v: &Termio) {
+        self.c_iflag = lo(self.c_iflag, v.c_iflag);
+        self.c_oflag = lo(self.c_oflag, v.c_oflag);
+        self.c_cflag = lo(self.c_cflag, v.c_cflag);
+        self.c_lflag = lo(self.c_lflag, v.c_lflag);
+        self.c_line = v.c_line;
+        let mut i = 0;
+        while i < NCC {
+            self.c_cc[i] = v.c_cc[i];
+            i += 1;
+        }
+    }
+
+    /// Load the speeds from the baud bits, so they are usable whichever
+    /// way they were set (Linux set_termios: tty_termios_input_baud_rate,
+    /// tty_termios_baud_rate)
+    pub const fn set_speeds(&mut self) {
+        self.c_ispeed = self.input_baud();
+        self.c_ospeed = self.baud();
+    }
+
+    /// The output speed (Linux tty_termios_baud_rate): BOTHER names
+    /// c_ospeed
+    pub const fn baud(&self) -> u32 {
+        match self.c_cflag & CBAUD {
+            BOTHER => self.c_ospeed,
+            b => baud_rate(b),
+        }
+    }
+
+    /// The input speed (Linux tty_termios_input_baud_rate): B0 in
+    /// CIBAUD is the output speed, BOTHER names c_ispeed
+    pub const fn input_baud(&self) -> u32 {
+        match (self.c_cflag >> IBSHIFT) & CBAUD {
+            B0 => self.baud(),
+            BOTHER => self.c_ispeed,
+            b => baud_rate(b),
+        }
+    }
+}
+
+/// `old` with its low half replaced by `new`
+const fn lo(old: u32, new: u16) -> u32 {
+    (old & 0xffff_0000) | new as u32
+}
+
+/// Speeds of the Bfoo values (Linux baud_table), CBAUDEX ones from 16
+const BAUD_TABLE: [u32; 31] = [
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+    115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000,
+    3000000, 3500000, 4000000,
+];
+
+/// The speed a Bfoo value names, 0 for none (Linux
+/// tty_termios_baud_rate's table lookup)
+const fn baud_rate(cbaud: u32) -> u32 {
+    let i = if cbaud & CBAUDEX != 0 {
+        (cbaud & !CBAUDEX) + 15
+    } else {
+        cbaud
+    } as usize;
+    if i < BAUD_TABLE.len() {
+        BAUD_TABLE[i]
+    } else {
+        0
+    }
+}
+
+/// Number of control characters in a struct termio (Linux NCC)
+pub const NCC: usize = 8;
+
+/// The old System V terminal settings (Linux struct termio, TCGETA,
+/// TCSETA): 16-bit flags. Size 18: one byte of tail padding, explicit
+/// here, which TCGETA writes as zero (Linux kernel_termios_to_user_termio
+/// clears the struct)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Termio {
+    /// Input mode flags
+    pub c_iflag: u16,
+    /// Output mode flags
+    pub c_oflag: u16,
+    /// Control mode flags
+    pub c_cflag: u16,
+    /// Local mode flags
+    pub c_lflag: u16,
+    /// Line discipline
+    pub c_line: u8,
+    /// Control characters
+    pub c_cc: [u8; NCC],
+    /// Tail padding
+    pub _pad: u8,
+}
+crate::pod!(Termio {
+    c_iflag,
+    c_oflag,
+    c_cflag,
+    c_lflag,
+    c_line,
+    c_cc,
+    _pad
+});
 
 /// Window size structure (Linux ABI-compatible)
 #[repr(C)]
@@ -384,6 +563,8 @@ pub const B4000000: u32 = 0x100f;
 
 /// Input baud rate mask
 pub const CIBAUD: u32 = 0x100f0000;
+/// Shift from CBAUD to CIBAUD
+pub const IBSHIFT: u32 = 16;
 /// Mark or space (stick) parity
 pub const CMSPAR: u32 = 0x40000000;
 /// Enable RTS/CTS flow control
@@ -474,3 +655,45 @@ pub const TCIFLUSH: u32 = 0;
 pub const TCOFLUSH: u32 = 1;
 /// Discard all pending data
 pub const TCIOFLUSH: u32 = 2;
+
+// The user's struct termios, termios2 and termio (asm-generic)
+const _: () = assert!(core::mem::size_of::<Termios>() == 36);
+const _: () = assert!(core::mem::size_of::<KTermios>() == 44);
+const _: () = assert!(core::mem::size_of::<Termio>() == 18);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speeds() {
+        let mut k = KTermios::from_termios(Termios::cooked());
+        assert_eq!((k.c_ispeed, k.c_ospeed), (115200, 115200));
+        k.c_cflag = (k.c_cflag & !CBAUD) | BOTHER | (B9600 << IBSHIFT);
+        k.c_ospeed = 31250;
+        k.set_speeds();
+        assert_eq!((k.c_ispeed, k.c_ospeed), (9600, 31250));
+        k.c_cflag = (k.c_cflag & !CIBAUD) | (BOTHER << IBSHIFT);
+        k.c_ispeed = 4242;
+        k.set_speeds();
+        assert_eq!(k.c_ispeed, 4242);
+        k.c_cflag = (k.c_cflag & !(CBAUD | CIBAUD)) | B4000000;
+        k.set_speeds();
+        assert_eq!((k.c_ispeed, k.c_ospeed), (4_000_000, 4_000_000));
+    }
+
+    #[test]
+    fn termio() {
+        let mut k = KTermios::from_termios(Termios::cooked());
+        k.c_lflag |= EXTPROC;
+        let mut v = k.termio();
+        assert_eq!(v.c_lflag as u32, k.c_lflag & 0xffff);
+        assert_eq!(v.c_cc, k.c_cc[..NCC]);
+        v.c_lflag &= !(ECHO as u16);
+        v.c_cc[VSWTC] = 7;
+        v.c_line = 3;
+        k.set_termio(&v);
+        assert_eq!(k.c_lflag & (EXTPROC | ECHO), EXTPROC);
+        assert_eq!((k.c_cc[VSWTC], k.c_line), (7, 3));
+    }
+}

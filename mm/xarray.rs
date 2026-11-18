@@ -111,12 +111,29 @@ impl Drop for Preload {
 /// Returns the old entry, or `nomem` when the preload fails or the retry
 /// still falls short.
 pub fn store_nomem<G, E>(
+    lock: impl FnMut() -> G,
+    idx: u64,
+    val: u64,
+    check: impl FnMut(&XArray) -> Result<(), E>,
+    nomem: E,
+) -> Result<u64, E>
+where
+    G: core::ops::DerefMut<Target = XArray>,
+    E: Copy,
+{
+    store_nomem_locked(lock, idx, val, check, nomem).map(|(old, _)| old)
+}
+
+/// [`store_nomem`] returning the lock still held after the store, for
+/// state kept under the same lock (Linux __filemap_add_folio: nrpages
+/// under the xa_lock)
+pub fn store_nomem_locked<G, E>(
     mut lock: impl FnMut() -> G,
     idx: u64,
     val: u64,
     mut check: impl FnMut(&XArray) -> Result<(), E>,
     nomem: E,
-) -> Result<u64, E>
+) -> Result<(u64, G), E>
 where
     G: core::ops::DerefMut<Target = XArray>,
     E: Copy,
@@ -130,7 +147,7 @@ where
             None => t.store(idx, val, &mut || None),
         };
         if let Some(old) = stored {
-            return Ok(old);
+            return Ok((old, t));
         }
         drop(t);
         if pre.is_some() {

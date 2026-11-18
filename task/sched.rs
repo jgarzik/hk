@@ -7,11 +7,10 @@
 //! change in interrupt context.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::Priority;
+use crate::sync::LockedCell;
 use crate::util::list::{Adapter, Link, List};
 
 /// Scheduling class, highest first (Linux stop/rt/fair/idle_sched_class)
@@ -39,6 +38,41 @@ impl Class {
     }
 }
 
+/// A task's scheduling parameters in one word (`SchedEntity.params`):
+/// class, policy, static priority and rt priority, a byte each
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Params(u32);
+
+impl Params {
+    const fn pack(class: Class, policy: u8, static_prio: u8, rt_priority: u8) -> u32 {
+        class as u32
+            | (policy as u32) << 8
+            | (static_prio as u32) << 16
+            | (rt_priority as u32) << 24
+    }
+
+    pub fn class(self) -> Class {
+        Class::from_u8(self.0 as u8)
+    }
+
+    pub fn policy(self) -> i32 {
+        i32::from((self.0 >> 8) as u8)
+    }
+
+    pub fn static_prio(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+
+    pub fn rt_priority(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+
+    /// Linux task_nice
+    pub fn nice(self) -> i32 {
+        i32::from(self.static_prio()) - i32::from(DEFAULT_PRIO)
+    }
+}
+
 /// Linux NICE_TO_PRIO(0): static_prio of nice 0
 pub const DEFAULT_PRIO: u8 = 120;
 
@@ -51,6 +85,57 @@ pub type TaskContext = <crate::arch::CurrentArch as crate::arch::ContextOps>::Ta
 /// Number of priority levels (0-255)
 pub const NUM_PRIORITIES: usize = 256;
 
+/// The fields of a task's entity owned by the lock of the run queue it
+/// is on (Linux plain sched_entity / sched_rt_entity fields under
+/// rq->lock): read and written only through that `CpuRunQueue`
+/// (`SchedEntity.rq`, a `LockedCell`)
+#[derive(Clone, Copy)]
+pub struct SeRq {
+    /// Fair: virtual runtime, ns (Linux se->vruntime; `fair`)
+    pub vruntime: u64,
+    /// Fair: virtual deadline (Linux se->deadline)
+    pub deadline: u64,
+    /// Fair: lag saved when it left its run queue (Linux se->vlag)
+    pub vlag: i64,
+    /// When it last started running or was charged (monotonic ns; 0
+    /// before it first runs; Linux se->exec_start)
+    pub exec_start: u64,
+    /// SCHED_RR: ticks left of its slice (Linux p->rt.time_slice)
+    pub rr_left: u32,
+    /// Its slice ran out: requeued at the tail, not the head
+    pub requeue_tail: bool,
+    /// It went to sleep counted in its run queue's `nr_uninterruptible`
+    /// (Linux p->sched_contributes_to_load); its wakeup uncounts it
+    pub contrib_load: bool,
+}
+
+impl SeRq {
+    const fn new() -> Self {
+        Self {
+            vruntime: 0,
+            deadline: 0,
+            vlag: 0,
+            exec_start: 0,
+            rr_left: RR_TICKS,
+            requeue_tail: false,
+            contrib_load: false,
+        }
+    }
+
+    /// SCHED_RR tick (its own CPU's tick): true once its slice is used
+    /// up, which starts a new one and requeues it at the tail (Linux
+    /// task_tick_rt)
+    pub fn rr_tick(&mut self) -> bool {
+        if self.rr_left > 1 {
+            self.rr_left -= 1;
+            return false;
+        }
+        self.rr_left = RR_TICKS;
+        self.requeue_tail = true;
+        true
+    }
+}
+
 /// A task's scheduling state (Linux p->__state, p->on_rq, run_list)
 ///
 /// `state` is written by the task itself (set_current_state) and by its
@@ -59,42 +144,36 @@ pub const NUM_PRIORITIES: usize = 256;
 /// run queue (`on_rq`) while it is queued or running; a sleeper leaves
 /// it in `schedule()`.
 pub struct SchedEntity {
-    /// `SleepState` as u8
+    /// `SleepState` as u8: set by the task and its wakers with no rq
+    /// lock, read by wakers before any (Linux p->__state, READ_ONCE)
     state: AtomicU8,
-    /// Queued or running on its CPU's run queue
+    /// Queued or running on its CPU's run queue: changed under that rq
+    /// lock, read without it (task_sched_runtime's fast path;
+    /// Linux task_on_rq_queued's READ_ONCE of p->on_rq)
     on_rq: AtomicBool,
-    /// It went to sleep counted in its run queue's `nr_uninterruptible`
-    /// (Linux p->sched_contributes_to_load), under that rq lock; its
-    /// wakeup uncounts it
-    pub contrib_load: AtomicBool,
     /// Its CPU runs it or is still switching away from it (Linux
     /// p->on_cpu): set when it is made current, cleared by the task
-    /// switched to once the switch is complete (finish_task_switch)
+    /// switched to once the switch is complete (finish_task_switch);
+    /// a waker spins on it with no rq lock (smp_cond_load_acquire)
     on_cpu: AtomicBool,
-    /// Scheduling class (`Class`)
-    class: AtomicU8,
-    /// SCHED_* policy (Linux p->policy)
-    policy: AtomicU8,
-    /// 100 + 20 + nice (Linux p->static_prio)
-    static_prio: AtomicU8,
-    /// 1..99 for SCHED_FIFO/RR, else 0 (Linux p->rt_priority)
-    rt_priority: AtomicU8,
+    /// Scheduling parameters, one word so a lockless reader sees one
+    /// setting (`Params`): class, SCHED_* policy (Linux p->policy),
+    /// 100 + 20 + nice (p->static_prio), 1..99 for SCHED_FIFO/RR else 0
+    /// (p->rt_priority); set under pi_lock and the rq lock, read
+    /// lock-free (getpriority, sched_getattr, /proc, wakeup placement)
+    params: AtomicU32,
     /// A fork child starts with SCHED_NORMAL and nice >= 0 (Linux
-    /// p->sched_reset_on_fork)
+    /// p->sched_reset_on_fork): set under pi_lock and the rq lock, read
+    /// lock-free by fork and sched_getattr
     reset_on_fork: AtomicBool,
-    /// SCHED_RR: ticks left of its slice (Linux p->rt.time_slice)
-    rr_left: AtomicU32,
-    /// Fair: virtual runtime, ns (Linux se->vruntime; `fair`)
-    pub vruntime: AtomicU64,
-    /// Fair: virtual deadline (Linux se->deadline)
-    pub deadline: AtomicU64,
-    /// Fair: lag saved when it left its run queue (Linux se->vlag)
-    pub vlag: AtomicI64,
-    /// Fair and rt: when it last started running or was charged
-    /// (monotonic ns; 0 before it first runs)
-    pub exec_start: AtomicU64,
-    /// Its slice ran out: requeued at the tail, not the head
-    requeue_tail: AtomicBool,
+    /// Owned by the lock of the run queue it is on, `Task.cpu`'s
+    /// (accessed through `CpuRunQueue::ent`, which checks that)
+    pub(super) rq: LockedCell<SeRq>,
+    /// Time run in total, ns (Linux se->sum_exec_runtime): advanced
+    /// under the rq lock of its CPU (`update_se`), read lock-free
+    /// (thread_group_cputime, cputime_adjust: Linux
+    /// read_sum_exec_runtime's READ_ONCE)
+    sum_exec_runtime: AtomicU64,
     /// Its place in a priority list (under the rq lock)
     pub link: Link,
     /// Saved kernel context while switched out (under the rq lock)
@@ -102,13 +181,10 @@ pub struct SchedEntity {
     /// The kernel stack it owns, freed after its last switch away (none
     /// for the boot stack of the first user task, nor an idle task's)
     pub stack: crate::mm::vmstack::StackSlot,
-    /// Next task on a [`WakeQ`](crate::task::percpu::WakeQ); null when
-    /// on none (Linux wake_q_node)
-    pub wake_q: AtomicPtr<()>,
 }
 
 // SAFETY: `ctx` (the UnsafeCell) is only touched under the rq lock of the
-// task's CPU; every other field is atomic
+// task's CPU; `rq` is Sync itself, every other field is atomic
 unsafe impl Sync for SchedEntity {}
 
 impl SchedEntity {
@@ -118,24 +194,15 @@ impl SchedEntity {
             state: AtomicU8::new(state),
             on_rq: AtomicBool::new(false),
             on_cpu: AtomicBool::new(false),
-            contrib_load: AtomicBool::new(false),
-            class: AtomicU8::new(Class::Fair as u8),
-            policy: AtomicU8::new(0),
-            static_prio: AtomicU8::new(DEFAULT_PRIO),
-            rt_priority: AtomicU8::new(0),
+            params: AtomicU32::new(Params::pack(Class::Fair, 0, DEFAULT_PRIO, 0)),
             reset_on_fork: AtomicBool::new(false),
-            rr_left: AtomicU32::new(RR_TICKS),
-            vruntime: AtomicU64::new(0),
-            deadline: AtomicU64::new(0),
-            vlag: AtomicI64::new(0),
-            exec_start: AtomicU64::new(0),
-            requeue_tail: AtomicBool::new(false),
+            rq: LockedCell::new(SeRq::new()),
+            sum_exec_runtime: AtomicU64::new(0),
             link: Link::new(),
             ctx: UnsafeCell::new(
                 <crate::arch::CurrentArch as crate::arch::ContextOps>::ZERO_CONTEXT,
             ),
             stack: crate::mm::vmstack::StackSlot::empty(),
-            wake_q: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -181,16 +248,28 @@ impl SchedEntity {
         self.on_cpu.store(v, Ordering::Release);
     }
 
+    /// Time run in total as of its last charge (Linux
+    /// read_sum_exec_runtime; `task_sched_runtime` adds a running
+    /// slice)
+    pub fn sum_exec_runtime(&self) -> u64 {
+        self.sum_exec_runtime.load(Ordering::Relaxed)
+    }
+
+    /// The scheduling parameters, one setting (one load)
+    pub fn params(&self) -> Params {
+        Params(self.params.load(Ordering::Relaxed))
+    }
+
     pub fn class(&self) -> Class {
-        Class::from_u8(self.class.load(Ordering::Relaxed))
+        self.params().class()
     }
 
     pub fn policy(&self) -> i32 {
-        i32::from(self.policy.load(Ordering::Relaxed))
+        self.params().policy()
     }
 
     pub fn static_prio(&self) -> u8 {
-        self.static_prio.load(Ordering::Relaxed)
+        self.params().static_prio()
     }
 
     /// Linux task_nice
@@ -199,7 +278,7 @@ impl SchedEntity {
     }
 
     pub fn rt_priority(&self) -> u8 {
-        self.rt_priority.load(Ordering::Relaxed)
+        self.params().rt_priority()
     }
 
     pub fn reset_on_fork(&self) -> bool {
@@ -210,32 +289,12 @@ impl SchedEntity {
     /// rq lock held, and off the run queue lists, or not yet started).
     /// A SCHED_RR slice goes on (Linux leaves p->rt.time_slice).
     pub fn set_params(&self, class: Class, policy: i32, static_prio: u8, rt_priority: u8) {
-        self.class.store(class as u8, Ordering::Relaxed);
-        self.policy.store(policy as u8, Ordering::Relaxed);
-        self.static_prio.store(static_prio, Ordering::Relaxed);
-        self.rt_priority.store(rt_priority, Ordering::Relaxed);
+        let p = Params::pack(class, policy as u8, static_prio, rt_priority);
+        self.params.store(p, Ordering::Relaxed);
     }
 
     pub fn set_reset_on_fork(&self, v: bool) {
         self.reset_on_fork.store(v, Ordering::Relaxed);
-    }
-
-    /// SCHED_RR tick (its own CPU's tick): true once its slice is used
-    /// up, which starts a new one and requeues it at the tail (Linux
-    /// task_tick_rt)
-    pub fn rr_tick(&self) -> bool {
-        if self.rr_left.fetch_sub(1, Ordering::Relaxed) > 1 {
-            return false;
-        }
-        self.rr_left.store(RR_TICKS, Ordering::Relaxed);
-        self.requeue_tail.store(true, Ordering::Relaxed);
-        true
-    }
-
-    /// Whether a preempted task goes to the tail (its slice ran out),
-    /// clearing that
-    pub fn take_requeue_tail(&self) -> bool {
-        self.requeue_tail.swap(false, Ordering::Relaxed)
     }
 
     /// The switch frame
@@ -248,6 +307,30 @@ impl SchedEntity {
         // SAFETY: see above
         unsafe { &mut *self.ctx.get() }
     }
+}
+
+/// Charge running task `t` (its run-queue fields `e`) for its time
+/// since `exec_start` (Linux update_se, every class's update_curr): its
+/// sum_exec_runtime and, while its thread group keeps CPU timer totals,
+/// the group's (account_group_exec_runtime). Under the rq lock of its
+/// CPU. The time charged, 0 for none.
+pub fn update_se(t: &super::Task, e: &mut SeRq, now: u64) -> u64 {
+    let start = e.exec_start;
+    if now <= start {
+        return 0;
+    }
+    e.exec_start = now;
+    if start == 0 {
+        return 0;
+    }
+    let delta = now - start;
+    // Under the rq lock: a load and a store (Linux
+    // se->sum_exec_runtime += delta)
+    crate::sync::Sole::sole_add(&t.se.sum_exec_runtime, delta);
+    if let Some(g) = t.cpu_group() {
+        g.cputimer.account_exec_runtime(delta);
+    }
+    delta
 }
 
 /// The runnable tasks of a CPU but the running one and the idle task,

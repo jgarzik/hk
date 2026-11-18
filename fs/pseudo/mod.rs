@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use super::KernelError;
 use super::dentry::{Dentry, DentryOps};
 use super::file::{File, FileOps};
-use super::inode::{Inode, InodeMode, NULL_INODE_OPS};
+use super::inode::{Inode, InodeMode, InodeRef, NULL_INODE_OPS};
 use super::mount::{MNT_NODEV, MNT_NOEXEC, Mount, MountRef};
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
@@ -56,7 +56,7 @@ impl SuperOps for PseudoSuperOps {
         _sb: &Arc<SuperBlock>,
         _mode: InodeMode,
         _i_op: &'static dyn super::inode::InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         Err(KernelError::NotPermitted)
     }
 
@@ -204,7 +204,7 @@ impl Pseudo {
 
     /// A dentry `name` for `inode` outside any tree (Linux
     /// d_alloc_pseudo) and its path
-    pub fn path(&self, name: &str, inode: Arc<Inode>) -> Result<Path, KernelError> {
+    pub fn path(&self, name: &str, inode: InodeRef) -> Result<Path, KernelError> {
         let mnt = self.mnt()?;
         let d = Dentry::new_pseudo(name.as_bytes(), inode, &mnt.sb)?;
         Ok(Path::new(mnt, crate::fs::DentryRef::new(d)?))

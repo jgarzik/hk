@@ -24,10 +24,52 @@ use crate::task::{Cred, override_creds};
 use crate::util::error::{KernelError, KernelResult};
 use crate::util::kmem::KVec;
 
+/// An SQE and what its opcode's prep copied at submission (Linux
+/// io_kiocb's command data, filled by def->prep in io_init_req); reads
+/// as the SQE
+#[derive(Default)]
+pub struct Sqe {
+    pub sqe: IoUringSqe,
+    pub open: Option<OpenArgs>,
+    /// Its checks or prep failed (a chain member, failed with its chain)
+    pub err: Option<KernelError>,
+}
+
+impl core::ops::Deref for Sqe {
+    type Target = IoUringSqe;
+    fn deref(&self) -> &IoUringSqe {
+        &self.sqe
+    }
+}
+
+impl Sqe {
+    /// The body of an operation that is not a read or write: an open's
+    /// copied arguments, moved out, else its syscall
+    pub fn take_body(&mut self) -> Body {
+        match self.open.take() {
+            Some(a) => Body::Open(a),
+            None => Body::Op,
+        }
+    }
+}
+
+/// IORING_OP_OPENAT/OPENAT2 as prepped (Linux struct io_open): the
+/// name and open_how copied at submission, the direct descriptor slot
+/// (`file_index`, 0 for none) and RLIMIT_NOFILE then
+pub struct OpenArgs {
+    pub dfd: i32,
+    pub name: Vec<u8>,
+    pub how: crate::fs::open::OpenHow,
+    pub slot: u32,
+    pub nofile: u64,
+}
+
 /// What an `OpReq` does
 pub enum Body {
     /// An operation through its syscall (`ops::run_blocking`)
     Op,
+    /// An open of what its prep copied (`ops::open`)
+    Open(OpenArgs),
     /// A read or write of `file`: user iovecs, or `len` bytes at `addr`
     /// of a registered buffer
     Rw {
@@ -93,6 +135,7 @@ impl OpReq {
         match &self.body {
             Body::Rw { file, .. } => !super::rw::bounded_file(file),
             Body::Op => super::ops::unbound(self.sqe.opcode),
+            Body::Open(_) => false,
             Body::Failed(_) => false,
         }
     }
@@ -101,10 +144,11 @@ impl OpReq {
     /// io_issue_sqe: override_creds(req->creds)): its result, a restart
     /// code as EINTR (Linux io_fixup_restart_res: submitted SQEs cannot
     /// be restarted)
-    fn exec(&self) -> KernelResult<i32> {
+    fn exec(&self, held: Option<&mut super::Submit>) -> KernelResult<i32> {
         let _creds = override_creds(self.creds.clone());
         let r = match &self.body {
             Body::Op => super::ops::run_blocking(&self.sqe),
+            Body::Open(a) => super::ops::open(&self.ring, a, held),
             Body::Rw {
                 file,
                 write,
@@ -133,7 +177,7 @@ impl OpReq {
 
     /// Run it to its end and post its CQE
     pub fn run(self) {
-        let r = self.exec();
+        let r = self.exec(None);
         self.post(r);
     }
 
@@ -156,10 +200,10 @@ impl OpReq {
     /// Run it as a chain member, posting its CQE: whether it broke the
     /// chain (Linux req_set_fail: an error, or a read or write short of
     /// its length, unless it is hard-linked)
-    pub fn run_linked(self) -> bool {
+    pub fn run_linked(self, held: Option<&mut super::Submit>) -> bool {
         let hard = self.sqe.flags & IOSQE_IO_HARDLINK != 0;
         let want = self.want();
-        let r = self.exec();
+        let r = self.exec(held);
         let v = self.post(r);
         !hard && (v < 0 || want.is_some_and(|w| (v as usize) < w))
     }
@@ -186,7 +230,7 @@ pub fn run_chain(c: KVec<OpReq>) {
         if failed {
             o.cancel();
         } else {
-            failed = o.run_linked();
+            failed = o.run_linked(None);
         }
     }
 }

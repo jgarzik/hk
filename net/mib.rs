@@ -32,9 +32,12 @@ pub struct Mib<const N: usize> {
 }
 
 impl<const N: usize> Mib<N> {
-    /// All zero, a part per possible CPU (Linux alloc_percpu); ENOMEM
+    /// All zero, a part per possible CPU (Linux alloc_percpu); ENOMEM.
+    /// Out of line: each part is made on its frame before it is pushed,
+    /// and a namespace makes six MIBs
+    #[inline(never)]
     fn new() -> Result<Self, KernelError> {
-        let n = (crate::cpu::nr_cpu_ids() as usize).max(1);
+        let n = crate::cpu::nr_possible() as usize;
         let mut v = crate::util::kmem::KVec::try_with_capacity(n)?;
         for _ in 0..n {
             v.try_push(Part([const { AtomicU64::new(0) }; N]))?;
@@ -44,18 +47,37 @@ impl<const N: usize> Mib<N> {
         })
     }
 
-    /// The calling CPU's words (a CPU past the parts, possible only for
-    /// a MIB made before SMP bring-up, shares the first's)
+    /// [`new`](Self::new) for a structure made where allocation cannot
+    /// fail (a network device: Linux alloc_netdev's pcpu stats)
+    pub fn new_nofail() -> Self {
+        let n = crate::cpu::nr_possible() as usize;
+        let mut v = alloc::vec::Vec::with_capacity(n);
+        v.resize_with(n, || Part([const { AtomicU64::new(0) }; N]));
+        Self { parts: v }
+    }
+
+    /// Add `n` (two's complement for a decrement) to the calling CPU's
+    /// word (Linux this_cpu_add: no lock prefix when the part is its
+    /// own; an atomic add on a part CPUs share, past the parts of a MIB
+    /// made before SMP bring-up)
     #[inline]
-    fn part(&self) -> &[AtomicU64; N] {
-        let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
-        &self.parts.get(cpu).unwrap_or(&self.parts[0]).0
+    fn add_word(&self, field: usize, n: u64) {
+        use crate::cpu::LocalWord;
+        match crate::cpu::own_slot(self.parts.len()) {
+            // SAFETY: own_slot: this CPU's part alone, nothing schedules
+            Some(c) => unsafe { self.parts[c].0[field].local_add(n as i64) },
+            None => {
+                let cpu = crate::cpu::try_this_id().unwrap_or(0) as usize;
+                let p = self.parts.get(cpu).unwrap_or(&self.parts[0]);
+                p.0[field].fetch_add(n, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Linux SNMP_ADD_STATS
     #[inline]
     pub fn add(&self, field: usize, n: u64) {
-        self.part()[field].fetch_add(n, Ordering::Relaxed);
+        self.add_word(field, n);
     }
 
     /// Linux SNMP_INC_STATS
@@ -67,16 +89,15 @@ impl<const N: usize> Mib<N> {
     /// Linux SNMP_DEC_STATS (a gauge: words may wrap, the sum does not)
     #[inline]
     pub fn dec(&self, field: usize) {
-        self.part()[field].fetch_sub(1, Ordering::Relaxed);
+        self.add_word(field, u64::MAX);
     }
 
     /// Linux SNMP_UPD_PO_STATS: a packet at `pkts` and its bytes at
     /// `pkts + 1` (every *PKTS entry is followed by its *OCTETS one)
     #[inline]
     pub fn upd_po(&self, pkts: usize, octets: usize, len: usize) {
-        let p = self.part();
-        p[pkts].fetch_add(1, Ordering::Relaxed);
-        p[octets].fetch_add(len as u64, Ordering::Relaxed);
+        self.add_word(pkts, 1);
+        self.add_word(octets, len as u64);
     }
 
     /// Every CPU's word of `field`, summed (Linux snmp_fold_field)
@@ -122,7 +143,7 @@ impl NetMib {
         let m = crate::util::kalloc::try_arc(Self {
             ip: Mib::new()?,
             icmp: Mib::new()?,
-            icmpmsg: crate::util::kalloc::try_box([const { AtomicU64::new(0) }; ICMPMSG_MIB_MAX])?,
+            icmpmsg: crate::util::kalloc::try_box_array(|| AtomicU64::new(0))?,
             tcp: Mib::new()?,
             udp: Mib::new()?,
             net: Mib::new()?,

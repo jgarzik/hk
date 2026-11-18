@@ -27,7 +27,7 @@ use crate::sync::{local_irq_restore, local_irq_save};
 use alloc::boxed::Box;
 use spin::Once;
 
-use crate::cpu::{PerCpu, nr_cpu_ids, this_id};
+use crate::cpu::{nr_cpu_ids, this_id};
 use crate::util::cpumask::{CpuMask, CpuSet};
 
 /// One call (Linux call_single_data)
@@ -53,14 +53,18 @@ impl Csd {
     }
 }
 
-/// Per sender CPU, one call slot per target CPU (Linux per-CPU cfd_data),
-/// `nr_cpu_ids` of them, allocated at bring-up (`init`). A CPU sends from
-/// thread context only and the kernel is not preemptive, so its row is
-/// used by one call at a time.
-static CFD: PerCpu<Once<Box<[Csd]>>> = crate::percpu![Once::new()];
+crate::percpu! {
+    /// Per sender CPU, one call slot per target CPU (Linux per-CPU cfd_data),
+    /// `nr_cpu_ids` of them, allocated at bring-up (`init`). A CPU sends from
+    /// thread context only and the kernel is not preemptive, so its row is
+    /// used by one call at a time.
+    static CFD: Once<Box<[Csd]>> = Once::new();
+}
 
-/// Per-CPU queue of calls to run there (Linux call_single_queue)
-static QUEUE: PerCpu<AtomicPtr<Csd>> = crate::percpu![AtomicPtr::new(core::ptr::null_mut())];
+crate::percpu! {
+    /// Per-CPU queue of calls to run there (Linux call_single_queue)
+    static QUEUE: AtomicPtr<Csd> = AtomicPtr::new(core::ptr::null_mut());
+}
 
 /// CPUs that take call-function IPIs (Linux cpu_active_mask): set by
 /// each CPU once it services interrupts. One global mask: every sender

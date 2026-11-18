@@ -20,7 +20,7 @@
 //! entry's `fa` (IrqRwLock). [`kill_fasync`] walks it under RCU, in any
 //! context but hardirq and under any spin locks, holding each entry's
 //! `fa` and its owner's `FOwner.st` (IrqRwLock) read across the send:
-//! then the signal locks (TASKLIST read, Task.sig, shared_pending), the
+//! then the signal locks (TASKLIST read, Task.sig, SignalStruct.shared), the
 //! queue entry allocated GFP_ATOMIC (doc/LOCKING.md 3.7). A process
 //! group owner's processes are walked under that TASKLIST read hold,
 //! each sent to in place, as Linux send_sigio: nothing else allocates.
@@ -35,13 +35,13 @@ use crate::io::poll::{
 };
 use crate::mm::page_alloc::Gfp;
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
-use crate::signal::{SIGIO, SIGURG, SendInfo, Signal, group_task, send_sig_info_in, valid_signal};
+use crate::signal::{SIGIO, SIGURG, SendInfo, Signal, send_sig_info_in, valid_signal};
 
 use crate::sync::IrqRwLock;
 use crate::sync::rcu::RcuHead;
 use crate::sync::spin::Mutex;
 use crate::task::Uid;
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef, TaskView};
+use crate::task::percpu::{TASKLIST, TaskRef, TaskView};
 use crate::task::pid::Pid;
 use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
@@ -138,18 +138,6 @@ impl File {
     }
 }
 
-/// The `Pid` the caller numbers `nr` while a task uses it as its pid
-/// or process group (Linux find_vpid with pid_task / the group's list
-/// checked, as f_setown's callers do)
-fn find_owner(nr: u32) -> Option<Arc<Pid>> {
-    let pid = crate::task::pid::find_vpid(nr)?;
-    let used = {
-        let table = TASKLIST.read();
-        table.pid_tid(&pid).is_some() || table.pgrp(&pid).next().is_some()
-    };
-    used.then_some(pid)
-}
-
 /// `who` > 0 a process, < 0 a process group, 0 none (Linux f_setown):
 /// ESRCH if none exists, EINVAL for INT_MIN; `force` = false keeps an
 /// owner already set (__f_setown)
@@ -165,7 +153,9 @@ pub fn f_setown(file: &File, who: i32, force: bool) -> Result<(), KernelError> {
     let own = file.f_owner_alloc()?;
     let pid = match who.unsigned_abs() {
         0 => None,
-        nr => Some(find_owner(nr).ok_or(KernelError::NoProcess)?),
+        // Hashed while a task uses it in any role (Linux f_setown:
+        // find_vpid under RCU, no other check)
+        nr => Some(crate::task::pid::find_vpid(nr).ok_or(KernelError::NoProcess)?),
     };
     own.set(pid, kind, force);
     Ok(())
@@ -189,14 +179,17 @@ fn owner_nr(o: &Owner) -> i32 {
     let Some(pid) = &o.pid else {
         return 0;
     };
-    let table = TASKLIST.read();
     let live = match o.kind {
-        PidType::Tid => table.pid_tid(pid).is_some(),
-        PidType::Tgid => table
-            .pid_tid(pid)
-            .and_then(|t| table.get(t))
-            .is_some_and(|t| t.task.tid() == t.task.pid),
-        PidType::Pgrp => table.pgrp(pid).next().is_some(),
+        PidType::Tid => pid.has_task(),
+        // Under RCU: the task it names leads its group (Linux
+        // pid_task(pid, PIDTYPE_TGID))
+        PidType::Tgid => {
+            let g = crate::sync::rcu::read_lock();
+            pid.task(&g).is_some_and(|t| t.tid() == t.pid)
+        }
+        // Under RCU: a leader is on the group's list (Linux
+        // pid_task(pid, PIDTYPE_PGID))
+        PidType::Pgrp => pid.pgrp_task(&crate::sync::rcu::read_lock()).is_some(),
     };
     if live { pid.vnr() as i32 } else { 0 }
 }
@@ -235,7 +228,7 @@ pub fn f_setown_ex(file: &File, arg: u64) -> Result<(), KernelError> {
         nr => Some(
             u32::try_from(nr)
                 .ok()
-                .and_then(find_owner)
+                .and_then(crate::task::pid::find_vpid)
                 .ok_or(KernelError::NoProcess)?,
         ),
     };
@@ -453,25 +446,22 @@ fn sigio_perm(o: &Owner, t: &TaskView<'_>) -> bool {
         || o.uid == cred.uid
 }
 
-/// What a SIGIO to task `t` reaches, if the setter may signal it: the
-/// thread itself for a thread owner, else its process (Linux
-/// send_sigio_to_task's do_send_sig_info to the task, by reference)
-fn sigio_target(table: &GlobalTaskTable, o: &Owner, t: &TaskView<'_>) -> Option<TaskRef> {
+/// Task `t`, the receiver of a SIGIO (for it or its process, Linux
+/// send_sigio_to_task's do_send_sig_info to the task pid_task found),
+/// if the setter may signal it
+fn sigio_target(o: &Owner, t: &TaskView<'_>) -> Option<TaskRef> {
     if !sigio_perm(o, t) {
         return None;
     }
-    match o.kind {
-        PidType::Tid => Some(crate::task::percpu::task_ref(t.task)),
-        _ => group_task(table, Some(*t)),
-    }
+    Some(crate::task::percpu::task_ref(t.task))
 }
 
 /// Linux send_sigio_to_task: the chosen signal with its POLL info, or
 /// plain SIGIO (SI_KERNEL) when none was chosen or it could not be
 /// queued; thread-directed for a thread owner, else to its process;
-/// sent in place under TASKLIST's read lock, held by the caller
+/// sent in place (its siglock) under TASKLIST's read lock, held by the
+/// caller for the owner's walk
 fn sigio_to_task(
-    table: &GlobalTaskTable,
     o: &Owner,
     t: &TaskRef,
     fd: i32,
@@ -485,7 +475,7 @@ fn sigio_to_task(
         PidType::Pgrp => crate::signal::PidType::Pgid,
         _ => crate::signal::PidType::Tgid,
     };
-    let mut send = |sig, info| send_sig_info_in(table, t, sig, info, ty, gone);
+    let mut send = |sig, info| send_sig_info_in(t, sig, info, ty, gone);
     if let Some(sig) = o.signum {
         // A signal with its own positive codes gets SI_SIGIO, not the
         // ambiguous POLL_* (SIGPOLL itself keeps it)
@@ -522,14 +512,14 @@ fn send_sigio(o: &Owner, fd: i32, reason: i32) {
     match o.kind {
         PidType::Tid | PidType::Tgid => {
             let v = table.pid_tid(pid).and_then(|tid| table.get(tid));
-            if let Some(t) = v.and_then(|v| sigio_target(&table, o, &v)) {
-                sigio_to_task(&table, o, &t, fd, reason, &mut gone);
+            if let Some(t) = v.and_then(|v| sigio_target(o, &v)) {
+                sigio_to_task(o, &t, fd, reason, &mut gone);
             }
         }
         PidType::Pgrp => {
             for v in table.pgrp(pid) {
-                if let Some(t) = sigio_target(&table, o, &v) {
-                    sigio_to_task(&table, o, &t, fd, reason, &mut gone);
+                if let Some(t) = sigio_target(o, &v) {
+                    sigio_to_task(o, &t, fd, reason, &mut gone);
                 }
             }
         }

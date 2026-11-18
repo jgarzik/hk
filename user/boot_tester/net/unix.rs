@@ -74,6 +74,7 @@ pub fn run_tests() {
     test_peercred();
     test_peergroups();
     test_scm_creds();
+    test_creds_userns();
     test_poll();
     test_proc();
     test_proc_big();
@@ -1406,6 +1407,13 @@ fn test_peergroups() {
     if pid == 0 {
         sys_exit(peergroups_child(&sa));
     }
+    // A child that fails before connecting must not hang the accept
+    if poll1(l, POLLIN, 10_000).0 != 1 {
+        hk_syscall::sys_kill(pid, hk_syscall::SIGKILL);
+        t.ok(b"connect", false, wait_status(pid) as i64);
+        close(l);
+        return t.done();
+    }
     let acc = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
     let mut buf = [0u8; 16];
     let (r, len) = peergroups(acc, &mut buf, 16);
@@ -1431,6 +1439,50 @@ fn test_peergroups() {
         close(f);
     }
     t.done();
+}
+
+/// UNIX_CREDS_USERNS: credentials are shown in the reader's user
+/// namespace and read in the sender's (Linux cred_to_ucred, scm_recv:
+/// from_kuid_munged; scm_check_creds: make_kuid). In a new user
+/// namespace with no maps root's ids are the overflow ids 65534 in
+/// SO_PEERCRED and SCM_CREDENTIALS, and a claim of uid 0 does not map
+/// (EINVAL)
+fn test_creds_userns() {
+    let mut t = T::new(b"UNIX_CREDS_USERNS");
+    let (a, b) = pair(SOCK_DGRAM);
+    setint(b, SOL_SOCKET, SO_PASSCRED, 1);
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(creds_userns_child(a, b));
+    }
+    t.eq(b"child", wait_status(pid) as i64, 0);
+    close(a);
+    close(b);
+    t.done();
+}
+
+/// 0, or the failed step
+fn creds_userns_child(a: i32, b: i32) -> u64 {
+    if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWUSER) != 0 {
+        return 1;
+    }
+    let (r, _, uid, gid) = peercred(a);
+    if r != 0 || (uid, gid) != (65534, 65534) {
+        return 2;
+    }
+    send(a, b"x", 0);
+    let mut buf = [0u8; 4];
+    let mut ctl = [0u8; 64];
+    let (_, _, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
+    let me = sys_getpid() as i32;
+    let c = cmsg_find(&ctl, clen, SOL_SOCKET, SCM_CREDENTIALS);
+    if c.is_none_or(|d| d[4..] != ucred(me, 65534, 65534)[4..]) {
+        return 3;
+    }
+    if send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(me, 0, 0), 0) != EINVAL {
+        return 4;
+    }
+    0
 }
 
 /// SCM_CREDENTIALS: delivered with SO_PASSCRED; a sender may only claim

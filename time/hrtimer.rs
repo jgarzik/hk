@@ -26,17 +26,18 @@
 //! `cancel_sync` waits out a running callback like `del_timer_sync`,
 //! and dropping a timer does that.
 //!
-//! Locking: `HrBase.q` is an IrqSpinlock leaf; callbacks run with no
-//! timer lock held. A timer's `base` changes only under its old base's
-//! lock, so lockers recheck it once they hold a lock (Linux
-//! lock_hrtimer_base); two base locks are never held together.
+//! Locking: `HrBase.q` is an IrqSpinlock leaf over the lists, `running`
+//! and each timer's `node` (expiry, clock) on that base; `pending` is
+//! also read without it. Callbacks run with no timer lock held. A
+//! timer's `base` changes only under its old base's lock, so lockers
+//! recheck it once they hold a lock (Linux lock_hrtimer_base); two base
+//! locks are never held together.
 
 use core::marker::PhantomPinned;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use crate::cpu::PerCpu;
-use crate::sync::{IrqSpinlock, IrqSpinlockGuard};
+use crate::sync::{IrqSpinlock, IrqSpinlockGuard, LockedCell};
 use crate::task::percpu::TICK_NS;
 use crate::util::list::{Link, List};
 
@@ -71,18 +72,25 @@ const MAX_RUN: usize = 256;
 /// Shortest programmed delay (an earlier event just interrupts again)
 const MIN_DELTA_NS: u64 = 1_000;
 
+/// A timer's expiry (Linux hrtimer node.expires and its clock base)
+#[derive(Clone, Copy)]
+struct HrNode {
+    /// Expiry on `clock`, ns
+    expires: u64,
+    clock: HrClock,
+}
+
 /// A high-resolution timer (Linux struct hrtimer)
 pub struct HrTimer {
     link: Link,
-    /// Expiry on `clock`, ns (under the base lock)
-    expires: AtomicU64,
-    clock: AtomicU8,
+    /// Owned by its base's lock (`HrQueues::node`)
+    node: LockedCell<HrNode>,
     func: HrFn,
     data: AtomicUsize,
     flags: u8,
     /// The base it is started on (set at its first start, kept)
     base: AtomicPtr<HrBase>,
-    /// Queued (under the base lock)
+    /// Queued: changed under the base lock, read without it (`pending`)
     pending: AtomicBool,
     _pin: PhantomPinned,
 }
@@ -94,8 +102,10 @@ impl HrTimer {
     pub const fn new(func: HrFn, flags: u8) -> Self {
         Self {
             link: Link::new(),
-            expires: AtomicU64::new(0),
-            clock: AtomicU8::new(0),
+            node: LockedCell::new(HrNode {
+                expires: 0,
+                clock: HrClock::Monotonic,
+            }),
             func,
             data: AtomicUsize::new(0),
             flags,
@@ -120,9 +130,9 @@ impl HrTimer {
         self.pending.load(Ordering::Acquire)
     }
 
-    /// Its expiry (as last started)
+    /// Its expiry (as last started; 0: never started)
     pub fn expires(&self) -> u64 {
-        self.expires.load(Ordering::Relaxed)
+        self.lock_base().map_or(0, |(_, q)| q.node(self).expires)
     }
 
     fn home(&self) -> &'static HrBase {
@@ -168,8 +178,8 @@ impl HrTimer {
         // callback is running on the old one (cancel_sync waits there)
         if let Some(cpu) = crate::cpu::try_this_id() {
             let here = base_of(cpu, self.flags);
-            let me = (&raw const *self).cast_mut();
-            if !core::ptr::eq(base, here) && base.running.load(Ordering::Acquire) != me {
+            let me = core::ptr::from_ref::<HrTimer>(&self).addr();
+            if !core::ptr::eq(base, here) && q.running != me {
                 self.base.store(
                     core::ptr::from_ref::<HrBase>(here).cast_mut(),
                     Ordering::Release,
@@ -179,8 +189,7 @@ impl HrTimer {
                 q = here.q.lock();
             }
         }
-        self.expires.store(expires, Ordering::Relaxed);
-        self.clock.store(clock as u8, Ordering::Relaxed);
+        q.set_node(&self, HrNode { expires, clock });
         q.insert(&self);
         drop(q);
         let cpu = base_cpu(base);
@@ -200,23 +209,23 @@ impl HrTimer {
     /// Stop it and wait out a running callback (Linux hrtimer_cancel);
     /// thread context unless HARD, never from its own callback
     pub fn cancel_sync(&self) -> bool {
-        let me = core::ptr::from_ref::<HrTimer>(self).cast_mut();
+        let me = core::ptr::from_ref::<HrTimer>(self).addr();
         let mut was = false;
+        // Linux hrtimer_cancel: hrtimer_try_to_cancel under the base
+        // lock, then wait for the callback with the lock dropped
         loop {
             let Some((base, mut q)) = self.lock_base() else {
                 return was;
             };
             was |= q.detach(self);
-            drop(q);
-            if base.running.load(Ordering::Acquire) != me {
+            if q.running != me {
                 return was;
             }
+            drop(q);
             if self.flags & HRTIMER_HARD != 0 {
                 core::hint::spin_loop();
             } else {
-                crate::time::timer::wait_soft(base_cpu(base), || {
-                    base.running.load(Ordering::Acquire) != me
-                });
+                crate::time::timer::wait_soft(base_cpu(base), || base.q.lock().running != me);
             }
         }
     }
@@ -228,32 +237,65 @@ impl Drop for HrTimer {
     }
 }
 
-/// A base's queued timers, each list sorted by expiry
+/// A base's queued timers, each list sorted by expiry, and the callback
+/// running (Linux hrtimer_cpu_base under its lock)
 struct HrQueues {
     mono: List<HrAdapter>,
     real: List<HrAdapter>,
+    /// Address of the timer whose callback runs now, 0: none (Linux
+    /// hrtimer_cpu_base.running); compared only, never dereferenced
+    running: usize,
 }
 
 impl HrQueues {
-    fn list(&mut self, clock: u8) -> &mut List<HrAdapter> {
-        if clock == HrClock::Realtime as u8 {
-            &mut self.real
-        } else {
-            &mut self.mono
+    fn list(&mut self, clock: HrClock) -> &mut List<HrAdapter> {
+        match clock {
+            HrClock::Realtime => &mut self.real,
+            HrClock::Monotonic => &mut self.mono,
         }
+    }
+
+    /// `t`'s base is this one (its `node` is ours to touch)
+    fn owns(&self, t: &HrTimer) -> bool {
+        base_ref(t.base.load(Ordering::Acquire)).is_some_and(|b| b.q.owns(self))
+    }
+
+    /// `t`'s expiry (panics unless `t` is on this base)
+    fn node(&self, t: &HrTimer) -> HrNode {
+        assert!(self.owns(t), "hrtimer: not on this base");
+        // SAFETY: `self` is the data of `t`'s base lock (checked), held
+        // by the guard it is borrowed from; `base` changes only under
+        // that lock
+        unsafe { t.node.get(self) }
+    }
+
+    fn set_node(&mut self, t: &HrTimer, n: HrNode) {
+        assert!(self.owns(t), "hrtimer: not on this base");
+        // SAFETY: as in `node`, borrowed mutably
+        unsafe { t.node.set(self, n) };
+    }
+
+    /// The expiry of a queued timer (`front` hands out raw pointers)
+    fn expiry(&self, t: *const HrTimer) -> u64 {
+        // SAFETY: queued timers are live (their drop unlinks them)
+        self.node(unsafe { &*t }).expires
     }
 
     /// Link `t` in expiry order (after equal ones: FIFO)
     fn insert(&mut self, t: &HrTimer) {
-        let e = t.expires.load(Ordering::Relaxed);
-        let list = self.list(t.clock.load(Ordering::Relaxed));
+        let HrNode { expires: e, clock } = self.node(t);
         let mut after: Option<*const HrTimer> = None;
-        for x in list.iter() {
-            if x.expires.load(Ordering::Relaxed) > e {
+        let sorted = match clock {
+            HrClock::Realtime => &self.real,
+            HrClock::Monotonic => &self.mono,
+        };
+        for x in sorted.iter() {
+            if self.node(x).expires > e {
                 break;
             }
             after = Some(core::ptr::from_ref::<HrTimer>(x));
         }
+        let list = self.list(clock);
         // SAFETY: pinned (callers take Pin), on no list
         unsafe {
             match after {
@@ -269,33 +311,31 @@ impl HrQueues {
         if !t.pending.load(Ordering::Relaxed) {
             return false;
         }
+        let clock = self.node(t).clock;
         // SAFETY: a pending timer is on its clock's list
-        unsafe { self.list(t.clock.load(Ordering::Relaxed)).remove(t) };
+        unsafe { self.list(clock).remove(t) };
         t.pending.store(false, Ordering::Release);
         true
     }
 
     /// The first timer due by `mono`/`real` now, unlinked
     fn pop_due(&mut self, mono: u64, real: u64) -> Option<*const HrTimer> {
-        let due = |l: &List<HrAdapter>, now: u64| {
-            l.front()
-                // SAFETY: queued timers are live
-                .filter(|&t| unsafe { (*t).expires.load(Ordering::Relaxed) } <= now)
-        };
-        let t = due(&self.mono, mono).or_else(|| due(&self.real, real))?;
+        let t = self.first_due(mono, real)?;
         // SAFETY: as above
         self.detach(unsafe { &*t });
         Some(t)
     }
 
+    /// The first timer due by `mono`/`real` now, still queued
+    fn first_due(&self, mono: u64, real: u64) -> Option<*const HrTimer> {
+        let due = |l: &List<HrAdapter>, now: u64| l.front().filter(|&t| self.expiry(t) <= now);
+        due(&self.mono, mono).or_else(|| due(&self.real, real))
+    }
+
     /// The earliest expiry, as CLOCK_MONOTONIC ns (`off`: realtime -
     /// monotonic now)
     fn next(&self, off: i128) -> Option<u64> {
-        let head = |l: &List<HrAdapter>| {
-            l.front()
-                // SAFETY: queued timers are live
-                .map(|t| unsafe { (*t).expires.load(Ordering::Relaxed) })
-        };
+        let head = |l: &List<HrAdapter>| l.front().map(|t| self.expiry(t));
         let real = head(&self.real).map(|e| (i128::from(e) - off).max(0) as u64);
         match (head(&self.mono), real) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -308,7 +348,10 @@ impl HrQueues {
 /// hrtimer_cpu_base's clock bases, hard or soft)
 pub struct HrBase {
     q: IrqSpinlock<HrQueues>,
-    running: AtomicPtr<HrTimer>,
+    /// Its CPU (Linux hrtimer_cpu_base.cpu): 0 in the template, set by
+    /// `prepare_cpu` in each other CPU's area before the area is
+    /// published (cpu::setup_areas); read only after
+    cpu: AtomicU32,
 }
 
 impl HrBase {
@@ -317,8 +360,9 @@ impl HrBase {
             q: IrqSpinlock::new(HrQueues {
                 mono: List::new(),
                 real: List::new(),
+                running: 0,
             }),
-            running: AtomicPtr::new(core::ptr::null_mut()),
+            cpu: AtomicU32::new(0),
         }
     }
 
@@ -330,45 +374,55 @@ impl HrBase {
             let Some(p) = q.pop_due(mono, real) else {
                 break;
             };
-            self.running.store(p.cast_mut(), Ordering::Release);
+            // Linux __run_hrtimer: running set under the lock, the lock
+            // dropped for the callback, cleared once it is taken again
+            q.running = p.addr();
             drop(q);
             // SAFETY: a queued timer is live (its drop unlinks it), and
             // stays so while `running` names it (cancel_sync)
             let t = unsafe { &*p };
             (t.func)(t);
-            self.running.store(core::ptr::null_mut(), Ordering::Release);
             q = self.q.lock();
+            q.running = 0;
         }
     }
 
     /// A timer is due now
     fn due(&self) -> bool {
         let (mono, real) = (crate::time::monotonic_ns(), crate::time::realtime_ns());
-        let q = self.q.lock();
-        let due = |l: &List<HrAdapter>, now: u64| {
-            l.front()
-                // SAFETY: queued timers are live
-                .is_some_and(|t| unsafe { (*t).expires.load(Ordering::Relaxed) } <= now)
-        };
-        due(&q.mono, mono) || due(&q.real, real)
+        self.q.lock().first_due(mono, real).is_some()
     }
 }
 
-/// Per CPU: [HARD, SOFT]
-static BASES: PerCpu<[HrBase; 2]> = crate::percpu![[HrBase::new(), HrBase::new()]];
+crate::percpu! {
+    /// Per CPU: [HARD, SOFT]
+    static BASES: [HrBase; 2] = [HrBase::new(), HrBase::new()];
+}
 
-/// Per CPU: due SOFT timers were handed to `ktimers/N`, which has not
-/// run them yet (Linux cpu_base->softirq_activated): the clock event
-/// is programmed from the HARD timers only meanwhile, or the expired
-/// SOFT expiry would make it fire again at once, over and over, and
-/// keep the CPU in the interrupt instead of letting `ktimers/N` run
-static SOFT_ACTIVATED: PerCpu<AtomicBool> = crate::percpu![AtomicBool::new(false)];
+crate::percpu! {
+    /// Per CPU: due SOFT timers were handed to `ktimers/N`, which has not
+    /// run them yet (Linux cpu_base->softirq_activated): the clock event
+    /// is programmed from the HARD timers only meanwhile, or the expired
+    /// SOFT expiry would make it fire again at once, over and over, and
+    /// keep the CPU in the interrupt instead of letting `ktimers/N` run
+    static SOFT_ACTIVATED: AtomicBool = AtomicBool::new(false);
+}
 
 /// The CPU whose base `b` is
 fn base_cpu(b: &HrBase) -> u32 {
-    let first = BASES.get(0).as_ptr() as usize;
-    ((core::ptr::from_ref::<HrBase>(b) as usize - first) / core::mem::size_of::<[HrBase; 2]>())
-        as u32
+    b.cpu.load(Ordering::Relaxed)
+}
+
+/// Give CPU `cpu`'s bases their CPU (Linux hrtimers_prepare_cpu), in
+/// its new per-CPU area before the area is published
+///
+/// # Safety
+/// As [`crate::cpu::PerCpu::get_unpublished`].
+pub unsafe fn prepare_cpu(cpu: u32) {
+    // SAFETY: the caller's contract
+    for b in unsafe { BASES.get_unpublished(cpu) } {
+        b.cpu.store(cpu, Ordering::Relaxed);
+    }
 }
 
 fn base_of(cpu: u32, flags: u8) -> &'static HrBase {
@@ -393,8 +447,10 @@ fn reprogram(cpu: u32) {
     crate::arch::clockevent_next(delta);
 }
 
-/// The scheduler tick of each CPU (Linux tick_sched_timer)
-static TICK: PerCpu<HrTimer> = crate::percpu![HrTimer::new(tick_fire, HRTIMER_HARD)];
+crate::percpu! {
+    /// The scheduler tick of each CPU (Linux tick_sched_timer)
+    static TICK: HrTimer = HrTimer::new(tick_fire, HRTIMER_HARD);
+}
 
 /// The tick: scheduler work, then the next tick (catching up from now
 /// if ticks were lost)

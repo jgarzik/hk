@@ -160,47 +160,14 @@ fn memory_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelEr
 /// Most pages a limit holds (Linux PAGE_COUNTER_MAX on 64-bit)
 const PAGE_COUNTER_MAX: u64 = i64::MAX as u64 / 4096;
 
-/// A size as Linux memparse: a base-0 number (0x hex, leading 0 octal)
-/// and an optional K/M/G/T/P/E suffix; overflow saturates
-fn memparse(s: &str) -> Option<u64> {
-    let digits_end = |t: &str, radix: u32| t.find(|c: char| !c.is_digit(radix)).unwrap_or(t.len());
-    let (radix, body) = if let Some(h) = s.strip_prefix("0x").or(s.strip_prefix("0X")) {
-        (16, h)
-    } else if s.len() > 1 && s.starts_with('0') {
-        (8, &s[1..])
-    } else {
-        (10, s)
-    };
-    let n = digits_end(body, radix);
-    if n == 0 && radix == 10 {
-        return None;
-    }
-    let v = if n == 0 {
-        0
-    } else {
-        u64::from_str_radix(&body[..n], radix).unwrap_or(u64::MAX)
-    };
-    let shl = match &body[n..] {
-        "" => 0,
-        "K" | "k" => 10,
-        "M" | "m" => 20,
-        "G" | "g" => 30,
-        "T" | "t" => 40,
-        "P" | "p" => 50,
-        "E" | "e" => 60,
-        _ => return None,
-    };
-    Some(
-        v.checked_shl(shl)
-            .filter(|r| r >> shl == v)
-            .unwrap_or(u64::MAX),
-    )
-}
-
-/// memory.max's limit in bytes (Linux page_counter_memparse): whole
-/// pages, and the page counter's maximum is "max"
+/// memory.max's limit in bytes (Linux page_counter_memparse: memparse,
+/// nothing after it): whole pages, and the page counter's maximum is
+/// "max"
 fn parse_memory_size(s: &str) -> Result<u64, KernelError> {
-    let bytes = memparse(s.trim()).ok_or(KernelError::InvalidArgument)?;
+    let (bytes, rest) = crate::util::kstrtox::memparse(s.trim().as_bytes());
+    if !rest.is_empty() {
+        return Err(KernelError::InvalidArgument);
+    }
     let pages = (bytes / 4096).min(PAGE_COUNTER_MAX);
     Ok(if pages == PAGE_COUNTER_MAX {
         MEMORY_MAX_UNLIMITED
@@ -233,18 +200,17 @@ mod tests {
 
     #[test]
     fn memparse_sizes() {
-        assert_eq!(memparse("4096"), Some(4096));
-        assert_eq!(memparse("0x1000"), Some(4096));
-        assert_eq!(memparse("010"), Some(8));
-        assert_eq!(memparse("1k"), Some(1024));
-        assert_eq!(memparse("2T"), Some(2 << 40));
-        assert_eq!(memparse("3p"), Some(3 << 50));
-        assert_eq!(memparse("1E"), Some(1 << 60));
-        assert_eq!(memparse("99E"), Some(u64::MAX));
-        assert_eq!(memparse(""), None);
-        assert_eq!(memparse("-1"), None);
-        assert_eq!(memparse("1X"), None);
-        assert_eq!(memparse("1KB"), None);
+        let inval = Err(KernelError::InvalidArgument);
+        assert_eq!(parse_memory_size("8192"), Ok(8192));
+        assert_eq!(parse_memory_size("0x2000"), Ok(8192));
+        assert_eq!(parse_memory_size("2T"), Ok(2 << 40));
+        // Linux: an empty limit is 0; the shift wraps
+        assert_eq!(parse_memory_size(""), Ok(0));
+        assert_eq!(parse_memory_size("99E"), Ok(3 << 60));
+        assert_eq!(parse_memory_size("-1"), inval);
+        assert_eq!(parse_memory_size("1X"), inval);
+        assert_eq!(parse_memory_size("1KB"), inval);
+        assert_eq!(parse_memory_size("0x"), inval);
         // Whole pages; the counter's maximum reads back as max
         assert_eq!(parse_memory_size("4097"), Ok(4096));
         assert_eq!(parse_memory_size("100"), Ok(0));

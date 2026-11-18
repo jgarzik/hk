@@ -6,10 +6,9 @@
 //! - xattr syscalls (extended attributes)
 //! - readahead (file readahead)
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::fs::{Inode, KernelError, LookupFlags, lookup_path_flags};
+use crate::fs::{InodeRef, KernelError, LookupFlags, lookup_path_flags};
 use crate::uaccess::{
     UaccessError, UserPtr, access_ok, copy_to_user, strncpy_from_user, strncpy_from_user_str,
 };
@@ -155,24 +154,13 @@ fn remount(m: &super::mount::MountRef, flags: u64, data: &[u8]) -> Result<(), Ke
         return Err(KernelError::NotPermitted);
     }
     let _s = m.sb.s_umount.write();
-    // Read-only first (EBUSY changes nothing), then the filesystem's
-    // options; their error undoes the switch (Linux reconfigure_super:
-    // sb_prepare_remount_readonly, ->reconfigure, cancel on error)
-    let was_ro = m.sb.rdonly();
-    if flags & ms::RDONLY != 0 {
-        m.sb.make_rdonly()?;
-    }
-    if let Err(e) = m.sb.s_op.remount(&m.sb, data) {
-        if !was_ro && m.sb.rdonly() {
-            m.sb.make_rdwr();
-        }
-        return Err(e);
-    }
-    if flags & ms::RDONLY == 0 {
-        m.sb.make_rdwr();
-    }
+    super::superblock::reconfigure_super(&m.sb, flags & ms::RDONLY != 0, data)?;
     m.sb.set_sync_flags(sb_sync_flags(flags));
-    m.set_flags(remount_flags(flags, m.flags()))
+    m.set_flags(remount_flags(flags, m.flags()))?;
+    // Linux set_mount_attributes: touch_mnt_namespace (the caller's
+    // namespace: check_mnt)
+    super::mount::touch_mnt_ns(crate::ns::current_mnt_ns().id());
+    Ok(())
 }
 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
@@ -185,7 +173,9 @@ fn reconfigure_mnt(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelE
     // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();
-    m.set_flags(remount_flags(flags, m.flags()))
+    m.set_flags(remount_flags(flags, m.flags()))?;
+    super::mount::touch_mnt_ns(crate::ns::current_mnt_ns().id());
+    Ok(())
 }
 
 /// MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE (Linux
@@ -216,6 +206,8 @@ fn change_type(m: &super::mount::MountRef, flags: u64) -> Result<(), KernelError
     } else {
         change_mnt_propagation(&mut ns, m, p);
     }
+    // Linux do_change_type: touch_mnt_namespace
+    ns.touch(&mut super::mount::MOUNT_LOCK.write(), m.ns());
     Ok(())
 }
 
@@ -280,11 +272,8 @@ pub fn sys_mount(
     };
     let target = crate::fs::namei::getname(target_ptr, false)?;
     // A mount may cover a file (bind): the target is only followed
-    let mp = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &target,
-        LookupFlags::open(),
-    )?;
+    let mp =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &target, LookupFlags::open())?;
 
     if flags & ms::MGC_MSK == ms::MGC_VAL {
         flags &= !ms::MGC_MSK;
@@ -306,8 +295,8 @@ pub fn sys_mount(
         return remount(&own_mount_at(&mp)?, flags, &data);
     }
     if flags & ms::BIND != 0 {
-        let old = crate::fs::namei::path_lookupat(
-            crate::task::percpu::current_cwd(),
+        let old = crate::fs::namei::path_lookup(
+            crate::fs::namei::Start::Cwd,
             &source,
             LookupFlags::open(),
         );
@@ -320,8 +309,8 @@ pub fn sys_mount(
         return change_type(&mount_at(&mp)?, flags);
     }
     if flags & ms::MOVE != 0 {
-        let old = crate::fs::namei::path_lookupat(
-            crate::task::percpu::current_cwd(),
+        let old = crate::fs::namei::path_lookup(
+            crate::fs::namei::Start::Cwd,
             &source,
             LookupFlags::open(),
         );
@@ -415,7 +404,7 @@ pub fn sys_umount2(target_ptr: UserPtr<u8>, flags: i32) -> KernelResult<()> {
         follow: flags & UMOUNT_NOFOLLOW == 0,
         ..LookupFlags::open()
     };
-    let target = crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), &target, lf)?;
+    let target = crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &target, lf)?;
     if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
@@ -434,11 +423,7 @@ pub fn sys_pivot_root(new_root_ptr: UserPtr<u8>, put_old_ptr: UserPtr<u8>) -> Ke
     }
     let dir = |p: UserPtr<u8>| {
         let name = crate::fs::namei::getname(p, false)?;
-        crate::fs::namei::path_lookupat(
-            crate::task::percpu::current_cwd(),
-            &name,
-            LookupFlags::opendir(),
-        )
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &name, LookupFlags::opendir())
     };
     let new = dir(new_root_ptr)?;
     let old = dir(put_old_ptr)?;
@@ -602,7 +587,7 @@ fn copy_xattr_value_from_user(value_ptr: UserPtr<u8>, size: u64) -> KernelResult
 
 /// Linux vfs_setxattr, write access already held: the permission
 /// check, then the file system's op
-fn setxattr_inode(inode: &Arc<Inode>, name: &[u8], value: &[u8], flags: i32) -> KernelResult<()> {
+fn setxattr_inode(inode: &InodeRef, name: &[u8], value: &[u8], flags: i32) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode
         .i_op
@@ -660,11 +645,8 @@ fn do_setxattr(
     let path = crate::fs::namei::getname(path_ptr, false)?;
     let name = xattr_name(name_ptr)?;
     let value = copy_xattr_value_from_user(value_ptr, size)?;
-    let fpath = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &path,
-        xattr_lookup(follow),
-    )?;
+    let fpath =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, xattr_lookup(follow))?;
     let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
     // setxattr/removexattr: write access first (EROFS), held across
     let _w = fpath.mnt.want_write()?;
@@ -693,7 +675,7 @@ pub fn sys_fsetxattr(
 /// `size`-byte user buffer (size 0: only its length); ERANGE from the
 /// file system when the buffer is too small
 fn getxattr_inode(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     name: &[u8],
     value_ptr: UserPtr<u8>,
     size: u64,
@@ -791,7 +773,7 @@ pub fn sys_fgetxattr(
 
 /// Linux listxattr: the NUL-separated names into the `size`-byte user
 /// buffer (size 0: only their length)
-fn listxattr_inode(inode: &Arc<Inode>, list_ptr: UserPtr<u8>, size: u64) -> KernelResult<usize> {
+fn listxattr_inode(inode: &InodeRef, list_ptr: UserPtr<u8>, size: u64) -> KernelResult<usize> {
     if size == 0 {
         return inode.i_op.listxattr(inode, &mut []).map_err(xattr_err);
     }
@@ -852,7 +834,7 @@ pub fn sys_flistxattr(fd: i32, list_ptr: UserPtr<u8>, size: u64) -> KernelResult
 }
 
 /// Linux vfs_removexattr, write access already held
-fn removexattr_inode(inode: &Arc<Inode>, name: &[u8]) -> KernelResult<()> {
+fn removexattr_inode(inode: &InodeRef, name: &[u8]) -> KernelResult<()> {
     super::dac::xattr_permission(inode, name, super::dac::MAY_WRITE)?;
     inode.i_op.removexattr(inode, name).map_err(xattr_err)
 }
@@ -875,11 +857,8 @@ pub fn sys_lremovexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>) -> KernelR
 fn do_removexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>, follow: bool) -> KernelResult<()> {
     let path = crate::fs::namei::getname(path_ptr, false)?;
     let name = xattr_name(name_ptr)?;
-    let fpath = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &path,
-        xattr_lookup(follow),
-    )?;
+    let fpath =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, xattr_lookup(follow))?;
     let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
     // setxattr/removexattr: write access first (EROFS), held across
     let _w = fpath.mnt.want_write()?;
@@ -975,7 +954,7 @@ pub fn vfs_fallocate(file: &super::File, mode: i32, offset: i64, len: i64) -> Ke
         return Err(KernelError::BadFd);
     }
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+    if inode.is_swapfile() {
         return Err(KernelError::TextBusy);
     }
     let m = inode.mode();

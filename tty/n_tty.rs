@@ -468,7 +468,7 @@ pub fn lookahead_flow_ctrl(tty: &Tty, bytes: &[u8]) {
 /// A START or STOP character under IXON (Linux
 /// n_tty_receive_char_flow_ctrl): output restarts (pending echo goes
 /// out) or stops; true if `c` was one (consumed, done ahead if `la`)
-fn flow_ctrl(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, la: bool) -> bool {
+fn flow_ctrl(tty: &Tty, ld: &mut NTtyData, t: &KTermios, c: u8, la: bool) -> bool {
     if c != t.c_cc[VSTART] && c != t.c_cc[VSTOP] {
         return false;
     }
@@ -486,7 +486,7 @@ fn flow_ctrl(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, la: bool) -> bool
 
 /// IXANY: any input restarts output stopped by STOP (not by TCOOFF)
 /// (Linux n_tty_receive_char)
-fn ixany(tty: &Tty, ld: &mut NTtyData, t: &Termios) {
+fn ixany(tty: &Tty, ld: &mut NTtyData, t: &KTermios) {
     if t.c_iflag & IXON != 0 && t.c_iflag & IXANY != 0 && tty.stopped_by_input() {
         tty.start_tty();
         process_echoes(tty, ld);
@@ -495,7 +495,7 @@ fn ixany(tty: &Tty, ld: &mut NTtyData, t: &Termios) {
 
 /// Input during a last close's drain: only flow control (Linux
 /// n_tty_receive_char_closing)
-fn receive_char_closing(tty: &Tty, ld: &mut NTtyData, t: &Termios, c: u8, la: bool) {
+fn receive_char_closing(tty: &Tty, ld: &mut NTtyData, t: &KTermios, c: u8, la: bool) {
     let c = if t.c_iflag & ISTRIP != 0 { c & 0x7f } else { c };
     if t.c_iflag & IXON == 0 || flow_ctrl(tty, ld, t, c, la) {
         return;
@@ -517,7 +517,7 @@ fn input_ready(tty: &Tty, ld: &mut Ld<'_>) {
 }
 
 /// Input mapping (IGNCR, ICRNL, INLCR); None drops the byte
-fn map_input(c: u8, t: &Termios) -> Option<u8> {
+fn map_input(c: u8, t: &KTermios) -> Option<u8> {
     match c {
         b'\r' if t.c_iflag & IGNCR != 0 => None,
         b'\r' if t.c_iflag & ICRNL != 0 => Some(b'\n'),
@@ -527,7 +527,7 @@ fn map_input(c: u8, t: &Termios) -> Option<u8> {
 }
 
 /// The signal a character raises under ISIG
-fn signal_char(c: u8, t: &Termios) -> Option<crate::signal::Signal> {
+fn signal_char(c: u8, t: &KTermios) -> Option<crate::signal::Signal> {
     use crate::signal::{SIGINT, SIGQUIT, SIGTSTP};
     [(VINTR, SIGINT), (VQUIT, SIGQUIT), (VSUSP, SIGTSTP)]
         .into_iter()
@@ -537,7 +537,7 @@ fn signal_char(c: u8, t: &Termios) -> Option<crate::signal::Signal> {
 
 /// Signal the foreground group, then unless NOFLSH flush queued echo,
 /// the driver's queued output and input (Linux isig, __isig)
-fn isig(tty: &Tty, ld: &mut NTtyData, t: &Termios, sig: crate::signal::Signal) {
+fn isig(tty: &Tty, ld: &mut NTtyData, t: &KTermios, sig: crate::signal::Signal) {
     if let Some(pg) = tty.pgrp() {
         crate::signal::kill_pgrp_pid(&pg, sig);
     }
@@ -552,7 +552,7 @@ fn isig(tty: &Tty, ld: &mut NTtyData, t: &Termios, sig: crate::signal::Signal) {
 /// n_tty_receive_char_special / n_tty_receive_char): ISTRIP, then flow
 /// control (IXON), signal characters (ISIG) and IXANY on the byte as
 /// received, then the CR/NL mapping, editing and echo
-fn receive_char(tty: &Tty, ld: &mut Ld<'_>, t: &Termios, c: u8, la: bool) {
+fn receive_char(tty: &Tty, ld: &mut Ld<'_>, t: &KTermios, c: u8, la: bool) {
     let c = if t.c_iflag & ISTRIP != 0 { c & 0x7f } else { c };
     if t.c_iflag & IXON != 0 && flow_ctrl(tty, ld, t, c, la) {
         return;
@@ -595,13 +595,13 @@ fn receive_char(tty: &Tty, ld: &mut Ld<'_>, t: &Termios, c: u8, la: bool) {
 }
 
 /// A control character shows as ^X under ECHOCTL (not TAB or NL)
-fn shows_caret(c: u8, t: &Termios) -> bool {
+fn shows_caret(c: u8, t: &KTermios) -> bool {
     t.c_lflag & ECHOCTL != 0 && (c < 0x20 || c == 0x7f) && c != b'\t' && c != b'\n'
 }
 
 /// Echo `c`: a control character as ^X with ECHOCTL, a newline through
 /// OPOST/ONLCR (Linux echo_char)
-fn echo_char(ld: &mut NTtyData, c: u8, t: &Termios) {
+fn echo_char(ld: &mut NTtyData, c: u8, t: &KTermios) {
     if c == b'\n' && t.c_oflag & OPOST != 0 && t.c_oflag & ONLCR != 0 {
         ld.add_echo(b'\r');
         ld.add_echo(b'\n');
@@ -615,7 +615,7 @@ fn echo_char(ld: &mut NTtyData, c: u8, t: &Termios) {
 
 /// Erase the last character of the edited line, echoing it away (ECHOE:
 /// one column, two for a ^X)
-fn erase(ld: &mut NTtyData, t: &Termios) -> bool {
+fn erase(ld: &mut NTtyData, t: &KTermios) -> bool {
     let Some(&c) = ld.line[..ld.line_len].last() else {
         return false;
     };
@@ -636,7 +636,7 @@ fn is_blank(c: u8) -> bool {
 }
 
 /// A character in canonical mode (Linux n_tty_receive_char_canon)
-fn canon_char(ld: &mut NTtyData, t: &Termios, c: u8) {
+fn canon_char(ld: &mut NTtyData, t: &KTermios, c: u8) {
     let is = |i: usize| t.c_cc[i] != 0 && t.c_cc[i] == c;
     if is(VERASE) {
         erase(ld, t);
@@ -851,7 +851,7 @@ pub fn write(
 /// Output one character needing OPOST processing, `output_lock` held
 /// (Linux do_output_char): NL as CR NL under ONLCR, both or neither;
 /// false if the driver has no room for it
-fn do_output_char(tty: &Tty, t: &Termios, c: u8) -> Result<bool, KernelError> {
+fn do_output_char(tty: &Tty, t: &KTermios, c: u8) -> Result<bool, KernelError> {
     let space = tty.write_room();
     if c == b'\n' && t.c_oflag & ONLCR != 0 {
         if space < 2 {
@@ -867,7 +867,7 @@ fn do_output_char(tty: &Tty, t: &Termios, c: u8) -> Result<bool, KernelError> {
 }
 
 /// Linux process_output: one character, under `output_lock`
-fn process_output(tty: &Tty, t: &Termios, c: u8) -> Result<bool, KernelError> {
+fn process_output(tty: &Tty, t: &KTermios, c: u8) -> Result<bool, KernelError> {
     let _o = tty.output_lock.lock();
     do_output_char(tty, t, c)
 }
@@ -875,7 +875,7 @@ fn process_output(tty: &Tty, t: &Termios, c: u8) -> Result<bool, KernelError> {
 /// The run of `buf` the driver has room for, up to the first character
 /// needing processing (Linux process_output_block), under
 /// `output_lock`: the bytes written
-fn process_output_block(tty: &Tty, t: &Termios, buf: &[u8]) -> Result<usize, KernelError> {
+fn process_output_block(tty: &Tty, t: &KTermios, buf: &[u8]) -> Result<usize, KernelError> {
     let _o = tty.output_lock.lock();
     let space = tty.write_room();
     let n = buf.len().min(space);
@@ -930,7 +930,7 @@ fn write_chunk(
 
 /// OPOST output of `b` while the driver has room; `b` is left at the
 /// first byte not written
-fn output_opost(tty: &Tty, t: &Termios, b: &mut &[u8]) -> Result<(), KernelError> {
+fn output_opost(tty: &Tty, t: &KTermios, b: &mut &[u8]) -> Result<(), KernelError> {
     while !b.is_empty() {
         let n = process_output_block(tty, t, b)?.min(b.len());
         *b = &b[n..];

@@ -117,7 +117,7 @@ pub use termios::{
     VSUSP,
     VTIME,
 };
-pub use termios::{Termios, Winsize};
+pub use termios::{KTermios, Termios, Winsize};
 
 /// TTY driver trait - hardware interface (Linux tty_operations)
 ///
@@ -311,7 +311,7 @@ pub struct Tty {
     /// Device number (/dev node)
     dev: DevId,
     /// Terminal settings
-    pub termios: Mutex<Termios>,
+    pub termios: Mutex<KTermios>,
     /// Hardware driver
     driver: &'static dyn TtyDriver,
     /// N_TTY input state (sleeping: Linux termios_rwsem's role for the
@@ -361,6 +361,10 @@ pub struct Tty {
     /// tty_files, port->count): held across an open, a release (the
     /// port's last close drains output) and a hangup
     files: crate::sync::Mutex<TtyFiles>,
+    /// Exclusive mode: a reopen without CAP_SYS_ADMIN is EBUSY (Linux
+    /// TTY_EXCLUSIVE, TIOCEXCL); set and cleared by ioctl with no lock,
+    /// tested by an open and cleared by the last release under `files`
+    exclusive: AtomicBool,
     /// A hangup is under way: readers stop (Linux TTY_HUPPING)
     hupping: AtomicBool,
     /// The port is down or failed to come up: read, write and the
@@ -378,7 +382,7 @@ impl Tty {
         Self {
             name,
             dev,
-            termios: Mutex::new(Termios::cooked()),
+            termios: Mutex::new(KTermios::from_termios(Termios::cooked())),
             driver,
             ldata: crate::sync::Mutex::new(n_tty::NTtyData::new()),
             avail: n_tty::Avail::new(),
@@ -400,6 +404,7 @@ impl Tty {
             do_write_wakeup: AtomicBool::new(false),
             wakeup_due: AtomicBool::new(false),
             files: crate::sync::Mutex::new(TtyFiles::new()),
+            exclusive: AtomicBool::new(false),
             hupping: AtomicBool::new(false),
             io_error: AtomicBool::new(false),
             port: crate::sync::Mutex::new(TtyPort::new()),
@@ -414,6 +419,16 @@ impl Tty {
     /// The tty's I/O fails (Linux tty_io_error)
     pub fn io_error(&self) -> bool {
         self.io_error.load(Ordering::Acquire)
+    }
+
+    /// Set or clear exclusive mode (Linux TIOCEXCL, TIOCNXCL)
+    pub fn set_exclusive(&self, on: bool) {
+        self.exclusive.store(on, Ordering::Release);
+    }
+
+    /// In exclusive mode (Linux TIOCGEXCL)
+    pub fn exclusive(&self) -> bool {
+        self.exclusive.load(Ordering::Acquire)
     }
 
     /// Device name (/dev node)
@@ -611,12 +626,12 @@ impl Tty {
     // =========================================================================
 
     /// Get a copy of the termios structure
-    pub fn get_termios(&self) -> Termios {
+    pub fn get_termios(&self) -> KTermios {
         *self.termios.lock()
     }
 
     /// Set the termios structure
-    pub fn set_termios(&self, termios: Termios) {
+    pub fn set_termios(&self, termios: KTermios) {
         self.update_termios(|t| *t = termios);
     }
 
@@ -624,7 +639,7 @@ impl Tty {
     /// ldata, so input, reads and polls see the old settings or the new
     /// ones with the ICANON change applied, never half; readers and
     /// pollers are woken (VMIN, VTIME or ICANON may make input readable)
-    pub fn update_termios(&self, f: impl FnOnce(&mut Termios)) {
+    pub fn update_termios(&self, f: impl FnOnce(&mut KTermios)) {
         let mut ld = n_tty::ldata(self);
         let (canon, ixon_off) = {
             let mut t = self.termios.lock();
@@ -732,17 +747,28 @@ impl Tty {
 
     /// A file opened the tty (Linux tty_open: tty_reopen's tty->count,
     /// tty_add_file, the port's open, TTY_HUPPED cleared, under
-    /// tty_lock); then it may become the controlling tty. A failed
-    /// activation fails the open; the failed file's release undoes it
+    /// tty_lock); then it may become the controlling tty. In exclusive
+    /// mode a reopen, by any path, needs CAP_SYS_ADMIN (Linux
+    /// tty_reopen: EBUSY), the file left unlisted and not pointed at
+    /// the tty. A listed file is pointed at it: a later failure (the
+    /// activation) fails the open, and the file's release undoes it
     /// (Linux tty_open's tty_release)
-    fn opened(&self, r: Arc<Redirect>, file: &File, ctty: bool) -> Result<(), KernelError> {
+    fn opened(&self, r: Arc<Redirect>, file: &File, via: Via) -> Result<(), KernelError> {
         let tty = r.tty;
         let mut f = self.files.lock();
+        if !f.list.is_empty()
+            && self.exclusive()
+            && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
+        {
+            return Err(KernelError::Busy);
+        }
+        let any: Arc<dyn core::any::Any + Send + Sync> = r.clone();
+        file.private.call_once(|| any);
         f.list.push(r);
         f.port_count += 1;
         self.port_open()?;
         f.hupped = false;
-        if ctty && file.get_flags() & O_NOCTTY == 0 {
+        if via == Via::Node && file.get_flags() & O_NOCTTY == 0 {
             jobctrl::open_set_tty(tty, file);
         }
         Ok(())
@@ -795,6 +821,7 @@ impl Tty {
         }
         f.hupped = false;
         self.set_io_error(false);
+        self.set_exclusive(false);
         jobctrl::session_clear_tty(self);
         *self.flow.lock() = Flow {
             stopped: false,
@@ -1071,6 +1098,19 @@ pub fn all() -> &'static [&'static Tty] {
     crate::arch::serial_ttys()
 }
 
+/// How a file reached its tty (Linux tty_open)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Via {
+    /// The tty's own node (tty_open_by_driver): it may become the
+    /// controlling tty
+    Node,
+    /// /dev/console (tty_open_by_driver via console_device): a hangup
+    /// leaves the file be
+    Console,
+    /// /dev/tty, the controlling tty (tty_open_current_tty)
+    Current,
+}
+
 /// An open file of a tty, its private data (Linux points the file at
 /// the tty, tty_file_private): listed on the tty (`TtyFiles`) from its
 /// open to its release
@@ -1095,21 +1135,19 @@ impl Redirect {
             .ok_or(KernelError::Io)
     }
 
-    /// Open `tty` through `file`: point the file at it and list it on
-    /// the tty (Linux tty->count, tty_add_file); `ctty`: it may become
-    /// the controlling tty; `console`: /dev/console. The release of a
-    /// file whose open failed before it was pointed at the tty finds no
-    /// tty to drop; one that failed later drops it as any release
-    fn open(file: &File, tty: &'static Tty, ctty: bool, console: bool) -> Result<(), KernelError> {
+    /// Open `tty` through `file`: list the file on the tty and point
+    /// it there (Linux tty->count, tty_add_file), reached `via` its
+    /// node, /dev/console or /dev/tty. The release of a file whose
+    /// open failed before it was listed finds nothing to drop; one
+    /// that failed later drops it as any release
+    fn open(file: &File, tty: &'static Tty, via: Via) -> Result<(), KernelError> {
         let r = try_arc(Redirect {
             tty,
-            console,
+            console: via == Via::Console,
             hung: AtomicBool::new(false),
             file: AtomicPtr::new(core::ptr::null_mut()),
         })?;
-        let any: Arc<dyn core::any::Any + Send + Sync> = r.clone();
-        file.private.call_once(|| any);
-        tty.opened(r, file, ctty)
+        tty.opened(r, file, via)
     }
 
     /// The release of a file opened by `open` (Linux tty_release)
@@ -1155,7 +1193,7 @@ impl CharDevice for TtyChar {
     }
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
-        Redirect::open(file, self.0, true, false)
+        Redirect::open(file, self.0, Via::Node)
     }
 
     fn release(&self, file: &File) {

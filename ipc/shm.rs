@@ -100,7 +100,7 @@ pub struct ShmidKernel {
     /// The segment's file on the kernel's tmpfs (its pages)
     pub file: crate::fs::FileRef,
     /// That file's inode (its resident pages, read under the table lock)
-    inode: Arc<crate::fs::Inode>,
+    inode: crate::fs::InodeRef,
     /// Destroyed (namespace totals given back): at most once
     destroyed: AtomicBool,
     /// Namespace this segment belongs to

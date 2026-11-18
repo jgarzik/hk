@@ -35,8 +35,7 @@ use crate::sync::spin::{Mutex, RwLock};
 
 use super::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
-use crate::fs::namei::path_lookupat;
-use crate::fs::{Inode, LookupFlags, lookup_path};
+use crate::fs::{Inode, InodeRef, LookupFlags, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
 use crate::mm::xarray::XArray;
@@ -134,7 +133,7 @@ struct SwapMap {
 /// One swap area (Linux swap_info_struct)
 pub struct SwapInfo {
     /// Backing file (a swap file)
-    pub inode: Option<Arc<Inode>>,
+    pub inode: Option<InodeRef>,
     /// Backing block device (a swap partition)
     pub bdev: Option<crate::block::blkdev::BdevHandle>,
     /// Path given to swapon
@@ -211,7 +210,7 @@ impl SwapInfo {
     }
 
     fn new(
-        backing: (Option<Arc<Inode>>, Option<crate::block::blkdev::BdevHandle>),
+        backing: (Option<InodeRef>, Option<crate::block::blkdev::BdevHandle>),
         path: Vec<u8>,
         swap_type: u8,
         max: u64,
@@ -561,9 +560,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         return Err(KernelError::NotPermitted);
     }
     let path = user_path(path)?;
-    let cwd = crate::task::percpu::current_cwd();
     let swap_file =
-        path_lookupat(cwd, &path, LookupFlags::open()).map_err(|_| KernelError::NotFound)?;
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, LookupFlags::open())
+            .map_err(|_| KernelError::NotFound)?;
     let inode = swap_file.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _g = SWAPON.lock();
     if find_swap_by_path(&path).is_some() {
@@ -589,7 +588,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         crate::mm::filemap::write_and_wait(&inode)?;
         crate::mm::filemap::invalidate(&inode);
     }
-    let mut hdr = [0u8; PAGE_SIZE];
+    // The header page off the stack (Linux reads it into a page cache
+    // folio, read_mapping_folio)
+    let mut hdr = crate::util::kmem::try_vec(PAGE_SIZE, 0u8)?;
     let read = match &bdev {
         Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|()| PAGE_SIZE),
         None => inode
@@ -608,7 +609,9 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
         .map_or(inode.get_size() / PAGE_SIZE as u64, |b| {
             b.nr_sects() / SECTORS_PER_PAGE
         });
-    let max = parse_header(&hdr, size)?;
+    let hdr =
+        <&[u8; PAGE_SIZE]>::try_from(hdr.as_slice()).map_err(|_| KernelError::InvalidArgument)?;
+    let max = parse_header(hdr, size)?;
     let priority = if swap_flags & SWAP_FLAG_PREFER != 0 {
         (swap_flags & SWAP_FLAG_PRIO_MASK) as i16
     } else {
@@ -625,7 +628,7 @@ pub fn sys_swapon(path: UserPtr<u8>, swap_flags: i32) -> KernelResult<()> {
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
-    si_inode.i_swapfile.store(true, Ordering::Release);
+    si_inode.set_swapfile(true);
     drop(lock);
     SWAP_INFO.write()[swap_type as usize] = Some(si);
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
@@ -664,7 +667,7 @@ pub fn sys_swapoff(path: UserPtr<u8>) -> KernelResult<()> {
     let table = SWAP_INFO.write()[t as usize].take();
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
-    si_inode.i_swapfile.store(false, Ordering::Release);
+    si_inode.set_swapfile(false);
     drop(lock);
     TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);

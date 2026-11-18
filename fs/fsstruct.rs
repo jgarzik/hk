@@ -16,14 +16,28 @@
 //! };
 //! ```
 //!
-//! In our Rust implementation, Arc provides the reference counting,
-//! and Mutex provides the locking.
+//! The paths and umask are under `seq`, a spin lock with a sequence
+//! (Linux fs->seq, a seqlock_t): writers take its write side, which
+//! moves the sequence (set_fs_root, set_fs_pwd, chroot_fs_refs, a
+//! namespace copy's repoint); a reader taking references takes its
+//! locking read (get_fs_root, get_fs_pwd, copy_fs_struct). An RCU path
+//! walk reads root and pwd with no lock and no reference under the
+//! sequence (Linux set_root, path_init: `root_rcu`, `pwd_rcu`): their
+//! addresses are kept in atomics beside the owned paths, stored in the
+//! same write section; a dentry or mount is freed only a grace period
+//! after its last reference goes, so one read under an RCU read guard
+//! stays allocated while the guard is held, and the walk takes its
+//! references later (legitimize_root) only if the dentry's and the
+//! mount tree's sequences say nothing moved.
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::sync::spin::Mutex;
+use crate::sync::SeqLock;
+use crate::sync::rcu::RcuReadGuard;
 
-use super::mount::MountRef;
+use super::dentry::{Dentry, DentryRef};
+use super::mount::{Mount, MountRef};
 use super::path_ref::Path;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
@@ -33,8 +47,13 @@ use crate::util::kalloc::{arc_nofail, try_arc};
 /// This is reference-counted via Arc. Multiple tasks can share
 /// the same FsStruct when CLONE_FS is used.
 pub struct FsStruct {
-    /// Lock protecting pwd, root, umask modifications
-    inner: Mutex<FsStructInner>,
+    /// Root, cwd and umask (Linux fs->seq: lock and sequence)
+    seq: SeqLock<FsStructInner>,
+    /// `root`'s mount and dentry, for RCU walks (no reference: the
+    /// locked path holds them); stored under `seq`'s write side
+    root_rcu: PathPtrs,
+    /// `pwd`'s, likewise
+    pwd_rcu: PathPtrs,
     /// Tasks using it (Linux fs->users): setns into a mount namespace
     /// needs it unshared
     pub users: core::sync::atomic::AtomicUsize,
@@ -49,17 +68,61 @@ struct FsStructInner {
     umask: u16,
 }
 
+/// A path's mount and dentry addresses, read by RCU walks under the
+/// fs_struct's sequence (Linux reads fs->root and fs->pwd themselves)
+struct PathPtrs {
+    mnt: AtomicPtr<Mount>,
+    dentry: AtomicPtr<Dentry>,
+}
+
+impl PathPtrs {
+    fn new(p: &Path) -> Self {
+        Self {
+            mnt: AtomicPtr::new(MountRef::as_ptr(&p.mnt).cast_mut()),
+            dentry: AtomicPtr::new(DentryRef::as_ptr(&p.dentry).cast_mut()),
+        }
+    }
+
+    /// Point at `p`, under the write side of the fs_struct's sequence
+    fn set(&self, p: &Path) {
+        self.mnt
+            .store(MountRef::as_ptr(&p.mnt).cast_mut(), Ordering::Release);
+        self.dentry
+            .store(DentryRef::as_ptr(&p.dentry).cast_mut(), Ordering::Release);
+    }
+
+    /// The mount and dentry, borrowed for `g`
+    fn get<'g>(&self, _g: &'g RcuReadGuard) -> (&'g Mount, &'g Dentry) {
+        let m = self.mnt.load(Ordering::Acquire);
+        let d = self.dentry.load(Ordering::Acquire);
+        // SAFETY: each is the address of a mount and a dentry the
+        // fs_struct's locked paths held when it was stored (`new`,
+        // `set`, never null), published before the path it replaced is
+        // put (after the write section); a mount and a dentry are freed
+        // only a grace period after their last reference goes, which
+        // waits for `_g`, taken before this load
+        unsafe { (&*m, &*d) }
+    }
+}
+
+/// What an RCU walk reads of root or pwd (Linux nd->path / nd->root
+/// with nd->seq / nd->root_seq): borrowed, with no reference, the
+/// dentry's `d_seq` sampled in the same read of the fs_struct
+pub type PathRcu<'g> = (&'g Mount, &'g Dentry, u32);
+
 impl FsStruct {
     /// Create a new FsStruct with the given root and pwd
     pub fn new(root: Path, pwd: Path) -> Arc<Self> {
-        arc_nofail(Self {
-            inner: Mutex::new(FsStructInner {
-                pwd,
-                root,
-                umask: 0o022,
-            }),
+        arc_nofail(Self::with(root, pwd, 0o022))
+    }
+
+    fn with(root: Path, pwd: Path, umask: u16) -> Self {
+        Self {
+            root_rcu: PathPtrs::new(&root),
+            pwd_rcu: PathPtrs::new(&pwd),
+            seq: SeqLock::new(FsStructInner { pwd, root, umask }),
             users: core::sync::atomic::AtomicUsize::new(1),
-        })
+        }
     }
 
     /// Create a new FsStruct at where "/" lands in the namespace: the
@@ -70,41 +133,83 @@ impl FsStruct {
         Some(Self::new(root.clone(), root))
     }
 
-    /// Get current working directory (returns cloned Path with bumped refs)
+    /// The current working directory, a reference (Linux get_fs_pwd)
     pub fn get_pwd(&self) -> Path {
-        self.inner.lock().pwd.clone()
+        self.seq.read_excl().pwd.clone()
     }
 
-    /// Get root directory (returns cloned Path with bumped refs)
+    /// The root directory, a reference (Linux get_fs_root)
     pub fn get_root(&self) -> Path {
-        self.inner.lock().root.clone()
+        self.seq.read_excl().root.clone()
+    }
+
+    /// The root for an RCU walk (Linux set_root under LOOKUP_RCU: read
+    /// under fs->seq, root_seq from its d_seq), no reference
+    pub fn root_rcu<'g>(&'g self, g: &'g RcuReadGuard) -> PathRcu<'g> {
+        self.read_rcu(&self.root_rcu, g)
+    }
+
+    /// The cwd for an RCU walk (Linux path_init's AT_FDCWD under
+    /// LOOKUP_RCU), no reference
+    pub fn pwd_rcu<'g>(&'g self, g: &'g RcuReadGuard) -> PathRcu<'g> {
+        self.read_rcu(&self.pwd_rcu, g)
+    }
+
+    /// `p` and its dentry's `d_seq`, read again if a writer raced
+    /// (read_seqbegin .. read_seqretry)
+    fn read_rcu<'g>(&'g self, p: &'g PathPtrs, g: &'g RcuReadGuard) -> PathRcu<'g> {
+        loop {
+            let s = self.seq.read_begin();
+            let (m, d) = p.get(g);
+            let seq = d.d_seq_begin();
+            if !self.seq.read_retry(s) {
+                return (m, d, seq);
+            }
+        }
     }
 
     /// Get umask
     pub fn get_umask(&self) -> u16 {
-        self.inner.lock().umask
+        self.seq.read_excl().umask
     }
 
-    /// Set current working directory
-    ///
-    /// Takes a new Path reference. The old pwd is dropped after
-    /// releasing the lock (two-phase ref management).
+    /// Set the cwd (Linux set_fs_pwd): the old one is put after the
+    /// write section
     pub fn set_pwd(&self, new_pwd: Path) {
         let old = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.seq.write();
+            self.pwd_rcu.set(&new_pwd);
             core::mem::replace(&mut inner.pwd, new_pwd)
         };
-        // old Path dropped here, decrementing refcounts
         drop(old);
     }
 
-    /// Set root directory
+    /// Set the root (Linux set_fs_root), likewise
     pub fn set_root(&self, new_root: Path) {
         let old = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.seq.write();
+            self.root_rcu.set(&new_root);
             core::mem::replace(&mut inner.root, new_root)
         };
         drop(old);
+    }
+
+    /// Root and cwd at `old` move to `new` in one write section (Linux
+    /// chroot_fs_refs' replace_path for one fs_struct)
+    pub fn replace_refs(&self, old: &Path, new: &Path) {
+        let olds = {
+            let mut inner = self.seq.write();
+            let root = inner.root.same(old).then(|| {
+                self.root_rcu.set(new);
+                core::mem::replace(&mut inner.root, new.clone())
+            });
+            let pwd = inner.pwd.same(old).then(|| {
+                self.pwd_rcu.set(new);
+                core::mem::replace(&mut inner.pwd, new.clone())
+            });
+            (root, pwd)
+        };
+        drop(olds);
     }
 
     /// After a mount namespace copy: root and pwd move to the copies of
@@ -116,8 +221,14 @@ impl FsStruct {
                 .map(|(_, new)| Path::new(new.clone(), p.dentry.clone()))
         };
         let old = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.seq.write();
             let (root, pwd) = (swap(&inner.root), swap(&inner.pwd));
+            if let Some(r) = &root {
+                self.root_rcu.set(r);
+            }
+            if let Some(p) = &pwd {
+                self.pwd_rcu.set(p);
+            }
             (
                 root.map(|r| core::mem::replace(&mut inner.root, r)),
                 pwd.map(|p| core::mem::replace(&mut inner.pwd, p)),
@@ -126,12 +237,11 @@ impl FsStruct {
         drop(old);
     }
 
-    /// Set umask, returns old umask
+    /// Set umask, returns old umask (Linux xchg: the sequence does not
+    /// move)
     pub fn set_umask(&self, new_umask: u16) -> u16 {
-        let mut inner = self.inner.lock();
-        let old = inner.umask;
-        inner.umask = new_umask;
-        old
+        let mut inner = self.seq.read_excl();
+        core::mem::replace(&mut inner.umask, new_umask)
     }
 
     /// Copy this FsStruct (for fork without CLONE_FS)
@@ -140,20 +250,16 @@ impl FsStruct {
     /// but independent (changes don't affect original).
     /// The underlying mount/dentry objects are still shared via Arc.
     ///
-    /// The paths (references) and umask are read under the lock, the
-    /// new struct allocated after it (Linux copy_fs_struct allocates,
-    /// then copies under fs->lock)
+    /// The paths (references) and umask are read under the locking
+    /// read, the new struct allocated after it (Linux copy_fs_struct
+    /// allocates, then copies under read_seqlock_excl)
     pub fn copy(&self) -> Result<Arc<Self>, KernelError> {
-        // Taken under the lock (Linux path_get under fs->lock): the
-        // mount count, an atomic, no allocation
+        // The mount count, an atomic, no allocation
         let (pwd, root, umask) = {
-            let inner = self.inner.lock();
+            let inner = self.seq.read_excl();
             (inner.pwd.clone(), inner.root.clone(), inner.umask)
         };
-        try_arc(Self {
-            inner: Mutex::new(FsStructInner { pwd, root, umask }),
-            users: core::sync::atomic::AtomicUsize::new(1),
-        })
+        try_arc(Self::with(root, pwd, umask))
     }
 }
 
@@ -201,6 +307,13 @@ pub fn get_task_fs(t: &Task) -> Option<Arc<FsStruct>> {
     fs.or_else(|| kthread_fs(t))
 }
 
+/// [`KTHREAD_FS`] for a kernel thread `t`, borrowed
+pub fn kthread_fs_ref(t: &Task) -> Option<&'static FsStruct> {
+    matches!(t.kind, crate::task::TaskKind::KernelThread)
+        .then(|| KTHREAD_FS.get().map(|f| &**f))
+        .flatten()
+}
+
 /// [`KTHREAD_FS`] for a kernel thread `t`, which has no fs of its own
 pub fn kthread_fs(t: &Task) -> Option<Arc<FsStruct>> {
     matches!(t.kind, crate::task::TaskKind::KernelThread)
@@ -242,4 +355,40 @@ pub fn install_fork_fs(child: &Task, fs: Arc<FsStruct>, shared: bool) {
         fs.users.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
     init_task_fs(child, fs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(m: &MountRef) -> Path {
+        Path::new(m.clone(), (*m.root).clone())
+    }
+
+    /// An RCU walk reads the paths the fs_struct holds, with no
+    /// reference: each write section moves what it reads, and the
+    /// counts are the locked paths' alone
+    #[test]
+    fn rcu_reads_follow_writes() {
+        let (a, b) = (crate::fs::mount::test_mnt(), crate::fs::mount::test_mnt());
+        let fs = FsStruct::new(at(&a), at(&a));
+        let n = DentryRef::count(&b.root);
+        let same = |p: PathRcu<'_>, m: &MountRef| {
+            core::ptr::eq(p.0, MountRef::as_ptr(m))
+                && core::ptr::eq(p.1, DentryRef::as_ptr(&m.root))
+        };
+        let g = crate::sync::rcu::read_lock();
+        assert!(same(fs.root_rcu(&g), &a) && same(fs.pwd_rcu(&g), &a));
+        drop(g);
+        fs.set_pwd(at(&b));
+        let g = crate::sync::rcu::read_lock();
+        assert!(same(fs.root_rcu(&g), &a) && same(fs.pwd_rcu(&g), &b));
+        assert_eq!(DentryRef::count(&b.root), n + 1);
+        drop(g);
+        fs.replace_refs(&at(&a), &at(&b));
+        let g = crate::sync::rcu::read_lock();
+        assert!(same(fs.root_rcu(&g), &b) && same(fs.pwd_rcu(&g), &b));
+        drop(g);
+        assert!(fs.get_root().same(&at(&b)));
+    }
 }

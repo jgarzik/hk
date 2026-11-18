@@ -24,13 +24,14 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{CurrentArch, IrqStackOps};
-use crate::cpu::PerCpu;
 use crate::mm::vmstack::{self, THREAD_SIZE, VmStack};
 
-/// Each CPU's IRQ stack top, 0 until [`set`]: written once, for a CPU
-/// not running yet (its start orders the store before its reads) or by
-/// the CPU itself
-static IRQ_STACK: PerCpu<AtomicU64> = crate::percpu![AtomicU64::new(0)];
+crate::percpu! {
+    /// Each CPU's IRQ stack top, 0 until [`set`]: written once, for a CPU
+    /// not running yet (its start orders the store before its reads) or by
+    /// the CPU itself
+    static IRQ_STACK: AtomicU64 = AtomicU64::new(0);
+}
 
 /// Give CPU `cpu` (not running yet, or the caller) the IRQ stack `s`,
 /// for good (Linux irq_init_percpu_irqstack, init_irq_stacks)

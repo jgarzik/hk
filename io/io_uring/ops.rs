@@ -6,6 +6,7 @@
 //! completes asynchronously: BUGS "io_uring gaps")
 
 use super::abi::*;
+use super::opreq::OpenArgs;
 use super::{IoRing, Submit};
 use crate::uaccess::{UserPtr, copy_val_from_user};
 use crate::util::error::{KernelError, KernelResult};
@@ -36,8 +37,8 @@ pub enum How {
 /// How the non-read/write opcode `op` is issued
 pub fn how(op: u8) -> How {
     match op {
-        IORING_OP_OPENAT | IORING_OP_FSYNC | IORING_OP_STATX | IORING_OP_FTRUNCATE
-        | IORING_OP_ACCEPT | IORING_OP_CONNECT => How::Punt,
+        IORING_OP_OPENAT | IORING_OP_OPENAT2 | IORING_OP_FSYNC | IORING_OP_STATX
+        | IORING_OP_FTRUNCATE | IORING_OP_ACCEPT | IORING_OP_CONNECT => How::Punt,
         IORING_OP_SEND | IORING_OP_RECV | IORING_OP_SENDMSG | IORING_OP_RECVMSG => How::TryNoWait,
         _ => How::Inline,
     }
@@ -82,9 +83,6 @@ pub fn run_blocking(sqe: &IoUringSqe) -> KernelResult<i32> {
     match sqe.opcode {
         IORING_OP_NOP => Ok(0),
         IORING_OP_CLOSE => crate::fs::syscall::sys_close(sqe.fd).map(|()| 0),
-        IORING_OP_OPENAT => {
-            crate::fs::syscall::sys_openat(sqe.fd, UserPtr::new(sqe.addr), sqe.op_flags, sqe.len)
-        }
         IORING_OP_FSYNC => fsync(sqe),
         IORING_OP_STATX => crate::fs::syscall::sys_statx(
             sqe.fd,
@@ -100,6 +98,73 @@ pub fn run_blocking(sqe: &IoUringSqe) -> KernelResult<i32> {
         // Valid inside a chain; it arms nothing (BUGS "io_uring gaps")
         IORING_OP_LINK_TIMEOUT => Ok(0),
         _ => net(sqe, 0).unwrap_or(Err(KernelError::InvalidArgument)),
+    }
+}
+
+/// The opcode's prep at submission (Linux def->prep from io_init_req):
+/// what must be copied from user memory now, so the SQE's pointers are
+/// not read again (IORING_FEAT_SUBMIT_STABLE); an error ends the batch
+pub fn prep(sqe: &IoUringSqe) -> KernelResult<Option<OpenArgs>> {
+    match sqe.opcode {
+        IORING_OP_OPENAT | IORING_OP_OPENAT2 => open_prep(sqe).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Linux io_openat_prep / io_openat2_prep, then __io_openat_prep: the
+/// open_how (OPENAT: from open_flags and the mode in len; OPENAT2:
+/// copied from addr2, len bytes, EINVAL below the first version, E2BIG,
+/// EFAULT), no buffer index (EINVAL), no registered file (EBADF),
+/// O_LARGEFILE unless O_PATH, the name copied in (getname: an empty one
+/// ENOENT), a direct slot (file_index) not with O_CLOEXEC (EINVAL), and
+/// RLIMIT_NOFILE as of now
+fn open_prep(sqe: &IoUringSqe) -> KernelResult<OpenArgs> {
+    use crate::fs::open::build_open_how;
+    let mut how = if sqe.opcode == IORING_OP_OPENAT2 {
+        crate::fs::open::copy_open_how(sqe.off, sqe.len as usize)?
+    } else {
+        build_open_how(sqe.op_flags, sqe.len)
+    };
+    if sqe.buf_index != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if sqe.flags & IOSQE_FIXED_FILE != 0 {
+        return Err(KernelError::BadFd);
+    }
+    crate::fs::open::force_largefile(&mut how);
+    let name = crate::fs::namei::getname(UserPtr::new(sqe.addr), false)?;
+    let slot = sqe.splice_fd_in as u32;
+    if slot != 0 && how.flags & u64::from(crate::fs::file::flags::O_CLOEXEC) != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(OpenArgs {
+        dfd: sqe.fd,
+        name,
+        how,
+        slot,
+        nofile: crate::fs::syscall::get_nofile_limit(),
+    })
+}
+
+/// Linux io_openat2: the open flags built (EINVAL), then a descriptor
+/// reserved below the prep's RLIMIT_NOFILE and the file installed there,
+/// or with a slot the file installed in the registered table under the
+/// submission lock: `held` if the caller has it (Linux
+/// io_ring_submit_lock skips it then), else taken
+pub fn open(r: &IoRing, a: &OpenArgs, held: Option<&mut Submit>) -> KernelResult<i32> {
+    use crate::fs::open::{open_file, open_install};
+    if a.slot == 0 {
+        return open_install(a.dfd, &a.name, &a.how, a.nofile);
+    }
+    let file = open_file(a.dfd, &a.name, &a.how)?;
+    match held {
+        Some(s) => {
+            let (res, old) = s.fixed_install(file, a.slot);
+            // A replaced file's put is deferred (fput); fine under it
+            drop(old);
+            res
+        }
+        None => r.fixed_install(file, a.slot),
     }
 }
 

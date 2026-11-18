@@ -39,6 +39,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | inode and page lock guards | RAII guard |
 | socket lock `SockLock` / `SockGuard` / `BhGuard` (`net/core/sock_lock.rs`, Linux socket_lock_t) | RAII guards over owner bit + spin lock |
 | frame borrows | typed handle |
+| a task's saved user FP/SIMD state `ThreadStruct` and the per-CPU binding `PerCpu::fpsimd_last_state` (`arch/aarch64/fpsimd.rs`, Linux thread.uw.fpsimd_state, fpsimd_last_state.st; `with_current_state`, `thread_switch`, `dup_thread` unsafe: the running task's own state, the outgoing task current, a task not running) | cell accessed only by its task, flushed state checked; the binding followed only while the running task's registers are live, when it names that task's state (set by `bind_task_to_cpu`), else only compared |
 | `Pod` byte views | marker trait |
 | `IoMem` registers | checked volatile |
 | `DmaBox` (`hw/dma.rs`, Rust-for-Linux CoherentAllocation) | owned device memory, freed on drop |
@@ -48,11 +49,20 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | red-black tree `RbTree` / `RbTreeNodeReservation` (`util/rbtree.rs`, Linux rb_root) | owning container of preallocated nodes |
 | intrusive red-black tree `RbRoot` / `RbNode` / `RbCursorMut` over a `ListPtr` (`util/rbtree.rs`, Linux rb_node embedded, `skb->rbnode`) | owning intrusive container, membership checked |
 | RCU callback head `RcuHead` / `HasRcuHead`, `call_rcu` (`sync/rcu.rs`, Linux rcu_head) | embedded queue node, claimed once |
+| slab RCU head `Page::slab_rcu_head` / `slab_rcu_end` (`mm/page.rs`, Linux struct slab's rcu_head in a union with slab_list, freelist and counters) | `RcuHead` over struct page fields dead once the slab is off its lists (layout const-asserted; a head has no uninitialized byte), zeroed back by its callback |
+| RCU pointers `RcuArc`, `RcuLockedArc` (nullable, writers proven by a `UniqueOwner`), `RcuPtr` (no ownership, unsafe read) (`sync/rcu.rs`, Linux `__rcu`) | published pointer, old version released after a grace period |
 | dentry reference `DentryRef` (`fs/dentry.rs`, Linux dget/dput on d_lockref), mount reference `MountRef` (`fs/mntput.rs`, Linux mntget/mntput on mnt_pcp) | counted pointer, last put deferred (RCU free, queued teardown) |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
+| RCU-readable dentry name `DNameSlot` over `ExternalName` (`fs/name.rs`, Linux d_name over d_shortname / external_name) | atomics a reader may see torn, never out of bounds; a replaced long block released after a grace period (`put_rcu`) |
+| inode reference `InodeRef` (`fs/inode.rs`, Linux ihold/iput on i_count); RCU-borrowed inode `Dentry::d_inode_rcu`, reference from it `Inode::igrab` (`fs/dentry.rs`, `fs/inode.rs`, Linux READ_ONCE(d_inode), igrab) | counted pointer, last put tears down at once (iput_final -> evict); borrow for a guard's life, memory freed a grace period after the teardown (`i_callback`) |
+| inode list `InodeList` (`fs/inode.rs`, Linux s_inodes, i_hash chains, b_dirty/b_io; `new` unsafe: eviction unlinks under the list's lock; `remove` and `iter_after` unsafe: membership) | intrusive list owning nothing, a linked entry live under the lock, a reference only by `Inode::igrab` |
 | RCU nulls hash bucket `NullsHead` / `NullsGuard` / `NullsRef` / `NullsUnlinked` (`util/hlist_nulls.rs`, Linux hlist_nulls) | owning intrusive container, lockless readers, grace-period-held references |
-| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h) | owning intrusive containers, membership checked |
+| hash bucket `BlHead` / `BlGuard` (`util/hlist_bl.rs`, Linux hlist_bl), owner-marked list `OwnedList`, owning list `PtrList` over a `ListPtr` (`Box`, `Arc` or `&'static`: `BoxList`, `ArcList`) (`util/list.rs`), RCU list `RcuList` with `RcuRef` and `RcuUnlinked` (`util/rculist.rs`, Linux rculist.h; `remove` and `iter_locked` unsafe: membership, and every remover excluded) | owning intrusive containers, membership checked |
 | RCU hash chain `RcuHList` / `HNode` / `RcuHRef` (`util/rcuhlist.rs`, Linux hlist_*_rcu), writers proven by a `UniqueOwner` | owning intrusive chain, membership checked, release after a grace period |
+| non-owning RCU hash chain `RcuHListBare` (`util/rcuhlist.rs`, Linux pid->tasks[type] bare hlist nodes), writers proven by a `UniqueOwner`; `add_head` unsafe: the entry stays allocated while linked and a grace period after (a task: unlinked at release, freed a grace period after leaving the task list, as `RcuPtr`'s targets) | intrusive chain owning nothing, readers safe under RCU |
+| RCU slot array `Slots` / `SlotsOwner` over an `RcuRef`, published by `RcuSlots` (unsafe publish: one place, replaced in the lock hold that retires it) from an opaque `SlotsRef` (`util/rcuslots.rs`, Linux fdtable->fd and file_ref_get), file reference `FileRef` (`fs/file.rs`, Linux f_ref) | owning array, one writer handle, reference taken unless the last went, on type-stable memory (SLAB_TYPESAFE_BY_RCU) and rechecked; grown arrays keep stale copies and own nothing, read only by readers that reached them under their guard |
+| data under a unique lock and one instance of a lock of many, `LockedByBoth` with `InstanceLock` / `InstanceGuard` (`sync/locked_by.rs`, Linux signal->thread_head under tasklist_lock and siglock; RfL `LockedBy` owner check) | cell checked against its owner instance at run time |
+| data under one instance of a lock of many, `InstanceCell` / `InstanceRef` / `InstanceRefMut` (`sync/locked_by.rs`, Linux task->blocked/pending under the siglock of the task's table; RfL `LockedBy` owner check) | cell checked against its owner instance, borrows counted (`RefCell` rule) at run time |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.
@@ -162,7 +172,8 @@ line when the file is clean, and never add it to a new file
 ### 12. Deferred release (RCU)
 
 An object that RCU readers reach without a reference (an `RcuList` or
-`RcuHList` entry, an `RcuArc` version) is released only after a grace
+`RcuHList` entry, an `RcuArc`/`RcuLockedArc` version, a task reached
+through `RcuPtr`) is released only after a grace
 period: the container's reference goes through `RcuUnlinked`,
 `RcuHRef` or `RcuRetired` (`defer`: `call_rcu`/`kfree_rcu`/`put_rcu`). That
 reference may be the last, so the object's `Drop`, and every drop it
@@ -171,6 +182,51 @@ causes, can run in `rcuc/N` with preemption off: it must not sleep
 named. A type kept in such a container says so where it is defined
 (Linux SOCK_RCU_FREE sockets: `__sk_destruct` runs from the RCU
 callback).
+
+An inode (`fs/inode.rs` `InodeRef`, Linux iput / destroy_inode /
+i_callback) is the other shape: RCU readers reach it with no reference
+(a dentry's `d_inode`), its teardown runs synchronously at the last
+put, and only the memory is deferred. Its references are counted in
+`i_count` through `InodeRef` (a raw pointer, as `DentryRef` counts
+`d_count`): a clone is ihold, `Inode::igrab` takes one from a borrowed
+inode unless the count is zero and I_FREEING / I_WILL_FREE is set
+(both only at zero, under `i_lock`), and the drop is iput, whose last
+put evicts and tears down through the raw pointer (`iput_final` ->
+`evict` -> `destroy_inode`), then queues `i_callback`, which frees the
+`Box` block `Inode::alloc` made. No `&mut Inode` is ever formed.
+`Inode` has no `Drop` and no drop glue; each field with drop glue is
+`ManuallyDrop`, dropped through its raw-pointer place by
+`destroy_inode` (or by `i_callback`, for what an RCU reader may read:
+`i_link`, `i_private_rcu`), so a reader, which reads only atomics,
+`ino`, `i_op` and other fields with no drop glue, never sees a byte it
+reads written before the free. Compile-time checks name every field
+(an exhaustive pattern, no `..`): `no_glue` asserts `needs_drop` false
+on each field's own type and on `Inode`, and `Inode::init_at`, which
+builds the inode in place in its uninitialized block, writes each field
+exactly once, so a field added fails the build until both are updated.
+`SignalStruct::alloc` (signal/mod.rs) builds the signal struct in place
+the same way (`try_arc_uninit`, an `init_at` writing each field once
+under an exhaustive pattern, then `assume_init`), so its large cells
+are never copied through the stack.
+
+A file (`fs/file.rs`, Linux's SLAB_TYPESAFE_BY_RCU `struct file`) is
+reached by descriptor-table readers (`util/rcuslots.rs`) and epoll
+through its address alone, who only try for a count. Every file lives
+in a `FileObj` of `FILP_CACHE` (`mm/slab.rs`, a type-stable cache): the
+file, then `f_count`, an atomic the cache's constructor makes when the
+slab is made, which nothing writes afterwards but atomically (the
+cache's free-list link is in the file part, `FileObj::FREEPTR`) and
+which stays a count until the slab goes back to the page allocator, a
+grace period after it emptied. A count is taken only from a nonzero
+one (`inc_not_zero`), which `File::alloc` sets last, Release, after
+writing the file; the release (`release`: `drop_in_place` of the file,
+then `file_free` to the cache) borrows the file part alone, and leaves
+the count 0. So a reader's compare-exchange never races a non-atomic
+write, a count it wins names a whole live file, maybe a newer one in the
+same memory, which `Slots::get` rejects by reloading the slot (Linux
+__get_file_rcu), and a reader that loaded the address under an RCU guard
+(or under a lock that keeps the file from being freed: epoll's `mtx`)
+cannot reach memory given back to the page allocator.
 
 ## Review checklist (for each new `unsafe`)
 

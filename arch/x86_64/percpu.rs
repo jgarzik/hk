@@ -61,6 +61,12 @@ pub struct PerCpu {
     /// Nesting depth of interrupt handlers (to avoid rescheduling in nested interrupts)
     pub interrupt_depth: AtomicU32,
 
+    /// The interrupt being handled came from user mode (Linux
+    /// __irq_regs, as user_mode(regs)): written only by this CPU at
+    /// interrupt entry and exit (`irq_regs_enter`/`_exit`), read by its
+    /// tick
+    pub irq_user: AtomicBool,
+
     /// Preemption count - tracks nested critical sections
     ///
     /// When > 0, preemption is disabled on this CPU. This count includes:
@@ -86,6 +92,7 @@ impl PerCpu {
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
             interrupt_depth: AtomicU32::new(0),
+            irq_user: AtomicBool::new(false),
             preempt_count: AtomicU32::new(0),
         }
     }
@@ -100,6 +107,7 @@ impl PerCpu {
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
+        self.irq_user.store(false, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
         // Don't set is_online yet - that happens after full init
     }
@@ -342,10 +350,32 @@ pub const ARCH_SET_CPUID: i32 = 0x1012;
 /// Must be paired with `preempt_enable()`.
 #[inline]
 pub fn preempt_disable() {
-    if let Some(percpu) = try_current_cpu() {
-        percpu.preempt_count.fetch_add(1, Ordering::Relaxed);
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        this_cpu_add!(preempt_count, 1u32);
     }
 }
+
+/// Add `$v` (wrapping) to this CPU's u32 field `$f` of its `PerCpu`
+/// in one unlocked instruction on the GS base (Linux raw_cpu_add_4:
+/// `addl %gs:`): only this CPU writes the field, and an interrupt
+/// cannot split one instruction (one that changes the field restores
+/// it before returning). No `nomem`: a compiler barrier, as Linux's
+/// preempt_disable has
+macro_rules! this_cpu_add {
+    ($f:ident, $v:expr) => {
+        // SAFETY: GS base is this CPU's PerCpu once PERCPU_UP is set (its
+        // callers check), and `$f` is a u32 field of it
+        unsafe {
+            ::core::arch::asm!(
+                "add dword ptr gs:[{o}], {v:e}",
+                o = const ::core::mem::offset_of!(PerCpu, $f),
+                v = in(reg) $v,
+                options(nostack)
+            )
+        }
+    };
+}
+pub(super) use this_cpu_add;
 
 /// Enable preemption on the current CPU
 ///
@@ -355,13 +385,52 @@ pub fn preempt_disable() {
 /// Must be paired with `preempt_disable()`.
 #[inline]
 pub fn preempt_enable() {
-    if let Some(percpu) = try_current_cpu() {
-        let prev = percpu.preempt_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(prev > 0, "preempt_enable called with preempt_count == 0");
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        debug_assert!(
+            preempt_count() > 0,
+            "preempt_enable called with preempt_count == 0"
+        );
+        this_cpu_add!(preempt_count, u32::MAX);
+        // A reschedule this enable could owe waits for the next check
+        // point (interrupt exit, yield): the kernel is not preemptive
+    }
+}
 
-        // If preempt_count is now 0 and reschedule is needed, we could
-        // trigger a reschedule here. For now, we defer to the existing
-        // reschedule check points (timer interrupt exit, yield, etc.)
+/// Enter interrupt context on this CPU (Linux irq_enter's
+/// preempt_count HARDIRQ_OFFSET): `interrupt_depth` + 1
+#[inline]
+pub fn irq_depth_enter() {
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        this_cpu_add!(interrupt_depth, 1u32);
+    }
+}
+
+/// Leave interrupt context on this CPU (`interrupt_depth` - 1)
+#[inline]
+pub fn irq_depth_exit() {
+    if crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
+        this_cpu_add!(interrupt_depth, u32::MAX);
+    }
+}
+
+/// Entering an interrupt that came from user mode or not (Linux
+/// set_irq_regs): recorded for the tick (`irq_from_user`); returns the
+/// value of the context it interrupted, for `irq_regs_exit`
+#[inline]
+pub fn irq_regs_enter(user: bool) -> bool {
+    // This CPU's word, interrupts off: a load and a store
+    try_current_cpu().is_some_and(|p| {
+        let old = p.irq_user.load(Ordering::Relaxed);
+        p.irq_user.store(user, Ordering::Relaxed);
+        old
+    })
+}
+
+/// Leaving the interrupt: restore the interrupted context's value
+#[inline]
+pub fn irq_regs_exit(old: bool) {
+    if let Some(p) = try_current_cpu() {
+        p.irq_user.store(old, Ordering::Relaxed);
     }
 }
 
@@ -413,7 +482,53 @@ impl PerCpuOps for X86_64Arch {
             .unwrap_or(0)
     }
 
+    #[inline]
+    fn irq_from_user() -> bool {
+        try_current_cpu().is_some_and(|p| p.irq_user.load(Ordering::Relaxed))
+    }
+
     fn cpu_online(cpu: u32) -> bool {
         (cpu as usize) < MAX_CPUS && get_percpu(cpu).is_online.load(Ordering::Acquire)
     }
+}
+
+/// Add `v` to the word at `p` in one unlocked instruction (Linux
+/// this_cpu_add on x86: `add`): for a per-CPU word only this CPU
+/// writes. The kernel is not preemptive, so the caller stays on the CPU
+/// whose word it chose, and an interrupt cannot split one instruction.
+///
+/// # Safety
+/// `p` is valid, aligned, and written only by this CPU (its interrupts
+/// included).
+#[inline(always)]
+pub unsafe fn local_add_u64(p: *mut u64, v: u64) {
+    // SAFETY: the caller's word; one read-modify-write instruction
+    unsafe {
+        core::arch::asm!(
+            "add qword ptr [{p}], {v}",
+            p = in(reg) p,
+            v = in(reg) v,
+            options(nostack)
+        )
+    };
+}
+
+/// [`local_add_u64`] returning the old value (Linux
+/// this_cpu_add_return: an unlocked `xadd`)
+///
+/// # Safety
+/// As [`local_add_u64`].
+#[inline(always)]
+pub unsafe fn local_xadd_u64(p: *mut u64, v: u64) -> u64 {
+    let mut r = v;
+    // SAFETY: the caller's word; one read-modify-write instruction
+    unsafe {
+        core::arch::asm!(
+            "xadd qword ptr [{p}], {r}",
+            p = in(reg) p,
+            r = inout(reg) r,
+            options(nostack)
+        )
+    };
+    r
 }

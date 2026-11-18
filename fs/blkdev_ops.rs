@@ -20,7 +20,7 @@ use crate::block::blkdev::{
     get_blkdev, sync_blockdev,
 };
 use crate::block::genhd;
-use crate::fs::inode::{Inode, InodeMode, Timespec};
+use crate::fs::inode::{Inode, InodeMode, InodeRef, Timespec};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::uaccess::{copy_to_user, get_user, put_user};
 use crate::util::error::KernelError;
@@ -320,7 +320,7 @@ fn write_ok(file: &File, len: usize, pos: u64) -> Result<bool, KernelError> {
         return Err(KernelError::NotPermitted);
     }
     // An active swap partition (Linux blkdev_write_iter: IS_SWAPFILE)
-    if b.bd_inode.i_swapfile.load(Ordering::Acquire) {
+    if b.bd_inode.is_swapfile() {
         return Err(KernelError::TextBusy);
     }
     if len == 0 {
@@ -414,7 +414,7 @@ pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), Kern
         filemap::put_page(phys);
         done += n;
     }
-    crate::fs::fs_writeback::mark_inode_dirty(&b.bd_inode);
+    crate::fs::fs_writeback::mark_inode_dirty_pages(&b.bd_inode);
     Ok(())
 }
 
@@ -482,7 +482,7 @@ static BDEV_AOPS: BdevAops = BdevAops;
 /// bytes (Linux bdev_alloc: new_inode on blockdev_superblock, numbered
 /// by the device), on the superblock's `s_inodes`, unhashed until the
 /// device is added; ENOMEM
-pub fn bdev_inode(dev: DevId, size: u64) -> Result<Arc<Inode>, KernelError> {
+pub fn bdev_inode(dev: DevId, size: u64) -> Result<InodeRef, KernelError> {
     let sb = crate::fs::pseudo::BDEV.sb()?;
     let inode = Inode::alloc(Inode::new_device(
         u64::from(dev.encode()),
@@ -503,7 +503,7 @@ pub fn bdev_inode(dev: DevId, size: u64) -> Result<Arc<Inode>, KernelError> {
 struct BdevInodeOps;
 
 impl crate::fs::inode::InodeOps for BdevInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
         Err(KernelError::NotDirectory)
     }
 

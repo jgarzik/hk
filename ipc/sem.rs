@@ -24,7 +24,8 @@ use crate::ipc::{
 };
 use crate::sync::spin::Mutex;
 use crate::task::Task;
-use crate::task::percpu::{WakeQ, current_pid};
+use crate::task::percpu::current_pid;
+use crate::task::wake_q::WakeQ;
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{UserPtr, UserSlice};
 use crate::util::error::{KernelError, KernelResult};
@@ -158,8 +159,11 @@ fn status_result(code: i32) -> KernelResult<()> {
     Err(e.expect("semop status"))
 }
 
-/// Complete `q` with `r` (Linux wake_up_sem_queue_prepare): its sleeper
-/// goes on `wq`, then the status store is the last touch of `q`
+/// Complete `q` with `r` (Linux wake_up_sem_queue_prepare): a
+/// reference to its sleeper first (it may return once the status is
+/// set), the status store (the last touch of `q`), then the sleeper on
+/// `wq` (wake_q_add_safe: the claim after the condition store, so a
+/// wakeup another queue owes it comes after the store)
 ///
 /// # Safety
 /// - `q` was just unlinked from a pending list under the array's locks,
@@ -169,8 +173,9 @@ unsafe fn complete(q: *const SemQueue, r: KernelResult<()>, wq: &mut WakeQ) {
     // has not returned (the caller)
     let q = unsafe { &*q };
     // SAFETY: the sleeper is in semop until it sees the status
-    wq.add(unsafe { &*q.sleeper });
+    let t = crate::task::percpu::task_ref(unsafe { &*q.sleeper });
     q.status.store(status_code(r), Ordering::Release);
+    wq.add_safe(t);
 }
 
 /// One semaphore's state (Linux struct sem)
@@ -745,7 +750,7 @@ impl SemArray {
         let mut wq = WakeQ::new();
         do_smart_update(&mut l, sops, &mut wq);
         drop(l);
-        wq.wake_up();
+        wq.wake();
     }
 
     /// Fill semid64_ds structure for IPC_STAT (complex mode)
@@ -795,7 +800,7 @@ impl IpcObject for SemArray {
             }
         }
         drop(dead);
-        wq.wake_up();
+        wq.wake();
         self.ns.used_sems.fetch_sub(self.nsems, Ordering::Relaxed);
     }
 }

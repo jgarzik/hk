@@ -40,7 +40,9 @@ use crate::mm::filemap::{self, Aops};
 use super::KernelError;
 use super::dentry::{Dentry, DentryRef};
 use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
-use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::inode::{
+    AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, Timespec,
+};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::util::kalloc::try_arc;
@@ -151,10 +153,6 @@ fn current_time() -> Timespec {
 pub struct RamfsInodeData {
     /// Children (for directories) - maps name to inode
     pub children: RwSem<Children>,
-
-    /// Symlink target (symlinks only - stored inline, not in page cache)
-    /// Symlinks are typically small, so inline storage is more efficient.
-    pub symlink_target: Option<FileName>,
 
     /// Extended attributes (name -> value)
     pub xattrs: Xattrs,
@@ -274,7 +272,7 @@ fn xattr_space(name: &[u8], size: usize) -> u64 {
 /// other entries come and go (an `rm -r` that unlinks as it reads sees
 /// every entry once). Positions 0 and 1 are "." and "..".
 pub struct Children {
-    by_name: BTreeMap<FileName, (u64, Arc<Inode>)>,
+    by_name: BTreeMap<FileName, (u64, InodeRef)>,
     by_pos: BTreeMap<u64, FileName>,
     next: u64,
 }
@@ -290,7 +288,7 @@ impl Children {
     }
 
     /// Inode of entry `name`
-    pub fn get(&self, name: &[u8]) -> Option<&Arc<Inode>> {
+    pub fn get(&self, name: &[u8]) -> Option<&InodeRef> {
         self.by_name.get(name).map(|(_, i)| i)
     }
 
@@ -305,7 +303,7 @@ impl Children {
     }
 
     /// Add (or replace) entry `name` at the next position
-    pub fn insert(&mut self, name: FileName, inode: Arc<Inode>) -> Option<Arc<Inode>> {
+    pub fn insert(&mut self, name: FileName, inode: InodeRef) -> Option<InodeRef> {
         let old = self.remove(&name);
         let pos = self.next;
         self.next += 1;
@@ -315,14 +313,14 @@ impl Children {
     }
 
     /// Remove entry `name`
-    pub fn remove(&mut self, name: &[u8]) -> Option<Arc<Inode>> {
+    pub fn remove(&mut self, name: &[u8]) -> Option<InodeRef> {
         let (pos, inode) = self.by_name.remove(name)?;
         self.by_pos.remove(&pos);
         Some(inode)
     }
 
     /// Entries at position `pos` or later, in position order
-    pub fn from_pos(&self, pos: u64) -> impl Iterator<Item = (u64, &[u8], &Arc<Inode>)> {
+    pub fn from_pos(&self, pos: u64) -> impl Iterator<Item = (u64, &[u8], &InodeRef)> {
         self.by_pos.range(pos..).filter_map(|(&p, name)| {
             self.by_name
                 .get(name)
@@ -336,7 +334,6 @@ impl RamfsInodeData {
     pub fn new_file() -> Self {
         Self {
             children: RwSem::new(Children::new()),
-            symlink_target: None,
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
@@ -347,22 +344,15 @@ impl RamfsInodeData {
     pub fn new_dir() -> Self {
         Self {
             children: RwSem::new(Children::new()),
-            symlink_target: None,
             xattrs: Xattrs::default(),
             xattr_pool: spin::Once::new(),
             xattr_bytes: AtomicU64::new(0),
         }
     }
 
-    /// Create symlink data (target stored inline)
-    pub fn new_symlink(target: FileName) -> Self {
-        Self {
-            children: RwSem::new(Children::new()),
-            symlink_target: Some(target),
-            xattrs: Xattrs::default(),
-            xattr_pool: spin::Once::new(),
-            xattr_bytes: AtomicU64::new(0),
-        }
+    /// Symlink data (the target is the inode's `i_link`)
+    pub fn new_symlink() -> Self {
+        Self::new_dir()
     }
 }
 
@@ -438,320 +428,29 @@ fn shmem_falloc(inode: &Inode, start: u64, end: u64, max: u64) -> Result<(), Ker
 }
 
 /// Ramfs inode operations
+/// The inode of entry `name` of ramfs directory `dir`
+fn child(dir: &Inode, name: &[u8]) -> Option<InodeRef> {
+    let p = dir.get_private()?;
+    let d = p.as_ref().as_any().downcast_ref::<RamfsInodeData>()?;
+    d.children.read().get(name).cloned()
+}
+
 pub struct RamfsInodeOps;
 
 impl RamfsInodeOps {
-    /// Helper for cross-directory rename operations
-    fn do_cross_dir_rename(
-        old_children: &mut Children,
-        old_name: &[u8],
-        new_children: &mut Children,
-        new_name: &[u8],
-        flags: u32,
-    ) -> Result<(), KernelError> {
-        const RENAME_NOREPLACE: u32 = 1;
-        const RENAME_EXCHANGE: u32 = 2;
-
-        let noreplace = flags & RENAME_NOREPLACE != 0;
-        let exchange = flags & RENAME_EXCHANGE != 0;
-
-        // Get source inode
-        let source_inode = old_children
-            .get(old_name)
-            .cloned()
-            .ok_or(KernelError::NotFound)?;
-
-        if exchange {
-            // Exchange requires both to exist
-            let target_inode = new_children
-                .get(new_name)
-                .cloned()
-                .ok_or(KernelError::NotFound)?;
-
-            // Move source to new location, target to old location
-            old_children.remove(old_name);
-            new_children.remove(new_name);
-            old_children.insert(FileName::from(old_name), target_inode);
-            new_children.insert(FileName::from(new_name), source_inode);
-        } else {
-            // Check if target exists
-            let target_exists = new_children.contains_key(new_name);
-
-            if noreplace && target_exists {
-                return Err(KernelError::AlreadyExists);
-            }
-
-            // Remove source
-            old_children.remove(old_name);
-
-            // Handle any existing target
-            if let Some(old_target) = new_children.remove(new_name) {
-                // If replacing a directory, it must be empty
-                if old_target.mode().is_dir() {
-                    let target_private = old_target.get_private().ok_or(KernelError::Io)?;
-                    let target_data = target_private
-                        .as_ref()
-                        .as_any()
-                        .downcast_ref::<RamfsInodeData>()
-                        .ok_or(KernelError::Io)?;
-                    if !target_data.children.read().is_empty() {
-                        // Restore source and target
-                        old_children.insert(FileName::from(old_name), source_inode);
-                        new_children.insert(FileName::from(new_name), old_target);
-                        return Err(KernelError::DirectoryNotEmpty);
-                    }
-                }
-                drop_link(&old_target);
-            }
-
-            // Insert at new location
-            new_children.insert(FileName::from(new_name), source_inode);
-        }
-
-        Ok(())
-    }
-}
-
-impl InodeOps for RamfsInodeOps {
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        ramfs_data
-            .children
-            .read()
-            .get(name)
-            .cloned()
-            .ok_or(KernelError::NotFound)
-    }
-
-    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        // Owner from the caller's fs ids (inode_init_owner)
-        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        add_new(dir, name, Kind::File, mode, uid, gid, current_time())
-    }
-
-    fn mknod(
-        &self,
-        dir: &Inode,
-        name: &[u8],
-        mode: InodeMode,
-        rdev: DevId,
-    ) -> Result<Arc<Inode>, KernelError> {
-        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        add_new(dir, name, Kind::Dev(rdev), mode, uid, gid, current_time())
-    }
-
-    /// Linux ramfs_tmpfile, shmem_tmpfile (d_tmpfile drops the link);
-    /// on tmpfs it takes an inode like any file
-    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        let inode = new_inode(&sb, Kind::File, mode, uid, gid, current_time())?;
-        inode.dec_nlink();
-        Ok(inode)
-    }
-
-    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        add_new(dir, name, Kind::Dir, mode, uid, gid, current_time())
-    }
-
-    fn maps_cache(&self) -> bool {
-        true
-    }
-
-    /// F_SEAL_EXEC keeps the exec bits (Linux shmem_setattr)
-    fn chmod_ok(&self, inode: &Inode, perm: u16) -> Result<(), KernelError> {
-        if seals(inode) & crate::mm::memfd::F_SEAL_EXEC != 0
-            && (inode.mode().perm() ^ perm) & 0o111 != 0
-        {
-            return Err(KernelError::NotPermitted);
-        }
-        Ok(())
-    }
-
-    /// tmpfs gets the inode back (Linux shmem_evict_inode ->
-    /// shmem_free_inode); a superblock already gone counts nothing
-    fn evict_inode(&self, inode: &Inode) {
-        if let Some(sb) = inode.superblock() {
-            free_inode(&sb);
-        }
-    }
-
-    fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
-        // Must be a symlink
-        if !inode.mode().is_symlink() {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        // Symlink target is stored inline
-        ramfs_data
-            .symlink_target
-            .clone()
-            .map(FileName::into_vec)
-            .ok_or(KernelError::InvalidArgument)
-    }
-
-    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        // S_IFLNK | 0777, the target inline (not in the page cache)
-        let (uid, gid, mode) = super::dac::init_owner(dir, InodeMode::symlink());
-        let kind = Kind::Symlink(FileName::from(target));
-        add_new(dir, name, kind, mode, uid, gid, current_time())
-    }
-
-    fn link(&self, dir: &Inode, name: &[u8], target_inode: &Arc<Inode>) -> Result<(), KernelError> {
-        // Cannot hard link directories
-        if target_inode.mode().is_dir() {
-            return Err(KernelError::PermissionDenied); // EPERM
-        }
-
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let dir_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        // Check if name already exists
-        if dir_data.children.read().contains_key(name) {
-            return Err(KernelError::AlreadyExists);
-        }
-
-        // tmpfs counts each extra name as an inode (Linux shmem_link:
-        // tmpfs dentries pin memory until unlinked); an O_TMPFILE file's
-        // first name took its inode at creation
-        if target_inode.get_nlink() > 0
-            && let Some(sb) = dir.superblock()
-        {
-            reserve_inode(&sb)?;
-        }
-        target_inode.inc_nlink();
-
-        // Add new directory entry pointing to existing inode
-        dir_data
-            .children
-            .write()
-            .insert(FileName::from(name), target_inode.clone());
-
-        Ok(())
-    }
-
-    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
-        if inode.mode().is_dir() {
-            return Err(KernelError::IsDirectory);
-        }
-        // Linux shmem_setattr: a sealed size (EPERM)
-        let (old, sl) = (inode.get_size(), seals(inode));
-        if (length < old && sl & crate::mm::memfd::F_SEAL_SHRINK != 0)
-            || (length > old && sl & crate::mm::memfd::F_SEAL_GROW != 0)
-        {
-            return Err(KernelError::NotPermitted);
-        }
-        filemap::truncate_setsize(inode, length);
-        Ok(())
-    }
-
-    /// tmpfs's, as Linux shmem_fallocate: allocate (and charge) the
-    /// pages, KEEP_SIZE and PUNCH_HOLE only; the cache is the only copy,
-    /// so a hole reads back as zeroes. On success the file counts as
-    /// modified (Linux file_modified). ramfs: EOPNOTSUPP.
-    fn fallocate(
-        &self,
-        inode: &Arc<Inode>,
-        mode: i32,
-        offset: u64,
-        len: u64,
-    ) -> Result<(), KernelError> {
-        use super::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
-        // ramfs has no fallocate (Linux ramfs_file_operations)
-        let max = inode.superblock().and_then(|sb| tmpfs::max_blocks(&sb));
-        let Some(max) = max else {
-            return Err(KernelError::OperationNotSupported);
-        };
-        if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
-            return Err(KernelError::OperationNotSupported);
-        }
-        let end = offset + len;
-        let sl = seals(inode);
-        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
-            // Linux shmem_fallocate: a write seal keeps the data
-            use crate::mm::memfd::{F_SEAL_FUTURE_WRITE, F_SEAL_WRITE};
-            if sl & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
-                return Err(KernelError::NotPermitted);
-            }
-            // The whole range: pages fallocated with KEEP_SIZE may lie
-            // past i_size (Linux shmem_truncate_range ignores it)
-            filemap::punch_range(inode, offset, end);
-        } else {
-            inode.newsize_ok(end)?;
-            if sl & crate::mm::memfd::F_SEAL_GROW != 0 && end > inode.get_size() {
-                return Err(KernelError::NotPermitted);
-            }
-            shmem_falloc(inode, offset, end, max)?;
-            if mode & FALLOC_FL_KEEP_SIZE == 0 && end > inode.get_size() {
-                inode.set_size(end);
-            }
-        }
-        super::dac::remove_privs(inode);
-        let now = current_time();
-        inode.set_mtime(now);
-        inode.set_ctime(now);
-        Ok(())
-    }
-
-    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
-        let private = dir.get_private().ok_or(KernelError::Io)?;
-        let dir_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        // Remove from directory
-        let removed_inode = {
-            let mut children = dir_data.children.write();
-            children.remove(name).ok_or(KernelError::NotFound)?
-        };
-
-        // The inode goes with its last reference (Arc drop)
-        drop_link(&removed_inode);
-
-        Ok(())
-    }
-
-    fn rename(
+    /// The entries' part of rename (the times are the caller's)
+    fn rename_entries(
         &self,
         old_dir: &Inode,
         old_name: &[u8],
-        new_dir: &Arc<Inode>,
+        new_dir: &InodeRef,
         new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
-        // RENAME_NOREPLACE = 1, RENAME_EXCHANGE = 2
         const RENAME_NOREPLACE: u32 = 1;
         const RENAME_EXCHANGE: u32 = 2;
-
         let noreplace = flags & RENAME_NOREPLACE != 0;
         let exchange = flags & RENAME_EXCHANGE != 0;
-
-        // No whiteouts (Linux simple_rename); NOREPLACE and EXCHANGE are
-        // mutually exclusive
-        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 || (noreplace && exchange) {
-            return Err(KernelError::InvalidArgument);
-        }
-
         // Get old directory's data
         let old_private = old_dir.get_private().ok_or(KernelError::Io)?;
         let old_dir_data = old_private
@@ -845,7 +544,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+    fn rmdir_entry(&self, dir: &Inode, name: &[u8], _d: &Dentry) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
@@ -882,10 +581,326 @@ impl InodeOps for RamfsInodeOps {
             children.remove(name).ok_or(KernelError::NotFound)?
         };
 
-        // Decrement link count
+        // Linux simple_rmdir -> simple_unlink: the times, the link
+        super::libfs::simple_link_times(dir, &removed_inode);
         removed_inode.dec_nlink();
 
         Ok(())
+    }
+    /// Helper for cross-directory rename operations
+    fn do_cross_dir_rename(
+        old_children: &mut Children,
+        old_name: &[u8],
+        new_children: &mut Children,
+        new_name: &[u8],
+        flags: u32,
+    ) -> Result<(), KernelError> {
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+
+        let noreplace = flags & RENAME_NOREPLACE != 0;
+        let exchange = flags & RENAME_EXCHANGE != 0;
+
+        // Get source inode
+        let source_inode = old_children
+            .get(old_name)
+            .cloned()
+            .ok_or(KernelError::NotFound)?;
+
+        if exchange {
+            // Exchange requires both to exist
+            let target_inode = new_children
+                .get(new_name)
+                .cloned()
+                .ok_or(KernelError::NotFound)?;
+
+            // Move source to new location, target to old location
+            old_children.remove(old_name);
+            new_children.remove(new_name);
+            old_children.insert(FileName::from(old_name), target_inode);
+            new_children.insert(FileName::from(new_name), source_inode);
+        } else {
+            // Check if target exists
+            let target_exists = new_children.contains_key(new_name);
+
+            if noreplace && target_exists {
+                return Err(KernelError::AlreadyExists);
+            }
+
+            // Remove source
+            old_children.remove(old_name);
+
+            // Handle any existing target
+            if let Some(old_target) = new_children.remove(new_name) {
+                // If replacing a directory, it must be empty
+                if old_target.mode().is_dir() {
+                    let target_private = old_target.get_private().ok_or(KernelError::Io)?;
+                    let target_data = target_private
+                        .as_ref()
+                        .as_any()
+                        .downcast_ref::<RamfsInodeData>()
+                        .ok_or(KernelError::Io)?;
+                    if !target_data.children.read().is_empty() {
+                        // Restore source and target
+                        old_children.insert(FileName::from(old_name), source_inode);
+                        new_children.insert(FileName::from(new_name), old_target);
+                        return Err(KernelError::DirectoryNotEmpty);
+                    }
+                }
+                drop_link(&old_target);
+            }
+
+            // Insert at new location
+            new_children.insert(FileName::from(new_name), source_inode);
+        }
+
+        Ok(())
+    }
+}
+
+impl InodeOps for RamfsInodeOps {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
+        let private = dir.get_private().ok_or(KernelError::Io)?;
+        let ramfs_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(KernelError::Io)?;
+
+        ramfs_data
+            .children
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or(KernelError::NotFound)
+    }
+
+    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
+        // Owner from the caller's fs ids (inode_init_owner)
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
+        add_new(dir, name, Kind::File, mode, uid, gid, current_time()).inspect(|_| dir.touch_mc())
+    }
+
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &[u8],
+        mode: InodeMode,
+        rdev: DevId,
+    ) -> Result<InodeRef, KernelError> {
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
+        add_new(dir, name, Kind::Dev(rdev), mode, uid, gid, current_time())
+            .inspect(|_| dir.touch_mc())
+    }
+
+    /// Linux ramfs_tmpfile, shmem_tmpfile (d_tmpfile drops the link);
+    /// on tmpfs it takes an inode like any file
+    fn tmpfile(&self, dir: &Inode, mode: InodeMode) -> Result<InodeRef, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
+        let inode = new_inode(&sb, Kind::File, mode, uid, gid, current_time())?;
+        inode.dec_nlink();
+        Ok(inode)
+    }
+
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<InodeRef, KernelError> {
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
+        add_new(dir, name, Kind::Dir, mode, uid, gid, current_time()).inspect(|_| dir.touch_mc())
+    }
+
+    fn maps_cache(&self) -> bool {
+        true
+    }
+
+    /// F_SEAL_EXEC keeps the exec bits (Linux shmem_setattr)
+    fn chmod_ok(&self, inode: &Inode, perm: u16) -> Result<(), KernelError> {
+        if seals(inode) & crate::mm::memfd::F_SEAL_EXEC != 0
+            && (inode.mode().perm() ^ perm) & 0o111 != 0
+        {
+            return Err(KernelError::NotPermitted);
+        }
+        Ok(())
+    }
+
+    /// tmpfs gets the inode back (Linux shmem_evict_inode ->
+    /// shmem_free_inode); a superblock already gone counts nothing
+    fn evict_inode(&self, inode: &Inode) {
+        if let Some(sb) = inode.superblock() {
+            free_inode(&sb);
+        }
+    }
+
+    /// The target, kept in the inode (Linux shmem_symlink's i_link)
+    fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
+        inode
+            .i_link()
+            .map(<[u8]>::to_vec)
+            .ok_or(KernelError::InvalidArgument)
+    }
+
+    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<InodeRef, KernelError> {
+        // S_IFLNK | 0777, the target in the inode (Linux tmpfs keeps a
+        // short one there, i_link, a long one in a page; here all, as
+        // nothing in hk pages a symlink out)
+        let (uid, gid, mode) = super::dac::init_owner(dir, InodeMode::symlink());
+        let kind = Kind::Symlink(FileName::from(target));
+        add_new(dir, name, kind, mode, uid, gid, current_time()).inspect(|_| dir.touch_mc())
+    }
+
+    fn link(&self, dir: &Inode, name: &[u8], target_inode: &InodeRef) -> Result<(), KernelError> {
+        // Cannot hard link directories
+        if target_inode.mode().is_dir() {
+            return Err(KernelError::PermissionDenied); // EPERM
+        }
+
+        let private = dir.get_private().ok_or(KernelError::Io)?;
+        let dir_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(KernelError::Io)?;
+
+        // Check if name already exists
+        if dir_data.children.read().contains_key(name) {
+            return Err(KernelError::AlreadyExists);
+        }
+
+        // tmpfs counts each extra name as an inode (Linux shmem_link:
+        // tmpfs dentries pin memory until unlinked); an O_TMPFILE file's
+        // first name took its inode at creation
+        if target_inode.get_nlink() > 0
+            && let Some(sb) = dir.superblock()
+        {
+            reserve_inode(&sb)?;
+        }
+        target_inode.inc_nlink();
+
+        // Add new directory entry pointing to existing inode
+        dir_data
+            .children
+            .write()
+            .insert(FileName::from(name), target_inode.clone());
+        super::libfs::simple_link_times(dir, target_inode);
+        Ok(())
+    }
+
+    fn truncate(&self, inode: &InodeRef, length: u64) -> Result<(), KernelError> {
+        if inode.mode().is_dir() {
+            return Err(KernelError::IsDirectory);
+        }
+        // Linux shmem_setattr: a sealed size (EPERM)
+        let (old, sl) = (inode.get_size(), seals(inode));
+        if (length < old && sl & crate::mm::memfd::F_SEAL_SHRINK != 0)
+            || (length > old && sl & crate::mm::memfd::F_SEAL_GROW != 0)
+        {
+            return Err(KernelError::NotPermitted);
+        }
+        filemap::truncate_setsize(inode, length);
+        Ok(())
+    }
+
+    /// tmpfs's, as Linux shmem_fallocate: allocate (and charge) the
+    /// pages, KEEP_SIZE and PUNCH_HOLE only; the cache is the only copy,
+    /// so a hole reads back as zeroes. On success the file counts as
+    /// modified (Linux file_modified). ramfs: EOPNOTSUPP.
+    fn fallocate(
+        &self,
+        inode: &InodeRef,
+        mode: i32,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), KernelError> {
+        use super::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
+        // ramfs has no fallocate (Linux ramfs_file_operations)
+        let max = inode.superblock().and_then(|sb| tmpfs::max_blocks(&sb));
+        let Some(max) = max else {
+            return Err(KernelError::OperationNotSupported);
+        };
+        if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let end = offset + len;
+        let sl = seals(inode);
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            // Linux shmem_fallocate: a write seal keeps the data
+            use crate::mm::memfd::{F_SEAL_FUTURE_WRITE, F_SEAL_WRITE};
+            if sl & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+                return Err(KernelError::NotPermitted);
+            }
+            // The whole range: pages fallocated with KEEP_SIZE may lie
+            // past i_size (Linux shmem_truncate_range ignores it)
+            filemap::punch_range(inode, offset, end);
+        } else {
+            inode.newsize_ok(end)?;
+            if sl & crate::mm::memfd::F_SEAL_GROW != 0 && end > inode.get_size() {
+                return Err(KernelError::NotPermitted);
+            }
+            shmem_falloc(inode, offset, end, max)?;
+            if mode & FALLOC_FL_KEEP_SIZE == 0 && end > inode.get_size() {
+                inode.set_size(end);
+            }
+        }
+        super::dac::remove_privs(inode);
+        let now = current_time();
+        inode.set_mtime(now);
+        inode.set_ctime(now);
+        Ok(())
+    }
+
+    fn unlink(&self, dir: &Inode, name: &[u8], _d: &Dentry) -> Result<(), KernelError> {
+        let private = dir.get_private().ok_or(KernelError::Io)?;
+        let dir_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(KernelError::Io)?;
+
+        // Remove from directory
+        let removed_inode = {
+            let mut children = dir_data.children.write();
+            children.remove(name).ok_or(KernelError::NotFound)?
+        };
+
+        // Linux simple_unlink: the times, then the link
+        super::libfs::simple_link_times(dir, &removed_inode);
+        // The inode goes with its last reference (Arc drop)
+        drop_link(&removed_inode);
+
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        old_dir: &Inode,
+        old_name: &[u8],
+        new_dir: &InodeRef,
+        new_name: &[u8],
+        flags: u32,
+    ) -> Result<(), KernelError> {
+        // RENAME_NOREPLACE = 1, RENAME_EXCHANGE = 2
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+
+        let noreplace = flags & RENAME_NOREPLACE != 0;
+        let exchange = flags & RENAME_EXCHANGE != 0;
+
+        // No whiteouts (Linux simple_rename); NOREPLACE and EXCHANGE are
+        // mutually exclusive
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 || (noreplace && exchange) {
+            return Err(KernelError::InvalidArgument);
+        }
+        // The inodes whose times change (Linux simple_rename_timestamp)
+        let src = child(old_dir, old_name);
+        let tgt = child(new_dir, new_name);
+        self.rename_entries(old_dir, old_name, new_dir, new_name, flags)?;
+        if let Some(s) = &src {
+            super::libfs::simple_rename_timestamp(old_dir, new_dir, s, tgt.as_deref());
+        }
+        Ok(())
+    }
+
+    fn rmdir(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
+        self.rmdir_entry(dir, name, d)
     }
 
     // =========================================================================
@@ -1195,7 +1210,7 @@ impl SuperOps for RamfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         _i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         new_inode(sb, Kind::of(mode), mode, 0, 0, current_time())
     }
 }
@@ -1211,14 +1226,29 @@ pub(crate) fn ramfs_mount(
     crate::fs::superblock::get_tree_nodev(fc, &RAMFS_SUPER_OPS, |sb| fill_root(sb, mode, 0, 0))
 }
 
+/// ramfs's, tmpfs's and devtmpfs's dentry operations (Linux
+/// simple_dentry_operations, which simple_lookup gives each dentry)
+static SIMPLE_DENTRY_OPS: super::dentry::DentryOps = super::dentry::DentryOps {
+    d_delete: Some(always_delete_dentry),
+    ..super::dentry::DentryOps::NONE
+};
+
+/// Linux always_delete_dentry: a negative dentry goes at its last put
+/// (the positive ones are pinned, `d_persistent`)
+fn always_delete_dentry(_: &Dentry) -> bool {
+    true
+}
+
 /// Give a new superblock its root directory (Linux ramfs_fill_super,
-/// shmem_fill_super: d_make_root of a new directory inode)
+/// shmem_fill_super: d_make_root of a new directory inode), its
+/// dentries simple_dentry_operations
 pub(crate) fn fill_root(
     sb: &Arc<SuperBlock>,
     mode: u16,
     uid: Uid,
     gid: Gid,
 ) -> Result<(), KernelError> {
+    sb.set_d_op(&SIMPLE_DENTRY_OPS);
     let inode = new_inode(
         sb,
         Kind::Dir,
@@ -1291,7 +1321,7 @@ fn new_inode(
     uid: Uid,
     gid: Gid,
     time: Timespec,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     reserve_inode(sb)?;
     let (ino, w) = (sb.alloc_ino(), Arc::downgrade(sb));
     let ops = &RAMFS_INODE_OPS;
@@ -1311,7 +1341,11 @@ fn new_inode(
             file_mapping(sb, &inode);
         }
         Kind::Dir => inode.set_private(try_arc(RamfsInodeData::new_dir())?),
-        Kind::Symlink(t) => inode.set_private(try_arc(RamfsInodeData::new_symlink(t))?),
+        Kind::Symlink(t) => {
+            // Before the inode is visible (Linux inode_set_cached_link)
+            inode.set_link(t.into_vec().into_boxed_slice());
+            inode.set_private(try_arc(RamfsInodeData::new_symlink())?);
+        }
         // Devices use the block or char layer, no ramfs data
         Kind::Dev(_) => {}
     }
@@ -1321,7 +1355,7 @@ fn new_inode(
 /// A new regular file of `sb` with permissions `perm`, in no directory,
 /// owned by the caller's fsuid and fsgid (Linux shmem_get_inode for
 /// shmem_file_setup: inode_init_owner with no directory)
-pub fn new_file(sb: &Arc<SuperBlock>, perm: u16) -> Result<Arc<Inode>, KernelError> {
+pub fn new_file(sb: &Arc<SuperBlock>, perm: u16) -> Result<InodeRef, KernelError> {
     let c = crate::task::current_cred();
     let mode = InodeMode::regular(perm);
     new_inode(sb, Kind::File, mode, c.fsuid, c.fsgid, current_time())
@@ -1338,7 +1372,7 @@ fn add_new(
     uid: Uid,
     gid: Gid,
     time: Timespec,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = dir.superblock().ok_or(KernelError::Io)?;
     let private = dir.get_private().ok_or(KernelError::Io)?;
     let dir_data = private
@@ -1447,12 +1481,10 @@ fn fill_pages(inode: &Inode, content: &[u8]) -> Result<(), KernelError> {
 /// hard-linked initramfs entry brings after its first name was made
 pub fn ramfs_fill_file(inode: &Inode, content: &[u8]) -> Result<(), KernelError> {
     let private = inode.get_private().ok_or(KernelError::Io)?;
-    let data = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<RamfsInodeData>()
-        .ok_or(KernelError::Io)?;
-    if data.symlink_target.is_some() || inode.mode().is_dir() {
+    if private.as_any().downcast_ref::<RamfsInodeData>().is_none() {
+        return Err(KernelError::Io);
+    }
+    if inode.mode().is_symlink() || inode.mode().is_dir() {
         return Err(KernelError::InvalidArgument);
     }
     fill_pages(inode, content)?;
@@ -1485,7 +1517,8 @@ pub fn ramfs_mkpath_with_timestamp(
     for component in path.split(|&c| c == b'/').filter(|s| !s.is_empty()) {
         // An existing component, found by the file system (the dcache
         // may hold a negative dentry or none): must be a directory
-        if let Ok(child) = super::namei::lookup_one(&current, component) {
+        let none = super::dentry::LookupBits::empty();
+        if let Ok(child) = super::namei::lookup_one(&current, component, none) {
             if child.get_inode().is_some_and(|i| !i.mode().is_dir()) {
                 return Err(KernelError::NotDirectory);
             }

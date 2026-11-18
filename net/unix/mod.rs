@@ -499,10 +499,12 @@ fn find_bsd(inode: &crate::fs::Inode) -> Option<Arc<UnixSock>> {
         .find(|e| {
             e.is_live()
                 && e.get().addr.read().as_ref().is_some_and(|a| {
-                    a.path
-                        .as_ref()
-                        .and_then(|d| d.get_inode())
-                        .is_some_and(|i| core::ptr::eq(Arc::as_ptr(&i), inode))
+                    // Its inode compared, no reference taken under the
+                    // bucket's spin lock (Linux d_backing_inode == i)
+                    a.path.as_ref().is_some_and(|d| {
+                        d.d_inode_rcu(&crate::sync::rcu::read_lock())
+                            .is_some_and(|i| core::ptr::eq(i, inode))
+                    })
                 })
         })
         .and_then(|e| e.upgrade());
@@ -834,11 +836,13 @@ impl UnixSock {
     /// listen or socketpair
     fn peercred_opt(&self) -> OptOut {
         let c = self.peercred.lock().clone();
-        // The pid in the reader's namespace, 0 if not visible (Linux
-        // cred_to_ucred: pid_vnr)
+        // The pid and ids in the reader's namespaces, pid 0 if not
+        // visible, an unmapped id the overflow id (Linux cred_to_ucred:
+        // pid_vnr, from_kuid_munged, from_kgid_munged)
+        let ns = crate::ns::current_user_ns();
         OptOut::Bytes(crate::net::socket::peercred_bytes(c.map(|c| {
             let pid = c.pid.as_ref().map_or(0, |p| p.vnr()) as i32;
-            (pid, c.uid, c.gid)
+            (pid, ns.from_kuid_munged(c.uid), ns.from_kgid_munged(c.gid))
         })))
     }
 

@@ -47,9 +47,12 @@ pub enum Ucount {
     /// user_struct.unix_inflight, charged to the sending user from
     /// queueing until received or dropped
     UnixInflight,
+    /// Pipe buffer slots: Linux user_struct.pipe_bufs, charged for each
+    /// pipe's slots from its creation to its free
+    PipeBufs,
 }
 
-const NR_UCOUNTS: usize = 5;
+const NR_UCOUNTS: usize = 6;
 
 /// One user's counters (Linux struct ucounts)
 pub struct Ucounts {
@@ -106,6 +109,13 @@ impl Ucounts {
         let old = self.ctr(t).fetch_sub(v, Ordering::Relaxed);
         debug_assert!(old >= v, "ucounts: {t:?} below zero");
         old == v
+    }
+
+    /// Give back `v`; the new count (Linux atomic_long_sub_return)
+    pub fn sub(&self, t: Ucount, v: u64) -> u64 {
+        let old = self.ctr(t).fetch_sub(v, Ordering::Relaxed);
+        debug_assert!(old >= v, "ucounts: {t:?} below zero");
+        old.wrapping_sub(v)
     }
 
     /// The count (Linux get_rlimit_value)

@@ -1,5 +1,6 @@
 //! x86-64 thread state syscalls: arch_prctl (Linux
-//! arch/x86/kernel/process_64.c), iopl and ioperm (ioport.c)
+//! arch/x86/kernel/process_64.c), iopl and ioperm (ioport.c); the arch
+//! thread state hooks
 
 use super::percpu::{
     self, ARCH_GET_CPUID, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_CPUID, ARCH_SET_FS, ARCH_SET_GS,
@@ -161,3 +162,42 @@ fn set_iopl_emul(level: u8) {
         task.iopl_emul = level;
     }
 }
+
+/// A task's arch thread state (Linux struct thread_struct): none here.
+/// The user FP state stays in the registers while the task is in the
+/// kernel and is saved on its own kernel stack across a switch
+/// (`context::context_switch`, `fpu`).
+#[derive(Default)]
+pub struct ThreadStruct;
+
+impl ThreadStruct {
+    /// A new task's
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+/// The arch part of a context switch (Linux __switch_to): `context_switch`
+/// does it
+///
+/// # Safety
+/// As the arm64 one's: interrupts off, `current` the outgoing task, the
+/// switch to `next` follows.
+pub unsafe fn thread_switch(_next: &crate::task::Task) {}
+
+/// A fork child's thread state: the FP state goes below its pt_regs
+/// (`fpu::save_for_clone_child`)
+///
+/// # Safety
+/// As the arm64 one's: `child` made by the running task, not run.
+pub unsafe fn dup_thread(_child: &crate::task::Task) {}
+
+/// A new program image's thread state: `entry::enter_user` loads the
+/// initial FP state
+pub fn flush_thread() {}
+
+/// Thread flags of the arch work on the way to user mode: none
+pub const EXIT_WORK: u32 = 0;
+
+/// The arch work on the way to user mode: none
+pub fn exit_to_user_mode_work(_work: u32) {}

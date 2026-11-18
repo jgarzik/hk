@@ -16,7 +16,7 @@ use crate::signal::{
     dequeue_signal, get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info,
     si_code, ss_flags, with_task_signal_state,
 };
-use crate::task::percpu::{TaskRef, current, current_pgid, current_tid, get_all_pids};
+use crate::task::percpu::{TaskRef, current, current_tid, get_all_pids};
 use crate::time::time_syscall::LinuxTimespec;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
@@ -103,24 +103,9 @@ pub fn sys_rt_sigaction(
         let old = sighand.get_action(sig);
         return write_oact(oact, &old);
     };
-    // The install and its flush as one step for other sigactions on
-    // this table (Linux do_sigaction holds siglock across both): none
-    // can install a handler, and let a signal be queued for it, before
-    // this flush has run. A send meanwhile sees the new action.
-    let old = {
-        let _update = sighand.lock_update();
-        let ignores = new.ignores(sig);
-        // The old action and the swap in one hold of the action lock
-        let old = sighand.set_action(sig, new)?;
-        // Ignored now: discarded pending; no longer ignored: interval
-        // timers whose signal it ignored queue it (Linux do_sigaction)
-        if ignores {
-            crate::signal::flush_group_signal(sig);
-        } else if old.is_ignore() {
-            crate::time::posix_timer::sig_unignore(sig);
-        }
-        old
-    };
+    // The install and its flush or timer requeue in one siglock hold
+    // (Linux do_sigaction); the old action written after it
+    let old = crate::signal::do_sigaction(sig, new)?;
     write_oact(oact, &old)
 }
 
@@ -180,10 +165,11 @@ pub fn sys_rt_sigpending(set: UserPtr<u64>, sigsetsize: u64) -> KernelResult<()>
     if sigsetsize != 8 || set.is_null() {
         return Err(KernelError::InvalidArgument);
     }
-    let pending = with_task_signal_state(&current(), |state| {
+    let me = current();
+    let pending = crate::signal::with_task_sig_group(&me, |state, group| {
         // Combine private and shared pending
-        let shared = state.shared_pending.lock();
-        state.pending.signal.union(&shared.signal).bits()
+        let shared = group.map_or(SigSet::EMPTY, |p| p.signal);
+        state.pending.signal.union(&shared).bits()
     })
     .ok_or(KernelError::NoProcess)?;
     // Written after the signal state is unlocked
@@ -205,7 +191,7 @@ pub(crate) fn kill_sig(sig: u32) -> KillSig {
 /// number, EPERM if the caller may not signal it
 fn group_target(pid: u64, sig: KillSig) -> KernelResult<TaskRef> {
     let me = Sender::current();
-    proc_target(pid, sig, |v, s| me.may_kill(v, s))
+    proc_target(pid, sig, |t, s| me.may_kill(t, s))
 }
 
 /// What the kill permission check needs of the caller, read before
@@ -229,23 +215,22 @@ impl Sender {
     /// check_kill_permission past valid_signal, which the caller has
     /// checked): same thread group, CAP_KILL, a real or effective uid
     /// matching the target's real or saved one, or SIGCONT within the
-    /// session; else EPERM
-    pub(crate) fn may_kill(
-        &self,
-        t: &crate::task::percpu::TaskView<'_>,
-        sig: Option<Signal>,
-    ) -> KernelResult<()> {
+    /// session; else EPERM. `t` is listed or was found under RCU; its
+    /// credentials and session are read under RCU (Linux
+    /// kill_ok_by_cred: __task_cred, task_session)
+    pub(crate) fn may_kill(&self, t: &crate::task::Task, sig: Option<Signal>) -> KernelResult<()> {
         use crate::signal::SIGCONT;
         use crate::task::{CAP_KILL, capable};
-        if self.tgid == t.task.pid || capable(CAP_KILL) {
+        if self.tgid == t.pid || capable(CAP_KILL) {
             return Ok(());
         }
+        let g = crate::sync::rcu::read_lock();
         let c = &self.cred;
-        let tc = t.cred_arc();
+        let tc = t.cred_rcu(&g);
         if c.euid == tc.suid || c.euid == tc.uid || c.uid == tc.suid || c.uid == tc.uid {
             return Ok(());
         }
-        if sig == Some(SIGCONT) && self.sid == t.task.sid() {
+        if sig == Some(SIGCONT) && self.sid == t.sid(&g) {
             return Ok(());
         }
         Err(KernelError::NotPermitted)
@@ -281,7 +266,6 @@ fn user_thread_send(
     sig: KillSig,
     info: impl FnOnce(Signal) -> SendInfo,
 ) -> KernelResult<()> {
-    use crate::task::percpu::TASKLIST;
     // The caller's numbers (Linux find_task_by_vpid, task_tgid_vnr)
     let (Some(tid), Some(tgid)) = (
         crate::task::pid::from_vnr(tid),
@@ -290,15 +274,17 @@ fn user_thread_send(
         return Err(KernelError::NoProcess);
     };
     let me = Sender::current();
+    // Found and checked under RCU (Linux do_send_specific)
     let t = {
-        let table = TASKLIST.read();
-        let v = table.get(tid).ok_or(KernelError::NoProcess)?;
-        if tgid.is_some_and(|g| v.task.pid != g) {
+        let g = crate::sync::rcu::read_lock();
+        let t = crate::task::percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+            .ok_or(KernelError::NoProcess)?;
+        if tgid.is_some_and(|g| t.pid != g) {
             return Err(KernelError::NoProcess);
         }
         // A bad number is EINVAL once the thread is found
-        me.may_kill(&v, sig?)?;
-        crate::task::percpu::task_ref(v.task)
+        me.may_kill(t, sig?)?;
+        crate::task::percpu::task_ref(t)
     };
     // Checked: a signal or a probe
     let Some(sig) = sig? else {
@@ -326,11 +312,11 @@ pub fn sys_kill(pid: i64, sig: u32) -> KernelResult<()> {
     // Numbers are the caller's (Linux find_vpid): none it sees is ESRCH
     let vpid = |nr: u64| crate::task::pid::from_vnr(nr).ok_or(KernelError::NoProcess);
     let me = Sender::current();
-    let check = |v: &crate::task::percpu::TaskView<'_>, s| me.may_kill(v, s);
+    let check = |t: &crate::task::Task, s| me.may_kill(t, s);
     match pid {
         1.. => user_group_send(vpid(pid as u64)?, sig, SendInfo::User),
         // Every process in the caller's process group, once each
-        0 => kill_pgrp(current_pgid(), sig, SendInfo::User, check),
+        0 => crate::signal::kill_own_pgrp(sig, SendInfo::User, check),
         -1 => kill_all(sig),
         // Every process in group -pid, once each (signal 0: does the
         // group exist, may we signal it)

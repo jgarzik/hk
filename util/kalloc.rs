@@ -45,16 +45,19 @@ struct Reserve {
     align: AtomicUsize,
 }
 
-static RESERVE: crate::cpu::PerCpu<Reserve> = crate::percpu!(Reserve {
+crate::percpu! {
+    static RESERVE: Reserve = Reserve {
     ptr: AtomicPtr::new(core::ptr::null_mut()),
     size: AtomicUsize::new(0),
     align: AtomicUsize::new(0),
-});
+};
+}
 
-/// This CPU's named heap GFP ([`with_gfp`]): 0 for none, else
-/// `NAMED | interrupt depth << 32 | gfp`
-static GFP_CX: crate::cpu::PerCpu<core::sync::atomic::AtomicU64> =
-    crate::percpu!(core::sync::atomic::AtomicU64::new(0));
+crate::percpu! {
+    /// This CPU's named heap GFP ([`with_gfp`]): 0 for none, else
+    /// `NAMED | interrupt depth << 32 | gfp`
+    static GFP_CX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+}
 
 /// A [`GFP_CX`] value is set
 const NAMED: u64 = 1 << 63;
@@ -75,7 +78,10 @@ pub fn with_gfp<R>(gfp: Gfp, f: impl FnOnce() -> R) -> R {
     crate::arch::preempt_disable();
     let cx = GFP_CX.this();
     let depth = u64::from(CurrentArch::interrupt_depth());
-    let old = cx.swap(NAMED | depth << 32 | u64::from(gfp.0), Relaxed);
+    // This CPU's word alone, and an interrupt nesting a scope restores
+    // it: a load and a store (Linux: the GFP is an argument)
+    let old = cx.load(Relaxed);
+    cx.store(NAMED | depth << 32 | u64::from(gfp.0), Relaxed);
     let r = f();
     cx.store(old, Relaxed);
     crate::arch::preempt_enable();
@@ -135,10 +141,72 @@ pub fn try_box<T>(v: T) -> Result<Box<T>, KernelError> {
     }
 }
 
+/// `Box::new_uninit()`, or ENOMEM: for a large `T` built in place
+pub fn try_box_uninit<T>() -> Result<Box<core::mem::MaybeUninit<T>>, KernelError> {
+    if crate::mm::fault_inject::should_fail() {
+        return Err(KernelError::OutOfMemory);
+    }
+    let layout = Layout::new::<T>();
+    if layout.size() == 0 {
+        // No allocation to fail
+        return Ok(Box::new_uninit());
+    }
+    // SAFETY: a nonzero size
+    let p = unsafe { alloc::alloc::alloc(layout) }.cast::<core::mem::MaybeUninit<T>>();
+    if p.is_null() {
+        return Err(KernelError::OutOfMemory);
+    }
+    // SAFETY: a fresh global-allocator block of `T`'s layout, which an
+    // uninitialized `T` may occupy
+    Ok(unsafe { Box::from_raw(p) })
+}
+
 /// `Arc::new(v)`, or ENOMEM
 pub fn try_arc<T>(v: T) -> Result<Arc<T>, KernelError> {
     #[expect(clippy::disallowed_methods)]
     reserved(arc_layout::<T>(), || Arc::new(v))
+}
+
+/// `Arc::new_uninit()`, or ENOMEM: for a large `T` built in place
+pub fn try_arc_uninit<T>() -> Result<Arc<core::mem::MaybeUninit<T>>, KernelError> {
+    reserved(arc_layout::<T>(), Arc::new_uninit)
+}
+
+/// `Box::new([f(); N])` made item by item in the heap block, or ENOMEM:
+/// for a large array (Linux kzalloc), which `try_box([..; N])` builds
+/// on the stack first in builds that do not optimize the copy away
+pub fn try_box_array<T, const N: usize>(f: impl FnMut() -> T) -> Result<Box<[T; N]>, KernelError> {
+    let v = crate::util::kmem::try_vec_with(N, f)?;
+    match v.into_boxed_slice().try_into() {
+        Ok(b) => Ok(b),
+        Err(_) => unreachable!("try_box_array: N items made"),
+    }
+}
+
+/// `Arc::new(f())` with the block allocated first and `f`'s value made
+/// in it, or ENOMEM before `f` runs: for a large `T`, which
+/// `try_arc(v)` copies through the caller's frame and its own (Linux
+/// fills a slab object in place, dup_task_struct). `f` must inline to
+/// the value's struct expression (an `#[inline(always)]` constructor):
+/// rustc returns a value from an opaque call into a temporary and
+/// copies it.
+#[inline(always)]
+pub fn try_arc_with<T>(f: impl FnOnce() -> T) -> Result<Arc<T>, KernelError> {
+    let mut a = try_arc_uninit::<T>()?;
+    fill(
+        Arc::get_mut(&mut a).expect("try_arc_with: a new Arc is unshared"),
+        f,
+    );
+    // SAFETY: the value was written just above
+    Ok(unsafe { a.assume_init() })
+}
+
+/// `slot.write(f())`, out of line: with `slot` a unique argument the
+/// struct expression `f` inlines to is stored field by field into it,
+/// where the caller would build it in its own frame first
+#[inline(never)]
+fn fill<T>(slot: &mut core::mem::MaybeUninit<T>, f: impl FnOnce() -> T) {
+    slot.write(f());
 }
 
 /// `Arc::<[T]>::from(s)`, or ENOMEM (a refcounted copy of a slice:

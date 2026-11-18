@@ -8,13 +8,14 @@
 //! - a non-leader thread that execs keeps the pid and becomes its tid
 //!   (de_thread's exchange_tids);
 //! - an orphan goes to the nearest child subreaper, which waits for it
-//!   (forget_original_parent).
+//!   (forget_original_parent), and so does every thread of it: a
+//!   non-leader's getppid names the new parent too.
 
 use crate::harness::verdict;
-use crate::mm::fork_mm::{join, spawn_thread_ptid};
+use crate::mm::fork_mm::{join, spawn_thread, spawn_thread_ptid};
 use hk_syscall::{
-    sys_close, sys_dup3, sys_execve, sys_exit, sys_faccessat, sys_fork, sys_getpid, sys_getppid,
-    sys_gettid, sys_pipe2, sys_prctl, sys_read, sys_wait4, sys_write,
+    sys_close, sys_dup3, sys_execve, sys_exit, sys_exit_group, sys_faccessat, sys_fork, sys_getpid,
+    sys_getppid, sys_gettid, sys_pipe2, sys_prctl, sys_read, sys_wait4, sys_write,
 };
 
 const AT_FDCWD: i32 = -100;
@@ -25,6 +26,7 @@ pub fn run_tests() {
     thread_ids();
     exec_thread();
     reparent();
+    reparent_thread();
 }
 
 fn leader() {
@@ -250,4 +252,77 @@ fn reparent() {
         n == 8 && ppid[0] == me && w == gc[0] && (st >> 8) & 0xff == 7,
         ppid[0],
     );
+}
+
+static mut RSTACK: Stack = Stack([0; 16384]);
+static mut RCTID: u32 = 0;
+
+/// The orphan's thread: told to go (`arg` high half: the read end),
+/// it sends its getppid (low half: the write end) and ends the process
+extern "C" fn report_ppid(arg: u64) -> ! {
+    let (go, out) = (arg >> 32, arg & 0xffff_ffff);
+    let mut c = [0u8; 1];
+    sys_read(go, c.as_mut_ptr(), 1);
+    let v = [sys_getppid()];
+    sys_write(out, v.as_ptr() as *const u8, 8);
+    sys_exit_group(7)
+}
+
+/// A grandchild with a second thread is orphaned: that thread, not the
+/// leader, sees this (subreaper) process as its parent (Linux
+/// forget_original_parent reparents every thread)
+fn reparent_thread() {
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    let me = sys_getpid();
+    sys_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    let (mut p, mut go, mut cx) = ([0i32; 2], [0i32; 2], [0i32; 2]);
+    sys_pipe2(p.as_mut_ptr(), 0);
+    sys_pipe2(go.as_mut_ptr(), 0);
+    sys_pipe2(cx.as_mut_ptr(), 0);
+    let child = sys_fork();
+    if child == 0 {
+        if sys_fork() == 0 {
+            orphan(p[1], go[0]);
+        }
+        // Gone once told: the grandchild's thread exists by then
+        let mut c = [0u8; 1];
+        sys_read(cx[0] as u64, c.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let mut gc = [0i64; 1];
+    sys_read(p[0] as u64, gc.as_mut_ptr() as *mut u8, 8);
+    sys_write(cx[1] as u64, b"x".as_ptr(), 1);
+    let mut st = 0;
+    sys_wait4(child, &mut st, 0, 0);
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut ppid = [0i64; 1];
+    let n = sys_read(p[0] as u64, ppid.as_mut_ptr() as *mut u8, 8);
+    let w = sys_wait4(gc[0], &mut st, 0, 0);
+    sys_prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0);
+    for fd in [p[0], p[1], go[0], go[1], cx[0], cx[1]] {
+        sys_close(fd as u64);
+    }
+    verdict(
+        b"PID_TID_REPARENT_THREAD",
+        n == 8 && ppid[0] == me && w == gc[0] && (st >> 8) & 0xff == 7,
+        ppid[0],
+    );
+}
+
+/// The grandchild: starts the reporting thread, sends its pid, then
+/// waits on a pipe nobody writes until that thread ends the process
+fn orphan(out: i32, go: i32) -> ! {
+    let mut hold = [0i32; 2];
+    sys_pipe2(hold.as_mut_ptr(), 0);
+    let top = unsafe { (&raw mut RSTACK as *mut u8).add(16384) as u64 };
+    let arg = ((go as u64) << 32) | out as u64;
+    let tid = unsafe { spawn_thread(top, report_ppid, arg, &raw mut RCTID) };
+    if tid <= 0 {
+        sys_exit(1);
+    }
+    let v = [sys_getpid()];
+    sys_write(out as u64, v.as_ptr() as *const u8, 8);
+    let mut c = [0u8; 1];
+    sys_read(hold[0] as u64, c.as_mut_ptr(), 1);
+    sys_exit(2)
 }

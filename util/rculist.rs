@@ -227,6 +227,26 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> RcuList<A, P> {
         if cur.is_null() {
             return None;
         }
+        // SAFETY: found on this list, `ends` held
+        Some(unsafe { self.unlink(&mut e, cur) })
+    }
+
+    /// Unlink `item` (Linux list_del_rcu), no walk; as
+    /// [`remove_first`](Self::remove_first)
+    ///
+    /// # Safety
+    /// `item` is on this list.
+    pub unsafe fn remove(&self, item: &A::Item) -> RcuUnlinked<A, P> {
+        let mut e = self.ends.lock();
+        // SAFETY: on this list (the caller), `ends` held
+        unsafe { self.unlink(&mut e, lk::<A>(item)) }
+    }
+
+    /// Unlink `cur`, keeping its `next` for readers on it
+    ///
+    /// # Safety
+    /// `cur` is a link of this list, whose `ends` is held as `e`.
+    unsafe fn unlink(&self, e: &mut Ends, cur: *mut Link) -> RcuUnlinked<A, P> {
         // SAFETY: `cur` and its neighbours are links of this list
         unsafe {
             let next = (*cur).next();
@@ -240,17 +260,33 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> RcuList<A, P> {
                 None => e.tail = prev,
             }
         }
-        // INVARIANT: off the list; `next` kept for readers on it
+        // INVARIANT: off the list; `next` kept for readers on it, `prev`
+        // poisoned so writers see it removed at once (Linux list_del_rcu:
+        // LIST_POISON2)
+        // SAFETY: `cur` is unlinked from its neighbours, `ends` held
+        unsafe { (*cur).unhash() };
         e.len -= 1;
         // SAFETY: the pointer the list took with into_raw
         let p = unsafe { P::from_raw(A::item(cur)) };
-        Some(RcuUnlinked(Some(p), PhantomData))
+        RcuUnlinked(Some(p), PhantomData)
     }
 
     /// The entries, front to back, valid while `g` is held (Linux
     /// list_for_each_entry_rcu): an entry added meanwhile may or may not
     /// be seen, one removed may still be
     pub fn iter<'a>(&'a self, _g: &'a RcuReadGuard) -> RcuIter<'a, A> {
+        RcuIter {
+            cur: self.head.load(Acquire),
+            _l: PhantomData,
+        }
+    }
+
+    /// The entries as a writer sees them, every writer excluded
+    ///
+    /// # Safety
+    /// No entry leaves the list while the borrow lasts (the caller holds
+    /// a lock every remover holds: TASKLIST for the task list).
+    pub unsafe fn iter_locked(&self) -> RcuIter<'_, A> {
         RcuIter {
             cur: self.head.load(Acquire),
             _l: PhantomData,
@@ -598,13 +634,32 @@ mod tests {
         let a = item(7);
         l.push_back(a.clone());
         let gone = l.remove_first(|i| i.v == 7).unwrap();
-        // Still linked for readers until the grace period ends
+        // Still linked for readers until the grace period ends, but
+        // removed for writers at once (the task list's liveness test:
+        // `GlobalTaskTable::view`, `Task::pid_alive`)
         assert!(a.link.is_linked());
+        assert!(!a.link.is_listed());
         drop(gone);
         assert!(!a.link.is_linked());
         assert_eq!(Arc::strong_count(&a), 1);
         l.push_back(a.clone());
         assert_eq!(values(&l), [7]);
+    }
+
+    #[test]
+    fn removed_at_once_by_membership() {
+        let l = RcuList::<ItemLink>::new();
+        let (a, b) = (item(1), item(2));
+        l.push_back(a.clone());
+        l.push_back(b.clone());
+        assert!(a.link.is_listed() && b.link.is_listed());
+        // SAFETY: `a` is on `l`
+        let gone = unsafe { l.remove(&a) };
+        assert!(!a.link.is_listed());
+        assert!(b.link.is_listed());
+        assert_eq!(values(&l), [2]);
+        drop(gone);
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 
     #[test]

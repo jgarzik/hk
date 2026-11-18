@@ -26,6 +26,129 @@ pub fn run_tests() {
     report_r(b"PROC_INO_UNIQUE", ino_unique());
     report_r(b"DROP_CACHES_DENTRIES", drop_dentries());
     report_r(b"DCACHE_UMOUNT_FREED", umount_freed());
+    report_r(b"PROC_FLUSH_DETACH", flush_detach());
+    report_r(b"PROC_RCU_CACHED", rcu_cached());
+}
+
+/// openat2 from `dfd` with `flags` and `resolve`
+fn open2(dfd: i32, p: &[u8], flags: u64, resolve: u64) -> i64 {
+    let mut b = [0u8; 24];
+    b[..8].copy_from_slice(&flags.to_ne_bytes());
+    b[16..].copy_from_slice(&resolve.to_ne_bytes());
+    hk_syscall::sys_openat2(dfd, p.as_ptr(), b.as_ptr(), 24)
+}
+
+/// A process's /proc entries answer an RCU walk (Linux pid_revalidate
+/// and proc_pid_permission under LOOKUP_RCU; proc_self_get_link with a
+/// NULL dentry): looked up once, they resolve with RESOLVE_CACHED, from
+/// the process directory and through /proc/self
+fn rcu_cached() -> R {
+    const O_PATH: u64 = 0o10_000_000;
+    const RESOLVE_CACHED: u64 = 0x20;
+    const EAGAIN: i64 = -11;
+    let dir = sys_open(b"/proc/self\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    check(b"open /proc/self", dir >= 0, dir)?;
+    let warm = |p: &[u8]| {
+        let fd = sys_open(p.as_ptr(), O_RDONLY, 0);
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+        fd >= 0
+    };
+    // Looked up, then again a clock tick later (the link's atime then
+    // needs no update: relatime)
+    let ok = warm(b"/proc/self/status\0");
+    crate::helpers::msleep(30);
+    let ok = ok && warm(b"/proc/self/status\0");
+    check(b"warm", ok, -1)?;
+    let r = open2(dir as i32, b"status\0", O_PATH, RESOLVE_CACHED);
+    let from_dir = r;
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    let r = open2(-100, b"/proc/self/status\0", O_PATH, RESOLVE_CACHED);
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    let fd0 = open2(-100, b"/proc/self/fd/0\0", O_PATH, RESOLVE_CACHED);
+    if fd0 >= 0 {
+        sys_close(fd0 as u64);
+    }
+    sys_close(dir as u64);
+    check(b"from the process directory", from_dir >= 0, from_dir)?;
+    check(b"through /proc/self", r >= 0, r)?;
+    // fd/<n> still leaves RCU mode (tid_fd_revalidate: ECHILD)
+    check(b"fd link", fd0 == EAGAIN, fd0)
+}
+
+/// A mount on /proc/<pid> goes when the process is reaped (Linux
+/// proc_flush_pid -> d_invalidate -> detach_mounts): run in a child
+/// with a private mount namespace, its exit status the failed step
+fn flush_detach() -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(flush_detach_child());
+    }
+    check(b"fork", pid > 0, pid)?;
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"child step", ws == 0, i64::from(ws >> 8))
+}
+
+/// Whether /proc/self/mountinfo shows a mount from source `src`
+fn mounted(src: &[u8]) -> bool {
+    let fd = sys_open(b"/proc/self/mountinfo\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 16384];
+    let mut n = 0;
+    while n < buf.len() {
+        let r = sys_read(fd as u64, buf[n..].as_mut_ptr(), (buf.len() - n) as u64);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    sys_close(fd as u64);
+    buf[..n].windows(src.len()).any(|w| w == src)
+}
+
+fn flush_detach_child() -> u64 {
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const MS_REC: u64 = 16384;
+    const MS_PRIVATE: u64 = 1 << 18;
+    let none = core::ptr::null();
+    if hk_syscall::sys_unshare(CLONE_NEWNS) != 0
+        || hk_syscall::sys_mount(none, b"/\0".as_ptr(), none, MS_REC | MS_PRIVATE, 0) != 0
+    {
+        return 1;
+    }
+    let (pid, w) = waiting_child();
+    let mut b = [0u8; 64];
+    let dir = proc_path(&mut b, pid, b"");
+    let r = hk_syscall::sys_mount(
+        b"hkflushsrc\0".as_ptr(),
+        dir.as_ptr(),
+        b"tmpfs\0".as_ptr(),
+        0,
+        0,
+    );
+    let on = r == 0 && mounted(b" hkflushsrc ");
+    sys_kill(pid, SIGKILL);
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    sys_close(w as u64);
+    if !on {
+        return 2;
+    }
+    if mounted(b" hkflushsrc ") {
+        return 3;
+    }
+    if stat(dir).err() != Some(ENOENT) {
+        return 4;
+    }
+    0
 }
 
 fn stat(p: &[u8]) -> Result<Stat, i64> {

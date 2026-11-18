@@ -26,7 +26,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::{ATTR_MAX, AttrNode, BinAttr, KNode, Kind, SysBuf};
 use crate::fs::KernelError;
 use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, generic_llseek};
-use crate::fs::inode::{AsAny, FileType, Inode, InodeAttr, InodeData, InodeMode, InodeOps};
+use crate::fs::inode::{
+    AsAny, FileType, Found, Inode, InodeAttr, InodeData, InodeMode, InodeOps, InodeRef,
+};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::SuperBlock;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLPRI, PollTable};
@@ -72,12 +74,16 @@ fn sb_ns(inode: &Inode) -> u64 {
 
 /// The node behind `inode`
 pub fn knode(inode: &Inode) -> Option<Arc<KNode>> {
-    let p = inode.get_private()?;
-    Some(p.as_any().downcast_ref::<KfInode>()?.0.clone())
+    knode_rcu(inode).map(|k| k.0.clone())
+}
+
+/// The node behind `inode`, borrowed (Linux inode->i_private)
+fn knode_rcu(inode: &Inode) -> Option<&KfInode> {
+    inode.private_rcu()?.as_any().downcast_ref::<KfInode>()
 }
 
 /// A new inode for `kn` on `sb` (Linux kernfs_init_inode)
-pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, KernelError> {
+pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<InodeRef, KernelError> {
     let (mode, size) = match &kn.kind {
         Kind::Dir(_) => (InodeMode::directory(kn.mode), 0),
         Kind::Attr(_) => (InodeMode::regular(kn.mode), ATTR_MAX as u64),
@@ -95,7 +101,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, Kernel
         Arc::downgrade(sb),
         &KERNFS_IOPS,
     ))?;
-    i.set_private(try_arc(KfInode(kn.clone()))?);
+    i.set_private_rcu(try_arc(KfInode(kn.clone()))?);
     let saved = *kn.iattr.lock();
     if let Some(a) = saved {
         i.set_mode_perm(a.perm);
@@ -116,19 +122,49 @@ impl InodeOps for KernfsIops {
         knode(inode).is_some_and(|k| k.empty)
     }
 
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        let d = knode(dir).ok_or(KernelError::Io)?;
-        let kn = d.find_ns(name, sb_ns(dir)).ok_or(KernelError::NotFound)?;
-        if kn.removed() {
-            return Err(KernelError::NotFound);
-        }
-        let sb = dir.superblock().ok_or(KernelError::Io)?;
-        inode(&sb, &kn)
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
+        self.lookup_neg(dir, name)?
+            .inode
+            .ok_or(KernelError::NotFound)
     }
 
-    /// Linux kernfs_iop_setattr: the node keeps the attributes, so an
-    /// inode made after this one is dropped shows them too
-    fn setattr_done(&self, inode: &Inode) {
+    /// Linux kernfs_iop_lookup: the node and the directory's revision
+    /// read together, the new dentry (negative for no node) stamped
+    /// with it (kernfs_set_rev); a node being removed is invisible and
+    /// its negative entry stamped with nothing (always stale)
+    fn lookup_neg(&self, dir: &Inode, name: &[u8]) -> Result<Found, KernelError> {
+        let d = knode(dir).ok_or(KernelError::Io)?;
+        let (kn, rev) = d.find_rev(name, sb_ns(dir));
+        let Some(kn) = kn else {
+            return Ok(Found {
+                inode: None,
+                d_time: rev,
+            });
+        };
+        if kn.removed() {
+            return Ok(Found {
+                inode: None,
+                d_time: 0,
+            });
+        }
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        Ok(Found {
+            inode: Some(inode(&sb, &kn)?),
+            d_time: rev,
+        })
+    }
+
+    /// Linux kernfs_iop_setattr: setattr_copy, then the node keeps the
+    /// attributes, so an inode made after this one is dropped shows
+    /// them too
+    fn setattr(
+        &self,
+        inode: &Inode,
+        atime: Option<crate::time::Timespec>,
+        mtime: Option<crate::time::Timespec>,
+        ctime: Option<crate::time::Timespec>,
+    ) {
+        crate::fs::inode::setattr_copy_times(inode, atime, mtime, ctime);
         let Some(kn) = knode(inode) else { return };
         *kn.iattr.lock() = Some(super::Iattr {
             perm: inode.mode().perm(),
@@ -138,16 +174,6 @@ impl InodeOps for KernfsIops {
             mtime: inode.mtime(),
             ctime: inode.ctime(),
         });
-    }
-
-    /// Linux kernfs_dop_revalidate: a removed node's dentry is stale
-    fn revalidate(&self, inode: &Inode) -> bool {
-        knode(inode).is_some_and(|kn| !kn.removed())
-    }
-
-    /// kernfs_dop_revalidate is -ECHILD in an RCU walk
-    fn revalidate_blocks(&self, _inode: &Inode) -> bool {
-        true
     }
 
     fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
@@ -175,6 +201,44 @@ impl InodeOps for KernfsIops {
 }
 
 pub static KERNFS_IOPS: KernfsIops = KernfsIops;
+
+/// kernfs's dentry operations (Linux kernfs_dops)
+pub static KERNFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_revalidate: Some(kernfs_revalidate),
+    ..crate::fs::dentry::DentryOps::NONE
+};
+
+/// Linux kernfs_dop_revalidate: ECHILD in an RCU walk; a negative
+/// dentry is valid while its directory's revision is the one its
+/// lookup saw (kernfs_dir_changed); a positive one while its node is
+/// active, still the child of `dir`'s node, by the dentry's name (the
+/// node is the inode data; a node's name and namespace never change
+/// here: no kernfs_rename)
+fn kernfs_revalidate(
+    dir: &Inode,
+    d: &crate::fs::dentry::Dentry,
+    inode: Option<&Inode>,
+    flags: crate::fs::dentry::LookupBits,
+) -> Result<bool, KernelError> {
+    if flags.contains(crate::fs::dentry::LookupBits::RCU) {
+        return Err(KernelError::NoChild);
+    }
+    let parent = knode(dir);
+    let Some(inode) = inode else {
+        return Ok(parent.is_none_or(|p| p.rev() == d.d_time()));
+    };
+    let Some(kn) = knode(inode) else {
+        return Ok(false);
+    };
+    if kn.removed() {
+        return Ok(false);
+    }
+    let same_parent = match (kn.parent(), parent) {
+        (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+        (a, b) => a.is_none() && b.is_none(),
+    };
+    Ok(same_parent && *d.name() == *kn.name_bytes())
+}
 
 /// show() output of an open file and where the last read ended (Linux
 /// seq_file buf and read_pos)

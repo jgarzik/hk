@@ -29,11 +29,10 @@
 //! leaked. Every pfn from outside is checked against the zone and the
 //! memory map's sections before its struct page is touched.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mm::page::{PG_BUDDY, PG_HEAD, PG_RESERVED, PG_TAIL, Page, put_mapping};
 use crate::sync::IrqSpinlock;
-use crate::util::cpumask::NR_CPUS;
 
 /// Largest block order (2^10 pages = 4MB, Linux MAX_PAGE_ORDER)
 pub const MAX_ORDER: u32 = 10;
@@ -144,8 +143,9 @@ fn alloc_mark(wmark: &[AtomicUsize; 3], gfp: Gfp) -> usize {
 // Per-CPU page lists
 // ============================================================================
 
-/// One CPU's order-0 page list (Linux per_cpu_pages)
-struct Pcp {
+/// One CPU's order-0 page list (Linux per_cpu_pages): a zone's are a
+/// per-CPU variable (Linux zone->per_cpu_pageset, alloc_percpu)
+pub struct Pcp {
     /// First page (pfn + 1, 0 = empty), linked through `Page.next`
     /// (under `lock`)
     lock: IrqSpinlock<u64>,
@@ -155,7 +155,7 @@ struct Pcp {
 }
 
 impl Pcp {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             lock: IrqSpinlock::new(0),
             count: AtomicUsize::new(0),
@@ -242,45 +242,65 @@ struct FreeArea {
     nr: [usize; ORDERS],
 }
 
-/// A range of physical memory managed as one pool (Linux struct zone)
-pub struct Zone {
+/// Where a zone's struct pages are and what it spans: set once at boot
+/// (`Zone::init`), before any allocation (Linux zone_start_pfn and
+/// spanned_pages, from free_area_init)
+#[derive(Clone, Copy)]
+struct Span {
     /// Address of pfn 0's struct page: page(pfn) = map + pfn * 64 (the
     /// vmemmap; host tests point it at their own array)
-    map: AtomicUsize,
+    map: usize,
     /// Pfns [start, end) the zone spans (holes are reserved pages)
-    start: AtomicU64,
-    end: AtomicU64,
+    start: u64,
+    end: u64,
+    /// Check every pfn against the memory map's sections (the vmemmap
+    /// backs only sections with RAM; host tests back the whole span)
+    sections: bool,
+}
+
+/// The per-CPU lists' refill/drain size and limit (Linux pcp->batch,
+/// pcp->high): set once at boot (`Zone::setup_pcp`)
+#[derive(Clone, Copy)]
+struct PcpSize {
+    batch: usize,
+    high: usize,
+}
+
+/// A range of physical memory managed as one pool (Linux struct zone)
+pub struct Zone {
+    /// Its struct pages and pfns, set once (`init`)
+    span: spin::Once<Span>,
     /// Buddy free lists (zone->lock)
     lock: IrqSpinlock<FreeArea>,
     /// Pages on the buddy lists (written under `lock`, read lock-free;
     /// Linux NR_FREE_PAGES)
     nr_free: AtomicUsize,
-    /// Pages handed to the zone at boot (Linux managed_pages)
+    /// Pages handed to the zone (Linux managed_pages): at boot and as
+    /// reserved boot memory is given up later, under `lock`; read
+    /// lock-free (statistics, list sizing)
     managed: AtomicUsize,
     /// Bad page states seen (double frees, busy pages on a free list);
     /// such pages are leaked, never handed out twice
     bad: AtomicUsize,
-    /// Check every pfn against the memory map's sections (the vmemmap
-    /// backs only sections with RAM; host tests back the whole span)
-    sections: core::sync::atomic::AtomicBool,
     /// Watermarks in pages (Wmark order)
     wmark: [AtomicUsize; 3],
     /// vm.min_free_kbytes the watermarks come from
     min_kb: AtomicUsize,
-    /// Per-CPU list refill/drain size and limit
-    batch: AtomicUsize,
-    high: AtomicUsize,
-    pcp: [Pcp; NR_CPUS],
-    /// A drain of every CPU's list is running (Linux pcpu_drain_mutex)
-    draining: AtomicBool,
+    /// The per-CPU lists' sizes, set once at the end of boot
+    /// (`setup_pcp`); until then no CPU uses its list (Linux
+    /// boot_pageset's high 0, batch 1 come to the same)
+    pcp_size: spin::Once<PcpSize>,
+    /// The per-CPU lists, each in its CPU's per-CPU area
+    pcp: &'static crate::cpu::PerCpu<Pcp>,
+    /// Serializes draining every CPU's list (Linux pcpu_drain_mutex,
+    /// taken with mutex_trylock: a drain that finds one running returns)
+    drain_lock: crate::sync::Mutex<()>,
 }
 
 impl Zone {
-    pub const fn new() -> Self {
+    pub const fn new(pcp: &'static crate::cpu::PerCpu<Pcp>) -> Self {
         Self {
-            map: AtomicUsize::new(0),
-            start: AtomicU64::new(0),
-            end: AtomicU64::new(0),
+            span: spin::Once::new(),
             lock: IrqSpinlock::new(FreeArea {
                 head: [0; ORDERS],
                 nr: [0; ORDERS],
@@ -288,13 +308,11 @@ impl Zone {
             nr_free: AtomicUsize::new(0),
             managed: AtomicUsize::new(0),
             bad: AtomicUsize::new(0),
-            sections: core::sync::atomic::AtomicBool::new(false),
             wmark: [const { AtomicUsize::new(0) }; 3],
             min_kb: AtomicUsize::new(0),
-            batch: AtomicUsize::new(1),
-            high: AtomicUsize::new(0),
-            pcp: [const { Pcp::new() }; NR_CPUS],
-            draining: AtomicBool::new(false),
+            pcp_size: spin::Once::new(),
+            pcp,
+            drain_lock: crate::sync::Mutex::new(()),
         }
     }
 
@@ -302,19 +320,23 @@ impl Zone {
     /// for valid pfns when `sections`: the vmemmap); every page is
     /// reserved until `free_range` (boot, before any allocation)
     pub fn init(&self, map: usize, start: u64, end: u64, sections: bool) {
-        self.sections.store(sections, Ordering::Relaxed);
-        self.map.store(map, Ordering::Relaxed);
-        self.start.store(start, Ordering::Relaxed);
-        self.end.store(end, Ordering::Relaxed);
+        assert!(!self.span.is_completed(), "zone: spanned twice");
+        self.span.call_once(|| Span {
+            map,
+            start,
+            end,
+            sections,
+        });
+    }
+
+    fn span(&self) -> &Span {
+        self.span.get().expect("zone not initialized")
     }
 
     /// The struct page of `pfn` (inside the span)
     #[inline]
     pub fn page(&self, pfn: u64) -> &Page {
-        let at = self
-            .map
-            .load(Ordering::Relaxed)
-            .wrapping_add(pfn as usize * 64);
+        let at = self.span().map.wrapping_add(pfn as usize * 64);
         // SAFETY: `init` mapped struct pages for the whole span's RAM
         // sections; callers pass pfns of pages they own or buddies of
         // them (same section)
@@ -324,7 +346,9 @@ impl Zone {
     /// The pfn is inside the zone
     #[inline]
     pub fn spans(&self, pfn: u64) -> bool {
-        (self.start.load(Ordering::Relaxed)..self.end.load(Ordering::Relaxed)).contains(&pfn)
+        self.span
+            .get()
+            .is_some_and(|s| (s.start..s.end).contains(&pfn))
     }
 
     /// The pfn is inside the zone and has a struct page (a hole between
@@ -332,8 +356,7 @@ impl Zone {
     /// to be ours
     #[inline]
     pub fn valid(&self, pfn: u64) -> bool {
-        self.spans(pfn)
-            && (!self.sections.load(Ordering::Relaxed) || crate::mm::page::pfn_valid(pfn))
+        self.spans(pfn) && (!self.span().sections || crate::mm::page::pfn_valid(pfn))
     }
 
     /// A page in a state it must not be in (Linux bad_page): reported
@@ -391,7 +414,9 @@ impl Zone {
     /// Free block [pfn, pfn + 2^order): merge with free buddies (Linux
     /// __free_one_page)
     fn free_one(&self, fa: &mut FreeArea, mut pfn: u64, mut order: u32) {
-        self.nr_free.fetch_add(1 << order, Ordering::Relaxed);
+        // Under the zone lock (`fa`): a load and a store, read lock-free
+        // for watermarks (Linux NR_FREE_PAGES via __mod_zone_page_state)
+        crate::sync::Sole::sole_add(&self.nr_free, 1 << order);
         while order < MAX_ORDER {
             // A buddy is in the same 2^MAX_ORDER block, so in the same
             // memory section; outside the zone it is never merged
@@ -423,7 +448,8 @@ impl Zone {
             o -= 1;
             self.list_add(fa, pfn + (1 << o), o);
         }
-        self.nr_free.fetch_sub(1 << order, Ordering::Relaxed);
+        // Under the zone lock, as in `free_one`
+        crate::sync::Sole::sole_add(&self.nr_free, (1usize << order).wrapping_neg());
         Some(pfn)
     }
 
@@ -431,34 +457,38 @@ impl Zone {
     // Per-CPU lists (this CPU, interrupts off)
     // ------------------------------------------------------------------
 
-    /// This CPU's list (None: no per-CPU data yet)
-    fn pcp(&self) -> Option<&Pcp> {
-        this_cpu().map(|c| &self.pcp[c])
+    /// This CPU's list and the lists' sizes (None: no per-CPU data
+    /// yet, or the lists not sized yet)
+    fn pcp(&self) -> Option<(&Pcp, PcpSize)> {
+        let size = *self.pcp_size.get()?;
+        this_cpu().map(|c| (self.pcp.get(c as u32), size))
     }
 
     fn pcp_push(&self, p: &Pcp, head: &mut u64, pfn: u64) {
         self.page(pfn).next.store(*head, Ordering::Relaxed);
         *head = pfn + 1;
-        p.count.fetch_add(1, Ordering::Relaxed);
+        // Under `p.lock` (`head`): Linux pcp->count++
+        crate::sync::Sole::sole_add(&p.count, 1);
     }
 
     fn pcp_pop(&self, p: &Pcp, head: &mut u64) -> Option<u64> {
         let pfn = head.checked_sub(1)?;
         *head = self.page(pfn).next.load(Ordering::Relaxed);
-        p.count.fetch_sub(1, Ordering::Relaxed);
+        // Under `p.lock`: Linux pcp->count--
+        crate::sync::Sole::sole_add(&p.count, usize::MAX);
         Some(pfn)
     }
 
     /// Order-0 page from this CPU's list, refilled with `batch` pages
     /// from the buddy lists when empty (Linux rmqueue_pcplist)
     fn pcp_alloc(&self) -> Option<u64> {
-        let Some(p) = self.pcp() else {
+        let Some((p, size)) = self.pcp() else {
             return self.take(&mut self.lock.lock(), 0);
         };
         let mut head = p.lock.lock();
         if *head == 0 {
             let mut fa = self.lock.lock();
-            for _ in 0..self.batch.load(Ordering::Relaxed) {
+            for _ in 0..size.batch {
                 match self.take(&mut fa, 0) {
                     Some(pfn) => self.pcp_push(p, &mut head, pfn),
                     None => break,
@@ -471,15 +501,15 @@ impl Zone {
     /// Order-0 page onto this CPU's list; past `high`, `batch` pages go
     /// back to the buddy lists (Linux free_unref_page)
     fn pcp_free(&self, pfn: u64) {
-        let Some(p) = self.pcp() else {
+        let Some((p, size)) = self.pcp() else {
             self.free_one(&mut self.lock.lock(), pfn, 0);
             return;
         };
         let mut head = p.lock.lock();
         self.pcp_push(p, &mut head, pfn);
-        if p.count.load(Ordering::Relaxed) > self.high.load(Ordering::Relaxed) {
+        if p.count.load(Ordering::Relaxed) > size.high {
             let mut fa = self.lock.lock();
-            for _ in 0..self.batch.load(Ordering::Relaxed) {
+            for _ in 0..size.batch {
                 match self.pcp_pop(p, &mut head) {
                     Some(pfn) => self.free_one(&mut fa, pfn, 0),
                     None => break,
@@ -498,16 +528,15 @@ impl Zone {
     /// (it may hold spinlocks, or have interrupted the drainer); false
     /// then.
     pub fn drain_all(&self) -> bool {
-        if self.draining.swap(true, Ordering::Acquire) {
+        let Some(_g) = self.drain_lock.try_lock() else {
             return false;
-        }
+        };
         self.drain_lists();
-        self.draining.store(false, Ordering::Release);
         true
     }
 
     fn drain_lists(&self) {
-        for p in &self.pcp {
+        for (_, p) in self.pcp.for_each_possible() {
             if p.count.load(Ordering::Relaxed) == 0 {
                 continue;
             }
@@ -647,7 +676,7 @@ impl Zone {
         // __page_cache_release), a released mapping may free an AnonVma
         // (slab)
         #[cfg(not(test))]
-        if order == 0 && self.sections.load(Ordering::Relaxed) {
+        if order == 0 && self.span().sections {
             crate::mm::swap::lru::page_freed(pfn);
         }
         for i in 0..1u64 << order {
@@ -800,12 +829,9 @@ impl Zone {
     /// free_reserved_area), in the largest aligned blocks that fit: the
     /// pages handed over
     pub fn free_range(&self, mut start: u64, end: u64) -> usize {
-        let (lo, hi) = (
-            self.start.load(Ordering::Relaxed),
-            self.end.load(Ordering::Relaxed),
-        );
-        start = start.max(lo);
-        let end = end.min(hi);
+        let s = self.span();
+        start = start.max(s.start);
+        let end = end.min(s.end);
         let mut fa = self.lock.lock();
         let mut freed = 0;
         while start < end {
@@ -820,7 +846,8 @@ impl Zone {
                 pg.flags.fetch_and(!PG_RESERVED, Ordering::Relaxed);
                 pg.refcount.store(0, Ordering::Relaxed);
             }
-            self.managed.fetch_add(1 << order, Ordering::Relaxed);
+            // Under the zone lock: a load and a store
+            crate::sync::Sole::sole_add(&self.managed, 1 << order);
             self.free_one(&mut fa, start, order);
             freed += 1 << order;
             start += 1 << order;
@@ -835,8 +862,14 @@ impl Zone {
         let b = (self.managed() / 1024).min(256) / 4;
         let x = (b + b / 2).max(2);
         let batch = (1usize << (usize::BITS - 1 - x.leading_zeros())) - 1;
-        self.batch.store(batch, Ordering::Relaxed);
-        self.high.store(4 * batch, Ordering::Relaxed);
+        self.size_pcp(batch, 4 * batch);
+    }
+
+    /// Give the per-CPU lists their sizes (once): CPUs use them from
+    /// here on
+    fn size_pcp(&self, batch: usize, high: usize) {
+        assert!(!self.pcp_size.is_completed(), "zone: lists sized twice");
+        self.pcp_size.call_once(|| PcpSize { batch, high });
     }
 
     /// Set the watermarks from min_free_kbytes (Linux
@@ -887,7 +920,9 @@ impl Zone {
     /// at once; not counting them failed the next 30 allocations, each
     /// then reclaiming); other CPUs' lists are not counted, as in Linux
     pub fn watermark_ok(&self, order: u32, gfp: Gfp) -> bool {
-        let local = self.pcp().map_or(0, |p| p.count.load(Ordering::Relaxed));
+        let local = self
+            .pcp()
+            .map_or(0, |(p, _)| p.count.load(Ordering::Relaxed));
         let free = (self.nr_free() + local) as isize - (1isize << order) + 1;
         free > alloc_mark(&self.wmark, gfp) as isize
     }
@@ -911,8 +946,8 @@ impl Zone {
     pub fn free_pages_all(&self) -> usize {
         let pcp: usize = self
             .pcp
-            .iter()
-            .map(|p| p.count.load(Ordering::Relaxed))
+            .for_each_possible()
+            .map(|(_, p)| p.count.load(Ordering::Relaxed))
             .sum();
         self.nr_free() + pcp
     }
@@ -924,8 +959,16 @@ impl Zone {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use core::sync::atomic::AtomicU64;
+
+    /// A zone's own per-CPU lists (host tests: leaked)
+    pub fn test_pcp() -> &'static crate::cpu::PerCpu<Pcp> {
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(crate::cpu::PerCpu::new(
+            [const { Pcp::new() }; crate::util::cpumask::NR_CPUS],
+        )))
+    }
 
     /// A zone over pfns [start, start + n) backed by a host array
     struct TestZone {
@@ -935,7 +978,7 @@ mod tests {
 
     fn zone(start: u64, n: usize) -> TestZone {
         let map: Vec<Page> = (0..n).map(|_| Page::new()).collect();
-        let z = Zone::new();
+        let z = Zone::new(test_pcp());
         let base = (map.as_ptr() as usize).wrapping_sub(start as usize * 64);
         z.init(base, start, start + n as u64, false);
         TestZone { z, _map: map }
@@ -1000,7 +1043,7 @@ mod tests {
         let t = zone(0, 8192);
         t.z.free_range(0, 8192);
         t.z.setup_pcp();
-        let high = t.z.high.load(Ordering::Relaxed);
+        let high = t.z.pcp_size.get().unwrap().high;
         let v: Vec<u64> = (0..2000)
             .map(|_| t.z.alloc_pages(0, Gfp::KERNEL).unwrap())
             .collect();
@@ -1132,8 +1175,7 @@ mod tests {
     fn failed_alloc_drains_other_cpus() {
         let t = zone(0, 64);
         t.z.free_range(0, 64);
-        t.z.batch.store(8, Ordering::Relaxed);
-        t.z.high.store(32, Ordering::Relaxed);
+        t.z.size_pcp(8, 32);
         let mut got = Vec::new();
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -1176,8 +1218,7 @@ mod tests {
     fn local_list_counts_toward_watermark() {
         let t = zone(0, 64);
         t.z.free_range(0, 64);
-        t.z.batch.store(8, Ordering::Relaxed);
-        t.z.high.store(32, Ordering::Relaxed);
+        t.z.size_pcp(8, 32);
         t.z.wmark
             .iter()
             .for_each(|w| w.store(50, Ordering::Relaxed));
@@ -1193,11 +1234,11 @@ mod tests {
     fn nested_drain_returns_at_once() {
         let t = zone(0, 64);
         t.z.free_range(0, 64);
-        t.z.draining.store(true, Ordering::Relaxed);
+        let g = t.z.drain_lock.try_lock().unwrap();
         assert!(!t.z.drain_all());
-        t.z.draining.store(false, Ordering::Relaxed);
+        drop(g);
         assert!(t.z.drain_all());
-        assert!(!t.z.draining.load(Ordering::Relaxed));
+        assert!(t.z.drain_lock.try_lock().is_some());
     }
 
     /// Atomic and opportunistic allocations (a huge-page try on every
@@ -1206,8 +1247,7 @@ mod tests {
     fn nowait_alloc_does_not_drain() {
         let t = zone(0, 64);
         t.z.free_range(0, 64);
-        t.z.batch.store(8, Ordering::Relaxed);
-        t.z.high.store(32, Ordering::Relaxed);
+        t.z.size_pcp(8, 32);
         std::thread::scope(|s| {
             s.spawn(|| {
                 TEST_CPU.with(|c| c.set(1));
@@ -1217,14 +1257,14 @@ mod tests {
                 v.into_iter().for_each(|p| t.z.free_pages(p, 0));
             });
         });
-        let parked = t.z.pcp[1].count.load(Ordering::Relaxed);
+        let parked = t.z.pcp.get(1).count.load(Ordering::Relaxed);
         assert!(parked > 0);
         while t.z.alloc_pages(0, Gfp::NOWAIT).is_some() {}
         assert!(t.z.alloc_pages(0, Gfp::TRANSHUGE_LIGHT).is_none());
-        assert_eq!(t.z.pcp[1].count.load(Ordering::Relaxed), parked);
+        assert_eq!(t.z.pcp.get(1).count.load(Ordering::Relaxed), parked);
         // A thread-context allocation drains it
         assert!(t.z.alloc_pages(0, Gfp::KERNEL).is_some());
-        assert_eq!(t.z.pcp[1].count.load(Ordering::Relaxed), 0);
+        assert_eq!(t.z.pcp.get(1).count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

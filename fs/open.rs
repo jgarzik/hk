@@ -1,14 +1,13 @@
 //! File open/close syscalls
 
+use super::dentry::LookupBits;
 use super::file::EMPTY_FOPS;
-use crate::fs::DentryRef;
 use crate::fs::FileRef;
 use crate::fs::namei::{
-    CreateAt, Last, Nd, filename_lookup, filename_lookup_from, getname, path_start,
+    Dfd, Nd, filename_lookup, filename_lookup_from, filename_lookup_start, getname, path_start,
 };
-use crate::fs::{
-    Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
-};
+use crate::fs::{Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac};
+use core::cell::Cell;
 
 use super::file::flags::AT_FDCWD;
 use super::flags::{
@@ -21,40 +20,6 @@ use super::syscall::current_fd_table;
 use crate::task::FD_CLOEXEC;
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
-
-/// Create regular file `name` in `parent` for O_CREAT (Linux
-/// lookup_open + may_o_create) under the parent's lock: an entry that
-/// appeared meanwhile is returned as is (created = false); otherwise
-/// write+search on the parent, the mode gets the umask and SGID
-/// stripping, the owner comes from init_owner
-fn create_in(
-    mnt: &super::mount::MountRef,
-    parent: &DentryRef,
-    name: &[u8],
-    mode: u32,
-) -> Result<(DentryRef, bool), KernelError> {
-    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    if !dir.mode().is_dir() {
-        return Err(KernelError::NotDirectory);
-    }
-    let c = dac::cred();
-    // lookup_open: write access is needed only to create
-    let w = mnt.want_write();
-    let _dir_lock = dir.lock();
-    (|| {
-        if let Ok(d) = lookup_one(parent, name) {
-            return Ok((d, false));
-        }
-        let _w = w?;
-        dac::may_create(&c, &dir)?;
-        let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
-        // The dentry first, so an ENOMEM leaves no file made
-        let d = Dentry::prealloc(parent, name)?;
-        let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
-        dir.touch_mc();
-        Ok((Dentry::add(parent, d, Some(inode)), true))
-    })()
-}
 
 /// sys_open - open a file: sys_openat with AT_FDCWD
 pub fn sys_open(path: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
@@ -101,7 +66,7 @@ pub mod resolve {
 }
 
 /// The first published open_how (Linux OPEN_HOW_SIZE_VER0)
-const OPEN_HOW_SIZE_VER0: usize = 24;
+pub const OPEN_HOW_SIZE_VER0: usize = 24;
 
 /// What an open does (Linux struct open_flags, fs/internal.h)
 pub struct OpenFlags {
@@ -212,6 +177,12 @@ pub fn build_open_flags(how: &OpenHow) -> Result<OpenFlags, KernelError> {
 fn open_lookup(flags: u32, res: u64) -> LookupFlags {
     use resolve::*;
     let excl = flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL;
+    // op->intent: LOOKUP_OPEN but for O_PATH, LOOKUP_CREATE with O_CREAT,
+    // LOOKUP_EXCL with O_EXCL too
+    let mut intent = LookupBits::empty();
+    intent.set(LookupBits::OPEN, flags & O_PATH == 0);
+    intent.set(LookupBits::CREATE, flags & O_CREAT != 0);
+    intent.set(LookupBits::EXCL, excl);
     LookupFlags {
         directory: flags & O_DIRECTORY != 0,
         follow: flags & O_NOFOLLOW == 0 && !excl,
@@ -221,6 +192,7 @@ fn open_lookup(flags: u32, res: u64) -> LookupFlags {
         beneath: res & RESOLVE_BENEATH != 0,
         in_root: res & RESOLVE_IN_ROOT != 0,
         cached: res & RESOLVE_CACHED != 0,
+        intent,
         ..LookupFlags::default()
     }
 }
@@ -234,11 +206,18 @@ enum OpenAt<'a> {
 }
 
 impl OpenAt<'_> {
-    /// The walk's start (Linux path_init)
-    fn start(self, path: &[u8], lf: LookupFlags) -> Result<Option<Path>, KernelError> {
+    /// The walk's start (Linux path_init), held for the lookup
+    fn start(self, path: &[u8], lf: LookupFlags) -> Result<Dfd, KernelError> {
         match self {
             Self::Fd(fd) => path_start(fd, path, lf),
-            Self::Root(r) => Ok(Some(r.clone())),
+            Self::Root(r) => {
+                // Linux path_init under ND_ROOT_PRESET: a name to walk
+                // needs a directory to walk it in
+                if !path.is_empty() && !r.get_inode().is_some_and(|i| i.mode().is_dir()) {
+                    return Err(KernelError::NotDirectory);
+                }
+                Ok(Dfd::Preset(r.clone()))
+            }
         }
     }
 
@@ -253,68 +232,71 @@ impl OpenAt<'_> {
 }
 
 /// Resolve the open target: an existing file, or (O_CREAT) a newly
-/// created one; the bool says it was created by this call
+/// created one; the bool says it was created by this call. Walked in
+/// RCU mode first, again in ref mode if that is ECHILD (Linux
+/// do_filp_open's retry of path_openat), which comes before anything
+/// is created; the only RCU-to-ref retry, as every walk below is one
+/// try in the mode given. (Linux's third try, LOOKUP_REVAL on ESTALE,
+/// has no case here: no walk returns ESTALE.) The symlink count is the
+/// open's, carried into the retry (Linux nameidata, set once by
+/// do_filp_open).
 fn open_target(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<(Path, bool), KernelError> {
+    let links = Cell::new(0);
+    match open_target_nd(at, path, op, true, &links) {
+        Err(KernelError::NoChild) => open_target_nd(at, path, op, false, &links),
+        r => r,
+    }
+}
+
+/// [`open_target`], its lookup's walks starting in RCU mode if `rcu`
+/// (Linux path_openat): one walk, its last name looked up with the
+/// open's intent (a trailing symlink followed unless O_NOFOLLOW or
+/// O_EXCL, its body walked the same way), on a miss under the parent's
+/// lock and with O_CREAT made there (open_last_lookups, lookup_open)
+fn open_target_nd(
+    at: OpenAt<'_>,
+    path: &[u8],
+    op: &OpenFlags,
+    rcu: bool,
+    links: &Cell<usize>,
+) -> Result<(Path, bool), KernelError> {
     let (flags, lf) = (op.flags, op.lookup);
-    if flags & O_CREAT == 0 {
-        return Ok((at.lookup(path, lf)?, false));
-    }
-    // O_CREAT|O_EMPTYPATH of an empty name: dirfd's own file; there is
-    // no last name, so no parent's sticky check (Linux nd->dir_mode is 0)
-    if path.is_empty() {
-        return creat_existing(at.lookup(path, lf)?, flags);
-    }
-    // O_CREAT (Linux open_last_lookups): the parent is walked, then a
-    // last name of "/", "." or ".." (a directory) or one with a trailing
-    // slash is EISDIR, existing or not; one lookup (Nd) throughout, so
-    // RESOLVE_* holds for the parent, the symlinks and the last name
     let start = at.start(path, lf)?;
-    let nd = Nd::new(&start, lf)?;
-    let p = nd.parentat(start, path, lf)?;
-    if p.last != Last::Norm || p.slash {
-        return Err(KernelError::IsDirectory);
-    }
-    // A final symlink is followed to where the file is (or is made),
-    // a dangling one included
-    let p = if lf.follow {
-        nd.last_links(p, lf)?
-    } else {
-        CreateAt::Name(p)
-    };
-    let p = match p {
-        CreateAt::Name(p) => p,
-        // A magic link's object (Linux nd_jump_link): no name to make
-        CreateAt::Object(d) => return creat_existing(d, flags),
-    };
-    let dir = Path::new(p.mnt.clone(), p.dir.clone());
-    let (d, created) = match nd.lookup(Some(dir), &p.name, lf) {
-        Ok(d) => (d, false),
-        Err(KernelError::NotFound) => {
-            let (d, c) = create_in(&p.mnt, &p.dir, &p.name, op.mode)?;
-            (Path::new(p.mnt.clone(), d), c)
+    let s = start.start();
+    // An empty name (O_EMPTYPATH): dirfd's own file, no walk; with
+    // O_CREAT there is no last name, so no parent's sticky check (Linux
+    // nd->dir_mode is 0)
+    if path.is_empty() {
+        let p = filename_lookup_start(s, path, lf)?;
+        if flags & O_CREAT == 0 {
+            return Ok((p, false));
         }
-        Err(e) => return Err(e),
-    };
+        return creat_existing(p, flags);
+    }
+    let nd = Nd::new(s, lf, rcu, links)?.open(flags, op.mode);
+    let d = nd.lookup(s, path, lf)?;
+    if flags & O_CREAT == 0 {
+        return Ok((d, false));
+    }
+    let created = nd.created();
+    // do_open's O_CREAT checks
     if !created && flags & O_EXCL != 0 {
         return Err(KernelError::AlreadyExists);
     }
-    if !created && d.get_inode().is_some_and(|i| i.mode().is_dir()) {
+    if d.get_inode().is_some_and(|i| i.mode().is_dir()) {
         return Err(KernelError::IsDirectory);
     }
-    // An existing file opened O_CREAT in a sticky directory (Linux
-    // may_create_in_sticky: fs.protected_fifos / _regular)
-    // The directory is the one holding the file the walk ended on, after
-    // a final symlink (Linux nd->dir_mode after the follow)
-    let parent = d.dentry.get_parent().unwrap_or_else(|| p.dir.clone());
-    if !created && let (Some(dir), Some(inode)) = (parent.get_inode(), d.get_inode()) {
-        super::dac::may_create_in_sticky(&crate::task::current_cred(), &dir, &inode)?;
+    // In a sticky directory (fs.protected_fifos / _regular): the one the
+    // last name was looked up in (nd->dir_mode, nd->dir_vfsuid)
+    if let Some(inode) = d.get_inode() {
+        let (dmode, duid) = nd.dir();
+        dac::may_create_in_sticky(&dac::cred(), dmode, duid, &inode)?;
     }
     Ok((d, created))
 }
 
-/// O_CREAT landing on an existing object with no name to create (an
-/// empty name with O_EMPTYPATH, a magic link): do_open's O_CREAT checks
-/// (EEXIST with O_EXCL, EISDIR)
+/// O_CREAT of an empty name with O_EMPTYPATH, dirfd's own file:
+/// do_open's O_CREAT checks (EEXIST with O_EXCL, EISDIR)
 fn creat_existing(d: Path, flags: u32) -> Result<(Path, bool), KernelError> {
     if flags & O_EXCL != 0 {
         return Err(KernelError::AlreadyExists);
@@ -345,21 +327,59 @@ pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> K
 /// first version EINVAL, one over a page or with unknown nonzero
 /// fields E2BIG; O_LARGEFILE unless O_PATH
 pub fn sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: u64, usize: usize) -> KernelResult<i32> {
-    if usize < OPEN_HOW_SIZE_VER0 {
-        return Err(KernelError::InvalidArgument);
-    }
+    // Linux openat2: EINVAL below the first version (copy_open_how), then
+    // E2BIG past a page
     if usize as u64 > crate::mm::PAGE_SIZE {
         return Err(KernelError::ArgListTooLong);
     }
-    let mut how = match crate::uaccess::copy_struct_from_user::<OpenHow>(how, usize) {
-        Ok(h) => h,
-        Err(None) => return Err(KernelError::ArgListTooLong),
-        Err(Some(_)) => return Err(KernelError::BadAddress),
-    };
+    let mut how = copy_open_how(how, usize)?;
+    force_largefile(&mut how);
+    do_sys_openat2(dirfd, path_ptr, &how)
+}
+
+/// O_LARGEFILE unless O_PATH (Linux openat2 and io_openat_prep:
+/// force_o_largefile on 64-bit)
+pub fn force_largefile(how: &mut OpenHow) {
     if how.flags & u64::from(O_PATH) == 0 {
         how.flags |= u64::from(O_LARGEFILE);
     }
-    do_sys_openat2(dirfd, path_ptr, &how)
+}
+
+/// The `struct open_how` of `usize` bytes at `how` (Linux openat2's and
+/// io_openat2_prep's checks and copy_struct_from_user): EINVAL below the
+/// first version, E2BIG for unknown nonzero fields, EFAULT
+pub fn copy_open_how(how: u64, usize: usize) -> KernelResult<OpenHow> {
+    if usize < OPEN_HOW_SIZE_VER0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    match crate::uaccess::copy_struct_from_user::<OpenHow>(how, usize) {
+        Ok(h) => Ok(h),
+        Err(None) => Err(KernelError::ArgListTooLong),
+        Err(Some(_)) => Err(KernelError::BadAddress),
+    }
+}
+
+/// Open `name` (already copied in) relative to `dirfd` as `how` asks
+/// (Linux build_open_flags + do_file_open): the file, not installed
+pub fn open_file(dirfd: i32, name: &[u8], how: &OpenHow) -> KernelResult<FileRef> {
+    let op = build_open_flags(how)?;
+    filp_open(OpenAt::Fd(dirfd), name, &op)
+}
+
+/// [`open_file`] at a descriptor reserved first below `nofile` (Linux
+/// FD_ADD: get_unused_fd_flags, then do_file_open; EMFILE first, the
+/// descriptor released if the open fails; io_openat2 passes the prep's
+/// RLIMIT_NOFILE); the descriptor
+pub fn open_install(dirfd: i32, name: &[u8], how: &OpenHow, nofile: u64) -> KernelResult<i32> {
+    let op = build_open_flags(how)?;
+    let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+    let fd = super::io::get_unused_fd_nofile(fd_flags, nofile)?;
+    let file = filp_open(OpenAt::Fd(dirfd), name, &op)?;
+    Ok(fd.install(file))
 }
 
 /// Open as `how` asks and install the file (Linux do_sys_openat2): the
@@ -368,17 +388,7 @@ fn do_sys_openat2(dirfd: i32, path_ptr: UserPtr<u8>, how: &OpenHow) -> KernelRes
     let op = build_open_flags(how)?;
     // O_EMPTYPATH: an empty name is dirfd itself (Linux LOOKUP_EMPTY)
     let path = getname(path_ptr, op.flags & O_EMPTYPATH != 0)?;
-    // The descriptor is reserved before the open (Linux FD_ADD:
-    // get_unused_fd_flags, then do_file_open; EMFILE first) and
-    // released if it fails
-    let fd_flags = if how.flags & u64::from(O_CLOEXEC) != 0 {
-        FD_CLOEXEC
-    } else {
-        0
-    };
-    let fd = super::io::get_unused_fd_flags(fd_flags)?;
-    let file = filp_open(OpenAt::Fd(dirfd), &path, &op)?;
-    Ok(fd.install(file))
+    open_install(dirfd, &path, how, super::syscall::get_nofile_limit())
 }
 
 /// Open `root` itself with open(2) `flags` (Linux file_open_root with an
@@ -397,8 +407,11 @@ pub fn file_open_root(root: &Path, flags: u32) -> Result<FileRef, KernelError> {
 /// write and search on the directory (EACCES), EOPNOTSUPP from a file
 /// system without tmpfile. Linkable unless O_EXCL.
 fn tmpfile_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, KernelError> {
+    // Linux do_tmpfile: path_lookupat with the lookup flags alone, no
+    // intent
     let lf = LookupFlags {
         directory: true,
+        intent: LookupBits::empty(),
         ..op.lookup
     };
     let dir = at.lookup(path, lf)?;
@@ -411,9 +424,7 @@ fn tmpfile_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, 
         .i_op
         .tmpfile(&dir_inode, InodeMode::regular(perm))?;
     if op.flags & O_EXCL == 0 {
-        inode
-            .i_linkable
-            .store(true, core::sync::atomic::Ordering::Relaxed);
+        inode.set_linkable(true);
     }
     let dentry = Dentry::tmpfile(&dir.dentry, inode.clone())?;
     let iw = inode.get_write_access()?;
@@ -508,14 +519,17 @@ fn filp_open(at: OpenAt<'_>, path: &[u8], op: &OpenFlags) -> Result<FileRef, Ker
     if flags & O_TRUNC != 0 && !created && inode.mode().is_file() {
         let _lock = inode.lock();
         // An active swap file (S_SWAPFILE, set under i_rwsem): ETXTBSY
-        if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+        if inode.is_swapfile() {
             return Err(KernelError::TextBusy);
         }
         dac::remove_privs(&inode);
         // ATTR_MTIME | ATTR_CTIME, also for a file already empty; a
         // refusal (a sealed memfd: EPERM) fails the open
         match inode.i_op.truncate(&inode, 0) {
-            Ok(()) => inode.touch_mc(),
+            Ok(()) => {
+                let now = crate::time::TIMEKEEPER.current_time();
+                inode.set_times(None, Some(now), Some(now));
+            }
             Err(KernelError::OperationNotSupported) => {}
             Err(e) => return Err(e),
         }
@@ -596,4 +610,122 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> KernelResult<()> {
         files.range_close(lo, hi);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::DentryRef;
+    use crate::fs::dentry::DentryOps;
+    use crate::fs::inode::{Inode, NULL_INODE_OPS, Timespec};
+    use alloc::sync::Weak;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// The inode whose revalidations are counted
+    const SEEN: u64 = 77;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    static BITS: AtomicU32 = AtomicU32::new(0);
+
+    /// Every entry is valid; `SEEN`'s revalidations are counted, the
+    /// last one's flags kept
+    fn reval(_: &Inode, _: &Dentry, i: Option<&Inode>, f: LookupBits) -> Result<bool, KernelError> {
+        if i.is_some_and(|i| i.ino == SEEN) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            BITS.store(f.bits(), Ordering::Relaxed);
+        }
+        Ok(true)
+    }
+
+    static OPS: DentryOps = DentryOps {
+        d_revalidate: Some(reval),
+        ..DentryOps::NONE
+    };
+
+    fn inode(ino: u64, mode: InodeMode) -> crate::fs::InodeRef {
+        let t = Timespec::from_secs(0);
+        Inode::alloc(Inode::new(
+            ino,
+            mode,
+            0,
+            0,
+            0,
+            t,
+            Weak::new(),
+            &NULL_INODE_OPS,
+        ))
+        .unwrap()
+    }
+
+    /// An O_CREAT open of an existing file is answered by the RCU walk
+    /// alone (Linux open_last_lookups: lookup_fast under LOOKUP_RCU,
+    /// step_into; no lookup_open, no i_rwsem), its one revalidation
+    /// seeing nd->flags: LOOKUP_FOLLOW and the open's intent. A walk a
+    /// concurrent mount change sent to ref mode is tried again.
+    #[test]
+    // The walk reads the current task, an aarch64 per-CPU register a
+    // host (EL0) test cannot read
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn creat_existing_rcu() {
+        let root = DentryRef::new(Dentry::new_root_op(
+            inode(1, InodeMode::directory(0o755)),
+            &OPS,
+        ))
+        .unwrap();
+        let d = Dentry::alloc(&root, b"d", Some(inode(2, InodeMode::directory(0o755)))).unwrap();
+        let _x = Dentry::alloc(&d, b"x", Some(inode(SEEN, InodeMode::regular(0o644)))).unwrap();
+        let top = Path::new(crate::fs::mount::test_mnt_root(root.clone()), root);
+        let op = build_open_flags(&build_open_how(O_CREAT | O_RDWR, 0o644)).unwrap();
+        let want = LookupBits::RCU | LookupBits::FOLLOW | LookupBits::OPEN | LookupBits::CREATE;
+        let mut seen = (0, 0);
+        for _ in 0..1000 {
+            CALLS.store(0, Ordering::Relaxed);
+            let links = Cell::new(0);
+            let r = open_target_nd(OpenAt::Root(&top), b"d/x", &op, true, &links);
+            seen = (CALLS.load(Ordering::Relaxed), BITS.load(Ordering::Relaxed));
+            if r.is_ok_and(|(p, made)| !made && p.get_inode().is_some_and(|i| i.ino == SEEN))
+                && seen == (1, want.bits())
+            {
+                return;
+            }
+        }
+        panic!("revalidations {} flags {:#x}", seen.0, seen.1);
+    }
+
+    /// The symlink count is the open's, not one try's (Linux
+    /// nd->total_link_count, set once by do_filp_open): each followed
+    /// link adds to it, and a try that starts with MAXSYMLINKS counted
+    /// already, as a ref-mode retry after an RCU try that followed them
+    /// would, is ELOOP at its first link
+    #[test]
+    // The walk reads the current task, an aarch64 per-CPU register a
+    // host (EL0) test cannot read
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn link_count_is_the_opens() {
+        let root = DentryRef::new(Dentry::new_root_op(
+            inode(1, InodeMode::directory(0o755)),
+            &OPS,
+        ))
+        .unwrap();
+        let _f = Dentry::alloc(&root, b"f", Some(inode(5, InodeMode::regular(0o644)))).unwrap();
+        let l = inode(6, InodeMode::symlink());
+        l.set_link(b"f".as_slice().into());
+        let _l = Dentry::alloc(&root, b"l", Some(l)).unwrap();
+        let top = Path::new(crate::fs::mount::test_mnt_root(root.clone()), root);
+        let op = build_open_flags(&build_open_how(O_RDONLY, 0)).unwrap();
+        // One try from `n` links counted: its answer (an RCU try a
+        // concurrent mount change made ECHILD is tried again) and the
+        // count after it
+        let try_from = |rcu: bool, n: usize| loop {
+            let links = Cell::new(n);
+            let r = open_target_nd(OpenAt::Root(&top), b"l", &op, rcu, &links);
+            if !matches!(r, Err(KernelError::NoChild)) {
+                return (r.map(|(p, _)| p.get_inode().map(|i| i.ino)), links.get());
+            }
+        };
+        for rcu in [true, false] {
+            assert_eq!(try_from(rcu, 0), (Ok(Some(5)), 1), "rcu {rcu}");
+            let (r, n) = try_from(rcu, 40);
+            assert_eq!((r.err(), n), (Some(KernelError::TooManySymlinks), 40));
+        }
+    }
 }

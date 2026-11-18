@@ -27,16 +27,23 @@
 //! (IrqSpinlock).
 
 use super::cb::{
-    ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
+    Live, ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
 };
 use super::output::Push;
 use crate::net::mib::*;
 use crate::util::error::KernelError;
 
-impl TcpCb {
-    /// Current timeout: the base RTO backed off, at most RTO_MAX
+impl Live {
+    /// Current timeout: the base RTO backed off, at most RTO_MAX (Linux
+    /// icsk_rto)
     pub(super) fn rto_cur(&self) -> u64 {
-        (self.rto << self.backoff.min(16)).min(RTO_MAX)
+        (self.rto.get() << self.backoff.get().min(16)).min(RTO_MAX)
+    }
+}
+
+impl TcpCb {
+    pub(super) fn rto_cur(&self) -> u64 {
+        self.live.rto_cur()
     }
 
     /// (Re)start the retransmission timer (no later than the user
@@ -46,7 +53,7 @@ impl TcpCb {
         if let Some(left) = self.user_left(now) {
             t = t.min(left.max(1));
         }
-        self.tmr = Some((Tmr::Rtx, now + t));
+        self.live.tmr.set(Some((Tmr::Rtx, now + t)));
     }
 
     /// TCP_USER_TIMEOUT time left while retransmitting or probing
@@ -71,14 +78,16 @@ impl TcpCb {
             let var = (self.rttvar4 / 4) as i64;
             self.rttvar4 = (self.rttvar4 as i64 + delta.abs() - var).max(0) as u64;
         }
-        self.rto = (self.srtt8 / 8 + self.rttvar4.max(1)).clamp(RTO_MIN, RTO_MAX);
-        self.backoff = 0;
+        self.live
+            .rto
+            .set((self.srtt8 / 8 + self.rttvar4.max(1)).clamp(RTO_MIN, RTO_MAX));
+        self.live.backoff.set(0);
     }
 
     /// RFC 6298 5.7: SYN retransmitted and no RTT measured
     pub(super) fn set_rto_fallback(&mut self) {
         if self.srtt8 == 0 {
-            self.rto = RTO_FALLBACK;
+            self.live.rto.set(RTO_FALLBACK);
         }
     }
 
@@ -123,8 +132,8 @@ impl TcpCb {
     /// A deadline passed (call at or after `next_timer()`)
     pub fn on_timer(&mut self, now: u64, out: &mut Out) {
         self.tick(now);
-        if self.wait_at.is_some_and(|t| t <= now) {
-            self.wait_at = None;
+        if self.live.wait_at.get().is_some_and(|t| t <= now) {
+            self.live.wait_at.set(None);
             match self.state {
                 TcpState::TimeWait => self.set_closed(out),
                 // Orphan in FIN_WAIT_2 too long (Linux tcp_keepalive_timer)
@@ -136,17 +145,17 @@ impl TcpCb {
         if self.dack.at.is_some_and(|t| t <= now) {
             self.delack_timer(out);
         }
-        if self.keep_at.is_some_and(|t| t <= now) {
-            self.keep_at = None;
+        if self.live.keep_at.get().is_some_and(|t| t <= now) {
+            self.live.keep_at.set(None);
             self.keepalive_timer(now, out);
         }
-        let Some((kind, at)) = self.tmr else {
+        let Some((kind, at)) = self.live.tmr.get() else {
             return;
         };
         if at > now {
             return;
         }
-        self.tmr = None;
+        self.live.tmr.set(None);
         match kind {
             Tmr::Rtx => self.rtx_timer(now, out),
             Tmr::Probe => self.probe_timer(now, out),
@@ -168,15 +177,15 @@ impl TcpCb {
         }
         // Linux tcp_write_timeout: reset while the RTO is short or the
         // retries are not used up
-        let reset = self.rto_cur() < RTO_MAX || !self.gave_up(self.backoff, now);
+        let reset = self.rto_cur() < RTO_MAX || !self.gave_up(self.live.backoff.get(), now);
         if !handshake && self.out_of_resources(now, reset, out) {
             return;
         }
-        if self.gave_up(self.backoff, now) {
+        if self.gave_up(self.live.backoff.get(), now) {
             self.timed_out(out);
             return;
         }
-        if self.backoff == 0 && !handshake {
+        if self.live.backoff.get() == 0 && !handshake {
             // Linux: the first timeout ends Reno recovery or disorder
             if self.cong.in_recovery() {
                 self.net_stat(LINUX_MIB_TCPRENORECOVERYFAIL);
@@ -187,7 +196,7 @@ impl TcpCb {
         let flight = self.snd_max.wrapping_sub(self.snd_una);
         self.cong.on_rto(flight);
         self.rtt_seq = None;
-        self.backoff += 1;
+        self.live.backoff.set(self.live.backoff.get() + 1);
         self.stats.rto_count = self.stats.rto_count.wrapping_add(1);
         if handshake {
             self.syn_rtx = true;
@@ -252,8 +261,8 @@ impl TcpCb {
         if self.rtx_stamp.is_none() {
             self.rtx_stamp = Some(now);
         }
-        self.probes += 1;
-        if self.gave_up(self.probes - 1, now) {
+        self.live.probes.set(self.live.probes.get() + 1);
+        if self.gave_up(self.live.probes.get() - 1, now) {
             self.timed_out(out);
             return;
         }
@@ -261,12 +270,12 @@ impl TcpCb {
             return;
         }
         self.send_probe(LINUX_MIB_TCPWINPROBE, out);
-        self.backoff += 1;
+        self.live.backoff.set(self.live.backoff.get() + 1);
         let mut t = self.rto_cur().max(RTO_MIN);
         if let Some(left) = self.user_left(now) {
             t = t.min(left.max(1));
         }
-        self.tmr = Some((Tmr::Probe, now + t));
+        self.live.tmr.set(Some((Tmr::Probe, now + t)));
     }
 
     // --- keepalive ------------------------------------------------------------
@@ -307,10 +316,10 @@ impl TcpCb {
     /// (Re)start keepalive after the connection opened or an option
     /// changed (Linux tcp_set_keepalive / tcp_sock_set_keepidle_locked)
     pub fn arm_keepalive(&mut self, now: u64) {
-        self.keep_at = None;
+        self.live.keep_at.set(None);
         if self.opts.keepalive && self.keep_state() {
             let left = self.keep_idle().saturating_sub(self.idle(now));
-            self.keep_at = Some(now + left);
+            self.live.keep_at.set(Some(now + left));
         }
     }
 
@@ -332,8 +341,8 @@ impl TcpCb {
             self.keep_idle()
         } else if idle >= self.keep_idle() {
             let ut = u64::from(self.opts.user_timeout);
-            if (ut != 0 && idle >= ut && self.probes > 0)
-                || (ut == 0 && self.probes >= self.keep_cnt())
+            if (ut != 0 && idle >= ut && self.live.probes.get() > 0)
+                || (ut == 0 && self.live.probes.get() >= self.keep_cnt())
             {
                 // Linux tcp_keepalive_timer -> tcp_write_err
                 self.abort(out);
@@ -342,12 +351,12 @@ impl TcpCb {
                 return;
             }
             self.send_probe(LINUX_MIB_TCPKEEPALIVE, out);
-            self.probes += 1;
+            self.live.probes.set(self.live.probes.get() + 1);
             self.keep_intvl()
         } else {
             self.keep_idle() - idle
         };
-        self.keep_at = Some(now + next);
+        self.live.keep_at.set(Some(now + next));
     }
 }
 
@@ -361,8 +370,11 @@ impl TcpCb {
     /// timers (`RTX`, `DELACK`, `KEEPALIVE`; Linux icsk_timeout,
     /// icsk_ack.timeout, sk_timer's expiry), ms
     pub fn deadlines(&self) -> [Option<u64>; 3] {
-        let keep = [self.keep_at, self.wait_at].into_iter().flatten().min();
-        [self.tmr.map(|t| t.1), self.dack.at, keep]
+        let keep = [self.live.keep_at.get(), self.live.wait_at.get()]
+            .into_iter()
+            .flatten()
+            .min();
+        [self.live.tmr.get().map(|t| t.1), self.dack.at, keep]
     }
 }
 

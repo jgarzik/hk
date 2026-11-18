@@ -203,7 +203,7 @@ qemu_extra_args() {
 
 setup_arm_config() {
     QEMU_BIN="qemu-system-aarch64"
-    KERNEL="target/aarch64-unknown-none/release/kernel"
+    KERNEL="target/aarch64-unknown-none-softfloat/release/kernel"
     INITRAMFS="user/initramfs-aarch64.cpio"
     SERIAL_LOG="$QEMU_LOG_DIR/serial_arm.log"
 

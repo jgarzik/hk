@@ -1,9 +1,9 @@
 //! Directory navigation syscalls (chdir, fchdir, chroot, getcwd)
 
 use crate::fs::dac::{self, MAY_CHDIR, MAY_EXEC};
-use crate::fs::namei::{getname, path_lookupat};
+use crate::fs::namei::{Start, getname, path_lookup};
 use crate::fs::{Dentry, KernelError, LookupFlags, Path};
-use crate::task::percpu::{current_cwd, current_fs};
+use crate::task::percpu::current_fs;
 use crate::uaccess::{UserPtr, copy_to_user};
 use crate::util::error::KernelResult;
 
@@ -22,7 +22,7 @@ fn may_chdir(d: &Dentry) -> Result<(), KernelError> {
 /// The searchable directory `path_ptr` names, from the cwd
 fn chdir_target(path_ptr: UserPtr<u8>) -> KernelResult<Path> {
     let name = getname(path_ptr, false)?;
-    let path = path_lookupat(current_cwd(), &name, LookupFlags::opendir())?;
+    let path = path_lookup(Start::Cwd, &name, LookupFlags::opendir())?;
     may_chdir(&path.dentry)?;
     Ok(path)
 }
@@ -86,7 +86,7 @@ pub fn sys_getcwd(buf: UserPtr<u8>, size: u64) -> KernelResult<usize> {
     // Linux getcwd: ENOENT for a removed directory; one outside the
     // root (a chroot escape, a detached mount) is "(unreachable)..."
     let pwd = fs.get_pwd();
-    if pwd.dentry.is_unhashed() {
+    if pwd.dentry.d_unlinked() {
         return Err(KernelError::NotFound);
     }
     let root = crate::fs::namei::nd_root()?;

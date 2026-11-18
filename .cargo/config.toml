@@ -18,5 +18,5 @@ rustflags = [
 ]
 
 # The linker script comes from build.rs
-[target.aarch64-unknown-none]
+[target.aarch64-unknown-none-softfloat]
 linker = "rust-lld"

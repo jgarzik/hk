@@ -24,7 +24,6 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::FRAME_ALLOCATOR;
-use crate::cpu::PerCpu;
 use crate::mm::page::{PG_ACTIVE, PG_LRU, Page, pfn_to_page, phys_to_page};
 use crate::sync::IrqSpinlock;
 
@@ -143,10 +142,12 @@ struct Batch {
     pfn: [u64; BATCH],
 }
 
-static BATCHES: PerCpu<IrqSpinlock<Batch>> = crate::percpu![IrqSpinlock::new(Batch {
+crate::percpu! {
+    static BATCHES: IrqSpinlock<Batch> = IrqSpinlock::new(Batch {
     n: 0,
     pfn: [0; BATCH],
-})];
+});
+}
 
 /// Move pages to the head of the inactive list, then drop the batch's
 /// references (after the lock)

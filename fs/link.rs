@@ -3,15 +3,13 @@
 //! This module contains syscalls for creating, reading, and removing
 //! filesystem links, as well as renaming files.
 
-use alloc::sync::Arc;
-
-use crate::fs::dentry::{Dentry, d_exchange, d_move};
+use crate::fs::dentry::{Dentry, LookupBits, d_exchange, d_move};
 use crate::fs::namei::{
     Last, Parent, create_entry, delete_entry, filename_create, filename_lookup, filename_parentat,
     getname,
 };
 use crate::fs::{
-    Inode, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
+    InodeRef, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
     lock_two_nondirs, lookup_one,
 };
 use crate::uaccess::{UserPtr, UserSlice};
@@ -130,9 +128,13 @@ pub fn sys_readlinkat(
     }
     // e.g. /proc/<pid>/exe: EACCES, ENOENT (Linux returns the get_link
     // error)
-    let target = match inode.i_op.readlink(&inode) {
-        Err(KernelError::OperationNotSupported) => return Err(KernelError::InvalidArgument),
-        r => r?,
+    // A target kept in the inode first (Linux vfs_readlink: i_link)
+    let target = match inode.i_link() {
+        Some(l) => l.to_vec(),
+        None => match inode.i_op.readlink(&inode) {
+            Err(KernelError::OperationNotSupported) => return Err(KernelError::InvalidArgument),
+            r => r?,
+        },
     };
     let n = target.len().min(bufsiz as usize);
     UserSlice::new(buf.addr(), bufsiz as usize)
@@ -163,16 +165,15 @@ pub fn sys_link(oldpath_ptr: UserPtr<u8>, newpath_ptr: UserPtr<u8>) -> KernelRes
 /// unless it is a linkable O_TMPFILE file,
 /// and no unlink can drop its last link between that check and the link
 /// (Linux vfs_link: inode_lock(inode), i_nlink == 0 -> ENOENT)
-fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), KernelError> {
-    use core::sync::atomic::Ordering::Relaxed;
+fn link_locked(dir: &InodeRef, name: &[u8], inode: &InodeRef) -> Result<(), KernelError> {
     let _lock = inode.lock();
     // An O_TMPFILE file (I_LINKABLE) gets its first name once
-    if inode.get_nlink() == 0 && !inode.i_linkable.load(Relaxed) {
+    if inode.get_nlink() == 0 && !inode.is_linkable() {
         return Err(KernelError::NotFound);
     }
+    // The times are the filesystem's (Linux simple_link)
     dir.i_op.link(dir, name, inode)?;
-    inode.i_linkable.store(false, Relaxed);
-    inode.touch_c();
+    inode.set_linkable(false);
     Ok(())
 }
 
@@ -381,7 +382,7 @@ fn do_renameat2(
 }
 
 /// One side of a rename: the split path and its parent's inode
-type Side<'a> = (&'a Parent, &'a Arc<Inode>);
+type Side<'a> = (&'a Parent, &'a InodeRef);
 
 /// The rename itself with both parents locked (Linux do_renameat2 trap
 /// check + vfs_rename): may_delete of the source, may_create or
@@ -390,9 +391,17 @@ type Side<'a> = (&'a Parent, &'a Arc<Inode>);
 fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelError> {
     let ((op, oname), odir) = ((&old.0.dir, old.0.name.as_slice()), old.1);
     let ((np, nname), ndir) = ((&new.0.dir, new.0.name.as_slice()), new.1);
-    let src = lookup_one(op, oname)?;
+    // Linux __start_renaming: the target looked up with
+    // LOOKUP_RENAME_TARGET | LOOKUP_CREATE (none for RENAME_EXCHANGE),
+    // and LOOKUP_EXCL for RENAME_NOREPLACE
+    let src = lookup_one(op, oname, LookupBits::empty())?;
     let sinode = src.get_inode().ok_or(KernelError::NotFound)?;
-    let dst = lookup_one(np, nname)
+    let mut tflags = LookupBits::RENAME_TARGET | LookupBits::CREATE;
+    if flags & RENAME_EXCHANGE != 0 {
+        tflags = LookupBits::empty();
+    }
+    tflags.set(LookupBits::EXCL, flags & RENAME_NOREPLACE != 0);
+    let dst = lookup_one(np, nname, tflags)
         .ok()
         .filter(|d| d.get_inode().is_some());
     let dinode = dst.as_ref().and_then(|d| d.get_inode());
@@ -447,7 +456,7 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
             if exchange { d.mode().is_dir() } else { is_dir },
         )?,
     }
-    if !Arc::ptr_eq(odir, ndir) {
+    if !InodeRef::ptr_eq(odir, ndir) {
         if is_dir {
             dac::permission_as(&c, &sinode, MAY_WRITE)?;
         }
@@ -488,16 +497,15 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
     {
         d.set_dead();
     }
-    // Both parents' mtime and ctime, both inodes' ctime (Linux
-    // simple_rename_timestamp)
-    if r.is_ok() {
-        odir.touch_mc();
-        ndir.touch_mc();
-        sinode.touch_c();
-        if let Some(d) = &dinode {
-            d.touch_c();
-        }
+    // The replaced name: what other namespaces mounted on it goes, and
+    // nothing is mounted there any more (Linux vfs_rename: dont_mount,
+    // detach_mounts, under the target's lock)
+    if let Some(t) = dst.as_ref().filter(|_| !exchange && r.is_ok()) {
+        t.dont_mount();
+        super::mount::detach_mounts(t);
     }
+    // The times are the filesystem's (Linux simple_rename_timestamp
+    // in ->rename)
     drop(dead_lock);
     drop(nondirs);
     r?;

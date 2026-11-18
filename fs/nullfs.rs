@@ -25,7 +25,7 @@ use super::KernelError;
 use super::dac::MAY_WRITE;
 use super::dentry::Dentry;
 use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
-use super::inode::{FileType, Inode, InodeMode, InodeOps};
+use super::inode::{FileType, Inode, InodeMode, InodeOps, InodeRef};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
@@ -41,7 +41,7 @@ impl SuperOps for NullfsSuperOps {
         _sb: &Arc<SuperBlock>,
         _mode: InodeMode,
         _i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         Err(KernelError::NotPermitted)
     }
 
@@ -64,7 +64,7 @@ struct NullfsInodeOps;
 
 impl InodeOps for NullfsInodeOps {
     /// Empty: every name is negative
-    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
         Err(KernelError::NotFound)
     }
 
@@ -159,7 +159,7 @@ fn is_file(file: &File) -> bool {
 struct NullfsFileInodeOps;
 
 impl InodeOps for NullfsFileInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<InodeRef, KernelError> {
         Err(KernelError::NotDirectory)
     }
 

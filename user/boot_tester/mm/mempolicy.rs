@@ -1,16 +1,13 @@
 //! NUMA Memory Policy syscall tests
 //!
 //! Tests for get_mempolicy, set_mempolicy, and mbind syscalls.
-//! These are stub implementations for single-node systems.
-//!
-//! NOTE: Running these tests on aarch64 causes CLONE_CLEAR_SIGHAND to fail
-//! due to a binary layout sensitivity issue. The tests are conditionally
-//! skipped on ARM until this is investigated.
+//! Single-node machines: node 0 is the only one with memory.
 
-use crate::helpers::{print, print_num, println};
+use crate::harness::{R, check, report_r};
+use crate::helpers::{linux_at_least, print, print_num, println};
 #[allow(unused_imports)]
 use hk_syscall::{
-    sys_get_mempolicy, sys_mbind, sys_migrate_pages, sys_mmap, sys_move_pages, sys_munmap,
+    sys_brk, sys_get_mempolicy, sys_mbind, sys_migrate_pages, sys_mmap, sys_move_pages, sys_munmap,
     sys_set_mempolicy,
 };
 
@@ -50,6 +47,20 @@ pub fn run_tests() {
     test_move_pages_node0();
     test_move_pages_invalid_node();
     test_migrate_pages_perm();
+    reset();
+
+    run(b"MPOL_SET_GET", set_get);
+    run(b"MPOL_MAXNODE", maxnode);
+    run(b"MPOL_MODE_FLAGS", mode_flags);
+    run(b"MPOL_GET_FLAGS", get_flags);
+    run(b"MPOL_FORK", fork_inherits);
+    run(b"MPOL_ADDR", addr_policy);
+    run(b"MBIND_POLICY", mbind_policy);
+    run(b"MBIND_HOLES", mbind_holes);
+    run(b"MBIND_STRICT", mbind_strict);
+    run(b"MBIND_FORK", mbind_fork);
+    run(b"MBIND_BRK", mbind_brk);
+    run(b"MIGRATE_MAXNODE", migrate_maxnode);
 }
 
 /// Test: Get default memory policy
@@ -60,7 +71,7 @@ fn test_get_mempolicy_default() {
     let mut policy: i32 = -1;
     let ret = sys_get_mempolicy(&mut policy as *mut i32, core::ptr::null_mut(), 0, 0, 0);
 
-    if ret == 0 && (policy == MPOL_DEFAULT || policy == MPOL_LOCAL) {
+    if ret == 0 && policy == MPOL_DEFAULT {
         println(b"PASS");
     } else {
         print(b"FAIL (ret=");
@@ -431,4 +442,481 @@ fn test_migrate_pages_perm() {
         print_num(i64::from(st));
         println(b"");
     }
+}
+
+const EINVAL: i64 = -22;
+const EFAULT: i64 = -14;
+const MPOL_PREFERRED_MANY: i32 = 5;
+const MPOL_WEIGHTED_INTERLEAVE: i32 = 6;
+const MPOL_F_STATIC_NODES: i32 = 1 << 15;
+const MPOL_F_RELATIVE_NODES: i32 = 1 << 14;
+const MPOL_F_NUMA_BALANCING: i32 = 1 << 13;
+const MPOL_F_NODE: u64 = 1;
+const MPOL_F_ADDR: u64 = 2;
+const MPOL_F_MEMS_ALLOWED: u64 = 4;
+const PAGE: u64 = 4096;
+
+/// Run `f` with the task policy reset after it, and report it
+fn run(name: &[u8], f: fn() -> R) {
+    let r = f();
+    reset();
+    report_r(name, r);
+}
+
+/// Back to MPOL_DEFAULT
+fn reset() {
+    sys_set_mempolicy(MPOL_DEFAULT, core::ptr::null(), 0);
+}
+
+/// set_mempolicy with a one-word mask, all 64 bits read
+fn set1(mode: i32, mask: u64) -> i64 {
+    sys_set_mempolicy(mode, &mask, 65)
+}
+
+/// (return, policy, mask) of get_mempolicy with a one-word mask
+fn get1(addr: u64, flags: u64) -> (i64, i32, u64) {
+    let mut p = -1;
+    let mut m = !0u64;
+    let r = sys_get_mempolicy(&mut p, &mut m, 64, addr, flags);
+    (r, p, m)
+}
+
+/// The task policy is `want` with nodes `mask`
+fn is_pol(want: i32, mask: u64) -> R {
+    let (r, p, m) = get1(0, 0);
+    check(b"get_mempolicy", r == 0, r)?;
+    check(b"policy", p == want, i64::from(p))?;
+    check(b"nodes", m == mask, m as i64)
+}
+
+/// MPOL_SET_GET: set_mempolicy stores the policy and get_mempolicy
+/// reports it (Linux do_set_mempolicy, do_get_mempolicy): nodes without
+/// memory are dropped, none left is EINVAL; MPOL_PREFERRED without
+/// nodes is MPOL_LOCAL; MPOL_DEFAULT and MPOL_LOCAL take no nodes; a
+/// refused call keeps the old policy
+fn set_get() -> R {
+    let cases: [(i32, u64, i32, u64); 7] = [
+        (MPOL_BIND, 1, MPOL_BIND, 1),
+        (MPOL_PREFERRED, 1, MPOL_PREFERRED, 1),
+        (MPOL_INTERLEAVE, 1, MPOL_INTERLEAVE, 1),
+        (MPOL_LOCAL, 0, MPOL_LOCAL, 0),
+        (MPOL_PREFERRED, 0, MPOL_LOCAL, 0),
+        (MPOL_BIND, 1 | 1 << 5, MPOL_BIND, 1),
+        (MPOL_DEFAULT, 0, MPOL_DEFAULT, 0),
+    ];
+    for (mode, mask, want, wmask) in cases {
+        let r = set1(mode, mask);
+        check(b"set_mempolicy", r == 0, r)?;
+        is_pol(want, wmask)?;
+    }
+    let r = set1(MPOL_BIND, 1 << 5);
+    check(b"no node with memory", r == EINVAL, r)?;
+    let r = set1(MPOL_DEFAULT, 1);
+    check(b"default with nodes", r == EINVAL, r)?;
+    let r = set1(MPOL_LOCAL, 1);
+    check(b"local with nodes", r == EINVAL, r)?;
+    let r = set1(MPOL_BIND, 0);
+    check(b"bind without nodes", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_INTERLEAVE, core::ptr::null(), 64);
+    check(b"interleave null mask", r == EINVAL, r)?;
+    let r = set1(MPOL_PREFERRED, 1);
+    check(b"preferred", r == 0, r)?;
+    let r = set1(MPOL_BIND, 1 << 5);
+    check(b"refused", r == EINVAL, r)?;
+    is_pol(MPOL_PREFERRED, 1)
+}
+
+/// MPOL_MAXNODE: the mask holds maxnode - 1 bits (Linux get_nodes):
+/// maxnode 0 is EINVAL, 1 reads none; bits past the kernel's
+/// MAX_NUMNODES must be zero; more than a page of bits is EINVAL
+fn maxnode() -> R {
+    let one = 1u64;
+    let r = sys_set_mempolicy(MPOL_BIND, &one, 0);
+    check(b"maxnode 0", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, &one, 1);
+    check(b"maxnode 1", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, &one, 2);
+    check(b"maxnode 2", r == 0, r)?;
+    let top = 1u64 << 63;
+    let r = sys_set_mempolicy(MPOL_BIND, &top, 64);
+    check(b"bit 63 of 64", r == EINVAL, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, &(top | 1), 64);
+    check(b"bits 0 and 63 of 64", r == 0, r)?;
+    // A page of bits; 1100 is past any MAX_NUMNODES (at most 1024)
+    let mut page = [0u64; 512];
+    page[0] = 1;
+    page[1100 / 64] = 1 << (1100 % 64);
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), 2048);
+    check(b"node 1100", r == EINVAL, r)?;
+    page[1100 / 64] = 0;
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), 2048);
+    check(b"2047 bits", r == 0, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), PAGE * 8 + 1);
+    check(b"a page of bits", r == 0, r)?;
+    let r = sys_set_mempolicy(MPOL_BIND, page.as_ptr(), PAGE * 8 + 2);
+    check(b"past a page", r == EINVAL, r)
+}
+
+/// MPOL_MODE_FLAGS: mode flags (Linux sanitize_mpol_flags, mpol_new):
+/// MPOL_F_STATIC_NODES and MPOL_F_RELATIVE_NODES exclude each other,
+/// need nodes, and make get_mempolicy report the caller's mask;
+/// MPOL_F_NUMA_BALANCING only with MPOL_BIND and MPOL_PREFERRED_MANY
+/// (the latter since Linux 6.10); a mode past MPOL_MAX (MPOL_WEIGHTED_INTERLEAVE
+/// since 6.9) is EINVAL
+fn mode_flags() -> R {
+    let both = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
+    let r = set1(MPOL_BIND | both, 1);
+    check(b"static and relative", r == EINVAL, r)?;
+    let r = set1(MPOL_INTERLEAVE | MPOL_F_NUMA_BALANCING, 1);
+    check(b"balancing interleave", r == EINVAL, r)?;
+    let r = set1(MPOL_BIND | MPOL_F_NUMA_BALANCING, 1);
+    check(b"balancing bind", r == 0, r)?;
+    is_pol(MPOL_BIND | MPOL_F_NUMA_BALANCING, 1)?;
+    let r = set1(MPOL_PREFERRED_MANY | MPOL_F_NUMA_BALANCING, 1);
+    // Before 6.10 EINVAL, unless backported (Ubuntu's 6.8 has it)
+    let old = !linux_at_least(6, 10) && r == EINVAL;
+    check(b"balancing preferred many", r == 0 || old, r)?;
+    let r = set1(MPOL_BIND | MPOL_F_STATIC_NODES, 1 | 1 << 5);
+    check(b"static", r == 0, r)?;
+    is_pol(MPOL_BIND | MPOL_F_STATIC_NODES, 1 | 1 << 5)?;
+    let r = set1(MPOL_BIND | MPOL_F_RELATIVE_NODES, 1 << 1);
+    check(b"relative", r == 0, r)?;
+    is_pol(MPOL_BIND | MPOL_F_RELATIVE_NODES, 1 << 1)?;
+    let r = set1(MPOL_LOCAL | MPOL_F_STATIC_NODES, 0);
+    check(b"static local", r == EINVAL, r)?;
+    let r = set1(MPOL_PREFERRED | MPOL_F_RELATIVE_NODES, 0);
+    check(b"relative preferred local", r == EINVAL, r)?;
+    let r = set1(MPOL_BIND | 1 << 16, 1);
+    check(b"unknown flag", r == EINVAL, r)?;
+    let r = set1(7, 1);
+    check(b"mode 7", r == EINVAL, r)?;
+    let r = set1(MPOL_WEIGHTED_INTERLEAVE, 1);
+    if !linux_at_least(6, 9) {
+        return check(b"weighted interleave", r == EINVAL, r);
+    }
+    check(b"weighted interleave", r == 0, r)?;
+    is_pol(MPOL_WEIGHTED_INTERLEAVE, 1)?;
+    let (r, p, _) = get1(0, MPOL_F_NODE);
+    check(b"weighted next node", r == 0 && p == 0, r)
+}
+
+/// MPOL_GET_FLAGS: get_mempolicy flags and mask sizes (Linux
+/// kernel_get_mempolicy, do_get_mempolicy, copy_nodes_to_user):
+/// MPOL_F_MEMS_ALLOWED alone; an address without MPOL_F_ADDR is EINVAL;
+/// MPOL_F_NODE is the next interleave node, EINVAL for other policies;
+/// a mask shorter than the kernel's node count is EINVAL, words past it
+/// are zeroed, more than a page EINVAL
+fn get_flags() -> R {
+    let (r, _, _) = get1(0, 8);
+    check(b"unknown flag", r == EINVAL, r)?;
+    let (r, p, m) = get1(0, MPOL_F_MEMS_ALLOWED);
+    check(b"mems allowed", r == 0 && p == 0 && m & 1 != 0, r)?;
+    let (r, _, _) = get1(0, MPOL_F_MEMS_ALLOWED | MPOL_F_NODE);
+    check(b"mems allowed node", r == EINVAL, r)?;
+    let (r, _, _) = get1(0, MPOL_F_MEMS_ALLOWED | MPOL_F_ADDR);
+    check(b"mems allowed addr", r == EINVAL, r)?;
+    let (r, _, _) = get1(PAGE, 0);
+    check(b"addr without flag", r == EINVAL, r)?;
+    let (r, _, _) = get1(0, MPOL_F_NODE);
+    check(b"default next node", r == EINVAL, r)?;
+    set1(MPOL_BIND, 1);
+    let (r, _, _) = get1(0, MPOL_F_NODE);
+    check(b"bind next node", r == EINVAL, r)?;
+    set1(MPOL_INTERLEAVE, 1);
+    let (r, p, m) = get1(0, MPOL_F_NODE);
+    check(b"interleave next node", r == 0 && p == 0 && m == 1, r)?;
+    let mut p = -1;
+    let mut w = [!0u64; 3];
+    let r = sys_get_mempolicy(&mut p, w.as_mut_ptr(), 0, 0, 0);
+    check(b"maxnode 0", r == EINVAL, r)?;
+    let r = sys_get_mempolicy(&mut p, core::ptr::null_mut(), 0, 0, 0);
+    check(b"no mask", r == 0 && p == MPOL_INTERLEAVE, r)?;
+    let r = sys_get_mempolicy(&mut p, w.as_mut_ptr(), 129, 0, 0);
+    check(b"129 bits", r == 0, r)?;
+    check(b"word 0", w[0] == 1, w[0] as i64)?;
+    check(b"word 1 zeroed", w[1] == 0, w[1] as i64)?;
+    check(b"word 2 kept", w[2] == !0, w[2] as i64)?;
+    let r = sys_get_mempolicy(&mut p, w.as_mut_ptr(), PAGE * 8 + 2, 0, 0);
+    check(b"past a page", r == EINVAL, r)
+}
+
+/// MPOL_FORK: a child starts with its parent's policy (Linux
+/// copy_process: mpol_dup) and changes only its own
+fn fork_inherits() -> R {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    set1(MPOL_INTERLEAVE, 1);
+    let pid = sys_fork();
+    if pid == 0 {
+        let (r, p, m) = get1(0, 0);
+        let code = if r != 0 || p != MPOL_INTERLEAVE || m != 1 {
+            1
+        } else if get1(0, MPOL_F_NODE) != (0, 0, 1) {
+            2
+        } else if set1(MPOL_LOCAL, 0) != 0 {
+            3
+        } else {
+            0
+        };
+        sys_exit(code);
+    }
+    check(b"fork", pid > 0, pid)?;
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    check(b"child", st == 0, i64::from(st))?;
+    is_pol(MPOL_INTERLEAVE, 1)
+}
+
+/// MPOL_ADDR: MPOL_F_ADDR reports the policy of the VMA at the address,
+/// MPOL_DEFAULT without one (never the task's), EFAULT outside any VMA;
+/// with MPOL_F_NODE the node of its page, faulted in if missing (Linux
+/// lookup_node), EFAULT if it cannot be read
+fn addr_policy() -> R {
+    set1(MPOL_BIND, 1);
+    let len = 2 * PAGE;
+    let p = sys_mmap(
+        0,
+        len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    check(b"mmap", p > 0, p)?;
+    let a = p as u64;
+    let r = addr_checks(a);
+    sys_munmap(a, len);
+    r?;
+    let (r, _, _) = get1(a, MPOL_F_ADDR);
+    check(b"unmapped", r == EFAULT, r)?;
+    let q = sys_mmap(0, PAGE, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(b"mmap none", q > 0, q)?;
+    let (r1, p1, _) = get1(q as u64, MPOL_F_ADDR);
+    let (r2, _, _) = get1(q as u64, MPOL_F_ADDR | MPOL_F_NODE);
+    sys_munmap(q as u64, PAGE);
+    check(b"prot none", r1 == 0 && p1 == MPOL_DEFAULT, r1)?;
+    check(b"prot none node", r2 == EFAULT, r2)
+}
+
+/// The MPOL_ADDR checks on the two fresh pages at `a`
+fn addr_checks(a: u64) -> R {
+    let (r, p, m) = get1(a + 8, MPOL_F_ADDR);
+    check(
+        b"vma policy",
+        r == 0 && p == MPOL_DEFAULT && m == 0,
+        i64::from(p),
+    )?;
+    // SAFETY: the first page is mapped writable
+    unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+    let (r, p, _) = get1(a, MPOL_F_ADDR | MPOL_F_NODE);
+    check(b"touched node", r == 0 && p == 0, r)?;
+    let (r, p, _) = get1(a + PAGE, MPOL_F_ADDR | MPOL_F_NODE);
+    check(b"untouched node", r == 0 && p == 0, r)
+}
+
+const MPOL_MF_STRICT: u32 = 1;
+const MPOL_MF_MOVE: u32 = 2;
+const MPOL_MF_LAZY: u32 = 8;
+
+/// mbind with a one-word mask, all 64 bits read
+fn mbind1(a: u64, len: u64, mode: i32, mask: u64, flags: u32) -> i64 {
+    sys_mbind(a, len, mode as u64, &mask, 65, flags)
+}
+
+/// The VMA policy at `a` is `want` with nodes `mask`
+fn vma_is(a: u64, want: i32, mask: u64) -> R {
+    let (r, p, m) = get1(a, MPOL_F_ADDR);
+    check(b"get_mempolicy addr", r == 0, r)?;
+    check(b"vma policy", p == want, i64::from(p))?;
+    check(b"vma nodes", m == mask, m as i64)
+}
+
+/// `pages` fresh anonymous read-write pages
+fn map_pages(pages: u64) -> Result<u64, (&'static [u8], i64)> {
+    let p = sys_mmap(
+        0,
+        pages * PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    check(b"mmap", p > 0, p)?;
+    Ok(p as u64)
+}
+
+/// Run `f` on `pages` fresh pages, unmapped after it
+fn with_pages(pages: u64, f: fn(u64) -> R) -> R {
+    let a = map_pages(pages)?;
+    let r = f(a);
+    sys_munmap(a, pages * PAGE);
+    r
+}
+
+/// MBIND_POLICY: mbind gives the VMAs of the range the policy, split at
+/// its edges, the length rounded up to pages (Linux do_mbind,
+/// mbind_range); MPOL_DEFAULT removes it; the task policy is untouched;
+/// argument checks (EINVAL: flags, alignment, a wrapping range, the
+/// mode's nodes)
+fn mbind_policy() -> R {
+    with_pages(4, |a| {
+        let r = mbind1(a + PAGE, 2 * PAGE, MPOL_BIND, 1, 0);
+        check(b"mbind bind", r == 0, r)?;
+        vma_is(a, MPOL_DEFAULT, 0)?;
+        vma_is(a + PAGE, MPOL_BIND, 1)?;
+        vma_is(a + 2 * PAGE + 8, MPOL_BIND, 1)?;
+        vma_is(a + 3 * PAGE, MPOL_DEFAULT, 0)?;
+        is_pol(MPOL_DEFAULT, 0)?;
+        let r = mbind1(a, 1, MPOL_INTERLEAVE, 1, 0);
+        check(b"mbind one byte", r == 0, r)?;
+        vma_is(a, MPOL_INTERLEAVE, 1)?;
+        vma_is(a + PAGE, MPOL_BIND, 1)?;
+        let r = mbind1(
+            a + 3 * PAGE,
+            PAGE,
+            MPOL_PREFERRED | MPOL_F_STATIC_NODES,
+            1 | 1 << 5,
+            0,
+        );
+        check(b"mbind static", r == 0, r)?;
+        vma_is(
+            a + 3 * PAGE,
+            MPOL_PREFERRED | MPOL_F_STATIC_NODES,
+            1 | 1 << 5,
+        )?;
+        let r = mbind1(a + 2 * PAGE, PAGE, MPOL_PREFERRED, 0, 0);
+        check(b"mbind preferred local", r == 0, r)?;
+        vma_is(a + 2 * PAGE, MPOL_LOCAL, 0)?;
+        let r = mbind1(a, 4 * PAGE, MPOL_DEFAULT, 0, 0);
+        check(b"mbind default", r == 0, r)?;
+        for i in 0..4 {
+            vma_is(a + i * PAGE, MPOL_DEFAULT, 0)?;
+        }
+        let r = mbind1(a, 0, MPOL_BIND, 1, 0);
+        check(b"length 0", r == 0, r)?;
+        let r = mbind1(a + 1, PAGE, MPOL_BIND, 1, 0);
+        check(b"unaligned", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_BIND, 1, MPOL_MF_LAZY);
+        check(b"lazy", r == EINVAL, r)?;
+        let r = mbind1(a, !(PAGE - 1), MPOL_BIND, 1, 0);
+        check(b"wraps", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_BIND, 0, 0);
+        check(b"bind without nodes", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_DEFAULT, 1, 0);
+        check(b"default with nodes", r == EINVAL, r)?;
+        let r = mbind1(a, PAGE, MPOL_BIND, 1 << 5, 0);
+        check(b"no node with memory", r == EINVAL, r)?;
+        vma_is(a, MPOL_DEFAULT, 0)
+    })
+}
+
+/// MBIND_HOLES: a hole in the range is EFAULT and nothing changes,
+/// except for MPOL_DEFAULT; a range with no VMA is EFAULT for every
+/// mode (Linux queue_pages_range, queue_pages_test_walk)
+fn mbind_holes() -> R {
+    let a = map_pages(3)?;
+    sys_munmap(a + PAGE, PAGE);
+    let r = holes(a);
+    sys_munmap(a, 3 * PAGE);
+    r?;
+    let r = mbind1(a, PAGE, MPOL_DEFAULT, 0, 0);
+    check(b"unmapped", r == EFAULT, r)
+}
+
+/// The MBIND_HOLES checks: pages 0 and 2 at `a` mapped, 1 not
+fn holes(a: u64) -> R {
+    let r = mbind1(a, 3 * PAGE, MPOL_BIND, 1, 0);
+    check(b"middle hole", r == EFAULT, r)?;
+    vma_is(a, MPOL_DEFAULT, 0)?;
+    let r = mbind1(a, 2 * PAGE, MPOL_BIND, 1, 0);
+    check(b"tail hole", r == EFAULT, r)?;
+    let r = mbind1(a + PAGE, 2 * PAGE, MPOL_BIND, 1, 0);
+    check(b"head hole", r == EFAULT, r)?;
+    vma_is(a + 2 * PAGE, MPOL_DEFAULT, 0)?;
+    let r = mbind1(a + PAGE, PAGE, MPOL_DEFAULT, 0, 0);
+    check(b"default in the hole", r == EFAULT, r)?;
+    let r = mbind1(a + 2 * PAGE, PAGE, MPOL_BIND, 1, 0);
+    check(b"bind", r == 0, r)?;
+    let r = mbind1(a, 3 * PAGE, MPOL_DEFAULT, 0, 0);
+    check(b"default over the hole", r == 0, r)?;
+    vma_is(a + 2 * PAGE, MPOL_DEFAULT, 0)
+}
+
+/// MBIND_STRICT: MPOL_MF_STRICT with a page off the policy's nodes is
+/// EIO and, without a move, leaves the policy unchanged; with
+/// MPOL_MF_MOVE the page goes where the policy puts it (here: where it
+/// is); untouched pages and MPOL_DEFAULT check nothing (Linux
+/// queue_folios_pte_range, strictly_unmovable)
+fn mbind_strict() -> R {
+    with_pages(2, |a| {
+        // SAFETY: the first page is mapped writable
+        unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+        let r = mbind1(a, 2 * PAGE, MPOL_BIND, 1, MPOL_MF_STRICT);
+        check(b"strict on node 0", r == 0, r)?;
+        vma_is(a, MPOL_BIND, 1)?;
+        let r = mbind1(a, 2 * PAGE, MPOL_LOCAL, 0, MPOL_MF_STRICT);
+        check(b"strict local", r == -5, r)?;
+        vma_is(a, MPOL_BIND, 1)?;
+        let r = mbind1(a + PAGE, PAGE, MPOL_LOCAL, 0, MPOL_MF_STRICT);
+        check(b"strict untouched", r == 0, r)?;
+        vma_is(a + PAGE, MPOL_LOCAL, 0)?;
+        let r = mbind1(a, 2 * PAGE, MPOL_LOCAL, 0, MPOL_MF_STRICT | MPOL_MF_MOVE);
+        check(b"strict move local", r == 0, r)?;
+        vma_is(a, MPOL_LOCAL, 0)?;
+        let r = mbind1(a, 2 * PAGE, MPOL_DEFAULT, 0, MPOL_MF_STRICT);
+        check(b"strict default", r == 0, r)?;
+        vma_is(a, MPOL_DEFAULT, 0)
+    })
+}
+
+/// MBIND_FORK: a child's VMAs keep their policies (Linux dup_mmap:
+/// vma_dup_policy)
+fn mbind_fork() -> R {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    with_pages(2, |a| {
+        let r = mbind1(a + PAGE, PAGE, MPOL_INTERLEAVE, 1, 0);
+        check(b"mbind", r == 0, r)?;
+        let pid = sys_fork();
+        if pid == 0 {
+            let ok =
+                vma_is(a, MPOL_DEFAULT, 0).is_ok() && vma_is(a + PAGE, MPOL_INTERLEAVE, 1).is_ok();
+            sys_exit(if ok { 0 } else { 1 });
+        }
+        check(b"fork", pid > 0, pid)?;
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+        check(b"child", st == 0, i64::from(st))
+    })
+}
+
+/// MBIND_BRK: brk does not grow a heap VMA that has a policy; the new
+/// pages are a VMA of their own, with none (Linux do_brk_flags:
+/// !vma_policy(vma))
+fn mbind_brk() -> R {
+    let b0 = sys_brk(0) as u64;
+    let base = (b0 + PAGE - 1) & !(PAGE - 1);
+    let r = brk_steps(base);
+    sys_brk(b0);
+    r
+}
+
+fn brk_steps(base: u64) -> R {
+    let r = sys_brk(base + PAGE) as u64;
+    check(b"brk one page", r == base + PAGE, r as i64)?;
+    let r = mbind1(base, PAGE, MPOL_BIND, 1, 0);
+    check(b"mbind heap", r == 0, r)?;
+    vma_is(base, MPOL_BIND, 1)?;
+    let r = sys_brk(base + 2 * PAGE) as u64;
+    check(b"brk grow", r == base + 2 * PAGE, r as i64)?;
+    vma_is(base + PAGE, MPOL_DEFAULT, 0)?;
+    vma_is(base, MPOL_BIND, 1)
+}
+
+/// MIGRATE_MAXNODE: migrate_pages reads its masks as get_nodes does:
+/// maxnode 1 holds no node bits, so the new nodes are empty (EINVAL)
+fn migrate_maxnode() -> R {
+    let one = 1u64;
+    let r = sys_migrate_pages(0, 1, &one, &one);
+    check(b"maxnode 1", r == -22, r)?;
+    let r = sys_migrate_pages(0, 2, &one, &one);
+    check(b"maxnode 2", r >= 0, r)
 }

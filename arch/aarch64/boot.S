@@ -178,7 +178,7 @@ create_boot_tables:
  * Called with the MMU off (BSP and APs); clobbers x1.
  */
 enable_mmu:
-    /* FP/SIMD at EL1 (the kernel is built with NEON) */
+    /* FP/SIMD untrapped at EL0 and EL1 (Linux __cpu_setup) */
     mrs     x1, cpacr_el1
     orr     x1, x1, #(3 << 20)
     msr     cpacr_el1, x1

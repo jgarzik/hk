@@ -68,7 +68,7 @@ pub struct PercpuCounter {
 impl PercpuCounter {
     /// A counter at 0 with a part per possible CPU; ENOMEM
     pub fn new() -> Result<Self, KernelError> {
-        let n = crate::cpu::nr_cpu_ids() as usize;
+        let n = crate::cpu::nr_possible() as usize;
         Ok(Self {
             lock: IrqSpinlock::new(()),
             count: AtomicI64::new(0),
@@ -77,23 +77,28 @@ impl PercpuCounter {
         })
     }
 
-    /// The calling CPU's part (None for a CPU past the parts: a counter
-    /// made before every CPU was up; it adds under the lock)
+    /// The calling CPU's part if it is its alone (None for an unknown
+    /// CPU, or one past or sharing the parts of a counter made before
+    /// every CPU was up: it adds under the lock)
     fn part(&self) -> Option<&AtomicI64> {
-        self.parts.get(crate::cpu::this_id() as usize).map(|p| &p.0)
+        crate::cpu::own_slot(self.parts.len()).map(|c| &self.parts[c].0)
     }
 
     /// Add `amount` (Linux percpu_counter_add_batch)
     pub fn add(&self, amount: i64) {
         let _irq = IrqOff::new();
         if let Some(p) = self.part() {
-            let v = p.fetch_add(amount, Ordering::Relaxed) + amount;
+            use crate::cpu::LocalWord;
+            // SAFETY: this CPU's own part (own_slot), interrupts off
+            // (Linux percpu_counter_add_batch: this_cpu ops)
+            let v = unsafe { p.local_add_return(amount) };
             if v.unsigned_abs() < self.batch.unsigned_abs() {
                 return;
             }
             let _l = self.lock.lock();
-            self.count
-                .fetch_add(p.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+            self.count.fetch_add(v, Ordering::Relaxed);
+            // SAFETY: as above
+            unsafe { p.local_add(v.wrapping_neg()) };
         } else {
             let _l = self.lock.lock();
             self.count.fetch_add(amount, Ordering::Relaxed);
@@ -126,7 +131,8 @@ impl PercpuCounter {
             if (local + amount).unsigned_abs() < self.batch.unsigned_abs()
                 && global + unknown <= limit
             {
-                p.fetch_add(amount, Ordering::Relaxed);
+                // SAFETY: this CPU's own part (own_slot), interrupts off
+                unsafe { crate::cpu::LocalWord::local_add(p, amount) };
                 return true;
             }
         }
@@ -143,7 +149,13 @@ impl PercpuCounter {
             }
         }
         // Fold the calling CPU's part with the amount
-        let folded = amount + part.map_or(0, |p| p.swap(0, Ordering::Relaxed));
+        // (this CPU's own part, interrupts off: a load and a store)
+        let folded = amount
+            + part.map_or(0, |p| {
+                let v = p.load(Ordering::Relaxed);
+                p.store(0, Ordering::Relaxed);
+                v
+            });
         self.count.fetch_add(folded, Ordering::Relaxed);
         true
     }

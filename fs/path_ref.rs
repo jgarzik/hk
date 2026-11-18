@@ -8,8 +8,6 @@
 //! - `path.clone()` is equivalent to Linux's `path_get()`
 //! - `drop(path)` is equivalent to Linux's `path_put()`
 
-use alloc::sync::Arc;
-
 use super::dentry::DentryRef;
 use super::mount::MountRef;
 
@@ -98,7 +96,7 @@ impl Path {
     }
 
     /// Get the inode (if any)
-    pub fn get_inode(&self) -> Option<Arc<super::inode::Inode>> {
+    pub fn get_inode(&self) -> Option<super::inode::InodeRef> {
         self.dentry.get_inode()
     }
 }

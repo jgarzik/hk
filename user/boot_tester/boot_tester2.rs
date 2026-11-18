@@ -14,6 +14,8 @@
 //! `boot_tester2 comm`: exit 0 if the task name (PR_GET_NAME) is
 //! "boot_tester2"; `boot_tester2 dumpable`: exit with PR_GET_DUMPABLE.
 //! `boot_tester2 sleep`: write a byte to fd 3, then sleep until killed.
+//! `boot_tester2 fpzero`: exit 0 if the FP/SIMD registers started in
+//! their initial state.
 //! Started with argc 0, it exits 7.
 
 #![no_std]
@@ -58,11 +60,14 @@ fn print_num(n: i64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        // The FP state the program starts with, for `fpzero`
+        "fxsave [rip + {snap}]",
         "xor ebp, ebp",
         "mov rdi, rsp",
         "and rsp, -16",
         "call {main}",
         "ud2",
+        snap = sym FP_SNAP,
         main = sym rust_start,
     )
 }
@@ -72,11 +77,35 @@ pub unsafe extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        // The FP state the program starts with, for `fpzero`
+        "adrp x9, {snap}",
+        "add x9, x9, :lo12:{snap}",
+        "stp q0, q1, [x9, #0]",
+        "stp q2, q3, [x9, #32]",
+        "stp q4, q5, [x9, #64]",
+        "stp q6, q7, [x9, #96]",
+        "stp q8, q9, [x9, #128]",
+        "stp q10, q11, [x9, #160]",
+        "stp q12, q13, [x9, #192]",
+        "stp q14, q15, [x9, #224]",
+        "stp q16, q17, [x9, #256]",
+        "stp q18, q19, [x9, #288]",
+        "stp q20, q21, [x9, #320]",
+        "stp q22, q23, [x9, #352]",
+        "stp q24, q25, [x9, #384]",
+        "stp q26, q27, [x9, #416]",
+        "stp q28, q29, [x9, #448]",
+        "stp q30, q31, [x9, #480]",
+        "mrs x10, fpcr",
+        "str x10, [x9, #512]",
+        "mrs x10, fpsr",
+        "str x10, [x9, #520]",
         "mov x29, xzr",
         "mov x30, xzr",
         "mov x0, sp",
         "bl {main}",
         "brk 0",
+        snap = sym FP_SNAP,
         main = sym rust_start,
     )
 }
@@ -395,6 +424,33 @@ fn chldsig() -> ! {
     sys_exit(r.max(0) as u64)
 }
 
+/// The FP/SIMD registers at `_start`: x86 an FXSAVE image, arm64
+/// v0-v31 then FPCR and FPSR
+#[repr(C, align(16))]
+struct FpSnap([u64; 66]);
+
+static mut FP_SNAP: FpSnap = FpSnap([0; 66]);
+
+/// fpzero mode: exit 0 if the program started with the initial FP state
+/// (Linux fpsimd_flush_thread: all zero on arm64; x86 fpstate_init: zero
+/// XMM registers, FCW 0x37f, MXCSR 0x1f80), else 1 + the first bad word
+fn fpzero() -> ! {
+    // SAFETY: written once by _start, before any Rust code
+    let s = unsafe { &(*(&raw const FP_SNAP)).0 };
+    #[cfg(target_arch = "aarch64")]
+    let bad = (0..66).find(|&i| s[i] != 0);
+    #[cfg(target_arch = "x86_64")]
+    let bad = if s[0] & 0xffff != 0x37f {
+        Some(0)
+    } else if s[3] & 0xffff_ffff != 0x1f80 {
+        Some(3)
+    } else {
+        // XMM0-15 at byte 160
+        (20..52).find(|&i| s[i] != 0)
+    };
+    sys_exit(bad.map_or(0, |i| 1 + i as u64))
+}
+
 extern "C" fn rust_start(sp: *const u64) -> ! {
     const PR_GET_DUMPABLE: i32 = 3;
     // An exec with no arguments still passes argv[0] "" (Linux
@@ -417,6 +473,7 @@ extern "C" fn rust_start(sp: *const u64) -> ! {
             sys_write(3, ids.as_ptr() as *const u8, 16);
             sys_exit(0);
         }
+        b"fpzero" => fpzero(),
         b"chldsig" => chldsig(),
         b"sigexec" => sigexec(),
         b"sleep" => {

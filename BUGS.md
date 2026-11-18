@@ -176,15 +176,24 @@ Topology is discovered (ACPI SRAT/SLIT, DT `numa-node-id`) and
 getcpu reports it; nothing else uses it. Missing (Linux
 `mm/mempolicy.c`, `mm/migrate.c`):
 
-- Policies are not stored: set_mempolicy and mbind validate and
-  return 0 (the `TaskMempolicy`/`Vma.mempolicy` fields stay default);
-  get_mempolicy always reports MPOL_LOCAL (Linux: the stored mode,
-  MPOL_DEFAULT when none) and ignores MPOL_F_NODE/MPOL_F_ADDR.
+- No shared policy: mbind on a shmem or SysV shm mapping sets only
+  that VMA's `mempolicy` (Linux shmem_set_policy keeps it on the
+  inode, seen by every mapping of it).
 - One buddy zone for all RAM: no per-node zones (pg_data_t) or
   node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
   local) affects where pages come from.
-- No page migration: migrate_pages and move_pages validate and move
-  nothing; move_pages query mode reports node 0 for every page.
+- No page migration: migrate_pages, move_pages and mbind's
+  MPOL_MF_MOVE move nothing (mbind counts a page off the policy's
+  nodes as not moved: EIO with MPOL_MF_STRICT); move_pages query mode
+  reports node 0 for every page.
+- A node is one page frame span (`NumaNode.start_pfn`..`end_pfn`,
+  the bounds of all its SRAT/DT ranges): with interleaved ranges
+  `pfn_to_node` gives a page the first node whose span covers it
+  (Linux page_to_nid: per-section node ids), so get_mempolicy's
+  MPOL_F_NODE|MPOL_F_ADDR and mbind's page check see the wrong node.
+- mbind with MPOL_MF_MOVE counts a misplaced page mapped by several
+  processes as not moved; Linux skips it without MPOL_MF_MOVE_ALL
+  (migrate_folio_add).
 - Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
   run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
   -object memory-backend-ram,id=m1,size=256M -numa
@@ -226,7 +235,10 @@ nosuid, without no_new_privs or a ptracer in the way) sets the
 effective (and saved) uid / gid to the file's owner, and file
 capabilities (security.capability) raise the permitted set
 (bprm_fill_uid, cap_bprm_creds_from_file). hk exec keeps the caller's
-credentials unchanged, so set-id programs run unprivileged.
+credentials unchanged, so set-id programs run unprivileged. The fix
+must read the file's mode, uid and gid under its `i_rwsem`
+(bprm_fill_uid's inode_lock), so a racing chown/chmod never pairs a new
+owner with the old set-id bits.
 
 ## CPU-time timer gaps
 
@@ -234,8 +246,7 @@ credentials unchanged, so set-id programs run unprivileged.
 
 timer_create and clock_nanosleep take only the caller's own process
 CPU clock (and its threads' for timer_create): another process's is
-EINVAL (Linux runs those too, checked when that process runs). The
-SCHED CPU clock counts utime + stime like PROF (Linux: exact runtime).
+EINVAL (Linux runs those too, checked when that process runs).
 A CPU-clock clock_nanosleep's hidden timer takes a timer id from the
 process's registry (Linux posix_cpu_nsleep's timer is not hashed: the
 next timer_create id does not move). rseq is ENOSYS (glibc runs
@@ -328,14 +339,6 @@ user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
 FLAG_WAIT_KILLABLE_RECV are EINVAL), and nothing is logged for RET_LOG
 or FLAG_LOG.
 
-## Pipe size is fixed
-
-**Location**: `io/pipe.rs`, `fs/fd.rs` (`sys_fcntl`)
-
-Every pipe holds 16 buffers; fcntl F_GETPIPE_SZ and F_SETPIPE_SZ are
-EINVAL and there is no /proc/sys/fs/pipe-max-size (Linux pipe_fcntl,
-pipe_set_size).
-
 ## AF_UNIX gaps
 
 **Location**: `net/unix/`
@@ -357,11 +360,6 @@ Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
 out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
 SO_PEERPIDFD, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC, SIOCUNIXFILE,
 SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
-
-SO_PEERCRED (`peercred_opt`) and SCM_CREDENTIALS (`scm::Creds`) report
-uid/gid unmapped; Linux maps them into the reader's user namespace
-(cred_to_ucred, scm_recv: from_kuid_munged/from_kgid_munged), as
-SO_PEERGROUPS already does.
 
 ## File permission (DAC) gaps
 
@@ -415,7 +413,7 @@ operations, as Linux has them:
 
 ## Credentials have no identity
 
-**Location**: `task/mod.rs` (`Cred`), `fs/namei.rs` (`may_linkat_empty`)
+**Location**: `task/mod.rs` (`Cred`), `fs/namei/mod.rs` (`may_linkat_empty`)
 
 `Cred` is a value, not Linux's shared, refcounted `struct cred`. linkat
 AT_EMPTY_PATH compares `f_cred` with the caller's creds by value, where
@@ -502,11 +500,18 @@ hub6, where Linux moves the port (uart_change_port).
 - **Hangup gaps:** no carrier (DCD) loss hangs a tty up (no modem
   control). No boot test unbinds the console UART (the test output
   goes there).
-- **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
-  TIOCEXCL exclusivity, sending a break (TCSBRK 0), packet mode,
+- **Missing:** TIOCSTI, sending a break (TCSBRK 0), packet mode,
   ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT, IUCLC/OLCUC, IMAXBEL,
   PARMRK and parity/break input handling, CRTSCTS (no modem
   control: IXOFF throttles by STOP/START only).
+- **No driver set_termios:** a termios change never reaches the
+  UART (Linux uart_set_termios -> serial8250_do_set_termios,
+  pl011_set_termios): speed, character size, parity and stop bits stay
+  as booted, and the speed is not clamped to the UART's range and
+  encoded back (uart_get_baud_rate, tty_termios_encode_baud_rate), so
+  a BOTHER speed reads back as BOTHER where Linux reports the nearest
+  Bfoo; locked termios (TIOCGLCKTRMIOS, TIOCSLCKTRMIOS) and the ADDRB
+  reset (tty_set_termios) are missing too.
 - **Serial ports:** ttyS1 is registered without probing COM2. The
   PL011 has no startup or
   shutdown (Linux pl011_startup/pl011_shutdown): its interrupts stay
@@ -523,8 +528,11 @@ hub6, where Linux moves the port (uart_change_port).
 **Location:** `task/futex.rs`
 
 - **FUTEX_WAKE_OP and PI futexes** are missing.
-- **futex_waitv flags:** FUTEX2_NUMA and FUTEX2_MPOL are EINVAL;
-  Linux accepts them (futex_parse_waitv, FUTEX2_VALID_MASK).
+- **FUTEX2_MPOL:** MPOL_BIND and MPOL_PREFERRED_MANY policies name no
+  node (Linux: their home_node; hk has no set_mempolicy_home_node).
+- **FUTEX2_NUMA:** each call takes the global `NUMA_TOPOLOGY` lock for
+  the node checks (Linux numa_node_id and node_possible read per-CPU
+  and static state).
 - **MAP_PRIVATE file mappings:** a shared futex there is keyed by
   (mm, address) from the VMA; Linux keys a page still in the page
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
@@ -617,9 +625,7 @@ return 0 without moving the device (Linux: moved, or an error).
   no count trigger, TIMEOUT_UPDATE or MULTISHOT
 - IORING_OP_LINK_TIMEOUT returns 0 without arming anything
 - poll ops never complete asynchronously
-- IORING_OP_OPENAT2 is not handled (Linux io_openat2: the open_how
-  rules of `fs/open.rs` sys_openat2, without its page limit), nor
-  most opcodes past IORING_OP_SHUTDOWN (EINVAL CQEs)
+- Most opcodes past IORING_OP_SHUTDOWN are not handled (EINVAL CQEs)
 - Setup flags: no SQPOLL (Linux allows it unprivileged), SUBMIT_ALL,
   COOP_TASKRUN, TASKRUN_FLAG, SINGLE_ISSUER, DEFER_TASKRUN,
   NO_SQARRAY, SQE128/CQE32, NO_MMAP, REGISTERED_FD_ONLY, R_DISABLED,
@@ -667,6 +673,41 @@ but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
 F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
+
+## tracefs gaps
+
+**Location**: `fs/tracefs.rs`
+
+- No instances/ directory (tracefs_create_instance_dir: mkdir/rmdir of
+  trace instances), so nothing removes a tracefs entry at run time.
+
+## fsync and freeze gaps
+
+**Location**: `fs/file.rs` (`FileOps::fsync`), `fs/inode.rs` (`touch_atime`)
+
+- `FileOps::fsync` takes no datasync flag, so fdatasync writes a
+  times-only dirty inode too (Linux vfs_fsync_range(datasync) skips
+  I_DIRTY_SYNC unless I_DIRTY_DATASYNC).
+- No filesystem freezing (FIFREEZE/FITHAW, sb_start_write): writers
+  such as touch_atime take mount write access only.
+- `SuperOps::write_inode` takes no wait argument (Linux
+  writeback_control sync_mode), so vfat's dirsync wait syncs the whole
+  device.
+- vfat `fat_add_entries` allocates a new directory cluster before it
+  writes the free slots it already has (Linux writes those first), so
+  a failed dirsync sync leaves the zeroed cluster linked in.
+
+## No buffer heads
+
+**Location**: `fs/vfat/mod.rs` (`write_inode_sb`, `VfatSbData.ipos`), `fs/blkdev_ops.rs`
+
+Filesystem metadata goes through the block device's page cache by copy
+(`filemap::read`, `bdev_write_meta`); there is no buffer head to pin a
+block and patch it in place. So vfat's write_inode holds its `ipos`
+lock (a sleeping mutex) across the entry's read, patch and write, where
+Linux __fat_write_inode reads the block with sb_bread, then patches the
+pinned buffer under the inode_hash_lock spinlock after rechecking
+i_pos, and marks it dirty.
 
 ## renameat2 flag gaps
 
@@ -1011,13 +1052,14 @@ Designs that grew one commit at a time. Tag = roadmap phase
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
-- **Process-wide state per thread** (C): pgid/sid copied into every
-  thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
+- **Process-wide state per thread** (C): the group and session `Pid`
+  references (`Task.pgrp`/`session`) held by every thread, not
+  once per process (Linux signal->pids); one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.
 - **`task/percpu.rs` is the largest file** (before C): scheduler core,
   do_clone, exit, wait, credential setters, several sleep APIs. Split
   like Linux (sched/core, fork, exit, cred). Other giant functions:
-  do_clone, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
+  copy_process, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
 - **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
@@ -1092,14 +1134,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
     host, completed (SO_ERROR 0, POLLOUT). Not reproduced on rerun;
     the socket is an active connect (no listener-side code involved).
 
-11. **STACK near-overflow flake** (arm64, once in three local
-    `check-arm` runs): `STACK:FAIL kernel stack nearly overflowed: 4016
-    of 16384 bytes left (need 4096)`, reported by
-    `task/percpu.rs` `check_stack_usage` for a task that exited around
-    the FAULT_INJECT tests. Some path comes within 80 bytes of the
-    margin; the check does not say which. Find the deep path (a
-    per-task high-water site, Linux stack_trace_max) and shrink it.
-
 12. **FORK_PGRP_SIGNAL flake** (hk x86, once in three local `check`
     runs): `FORK_PGRP_SIGNAL:FAIL got 11`: in round 1 a child forked
     before the group's SIGUSR1 showed pending in its parent did not
@@ -1107,6 +1141,27 @@ Tag = roadmap phase (doc/ROADMAP.md).
     process-group kill racing fork (Linux copy_process's
     signal->multiprocess delay and its recheck under siglock) may
     miss a child that joined the group before the walk.
+
+13. **TCP_MEM_PRESSURE flake** (hk x86, once in four local `check`
+    runs, in a gate): `TCP_MEM_PRESSURE:FAIL pair status got 1024`: a
+    pair's reader got less than 128 KiB before its 20 s receive
+    timeout (`user/boot_tester/net/tcp_mem.rs` `pair`, exit 4) with
+    every tcp_mem limit at 4 pages. A connection stalled under memory
+    pressure: a forced charge for an empty queue, or the window or
+    retransmit timer after a drop, may not restart it.
+
+14. **FD_ALLOC_SCALE flake on Linux** (`check-linux`, under host load):
+    `FD_ALLOC_SCALE:FAIL 5`: the batch of dup()s at ~33000 descriptors
+    took 4x or more the batch at ~2000 on the reference Linux; uncached
+    reruns pass. The ratio of two wall-clock timings
+    (`user/boot_tester/io/fd_scale.rs` `batch_ns`, best of three) is
+    taken minutes apart in time and absorbs host contention; interleave
+    the low and high batches, or compare more tries.
+
+15. **AIO_VFAT_DIO_CACHE flake on Linux** (`check-linux`, once):
+    `AIO_VFAT_DIO_CACHE:FAIL io_getevents got -4`: io_getevents returned
+    EINTR on the reference Linux; a rerun passed. Find what signal
+    interrupts the wait, or retry the wait on EINTR as Linux allows.
 
 ## DRM dumb buffers are the boot framebuffer only
 
@@ -1123,14 +1178,6 @@ dumb buffer from shmem and blits it on page flip
 
 No time namespaces (CLONE_NEWTIME, the time and time_for_children
 links). No nsfs file handles (File handle gaps).
-
-## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
-
-**Location**: `fs/proc/mod.rs` (`ProcfsFileOps::poll`)
-
-mounts and mountinfo poll readable only: a change of the mount table
-never reports POLLERR|POLLPRI (Linux mounts_poll: the namespace's
-event count against the reader's).
 
 ## TSC trusted without the invariant flag
 

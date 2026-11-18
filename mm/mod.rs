@@ -51,6 +51,7 @@ pub mod tlb;
 pub mod vma;
 pub mod vmalloc;
 pub mod vmstack;
+pub mod vmstat;
 pub mod writeback;
 pub mod xarray;
 

@@ -13,8 +13,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::cpu::PerCpu;
-
 /// Seconds (Linux watchdog_thresh)
 static THRESH: AtomicU32 = AtomicU32::new(10);
 
@@ -28,11 +26,13 @@ struct Cpu {
     reported: AtomicBool,
 }
 
-static CPUS: PerCpu<Cpu> = crate::percpu![Cpu {
+crate::percpu! {
+    static CPUS: Cpu = Cpu {
     touched: AtomicU64::new(0),
     kicked: AtomicU64::new(0),
     reported: AtomicBool::new(false),
-}];
+};
+}
 
 /// `watchdog_thresh=` (Linux: 0..=60 seconds)
 pub fn set_thresh(s: u32) {

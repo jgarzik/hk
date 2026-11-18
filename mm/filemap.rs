@@ -33,7 +33,7 @@ use super::page::{
 };
 use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, XArray};
 use crate::FRAME_ALLOCATOR;
-use crate::fs::inode::Inode;
+use crate::fs::inode::{Inode, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
@@ -149,14 +149,10 @@ pub struct AddressSpace {
     /// same chain type as an anon_vma's): written under the mmap_lock
     /// held for writing, read by truncate and the reverse map
     pub i_mmap: AnonVma,
-    /// When its first dirty page since it was last clean came,
-    /// monotonic ns (Linux inode->dirtied_when, set as I_DIRTY_PAGES
-    /// is): written under the `i_pages` lock, read by the periodic
-    /// writeback (vm.dirty_expire_centisecs)
-    pub dirtied_when: AtomicU64,
     /// The inode it belongs to, for page dirtying to mark it dirty
-    /// (Linux mapping->host; set with the aops by `set_aops`)
-    host: Once<alloc::sync::Weak<Inode>>,
+    /// (Linux mapping->host; set with the aops by `set_aops`): null, or
+    /// the inode whose `i_data` this is, set before any page is cached
+    host: core::sync::atomic::AtomicPtr<Inode>,
     /// Writeback errors, reported once to each open file by fsync
     /// (Linux mapping->wb_err)
     pub wb_err: crate::util::errseq::ErrSeq,
@@ -174,8 +170,7 @@ impl AddressSpace {
             seals: AtomicU32::new(0),
             writable: core::sync::atomic::AtomicI64::new(0),
             i_mmap: AnonVma::default(),
-            dirtied_when: AtomicU64::new(0),
-            host: Once::new(),
+            host: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             wb_err: crate::util::errseq::ErrSeq::new(),
         }
     }
@@ -183,11 +178,26 @@ impl AddressSpace {
     /// Set the filesystem's operations and, for a mapping whose pages
     /// get dirty, the inode it belongs to (once, before any page is
     /// cached; Linux inode->i_mapping->a_ops, mapping->host)
-    pub fn set_aops(&self, a: &'static dyn Aops, host: Option<&alloc::sync::Arc<Inode>>) {
+    pub fn set_aops(&self, a: &'static dyn Aops, host: Option<&InodeRef>) {
         self.a_ops.call_once(|| a);
         if let Some(h) = host {
-            self.host.call_once(|| alloc::sync::Arc::downgrade(h));
+            // INVARIANT: the host's own mapping (Linux inode->i_data)
+            assert!(
+                core::ptr::eq(&raw const *h.i_data, self),
+                "filemap: a host's own mapping"
+            );
+            self.host
+                .store(InodeRef::as_ptr(h).cast_mut(), Ordering::Release);
         }
+    }
+
+    /// The inode it belongs to (Linux mapping->host), if one was set:
+    /// borrowed with the mapping, which is part of it
+    fn host(&self) -> Option<&Inode> {
+        let p = self.host.load(Ordering::Acquire);
+        // SAFETY: null or the inode this mapping is the `i_data` of
+        // (`set_aops`), so its memory outlives this borrow of the mapping
+        (!p.is_null()).then(|| unsafe { &*p })
     }
 
     pub fn aops(&self) -> &'static dyn Aops {
@@ -279,61 +289,45 @@ impl Drop for AddressSpace {
     }
 }
 
-/// Dirty page-cache pages, per CPU (Linux NR_FILE_DIRTY vmstat): summed
-/// for balance_dirty_pages and /proc/meminfo
-static NR_DIRTY: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
-
-/// Page-cache pages, and those of unevictable mappings, per CPU
-/// (Linux NR_FILE_PAGES, NR_UNEVICTABLE): /proc/meminfo
-static NR_FILE: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
-static NR_UNEVICT: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
-/// tmpfs pages (Linux NR_SHMEM): those of a mapping charged to a tmpfs
-static NR_SHMEM: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
-    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
-
-fn sum(c: &crate::cpu::PerCpu<core::sync::atomic::AtomicI64>) -> u64 {
-    c.for_each_possible()
-        .map(|(_, c)| c.load(Ordering::Relaxed))
-        .sum::<i64>()
-        .max(0) as u64
-}
+use super::vmstat::{Item, add as vm_add, read as vm_read};
 
 /// `d` pages entered (or left) the cache of `m`
 fn count_file(m: &AddressSpace, d: i64) {
-    NR_FILE.this().fetch_add(d, Ordering::Relaxed);
+    vm_add(Item::FilePages, d);
     if m.has_flag(AS_UNEVICTABLE) {
-        NR_UNEVICT.this().fetch_add(d, Ordering::Relaxed);
+        vm_add(Item::Unevictable, d);
     }
     if m.acct.get().is_some() {
-        NR_SHMEM.this().fetch_add(d, Ordering::Relaxed);
+        vm_add(Item::Shmem, d);
     }
 }
 
 /// tmpfs and shared memory pages (Linux NR_SHMEM): /proc/meminfo Shmem
 pub fn nr_shmem() -> u64 {
-    sum(&NR_SHMEM)
+    vm_read(Item::Shmem)
 }
 
 /// Page-cache pages (Linux NR_FILE_PAGES)
 pub fn nr_file_pages() -> u64 {
-    sum(&NR_FILE)
+    vm_read(Item::FilePages)
 }
 
 /// Page-cache pages that never leave memory (ramfs; Linux Unevictable)
 pub fn nr_unevictable() -> u64 {
-    sum(&NR_UNEVICT)
+    vm_read(Item::Unevictable)
 }
 
 fn count_dirty(d: i64) {
-    NR_DIRTY.this().fetch_add(d, Ordering::Relaxed);
+    vm_add(Item::FileDirty, d);
+    if d > 0 {
+        // Linux account_page_dirtied: this_cpu_inc(bdp_ratelimits)
+        super::writeback::dirtied(d);
+    }
 }
 
 /// Dirty page-cache pages (Linux global_node_page_state(NR_FILE_DIRTY))
 pub fn nr_dirty() -> u64 {
-    sum(&NR_DIRTY)
+    vm_read(Item::FileDirty)
 }
 
 /// Clear the page's dirty bit; true (and uncounted) if it was set
@@ -407,7 +401,7 @@ fn insert(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
     pg.mapping.store(m.key(), Ordering::Release);
     FRAME_ALLOCATOR.incref(phys);
     // Nothing allocated under the spin lock (Linux xas_nomem)
-    let stored = super::xarray::store_nomem(
+    let stored = super::xarray::store_nomem_locked(
         || m.i_pages.lock(),
         index,
         phys,
@@ -421,8 +415,11 @@ fn insert(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
         KernelError::OutOfMemory,
     );
     match stored {
-        Ok(_) => {
-            m.nrpages.fetch_add(1, Ordering::Relaxed);
+        Ok((_, pages)) => {
+            // Under the i_pages lock, read lock-free (Linux nrpages under
+            // the xa_lock, READ_ONCE): a load and a store
+            crate::sync::Sole::sole_add(&m.nrpages, 1);
+            drop(pages);
             count_file(m, 1);
             Ok(())
         }
@@ -505,11 +502,12 @@ pub fn remove(m: &AddressSpace, phys: u64) {
         let old = pages.erase(index);
         debug_assert_eq!(old, phys);
         pg.mapping.store(0, Ordering::Release);
+        // Under the i_pages lock (Linux page_cache_delete: nrpages -= nr)
+        crate::sync::Sole::sole_add(&m.nrpages, u64::MAX);
     }
     test_clear_dirty(pg);
     pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
     pg.private.store(0, Ordering::Relaxed);
-    m.nrpages.fetch_sub(1, Ordering::Relaxed);
     count_file(m, -1);
     m.uncharge(1);
     put_page(phys);
@@ -572,8 +570,10 @@ pub fn dirty_page(m: &AddressSpace, phys: u64) {
         return;
     }
     m.aops().dirty_folio(m, phys);
-    if let Some(inode) = m.host.get().and_then(alloc::sync::Weak::upgrade) {
-        crate::fs::fs_writeback::mark_inode_dirty(&inode);
+    // A reference unless its last went (Linux __mark_inode_dirty skips
+    // an I_FREEING inode)
+    if let Some(inode) = m.host().and_then(Inode::igrab) {
+        crate::fs::fs_writeback::mark_inode_dirty_pages(&inode);
     }
 }
 
@@ -585,12 +585,9 @@ pub fn dirty_folio(m: &AddressSpace, phys: u64) {
         && pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
     {
         count_dirty(1);
-        let mut pages = m.i_pages.lock();
-        if !pages.marked(MARK_DIRTY) {
-            m.dirtied_when
-                .store(crate::time::monotonic_ns(), Ordering::Release);
-        }
-        pages.set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
+        m.i_pages
+            .lock()
+            .set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
     }
 }
 

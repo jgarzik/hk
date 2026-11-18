@@ -124,61 +124,49 @@ fn add_attrs(dir: &Arc<KNode>, n: &Arc<NetDevice>) -> Result<(), KernelError> {
         (b"rx_packets", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats
-                    .rx_packets
-                    .load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::RX_PACKETS)
             ))
         }),
         (b"tx_packets", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats
-                    .tx_packets
-                    .load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::TX_PACKETS)
             ))
         }),
         (b"rx_bytes", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats.rx_bytes.load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::RX_BYTES)
             ))
         }),
         (b"tx_bytes", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats.tx_bytes.load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::TX_BYTES)
             ))
         }),
         (b"rx_errors", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats
-                    .rx_errors
-                    .load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::RX_ERRORS)
             ))
         }),
         (b"tx_errors", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats
-                    .tx_errors
-                    .load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::TX_ERRORS)
             ))
         }),
         (b"rx_dropped", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats
-                    .rx_dropped
-                    .load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::RX_DROPPED)
             ))
         }),
         (b"tx_dropped", |n| {
             Ok(format!(
                 "{}\n",
-                n.stats
-                    .tx_dropped
-                    .load(core::sync::atomic::Ordering::Relaxed)
+                n.stats.get(crate::net::device::stat::TX_DROPPED)
             ))
         }),
     ];

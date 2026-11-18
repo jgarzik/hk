@@ -30,7 +30,10 @@
 //! two CPUs never reorder one connection's segments), the error and
 //! shutdown bits and the lockless view (`Snap`: state, queue sizes,
 //! writability, send window edges, Linux's READ_ONCE fields that
-//! tcp_poll, the waits and tcp_v4_err read) are published. Wakeups,
+//! tcp_poll, the waits and tcp_v4_err read) are published. The fields
+//! /proc/net/tcp reads beyond `Snap` (timers, RTO, cwnd, ...) are the
+//! block's own `cb::Live` cells, stored where they change and read with
+//! no lock (`TcpSock.live`; Linux get_tcp4_sock's racy reads). Wakeups,
 //! SIGIO included, run in the step: from the owner, or under `slock`
 //! (unowned input, timers and errors; `release_cb`), as Linux. Transmitting never re-enters a socket lock: `lo`
 //! queues to the receive backlog and `netif_rx_flush_local` runs only
@@ -60,14 +63,12 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use crate::net::sock_lock::{BhGuard, SockGuard, SockHooks, SockLock};
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::Relock;
-use crate::util::kalloc::try_arc_cyclic;
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 
 use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;
@@ -203,16 +204,6 @@ struct Snap {
     /// Linux snd_una / snd_nxt (the ICMP error sequence check)
     snd_una: AtomicU32,
     snd_max: AtomicU32,
-    /// /proc/net/tcp's values (`info::ProcView`)
-    tr: AtomicU8,
-    when: AtomicU64,
-    backoff: AtomicU32,
-    probes: AtomicU32,
-    rto: AtomicU64,
-    ato: AtomicU64,
-    qp: AtomicU32,
-    cwnd: AtomicU32,
-    last: AtomicI64,
 }
 
 impl Snap {
@@ -224,33 +215,7 @@ impl Snap {
         self.writable.store(c.writable(), Ordering::Release);
         self.snd_una.store(c.snd_una, Ordering::Release);
         self.snd_max.store(c.snd_max, Ordering::Release);
-        let v = info::ProcView::of(c);
-        self.tr.store(v.tr, Ordering::Relaxed);
-        self.when.store(v.when, Ordering::Relaxed);
-        self.backoff.store(v.backoff, Ordering::Relaxed);
-        self.probes.store(v.probes, Ordering::Relaxed);
-        self.rto.store(v.rto, Ordering::Relaxed);
-        self.ato.store(v.ato, Ordering::Relaxed);
-        self.qp.store(v.qp, Ordering::Relaxed);
-        self.cwnd.store(v.cwnd, Ordering::Relaxed);
-        self.last.store(v.last, Ordering::Relaxed);
         self.state.store(c.state.linux(), Ordering::Release);
-    }
-
-    /// /proc/net/tcp's values (each read on its own, as Linux's
-    /// READ_ONCE fields: a line may mix two steps' values)
-    fn proc_view(&self) -> info::ProcView {
-        info::ProcView {
-            tr: self.tr.load(Ordering::Relaxed),
-            when: self.when.load(Ordering::Relaxed),
-            backoff: self.backoff.load(Ordering::Relaxed),
-            probes: self.probes.load(Ordering::Relaxed),
-            rto: self.rto.load(Ordering::Relaxed),
-            ato: self.ato.load(Ordering::Relaxed),
-            qp: self.qp.load(Ordering::Relaxed),
-            cwnd: self.cwnd.load(Ordering::Relaxed),
-            last: self.last.load(Ordering::Relaxed),
-        }
     }
 }
 
@@ -260,7 +225,14 @@ pub struct TcpSock {
     pub inet: Inet,
     lock: SockLock<Inner>,
     queue: Mutex<Option<Accept>>,
+    /// Children ready to accept (Linux sk_ack_backlog): changed under
+    /// `queue` with its `ready` list (sk_acceptq_added / removed),
+    /// read lock-free by poll, accept's wait and /proc (READ_ONCE)
+    ack_backlog: AtomicU32,
     snap: Snap,
+    /// Its control block's fields /proc/net/tcp reads with no lock
+    /// (`cb::Live`, shared with the block)
+    live: Arc<cb::Live>,
     /// MTU of an ICMP frag needed met while owned (Linux tp->mtu_info)
     mtu_info: AtomicU32,
     /// errno of another ICMP error met while owned (Linux sk_err_soft)
@@ -403,7 +375,8 @@ fn route_mss(net: &NetNamespace, daddr: Ipv4Addr, saddr: Ipv4Addr, oif: u32) -> 
 
 impl TcpSock {
     pub fn new(sk: Sock) -> Result<Arc<Self>, KernelError> {
-        let mut cb = TcpCb::new(cfg(&sk.net));
+        let live = try_arc(cb::Live::default())?;
+        let mut cb = TcpCb::new(cfg(&sk.net), live.clone());
         cb.mib = Some(Arc::clone(&sk.net.mib));
         cb.opts.ca = sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
         let snap = Snap::default();
@@ -421,7 +394,9 @@ impl TcpSock {
                 connecting: false,
             }),
             queue: Mutex::new(None),
+            ack_backlog: AtomicU32::new(0),
             snap,
+            live,
             mtu_info: AtomicU32::new(0),
             err_soft: AtomicI32::new(0),
             timers: [
@@ -965,7 +940,7 @@ impl TcpSock {
         if opts.syncnt != 0 {
             kc.synack_retries = opts.syncnt;
         }
-        let mut cb = TcpCb::new(kc);
+        let mut cb = TcpCb::new(kc, Arc::clone(&c.live));
         cb.mib = Some(Arc::clone(&self.sk.net.mib));
         cb.opts = opts;
         (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = caps;
@@ -1016,6 +991,9 @@ impl TcpSock {
             .remove_first(|x| core::ptr::eq(x, Arc::as_ptr(c)))
             .unwrap_or_else(|| c.clone());
         q.ready.push_back(r);
+        // Under `queue` (Linux sk_acceptq_added)
+        self.ack_backlog
+            .store(q.ready.len() as u32, Ordering::Relaxed);
         true
     }
 
@@ -1095,7 +1073,7 @@ impl TcpSock {
             self.sk.store_err(0);
             let mut c = cfg(&self.sk.net);
             c.syn_retries = self.syncnt(&g.cb.opts);
-            let mut cb = TcpCb::new(c);
+            let mut cb = TcpCb::new(c, Arc::clone(&self.live));
             cb.mib = Some(Arc::clone(&self.sk.net.mib));
             cb.opts = g.cb.opts;
             (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = (g.cb.rcv_cap, g.cb.snd_cap, g.cb.rcv_locked);
@@ -1198,6 +1176,14 @@ impl TcpSock {
     /// silently when its timer fires, or when a segment comes, which is
     /// then looked up again (`req_dead`; Linux reqsk_timer_handler,
     /// tcp_v4_rcv)
+    /// Take the listener's queues away (it stops listening): its ready
+    /// count goes to 0 with them, under `queue`
+    fn take_queue(&self) -> Option<Accept> {
+        let mut g = self.queue.lock();
+        self.ack_backlog.store(0, Ordering::Relaxed);
+        g.take()
+    }
+
     fn listen_stop(&self, mut q: Accept) {
         while q.syn.pop_front().is_some() {}
         while let Some(c) = q.ready.pop_front() {
@@ -1233,7 +1219,7 @@ impl TcpSock {
                 .net
                 .tcp
                 .listen_del(self.inet.get().sport, &self.arc());
-            let q = self.queue.lock().take();
+            let q = self.take_queue();
             if let Some(q) = q {
                 self.listen_stop(q);
             }
@@ -1920,7 +1906,7 @@ impl ProtoOps for TcpSock {
                 g.cb.set_closed(out);
                 // Its children stop as the owner (Linux tcp_close ->
                 // inet_csk_listen_stop under lock_sock, after TCP_CLOSE)
-                let q = self.queue.lock().take();
+                let q = self.take_queue();
                 if let Some(q) = q {
                     self.listen_stop(q);
                 }
@@ -2055,19 +2041,23 @@ impl ProtoOps for TcpSock {
         }
         let mut timeo = self.sk.rcv_timeo(nonblock);
         loop {
-            let c = self.queue.lock().as_mut().and_then(|q| q.ready.pop_front());
+            let c = self.queue.lock().as_mut().and_then(|q| {
+                let c = q.ready.pop_front();
+                // Under `queue` (Linux sk_acceptq_removed)
+                self.ack_backlog
+                    .store(q.ready.len() as u32, Ordering::Relaxed);
+                c
+            });
             if let Some(c) = c {
                 return Ok(c);
             }
             if self.state() != TcpState::Listen {
                 return Err(KernelError::InvalidArgument);
             }
+            // Linux inet_csk_wait_for_connect: the queue's emptiness
+            // read lock-free (reqsk_queue_empty)
             let ready = || {
-                self.queue
-                    .lock()
-                    .as_ref()
-                    .is_none_or(|q| !q.ready.is_empty())
-                    || self.state() != TcpState::Listen
+                self.ack_backlog.load(Ordering::Relaxed) != 0 || self.state() != TcpState::Listen
             };
             timeo = self.sk.wait(timeo, ready)?;
         }
@@ -2093,11 +2083,8 @@ impl ProtoOps for TcpSock {
     fn poll(&self) -> u16 {
         let state = self.state();
         if state == TcpState::Listen {
-            let ready = self
-                .queue
-                .lock()
-                .as_ref()
-                .is_some_and(|q| !q.ready.is_empty());
+            // Linux inet_csk_listen_poll: reqsk_queue_empty, lock-free
+            let ready = self.ack_backlog.load(Ordering::Relaxed) != 0;
             return if ready { POLLIN | POLLRDNORM } else { 0 };
         }
         let mut mask = 0;
@@ -2260,7 +2247,9 @@ impl TcpSock {
                     if val < 0 || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen) {
                         return bad();
                     }
-                    g.cb.opts.fastopen = (val as u32).min(self.sk.net.sysctl.somaxconn());
+                    g.cb.live
+                        .fastopen
+                        .set((val as u32).min(self.sk.net.sysctl.somaxconn()));
                 }
                 TCP_NOTSENT_LOWAT => {
                     g.cb.opts.notsent_lowat = val as u32;
@@ -2308,7 +2297,7 @@ impl TcpSock {
                 } else if closed {
                     cb::MSS_DEFAULT
                 } else {
-                    g.cb.mss
+                    g.cb.live.mss.get()
                 }
             }
             TCP_NODELAY => u32::from(o.nodelay),
@@ -2320,7 +2309,7 @@ impl TcpSock {
             TCP_SYNCNT => self.syncnt(o),
             TCP_USER_TIMEOUT => o.user_timeout,
             TCP_DEFER_ACCEPT => info::retrans_to_secs(o.defer_accept),
-            TCP_FASTOPEN => o.fastopen,
+            TCP_FASTOPEN => g.cb.live.fastopen.get(),
             TCP_NOTSENT_LOWAT => o.notsent_lowat,
             _ => return Err(KernelError::NoProtocolOption),
         };

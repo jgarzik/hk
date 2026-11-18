@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::sync::spin::RwLock;
 
@@ -98,74 +98,86 @@ pub trait NetDeviceOps: Send + Sync {
     fn set_multicast_list(&self, _addrs: &[[u8; 6]]) {}
 }
 
-/// Network device statistics
-#[derive(Default)]
+/// Network device statistics, per CPU (Linux pcpu_sw_netstats summed by
+/// dev_get_stats): each counter a word of this CPU's part, added to
+/// without a lock prefix, the parts summed on read
 pub struct NetDeviceStats {
-    /// Total packets received
-    pub rx_packets: AtomicU64,
-    /// Total packets transmitted
-    pub tx_packets: AtomicU64,
-    /// Total bytes received
-    pub rx_bytes: AtomicU64,
-    /// Total bytes transmitted
-    pub tx_bytes: AtomicU64,
-    /// Receive errors
-    pub rx_errors: AtomicU64,
-    /// Transmit errors
-    pub tx_errors: AtomicU64,
-    /// Packets dropped (rx)
-    pub rx_dropped: AtomicU64,
-    /// Packets dropped (tx)
-    pub tx_dropped: AtomicU64,
-    /// Multicast packets received
-    pub multicast: AtomicU64,
-    /// Collisions
-    pub collisions: AtomicU64,
-    /// Received frames with no protocol handler (Linux rx_nohandler)
-    pub rx_nohandler: AtomicU64,
+    mib: crate::net::mib::Mib<{ stat::N }>,
+}
+
+/// The counters of [`NetDeviceStats`] (rtnl_link_stats64 fields)
+pub mod stat {
+    pub const RX_PACKETS: usize = 0;
+    pub const TX_PACKETS: usize = 1;
+    pub const RX_BYTES: usize = 2;
+    pub const TX_BYTES: usize = 3;
+    pub const RX_ERRORS: usize = 4;
+    pub const TX_ERRORS: usize = 5;
+    pub const RX_DROPPED: usize = 6;
+    pub const TX_DROPPED: usize = 7;
+    pub const MULTICAST: usize = 8;
+    pub const COLLISIONS: usize = 9;
+    pub const RX_NOHANDLER: usize = 10;
+    pub const N: usize = 11;
+}
+
+impl Default for NetDeviceStats {
+    fn default() -> Self {
+        Self {
+            mib: crate::net::mib::Mib::new_nofail(),
+        }
+    }
 }
 
 impl NetDeviceStats {
+    /// Counter `f` (a `stat::*`), every CPU's part summed
+    pub fn get(&self, f: usize) -> u64 {
+        self.mib.fold(f)
+    }
+
     pub fn inc_rx_packets(&self) {
-        self.rx_packets.fetch_add(1, Ordering::Relaxed);
+        self.mib.inc(stat::RX_PACKETS);
     }
 
     pub fn inc_tx_packets(&self) {
-        self.tx_packets.fetch_add(1, Ordering::Relaxed);
+        self.mib.inc(stat::TX_PACKETS);
     }
 
     pub fn add_rx_bytes(&self, bytes: u64) {
-        self.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.mib.add(stat::RX_BYTES, bytes);
     }
 
     pub fn add_tx_bytes(&self, bytes: u64) {
-        self.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.mib.add(stat::TX_BYTES, bytes);
     }
 
     pub fn inc_rx_errors(&self) {
-        self.rx_errors.fetch_add(1, Ordering::Relaxed);
+        self.mib.inc(stat::RX_ERRORS);
     }
 
     pub fn inc_tx_errors(&self) {
-        self.tx_errors.fetch_add(1, Ordering::Relaxed);
+        self.mib.inc(stat::TX_ERRORS);
     }
 
     pub fn inc_rx_dropped(&self) {
-        self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+        self.mib.inc(stat::RX_DROPPED);
     }
 
     pub fn inc_tx_dropped(&self) {
-        self.tx_dropped.fetch_add(1, Ordering::Relaxed);
+        self.mib.inc(stat::TX_DROPPED);
+    }
+
+    pub fn inc_multicast(&self) {
+        self.mib.inc(stat::MULTICAST);
     }
 
     pub fn inc_rx_nohandler(&self) {
-        self.rx_nohandler.fetch_add(1, Ordering::Relaxed);
+        self.mib.inc(stat::RX_NOHANDLER);
     }
 
     /// Count one received packet of `len` bytes
     pub fn rx_packet(&self, len: usize) {
-        self.rx_packets.fetch_add(1, Ordering::Relaxed);
-        self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        self.mib.upd_po(stat::RX_PACKETS, stat::RX_BYTES, len);
     }
 }
 

@@ -32,9 +32,26 @@ impl SeqCount {
     /// write_seqcount_begin): the counter goes odd before any of the
     /// writer's stores (smp_wmb after the increment)
     pub fn write(&self) -> SeqCountGuard<'_> {
-        self.seq.fetch_add(1, Ordering::Relaxed);
+        // Its writers are serialized by their lock: a plain increment
+        // (Linux s->sequence++), no locked RMW
+        self.bump(1, Ordering::Relaxed);
         fence(Ordering::Release);
         SeqCountGuard(self)
+    }
+
+    /// Add `n` as the one writer (under the writers' lock): a load and
+    /// a store, the store `ord`
+    fn bump(&self, n: u32, ord: Ordering) {
+        self.seq
+            .store(self.seq.load(Ordering::Relaxed).wrapping_add(n), ord);
+    }
+
+    /// Make every read begun before now repeat, without a write section
+    /// (Linux write_seqcount_invalidate: smp_wmb, then +2), under the
+    /// writers' lock: the writer's earlier stores come first
+    pub fn invalidate(&self) {
+        fence(Ordering::Release);
+        self.bump(2, Ordering::Relaxed);
     }
 
     /// Begin a lockless read (Linux read_seqcount_begin): waits out a
@@ -49,6 +66,13 @@ impl SeqCount {
         }
     }
 
+    /// Begin a lockless read without waiting out a writer (Linux
+    /// raw_seqcount_begin): an odd count comes back even, so a read that
+    /// began inside a write section fails its `read_retry`
+    pub fn raw_begin(&self) -> u32 {
+        self.seq.load(Ordering::Acquire) & !1
+    }
+
     /// The read since `start` raced a writer and must be repeated (Linux
     /// read_seqcount_retry: smp_rmb, then the counter)
     pub fn read_retry(&self, start: u32) -> bool {
@@ -61,7 +85,7 @@ impl Drop for SeqCountGuard<'_> {
     /// Linux write_seqcount_end: the writer's stores before the counter
     /// goes even (smp_wmb, then the increment)
     fn drop(&mut self) {
-        self.0.seq.fetch_add(1, Ordering::Release);
+        self.0.bump(1, Ordering::Release);
     }
 }
 

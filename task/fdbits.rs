@@ -9,9 +9,15 @@
 //! caller runs with the table lock dropped (`fdtable::Files`, Linux
 //! expand_fdtable / dup_fd): a table that must grow is replaced by a
 //! bigger one the caller made, its contents moved over.
+//!
+//! The slots are readable under RCU with no lock (`util::rcuslots`,
+//! Linux fdtable->fd under rcu_read_lock): the table writes them, under
+//! its owner's lock, through their one [`SlotsOwner`]; the bitmaps are
+//! read under the lock only.
 
 use super::{FD_CLOEXEC, Fd};
 use crate::util::error::{KernelError, KernelResult};
+use crate::util::rcuslots::{RcuRef, SlotsOwner, SlotsRef};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -135,15 +141,15 @@ fn copy_bits(dst: &mut [u64], src: &[u64], n: usize) {
 }
 
 /// One descriptor table (Linux struct fdtable)
-pub struct Fdt<F> {
-    /// The slots: None while free or reserved but not installed yet
-    fd: Box<[Option<F>]>,
+pub struct Fdt<F: RcuRef> {
+    /// The slots: empty while free or reserved but not installed yet
+    fd: SlotsOwner<F>,
     /// `open`, then `cloexec` (max_fds / 64 words each), then `full`,
     /// in one block as Linux's
     bits: Box<[u64]>,
 }
 
-impl<F: Clone> Fdt<F> {
+impl<F: RcuRef> Fdt<F> {
     /// A table for at least `slots_wanted` descriptors (Linux
     /// alloc_fdtable): the next power of two, at least 64; EMFILE when
     /// fs.nr_open leaves fewer than wanted or the slots would pass
@@ -161,7 +167,7 @@ impl<F: Clone> Fdt<F> {
             return Err(KernelError::ProcessFileLimit);
         }
         let words = nr / BITS;
-        let fd = crate::util::kmem::try_vec(nr, None)?.into_boxed_slice();
+        let fd = SlotsOwner::alloc(nr)?;
         let bits = crate::util::kmem::try_vec(2 * words + words.div_ceil(BITS), 0u64)?;
         Ok(Self {
             fd,
@@ -170,7 +176,7 @@ impl<F: Clone> Fdt<F> {
     }
 }
 
-impl<F> Fdt<F> {
+impl<F: RcuRef> Fdt<F> {
     /// Its size (Linux fdtable->max_fds), a multiple of 64
     pub fn max_fds(&self) -> usize {
         self.fd.len()
@@ -243,18 +249,24 @@ impl<F> Fdt<F> {
         next_zero(self.open(), start.max(bitbit))
     }
 
-    /// Move `old`'s descriptors and bits into this bigger, empty table
-    /// (Linux copy_fdtable)
-    fn copy_from(&mut self, old: &mut Fdt<F>) {
-        for (new, f) in self.fd.iter_mut().zip(old.fd.iter_mut()) {
-            *new = f.take();
-        }
+    /// Copy `old`'s bits into this bigger, empty table (Linux
+    /// copy_fdtable's bitmaps)
+    fn copy_bits_from(&mut self, old: &Fdt<F>) {
         let n = old.max_fds();
         let (open, ce, full) = self.bits_mut();
         copy_bits(open, old.open(), n);
         copy_bits(ce, old.cloexec(), n);
         copy_bits(full, old.full(), n / BITS);
     }
+}
+
+/// What a table's growth left over, freed after the unlock: the old
+/// bitmaps and the old slots, whose readers' copy is freed a grace
+/// period after the new slots are published (Linux free_fdtable_rcu)
+#[must_use]
+pub struct Spare<F: RcuRef> {
+    _bits: Box<[u64]>,
+    _slots: SlotsRef<F>,
 }
 
 /// What [`FdTable::alloc_fd`] found
@@ -270,7 +282,7 @@ pub enum Slot {
 /// next_fd, under file_lock). A descriptor is free, reserved (open bit
 /// set, no file: between get_unused_fd_flags and fd_install, invisible
 /// to lookups) or installed.
-pub struct FdTable<F> {
+pub struct FdTable<F: RcuRef> {
     fdt: Fdt<F>,
     /// No descriptor below this is free (Linux files_struct.next_fd)
     next_fd: usize,
@@ -280,7 +292,7 @@ pub struct FdTable<F> {
     pub(super) resize_in_progress: bool,
 }
 
-impl<F: Clone> FdTable<F> {
+impl<F: RcuRef> FdTable<F> {
     /// An empty table in `fdt`
     pub fn new(fdt: Fdt<F>) -> Self {
         Self {
@@ -295,20 +307,19 @@ impl<F: Clone> FdTable<F> {
         self.fdt.max_fds()
     }
 
-    /// The file installed at `fd`
-    fn slot(&self, fd: Fd) -> Option<&F> {
-        let i = usize::try_from(fd).ok()?;
-        self.fdt.fd.get(i)?.as_ref()
+    /// The slots, for readers (Linux files->fdt->fd)
+    pub fn slots(&self) -> SlotsRef<F> {
+        self.fdt.fd.shared()
     }
 
     /// A reference to the file at `fd` (Linux files_lookup_fd_locked)
     pub fn get(&self, fd: Fd) -> Option<F> {
-        self.slot(fd).cloned()
+        self.fdt.fd.get(usize::try_from(fd).ok()?)
     }
 
     /// A file is installed at `fd`
     pub fn is_valid(&self, fd: Fd) -> bool {
-        self.slot(fd).is_some()
+        usize::try_from(fd).is_ok_and(|i| self.fdt.fd.is_some(i))
     }
 
     /// The descriptor flags of `fd`: FD_CLOEXEC or 0 (Linux
@@ -373,15 +384,22 @@ impl<F: Clone> FdTable<F> {
 
     /// Move into `new`, bigger (Linux expand_fdtable: copy_fdtable, then
     /// the new table replaces the old; under resize_in_progress nothing
-    /// else grew it); the table left over, empty, is returned to free
-    /// after the unlock
-    #[must_use]
-    pub fn expand(&mut self, mut new: Fdt<F>) -> Fdt<F> {
+    /// else grew it); what is left over is returned to free after the
+    /// unlock, the caller publishing the new slots ([`slots`](Self::slots))
+    /// before it (Linux rcu_assign_pointer(files->fdt, new_fdt)). Err:
+    /// `new` is not bigger, handed back unused to free after the unlock
+    /// too (Linux __free_fdtable after spin_unlock)
+    pub fn expand(&mut self, mut new: Fdt<F>) -> Result<Spare<F>, Fdt<F>> {
         if new.max_fds() <= self.max_fds() {
-            return new;
+            return Err(new);
         }
-        new.copy_from(&mut self.fdt);
-        core::mem::replace(&mut self.fdt, new)
+        new.copy_bits_from(&self.fdt);
+        let Fdt { fd, bits } = new;
+        let old = self.fdt.fd.grow(fd);
+        Ok(Spare {
+            _bits: core::mem::replace(&mut self.fdt.bits, bits),
+            _slots: old,
+        })
     }
 
     /// Put `file` in the reserved descriptor `fd` (Linux fd_install)
@@ -389,8 +407,8 @@ impl<F: Clone> FdTable<F> {
         let i = fd as usize;
         // A kernel bug otherwise: fd is not reserved, or already holds a
         // file (Linux VFS_BUG_ON)
-        assert!(self.fdt.is_open(i) && self.fdt.fd[i].is_none());
-        self.fdt.fd[i] = Some(file);
+        assert!(self.fdt.is_open(i) && !self.fdt.fd.is_some(i));
+        self.fdt.fd.replace(i, Some(file));
     }
 
     /// Release the reserved or closed descriptor `fd` (Linux
@@ -405,8 +423,8 @@ impl<F: Clone> FdTable<F> {
     /// releasing the file after the unlock (Linux file_close_fd_locked);
     /// None (EBADF) if no file is installed there, a reservation too
     pub fn close_fd(&mut self, fd: Fd) -> Option<F> {
-        let i = usize::try_from(fd).ok()?;
-        let f = self.fdt.fd.get_mut(i)?.take()?;
+        let i = usize::try_from(fd).ok().filter(|&i| i < self.max_fds())?;
+        let f = self.fdt.fd.replace(i, None)?;
         self.put_unused(fd);
         Some(f)
     }
@@ -415,10 +433,10 @@ impl<F: Clone> FdTable<F> {
     /// before, if any, for the caller to close after the unlock (Linux
     /// do_dup2): EBUSY for a descriptor reserved but not installed yet
     pub fn dup2(&mut self, fd: usize, file: F, flags: u32) -> KernelResult<Option<F>> {
-        if self.fdt.fd[fd].is_none() && self.fdt.is_open(fd) {
+        if !self.fdt.fd.is_some(fd) && self.fdt.is_open(fd) {
             return Err(KernelError::Busy);
         }
-        let tofree = self.fdt.fd[fd].replace(file);
+        let tofree = self.fdt.fd.replace(fd, Some(file));
         self.fdt.set_open(fd, flags & FD_CLOEXEC != 0);
         Ok(tofree)
     }
@@ -471,7 +489,7 @@ impl<F: Clone> FdTable<F> {
             if fd >= self.max_fds() {
                 return None;
             }
-            if self.fdt.fd[fd].is_some() {
+            if self.fdt.fd.is_some(fd) {
                 return Some(fd as Fd);
             }
             fd += 1;
@@ -494,8 +512,8 @@ impl<F: Clone> FdTable<F> {
         copy_bits(ce, self.fdt.cloexec(), n);
         copy_bits(full, self.fdt.full(), n / BITS);
         for i in 0..n {
-            match &self.fdt.fd[i] {
-                Some(f) => new.fd[i] = Some(f.clone()),
+            match self.fdt.fd.get(i) {
+                f @ Some(_) => drop(new.fd.replace(i, f)),
                 None => new.clear_open(i),
             }
         }
@@ -505,16 +523,19 @@ impl<F: Clone> FdTable<F> {
     /// Installed descriptors
     #[cfg(test)]
     pub fn count(&self) -> usize {
-        self.fdt.fd.iter().filter(|f| f.is_some()).count()
+        (0..self.max_fds())
+            .filter(|&i| self.fdt.fd.is_some(i))
+            .count()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::rcuslots::tests::TRef;
     use alloc::sync::Arc;
 
-    type T = FdTable<Arc<u32>>;
+    type T = FdTable<TRef>;
 
     fn table() -> T {
         FdTable::new(Fdt::alloc(NR_OPEN_DEFAULT).unwrap())
@@ -523,8 +544,7 @@ mod tests {
     /// Grow `t` until it holds descriptor `nr` (as `Files::expand_files`)
     fn grow(t: &mut T, nr: usize) {
         while t.need_expand(nr).unwrap() {
-            let spare = t.expand(Fdt::alloc(nr + 1).unwrap());
-            assert_eq!(spare.fd.iter().filter(|f| f.is_some()).count(), 0);
+            assert!(t.expand(Fdt::alloc(nr + 1).unwrap()).is_ok());
         }
     }
 
@@ -533,7 +553,7 @@ mod tests {
         loop {
             match t.alloc_fd(start, flags, end)? {
                 Slot::Fd(fd) => {
-                    t.install(fd, f.clone());
+                    t.install(fd, TRef(f.clone()));
                     return Ok(fd);
                 }
                 Slot::Expand(nr) => {
@@ -555,12 +575,12 @@ mod tests {
     fn sizes() {
         let t = table();
         assert_eq!(t.max_fds(), 64);
-        assert_eq!(Fdt::<Arc<u32>>::alloc(65).unwrap().max_fds(), 128);
-        assert_eq!(Fdt::<Arc<u32>>::alloc(1000).unwrap().max_fds(), 1024);
+        assert_eq!(Fdt::<TRef>::alloc(65).unwrap().max_fds(), 128);
+        assert_eq!(Fdt::<TRef>::alloc(1000).unwrap().max_fds(), 1024);
         let cap = nr_open() as usize;
-        assert_eq!(Fdt::<Arc<u32>>::alloc(300_000).unwrap().max_fds(), cap / 2);
+        assert_eq!(Fdt::<TRef>::alloc(300_000).unwrap().max_fds(), cap / 2);
         assert_eq!(
-            Fdt::<Arc<u32>>::alloc(cap + 1).err(),
+            Fdt::<TRef>::alloc(cap + 1).err(),
             Some(KernelError::ProcessFileLimit)
         );
     }
@@ -641,13 +661,16 @@ mod tests {
         assert_eq!(t.alloc_fd(0, 0, u64::MAX), Ok(Slot::Fd(0)));
         assert!(t.get(0).is_none() && !t.is_valid(0));
         assert!(t.close_fd(0).is_none());
-        assert_eq!(t.dup2(0, f.clone(), 0), Err(KernelError::Busy));
+        assert!(matches!(
+            t.dup2(0, TRef(f.clone()), 0),
+            Err(KernelError::Busy)
+        ));
         assert_eq!(add(&mut t, 0, 0, u64::MAX, &f), Ok(1));
         let c = t.dup_into(Fdt::alloc(t.sane_size()).unwrap());
         assert!(c.is_valid(1) && !c.fdt.is_open(0));
         assert!(t.close_next(0, 100).is_some_and(|(fd, _)| fd == 1));
         assert!(t.close_next(0, 100).is_none());
-        t.install(0, f.clone());
+        t.install(0, TRef(f.clone()));
         assert!(t.is_valid(0));
         assert!(t.close_fd(0).is_some());
         assert_eq!(t.alloc_fd(0, 0, u64::MAX), Ok(Slot::Fd(0)));
@@ -670,12 +693,12 @@ mod tests {
         assert!(t.close_fd(5).is_some());
         assert_eq!(add(&mut t, 3, 0, u64::MAX, &f), Ok(5));
         // dup2 over an open descriptor hands the old file back
-        assert!(t.dup2(11, f.clone(), FD_CLOEXEC).unwrap().is_none());
+        assert!(t.dup2(11, TRef(f.clone()), FD_CLOEXEC).unwrap().is_none());
         assert_eq!(t.get_fd_flags(11), FD_CLOEXEC);
-        assert!(t.dup2(11, f.clone(), 0).unwrap().is_some());
+        assert!(t.dup2(11, TRef(f.clone()), 0).unwrap().is_some());
         assert_eq!(t.get_fd_flags(11), 0);
         grow(&mut t, 300);
-        assert!(t.dup2(300, f.clone(), 0).unwrap().is_none());
+        assert!(t.dup2(300, TRef(f.clone()), 0).unwrap().is_none());
         assert_eq!(t.max_fds(), 512);
         let c = t.dup_into(Fdt::alloc(t.sane_size()).unwrap());
         assert_eq!(c.count(), t.count());
@@ -719,7 +742,7 @@ mod tests {
             if x & (1 << 40) != 0 {
                 grow(&mut t, fd);
                 if !t.is_valid(fd as Fd) {
-                    assert!(t.dup2(fd, f.clone(), 0).unwrap().is_none());
+                    assert!(t.dup2(fd, TRef(f.clone()), 0).unwrap().is_none());
                 }
             } else {
                 t.close_fd(fd as Fd);

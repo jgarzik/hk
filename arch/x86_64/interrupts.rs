@@ -308,10 +308,19 @@ pub extern "C" fn idt_dispatch(regs: &UserFrame, vector: u64) {
     match vector {
         // Exceptions stay on the stack they hit
         0..=31 => handle_exception(regs, vector),
-        // From user mode the task stack is empty: interrupts run there
-        // (Linux run_irq_on_irqstack_cond, run_sysvec_on_irqstack_cond)
-        v if user => handle_interrupt(v),
-        v => crate::irq_stack::run(|| handle_interrupt(v)),
+        v => {
+            // Where it came from, for the tick (Linux set_irq_regs)
+            let old = super::percpu::irq_regs_enter(user);
+            // From user mode the task stack is empty: interrupts run
+            // there (Linux run_irq_on_irqstack_cond,
+            // run_sysvec_on_irqstack_cond)
+            if user {
+                handle_interrupt(v);
+            } else {
+                crate::irq_stack::run(|| handle_interrupt(v));
+            }
+            super::percpu::irq_regs_exit(old);
+        }
     }
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
@@ -508,6 +517,23 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
             error: error_code,
         };
         user_fault(uframe, sig, code, addr, trap);
+        return;
+    }
+
+    // A kernel-mode trap on an FP restore from a user frame (a page
+    // fault not resolved above, a #GP for a malformed image): resume at
+    // its fixup, which returns the trap number (Linux
+    // EX_TYPE_FAULT_MCE_SAFE, ex_handler_fault)
+    if cs & 3 == 0
+        && let Some(fixup) = super::uaccess::fprestore_fixup(rip)
+    {
+        // SAFETY: field stores
+        unsafe {
+            uframe.with(|r| {
+                r.rip = fixup;
+                r.rax = vector;
+            })
+        };
         return;
     }
 
@@ -717,16 +743,11 @@ pub const RESCHEDULE_VECTOR: u8 = 0xfd;
 /// Run `f` as an interrupt handler: interrupt depth and lockdep's
 /// interrupt context account for it
 fn in_irq(f: impl FnOnce()) {
-    let percpu = super::percpu::try_current_cpu();
-    if let Some(p) = percpu {
-        p.interrupt_depth.fetch_add(1, Ordering::Relaxed);
-    }
+    super::percpu::irq_depth_enter();
     crate::sync::lockdep::irq_enter();
     f();
     crate::sync::lockdep::irq_exit();
-    if let Some(p) = percpu {
-        p.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
-    }
+    super::percpu::irq_depth_exit();
 }
 
 /// Call-function IPI (Linux sysvec_call_function): EOI first, so a call
@@ -818,11 +839,11 @@ fn handle_lapic_timer() {
         return;
     };
 
-    // Increment interrupt depth
-    percpu.interrupt_depth.fetch_add(1, Ordering::Relaxed);
+    super::percpu::irq_depth_enter();
 
-    // Increment per-CPU tick counter
-    percpu.ticks.fetch_add(1, Ordering::Relaxed);
+    // This CPU's tick count: its only writer (a plain add; others read)
+    let t = percpu.ticks.load(Ordering::Relaxed);
+    percpu.ticks.store(t.wrapping_add(1), Ordering::Relaxed);
 
     // Update global timekeeper (only on CPU 0 to avoid contention)
     if percpu.id() == 0 {
@@ -835,8 +856,7 @@ fn handle_lapic_timer() {
     // Send EOI to LAPIC (must be done before any potential context switch)
     lapic::eoi();
 
-    // Decrement interrupt depth
-    percpu.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
+    super::percpu::irq_depth_exit();
 }
 
 /// Legacy PIC interrupt `irq` (0-15)

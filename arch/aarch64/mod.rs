@@ -12,6 +12,7 @@ pub mod context;
 pub mod cpu;
 pub mod dtb;
 pub mod exceptions;
+pub mod fpsimd;
 pub mod gic;
 pub mod ioremap;
 pub mod ipi;
@@ -24,6 +25,7 @@ pub mod pci_irq;
 pub mod percpu;
 pub mod power;
 pub mod ptrace;
+pub mod qspin;
 pub mod rtc;
 pub mod serial;
 pub mod signal;
@@ -44,15 +46,15 @@ use crate::arch::{
 };
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
-/// (Linux struct pt_regs, with the FP/SIMD state Linux keeps in
-/// thread.uw.fpsimd_state)
+/// (Linux struct pt_regs)
 ///
-/// This captures all general-purpose registers, exception state and the
-/// FP/SIMD registers (the kernel uses NEON, so every exception saves them).
-/// Layout matches the order we push/pop in exception vectors (vectors.S
-/// TRAP_FRAME_SIZE / TF_*). For an exception from EL0 this is the task's
-/// user state, at the top of its kernel stack (`current_pt_regs`): its
-/// only copy while the task is in the kernel.
+/// This captures all general-purpose registers and the exception state;
+/// the kernel never touches the FP/SIMD registers, so no exception saves
+/// them (the user's live in the registers, or in the task's
+/// `fpsimd::ThreadStruct`). Layout matches the order we push/pop in
+/// exception vectors (vectors.S TRAP_FRAME_SIZE). For an exception from
+/// EL0 this is the task's user state, at the top of its kernel stack
+/// (`current_pt_regs`): its only copy while the task is in the kernel.
 #[repr(C)]
 #[derive(Clone, Default)]
 pub struct Aarch64TrapFrame {
@@ -64,12 +66,6 @@ pub struct Aarch64TrapFrame {
     pub elr: u64,
     /// Saved Program Status Register
     pub spsr: u64,
-    /// Floating-point status register
-    pub fpsr: u32,
-    /// Floating-point control register
-    pub fpcr: u32,
-    /// SIMD/FP registers V0-V31
-    pub v: [u128; 32],
     /// x0 of a syscall at entry (x0 then holds the return value; Linux
     /// orig_x0, for the restart)
     pub orig_x0: u64,
@@ -81,9 +77,8 @@ pub struct Aarch64TrapFrame {
 /// `syscallno` of a frame that is not a syscall's (Linux NO_SYSCALL)
 pub const NO_SYSCALL: u64 = u64::MAX;
 
-const _: () = assert!(core::mem::size_of::<Aarch64TrapFrame>() == 0x330);
-const _: () = assert!(core::mem::offset_of!(Aarch64TrapFrame, v) == 0x120);
-const _: () = assert!(core::mem::offset_of!(Aarch64TrapFrame, syscallno) == 0x328);
+const _: () = assert!(core::mem::size_of::<Aarch64TrapFrame>() == 0x120);
+const _: () = assert!(core::mem::offset_of!(Aarch64TrapFrame, syscallno) == 0x118);
 
 impl crate::arch::UserRegs for Aarch64TrapFrame {
     fn ip(&self) -> u64 {
@@ -456,9 +451,10 @@ impl ArchBusOps for Aarch64Arch {
 impl UserModeOps for Aarch64Arch {
     unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> ! {
         // Enter user mode at `entry` (the task's TTBR0 is loaded:
-        // mm::tlb::switch_mm): every register, FP/SIMD included, zero,
-        // FPCR/FPSR default, EL0t with interrupts enabled (Linux
-        // start_thread), in the pt_regs at the top of its kernel stack,
+        // mm::tlb::switch_mm): every register zero, EL0t with
+        // interrupts enabled (Linux start_thread; the FP/SIMD state was
+        // zeroed by exec's fpsimd::flush_thread), in the pt_regs at the
+        // top of its kernel stack,
         // left through vectors.S ret_to_user. The image's code was synced
         // to the instruction caches when exec loaded it
         // (paging::sync_page).
@@ -526,6 +522,12 @@ impl PerCpuOps for Aarch64Arch {
             .unwrap_or(0)
     }
 
+    #[inline]
+    fn irq_from_user() -> bool {
+        percpu::try_current_cpu()
+            .is_some_and(|p| p.irq_user.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
     fn cpu_online(cpu: u32) -> bool {
         (cpu as usize) < percpu::MAX_CPUS
             && percpu::get_percpu(cpu)
@@ -546,7 +548,6 @@ impl ContextOps for Aarch64Arch {
         fp: 0,
         lr: 0,
         sp: 0,
-        d8_d15: [0; 8],
     };
 
     #[inline]
@@ -597,7 +598,7 @@ pub use paging::Aarch64PageTable;
 impl SchedArch for Aarch64Arch {
     type SchedPageTable = Aarch64PageTable;
 
-    // The child's TrapFrame carries the inherited FP/SIMD registers
+    // The child's FP/SIMD state is in its task (fpsimd::dup_thread)
     unsafe fn clone_child_fpu(regs: u64) -> u64 {
         regs
     }
@@ -682,6 +683,9 @@ impl VfsInitOps for Aarch64Arch {
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
+    // SAFETY: first thing on the boot CPU: nothing used a per-CPU
+    // variable yet
+    unsafe { crate::cpu::setup_boot_area() };
     // Initialize serial FIRST before anything else
     serial::init();
 

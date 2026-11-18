@@ -18,10 +18,11 @@
 //!
 //! The group totals (Linux thread_group_cputimer) are atomics in the
 //! SignalStruct, started from the group's CPU time when the first
-//! process timer or a finite RLIMIT_CPU is armed and fed at every
-//! accounting point after (`Task::account`), so they are exact to a
-//! tick. Thread caches are per-task atomics. Both are hints: a stale
-//! one only costs a pass of `run`.
+//! process timer or a finite RLIMIT_CPU is armed and fed after by
+//! every thread's runtime charges (`sched::update_se`) and tick samples
+//! (`cputime::account_process_tick`), so they are exact to a tick. Thread caches
+//! are per-task atomics. Both are hints: a stale one only costs a pass
+//! of `run`.
 //!
 //! Locking: atomics only, except `run` and arming, which hold the
 //! group's `posix_timers` while they decide and store the group's state
@@ -35,35 +36,42 @@ use crate::time::posix_timer::ElistAdapter;
 use crate::util::list::ArcList;
 
 use crate::task::Tid;
+use crate::task::cputime::TaskCputime;
 
 /// No expiry
 pub const NONE: u64 = u64::MAX;
 
-/// What a CPU timer counts (Linux CPUCLOCK_PROF / VIRT; SCHED counts
-/// as PROF: hk keeps no separate runtime sum)
+/// What a CPU timer counts (Linux CPUCLOCK_PROF / VIRT / SCHED)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sample {
     /// utime + stime
     Prof = 0,
     /// utime
     Virt = 1,
+    /// sum_exec_runtime
+    Sched = 2,
 }
 
+/// The samples, in `Sample` order
+const SAMPLES: [Sample; 3] = [Sample::Prof, Sample::Virt, Sample::Sched];
+
 impl Sample {
-    /// From a CPU clock id's low bits (CPUCLOCK_PROF 0, VIRT 1, SCHED 2)
+    /// From a CPU clock id's low bits (CPUCLOCK_PROF 0, VIRT 1, SCHED
+    /// 2; validated by the caller)
     pub fn of(which: u8) -> Self {
-        if which == 1 {
-            Sample::Virt
-        } else {
-            Sample::Prof
+        match which {
+            0 => Sample::Prof,
+            1 => Sample::Virt,
+            _ => Sample::Sched,
         }
     }
 
-    /// This sample of (utime, stime)
-    pub fn pick(self, (u, s): (u64, u64)) -> u64 {
+    /// This sample of `c` (Linux store_samples)
+    pub fn pick(self, c: &TaskCputime) -> u64 {
         match self {
-            Sample::Prof => u.saturating_add(s),
-            Sample::Virt => u,
+            Sample::Prof => c.utime.saturating_add(c.stime),
+            Sample::Virt => c.utime,
+            Sample::Sched => c.sum_exec_runtime,
         }
     }
 }
@@ -80,48 +88,66 @@ pub struct CpuClock {
 /// A thread group's CPU timer state (Linux signal->cputimer and the
 /// process part of posix_cputimers)
 pub struct GroupCputimer {
-    /// The totals below are kept (Linux cputimer->running)
+    /// The totals below are kept (Linux posix_cputimers.timers_active)
     active: AtomicBool,
-    /// Group utime, stime (ns) while active
-    sums: [AtomicU64; 2],
+    /// Group utime, stime, sum_exec_runtime (ns) while active (Linux
+    /// cputimer->cputime_atomic): every thread of the group adds to
+    /// them from its own CPU, hence RMWs
+    sums: [AtomicU64; 3],
     /// Earliest process-timer expiry per sample (ns), NONE if none
-    next: [AtomicU64; 2],
+    next: [AtomicU64; 3],
 }
 
 impl GroupCputimer {
     pub const fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
-            sums: [AtomicU64::new(0), AtomicU64::new(0)],
-            next: [AtomicU64::new(NONE), AtomicU64::new(NONE)],
+            sums: [const { AtomicU64::new(0) }; 3],
+            next: [const { AtomicU64::new(NONE) }; 3],
         }
     }
 
-    /// A thread of the group ran `delta` ns in user (or kernel) mode
-    /// (Linux account_group_*_time)
-    pub fn charge(&self, delta: u64, kernel: bool) {
+    /// A thread of the group got `delta` ns of user time (Linux
+    /// account_group_user_time)
+    pub fn account_user_time(&self, delta: u64) {
         if self.active.load(Ordering::Relaxed) {
-            self.sums[usize::from(kernel)].fetch_add(delta, Ordering::Relaxed);
+            self.sums[0].fetch_add(delta, Ordering::Relaxed);
         }
     }
 
-    /// The group's (utime, stime), if kept
-    pub fn totals(&self) -> Option<(u64, u64)> {
-        self.active.load(Ordering::Acquire).then(|| {
-            (
-                self.sums[0].load(Ordering::Relaxed),
-                self.sums[1].load(Ordering::Relaxed),
-            )
+    /// A thread of the group got `delta` ns of system time (Linux
+    /// account_group_system_time)
+    pub fn account_system_time(&self, delta: u64) {
+        if self.active.load(Ordering::Relaxed) {
+            self.sums[1].fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// A thread of the group was charged `delta` ns of runtime (Linux
+    /// account_group_exec_runtime)
+    pub fn account_exec_runtime(&self, delta: u64) {
+        if self.active.load(Ordering::Relaxed) {
+            self.sums[2].fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// The group's CPU time, if kept (Linux proc_sample_cputime_atomic)
+    pub fn totals(&self) -> Option<TaskCputime> {
+        self.active.load(Ordering::Acquire).then(|| TaskCputime {
+            utime: self.sums[0].load(Ordering::Relaxed),
+            stime: self.sums[1].load(Ordering::Relaxed),
+            sum_exec_runtime: self.sums[2].load(Ordering::Relaxed),
         })
     }
 
     /// Start keeping totals from the group's CPU time `now` (Linux
     /// thread_group_start_cputime); under the group's `posix_timers`,
     /// as every start and stop, so the load-then-stores cannot race
-    fn start(&self, now: (u64, u64)) {
+    fn start(&self, now: TaskCputime) {
         if !self.active.load(Ordering::Acquire) {
-            self.sums[0].store(now.0, Ordering::Relaxed);
-            self.sums[1].store(now.1, Ordering::Relaxed);
+            self.sums[0].store(now.utime, Ordering::Relaxed);
+            self.sums[1].store(now.stime, Ordering::Relaxed);
+            self.sums[2].store(now.sum_exec_runtime, Ordering::Relaxed);
             self.active.store(true, Ordering::Release);
         }
     }
@@ -140,43 +166,59 @@ impl GroupCputimer {
 
     /// Past a process expiry
     fn due(&self) -> bool {
-        self.totals().is_some_and(|t| {
-            Sample::Prof.pick(t) >= self.next[0].load(Ordering::Relaxed)
-                || Sample::Virt.pick(t) >= self.next[1].load(Ordering::Relaxed)
-        })
+        self.totals().is_some_and(|t| past(&t, &self.next))
     }
+}
+
+/// `c` is past one of the expiries `next` (Linux
+/// task_cputimers_expired)
+fn past(c: &TaskCputime, next: &[AtomicU64; 3]) -> bool {
+    SAMPLES
+        .iter()
+        .zip(next)
+        .any(|(s, n)| s.pick(c) >= n.load(Ordering::Relaxed))
 }
 
 /// Group `pid`'s current CPU time: its kept totals, else the sum over
 /// its threads (Linux cpu_clock_sample_group with start=false; thread
 /// context). Never starts the totals: only arming a process timer does
-/// (`arm_group`, under `posix_timers`), so timer_gettime, settime's old
-/// value and clock_nanosleep's remainder leave the group's accounting
-/// as they found it.
-pub fn group_sample(sig: &crate::signal::SignalStruct, pid: crate::task::Pid) -> (u64, u64) {
-    sig.cputimer
-        .totals()
-        .unwrap_or_else(|| crate::task::percpu::get_process_times(pid))
+/// (`arm_group`, under `posix_timers`), so clock_gettime,
+/// timer_gettime, settime's old value and clock_nanosleep's remainder
+/// leave the group's accounting as they found it.
+pub fn group_sample(sig: &crate::signal::SignalStruct, pid: crate::task::Pid) -> TaskCputime {
+    sig.cputimer.totals().unwrap_or_else(|| {
+        let table = crate::task::percpu::TASKLIST.read();
+        crate::task::cputime::thread_group_cputime(&table, pid)
+    })
 }
 
-/// Thread `tid`'s (utime, stime) now, if it is alive
-pub fn thread_sample(tid: Tid) -> Option<(u64, u64)> {
-    let now = crate::time::monotonic_ns();
+/// Thread `t`'s clock `s` now (Linux cpu_clock_sample): its runtime
+/// with the running slice, or its utime/stime samples
+pub fn cpu_clock_sample(t: &crate::task::Task, s: Sample) -> u64 {
+    match s {
+        Sample::Sched => crate::task::percpu::task_sched_runtime(t),
+        _ => s.pick(&crate::task::cputime::task_cputime(t)),
+    }
+}
+
+/// Thread `tid`'s clock `s` now, if it is alive
+pub fn thread_sample(tid: Tid, s: Sample) -> Option<u64> {
     let me = crate::task::percpu::current();
     if me.tid() == tid {
-        return Some(me.cputime(now));
+        return Some(cpu_clock_sample(&me, s));
     }
-    crate::task::percpu::TASKLIST
-        .read()
-        .get(tid)
-        .map(|t| t.task.cputime(now))
+    // Found and sampled under RCU (Linux cpu_timer_task_rcu,
+    // cpu_clock_sample under rcu_read_lock)
+    let g = crate::sync::rcu::read_lock();
+    crate::task::percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+        .map(|t| cpu_clock_sample(t, s))
 }
 
 /// The value of `clock` now (process: group `pid`'s totals)
 pub fn sample_now(clock: CpuClock, pid: crate::task::Pid) -> Option<u64> {
     match clock.thread {
-        Some(tid) => thread_sample(tid).map(|t| clock.sample.pick(t)),
-        None => crate::signal::current_signal().map(|g| clock.sample.pick(group_sample(&g, pid))),
+        Some(tid) => thread_sample(tid, clock.sample),
+        None => crate::signal::current_signal().map(|g| clock.sample.pick(&group_sample(&g, pid))),
     }
 }
 
@@ -184,7 +226,7 @@ pub fn sample_now(clock: CpuClock, pid: crate::task::Pid) -> Option<u64> {
 /// (restarted from `sample`, a fresh group CPU time, if `run` stopped
 /// them meanwhile). Under `posix_timers`, like the end of `run`, so a
 /// pass that found nothing armed cannot stop or overwrite this one.
-fn arm_group(sig: &crate::signal::SignalStruct, s: Sample, at: u64, sample: (u64, u64)) {
+fn arm_group(sig: &crate::signal::SignalStruct, s: Sample, at: u64, sample: TaskCputime) {
     let _reg = sig.posix_timers.lock();
     sig.cputimer.start(sample);
     sig.cputimer.arm(s, at);
@@ -201,10 +243,7 @@ pub fn arm(clock: CpuClock, at: u64) {
             let task = if me.tid() == tid {
                 Some(crate::task::percpu::task_ref(&me))
             } else {
-                crate::task::percpu::TASKLIST
-                    .read()
-                    .get(tid)
-                    .map(|t| crate::task::percpu::task_ref(t.task))
+                crate::task::percpu::find_task(tid)
             };
             let (Some(t), Some(g)) = (task, crate::signal::current_signal()) else {
                 return;
@@ -225,15 +264,8 @@ pub fn arm(clock: CpuClock, at: u64) {
 /// thread's own or of its group's, run the timers on the way back to
 /// user mode (Linux run_posix_cpu_timers' fastpath + task_work)
 pub fn tick(t: &crate::task::Task) {
-    let mine = [
-        t.cpu_next[0].load(Ordering::Relaxed),
-        t.cpu_next[1].load(Ordering::Relaxed),
-    ];
-    let mut due = false;
-    if mine != [NONE, NONE] {
-        let c = t.cputime(crate::time::monotonic_ns());
-        due = Sample::Prof.pick(c) >= mine[0] || Sample::Virt.pick(c) >= mine[1];
-    }
+    let armed = t.cpu_next.iter().any(|n| n.load(Ordering::Relaxed) != NONE);
+    let mut due = armed && past(&crate::task::cputime::task_cputime(t), &t.cpu_next);
     if !due {
         due = t.cpu_group().is_some_and(|g| g.cputimer.due());
     }
@@ -243,7 +275,11 @@ pub fn tick(t: &crate::task::Task) {
 }
 
 /// Run the calling task's due CPU timers and its group's (task context,
-/// on the way back to user mode; Linux handle_posix_cpu_timers)
+/// on the way back to user mode; Linux handle_posix_cpu_timers). Out of
+/// line: inlined, its sends grew the return path's frame (every return
+/// to user mode, and the signal delivery under it) by ~370 bytes on
+/// arm64
+#[inline(never)]
 pub fn run() {
     use crate::task::percpu;
     let me = percpu::current();
@@ -251,15 +287,17 @@ pub fn run() {
     let Some(sig) = me.cpu_group().cloned() else {
         return;
     };
-    let mine = me.cputime(crate::time::monotonic_ns());
+    // Its samples as of the last charge (Linux check_thread_timers:
+    // task_sample_cputime)
+    let mine = crate::task::cputime::task_cputime(&me);
     // Expired timers, linked under the lock and fired after it (Linux
     // collect_timerqueue's firing list); the process signals of the
     // itimers (VIRT, PROF) and RLIMIT_CPU, at most one each
     let mut firing: ArcList<ElistAdapter> = ArcList::new();
     let mut itimer_sig = [None; 2];
     let mut rlimit_sig = None;
-    let mut thread_next = [NONE; 2];
-    let mut proc_next = [NONE; 2];
+    let mut thread_next = [NONE; 3];
+    let mut proc_next = [NONE; 3];
     let mut any_process = false;
     // The whole pass under `posix_timers`: arming (`arm_group`) takes
     // it too, so what is decided below holds until it is stored
@@ -270,13 +308,13 @@ pub fn run() {
             continue;
         };
         let now = match clock.thread {
-            Some(x) if x == tid => clock.sample.pick(mine),
+            Some(x) if x == tid => clock.sample.pick(&mine),
             // Another thread's timer: checked when it runs
             Some(_) => continue,
             None => {
                 any_process |= t.armed();
                 match group {
-                    Some(g) => clock.sample.pick(g),
+                    Some(g) => clock.sample.pick(&g),
                     None => continue,
                 }
             }
@@ -299,7 +337,7 @@ pub fn run() {
         let (Some(g), Some(clock)) = (group, t.cpu_clock()) else {
             continue;
         };
-        if let Some(Expired::Signal(s)) = t.cpu_expire(clock.sample.pick(g)) {
+        if let Some(Expired::Signal(s)) = t.cpu_expire(clock.sample.pick(&g)) {
             *out = Some(s);
         }
         if let Some(at) = t.cpu_expiry() {
@@ -318,7 +356,7 @@ pub fn run() {
     let limited = match group {
         Some(g) => rlimit_cpu(
             &sig,
-            Sample::Prof.pick(g),
+            Sample::Prof.pick(&g),
             &mut rlimit_sig,
             &mut proc_next[0],
         ),
@@ -337,7 +375,7 @@ pub fn run() {
     }
     // From the kernel to the process (Linux SEND_SIG_PRIV)
     for s in itimer_sig.into_iter().chain([rlimit_sig]).flatten() {
-        let _ = crate::signal::group_send_sig_info(&me, s, crate::signal::SendInfo::Kernel);
+        let _ = crate::signal::send_group_signal(&me, s, crate::signal::SendInfo::Kernel);
     }
 }
 

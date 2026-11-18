@@ -35,10 +35,13 @@ The project uses stable Rust (no nightly features). Toolchain, components and ta
 
 ```bash
 rustup target add x86_64-unknown-none
-rustup target add aarch64-unknown-none
+rustup target add aarch64-unknown-none-softfloat
 rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 ```
+
+The arm64 kernel builds for `aarch64-unknown-none-softfloat`: no FP/SIMD
+code generation (Linux `-mgeneral-regs-only`).
 
 ## Quick Start
 
@@ -85,12 +88,12 @@ make build-arm      # Release build
 
 # Or directly with cargo:
 cargo build -p hk-kernel --target x86_64-unknown-none --release
-cargo build -p hk-kernel --target aarch64-unknown-none --release
+cargo build -p hk-kernel --target aarch64-unknown-none-softfloat --release
 ```
 
 The kernel binary is output to:
 - x86-64: `target/x86_64-unknown-none/release/kernel`
-- aarch64: `target/aarch64-unknown-none/release/kernel`
+- aarch64: `target/aarch64-unknown-none-softfloat/release/kernel`
 
 ### Userspace
 
@@ -350,7 +353,7 @@ target/vfat.img                              # FAT32 USB mass-storage image (bot
 user/initramfs-x86_64.cpio                   # Userspace CPIO archive
 
 # aarch64
-target/aarch64-unknown-none/release/kernel   # Kernel binary (ELF)
+target/aarch64-unknown-none-softfloat/release/kernel   # Kernel binary (ELF)
 user/initramfs-aarch64.cpio                  # Userspace CPIO archive
 
 # Userspace binaries
@@ -393,7 +396,7 @@ which qemu-system-aarch64
 
 `rust-toolchain.toml` should install these automatically; if not:
 ```bash
-rustup target add x86_64-unknown-none aarch64-unknown-none
+rustup target add x86_64-unknown-none aarch64-unknown-none-softfloat
 rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 ```
 

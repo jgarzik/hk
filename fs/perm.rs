@@ -7,10 +7,8 @@
 //! - umask (file creation mask)
 //! - utime, utimes, utimensat, futimens (timestamp modification)
 
-use alloc::sync::Arc;
-
 use crate::fs::dac::{self, MAY_ACCESS};
-use crate::fs::{Dentry, Inode, KernelError, LookupFlags, Path};
+use crate::fs::{Dentry, InodeRef, KernelError, LookupFlags, Path};
 use crate::time::time_syscall::{LinuxTimespec, Timeval};
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
@@ -41,7 +39,7 @@ fn resolve(dirfd: i32, path_ptr: UserPtr<u8>, flags: i32, empty_ok: bool) -> Ker
     user_path_at(dirfd, path_ptr, LookupFlags::at(flags), empty_ok)
 }
 
-fn inode_of(d: &Dentry) -> KernelResult<Arc<Inode>> {
+fn inode_of(d: &Dentry) -> KernelResult<InodeRef> {
     d.get_inode().ok_or(KernelError::NotFound)
 }
 
@@ -268,14 +266,7 @@ fn do_utimes(
         None => (Some(now), Some(now)),
         Some(t) => (pick(&t[0]), pick(&t[1])),
     };
-    if let Some(t) = atime {
-        inode.set_atime(t);
-    }
-    if let Some(t) = mtime {
-        inode.set_mtime(t);
-    }
-    inode.set_ctime(now);
-    inode.i_op.setattr_done(&inode);
+    inode.set_times(atime, mtime, Some(now));
     drop(lock);
     Ok(())
 }

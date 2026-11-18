@@ -17,8 +17,6 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
-use crate::cpu::PerCpu;
-
 use crate::util::error::KernelError;
 
 /// Accounting quantum (Linux PAGE_SIZE: sk_forward_alloc is charged in
@@ -28,11 +26,13 @@ pub const QUANTUM: usize = 4096;
 /// Quanta held by all connections, less what the CPUs' reserves hold
 /// (Linux tcp_memory_allocated)
 static ALLOCATED: AtomicIsize = AtomicIsize::new(0);
-/// Each CPU's changes not yet in `ALLOCATED` (Linux
-/// tcp_memory_per_cpu_fw_alloc). An atomic RMW on the slot, so a task
-/// moved to another CPU between two steps only changes that CPU's
-/// reserve (Linux this_cpu ops)
-static FW_ALLOC: PerCpu<AtomicIsize> = crate::percpu![AtomicIsize::new(0)];
+crate::percpu! {
+    /// Each CPU's changes not yet in `ALLOCATED` (Linux
+    /// tcp_memory_per_cpu_fw_alloc): written only by its CPU, with
+    /// this_cpu adds (`PerCpu::this_add_return`; the kernel is not
+    /// preemptive, so a step stays on one CPU), drained by its CPU too
+    static FW_ALLOC: AtomicIsize = AtomicIsize::new(0);
+}
 /// Linux SK_MEMORY_PCPU_RESERVE: 1 MiB in quanta, the default and the
 /// least net.core.mem_pcpu_rsv takes
 const PCPU_RSV_MIN: i32 = (1 << 20) / QUANTUM as i32;
@@ -50,9 +50,11 @@ static LIMITS: [AtomicUsize; 3] = [
 static PRESSURE: AtomicU64 = AtomicU64::new(0);
 /// TCP control blocks alive (Linux tcp_sockets_allocated)
 static SOCKETS: AtomicUsize = AtomicUsize::new(0);
-/// Orphaned connections, every namespace's, per CPU (Linux
-/// tcp_orphan_count): a part may go negative, the sum does not
-static ORPHANS: PerCpu<AtomicIsize> = crate::percpu![AtomicIsize::new(0)];
+crate::percpu! {
+    /// Orphaned connections, every namespace's, per CPU (Linux
+    /// tcp_orphan_count): a part may go negative, the sum does not
+    static ORPHANS: AtomicIsize = AtomicIsize::new(0);
+}
 
 /// Quanta covering `bytes` (Linux sk_mem_pages)
 pub fn quanta(bytes: usize) -> usize {
@@ -83,7 +85,7 @@ fn rsv() -> isize {
 
 /// Add `amt` quanta (Linux sk_memory_allocated_add)
 pub fn add(amt: usize) {
-    let v = FW_ALLOC.this().fetch_add(amt as isize, Ordering::Relaxed) + amt as isize;
+    let v = FW_ALLOC.this_add_return(amt as i64) as isize;
     if v >= rsv() {
         drain();
     }
@@ -91,7 +93,7 @@ pub fn add(amt: usize) {
 
 /// Give back `amt` quanta (Linux sk_memory_allocated_sub)
 pub fn sub(amt: usize) {
-    let v = FW_ALLOC.this().fetch_sub(amt as isize, Ordering::Relaxed) - amt as isize;
+    let v = FW_ALLOC.this_add_return(-(amt as i64)) as isize;
     if v <= -rsv() {
         drain();
     }
@@ -161,14 +163,14 @@ pub struct Orphan(());
 
 impl Orphan {
     pub fn new() -> Self {
-        ORPHANS.this().fetch_add(1, Ordering::Relaxed);
+        ORPHANS.this_add(1);
         Self(())
     }
 }
 
 impl Drop for Orphan {
     fn drop(&mut self) {
-        ORPHANS.this().fetch_sub(1, Ordering::Relaxed);
+        ORPHANS.this_add(-1);
     }
 }
 

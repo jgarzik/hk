@@ -18,7 +18,9 @@ fn chld_info(
 ) -> Option<SigInfo> {
     let v = table.view(t)?;
     let uid = v.cred_arc().uid;
-    let (utime, stime) = v.task.cputime(crate::time::monotonic_ns());
+    // Raw samples (Linux task_cputime)
+    let c = crate::task::cputime::task_cputime(v.task);
+    let (utime, stime) = (c.utime, c.stime);
     let fields = SigFields::Chld {
         pid: crate::task::pid::nr_ns(t.tid(), ns) as i32,
         uid,
@@ -48,12 +50,18 @@ pub fn notify_parent_cldstop(
         return;
     };
     let (tsk, parent) = if for_ptracer {
-        (crate::task::percpu::task_ref(t), v.tracer())
+        (
+            crate::task::percpu::task_ref(t),
+            v.tracer().map(crate::task::percpu::task_ref),
+        )
     } else {
         let Some(l) = table.get(t.pid) else {
             return;
         };
-        (crate::task::percpu::task_ref(l.task), l.real_parent())
+        (
+            crate::task::percpu::task_ref(l.task),
+            l.real_parent().map(crate::task::percpu::task_ref),
+        )
     };
     let Some(parent) = parent else {
         return;
@@ -61,10 +69,14 @@ pub fn notify_parent_cldstop(
     let status = match why {
         Why::Continued => super::SIGCONT.nr() as i32,
         Why::Stopped => {
-            let code = tsk.cpu_group().map_or(0, |s| super::stop::stop_code(s));
+            let code = tsk
+                .cpu_group()
+                .zip(super::lock_sighand_in(&tsk, table))
+                .map_or(0, |(s, g)| super::stop::stop_code(&g, s));
             (code & 0x7f) as i32
         }
-        Why::Trapped => (tsk.sig.lock().ptrace_code & 0x7f) as i32,
+        Why::Trapped => super::lock_sighand_in(&tsk, table)
+            .map_or(0, |g| (super::sig_of(&tsk, &g).ptrace_code & 0x7f) as i32),
     };
     let quiet = table
         .view(&parent)
@@ -73,17 +85,14 @@ pub fn notify_parent_cldstop(
     // As the receiver's namespace numbers it (Linux task_pid_nr_ns(tsk,
     // task_active_pid_ns(parent)))
     let info = chld_info(table, &tsk, why.code(), status, parent.pid_ns());
-    if !quiet
-        && let Some(info) = info
-        && let Some(to) = super::group_task(table, table.get(parent.pid))
-    {
-        // Linux send_signal_locked(SIGCHLD, .., PIDTYPE_TGID); SIGCHLD
-        // flushes nothing
+    if !quiet && let Some(info) = info {
+        // To the parent thread, for its group (Linux
+        // __group_send_sig_info(SIGCHLD, .., parent): send_signal_locked
+        // PIDTYPE_TGID); SIGCHLD flushes nothing
         let mut gone = super::SigPending::new();
         let info = SendInfo::Info(info);
         let _ = super::send_task_in(
-            table,
-            &to,
+            &parent,
             SIGCHLD,
             info,
             super::PidType::Tgid,
@@ -109,16 +118,14 @@ fn chld_code(status: i32) -> (i32, i32) {
     }
 }
 
-/// Who is told of zombie `z`: its tracer, else its real parent
-/// (`_parent`), through `to`, the thread of that process a group signal
-/// is checked against; the signal (its exit signal, or SIGCHLD to a
+/// Who is told of zombie `z`: its tracer, else its real parent (`to`,
+/// that thread, for its process: Linux __group_send_sig_info to
+/// tsk->parent); the signal (its exit signal, or SIGCHLD to a
 /// tracer that is not the parent, to a thread, or to an image that did
 /// not ask for it; None: none) and whether it is released at once
 /// (autoreap)
 struct Rcv {
-    /// Kept only so its last reference, if this is it, goes after
-    /// TASKLIST
-    _parent: TaskRef,
+    /// Kept so its last reference, if this is it, goes after TASKLIST
     to: TaskRef,
     sig: Option<Signal>,
     autoreap: bool,
@@ -155,10 +162,10 @@ impl Zombie {
 fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let tid = z.tid();
     let t = table.get(tid)?;
-    let real = t.real_parent();
+    let real = t.real_parent().map(crate::task::percpu::task_ref);
     let tracer = match z {
         Zombie::Detached(_) => None,
-        _ => t.tracer(),
+        _ => t.tracer().map(crate::task::percpu::task_ref),
     };
     let traced = tracer.is_some();
     let parent = tracer.or(real.clone())?;
@@ -183,31 +190,24 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     if sig != Some(SIGCHLD) && t.parent_exec_id() != crate::task::self_exec_id(&parent) {
         sig = Some(SIGCHLD);
     }
-    let to = super::group_task(table, table.get(parent.pid))?;
     let (sig, autoreap) = if traced {
         (sig, false)
     } else {
-        disposition(table, &to, sig)
+        disposition(table, &parent, sig)
     };
     Some(Rcv {
-        _parent: parent,
-        to,
+        to: parent,
         sig,
         autoreap,
     })
 }
 
-/// What untraced child notice `sig` to the process `to` is a thread of
-/// does, by that process's SIGCHLD action (Linux do_notify_parent:
-/// psig, the handlers its threads share; not a thread's own, which an
-/// exited one no longer has): the signal sent (None: none) and
-/// autoreap. A parent that ignores SIGCHLD or set SA_NOCLDWAIT does not
+/// What untraced child notice `sig` to the parent thread `to` does, by
+/// its process's SIGCHLD action (Linux do_notify_parent: psig =
+/// tsk->parent->sighand, the handlers its threads share): the signal
+/// sent (None: none) and autoreap. A parent that ignores SIGCHLD or set SA_NOCLDWAIT does not
 /// wait for the child; one that ignores it gets no signal.
-fn disposition(
-    table: &GlobalTaskTable,
-    to: &TaskRef,
-    sig: Option<Signal>,
-) -> (Option<Signal>, bool) {
+fn disposition(table: &GlobalTaskTable, to: &Task, sig: Option<Signal>) -> (Option<Signal>, bool) {
     if sig != Some(SIGCHLD) {
         return (sig, false);
     }
@@ -221,12 +221,11 @@ fn disposition(
     }
 }
 
-/// The process `pid` reaps its children itself: it ignores SIGCHLD or
-/// set SA_NOCLDWAIT (Linux ignoring_children, by its SIGCHLD action as
-/// [`disposition`] reads it)
-pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool {
-    super::group_task(table, table.get(pid))
-        .is_some_and(|to| disposition(table, &to, Some(SIGCHLD)).1)
+/// The process of task `t` reaps its children itself: it ignores
+/// SIGCHLD or set SA_NOCLDWAIT (Linux ignoring_children(t->sighand), by
+/// its SIGCHLD action as [`disposition`] reads it)
+pub fn ignoring_children(table: &GlobalTaskTable, t: &Task) -> bool {
+    disposition(table, t, Some(SIGCHLD)).1
 }
 
 /// What [`notify`] did: the parent is to release the zombie now
@@ -279,15 +278,7 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
         // the last thread's release sends its leader's notice with its
         // own pid already detached)
         let info = SendInfo::Notice(info.with_sig(sig));
-        let _ = super::send_task_in(
-            table,
-            &r.to,
-            sig,
-            info,
-            super::PidType::Tgid,
-            false,
-            &mut gone,
-        );
+        let _ = super::send_task_in(&r.to, sig, info, super::PidType::Tgid, false, &mut gone);
     }
     Told {
         autoreap,
@@ -298,21 +289,23 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
 
 /// Zombie `tid`'s notice info, read under TASKLIST: its pid (as the
 /// receiver's namespace `ns` numbers it: Linux do_notify_parent), uid, wait
-/// status, and its CPU times (a leader's: its group's)
+/// status, and its CPU times with its group's exited threads
 fn chld_notice(table: &GlobalTaskTable, tid: Tid, ns: &crate::ns::PidNamespace) -> Option<SigInfo> {
     let t = table.get(tid)?;
     let crate::task::TaskState::Zombie(own) = t.state() else {
         return None;
     };
-    let status = match t.signal().map(|s| s.group_exit()) {
+    let status = match t.task.cpu_group().map(|s| s.group_exit()) {
         Some(super::GroupExit::Exit(code)) => code,
         _ => own,
     };
-    let (utime, stime) = if t.leader() {
-        crate::task::percpu::group_times(table, t.task.pid)
-    } else {
-        t.task.cputime(crate::time::monotonic_ns())
-    };
+    // Its raw samples and its group's exited threads' (Linux
+    // do_notify_parent: task_cputime + signal->utime/stime)
+    let mut c = crate::task::cputime::task_cputime(t.task);
+    if let Some(s) = t.task.cpu_group() {
+        c = c + s.dead_times();
+    }
+    let (utime, stime) = (c.utime, c.stime);
     let (code, st) = chld_code(status);
     let fields = SigFields::Chld {
         pid: crate::task::pid::nr_ns(tid, ns) as i32,

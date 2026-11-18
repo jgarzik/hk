@@ -21,9 +21,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::block::blkdev::DevId;
 use crate::fs::fs_writeback::IoListA;
+use crate::fs::inode::InodeList;
 use crate::sync::spin::Mutex;
 use crate::task::workqueue::{DelayedWork, Workqueue, wq_flags};
-use crate::util::list::WeakList;
 
 /// The periodic writeback's interval in scheduler ticks
 /// (vm.dirty_writeback_centisecs)
@@ -66,13 +66,13 @@ pub struct BdiWriteback {
 
 /// A disk's dirty inodes, linked through `Inode.i_io_list`, holding no
 /// reference to them (Linux wb->b_dirty, b_io): an inode's last
-/// reference evicts it whether dirty or not, its `Drop` unlinking it
+/// reference evicts it whether dirty or not, its eviction unlinking it
 pub(crate) struct WbLists {
     /// Dirtied and not yet taken by a pass, oldest first (Linux b_dirty,
     /// which keeps them newest first)
-    pub b_dirty: WeakList<IoListA>,
+    pub b_dirty: InodeList<IoListA>,
     /// Taken by the running pass, to write in order (Linux b_io)
-    pub b_io: WeakList<IoListA>,
+    pub b_io: InodeList<IoListA>,
 }
 
 impl BdiWriteback {
@@ -86,9 +86,13 @@ impl BdiWriteback {
         })));
         Self {
             dev_id,
-            list_lock: Mutex::new(WbLists {
-                b_dirty: WeakList::new(),
-                b_io: WeakList::new(),
+            // SAFETY: an inode's eviction takes it off either list under
+            // `list_lock` (`fs_writeback::inode_io_list_del`)
+            list_lock: Mutex::new(unsafe {
+                WbLists {
+                    b_dirty: InodeList::new(),
+                    b_io: InodeList::new(),
+                }
             }),
             pass: crate::sync::Mutex::new(()),
             dwork,
@@ -152,12 +156,74 @@ fn limit(ratio: &AtomicU64, bytes: &AtomicU64) -> u64 {
     total * ratio.load(Ordering::Relaxed) / 100
 }
 
+crate::percpu! {
+    /// Pages this CPU dirtied since its last throttle check (Linux
+    /// bdp_ratelimits): written by its CPU alone, interrupts off
+    static BDP_RATELIMITS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+}
+
+/// Pages a CPU dirties between checks (Linux ratelimit_pages, set by
+/// writeback_set_ratelimit: the dirty threshold over 32 per CPU, at
+/// least 16); 0 until first computed
+static RATELIMIT_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// Pages a task dirties between its checks (Linux nr_dirtied_pause's
+/// start, 128 KiB; hk does not adapt it)
+const DIRTIED_PAUSE: u64 = 32;
+
+/// `n` pages were dirtied by the current task on this CPU (Linux
+/// account_page_dirtied: current->nr_dirtied, bdp_ratelimits)
+pub fn dirtied(n: i64) {
+    crate::sync::Sole::sole_add(&crate::task::percpu::current().nr_dirtied, n as u64);
+    let irq = crate::sync::local_irq_save();
+    let w = BDP_RATELIMITS.this();
+    w.store(w.load(Ordering::Relaxed) + n, Ordering::Relaxed);
+    crate::sync::local_irq_restore(irq);
+}
+
+/// Linux writeback_set_ratelimit: from the dirty limits and the CPUs
+fn set_ratelimit() -> u64 {
+    let cpus = u64::from(crate::cpu::nr_possible().max(1));
+    let r = (limit(&DIRTY_RATIO, &DIRTY_BYTES) / (cpus * 32)).max(16);
+    RATELIMIT_PAGES.store(r, Ordering::Relaxed);
+    r
+}
+
+/// The current task, or this CPU, dirtied enough pages since its last
+/// check to check again (Linux balance_dirty_pages_ratelimited_flags:
+/// current->nr_dirtied against nr_dirtied_pause, else this CPU's
+/// bdp_ratelimits against ratelimit_pages); the counts restart then
+fn ratelimit_due() -> bool {
+    let r = match RATELIMIT_PAGES.load(Ordering::Relaxed) {
+        0 => set_ratelimit(),
+        r => r,
+    };
+    let me = crate::task::percpu::current();
+    let task_due = me.nr_dirtied.load(Ordering::Relaxed) >= DIRTIED_PAUSE;
+    let irq = crate::sync::local_irq_save();
+    let w = BDP_RATELIMITS.this();
+    let due = task_due || w.load(Ordering::Relaxed) >= r as i64;
+    if due {
+        w.store(0, Ordering::Relaxed);
+    }
+    crate::sync::local_irq_restore(irq);
+    if due {
+        // Linux balance_dirty_pages: current->nr_dirtied = 0
+        me.nr_dirtied.store(0, Ordering::Relaxed);
+    }
+    due
+}
+
 /// After a write dirtied pages of `inode` (Linux
-/// balance_dirty_pages_ratelimited): past the background limit its
+/// balance_dirty_pages_ratelimited): checked once this CPU dirtied
+/// `RATELIMIT_PAGES` since its last check; past the background limit its
 /// device's writeback starts now; past the dirty limit the writer
 /// writes the inode back itself (Linux throttles it until the flusher
 /// catches up). Sleeps; no lock held.
 pub fn balance_dirty_pages(inode: &crate::fs::Inode) {
+    if !ratelimit_due() {
+        return;
+    }
     let dirty = crate::mm::filemap::nr_dirty();
     if dirty > limit(&DIRTY_RATIO, &DIRTY_BYTES) {
         let _ = crate::fs::fs_writeback::writeback_inode(inode);
@@ -178,6 +244,8 @@ fn set_pair(
     crate::sysctl::range(v, lo, hi)?;
     on.store(v as u64, Ordering::Relaxed);
     off.store(0, Ordering::Relaxed);
+    // Linux dirty_*_handler: writeback_set_ratelimit
+    set_ratelimit();
     Ok(())
 }
 

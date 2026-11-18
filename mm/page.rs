@@ -17,6 +17,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::mm::anon_vma::AnonVma;
+use crate::sync::rcu::RcuHead;
 
 // ============================================================================
 // Page flags (stored in atomic for lock-free access)
@@ -96,7 +97,10 @@ pub struct Page {
     pub mapping: AtomicU64,
     /// Index within the mapping (virtual page for anonymous pages)
     pub index: AtomicU64,
-    /// List links, pfn + 1 (0 = none), owned by the list holder's lock
+    /// List links, pfn + 1 (0 = none), owned by the list holder's lock.
+    /// `next` through `ptl`: a slab's head page waiting for its
+    /// grace-period free holds its `RcuHead` there instead
+    /// ([`Page::slab_rcu_head`])
     pub next: AtomicU64,
     pub prev: AtomicU64,
     /// Compound tail: the head's pfn; slab: first free object
@@ -108,6 +112,22 @@ pub struct Page {
 }
 
 const _: () = assert!(core::mem::size_of::<Page>() == 64);
+
+/// Where a slab's head page keeps its `RcuHead`: over `next`, `prev`,
+/// `private`, `inuse` and `ptl`, which end the page with no padding
+/// (Linux struct slab: rcu_head in a union with slab_list, freelist and
+/// counters)
+const SLAB_RCU: usize = core::mem::offset_of!(Page, next);
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(offset_of!(Page, prev) == SLAB_RCU + 8);
+    assert!(offset_of!(Page, private) == SLAB_RCU + 16);
+    assert!(offset_of!(Page, inuse) == SLAB_RCU + 24);
+    assert!(offset_of!(Page, ptl) == SLAB_RCU + 28);
+    assert!(SLAB_RCU + 32 == size_of::<Page>());
+    assert!(size_of::<RcuHead>() <= 32);
+    assert!(SLAB_RCU.is_multiple_of(align_of::<RcuHead>()));
+};
 
 impl Page {
     /// A reserved page with nothing else set
@@ -320,6 +340,52 @@ impl Page {
         self.index.store(0, Ordering::Relaxed);
         old
     }
+
+    // ========================================================================
+    // Slab RCU head (Linux struct slab's rcu_head union)
+    // ========================================================================
+
+    /// A fresh `RcuHead` over a slab head page's list links, free list
+    /// and counts (`next` through `ptl`, see `SLAB_RCU`), for the slab's
+    /// grace-period free (Linux free_slab's call_rcu(&slab->rcu_head))
+    ///
+    /// # Safety
+    /// - The page heads a slab that is on no list and has no object in
+    ///   use, owned by the caller alone.
+    /// - Nothing reads or writes `next`, `prev`, `private`, `inuse` or
+    ///   `ptl` until [`Page::slab_rcu_end`].
+    #[inline]
+    pub unsafe fn slab_rcu_head(&self) -> &RcuHead {
+        let p = core::ptr::from_ref(self)
+            .cast::<u8>()
+            .wrapping_add(SLAB_RCU)
+            .cast::<RcuHead>()
+            .cast_mut();
+        // SAFETY: inside this page and aligned (SLAB_RCU's asserts); its
+        // bytes are atomics, writable through a shared borrow, no one
+        // else's until `slab_rcu_end` (the caller's contract)
+        unsafe { p.write(RcuHead::new()) };
+        // SAFETY: written just now; every byte of a head is initialized
+        // (RcuHead's invariant), so the fields read again later are
+        // plain words
+        unsafe { &*p }
+    }
+
+    /// The fields under a slab's `RcuHead` back, zeroed (the struct page
+    /// of a free page; `ptl` an unlocked PTE lock), once its callback
+    /// runs (Linux rcu_free_slab)
+    ///
+    /// # Safety
+    /// The head from [`Page::slab_rcu_head`] is on no RCU list (its
+    /// callback runs) and is never used again.
+    #[inline]
+    pub unsafe fn slab_rcu_end(&self) {
+        self.next.store(0, Ordering::Relaxed);
+        self.prev.store(0, Ordering::Relaxed);
+        self.private.store(0, Ordering::Relaxed);
+        self.inuse.store(0, Ordering::Relaxed);
+        self.ptl.store(0, Ordering::Relaxed);
+    }
 }
 
 // ============================================================================
@@ -494,6 +560,12 @@ pub fn pfn_to_page(pfn: u64) -> &'static Page {
     assert!(pfn_valid(pfn), "pfn_to_page: invalid pfn {pfn:#x}");
     // SAFETY: the memory map of a valid pfn's section is mapped for good
     unsafe { &*((crate::arch::paging::VMEMMAP_START + pfn * 64) as *const Page) }
+}
+
+/// The pfn of a struct page of the memory map (Linux page_to_pfn)
+#[inline]
+pub fn page_to_pfn(pg: &Page) -> u64 {
+    (core::ptr::from_ref(pg) as u64 - crate::arch::paging::VMEMMAP_START) / 64
 }
 
 /// The struct page of the frame at `phys`, if it has one

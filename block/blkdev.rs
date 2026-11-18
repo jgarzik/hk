@@ -979,7 +979,7 @@ pub struct BlockDevice {
     ro_warned: AtomicBool,
     /// The device's inode in the bdev pseudo filesystem: its page cache
     /// (Linux bd_mapping) serves device-node I/O and filesystem metadata
-    pub bd_inode: Arc<crate::fs::Inode>,
+    pub bd_inode: crate::fs::InodeRef,
     /// Its device in the block class (Linux bd_device); weak: the
     /// device's data is this block device, and the class keeps it
     /// while registered
@@ -1245,7 +1245,7 @@ pub fn get_blkdev(dev: DevId) -> Option<Arc<BlockDevice>> {
 
 /// `f` on each block device's inode (Linux: blockdev_superblock's
 /// s_inodes), with no lock held
-fn for_each_bdev_inode(mut f: impl FnMut(&Arc<crate::fs::Inode>)) {
+fn for_each_bdev_inode(mut f: impl FnMut(&crate::fs::InodeRef)) {
     let Ok(sb) = crate::fs::pseudo::BDEV.sb() else {
         return;
     };

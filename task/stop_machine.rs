@@ -15,7 +15,6 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::cpu::PerCpu;
 use crate::sync::IrqSpinlock;
 use crate::sync::Mutex;
 use crate::sync::completion::Completion;
@@ -46,12 +45,14 @@ struct Stopper {
     enabled: AtomicBool,
 }
 
-static STOPPERS: PerCpu<Stopper> = crate::percpu![Stopper {
+crate::percpu! {
+    static STOPPERS: Stopper = Stopper {
     lock: Mutex::new(()),
     work: IrqSpinlock::new(None),
     wq: WaitQueue::new(),
     enabled: AtomicBool::new(false),
-}];
+};
+}
 
 /// Run `func(arg)` on `cpu` from its stopper and wait for it (Linux
 /// stop_one_cpu); thread context, may sleep. False if `cpu` has no

@@ -8,9 +8,11 @@
 //! 5. Writing to control files (pids.max)
 //! 6. Cleaning up with rmdir
 
+use crate::harness::T;
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_RDONLY, O_RDWR, sys_close, sys_mkdir, sys_mount, sys_open, sys_read, sys_rmdir, sys_write,
+    O_RDONLY, O_RDWR, Stat, sys_close, sys_mkdir, sys_mount, sys_open, sys_read, sys_rmdir,
+    sys_stat, sys_umount2, sys_write,
 };
 
 /// Run all cgroup tests
@@ -22,7 +24,63 @@ pub fn run_tests() {
     test_read_control_files();
     test_write_pids_max();
     test_cleanup_cgroup();
+    two_mounts();
     println(b"=== Cgroup Test Complete ===");
+}
+
+/// CGROUPFS_TWO_MOUNTS: two cgroup2 mounts show the one hierarchy
+/// (Linux cgrp_dfl_root) through one superblock (one st_dev): a name
+/// that failed in one (a negative dentry,
+/// kept while its directory's revision stands: kernfs_iop_lookup,
+/// kernfs_dop_revalidate) is found once the other makes it, its control
+/// files too; a cgroup removed through one is gone from the other
+/// (kernfs_dop_revalidate: its node is no longer active), though that
+/// one cached it
+fn two_mounts() {
+    let mut t = T::new(b"CGROUPFS_TWO_MOUNTS");
+    let (a, b) = (b"/tmp/cga\0", b"/tmp/cgb\0");
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(a.as_ptr(), 0o755);
+    sys_mkdir(b.as_ptr(), 0o755);
+    let fs = b"cgroup2\0".as_ptr();
+    let ra = sys_mount(b"none\0".as_ptr(), a.as_ptr(), fs, 0, 0);
+    let rb = sys_mount(b"none\0".as_ptr(), b.as_ptr(), fs, 0, 0);
+    if t.eq(b"mount a", ra, 0) && t.eq(b"mount b", rb, 0) {
+        two_mounts_cases(&mut t);
+    }
+    sys_umount2(a.as_ptr(), 0);
+    sys_umount2(b.as_ptr(), 0);
+    sys_rmdir(a.as_ptr());
+    sys_rmdir(b.as_ptr());
+    t.done();
+}
+
+fn two_mounts_cases(t: &mut T) {
+    const ENOENT: i64 = -2;
+    // One superblock for both (Linux kernfs_get_tree: sget keyed on
+    // the hierarchy's kernfs root), so one device number
+    let (mut sa, mut sb) = (Stat::default(), Stat::default());
+    let a = sys_stat(b"/tmp/cga\0".as_ptr(), &mut sa);
+    let b = sys_stat(b"/tmp/cgb\0".as_ptr(), &mut sb);
+    if t.eq(b"stat a", a, 0) && t.eq(b"stat b", b, 0) {
+        t.ok(b"one st_dev", sa.st_dev == sb.st_dev, sb.st_dev as i64);
+    }
+    let mut st = Stat::default();
+    let bx = b"/tmp/cgb/tm2\0".as_ptr();
+    let bp = b"/tmp/cgb/tm2/cgroup.procs\0".as_ptr();
+    sys_rmdir(b"/tmp/cga/tm2\0".as_ptr());
+    t.eq(b"miss in b", sys_stat(bx, &mut st), ENOENT);
+    t.eq(b"miss again", sys_stat(bx, &mut st), ENOENT);
+    t.eq(
+        b"mkdir in a",
+        sys_mkdir(b"/tmp/cga/tm2\0".as_ptr(), 0o755),
+        0,
+    );
+    t.eq(b"found in b", sys_stat(bx, &mut st), 0);
+    t.eq(b"its file in b", sys_stat(bp, &mut st), 0);
+    t.eq(b"rmdir in a", sys_rmdir(b"/tmp/cga/tm2\0".as_ptr()), 0);
+    t.eq(b"gone from b", sys_stat(bx, &mut st), ENOENT);
+    t.eq(b"its file gone", sys_stat(bp, &mut st), ENOENT);
 }
 
 /// Mount cgroupfs at /sys/fs/cgroup (sysfs's mount point)

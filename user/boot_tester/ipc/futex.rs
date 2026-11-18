@@ -13,12 +13,12 @@
 //!   wait, wake and a requeue target (Linux get_futex_key)
 
 use crate::harness::pass;
-use crate::helpers::{print, print_num, println};
+use crate::helpers::{linux_at_least, print, print_num, println, skip};
 use core::ptr;
 use hk_syscall::{
-    CLOCK_MONOTONIC, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, FUTEX2_PRIVATE, FUTEX2_SIZE_U32,
-    FutexWaitv, RobustListHead, sys_futex, sys_futex_waitv, sys_get_robust_list,
-    sys_set_robust_list,
+    CLOCK_MONOTONIC, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, FUTEX2_MPOL, FUTEX2_NUMA,
+    FUTEX2_PRIVATE, FUTEX2_SIZE_U32, FutexWaitv, RobustListHead, sys_futex, sys_futex_waitv,
+    sys_get_robust_list, sys_getcpu, sys_set_robust_list,
 };
 
 /// Run all futex tests
@@ -36,6 +36,8 @@ pub fn run_tests() {
     test_futex_waitv_reserved_nonzero();
     test_futex_waitv_wrong_value();
     test_futex_waitv_invalid_size();
+    test_futex_waitv_val_range();
+    test_futex_waitv_numa();
     test_futex_unaligned();
 }
 
@@ -349,5 +351,82 @@ fn test_futex_waitv_invalid_size() {
     } else {
         print(b"FUTEX_WAITV_SIZE:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
+    }
+}
+
+/// Test: a value wider than the 32-bit word is EINVAL (Linux
+/// futex_validate_input)
+fn test_futex_waitv_val_range() {
+    // Not the truncated value: a kernel that truncates says EAGAIN
+    let futex_val: u32 = 1;
+    let mut w = FutexWaitv::new(
+        &futex_val as *const u32 as u64,
+        0,
+        FUTEX2_SIZE_U32 | FUTEX2_PRIVATE,
+    );
+    w.val = 1 << 32;
+    let ret = sys_futex_waitv(&w, 1, 0, ptr::null(), CLOCK_MONOTONIC);
+    if ret == -22 {
+        pass(b"FUTEX_WAITV_VAL_RANGE");
+    } else {
+        print(b"FUTEX_WAITV_VAL_RANGE:FAIL: expected -22, got ");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// A FUTEX2_NUMA futex: the word and its node word
+#[repr(C, align(8))]
+struct NumaFutex([u32; 2]);
+
+/// futex_waitv on a NUMA futex holding 42, expecting 0
+fn waitv_numa(addr: u64, flags: u32) -> i64 {
+    let w = FutexWaitv::new(addr, 0, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE | flags);
+    sys_futex_waitv(&w, 1, 0, ptr::null(), CLOCK_MONOTONIC)
+}
+
+/// Test: FUTEX2_NUMA and FUTEX2_MPOL (Linux 6.16): an unset node word
+/// gets this CPU's node (no policy set), a set one must name a node,
+/// and the pair is 8-byte aligned
+fn test_futex_waitv_numa() {
+    if !linux_at_least(6, 16) {
+        skip(b"FUTEX_WAITV_NUMA", b"Linux < 6.16");
+        return;
+    }
+    let set = |flags: u32, name: &[u8]| {
+        // The node of the CPU before and after: the task may migrate
+        let (mut before, mut after) = (0u32, 0u32);
+        let mut f = NumaFutex([42, u32::MAX]);
+        sys_getcpu(ptr::null_mut(), &mut before);
+        let ret = waitv_numa(f.0.as_mut_ptr() as u64, flags);
+        sys_getcpu(ptr::null_mut(), &mut after);
+        // SAFETY: the kernel wrote the node word during the call
+        let got = unsafe { ptr::read_volatile(&f.0[1]) };
+        if ret == -11 && (got == before || got == after) {
+            pass(name);
+        } else {
+            print(name);
+            print(b":FAIL: ret ");
+            print_num(ret);
+            print(b" node ");
+            print_num(got as i64);
+            println(b"");
+        }
+    };
+    set(FUTEX2_NUMA, b"FUTEX_WAITV_NUMA_SET");
+    set(FUTEX2_NUMA | FUTEX2_MPOL, b"FUTEX_WAITV_NUMA_MPOL");
+
+    let f = NumaFutex([42, 4000]);
+    let bad = waitv_numa(f.0.as_ptr() as u64, FUTEX2_NUMA);
+    let mut pair = [NumaFutex([42, u32::MAX]), NumaFutex([42, u32::MAX])];
+    let odd = waitv_numa(pair[0].0.as_mut_ptr() as u64 + 4, FUTEX2_NUMA);
+    if bad == -22 && odd == -22 {
+        pass(b"FUTEX_WAITV_NUMA_EINVAL");
+    } else {
+        print(b"FUTEX_WAITV_NUMA_EINVAL:FAIL: bad node ");
+        print_num(bad);
+        print(b" unaligned ");
+        print_num(odd);
+        println(b"");
     }
 }

@@ -1293,8 +1293,10 @@ pub const FUTEX2_SIZE_U32: u32 = 0x02;
 pub const FUTEX2_SIZE_U64: u32 = 0x03;
 pub const FUTEX2_SIZE_MASK: u32 = 0x03;
 
-/// FUTEX2 NUMA flag (not currently supported)
+/// The word is followed by a node word
 pub const FUTEX2_NUMA: u32 = 0x04;
+/// An unset node word takes the memory policy's node
+pub const FUTEX2_MPOL: u32 = 0x08;
 
 /// FUTEX2 private flag - futex is process-private (same as FUTEX_PRIVATE_FLAG)
 pub const FUTEX2_PRIVATE: u32 = 128;

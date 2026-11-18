@@ -1020,7 +1020,7 @@ pub fn sys_pidfd_send_signal(
     // receiver is found, so it is never sent.
     let sig = crate::signal::syscall::kill_sig(u32::try_from(sig).unwrap_or(u32::MAX));
     let me = crate::signal::syscall::Sender::current();
-    let check = |t: &super::percpu::TaskView<'_>, s| me.may_kill(t, s);
+    let check = |t: &super::Task, s| me.may_kill(t, s);
     let pid = pidfd.pid_ref();
     match scope {
         Scope::Thread => {

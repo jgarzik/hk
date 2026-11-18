@@ -650,20 +650,14 @@ pub fn fill_link(dev: &NetDevice, ty: u16, flags: u16, seq: u32, pid: u32, chang
 
 /// Counters in struct rtnl_link_stats64 order (25 x u64)
 fn stats_vals(dev: &NetDevice) -> [u64; 25] {
-    use core::sync::atomic::Ordering::Relaxed;
+    use crate::net::device::stat;
     let s = &dev.stats;
     let mut v = [0u64; 25];
-    v[0] = s.rx_packets.load(Relaxed);
-    v[1] = s.tx_packets.load(Relaxed);
-    v[2] = s.rx_bytes.load(Relaxed);
-    v[3] = s.tx_bytes.load(Relaxed);
-    v[4] = s.rx_errors.load(Relaxed);
-    v[5] = s.tx_errors.load(Relaxed);
-    v[6] = s.rx_dropped.load(Relaxed);
-    v[7] = s.tx_dropped.load(Relaxed);
-    v[8] = s.multicast.load(Relaxed);
-    v[9] = s.collisions.load(Relaxed);
-    v[23] = s.rx_nohandler.load(Relaxed);
+    // rtnl_link_stats64 slots 0..=9 are stat 0..=9, rx_nohandler 23
+    for (f, slot) in v.iter_mut().enumerate().take(stat::COLLISIONS + 1) {
+        *slot = s.get(f);
+    }
+    v[23] = s.get(stat::RX_NOHANDLER);
     v
 }
 

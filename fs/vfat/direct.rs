@@ -43,7 +43,7 @@ use alloc::sync::Arc;
 
 use crate::block::dio::{self, AsyncIo, Extent};
 use crate::fs::file::{File, RwFlags};
-use crate::fs::inode::Inode;
+use crate::fs::inode::{Inode, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::mm::filemap::{self, PAGE_SIZE};
 use crate::mm::gup::PageSeg;
@@ -52,9 +52,7 @@ use crate::task::workqueue::{SYSTEM_WQ, Work};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
-use super::{
-    VfatSbData, cache, get_inode_data, get_sb_data, update_size, vfat_write, write_failed,
-};
+use super::{VfatSbData, cache, get_inode_data, get_sb_data, vfat_write, write_failed};
 
 /// Last byte of `count` (> 0) bytes at `pos`
 fn last(pos: u64, count: usize) -> u64 {
@@ -99,7 +97,7 @@ fn sb_of(inode: &Inode) -> Result<VfatSbData, KernelError> {
 /// IOCB_DIRECT): the cache over the range written back, the direct
 /// part, then the rest through the cache if it stopped short before
 /// the end of the file
-pub fn read(inode: &Arc<Inode>, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
+pub fn read(inode: &InodeRef, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
     let count = to.len();
     if count == 0 {
         return Ok(0);
@@ -165,7 +163,7 @@ fn invalidate_post(inode: &Inode, pos: u64, count: usize) {
 
 /// O_DIRECT write of `from` at `pos` (Linux __generic_file_write_iter
 /// with IOCB_DIRECT); the VFS holds i_rwsem and gave at least one byte
-pub fn write(inode: &Arc<Inode>, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
+pub fn write(inode: &InodeRef, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
     let count = from.len();
     let n = match invalidate_pages(inode, pos, count) {
         // A page that cannot be dropped: all through the cache
@@ -183,7 +181,7 @@ pub fn write(inode: &Arc<Inode>, from: &mut IovSource<'_>, pos: u64) -> Result<u
 /// fat_direct_IO): 0 for one past the initialized bytes; the bios, the
 /// range dropped from the cache again and the size raised
 fn direct_write(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     from: &mut IovSource<'_>,
     pos: u64,
 ) -> Result<usize, KernelError> {
@@ -216,11 +214,8 @@ fn direct_write(
         let at = pos + n as u64;
         if at > inode.get_size() {
             inode.set_size(at);
+            // Linux generic_file_direct_write: mark_inode_dirty
             crate::fs::fs_writeback::mark_inode_dirty(inode);
-            // The data is on the disk: its count is returned whatever
-            // the directory entry's update does (Linux
-            // generic_file_direct_write: mark_inode_dirty cannot fail)
-            let _ = update_size(inode, &sb);
         }
     }
     Ok(n)
@@ -231,7 +226,7 @@ fn direct_write(
 /// generic_perform_write): all the bytes, or the direct ones if this
 /// part failed (its error if there were none)
 fn fallback(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     from: &mut IovSource<'_>,
     pos: u64,
     direct: usize,
@@ -261,9 +256,17 @@ fn fallback(
 /// in dio_complete), a read's result cut at the size it saw; a write
 /// ends in thread context when the file has pages cached at its end
 /// (`PostWrite`)
+///
+/// # Invariants
+/// `inode` is the inode of the file `inner` holds (`FileOps::dio_submit`)
+/// through its dentry, so it stays live while `inner` does.
 struct VfatAio {
     inner: Arc<dyn AsyncIo>,
-    inode: Arc<Inode>,
+    /// The file's inode, borrowed with no reference of its own (Linux
+    /// struct dio's inode, kept by iocb->ki_filp): its end may come in
+    /// an interrupt handler, where no inode reference may be put (Linux
+    /// iput's might_sleep)
+    inode: core::ptr::NonNull<Inode>,
     /// Most bytes the result counts
     cut: usize,
     /// A write's end over a cached range
@@ -302,19 +305,27 @@ impl PostWrite {
     }
 }
 
+// SAFETY: `inode` is a shared borrow of a Sync inode (type invariant);
+// the rest is Send and Sync
+unsafe impl Send for VfatAio {}
+// SAFETY: as above
+unsafe impl Sync for VfatAio {}
+
 impl VfatAio {
     /// `write`: the position of a write
     fn new(
         inner: Arc<dyn AsyncIo>,
-        inode: &Arc<Inode>,
+        inode: &InodeRef,
         cut: usize,
         write: Option<u64>,
     ) -> Result<Arc<Self>, KernelError> {
         let post = write.map(PostWrite::new).transpose()?;
         inode.inode_dio_begin();
+        // INVARIANT: `inode` is the file's (the caller's, from the file
+        // `inner` holds)
         let r = try_arc(Self {
             inner,
-            inode: inode.clone(),
+            inode: core::ptr::NonNull::from(&**inode),
             cut,
             post,
         });
@@ -324,13 +335,19 @@ impl VfatAio {
         r
     }
 
+    /// The file's inode
+    fn inode(&self) -> &Inode {
+        // SAFETY: live while `inner` holds the file (type invariant)
+        unsafe { self.inode.as_ref() }
+    }
+
     /// Drop what was cached over the written range meanwhile (thread
     /// context)
     fn invalidate(&self, res: &Result<usize, KernelError>) {
         if let (Some(p), Ok(n)) = (&self.post, res)
             && *n > 0
         {
-            invalidate_post(&self.inode, p.pos, *n);
+            invalidate_post(self.inode(), p.pos, *n);
         }
     }
 
@@ -344,7 +361,7 @@ impl VfatAio {
 
 impl Drop for VfatAio {
     fn drop(&mut self) {
-        self.inode.inode_dio_end();
+        self.inode().inode_dio_end();
     }
 }
 
@@ -352,8 +369,9 @@ impl Drop for VfatAio {
 // this holds it; `complete` cuts the result and either hands this to
 // its write's work (a lock and a queueing, both any context: the work
 // was made at submission) or ends the count (atomics and a wakeup) and
-// drops this before passing the result on: its inode reference is not
-// the last, as the inner request holds the file (`FileOps::dio_submit`)
+// drops this before passing the result on: it holds no inode reference
+// (its inode is the file's, which the inner request holds:
+// `FileOps::dio_submit`)
 unsafe impl AsyncIo for VfatAio {
     fn segs(&self) -> &[PageSeg] {
         self.inner.segs()
@@ -361,7 +379,7 @@ unsafe impl AsyncIo for VfatAio {
 
     fn complete(self: Arc<Self>, res: Result<usize, KernelError>) {
         let res = res.map(|n| n.min(self.cut));
-        let cached = matches!(res, Ok(n) if n > 0) && self.inode.i_data.nrpages() != 0;
+        let cached = matches!(res, Ok(n) if n > 0) && self.inode().i_data.nrpages() != 0;
         if let Some(p) = self.post.as_ref().filter(|_| cached) {
             let (job, work) = (p.job.clone(), p.work.clone());
             *job.lock() = Some((self, res));
@@ -401,7 +419,7 @@ fn io_len(io: &dyn AsyncIo) -> usize {
 /// An asynchronous direct read (`direct_read`'s steps, the wait left to
 /// the bios' end)
 fn read_async(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     io: Arc<dyn AsyncIo>,
     pos: u64,
 ) -> Result<Option<usize>, KernelError> {
@@ -432,7 +450,7 @@ fn read_async(
 /// the whole write at once through the VFS
 fn write_async(
     file: &File,
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     io: Arc<dyn AsyncIo>,
     pos: u64,
     flags: RwFlags,
@@ -457,7 +475,7 @@ fn write_async(
     let end = pos
         .checked_add(count as u64)
         .ok_or(KernelError::InvalidArgument)?;
-    let fits = !inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire)
+    let fits = !inode.is_swapfile()
         && end <= inode.get_size()
         && get_inode_data(inode)?.mmu_private >= end
         && inode.i_data.nrpages() == 0
@@ -468,9 +486,10 @@ fn write_async(
         return sync(&*io);
     }
     let m = map(&sb, inode, pos, count)?;
-    // file_modified, before the data (Linux __generic_file_write_iter)
+    // file_modified, before the data (Linux __generic_file_write_iter):
+    // the times through the filesystem (fat_update_time)
     crate::fs::dac::remove_privs(inode);
-    inode.touch_mc();
+    inode.file_update_time();
     let w = VfatAio::new(io, inode, count, Some(pos))?;
     dio::submit_async_map(&sb.bdev, w, &m, count, true, flags)?;
     drop(lock);

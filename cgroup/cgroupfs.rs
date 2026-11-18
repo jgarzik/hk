@@ -25,11 +25,13 @@ use alloc::vec::Vec;
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
-use crate::fs::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use crate::fs::inode::{
+    AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, InodeRef, Timespec,
+};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
-use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_init, cgroup_mkdir, cgroup_rmdir};
+use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_mkdir, cgroup_rmdir};
 use crate::task::Pid;
 use crate::util::kalloc::try_arc;
 
@@ -154,8 +156,32 @@ impl InodeData for CgroupfsInodeData {}
 /// Cgroupfs inode operations
 pub struct CgroupfsInodeOps;
 
+/// The cgroup of an inode
+fn cgroup_of(inode: &Inode) -> Option<Arc<Cgroup>> {
+    let p = inode.get_private()?;
+    p.as_any().downcast_ref::<CgroupfsInodeData>()?.cgroup()
+}
+
 impl InodeOps for CgroupfsInodeOps {
-    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+    /// Linux kernfs_iop_lookup (cgroup2 is kernfs there): a missing
+    /// name is a negative dentry stamped with the directory's revision,
+    /// read before the lookup (a change after the read moves it on)
+    fn lookup_neg(&self, dir: &Inode, name: &[u8]) -> Result<crate::fs::inode::Found, KernelError> {
+        let rev = cgroup_of(dir).map_or(0, |c| c.rev());
+        match self.lookup(dir, name) {
+            Ok(i) => Ok(crate::fs::inode::Found {
+                inode: Some(i),
+                d_time: rev,
+            }),
+            Err(KernelError::NotFound) => Ok(crate::fs::inode::Found {
+                inode: None,
+                d_time: rev,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let data = private
             .as_ref()
@@ -199,7 +225,7 @@ impl InodeOps for CgroupfsInodeOps {
         }
     }
 
-    fn mkdir(&self, dir: &Inode, name: &[u8], _mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], _mode: InodeMode) -> Result<InodeRef, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let data = private
             .as_ref()
@@ -215,12 +241,15 @@ impl InodeOps for CgroupfsInodeOps {
         let new_cg = cgroup_mkdir(&parent_cg, name)?;
         // No inode, no cgroup: a failed mkdir leaves the name free
         // (Linux cgroup_mkdir destroys what it built on an error)
-        create_cgroup_dir_inode(dir, &new_cg).inspect_err(|_| {
+        let i = create_cgroup_dir_inode(dir, &new_cg).inspect_err(|_| {
             let _ = cgroup_rmdir(&parent_cg, name);
-        })
+        })?;
+        // The parent's times (Linux kernfs_link_sibling's parent iattr)
+        dir.touch_mc();
+        Ok(i)
     }
 
-    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8], d: &Dentry) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let data = private
             .as_ref()
@@ -233,7 +262,16 @@ impl InodeOps for CgroupfsInodeOps {
             _ => return Err(KernelError::NotDirectory),
         };
         let parent_cg = parent.upgrade().ok_or(KernelError::NotFound)?;
-        cgroup_rmdir(&parent_cg, name)
+        cgroup_rmdir(&parent_cg, name)?;
+        // The parent's and the victim's times (Linux kernfs_remove's
+        // parent iattr)
+        let now = crate::time::TIMEKEEPER.current_time();
+        dir.set_ctime(now);
+        dir.set_mtime(now);
+        if let Some(i) = d.get_inode() {
+            i.set_ctime(now);
+        }
+        Ok(())
     }
 }
 
@@ -245,10 +283,7 @@ pub static CGROUPFS_INODE_OPS: CgroupfsInodeOps = CgroupfsInodeOps;
 // ============================================================================
 
 /// Create a cgroup directory inode
-fn create_cgroup_dir_inode(
-    parent: &Inode,
-    cgroup: &Arc<Cgroup>,
-) -> Result<Arc<Inode>, KernelError> {
+fn create_cgroup_dir_inode(parent: &Inode, cgroup: &Arc<Cgroup>) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let inode = Inode::alloc(Inode::new(
         cgroup.ino,
@@ -271,7 +306,7 @@ fn create_control_file_inode(
     parent: &Inode,
     cgroup: &Arc<Cgroup>,
     file_type: CgroupControlFileType,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let mode = if file_type.is_writable() {
         0o644
@@ -301,7 +336,7 @@ fn create_subsys_file_inode(
     cgroup: &Arc<Cgroup>,
     controller: ControllerType,
     file_name: &'static str,
-) -> Result<Arc<Inode>, KernelError> {
+) -> Result<InodeRef, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
 
     // Determine mode from controller's control file definition
@@ -737,7 +772,7 @@ impl SuperOps for CgroupfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, KernelError> {
+    ) -> Result<InodeRef, KernelError> {
         let inode = Inode::alloc(Inode::new(
             sb.alloc_ino(),
             mode,
@@ -762,17 +797,113 @@ pub static CGROUPFS_SUPER_OPS: CgroupfsSuperOps = CgroupfsSuperOps;
 // Mount Function
 // ============================================================================
 
-/// Mount cgroupfs
+/// What a cgroup2 superblock shows (Linux kernfs_super_info: its kernfs
+/// root, cgrp_dfl_root's, and namespace tag, none for cgroup2): the key
+/// its mounts share it by
+struct CgSuper {
+    root: Arc<crate::cgroup::CgroupRoot>,
+}
+
+impl AsAny for CgSuper {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+impl crate::fs::superblock::SuperBlockData for CgSuper {}
+
+/// Whether `sb` shows the hierarchy `root` (Linux kernfs_test_super:
+/// the same kernfs root and namespace tag)
+fn shows(sb: &SuperBlock, root: &Arc<crate::cgroup::CgroupRoot>) -> bool {
+    let p = sb.private.read();
+    p.as_ref()
+        .and_then(|p| p.as_any().downcast_ref::<CgSuper>())
+        .is_some_and(|c| Arc::ptr_eq(&c.root, root))
+}
+
+/// Mount cgroup2 (Linux cgroup_get_tree -> kernfs_get_tree): the
+/// default hierarchy's superblock, one shared by all its mounts (sget
+/// keyed on the hierarchy, kernfs_test_super / kernfs_set_super), so
+/// they have one device number and one dcache; filled if new
 fn cgroupfs_mount(
     fc: &crate::fs::superblock::FsContext<'_>,
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
-    // Initialize cgroup subsystem if not done
-    cgroup_init();
-    crate::fs::superblock::get_tree_nodev(fc, &CGROUPFS_SUPER_OPS, cgroupfs_fill)
+    let root = CGROUP_ROOT.clone();
+    let info: Arc<dyn crate::fs::superblock::SuperBlockData> =
+        try_arc(CgSuper { root: root.clone() })?;
+    let test = |sb: &SuperBlock| shows(sb, &root);
+    let sb = crate::fs::superblock::sget(fc, &CGROUPFS_SUPER_OPS, Some(&test), &|sb| {
+        // Linux kernfs_set_super
+        sb.set_private(info.clone());
+        crate::fs::superblock::set_anon_super(sb)
+    })?;
+    if !sb.has_root() {
+        cgroupfs_fill(&sb)?;
+        sb.set_active();
+    }
+    Ok(sb)
+}
+
+/// cgroup2's dentry operations (Linux kernfs_dops: cgroup2 is a kernfs
+/// filesystem there)
+static CGROUPFS_DOPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_revalidate: Some(cgroupfs_revalidate),
+    ..crate::fs::dentry::DentryOps::NONE
+};
+
+/// Linux kernfs_dop_revalidate: ECHILD in an RCU walk; a negative
+/// dentry is valid while its directory's revision is the one its
+/// lookup saw (kernfs_dir_changed); a positive one while its node is
+/// active and still that directory's child of that name
+/// ([`still_there`])
+fn cgroupfs_revalidate(
+    dir: &Inode,
+    d: &Dentry,
+    inode: Option<&Inode>,
+    flags: crate::fs::dentry::LookupBits,
+) -> Result<bool, KernelError> {
+    if flags.contains(crate::fs::dentry::LookupBits::RCU) {
+        return Err(KernelError::NoChild);
+    }
+    match inode {
+        Some(i) => Ok(still_there(dir, d, i)),
+        None => Ok(cgroup_of(dir).is_none_or(|c| c.rev() == d.d_time())),
+    }
+}
+
+/// kernfs_dop_revalidate's checks of a positive cgroupfs dentry `d` of
+/// `inode` in `dir`: its cgroup is not removed (kernfs_active), and it
+/// is still `dir`'s entry of that name (the parent and name checks): a
+/// child cgroup that parent's child by the dentry's name, a control
+/// file its own directory's, a controller's file while the controller
+/// is enabled there (Linux css_clear_dir removes its nodes)
+fn still_there(dir: &Inode, d: &Dentry, inode: &Inode) -> bool {
+    let Some(p) = inode.get_private() else {
+        return false;
+    };
+    let Some(data) = p.as_any().downcast_ref::<CgroupfsInodeData>() else {
+        return false;
+    };
+    let (Some(cg), Some(parent)) = (data.cgroup(), cgroup_of(dir)) else {
+        return false;
+    };
+    if cg.is_dead() {
+        return false;
+    }
+    match data {
+        CgroupfsInodeData::Directory { .. } => parent
+            .lookup_child(&d.name())
+            .is_some_and(|c| Arc::ptr_eq(&c, &cg)),
+        CgroupfsInodeData::ControlFile { .. } => Arc::ptr_eq(&parent, &cg),
+        CgroupfsInodeData::SubsysFile { controller, .. } => {
+            Arc::ptr_eq(&parent, &cg) && cg.css(*controller).is_some()
+        }
+    }
 }
 
 /// The root directory, the root cgroup's
 fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
+    sb.set_d_op(&CGROUPFS_DOPS);
     // Get root cgroup
     let root_cg = CGROUP_ROOT
         .root_cgroup()
@@ -802,11 +933,13 @@ fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// cgroup2's kill_sb (Linux cgroup_kill_sb, ending in kernfs_kill_sb's
-/// kill_anon_super; hk's cgroupfs keeps no root reference or kernfs
-/// info on the superblock)
+/// cgroup2's kill_sb (Linux cgroup_kill_sb, ending in kernfs_kill_sb:
+/// kill_anon_super, then the kernfs info freed; the default hierarchy
+/// is never killed)
 fn cgroup_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
     crate::fs::superblock::kill_anon_super(sb, g);
+    let info = sb.private.write().take();
+    drop(info);
 }
 
 /// Cgroupfs filesystem type

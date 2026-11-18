@@ -36,6 +36,7 @@ use super::mem;
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::*;
 use crate::net::skb::{SkBuff, SkbHead, SkbTree};
+use crate::sync::{SoleCell, Word};
 use crate::util::error::KernelError;
 
 /// TCP header flags
@@ -218,8 +219,6 @@ pub struct Opts {
     pub notsent_lowat: u32,
     /// TCP_DEFER_ACCEPT (retransmissions; stored only)
     pub defer_accept: u8,
-    /// TCP_FASTOPEN queue length (stored only: no TFO)
-    pub fastopen: u32,
     /// TCP_CONGESTION (index into `cong::ALGOS`)
     pub ca: usize,
 }
@@ -428,18 +427,18 @@ impl TwCb {
             ts_recent: c.ts_recent,
             ts_stamp: c.ts_stamp,
             clock: c.clock,
-            mss: c.mss,
+            mss: c.live.mss.get(),
             adv_mss: c.adv_mss,
-            tmr: c.tmr,
-            wait_at: c.wait_at,
+            tmr: c.live.tmr.get(),
+            wait_at: c.live.wait_at.get(),
             last_oow: c.last_oow,
         }
     }
 
     /// A control block in this state, empty queues, with the
-    /// namespace's current settings
-    pub fn cb(&self, cfg: Cfg) -> TcpCb {
-        let mut t = TcpCb::new(cfg);
+    /// namespace's current settings, its lockless fields in `live`
+    pub fn cb(&self, cfg: Cfg, live: Arc<Live>) -> TcpCb {
+        let mut t = TcpCb::new(cfg, live);
         t.state = self.state;
         t.iss = self.iss;
         t.snd_una = self.snd_una;
@@ -463,10 +462,10 @@ impl TwCb {
         t.ts_recent = self.ts_recent;
         t.ts_stamp = self.ts_stamp;
         t.clock = self.clock;
-        t.mss = self.mss;
+        t.live.mss.set(self.mss);
         t.adv_mss = self.adv_mss;
-        t.tmr = self.tmr;
-        t.wait_at = self.wait_at;
+        t.live.tmr.set(self.tmr);
+        t.live.wait_at.set(self.wait_at);
         t.last_oow = self.last_oow;
         t
     }
@@ -498,6 +497,92 @@ pub(super) enum Tmr {
     Rtx,
     /// Zero-window probe (persist)
     Probe,
+}
+
+/// The kind in the top two bits (0: none), the deadline (ms) below
+impl Word for Option<(Tmr, u64)> {
+    fn pack(self) -> u64 {
+        match self {
+            None => 0,
+            Some((k, t)) => {
+                let k = match k {
+                    Tmr::Rtx => 1,
+                    Tmr::Probe => 2,
+                };
+                k << 62 | t.min(TMR_AT)
+            }
+        }
+    }
+
+    fn unpack(w: u64) -> Self {
+        let t = w & TMR_AT;
+        match w >> 62 {
+            1 => Some((Tmr::Rtx, t)),
+            2 => Some((Tmr::Probe, t)),
+            _ => None,
+        }
+    }
+}
+
+/// The deadline bits of a packed `Tmr`
+const TMR_AT: u64 = (1 << 62) - 1;
+
+/// The control block's fields /proc/net/tcp reads with no lock (Linux
+/// get_tcp4_sock's racy reads: icsk_pending and icsk_timeout, the
+/// keepalive timer, icsk_backoff, icsk_probes_out, icsk_rto, icsk_ack
+/// ato / quick / pingpong, snd_cwnd, snd_ssthresh, mss_cache,
+/// fastopenq.max_qlen). They are the block's own fields, not copies,
+/// kept apart from it so a reader may load them while the block's
+/// holder (its socket lock's, or a TIME_WAIT entry's) stores them: the
+/// socket shares this with its block (`TcpSock.live`), and the block
+/// with its `Cong`. One writer: the block's holder.
+#[derive(Debug, Default)]
+pub struct Live {
+    /// The retransmit or zero-window probe timer and its deadline
+    pub(super) tmr: SoleCell<Option<(Tmr, u64)>>,
+    /// TIME_WAIT 2MSL or orphan FIN_WAIT_2 deadline
+    pub(super) wait_at: SoleCell<Option<u64>>,
+    /// Keepalive deadline
+    pub(super) keep_at: SoleCell<Option<u64>>,
+    /// RTO before backoff (ms)
+    pub(super) rto: SoleCell<u64>,
+    /// Consecutive timeouts / probes (exponential backoff)
+    pub(super) backoff: SoleCell<u32>,
+    /// Zero-window or keepalive probes without an answer
+    pub(super) probes: SoleCell<u32>,
+    /// Send MSS: payload per segment (min(peer's MSS option, path MTU -
+    /// 40, TCP_MAXSEG) less option bytes)
+    pub(super) mss: SoleCell<u32>,
+    /// Delayed ACK (Linux icsk_ack): ACKs left to send at once
+    /// (quickack mode), interactive (replies follow data, ACKs ride on
+    /// them), the adaptive delay (ms; 0 until data arrives)
+    pub(super) quick: SoleCell<u32>,
+    pub(super) pingpong: SoleCell<bool>,
+    pub(super) ato: SoleCell<u64>,
+    /// `Cong`'s window and slow start threshold (bytes)
+    pub(super) cwnd: SoleCell<u32>,
+    pub(super) ssthresh: SoleCell<u32>,
+    /// TCP_FASTOPEN queue length (stored only: no TFO). The socket's,
+    /// not the connection's (Linux fastopenq, in the accept queue): a
+    /// new block keeps it, a listener's child starts at 0
+    pub(super) fastopen: SoleCell<u32>,
+}
+
+impl Live {
+    /// A new connection's values; `fastopen` stays (`TcpCb::new`, then
+    /// `Cong::new`)
+    fn reset(&self) {
+        self.tmr.set(None);
+        self.wait_at.set(None);
+        self.keep_at.set(None);
+        self.rto.set(RTO_INIT);
+        self.backoff.set(0);
+        self.probes.set(0);
+        self.mss.set(MSS_DEFAULT);
+        self.quick.set(0);
+        self.pingpong.set(false);
+        self.ato.set(0);
+    }
 }
 
 /// Most out-of-order pieces kept: a peer sending many tiny scattered
@@ -629,9 +714,7 @@ impl Ooo {
     }
 }
 
-/// The control block. Build it with [`TcpCb::new`]: `Default` is only
-/// new()'s base (its MSS, RTO and queue caps are zero)
-#[derive(Default)]
+/// The control block
 pub struct TcpCb {
     pub state: TcpState,
     pub cfg: Cfg,
@@ -706,10 +789,7 @@ pub struct TcpCb {
     /// Latest clock value seen (ms; stamps segments built without `now`)
     pub(super) clock: u64,
 
-    // --- segment sizes ----------------------------------------------------
-    /// Send MSS: payload per segment (min(peer's MSS option, path MTU -
-    /// 40, TCP_MAXSEG) less option bytes)
-    pub mss: u32,
+    // --- segment sizes (the send MSS is `live.mss`) ------------------------
     pub(super) peer_mss: u32,
     /// Path MTU - 40 (route, then ICMP frag needed)
     pub(super) path_mss: u32,
@@ -719,11 +799,6 @@ pub struct TcpCb {
     // --- timers and RTT (RFC 6298) ----------------------------------------
     pub(super) srtt8: u64,
     pub(super) rttvar4: u64,
-    pub(super) rto: u64,
-    /// Consecutive timeouts / probes (exponential backoff)
-    pub(super) backoff: u32,
-    /// Zero-window or keepalive probes without an answer
-    pub(super) probes: u32,
     /// Karn: (sequence that must be acknowledged, send time)
     pub(super) rtt_seq: Option<(u32, u64)>,
     pub(super) syn_rtx: bool,
@@ -738,11 +813,6 @@ pub struct TcpCb {
     /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
     /// processed as tcp_child_process does
     pub(super) req_full: bool,
-    pub(super) tmr: Option<(Tmr, u64)>,
-    /// TIME_WAIT 2MSL or orphan FIN_WAIT_2 deadline
-    pub(super) wait_at: Option<u64>,
-    /// Keepalive deadline
-    pub(super) keep_at: Option<u64>,
     /// When the oldest unacknowledged data was (about) first sent, once
     /// retransmitting or probing (Linux retrans_stamp; TCP_USER_TIMEOUT)
     pub(super) rtx_stamp: Option<u64>,
@@ -753,6 +823,9 @@ pub struct TcpCb {
     pub(super) cong: Cong,
     /// Delayed ACK state
     pub(super) dack: Dack,
+    /// The fields /proc/net/tcp reads with no lock: timers, RTO and
+    /// backoff, probes, MSS, the delayed ACK mode, cwnd / ssthresh
+    pub live: Arc<Live>,
 
     // --- misc -------------------------------------------------------------
     /// Closed by the user (no file refers to it any more)
@@ -794,18 +867,72 @@ pub struct Stats {
 }
 
 impl TcpCb {
-    /// A closed control block
-    pub fn new(cfg: Cfg) -> Self {
+    /// A closed control block, its lockless fields in `live` (reset,
+    /// but for the socket's own: see `Live`)
+    pub fn new(cfg: Cfg, live: Arc<Live>) -> Self {
+        live.reset();
         Self {
+            state: Default::default(),
             cfg,
+            opts: Default::default(),
+            iss: Default::default(),
+            snd_una: Default::default(),
+            snd_nxt: Default::default(),
+            snd_max: Default::default(),
+            snd_wnd: Default::default(),
+            snd_wl1: Default::default(),
+            snd_wl2: Default::default(),
+            max_wnd: Default::default(),
+            wq: Default::default(),
+            rtx: Default::default(),
+            write_seq: Default::default(),
             snd_cap: 64 * 1024,
+            fin_queued: Default::default(),
+            snd_sml: Default::default(),
+            irs: Default::default(),
+            rcv_nxt: Default::default(),
+            rcv_adv: Default::default(),
+            rcv_wup: Default::default(),
+            rcvq: Default::default(),
+            copied_seq: Default::default(),
+            rcv_bytes: Default::default(),
+            ooo: Default::default(),
+            ooo_fin: Default::default(),
             rcv_cap: 64 * 1024,
-            mss: MSS_DEFAULT,
+            rcv_locked: Default::default(),
+            rcv_shut: Default::default(),
+            snd_wscale: Default::default(),
+            rcv_wscale: Default::default(),
+            wscale_ok: Default::default(),
+            ts_ok: Default::default(),
+            ts_off: Default::default(),
+            ts_recent: Default::default(),
+            ts_stamp: Default::default(),
+            clock: Default::default(),
             peer_mss: MSS_DEFAULT,
             path_mss: 65495,
             adv_mss: MSS_DEFAULT,
-            rto: RTO_INIT,
-            ..Default::default()
+            srtt8: Default::default(),
+            rttvar4: Default::default(),
+            rtt_seq: Default::default(),
+            syn_rtx: Default::default(),
+            syn_unacked: Default::default(),
+            passive: Default::default(),
+            req_full: Default::default(),
+            rtx_stamp: Default::default(),
+            rcv_tstamp: Default::default(),
+            lsndtime: Default::default(),
+            cong: Cong::new(live.clone()),
+            dack: Default::default(),
+            orphan: Default::default(),
+            soft_err: Default::default(),
+            ack_now: Default::default(),
+            ack_nomem: Default::default(),
+            last_oow: Default::default(),
+            stats: Default::default(),
+            held: Default::default(),
+            mib: Default::default(),
+            live,
         }
     }
 
@@ -907,7 +1034,7 @@ impl TcpCb {
         }
         self.update_mss();
         self.dack
-            .init(self.adv_mss.min(self.mss), self.rcv_cap as u32);
+            .init(self.adv_mss.min(self.live.mss.get()), self.rcv_cap as u32);
     }
 
     /// Our window scale (Linux tcp_select_initial_window): enough for
@@ -944,8 +1071,10 @@ impl TcpCb {
         if self.opts.user_mss != 0 {
             m = m.min(self.opts.user_mss);
         }
-        self.mss = m.saturating_sub(self.opt_len()).max(MSS_MIN);
-        self.cong.set_mss(self.mss);
+        self.live
+            .mss
+            .set(m.saturating_sub(self.opt_len()).max(MSS_MIN));
+        self.cong.set_mss(self.live.mss.get());
     }
 
     /// The path MTU to the peer changed (ICMP frag needed): shrink the
@@ -956,10 +1085,10 @@ impl TcpCb {
         if m >= self.path_mss {
             return;
         }
-        let old = self.mss;
+        let old = self.live.mss.get();
         self.path_mss = m;
         self.update_mss();
-        if self.mss < old && self.state.synced() && self.snd_nxt != self.snd_una {
+        if self.live.mss.get() < old && self.state.synced() && self.snd_nxt != self.snd_una {
             self.snd_nxt = self.snd_una;
             self.rtt_seq = None;
             self.output(now, out);
@@ -1031,7 +1160,7 @@ impl TcpCb {
             }
             self.wq.push_back(t);
         }
-        let mut skb = SkBuff::alloc_tx(self.mss as usize, Gfp::KERNEL)?;
+        let mut skb = SkBuff::alloc_tx(self.live.mss.get() as usize, Gfp::KERNEL)?;
         skb.tcp = Seg {
             seq: self.write_seq,
             end_seq: self.write_seq,
@@ -1219,7 +1348,7 @@ impl TcpCb {
         }
         if self.dack.pending
             && (self.rcv_nxt.wrapping_sub(self.rcv_wup) > self.dack.rcv_mss
-                || (self.dack.pushed && !self.dack.pingpong && self.rcv_bytes == 0))
+                || (self.dack.pushed && !self.live.pingpong.get() && self.rcv_bytes == 0))
         {
             self.send_ack(out);
             return;
@@ -1394,7 +1523,7 @@ impl TcpCb {
         self.stop_timers();
         self.purge_wq();
         self.mem_settle();
-        self.wait_at = Some(now + TIMEWAIT_LEN);
+        self.live.wait_at.set(Some(now + TIMEWAIT_LEN));
         out.timewait = true;
         out.wake |= wake::STATE;
     }
@@ -1472,7 +1601,7 @@ impl TcpCb {
     /// Orphan in FIN_WAIT_2: give up after tcp_fin_timeout
     pub(super) fn arm_fw2(&mut self, now: u64) {
         if self.orphan {
-            self.wait_at = Some(now + self.cfg.fin_timeout);
+            self.live.wait_at.set(Some(now + self.cfg.fin_timeout));
         }
     }
 
@@ -1508,7 +1637,7 @@ impl TcpCb {
         let unit = 1u32 << self.rcv_wscale;
         let mut free = self.free_space();
         if free < full / 2 {
-            self.dack.quick = 0;
+            self.live.quick.set(0);
             free = free / unit * unit;
             if free < full / 16 || free < mss {
                 return 0;
@@ -1668,10 +1797,10 @@ impl TcpCb {
     /// Earliest deadline the caller must call `on_timer` at
     pub fn next_timer(&self) -> Option<u64> {
         [
-            self.tmr.map(|t| t.1),
-            self.wait_at,
+            self.live.tmr.get().map(|t| t.1),
+            self.live.wait_at.get(),
             self.dack.at,
-            self.keep_at,
+            self.live.keep_at.get(),
         ]
         .into_iter()
         .flatten()
@@ -1680,9 +1809,9 @@ impl TcpCb {
 
     /// Cancel every timer
     pub(super) fn stop_timers(&mut self) {
-        self.tmr = None;
-        self.wait_at = None;
+        self.live.tmr.set(None);
+        self.live.wait_at.set(None);
         self.dack.at = None;
-        self.keep_at = None;
+        self.live.keep_at.set(None);
     }
 }

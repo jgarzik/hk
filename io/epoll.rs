@@ -166,8 +166,9 @@ pub struct EpItem {
     /// holds a reference until the item is removed
     fllink: Link,
     fd: Fd,
-    /// The file: no reference (its last close removes the item)
-    file: Weak<File>,
+    /// The file's address: no reference (its last close removes the
+    /// item; Linux epi->ffd.file)
+    file: *const File,
     /// The epoll it belongs to; alive while the item's entries are
     /// registered (the epoll unregisters them before it is freed)
     ep_raw: *const Eventpoll,
@@ -192,11 +193,21 @@ crate::adapter!(pub FlAdapter, EpItem, fllink);
 impl EpItem {
     /// The ready events of its file, without registering
     fn poll(&self) -> u32 {
-        let Some(file) = FileRef::try_get(&self.file) else {
+        let Some(file) = self.fget() else {
             return 0;
         };
         let revents = u32::from(file.f_op.poll(&file, None));
         revents & (self.events.load(Ordering::Acquire) | EPOLLERR | EPOLLHUP)
+    }
+
+    /// A reference to its file unless the last one went (Linux
+    /// epi_fget): under its epoll's `mtx`, with the item in the map
+    fn fget(&self) -> Option<FileRef> {
+        // SAFETY: the item is in its epoll's map under `mtx` (every
+        // caller), so its file's release has not passed this epoll's
+        // `eventpoll_release`, which takes `mtx` to remove it: the file
+        // is not freed
+        unsafe { FileRef::try_get(self.file) }
     }
 
     /// Stop receiving callbacks
@@ -264,9 +275,11 @@ pub struct Eventpoll {
     wq: WaitQueue,
     /// Pollers of the epoll file itself (an epoll watching it)
     poll_wq: WaitQueue,
-    /// Its own file (for the epolls watching it: the loop check's
-    /// upward depth)
-    file: spin::Once<Weak<File>>,
+    /// Its own file while open (for the epolls watching it: the loop
+    /// check's upward depth; Linux ep->file): set before the epoll is
+    /// reachable, cleared by the file's release under `EPNESTED`, read
+    /// under `EPNESTED`
+    file: core::sync::atomic::AtomicPtr<File>,
 }
 
 /// Serializes the loop check with the insert of an epoll target
@@ -284,7 +297,7 @@ impl Eventpoll {
             lock: IrqSpinlock::new(ArcList::new()),
             wq: WaitQueue::new(),
             poll_wq: WaitQueue::new(),
-            file: spin::Once::new(),
+            file: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         })
     }
 
@@ -337,7 +350,7 @@ impl Eventpoll {
             rdlink: Link::new(),
             fllink: Link::new(),
             fd,
-            file: FileRef::downgrade(file),
+            file: FileRef::as_ptr(file),
             ep_raw: Arc::as_ptr(self),
             ep: Arc::downgrade(self),
             events: AtomicU32::new(ev.events),
@@ -549,7 +562,7 @@ impl Eventpoll {
             .mtx
             .lock()
             .values()
-            .filter_map(|it| FileRef::try_get(&it.file))
+            .filter_map(|it| it.fget())
             .collect();
         files.iter().filter_map(|f| get_eventpoll(f)).collect()
     }
@@ -564,6 +577,27 @@ fn f_ep_del(file: &File, item: &EpItem) -> Option<Arc<EpItem>> {
     item.fllink.is_linked().then(|| unsafe { l.remove(item) })
 }
 
+/// Take `item` off its file's watchers unless that file's release does
+/// (an epoll's drop: Linux ep_remove_safe from ep_clear_and_put). No
+/// `mtx` holds the file back, so it is reached under RCU: while the item
+/// is linked, its file has not finished its release (`eventpoll_release`
+/// unlinks it first), so its memory stays the file cache's for this read
+/// section (type-stable, `FileObj`). A count taken there is that file's,
+/// or a newer one's in the same memory, which never had the item; none
+/// means the release is under way and unlinks it.
+fn f_ep_off(item: &EpItem) -> Option<Arc<EpItem>> {
+    let f = {
+        let _g = crate::sync::rcu::read_lock();
+        if !item.fllink.is_linked() {
+            return None;
+        }
+        // SAFETY: the file was not freed when this read section saw the
+        // item linked (above)
+        unsafe { FileRef::try_get(item.file) }?
+    };
+    f_ep_del(&f, item)
+}
+
 impl Drop for Eventpoll {
     /// The epoll file's last close (Linux ep_free): every item goes,
     /// unregistered before the ready list is emptied (no callback can
@@ -574,10 +608,8 @@ impl Drop for Eventpoll {
         let items = core::mem::take(self.mtx.get_mut());
         for item in items.values() {
             item.unregister();
-            if let Some(f) = item.file.upgrade() {
-                let off = f_ep_del(&f, item);
-                drop(off);
-            }
+            let off = f_ep_off(item);
+            drop(off);
         }
         let ready = core::mem::take(self.lock.get_mut());
         drop(ready);
@@ -588,9 +620,8 @@ impl Drop for Eventpoll {
 /// `file`'s last close (Linux eventpoll_release_file, from __fput): its
 /// items leave every epoll, unregistered before the file's queues go,
 /// each under its epoll's `mtx` (Linux ep_remove under ep->mtx): no scan
-/// of that epoll holds the item meanwhile, so a scan's failed
-/// `FileRef::try_get` never holds the file's last `Arc` (this release
-/// keeps one until it is done)
+/// of that epoll holds the item meanwhile, and a scan that holds the
+/// item before keeps the file from being freed (`EpItem::fget`)
 pub fn eventpoll_release(file: &File) {
     // One at a time under `f_ep`: an epoll's drop takes its items off
     // concurrently
@@ -667,11 +698,14 @@ fn up_depth(ep: &Eventpoll, seen: &mut Seen) -> Result<u32, KernelError> {
     if let Some(&Some(d)) = seen.get(&k) {
         return Ok(d);
     }
-    let Some(file) = ep.file.get().and_then(Weak::upgrade) else {
+    let p = ep.file.load(Ordering::Relaxed);
+    // SAFETY: set while its file is open, cleared by that file's
+    // release under `EPNESTED`, which the caller holds
+    let Some(file) = (unsafe { p.as_ref() }) else {
         return Ok(0);
     };
     let mut d = 0;
-    for w in watchers(&file)? {
+    for w in watchers(file)? {
         d = d.max(up_depth(&w, seen)? + 1);
     }
     seen.insert(k, Some(d));
@@ -707,6 +741,16 @@ impl FileOps for EpollFileOps {
         };
         ep.poll(pt)
     }
+
+    /// The epoll file's release: the loop check no longer reaches it
+    /// through its epoll (Linux ep_eventpoll_release clears the epoll)
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        if let Some(ep) = file.private_ref::<Eventpoll>() {
+            let _nest = EPNESTED.lock();
+            ep.file.store(core::ptr::null_mut(), Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
 /// Create an epoll file
@@ -722,7 +766,9 @@ pub fn create_epoll_file(eflags: i32) -> Result<FileRef, KernelError> {
         ep.clone(),
         file_flags,
     )?;
-    ep.file.call_once(|| FileRef::downgrade(&file));
+    // Before the epoll is reachable: no loop check reads it yet
+    ep.file
+        .store(FileRef::as_ptr(&file).cast_mut(), Ordering::Relaxed);
     Ok(file)
 }
 

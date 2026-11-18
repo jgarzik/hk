@@ -51,8 +51,20 @@ pub struct PerCpu {
     /// Nesting depth of interrupt handlers
     pub interrupt_depth: AtomicU32,
 
+    /// The interrupt being handled came from user mode (Linux
+    /// __irq_regs, as user_mode(regs)): written only by this CPU at
+    /// interrupt entry and exit (`irq_regs_enter`/`_exit`), read by its
+    /// tick
+    pub irq_user: AtomicBool,
+
     /// Preemption count - tracks nested critical sections
     pub preempt_count: AtomicU32,
+
+    /// The user FP/SIMD state bound to this CPU's registers (Linux
+    /// fpsimd_last_state.st; null none): written and read only by this
+    /// CPU with its FP context claimed or interrupts off; followed only
+    /// while the running task's registers are live (`fpsimd`)
+    pub fpsimd_last_state: AtomicPtr<super::fpsimd::UserFpsimdState>,
 }
 
 const _: () = assert!(core::mem::offset_of!(PerCpu, overflow_stack) == 8);
@@ -71,7 +83,9 @@ impl PerCpu {
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
             interrupt_depth: AtomicU32::new(0),
+            irq_user: AtomicBool::new(false),
             preempt_count: AtomicU32::new(0),
+            fpsimd_last_state: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -86,7 +100,10 @@ impl PerCpu {
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
+        self.irq_user.store(false, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
+        self.fpsimd_last_state
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
     }
 
     /// This CPU's address, for TPIDR_EL1 (only ever read through as
@@ -267,8 +284,40 @@ pub fn online_cpu_count() -> u32 {
 #[inline]
 pub fn preempt_disable() {
     if let Some(percpu) = try_current_cpu() {
-        percpu.preempt_count.fetch_add(1, Ordering::Relaxed);
+        this_cpu_add(&percpu.preempt_count, 1);
+        // Linux preempt_disable's barrier(): the section stays after it
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
     }
+}
+
+/// Entering an interrupt that came from user mode or not (Linux
+/// set_irq_regs): recorded for the tick (`irq_from_user`); returns the
+/// value of the context it interrupted, for `irq_regs_exit`
+#[inline]
+pub fn irq_regs_enter(user: bool) -> bool {
+    // This CPU's word, interrupts off: a load and a store
+    try_current_cpu().is_some_and(|p| {
+        let old = p.irq_user.load(Ordering::Relaxed);
+        p.irq_user.store(user, Ordering::Relaxed);
+        old
+    })
+}
+
+/// Leaving the interrupt: restore the interrupted context's value
+#[inline]
+pub fn irq_regs_exit(old: bool) {
+    if let Some(p) = try_current_cpu() {
+        p.irq_user.store(old, Ordering::Relaxed);
+    }
+}
+
+/// Add `v` (wrapping) to this CPU's counter `c` with a plain load and
+/// store (Linux arm64 __preempt_count_add: READ_ONCE, WRITE_ONCE): only
+/// this CPU writes it, and an interrupt between the two that changes it
+/// restores it before returning
+#[inline]
+pub fn this_cpu_add(c: &AtomicU32, v: u32) {
+    c.store(c.load(Ordering::Relaxed).wrapping_add(v), Ordering::Relaxed);
 }
 
 /// Enable preemption on the current CPU
@@ -280,12 +329,15 @@ pub fn preempt_disable() {
 #[inline]
 pub fn preempt_enable() {
     if let Some(percpu) = try_current_cpu() {
-        let prev = percpu.preempt_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(prev > 0, "preempt_enable called with preempt_count == 0");
-
-        // If preempt_count is now 0 and reschedule is needed, we could
-        // trigger a reschedule here. For now, we defer to the existing
-        // reschedule check points (timer interrupt exit, yield, etc.)
+        debug_assert!(
+            percpu.preempt_count.load(Ordering::Relaxed) > 0,
+            "preempt_enable called with preempt_count == 0"
+        );
+        // Linux preempt_enable's barrier(): the section stays before it
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        this_cpu_add(&percpu.preempt_count, u32::MAX);
+        // A reschedule this enable could owe waits for the next check
+        // point (interrupt exit, yield): the kernel is not preemptive
     }
 }
 
@@ -295,4 +347,28 @@ pub fn preempt_count() -> u32 {
     try_current_cpu()
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed))
         .unwrap_or(0)
+}
+
+/// Add `v` to the word at `p` (Linux this_cpu_add on arm64: an atomic
+/// add with no barriers): for a per-CPU word only this CPU writes; the
+/// exclusive pair keeps an interrupt's own add on the word
+///
+/// # Safety
+/// `p` is valid, aligned, and written only by this CPU (its interrupts
+/// included).
+#[inline(always)]
+pub unsafe fn local_add_u64(p: *mut u64, v: u64) {
+    // SAFETY: the caller's valid, aligned word, used only atomically
+    unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.fetch_add(v, Ordering::Relaxed);
+}
+
+/// [`local_add_u64`] returning the old value (Linux
+/// this_cpu_add_return)
+///
+/// # Safety
+/// As [`local_add_u64`].
+#[inline(always)]
+pub unsafe fn local_xadd_u64(p: *mut u64, v: u64) -> u64 {
+    // SAFETY: as local_add_u64
+    unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.fetch_add(v, Ordering::Relaxed)
 }

@@ -25,7 +25,6 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cpu::PerCpu;
 use crate::sync::IrqSpinlock;
 use crate::util::error::{KernelError, KernelResult};
 
@@ -118,10 +117,12 @@ struct CpuCrng {
     generation: u64,
 }
 
-static CPU_CRNG: PerCpu<IrqSpinlock<CpuCrng>> = crate::percpu![IrqSpinlock::new(CpuCrng {
+crate::percpu! {
+    static CPU_CRNG: IrqSpinlock<CpuCrng> = IrqSpinlock::new(CpuCrng {
     key: [0; 8],
     generation: 0,
-})];
+});
+}
 
 /// Mix fresh seed material into the base key (Linux crng_reseed with
 /// extract_entropy): the new key is a ChaCha20 block of the old key

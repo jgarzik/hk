@@ -2,7 +2,6 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::{File, FileRef};
@@ -72,9 +71,7 @@ fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
         if !f.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
-        if f.mapping_inode()
-            .is_some_and(|i| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire))
-        {
+        if f.mapping_inode().is_some_and(|i| i.is_swapfile()) {
             return Err(KernelError::TextBusy);
         }
     }
@@ -87,7 +84,7 @@ fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
 /// A shared writable mapping counted on its file's mapping while it is
 /// made (Linux mapping_map_writable .. mapping_unmap_writable around
 /// vma_link, which counts it for good)
-struct WritableHold(Option<Arc<crate::fs::Inode>>);
+struct WritableHold(Option<crate::fs::InodeRef>);
 
 impl WritableHold {
     fn new(v: &Vma) -> Result<Self, KernelError> {
@@ -603,9 +600,10 @@ fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) -> Result<(), KernelEr
 }
 
 /// A VMA the heap can grow into: private anonymous memory, no file
-/// or shared object behind it
+/// or shared object behind it, and no memory policy (Linux
+/// do_brk_flags: !vma_policy(vma))
 fn is_heap(v: &Vma) -> bool {
-    v.file.is_none() && v.shm.is_none() && v.is_private()
+    v.file.is_none() && v.shm.is_none() && v.is_private() && v.mempolicy.is_none()
 }
 
 // ============================================================================

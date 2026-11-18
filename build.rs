@@ -74,7 +74,7 @@ fn main() {
     }
 
     // aarch64 bare-metal target
-    if target == "aarch64-unknown-none" {
+    if target == "aarch64-unknown-none-softfloat" {
         let arch_dir = Path::new(&manifest_dir).join("arch/aarch64");
 
         // Assemble boot.S with aarch64 cross-assembler

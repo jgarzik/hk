@@ -16,10 +16,18 @@
 use super::tlb::{self, PAGE_SHIFT, PMD_SHIFT};
 use super::{Mm, PAGE_SIZE};
 use crate::arch::{Leaf, paging};
+use crate::util::kmem::KVec;
 
-/// Frames held back for one flush (Linux MAX_GATHER_BATCH, smaller:
-/// the gather lives on the kernel stack)
-const BATCH: usize = 64;
+/// Frames the gather itself holds (Linux MMU_GATHER_BUNDLE, the local
+/// batch on the stack)
+const MMU_GATHER_BUNDLE: usize = 8;
+
+/// Frames a batch page holds (Linux MAX_GATHER_BATCH)
+const MAX_GATHER_BATCH: usize = PAGE_SIZE as usize / core::mem::size_of::<Leaf>();
+
+/// Batch pages one gather may chain (Linux MAX_GATHER_BATCH_COUNT:
+/// about 10000 frames held back for one flush)
+const MAX_GATHER_BATCH_COUNT: usize = 10000 / MAX_GATHER_BATCH;
 
 /// The range a gather flushes: every entry cleared, at the smallest
 /// stride met (Linux mmu_gather start/end + cleared_* levels)
@@ -60,9 +68,17 @@ pub struct Gather<'a> {
     freed_tables: bool,
     /// The whole address space goes (exit): flush it all
     full: bool,
-    /// Frames to release after the flush
-    batch: [Leaf; BATCH],
+    /// Frames to release after the flush: the local batch (Linux
+    /// tlb->local) ...
+    local: [Leaf; MMU_GATHER_BUNDLE],
     n: usize,
+    /// ... then the batch pages chained after it, kept until the
+    /// gather ends (Linux the list from tlb->local.next); each has a
+    /// page of capacity it never grows past
+    batches: alloc::vec::Vec<alloc::vec::Vec<Leaf>>,
+    /// The batch being filled: 0 the local one, `i` `batches[i - 1]`
+    /// (Linux tlb->active)
+    active: usize,
     /// Detached page tables to free after the flush (exit)
     tables: Option<paging::UserTables>,
     /// Emptied page-table frames unlinked by munmap, freed after the
@@ -78,8 +94,10 @@ impl<'a> Gather<'a> {
             range: FlushRange::EMPTY,
             freed_tables: false,
             full: false,
-            batch: [Leaf::Page(0); BATCH],
+            local: [Leaf::Page(0); MMU_GATHER_BUNDLE],
             n: 0,
+            batches: alloc::vec::Vec::new(),
+            active: 0,
             tables: None,
             table_frames: alloc::vec::Vec::new(),
         }
@@ -129,11 +147,58 @@ impl<'a> Gather<'a> {
     }
 
     fn push(&mut self, leaf: Leaf) {
-        if self.n == BATCH {
+        if self.add(leaf) {
             self.flush();
         }
-        self.batch[self.n] = leaf;
-        self.n += 1;
+    }
+
+    /// Gather `leaf` into the active batch; true when that filled it and
+    /// no next batch can be had: the caller flushes (Linux
+    /// __tlb_remove_page_size)
+    fn add(&mut self, leaf: Leaf) -> bool {
+        let full = match self.active {
+            0 => {
+                self.local[self.n] = leaf;
+                self.n += 1;
+                self.n == MMU_GATHER_BUNDLE
+            }
+            i => {
+                let b = &mut self.batches[i - 1];
+                // Within the page of capacity: no allocation
+                b.push(leaf);
+                b.len() == b.capacity()
+            }
+        };
+        full && !self.next_batch()
+    }
+
+    /// Make the next batch page active: one kept from an earlier flush,
+    /// else a new one, allocated GFP_NOWAIT under the page table lock;
+    /// false at MAX_GATHER_BATCH_COUNT or without memory (Linux
+    /// tlb_next_batch)
+    fn next_batch(&mut self) -> bool {
+        if self.active < self.batches.len() {
+            self.active += 1;
+            return true;
+        }
+        if self.batches.len() == MAX_GATHER_BATCH_COUNT {
+            return false;
+        }
+        let gfp = crate::mm::page_alloc::Gfp::NOWAIT.with(crate::mm::page_alloc::Gfp::NOWARN);
+        let b = crate::util::kalloc::with_gfp(gfp, || {
+            if self.batches.capacity() == 0 {
+                // The chain's slots, once: pushes below then never
+                // allocate (Linux links the pages themselves)
+                self.batches = KVec::try_with_capacity(MAX_GATHER_BATCH_COUNT)?.into_vec();
+            }
+            KVec::try_with_capacity(MAX_GATHER_BATCH)
+        });
+        let Ok(b) = b else {
+            return false;
+        };
+        self.batches.push(b.into_vec());
+        self.active += 1;
+        true
     }
 
     /// Flush the TLB for what was gathered, then release it (Linux
@@ -145,10 +210,18 @@ impl<'a> Gather<'a> {
         } else if !r.is_empty() {
             tlb::flush_tlb_mm_range(self.mm, r.start, r.end, r.shift, self.freed_tables);
         }
-        for &leaf in &self.batch[..self.n] {
+        // Linux tlb_batch_pages_flush: every batch from the local one,
+        // then the first active again
+        for &leaf in &self.local[..self.n] {
             super::memory::zap_leaf(leaf);
         }
         self.n = 0;
+        for b in &mut self.batches {
+            for leaf in b.drain(..) {
+                super::memory::zap_leaf(leaf);
+            }
+        }
+        self.active = 0;
         for t in self.table_frames.drain(..) {
             crate::FRAME_ALLOCATOR.free(t);
         }

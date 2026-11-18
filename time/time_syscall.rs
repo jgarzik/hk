@@ -25,7 +25,7 @@ pub const CLOCK_BOOTTIME_ALARM: i32 = 9;
 pub const CLOCK_TAI: i32 = 11;
 
 /// CPU clock kinds (Linux CPUCLOCK_PROF/VIRT/SCHED): user+system,
-/// user only, scheduler runtime (user+system on hk)
+/// user only, scheduler runtime
 pub const CPUCLOCK_PROF: u8 = 0;
 pub const CPUCLOCK_VIRT: u8 = 1;
 pub const CPUCLOCK_SCHED: u8 = 2;
@@ -159,39 +159,50 @@ pub fn tai_offset_ns() -> i128 {
 /// caller's own tid
 fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64, KernelError> {
     use crate::task::percpu;
+    use crate::time::cpu_timer::{Sample, cpu_clock_sample, group_sample};
     let pid = clock_pid(pid).ok_or(KernelError::InvalidArgument)?;
     let me = percpu::current_tid();
-    let (utime, stime) = if thread {
+    let sample = Sample::of(which);
+    if thread {
         let tid = if pid == 0 {
             me
         } else {
             pid as crate::task::Tid
         };
-        let table = percpu::TASKLIST.read();
-        let t = table.get(tid).ok_or(KernelError::InvalidArgument)?;
-        if t.task.pid != percpu::current_pid() {
+        // Found and sampled under RCU (Linux posix_cpu_clock_get:
+        // pid_task, cpu_clock_sample under rcu_read_lock)
+        let g = crate::sync::rcu::read_lock();
+        let t = percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+            .ok_or(KernelError::InvalidArgument)?;
+        if t.pid != percpu::current_pid() {
             return Err(KernelError::InvalidArgument);
         }
-        t.task.cputime(crate::time::monotonic_ns())
+        return Ok(cpu_clock_sample(t, sample));
+    }
+    // Linux pid_for_clock (gettime): pid 0, or the caller's own tid from
+    // any thread, is its process
+    let (tgid, sig) = if pid == 0 || (gettime && pid == me) {
+        (percpu::current_pid(), crate::signal::current_signal())
     } else {
-        // Linux pid_for_clock (gettime): pid 0, or the caller's own tid
-        // from any thread, is its process
-        let tgid = if pid == 0 || (gettime && pid == me) {
-            percpu::current_pid()
-        } else {
-            let table = percpu::TASKLIST.read();
-            let t = table.get(pid as crate::task::Tid);
-            if !t.is_some_and(|t| t.task.pid == pid) {
-                return Err(KernelError::InvalidArgument);
-            }
-            pid
-        };
-        percpu::get_process_times(tgid)
+        // A group leader's, found under RCU (Linux pid_for_clock:
+        // find_task_by_vpid, has_group_leader_pid)
+        let g = crate::sync::rcu::read_lock();
+        let t = percpu::pid_ns_task(pid, &crate::ns::INIT_PID_NS, &g);
+        let t = t
+            .filter(|t| t.pid == pid)
+            .ok_or(KernelError::InvalidArgument)?;
+        (pid, t.cpu_group().cloned())
     };
-    Ok(match which {
-        CPUCLOCK_VIRT => utime,
-        _ => utime.saturating_add(stime), // PROF, SCHED
-    })
+    // Linux cpu_clock_sample_group(start=false); a kernel thread (no
+    // SignalStruct here; Linux gives it one) is its threads' sum
+    let c = match sig {
+        Some(sig) => group_sample(&sig, tgid),
+        None => {
+            let table = percpu::TASKLIST.read();
+            crate::task::cputime::thread_group_cputime(&table, tgid)
+        }
+    };
+    Ok(sample.pick(&c))
 }
 
 /// clock_nanosleep on a process CPU clock (Linux posix_cpu_nsleep): a

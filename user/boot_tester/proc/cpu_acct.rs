@@ -12,9 +12,15 @@
 //!   spins
 //! - CPU_ACCT_EXITED: a thread's CPU time stays the process's after it
 //!   exits (Linux signal->utime/stime)
+//! - CPU_ACCT_SCHED_FINE: the thread CPU clock (CPUCLOCK_SCHED) is the
+//!   scheduler's runtime, not tick samples: spinning, it advances in
+//!   steps well under a tick
 //! - CPU_ACCT_CHILDREN: a reaped child's CPU time shows in wait4's
 //!   rusage, getrusage(RUSAGE_CHILDREN), times()'s tms_cutime/cstime and
 //!   /proc/self/stat's cutime/cstime
+//! - CPU_ACCT_KTHREAD_CLOCK: a kernel thread's process CPU clock reads
+//!   (Linux posix_cpu_clock_get: a kthread is a process too), it was
+//!   EINVAL
 
 use crate::harness::verdict;
 use crate::mm::fork_mm::{join, spawn_thread};
@@ -35,10 +41,57 @@ const MS: i64 = 1_000_000;
 
 pub fn run_tests() {
     sleep();
+    sched_fine();
     user();
     spinner();
     exited();
     children();
+    kthread_clock();
+}
+
+/// Stat field 9 (flags) of /proc/<pid>/stat, or None
+fn stat_flags(pid: i64) -> Option<u64> {
+    let mut path = [0u8; 24];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut d = [0u8; 10];
+    let (mut n, mut p) = (0, pid);
+    while p > 0 || n == 0 {
+        d[n] = b'0' + (p % 10) as u8;
+        p /= 10;
+        n += 1;
+    }
+    for i in 0..n {
+        path[6 + i] = d[n - 1 - i];
+    }
+    path[6 + n..6 + n + 6].copy_from_slice(b"/stat\0");
+    let mut buf = [0u8; 1024];
+    let r = crate::helpers::read_file(&path[..6 + n + 6], &mut buf);
+    if r <= 0 {
+        return None;
+    }
+    let b = &buf[..r as usize];
+    let close = b.iter().rposition(|&c| c == b')')?;
+    let tok = b[close + 1..]
+        .split(|&c| c == b' ')
+        .filter(|t| !t.is_empty())
+        .nth(6)?;
+    Some(tok.iter().fold(0u64, |v, &c| v * 10 + u64::from(c - b'0')))
+}
+
+fn kthread_clock() {
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    let Some(pid) = (2..4096).find(|&p| stat_flags(p).is_some_and(|f| f & PF_KTHREAD != 0)) else {
+        verdict(b"CPU_ACCT_KTHREAD_CLOCK", false, -1);
+        return;
+    };
+    // MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)
+    let clk = ((!pid) << 3) | 2;
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let r = sys_clock_gettime(clk as i32, &mut ts);
+    verdict(b"CPU_ACCT_KTHREAD_CLOCK", r == 0, r);
 }
 
 /// The calling thread's (`process`: process's) CPU time in ms
@@ -149,6 +202,30 @@ fn children() {
         0
     };
     verdict(b"CPU_ACCT_CHILDREN", step == 0, step * 100_000 + waited);
+}
+
+/// The calling thread's CPU clock in ns
+fn own_cpu_ns() -> i64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(3, &mut ts);
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+fn sched_fine() {
+    // The smallest of a few steps (a step may span a preemption)
+    let mut best = i64::MAX;
+    for _ in 0..8 {
+        let a = own_cpu_ns();
+        let mut b = own_cpu_ns();
+        while b == a {
+            b = own_cpu_ns();
+        }
+        best = best.min(b - a);
+    }
+    verdict(b"CPU_ACCT_SCHED_FINE", best < 2 * MS, best);
 }
 
 fn nap(ms: i64) {

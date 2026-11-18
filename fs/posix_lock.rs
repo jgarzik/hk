@@ -13,11 +13,10 @@
 //! - Locks are NOT inherited across fork() but ARE released on exec()
 //! - Length 0 means "to end of file" (EOF lock)
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::file::seek;
-use crate::fs::{File, Inode};
+use crate::fs::{File, InodeRef};
 use crate::task::percpu::current_pid;
 use crate::util::error::KernelError;
 
@@ -380,7 +379,7 @@ pub fn posix_getlk(file: &File, flock: &mut Flock) -> Result<(), KernelError> {
 /// Set (or with F_UNLCK clear) the caller's lock on [start, end) of
 /// `inode`: Err(WouldBlock) on a conflict, with its owner
 fn set(
-    inode: &Arc<Inode>,
+    inode: &InodeRef,
     (start, end): (u64, u64),
     l_type: i16,
 ) -> Result<(), (KernelError, Option<u64>)> {

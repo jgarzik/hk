@@ -5,13 +5,17 @@
 //! - Test: syslog() - kernel logging operations
 //! - Test: clone3() - modern extensible clone (basic validation only)
 //! - Test: clone3() - a struct larger than the kernel's: zero tail ok, else E2BIG
+//! - CLONE_FLAG_DEPS: clone(CLONE_THREAD) without CLONE_SIGHAND and
+//!   clone(CLONE_SIGHAND) without CLONE_VM are EINVAL (Linux
+//!   copy_process: a thread group shares its handlers, handlers are
+//!   shared only with the memory)
 
 use crate::harness::pass;
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
-    PER_LINUX, PERSONALITY_QUERY, SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_CONSOLE_LEVEL,
-    SYSLOG_ACTION_OPEN, SYSLOG_ACTION_SIZE_BUFFER, sys_clone3, sys_exit, sys_personality,
-    sys_syslog, sys_wait4,
+    CLONE_SIGHAND, PER_LINUX, PERSONALITY_QUERY, SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_CONSOLE_LEVEL,
+    SYSLOG_ACTION_OPEN, SYSLOG_ACTION_SIZE_BUFFER, sys_clone, sys_clone3, sys_exit,
+    sys_personality, sys_syslog, sys_wait4,
 };
 
 /// Run all clone3/personality/syslog tests
@@ -23,6 +27,35 @@ pub fn run_tests() {
     test_syslog_console_level();
     test_syslog_invalid_type();
     test_clone3_big_struct();
+    clone_flag_deps();
+}
+
+/// clone with `flags`: the child (if the kernel made one) exits at once
+/// and is reaped; the result
+fn clone_try(flags: u64) -> i64 {
+    let r = sys_clone(flags, 0, 0, 0, 0);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r > 0 {
+        let mut st = 0i32;
+        sys_wait4(r, &mut st, 0x4000_0000, 0); // __WALL
+    }
+    r
+}
+
+/// CLONE_THREAD needs CLONE_SIGHAND, CLONE_SIGHAND needs CLONE_VM
+fn clone_flag_deps() {
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    const SIGCHLD: u64 = 17;
+    const EINVAL: i64 = -22;
+    let thread = clone_try(CLONE_THREAD);
+    let sighand = clone_try(CLONE_SIGHAND | SIGCHLD);
+    crate::harness::verdict(
+        b"CLONE_FLAG_DEPS",
+        thread == EINVAL && sighand == EINVAL,
+        if thread != EINVAL { thread } else { sighand },
+    );
 }
 
 /// Test: personality() - query current personality

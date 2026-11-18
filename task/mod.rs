@@ -3,6 +3,7 @@
 pub mod acct;
 pub(crate) mod argstr;
 pub(crate) mod binfmt_script;
+pub mod cputime;
 pub mod futex;
 pub mod kcmp;
 pub mod membarrier;
@@ -130,7 +131,7 @@ use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
 use crate::ns::NsProxy;
 use crate::seccomp::SeccompFilter;
-use crate::signal::{SigHand, SignalStruct, TaskSignalState};
+use crate::signal::{SigHand, TaskSignalState};
 
 use crate::sync::spin::Mutex;
 
@@ -189,6 +190,48 @@ pub struct Cred {
     /// reference, pointed at a new uid's by `set_cred_ucounts` before a
     /// uid change is committed
     pub ucounts: UcountsRef,
+    /// Its deferred release once a task stops publishing it (Linux
+    /// cred->rcu, put_cred_rcu): [`TaskCred`]'s retired references
+    /// go through `put_rcu`
+    pub rcu: CredRcu,
+}
+
+/// A [`Cred`]'s `RcuPuts`: a copy gets a fresh one, and it takes no
+/// part in comparison or printing
+#[derive(Default)]
+pub struct CredRcu(crate::sync::rcu::RcuPuts);
+
+impl CredRcu {
+    pub const fn new() -> Self {
+        Self(crate::sync::rcu::RcuPuts::new())
+    }
+}
+
+impl Clone for CredRcu {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for CredRcu {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CredRcu {}
+
+impl core::fmt::Debug for CredRcu {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CredRcu")
+    }
+}
+
+// SAFETY: a field of Cred named for this use only (CredRcu.0)
+unsafe impl crate::sync::rcu::HasRcuPuts for Cred {
+    fn rcu_puts(&self) -> &crate::sync::rcu::RcuPuts {
+        &self.rcu.0
+    }
 }
 
 /// Supplementary group list (Linux struct group_info): sorted and
@@ -224,44 +267,50 @@ impl GroupInfo {
 
 impl Cred {
     /// Root credentials (uid=0, gid=0, full capabilities)
-    pub const ROOT: Self = Self {
-        uid: 0,
-        gid: 0,
-        suid: 0,
-        sgid: 0,
-        euid: 0,
-        egid: 0,
-        fsuid: 0,
-        fsgid: 0,
-        cap_inheritable: CAP_FULL_SET,
-        cap_permitted: CAP_FULL_SET,
-        cap_effective: CAP_FULL_SET,
-        cap_bset: CAP_FULL_SET,
-        cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
-        groups: GroupInfo::EMPTY,
-        ucounts: UcountsRef::INIT,
-    };
+    pub const fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            suid: 0,
+            sgid: 0,
+            euid: 0,
+            egid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            cap_inheritable: CAP_FULL_SET,
+            cap_permitted: CAP_FULL_SET,
+            cap_effective: CAP_FULL_SET,
+            cap_bset: CAP_FULL_SET,
+            cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
+            groups: GroupInfo::EMPTY,
+            ucounts: UcountsRef::INIT,
+            rcu: CredRcu::new(),
+        }
+    }
 
     /// No privileges at all (overflow uid/gid 65534, no capabilities,
     /// empty bounding set): what a context without a task gets, so a
     /// missing task never runs privileged
-    pub const NOBODY: Self = Self {
-        uid: 65534,
-        gid: 65534,
-        suid: 65534,
-        sgid: 65534,
-        euid: 65534,
-        egid: 65534,
-        fsuid: 65534,
-        fsgid: 65534,
-        cap_inheritable: CAP_EMPTY_SET,
-        cap_permitted: CAP_EMPTY_SET,
-        cap_effective: CAP_EMPTY_SET,
-        cap_bset: CAP_EMPTY_SET,
-        cap_ambient: CAP_EMPTY_SET,
-        groups: GroupInfo::EMPTY,
-        ucounts: UcountsRef::INIT,
-    };
+    pub const fn nobody() -> Self {
+        Self {
+            uid: 65534,
+            gid: 65534,
+            suid: 65534,
+            sgid: 65534,
+            euid: 65534,
+            egid: 65534,
+            fsuid: 65534,
+            fsgid: 65534,
+            cap_inheritable: CAP_EMPTY_SET,
+            cap_permitted: CAP_EMPTY_SET,
+            cap_effective: CAP_EMPTY_SET,
+            cap_bset: CAP_EMPTY_SET,
+            cap_ambient: CAP_EMPTY_SET,
+            groups: GroupInfo::EMPTY,
+            ucounts: UcountsRef::INIT,
+            rcu: CredRcu::new(),
+        }
+    }
 
     /// Create credentials for a specific user/group
     ///
@@ -293,6 +342,7 @@ impl Cred {
             cap_ambient: CAP_EMPTY_SET,
             groups: GroupInfo::EMPTY,
             ucounts: UcountsRef::INIT,
+            rcu: CredRcu::new(),
         }
     }
 
@@ -306,7 +356,7 @@ impl Cred {
 
 impl Default for Cred {
     fn default() -> Self {
-        Self::ROOT
+        Self::root()
     }
 }
 
@@ -679,6 +729,10 @@ pub mod tif {
     /// mode (Linux TIF_SINGLESTEP; set and cleared by the tracer while
     /// the task is stopped)
     pub const SINGLESTEP: u32 = 1 << 6;
+    /// arm64: this CPU's FP/SIMD registers do not hold the task's user
+    /// state; it is loaded on the way back to user mode (Linux
+    /// TIF_FOREIGN_FPSTATE; `arch::aarch64::fpsimd`)
+    pub const FOREIGN_FPSTATE: u32 = 1 << 7;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -689,7 +743,7 @@ pub mod tif {
 /// - hot counters and flags: atomics written by the task itself (or
 ///   its creator before it first runs) or under TASKLIST, and read
 ///   lock-free by anyone (accounting, `flags`, `thread_flags`, `cpu`,
-///   `ppid`/`pgid`/`sid`, `seccomp_mode`);
+///   `seccomp_mode`);
 /// - `cred`: read by the task itself without a lock and by others under
 ///   TASKLIST, replaced by the task under TASKLIST (commit_creds);
 /// - the `alloc_lock` fields (Linux task_lock: `mm`, `files`, `fs`,
@@ -697,8 +751,32 @@ pub mod tif {
 ///   itself without a lock (all but `io_context`) and by others under
 ///   its `alloc_lock` ([`Task::task_lock`]), changed under it by the
 ///   task (or its creator before it runs; `io_context` by anyone);
+/// - the relations RCU readers follow (`real_parent`, `ptracer`,
+///   `pgrp`, `session`; Linux real_parent, parent,
+///   signal->pids[PIDTYPE_PGID, PIDTYPE_SID]): written under
+///   TASKLIST's write lock, read under it or under an RCU read guard;
 /// - everything else ([`TaskInner`]), read and written only under
 ///   TASKLIST, through the table's views (`GlobalTaskTable::get` etc.).
+///
+/// # Invariants
+/// A task leaves memory no sooner than a grace period after it leaves
+/// the task list: the list's reference is dropped through `kfree_rcu`
+/// (Linux put_task_struct_rcu_user -> delayed_put_task_struct). That
+/// reference is usually the last, so the task's drop runs in `rcuc/N`
+/// with preemption off: nothing it still holds may sleep to release
+/// (exit took all that may, doc/UNSAFE.md rule 12).
+/// `real_parent` is null or, whenever this task is in the task list,
+/// names a task in it: it changes only under TASKLIST's write lock, to
+/// a listed task (fork, `adopt`, exec's leader change), and a task's
+/// children are handed on before it leaves the list
+/// (forget_original_parent; `remove` clears any left).
+/// `ptracer` is null or, whenever this task is in the task list, names
+/// a task in it: it is set only under TASKLIST's write lock, while
+/// this task is listed (or joins the list in that section), to a
+/// listed task that is not exiting (the attaching tracer itself,
+/// current; PTRACE_TRACEME's real parent, refused once PF_EXITING;
+/// CLONE_PTRACE's creator's tracer), and a tracer detaches every
+/// tracee before it leaves the list (exit_ptrace, after PF_EXITING).
 pub struct Task {
     /// Thread ID: the root number of its `thread_pid`; changes only when
     /// a non-leader execs and takes its leader's (exchange_tids)
@@ -755,13 +833,6 @@ pub struct Task {
     /// before its CPU's rq lock (`try_to_wake_up`)
     pub pi_lock: crate::sync::IrqSpinlock<()>,
 
-    /// Parent process ID (0 for init/orphans; written under TASKLIST)
-    pub ppid: AtomicU64,
-    /// Process group ID: the number of `TaskInner.pgrp` (written with
-    /// it under TASKLIST's write lock, in every thread of the group)
-    pub pgid: AtomicU64,
-    /// Session ID: likewise for `TaskInner.session`
-    pub sid: AtomicU64,
     /// User TLS register (x86-64 FS base, arm64 TPIDR_EL0), saved at
     /// switch-out and loaded at switch-in; set by the task itself or its
     /// creator (CLONE_SETTLS)
@@ -770,15 +841,21 @@ pub struct Task {
     /// thread.gsbase; 0 on arm64), saved at switch-out and loaded at
     /// switch-in like `tls`; inherited by a fork child, 0 after exec
     pub gsbase: AtomicU64,
+    /// Arch thread state (Linux thread_struct): arm64 the user FP/SIMD
+    /// state while it is not live in a CPU's registers; its own access
+    /// rules (`arch::ThreadStruct`)
+    pub thread: crate::arch::ThreadStruct,
     /// Seccomp mode (0 = DISABLED, 1 = STRICT, 2 = FILTER), set by the
     /// task itself; read at every syscall entry
     pub seccomp_mode: AtomicU8,
 
-    /// Its signal state (blocked mask, private pending set, altstack;
-    /// Linux siglock's per-task part): spin Mutex, thread context only
-    /// (no interrupt handler sends signals), under TASKLIST when both
-    /// are taken; the shared pending set's lock nests inside
-    pub sig: crate::sync::spin::Mutex<TaskSignalState>,
+    /// Its signal state (blocked mask, private pending set, altstack,
+    /// ptrace stop; Linux task->blocked, ->pending, ->jobctl..., no lock
+    /// of their own): under the siglock of the table `sighand` names,
+    /// the cell's owner, handed over with that field (exec's unshare,
+    /// under TASKLIST's write lock and the old siglock); reached through
+    /// `signal::lock_task_sighand`
+    pub sig: crate::sync::InstanceCell<TaskSignalState, SigHand>,
     /// Keyring references (Linux cred->thread_keyring etc.): spin lock,
     /// thread context; the key database is taken under it
     pub keyrings: crate::sync::spin::Mutex<crate::keys::keyring::TaskKeyrings>,
@@ -836,31 +913,22 @@ pub struct Task {
     /// (ioprio_set), so read only under `alloc_lock`
     io_context: OwnCell<Option<Arc<IoContext>>>,
 
-    /// User CPU time consumed (nanoseconds)
+    /// User CPU time, ns: tick samples (Linux p->utime), added only by
+    /// the tick of the CPU running the task (a load and a store), read
+    /// lock-free
     pub utime: AtomicU64,
-    /// System CPU time consumed (nanoseconds)
+    /// System CPU time, ns: tick samples (Linux p->stime), as `utime`
     pub stime: AtomicU64,
-    /// When the task last started running or crossed the user/kernel
-    /// boundary (for the utime/stime split)
-    pub last_run_ns: AtomicU64,
-    /// In kernel mode (for the utime/stime split)
-    pub in_kernel: AtomicBool,
-    /// Sequence count around changes of utime/stime/last_run_ns/in_kernel
-    /// (Linux seqcount, as vtime->seqcount): odd while one is under way.
-    /// Their only writer is the task's own CPU with interrupts off (its
-    /// syscalls, its switches, the tick), so readers on other CPUs retry
-    acct_seq: AtomicU32,
-    /// On a CPU since its last accounting point, for readers adding
-    /// the current slice: set by `switch_in`, cleared by `switch_out`,
-    /// both inside `acct_seq` (`se.on_cpu` clears only after the
-    /// switch, which would add a slice already charged)
-    acct_running: AtomicBool,
-    /// Earliest expiry (ns of its PROF, VIRT time) of a CPU timer on
-    /// this thread's clock: a hint for the tick (`cpu_timer`)
-    pub cpu_next: [AtomicU64; 2],
-    /// Its thread group's SignalStruct, set once when the task gets it
-    /// (never changes): the tick and the accounting reach the group's
-    /// CPU timer state through it without TASKLIST
+    /// utime/stime last reported, adjusted (Linux p->prev_cputime)
+    pub prev_cputime: cputime::PrevCputime,
+    /// Earliest expiry (ns of its PROF, VIRT, SCHED time) of a CPU
+    /// timer on this thread's clock: a hint for the tick (`cpu_timer`;
+    /// Linux posix_cputimers' expiry cache)
+    pub cpu_next: [AtomicU64; 3],
+    /// Its thread group's SignalStruct (Linux task->signal), set once
+    /// when the task gets it, in the TASKLIST section that lists it,
+    /// and fixed for the task's life: the group's pending set, limits,
+    /// timers and exit state are reached through it with no TASKLIST
     cpu_group: spin::Once<Arc<crate::signal::SignalStruct>>,
     /// Voluntary context switches (task yielded or slept)
     pub nvcsw: AtomicU64,
@@ -868,6 +936,9 @@ pub struct Task {
     pub nivcsw: AtomicU64,
     /// Minor page faults (demand paging, COW - no I/O required)
     pub min_flt: AtomicU64,
+    /// Pages it dirtied since its last dirty throttle check (Linux
+    /// current->nr_dirtied): written by the task alone (`Sole`)
+    pub nr_dirtied: AtomicU64,
     /// Major page faults (swap-in required - I/O needed)
     pub maj_flt: AtomicU64,
 
@@ -876,32 +947,73 @@ pub struct Task {
     /// Its place in its real parent's `children` (Linux sibling; under
     /// TASKLIST)
     pub sibling: crate::util::list::Link,
-    /// Its place in its group leader's `threads` (Linux thread_node;
-    /// under TASKLIST), and that list's mark
+    /// Its place in its group's `SignalStruct.threads` (Linux
+    /// thread_node; under TASKLIST and that group's siglock), and that
+    /// list's mark
     pub thread_node: crate::util::list::Link,
     thread_owner: crate::util::list::Owner,
     /// A group leader's place on its process group's `Pid.pgrp` (Linux
-    /// pid_links[PIDTYPE_PGID]; under TASKLIST)
-    pub pgrp_link: crate::util::list::Link,
+    /// pid_links[PIDTYPE_PGID]: changed under TASKLIST's write lock,
+    /// read under it or RCU)
+    pub pgrp_link: crate::util::rcuhlist::HNode,
     /// A group leader's place on its session's `Pid.session` (Linux
-    /// pid_links[PIDTYPE_SID]; under TASKLIST)
-    pub session_link: crate::util::list::Link,
+    /// pid_links[PIDTYPE_SID]), likewise
+    pub session_link: crate::util::rcuhlist::HNode,
+    /// The real parent (Linux real_parent): the task whose `children`
+    /// list holds this one's group leader; null for init and kernel
+    /// threads. No reference: valid while this task is listed (type
+    /// invariant), read under TASKLIST ([`Task::parent_locked`]) or an
+    /// RCU read guard ([`Task::parent`]), written under its write lock
+    real_parent: crate::sync::rcu::RcuPtr<Task>,
+    /// The tracer while traced, else null (Linux task->parent while
+    /// ptraced, ptrace_parent()): a task pointer, never a number, so a
+    /// recycled tid never names it. No reference: valid while this task
+    /// is listed (type invariant), read under TASKLIST
+    /// ([`Task::tracer_locked`]) or an RCU read guard
+    /// ([`Task::tracer`]), written under its write lock
+    ptracer: crate::sync::rcu::RcuPtr<Task>,
+    /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
+    /// PIDTYPE_SID]): the same in every thread of the group, the only
+    /// record of its group and session; none for kernel threads and
+    /// once its released leader's group is gone. Replaced under
+    /// TASKLIST's write lock, the old reference dropped a
+    /// grace period later (Linux free_pid -> delayed_put_pid); read
+    /// under its read lock or an RCU read guard
+    pub pgrp: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    pub session: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    /// Releases the task list's reference a grace period after it is
+    /// unlisted (type invariant)
+    rcu: crate::sync::rcu::RcuHead,
+    /// Its signal handlers (Linux task->sighand, `__rcu`; shared with
+    /// CLONE_SIGHAND): written under TASKLIST's write lock and the old
+    /// table's `siglock`, the replaced one dropped a grace period later
+    /// (`put_rcu`); read under TASKLIST or an RCU read guard. Set in
+    /// the section that lists the task, cleared at release (a zombie
+    /// keeps it, Linux __exit_signal).
+    pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, percpu::GlobalTaskTable>,
+    /// Its process identifier (Linux task->thread_pid; None for the idle
+    /// tasks, tid 0): set before the task is listed, exchanged by
+    /// de_thread (exchange_tids) and cleared at release (detach_pid)
+    /// under TASKLIST's write lock, the replaced reference dropped a
+    /// grace period later; read under TASKLIST or an RCU read guard
+    /// (task_pid_nr_ns)
+    pub thread_pid: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    /// Ptrace flags (Linux task->ptrace: PT_PTRACED, PT_SEIZED,
+    /// PT_SYSCALL_TRACE, PT_SINGLESTEP; 0: not traced): written under
+    /// TASKLIST's write lock (a `TaskViewMut`), read with a Relaxed load
+    /// anywhere (Linux reads it racily under siglock: sig_ignored,
+    /// ptrace_signal); a decision that must hold reads it under TASKLIST
+    ptrace: AtomicU32,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner>>,
 }
 
+crate::rcu_head!(Task, rcu);
+
 /// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner {
-    /// Its process identifier (Linux thread_pid; None for the idle
-    /// tasks, tid 0)
-    thread_pid: Option<Arc<pid::Pid>>,
-    /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
-    /// PIDTYPE_SID]): the same in every thread of the group, numbered
-    /// by the `pgid`/`sid` atomics; None for kernel threads
-    pgrp: Option<Arc<pid::Pid>>,
-    session: Option<Arc<pid::Pid>>,
-    /// A group leader on its `pgrp`'s and `session`'s lists
+    /// A group leader on its `Task.pgrp`'s and `session`'s lists
     pids_linked: bool,
     /// The user namespace of its credentials (Linux
     /// real_cred->user_ns; hk keeps the namespace itself in the
@@ -950,12 +1062,6 @@ pub struct TaskInner {
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
-    /// Signal handlers (shared when CLONE_SIGHAND)
-    sighand: Option<Arc<SigHand>>,
-
-    /// Thread-group signal state (shared when CLONE_THREAD)
-    signal: Option<Arc<SignalStruct>>,
-
     /// SysV semaphore undo list (shared when CLONE_SYSVSEM)
     sysvsem: Option<Arc<SemUndoList>>,
 
@@ -1001,22 +1107,6 @@ pub struct TaskInner {
     /// SignalStruct as a zombie, for the group's exit status.
     leader: bool,
 
-    // =========================================================================
-    // Ptrace state (like Linux task_struct ptrace fields)
-    // =========================================================================
-    /// Ptrace flags (PT_PTRACED, PT_SEIZED, PT_SYSCALL_TRACE, PT_SINGLESTEP)
-    /// 0 = not traced, non-zero = traced with flags
-    ptrace: u32,
-
-    /// The tracer (Linux task->parent while traced): a task reference,
-    /// so a recycled number never names it (under TASKLIST)
-    ptracer: Option<alloc::sync::Weak<Task>>,
-
-    /// The real parent (Linux real_parent): the task whose `children`
-    /// list holds this one; None for init and kernel threads. Weak:
-    /// exit reparents children first (under TASKLIST)
-    real_parent: Option<alloc::sync::Weak<Task>>,
-
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
@@ -1025,11 +1115,6 @@ pub struct TaskInner {
     /// On its real parent's `children` (a group leader; Linux: only
     /// leaders are)
     in_children: bool,
-
-    /// A leader's thread group, itself included (Linux
-    /// signal->thread_head; links `thread_node`), one strong reference
-    /// each, until a thread leaves the task list (under TASKLIST)
-    threads: crate::util::list::OwnedList<ThreadNode>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     ptrace_message: u64,
@@ -1042,11 +1127,8 @@ impl TaskInner {
     /// A task in `state` on page table `pgd`: a leader with no exit
     /// signal, nothing shared, not traced; each creation path sets the
     /// rest (struct update)
-    pub fn new(thread_pid: Option<Arc<pid::Pid>>, state: TaskState, pgd: u64) -> Self {
+    pub fn new(state: TaskState, pgd: u64) -> Self {
         Self {
-            thread_pid,
-            pgrp: None,
-            session: None,
             pids_linked: false,
             user_ns: None,
             exit_code: 0,
@@ -1057,8 +1139,6 @@ impl TaskInner {
             pgd,
             clear_child_tid: 0,
             set_child_tid: 0,
-            sighand: None,
-            signal: None,
             sysvsem: None,
             robust_list: 0,
             prctl: PrctlState::default(),
@@ -1066,60 +1146,11 @@ impl TaskInner {
             seccomp_filter: None,
             iopl_emul: 0,
             leader: true,
-            ptrace: 0,
-            ptracer: None,
-            real_parent: None,
             children: crate::util::list::ArcList::new(),
             in_children: false,
-            threads: crate::util::list::OwnedList::new(),
             ptrace_message: 0,
             ptrace_options: 0,
         }
-    }
-
-    /// Its signal handlers (none once it exits)
-    pub fn sighand(&self) -> Option<&Arc<SigHand>> {
-        self.sighand.as_ref()
-    }
-
-    /// Install signal handlers `h`; returns the old ones
-    pub fn set_sighand(&mut self, h: Arc<SigHand>) -> Option<Arc<SigHand>> {
-        self.sighand.replace(h)
-    }
-
-    /// Detach its signal handlers
-    pub fn take_sighand(&mut self) -> Option<Arc<SigHand>> {
-        self.sighand.take()
-    }
-
-    /// Its thread group's signal state (none once it is reaped)
-    pub fn signal(&self) -> Option<&Arc<SignalStruct>> {
-        self.signal.as_ref()
-    }
-
-    /// Install thread-group signal state `s`
-    pub fn set_signal(&mut self, s: Arc<SignalStruct>) {
-        self.signal = Some(s);
-    }
-
-    /// Detach its thread group's signal state
-    pub fn take_signal(&mut self) -> Option<Arc<SignalStruct>> {
-        self.signal.take()
-    }
-
-    /// Its process identifier (None for the idle tasks)
-    pub fn thread_pid(&self) -> Option<&Arc<pid::Pid>> {
-        self.thread_pid.as_ref()
-    }
-
-    /// Its process group (None for kernel threads)
-    pub fn pgrp(&self) -> Option<&Arc<pid::Pid>> {
-        self.pgrp.as_ref()
-    }
-
-    /// Its session (None for kernel threads)
-    pub fn session(&self) -> Option<&Arc<pid::Pid>> {
-        self.session.as_ref()
     }
 
     /// It is its thread group's leader
@@ -1127,19 +1158,9 @@ impl TaskInner {
         self.leader
     }
 
-    /// Its real parent, if it has one that lives
-    pub fn real_parent(&self) -> Option<percpu::TaskRef> {
-        self.real_parent.as_ref().and_then(|w| w.upgrade())
-    }
-
     /// Its current state
     pub fn state(&self) -> TaskState {
         self.state
-    }
-
-    /// Its ptrace flags (0: not traced)
-    pub fn ptrace(&self) -> u32 {
-        self.ptrace
     }
 
     /// Its exit status, once a zombie
@@ -1228,10 +1249,9 @@ crate::owned_adapter!(pub ThreadNode, Task, thread_node, thread_owner);
 /// The ids a new task starts with
 pub struct TaskIds {
     pub pid: Pid,
-    pub ppid: Pid,
-    pub pgid: Pid,
-    pub sid: Pid,
     pub seccomp_mode: u8,
+    /// Its struct pid (None for the idle tasks)
+    pub thread_pid: Option<Arc<pid::Pid>>,
 }
 
 /// An owner field (Linux current->mm, ->files): the owning task reads it
@@ -1246,6 +1266,12 @@ unsafe impl<T: Send> Sync for OwnCell<T> {}
 impl<T> OwnCell<T> {
     pub const fn new(v: T) -> Self {
         Self(UnsafeCell::new(v))
+    }
+
+    /// The field, writable, through exclusive access to the task (not
+    /// shared yet: its creator filling it in)
+    fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
     }
 
     /// # Safety
@@ -1266,11 +1292,21 @@ impl<T> OwnCell<T> {
 }
 
 /// The credentials of the boot task (no allocation)
-static INIT_CRED: Cred = Cred::ROOT;
+static INIT_CRED: Cred = Cred::root();
 
-/// A task's credentials pointer: an `Arc<Cred>` turned raw, or the boot
-/// task's static `INIT_CRED`; the rules of [`OwnCell`] with TASKLIST
-/// in place of `alloc_lock`
+/// A task's credentials pointer (Linux task->real_cred / cred, `__rcu`):
+/// an `Arc<Cred>` turned raw, or the boot task's static `INIT_CRED`.
+/// Only the task itself replaces it (or its creator before it first
+/// runs: Linux commit_creds' rcu_assign_pointer), publishing with
+/// Release; the replaced reference is dropped a grace period later
+/// (`put_rcu`, Linux put_cred_rcu), so a reader under an RCU read
+/// guard (Linux __task_cred) or the task itself (current_cred) reads
+/// a live set.
+///
+/// # Invariants
+/// The pointer is `INIT_CRED` or an `Arc::into_raw` whose count the
+/// cell holds; a replaced one is handed to `put_rcu`, never dropped at
+/// once.
 struct TaskCred(AtomicPtr<Cred>);
 
 impl TaskCred {
@@ -1286,42 +1322,60 @@ impl TaskCred {
         core::ptr::eq(p, &raw const INIT_CRED)
     }
 
-    /// # Safety
-    /// The caller is the task itself, or holds TASKLIST.
-    unsafe fn get(&self) -> Cred {
-        // SAFETY: the pointer is live (see above)
-        unsafe { (*self.0.load(Ordering::Acquire)).clone() }
+    /// The credentials, valid while `g` is held (Linux __task_cred:
+    /// rcu_dereference)
+    fn read<'a>(&'a self, _g: &'a crate::sync::rcu::RcuReadGuard) -> &'a Cred {
+        // SAFETY: a version published here stays allocated a grace
+        // period after it is replaced (type invariant: put_rcu), so
+        // until `_g` drops; the cell itself (borrowed for 'a) holds the
+        // current one
+        unsafe { &*self.0.load(Ordering::Acquire) }
     }
 
+    /// The credentials, read by the task itself (Linux current_cred:
+    /// rcu_dereference_protected, no reader lock)
+    ///
     /// # Safety
-    /// As [`TaskCred::get`].
-    unsafe fn ucounts(&self) -> UcountsRef {
-        // SAFETY: the pointer is live (see above)
-        unsafe { (*self.0.load(Ordering::Acquire)).ucounts.clone() }
+    /// The caller is the task itself (the only writer), and drops the
+    /// borrow before it replaces them.
+    unsafe fn own(&self) -> &Cred {
+        // SAFETY: no one else replaces the version loaded (see above)
+        unsafe { &*self.0.load(Ordering::Relaxed) }
     }
 
-    /// # Safety
-    /// As [`TaskCred::get`].
-    unsafe fn arc(&self) -> Arc<Cred> {
-        let p = self.0.load(Ordering::Acquire);
+    /// A reference to the credentials (Linux get_task_cred)
+    fn arc(&self) -> Arc<Cred> {
+        let g = crate::sync::rcu::read_lock();
+        let p = core::ptr::from_ref(self.read(&g));
         if Self::is_static(p) {
             // The boot task's static set: no caller can fail here
             return arc_nofail(INIT_CRED.clone());
         }
-        // SAFETY: `p` came from Arc::into_raw and holds a count
+        // SAFETY: `p` came from Arc::into_raw and is live under `g`
+        // with a count held (the cell's, or one put_rcu drops after
+        // `g`), so the count is nonzero
         unsafe {
             Arc::increment_strong_count(p);
             Arc::from_raw(p)
         }
     }
 
+    /// Publish `new` (Linux commit_creds' rcu_assign_pointer); the old
+    /// reference goes through `put_rcu`
+    ///
     /// # Safety
-    /// TASKLIST is held, and the caller is the task itself or it has
-    /// not run yet.
-    unsafe fn replace(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+    /// The caller is the task itself, or the task has not run yet.
+    unsafe fn replace(&self, new: Arc<Cred>) {
         let old = self.0.swap(Arc::into_raw(new).cast_mut(), Ordering::AcqRel);
-        // SAFETY: from Arc::into_raw unless static
-        (!Self::is_static(old)).then(|| unsafe { Arc::from_raw(old) })
+        if Self::is_static(old) {
+            return;
+        }
+        // SAFETY: from Arc::into_raw, the cell's count (invariant)
+        let old = unsafe { Arc::from_raw(old) };
+        // At the start of boot no other CPU runs a reader
+        if crate::sync::rcu::can_queue() {
+            crate::sync::rcu::put_rcu(old);
+        }
     }
 }
 
@@ -1349,6 +1403,17 @@ impl CredOverride {
     /// before, its count passed to the caller
     fn swap(&self, p: *mut Cred) -> *mut Cred {
         self.0.swap(p, Ordering::Relaxed)
+    }
+
+    /// The override in force, borrowed
+    ///
+    /// # Safety
+    /// The caller is the task itself, and drops the borrow before it
+    /// reverts or replaces the override.
+    unsafe fn get(&self) -> Option<&Cred> {
+        // SAFETY: from Arc::into_raw, holding the cell's count, which
+        // only this task (the caller) gives up (see above)
+        unsafe { self.0.load(Ordering::Relaxed).as_ref() }
     }
 
     /// # Safety
@@ -1536,6 +1601,15 @@ impl TaskLock<'_> {
         unsafe { self.task.nsproxy.replace(ns) }
     }
 
+    /// Install a memory policy (Linux do_set_mempolicy)
+    ///
+    /// Panics as [`TaskLock::set_mm`]
+    pub fn set_mempolicy(&mut self, p: crate::mm::mempolicy::TaskMempolicy) {
+        self.owner_check();
+        // SAFETY: as above
+        unsafe { self.task.mempolicy.replace(p) };
+    }
+
     /// Rename the task (Linux __set_task_comm)
     ///
     /// Panics as [`TaskLock::set_mm`]
@@ -1547,8 +1621,11 @@ impl TaskLock<'_> {
 }
 
 impl Task {
-    /// A task with its locked fields (not yet in the table)
+    /// A task with its locked fields (not yet in the table). Always
+    /// inline, for `kalloc::try_arc_with`: built straight in the task's
+    /// block, never on a stack
     #[expect(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn new(
         tid: Tid,
         ids: TaskIds,
@@ -1570,12 +1647,14 @@ impl Task {
         Self {
             tid: AtomicU64::new(tid),
             pid: ids.pid,
-            pid_ns: inner.thread_pid.as_ref().map(|p| p.ns().clone()),
+            pid_ns: ids.thread_pid.as_ref().map(|p| p.ns().clone()),
             kind,
             kstack_top,
             start_time: AtomicU64::new(now),
             flags: AtomicU32::new(flags),
-            thread_flags: AtomicU32::new(0),
+            // No CPU's registers hold its user state (Linux copy_thread:
+            // fpsimd_flush_task_state)
+            thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
             cpu: AtomicU32::new(cpu),
             wake_cpu: AtomicU32::new(cpu),
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
@@ -1586,13 +1665,11 @@ impl Task {
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
             pi_lock: crate::sync::IrqSpinlock::new(()),
-            ppid: AtomicU64::new(ids.ppid),
-            pgid: AtomicU64::new(ids.pgid),
-            sid: AtomicU64::new(ids.sid),
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            thread: crate::arch::ThreadStruct::new(),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
-            sig: crate::sync::spin::Mutex::new(sig),
+            sig: crate::sync::InstanceCell::new(sig),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
@@ -1614,25 +1691,28 @@ impl Task {
             io_context: OwnCell::new(None),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
-            last_run_ns: AtomicU64::new(now),
-            in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
-            acct_seq: AtomicU32::new(0),
-            acct_running: AtomicBool::new(false),
-            cpu_next: [
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-            ],
+            prev_cputime: cputime::PrevCputime::new(),
+            cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
+            nr_dirtied: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
             thread_owner: crate::util::list::Owner::new(),
-            pgrp_link: crate::util::list::Link::new(),
-            session_link: crate::util::list::Link::new(),
+            pgrp_link: crate::util::rcuhlist::HNode::new(),
+            session_link: crate::util::rcuhlist::HNode::new(),
+            real_parent: crate::sync::rcu::RcuPtr::null(),
+            ptracer: crate::sync::rcu::RcuPtr::null(),
+            pgrp: crate::sync::rcu::RcuLockedArc::none(),
+            session: crate::sync::rcu::RcuLockedArc::none(),
+            rcu: crate::sync::rcu::RcuHead::new(),
+            sighand: crate::sync::rcu::RcuLockedArc::none(),
+            thread_pid: crate::sync::rcu::RcuLockedArc::new(ids.thread_pid),
+            ptrace: AtomicU32::new(0),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1648,7 +1728,9 @@ impl Task {
             kstack_top,
             start_time: AtomicU64::new(0),
             flags: AtomicU32::new(pf::KTHREAD | pf::NO_SETAFFINITY),
-            thread_flags: AtomicU32::new(0),
+            // Its registers hold no user state (Linux init_task:
+            // _TIF_FOREIGN_FPSTATE)
+            thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
             cpu: AtomicU32::new(0),
             wake_cpu: AtomicU32::new(0),
             cpus_mask: crate::util::cpumask::CpuMask::new(),
@@ -1659,13 +1741,11 @@ impl Task {
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),
             pi_lock: crate::sync::IrqSpinlock::new(()),
-            ppid: AtomicU64::new(0),
-            pgid: AtomicU64::new(0),
-            sid: AtomicU64::new(0),
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
+            thread: crate::arch::ThreadStruct::new(),
             seccomp_mode: AtomicU8::new(0),
-            sig: crate::sync::spin::Mutex::new(TaskSignalState::boot()),
+            sig: crate::sync::InstanceCell::new(TaskSignalState::boot()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             kthread: crate::sync::spin::Mutex::new(None),
             cgroup: crate::sync::spin::Mutex::new(None),
@@ -1687,25 +1767,28 @@ impl Task {
             io_context: OwnCell::new(None),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
-            last_run_ns: AtomicU64::new(0),
-            in_kernel: AtomicBool::new(true),
-            acct_seq: AtomicU32::new(0),
-            acct_running: AtomicBool::new(false),
-            cpu_next: [
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-                AtomicU64::new(crate::time::cpu_timer::NONE),
-            ],
+            prev_cputime: cputime::PrevCputime::new(),
+            cpu_next: [const { AtomicU64::new(crate::time::cpu_timer::NONE) }; 3],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
+            nr_dirtied: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::util::list::Link::new(),
             sibling: crate::util::list::Link::new(),
             thread_node: crate::util::list::Link::new(),
             thread_owner: crate::util::list::Owner::new(),
-            pgrp_link: crate::util::list::Link::new(),
-            session_link: crate::util::list::Link::new(),
+            pgrp_link: crate::util::rcuhlist::HNode::new(),
+            session_link: crate::util::rcuhlist::HNode::new(),
+            real_parent: crate::sync::rcu::RcuPtr::null(),
+            ptracer: crate::sync::rcu::RcuPtr::null(),
+            pgrp: crate::sync::rcu::RcuLockedArc::none(),
+            session: crate::sync::rcu::RcuLockedArc::none(),
+            rcu: crate::sync::rcu::RcuHead::new(),
+            sighand: crate::sync::rcu::RcuLockedArc::none(),
+            thread_pid: crate::sync::rcu::RcuLockedArc::none(),
+            ptrace: AtomicU32::new(0),
             inner: TableCell::new(None),
         }
     }
@@ -1720,6 +1803,133 @@ impl Task {
     #[inline]
     pub fn pid_ns(&self) -> &crate::ns::PidNamespace {
         self.pid_ns.as_deref().unwrap_or(&crate::ns::INIT_PID_NS)
+    }
+
+    /// Still in the task list, not yet reaped (Linux pid_alive): read
+    /// with no lock, so only a hint once it returns unless TASKLIST is
+    /// held
+    pub fn pid_alive(&self) -> bool {
+        self.tasks_link.is_listed()
+    }
+
+    /// Its real parent, none once it has left the task list (Linux
+    /// pid_alive(p) ? rcu_dereference(p->real_parent)); no reference
+    /// taken: the parent stays allocated while `g` is held
+    pub fn parent<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> Option<&'a Task> {
+        let _ = g;
+        if !self.tasks_link.is_listed() {
+            return None;
+        }
+        // SAFETY: it was listed within `g`'s section, so its parent at
+        // any later point was listed then too (type invariant: set only
+        // to a listed task while it is listed, never changed once it
+        // leaves) and leaves memory no sooner than a grace period after
+        // it leaves the list, which `g` keeps from ending for 'a
+        unsafe { self.real_parent.get() }
+    }
+
+    /// Its real parent, TASKLIST held (Linux real_parent under
+    /// tasklist_lock); none once it has left the task list
+    pub fn parent_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+        let _ = table;
+        if !self.tasks_link.is_listed() {
+            return None;
+        }
+        // SAFETY: listed, and `table` borrowed for 'a keeps it so: its
+        // parent is listed for 'a too (type invariant), held by the
+        // list's reference
+        unsafe { self.real_parent.get() }
+    }
+
+    /// Its real parent becomes `p` (TASKLIST held for writing: Linux
+    /// rcu_assign_pointer(real_parent) under tasklist_lock); `p` is
+    /// listed (the type invariant)
+    pub fn set_parent(&self, p: Option<&Task>, table: &mut percpu::GlobalTaskTable) {
+        let _ = table;
+        debug_assert!(p.is_none_or(|p| p.tasks_link.is_listed()));
+        // INVARIANT: `p` is listed (the callers'), under the write lock
+        self.real_parent
+            .set(p.map_or(core::ptr::null(), core::ptr::from_ref));
+    }
+
+    /// Its real parent's address, to compare only
+    pub fn parent_ptr(&self) -> *const Task {
+        self.real_parent.as_ptr()
+    }
+
+    /// Its tracer, none if it is not traced or has left the task list
+    /// (Linux pid_alive(p) ? ptrace_parent(p), under rcu_read_lock); no
+    /// reference taken: the tracer stays allocated while `g` is held
+    pub fn tracer<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> Option<&'a Task> {
+        let _ = g;
+        if !self.tasks_link.is_listed() {
+            return None;
+        }
+        // SAFETY: it was listed within `g`'s section, so its tracer at
+        // any later point was listed then too (type invariant: set only
+        // to a listed task while it is listed, cleared before that task
+        // leaves the list, never set once it leaves) and leaves memory
+        // no sooner than a grace period after it leaves the list, which
+        // `g` keeps from ending for 'a
+        unsafe { self.ptracer.get() }
+    }
+
+    /// Its tracer, TASKLIST held (Linux task->parent of a ptraced task
+    /// under tasklist_lock); none if not traced or no longer listed
+    pub fn tracer_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+        let _ = table;
+        if !self.tasks_link.is_listed() {
+            return None;
+        }
+        // SAFETY: listed, and `table` borrowed for 'a keeps it so and
+        // keeps its tracer listed for 'a too (type invariant), held by
+        // the list's reference
+        unsafe { self.ptracer.get() }
+    }
+
+    /// Its tracer's address, to compare only (null: not traced)
+    pub fn tracer_ptr(&self) -> *const Task {
+        self.ptracer.as_ptr()
+    }
+
+    /// Its process as `ns` numbers it, 0 if not visible there or once
+    /// its group is released (Linux task_tgid_nr_ns:
+    /// pid_nr_ns(rcu_dereference(signal->pids[PIDTYPE_TGID]))), under
+    /// `g`. A kernel thread (no signal struct) is numbered only in the
+    /// root namespace.
+    pub fn tgid_nr_ns(
+        &self,
+        ns: &crate::ns::PidNamespace,
+        g: &crate::sync::rcu::RcuReadGuard,
+    ) -> u32 {
+        match self.cpu_group() {
+            Some(s) => s.leader_pid.read(g).map_or(0, |p| p.nr_ns(ns)),
+            // A root number, a u32 (pid_max)
+            None if ns.level == 0 => self.pid as u32,
+            None => 0,
+        }
+    }
+
+    /// Its thread as `ns` numbers it, 0 if not visible there or once it
+    /// has left the task list (Linux task_pid_nr_ns), under `g`
+    pub fn pid_nr_ns(
+        &self,
+        ns: &crate::ns::PidNamespace,
+        g: &crate::sync::rcu::RcuReadGuard,
+    ) -> u32 {
+        self.thread_pid.read(g).map_or(0, |p| p.nr_ns(ns))
+    }
+
+    /// Its process group (root number), 0 for none (Linux
+    /// pid_nr(task_pgrp)), under `g`
+    pub fn pgid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
+        self.pgrp.read(g).map_or(0, |p| Pid::from(p.nr()))
+    }
+
+    /// Its session (root number), 0 for none (Linux
+    /// pid_nr(task_session)), under `g`
+    pub fn sid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
+        self.session.read(g).map_or(0, |p| Pid::from(p.nr()))
     }
 
     /// Its pid namespace, a counted reference (Linux
@@ -1741,48 +1951,32 @@ impl Task {
         &self.inner
     }
 
-    pub fn ppid(&self) -> Pid {
-        self.ppid.load(Ordering::Relaxed)
-    }
-
-    pub fn pgid(&self) -> Pid {
-        self.pgid.load(Ordering::Relaxed)
-    }
-
-    pub fn sid(&self) -> Pid {
-        self.sid.load(Ordering::Relaxed)
-    }
-
     /// Seccomp mode (syscall entry)
     pub fn seccomp_mode(&self) -> u8 {
         self.seccomp_mode.load(Ordering::Relaxed)
     }
 
-    /// The task's credentials, copied
-    ///
-    /// # Safety
-    /// The caller is the task itself, or holds TASKLIST.
-    pub unsafe fn cred(&self) -> Cred {
-        // SAFETY: see above
-        unsafe { self.cred.get() }
+    /// The task's credentials, valid while `g` is held (Linux
+    /// __task_cred under rcu_read_lock)
+    pub fn cred_rcu<'a>(&'a self, g: &'a crate::sync::rcu::RcuReadGuard) -> &'a Cred {
+        self.cred.read(g)
+    }
+
+    /// The task's credentials, copied (under an RCU read guard)
+    pub fn cred(&self) -> Cred {
+        self.cred_rcu(&crate::sync::rcu::read_lock()).clone()
     }
 
     /// A reference to its real uid's counters (Linux task_ucounts)
-    ///
-    /// # Safety
-    /// As [`Task::cred`].
-    pub unsafe fn ucounts(&self) -> UcountsRef {
-        // SAFETY: see above
-        unsafe { self.cred.ucounts() }
+    pub fn ucounts(&self) -> UcountsRef {
+        self.cred_rcu(&crate::sync::rcu::read_lock())
+            .ucounts
+            .clone()
     }
 
-    /// A reference to the task's credentials
-    ///
-    /// # Safety
-    /// As [`Task::cred`].
-    pub unsafe fn cred_arc(&self) -> Arc<Cred> {
-        // SAFETY: see above
-        unsafe { self.cred.arc() }
+    /// A reference to the task's credentials (Linux get_task_cred)
+    pub fn cred_arc(&self) -> Arc<Cred> {
+        self.cred.arc()
     }
 
     /// The credentials its own checks use: an override in force, else
@@ -1794,9 +1988,21 @@ impl Task {
         // SAFETY: the task itself (see above)
         match unsafe { self.cred_override.arc() } {
             Some(c) => c,
-            // SAFETY: as above
-            None => unsafe { self.cred.arc() },
+            None => self.cred.arc(),
         }
+    }
+
+    /// As [`Task::subj_cred_arc`], borrowed (Linux current_cred: no
+    /// reference taken)
+    ///
+    /// # Safety
+    /// The caller is the task itself, and drops the borrow before it
+    /// changes its credentials or their override (commit_creds,
+    /// override_creds, revert_creds).
+    pub unsafe fn subj_cred_ref(&self) -> &Cred {
+        // SAFETY: the task itself, which keeps both as they are while
+        // borrowed (the caller's contract)
+        unsafe { self.cred_override.get().unwrap_or_else(|| self.cred.own()) }
     }
 
     /// As [`Task::subj_cred_arc`], copied
@@ -1807,8 +2013,8 @@ impl Task {
         // SAFETY: the task itself (see above)
         match unsafe { self.cred_override.arc() } {
             Some(c) => (*c).clone(),
-            // SAFETY: as above
-            None => unsafe { self.cred.get() },
+            // SAFETY: the task itself, borrowed only for the copy
+            None => unsafe { self.cred.own() }.clone(),
         }
     }
 
@@ -1820,13 +2026,12 @@ impl Task {
         }
     }
 
-    /// Install new credentials, returning the old ones (dropped by the
-    /// caller after TASKLIST)
+    /// Install new credentials (Linux commit_creds' rcu_assign_pointer):
+    /// the old reference is dropped a grace period later (put_cred_rcu)
     ///
     /// # Safety
-    /// The caller holds TASKLIST and is the task itself, or the task
-    /// has not run yet.
-    pub unsafe fn set_cred(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+    /// The caller is the task itself, or the task has not run yet.
+    pub unsafe fn set_cred(&self, new: Arc<Cred>) {
         // SAFETY: see above
         unsafe { self.cred.replace(new) }
     }
@@ -1887,12 +2092,16 @@ impl Task {
         self.flags.load(Ordering::Acquire) & f != 0
     }
 
+    /// Set PF_* bits: the task's own flags, which only it writes
+    /// (Linux current->flags |= PF_*), a load and a store; Release for
+    /// the readers that test them from other tasks (PF_EXITING)
     pub fn set_flag(&self, f: u32) {
-        self.flags.fetch_or(f, Ordering::AcqRel);
+        crate::sync::Sole::sole_or(&self.flags, f, Ordering::Release);
     }
 
+    /// Clear PF_* bits (as [`set_flag`](Self::set_flag))
     pub fn clear_flag(&self, f: u32) {
-        self.flags.fetch_and(!f, Ordering::AcqRel);
+        crate::sync::Sole::sole_clear(&self.flags, f, Ordering::Release);
     }
 
     /// The task's CPU (its run queue)
@@ -1933,36 +2142,10 @@ impl Task {
         self.thread_flags.fetch_and(!f, Ordering::AcqRel) & f != 0
     }
 
-    /// Charge the time since the last boundary to user or system time
-    /// and start a new interval in `kernel` mode (the task itself: the
-    /// only writer, so plain loads and stores suffice)
-    pub fn account(&self, now: u64, kernel: bool) {
-        self.acct_begin();
-        self.charge(now, kernel);
-        self.acct_end();
-    }
-
-    /// The body of `account`, inside the caller's sequence window
-    fn charge(&self, now: u64, kernel: bool) {
-        let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
-        let was_kernel = self.in_kernel.load(Ordering::Relaxed);
-        // The group's running totals for its CPU timers (when kept)
-        if let Some(g) = self.cpu_group.get() {
-            g.cputimer.charge(delta, was_kernel);
-        }
-        let t = if was_kernel { &self.stime } else { &self.utime };
-        t.store(
-            t.load(Ordering::Relaxed).saturating_add(delta),
-            Ordering::Relaxed,
-        );
-        self.last_run_ns.store(now, Ordering::Relaxed);
-        self.in_kernel.store(kernel, Ordering::Relaxed);
-    }
-
-    /// Charge the time since the last accounting point to the mode the
-    /// task is in, staying in it (a context switch away, the tick)
-    pub fn account_now(&self, now: u64) {
-        self.account(now, self.in_kernel.load(Ordering::Relaxed));
+    /// Its ptrace flags, a racy read (Linux READ_ONCE(task->ptrace));
+    /// 0: not traced
+    pub fn ptrace(&self) -> u32 {
+        self.ptrace.load(Ordering::Relaxed)
     }
 
     /// Its thread group's SignalStruct (none for kernel threads)
@@ -1975,74 +2158,9 @@ impl Task {
         self.cpu_group.call_once(|| s.clone());
     }
 
-    /// The task starts running at `now`: the time it was off a CPU is
-    /// nobody's (Linux vtime_task_switch)
-    pub fn switch_in(&self, now: u64) {
-        self.acct_begin();
-        self.last_run_ns.store(now, Ordering::Relaxed);
-        self.acct_running.store(true, Ordering::Relaxed);
-        self.acct_end();
-    }
-
-    /// The task leaves its CPU at `now`: charge its time up to now and
-    /// stop counting a running slice, in one sequence window
-    pub fn switch_out(&self, now: u64) {
-        self.acct_begin();
-        self.charge(now, self.in_kernel.load(Ordering::Relaxed));
-        self.acct_running.store(false, Ordering::Relaxed);
-        self.acct_end();
-    }
-
-    fn acct_begin(&self) {
-        self.acct_seq.fetch_add(1, Ordering::Relaxed);
-        core::sync::atomic::fence(Ordering::Release);
-    }
-
-    fn acct_end(&self) {
-        self.acct_seq.fetch_add(1, Ordering::Release);
-    }
-
-    /// (utime, stime) at `now`, including the slice of a task running
-    /// on a CPU since its last accounting point (Linux task_cputime with
-    /// vtime_delta), consistent from any CPU
-    pub fn cputime(&self, now: u64) -> (u64, u64) {
-        loop {
-            let s1 = self.acct_seq.load(Ordering::Acquire);
-            if s1 & 1 != 0 {
-                core::hint::spin_loop();
-                continue;
-            }
-            let (mut u, mut s) = self.times();
-            let last = self.last_run_ns.load(Ordering::Relaxed);
-            let kernel = self.in_kernel.load(Ordering::Relaxed);
-            let running = self.acct_running.load(Ordering::Relaxed);
-            core::sync::atomic::fence(Ordering::Acquire);
-            if self.acct_seq.load(Ordering::Relaxed) != s1 {
-                continue;
-            }
-            if running {
-                let d = now.saturating_sub(last);
-                if kernel {
-                    s += d;
-                } else {
-                    u += d;
-                }
-            }
-            return (u, s);
-        }
-    }
-
     /// Start time (monotonic ns)
     pub fn start_time(&self) -> u64 {
         self.start_time.load(Ordering::Relaxed)
-    }
-
-    /// (utime, stime) in nanoseconds
-    pub fn times(&self) -> (u64, u64) {
-        (
-            self.utime.load(Ordering::Relaxed),
-            self.stime.load(Ordering::Relaxed),
-        )
     }
 }
 

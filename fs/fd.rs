@@ -6,8 +6,6 @@
 //! - truncate, ftruncate (file size modification)
 //! - pipe, pipe2 (pipe creation)
 
-use alloc::sync::Arc;
-
 use crate::fs::{KernelError, LookupFlags};
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
@@ -26,7 +24,7 @@ use crate::task::fdtable::UnusedFd;
 /// `times` (ftruncate: Linux ATTR_MTIME | ATTR_CTIME): mtime and ctime
 /// are set even when the size stays; without it only a size change
 /// sets them (the file system's setattr, as ext4, tmpfs and vfat).
-fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelResult<()> {
+fn do_truncate(inode: &super::InodeRef, length: u64, times: bool) -> KernelResult<()> {
     // Check RLIMIT_FSIZE when extending the file
     let current_size = inode.get_size();
     // RLIMIT_FSIZE (SIGXFSZ), then the filesystem's largest file (Linux
@@ -49,7 +47,7 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelRes
     // Under i_rwsem, like Linux do_truncate: atomic with writes; an
     // active swap area (set by swapon under i_rwsem) is ETXTBSY
     let lock = inode.lock();
-    let r = if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+    let r = if inode.is_swapfile() {
         Err(KernelError::TextBusy)
     } else {
         // The set-id kill with the size change (Linux do_truncate:
@@ -58,7 +56,8 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> KernelRes
         let changed = inode.get_size() != length;
         inode.i_op.truncate(inode, length).inspect(|()| {
             if times || changed {
-                inode.touch_mc();
+                let now = crate::time::TIMEKEEPER.current_time();
+                inode.set_times(None, Some(now), Some(now));
             }
         })
     };
@@ -109,11 +108,8 @@ pub fn sys_truncate(path_ptr: UserPtr<u8>, length: i64) -> KernelResult<()> {
     let path = crate::fs::namei::getname(path_ptr, false)?;
 
     // Look up the file (follow symlinks for truncate)
-    let fpath = crate::fs::namei::path_lookupat(
-        crate::task::percpu::current_cwd(),
-        &path,
-        LookupFlags::open(),
-    )?;
+    let fpath =
+        crate::fs::namei::path_lookup(crate::fs::namei::Start::Cwd, &path, LookupFlags::open())?;
     let inode = fpath.dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // vfs_truncate: EISDIR / EINVAL, write access (EROFS), write
@@ -302,6 +298,8 @@ mod fcntl_cmd {
     pub const F_SETOWN_EX: i32 = 15;
     pub const F_GETOWN_EX: i32 = 16;
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
+    pub const F_SETPIPE_SZ: i32 = 1031;
+    pub const F_GETPIPE_SZ: i32 = 1032;
 }
 
 /// Lock `flock` was just set through `fd`: if a close (by another
@@ -410,6 +408,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> KernelResult<i64> {
 
         F_SETOWN | F_GETOWN | F_SETOWN_EX | F_GETOWN_EX | F_SETSIG | F_GETSIG => {
             fcntl_owner(&file, cmd, arg)
+        }
+
+        // Linux pipe_fcntl: a pipe or FIFO only (EBADF), the size an
+        // unsigned int
+        F_GETPIPE_SZ => Ok(crate::io::pipe::pipe_of(&file)?.size() as i64),
+        F_SETPIPE_SZ => {
+            Ok(crate::io::pipe::pipe_of(&file)?.set_size(u64::from(arg as u32))? as i64)
         }
 
         _ => Err(KernelError::InvalidArgument),

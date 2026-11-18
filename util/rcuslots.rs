@@ -1,0 +1,344 @@
+//! An array of RCU-readable owned references (Linux fdtable->fd: an
+//! array of `struct file __rcu *` written with rcu_assign_pointer under
+//! file_lock and read by __fget_files_rcu under rcu_read_lock)
+//!
+//! [`Slots`] is the array readers see: under an [`RcuReadGuard`] they
+//! take a reference from a slot unless its target's last one went
+//! ([`RcuRef::get_rcu`], Linux file_ref_get). [`SlotsOwner`] is its one
+//! writer: slots change only through it, so whoever borrows it mutably
+//! (the table's lock holder) is the only writer. A table that grows is
+//! copied into a bigger array ([`SlotsOwner::grow`], Linux
+//! copy_fdtable): the old one keeps its pointers as stale copies the new
+//! one owns, so a reader still on it finds the same references, and it
+//! is freed a grace period after the new one is published (Linux
+//! free_fdtable_rcu). Readers reach an array only through its owner or
+//! through [`RcuSlots`], borrowed for their guard: no handle outlives a
+//! grace period with access to a retired array's stale pointers
+//! ([`SlotsRef`] can only be published or dropped).
+
+use alloc::sync::Arc;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+use crate::sync::rcu::{HasRcuHead, RcuArc, RcuHead, RcuReadGuard, RcuRetired};
+use crate::util::error::KernelResult;
+
+/// A counted reference that a reader may take again from its target's
+/// address under RCU (Linux a `struct file *`, its f_ref, and the
+/// SLAB_TYPESAFE_BY_RCU file cache)
+///
+/// # Safety
+/// - `into_raw` leaks one reference, which `from_raw` takes back.
+/// - A target's memory is type-stable (Linux SLAB_TYPESAFE_BY_RCU): it
+///   may be freed and reused for a new target at once, but stays an
+///   object of the targets' cache, its count readable, until a grace
+///   period after it was freed.
+/// - `get_rcu` touches only that count, which nothing writes but
+///   atomically, and takes a reference only from a nonzero one: a
+///   target's, set after the rest of the target (Release), so a reader
+///   may get a newer target than the one it looked for, never a dead
+///   or half-made one.
+pub unsafe trait RcuRef: Sized {
+    type Target;
+
+    /// Leak the reference, as its target's address
+    fn into_raw(self) -> *const Self::Target;
+
+    /// Take a leaked reference back
+    ///
+    /// # Safety
+    /// `p` came from `into_raw`, and its reference is taken back once.
+    unsafe fn from_raw(p: *const Self::Target) -> Self;
+
+    /// A new reference to the target at `p`, unless its last one went
+    /// (Linux file_ref_get): to whatever target is there now, which the
+    /// caller checks is the one it meant (Linux __get_file_rcu's
+    /// reload)
+    ///
+    /// # Safety
+    /// `p` came from `into_raw`, and its memory is still of the cache: a
+    /// target with a reference, or one the caller's RCU read section
+    /// began to reach while it was.
+    unsafe fn get_rcu(p: *const Self::Target) -> Option<Self>;
+}
+
+/// What a lookup in [`Slots`] found (Linux __fget_files_rcu's cases)
+pub enum Lookup<R> {
+    /// No reference there
+    Empty,
+    /// The slot changed or its target was going: look again
+    Raced,
+    /// A new reference to what the slot held
+    Got(R),
+}
+
+/// The array readers see (Linux fdtable->fd and max_fds)
+///
+/// # Invariants
+/// Until `retired` is set, each non-null slot holds one reference
+/// (`RcuRef::into_raw`) the array owns, and slots are written only
+/// through the array's one [`SlotsOwner`]; once set (by `grow`, which
+/// moved them into the next array), slots are never written and own
+/// nothing. A pointer a slot holds named a target with a reference at
+/// some time after every reader that can reach the array began: a
+/// shared borrow comes only from its owner (not retired while borrowed)
+/// or from [`RcuSlots::read`], for a guard begun while the array was
+/// published, and a retired one is freed a grace period after it was
+/// replaced.
+pub struct Slots<R: RcuRef> {
+    s: alloc::boxed::Box<[AtomicPtr<R::Target>]>,
+    retired: AtomicBool,
+    rcu: RcuHead,
+    /// Owns `R`s: Send and Sync as they are
+    _r: PhantomData<R>,
+}
+
+// SAFETY: `rcu` is a field of the array, used only for its deferred
+// free
+unsafe impl<R: RcuRef> HasRcuHead for Slots<R> {
+    fn rcu_head(&self) -> &RcuHead {
+        &self.rcu
+    }
+}
+
+impl<R: RcuRef> Slots<R> {
+    /// Slots it has (Linux max_fds)
+    pub fn len(&self) -> usize {
+        self.s.len()
+    }
+
+    /// Whether it has none
+    pub fn is_empty(&self) -> bool {
+        self.s.is_empty()
+    }
+
+    /// A reference to what slot `i` holds (Linux __fget_files_rcu's
+    /// load, file_ref_get and recheck of the slot): `Raced` when the
+    /// target was going or the slot changed meanwhile
+    pub fn get(&self, i: usize, _g: &RcuReadGuard) -> Lookup<R> {
+        let Some(slot) = self.s.get(i) else {
+            return Lookup::Empty;
+        };
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            return Lookup::Empty;
+        }
+        // SAFETY: `p` named a target with a reference after this reader
+        // began (type invariant); its memory stays type-stable until a
+        // grace period after it is freed (RcuRef), which `_g` keeps from
+        // ending
+        let Some(r) = (unsafe { R::get_rcu(p) }) else {
+            return Lookup::Raced;
+        };
+        // The memory may hold a newer target: the slot still holding it
+        // means that one is this slot's (Linux __get_file_rcu)
+        if slot.load(Ordering::Acquire) != p {
+            return Lookup::Raced;
+        }
+        Lookup::Got(r)
+    }
+
+    /// The address slot `i` holds, to compare or borrow only (Linux
+    /// rcu_dereference_raw of an fd entry); null for none
+    pub fn as_ptr(&self, i: usize) -> *const R::Target {
+        self.s
+            .get(i)
+            .map_or(core::ptr::null(), |s| s.load(Ordering::Acquire))
+    }
+}
+
+impl<R: RcuRef> Drop for Slots<R> {
+    fn drop(&mut self) {
+        if *self.retired.get_mut() {
+            return;
+        }
+        for s in self.s.iter_mut() {
+            let p = *s.get_mut();
+            if !p.is_null() {
+                // SAFETY: not retired: a reference the array owns (type
+                // invariant), taken back once as the array goes
+                drop(unsafe { R::from_raw(p) });
+            }
+        }
+    }
+}
+
+/// The one writer of a [`Slots`] (Linux the file_lock holder's
+/// rcu_assign_pointer on fdt->fd)
+pub struct SlotsOwner<R: RcuRef>(Arc<Slots<R>>);
+
+impl<R: RcuRef> SlotsOwner<R> {
+    /// `n` empty slots; ENOMEM
+    pub fn alloc(n: usize) -> KernelResult<Self> {
+        let s = crate::util::kmem::try_vec_with(n, || AtomicPtr::new(core::ptr::null_mut()))?;
+        // INVARIANT: no reference held, not retired; this is its owner
+        let a = Slots {
+            s: s.into_boxed_slice(),
+            retired: AtomicBool::new(false),
+            rcu: RcuHead::new(),
+            _r: PhantomData,
+        };
+        Ok(Self(crate::util::kalloc::try_arc(a)?))
+    }
+
+    /// The array, to publish for readers ([`RcuSlots`])
+    pub fn shared(&self) -> SlotsRef<R> {
+        SlotsRef(self.0.clone())
+    }
+
+    /// The array, borrowed
+    pub fn slots(&self) -> &Slots<R> {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Slot `i` holds a reference
+    pub fn is_some(&self, i: usize) -> bool {
+        !self.0.as_ptr(i).is_null()
+    }
+
+    /// A reference to what slot `i` holds (Linux files_lookup_fd_locked
+    /// and get_file)
+    pub fn get(&self, i: usize) -> Option<R> {
+        let p = self.0.as_ptr(i);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: a reference the array owns (type invariant; it is not
+        // retired while it has an owner), which no writer can drop while
+        // `self` is borrowed: allocated, and the reference taken cannot
+        // fail
+        unsafe { R::get_rcu(p) }
+    }
+
+    /// Put `v` in slot `i` (below `len`), the reference there before
+    /// handed back (Linux rcu_assign_pointer(fdt->fd[fd], file))
+    pub fn replace(&mut self, i: usize, v: Option<R>) -> Option<R> {
+        let new = v.map_or(core::ptr::null_mut(), |r| R::into_raw(r).cast_mut());
+        // INVARIANT: the array owns `new`; the old one leaves below
+        let old = self.0.s[i].swap(new, Ordering::AcqRel);
+        // SAFETY: a reference the array owned (type invariant), which
+        // the swap took out
+        (!old.is_null()).then(|| unsafe { R::from_raw(old) })
+    }
+
+    /// Move every reference into `new`, empty and at least as long,
+    /// which becomes the owned array (Linux copy_fdtable); the old one
+    /// is handed back, its pointers left as stale copies for readers
+    /// still on it, to be freed a grace period after `new` is published
+    pub fn grow(&mut self, new: SlotsOwner<R>) -> SlotsRef<R> {
+        assert!(new.len() >= self.len());
+        for (d, s) in new.0.s.iter().zip(self.0.s.iter()) {
+            let p = s.load(Ordering::Relaxed);
+            debug_assert!(d.load(Ordering::Relaxed).is_null());
+            // INVARIANT: the new array owns what the old one did
+            d.store(p, Ordering::Relaxed);
+        }
+        // INVARIANT: the old array owns nothing from here on, and its
+        // owner is gone: it is never written again
+        self.0.retired.store(true, Ordering::Relaxed);
+        SlotsRef(core::mem::replace(&mut self.0, new.0))
+    }
+}
+
+/// A counted reference to an array that gives no access to it: it can
+/// only be published ([`RcuSlots`]) or dropped, so a retired array is
+/// never read but by readers that reached it while it was published
+#[must_use]
+pub struct SlotsRef<R: RcuRef>(Arc<Slots<R>>);
+
+/// The published array (Linux files->fdt under rcu_assign_pointer):
+/// readers borrow it for their guard only (Linux rcu_dereference)
+pub struct RcuSlots<R: RcuRef>(RcuArc<Slots<R>>);
+
+impl<R: RcuRef> RcuSlots<R> {
+    /// Publishing `a`
+    ///
+    /// # Safety
+    /// `a` is published nowhere else, and is replaced here
+    /// ([`replace`](Self::replace)) when its owner retires it
+    /// ([`SlotsOwner::grow`]), with no slot of the new array written in
+    /// between (both under the writer's one lock hold).
+    pub unsafe fn new(a: SlotsRef<R>) -> Self {
+        Self(RcuArc::new(a.0))
+    }
+
+    /// The published array, for the guard's life
+    pub fn read<'a>(&'a self, g: &'a RcuReadGuard) -> &'a Slots<R> {
+        self.0.read(g)
+    }
+
+    /// The published array's address, to compare only
+    pub fn as_ptr(&self) -> *const Slots<R> {
+        self.0.as_ptr()
+    }
+
+    /// Publish `a` in place of the array its owner just retired (Linux
+    /// rcu_assign_pointer(files->fdt, new_fdt)); the old one is freed a
+    /// grace period later, when the result is dropped or deferred
+    ///
+    /// # Safety
+    /// As [`new`](Self::new)'s, for `a`; and the array published until
+    /// now was just retired, with no slot of `a` written since.
+    pub unsafe fn replace(&self, a: SlotsRef<R>) -> RcuRetired<Slots<R>> {
+        self.0.replace(a.0)
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    /// A host test's reference: an `Arc` (no reader runs concurrently)
+    pub struct TRef(pub Arc<u32>);
+
+    // SAFETY: host tests have no RCU readers: a target is only reached
+    // from a slot that holds a reference to it
+    unsafe impl RcuRef for TRef {
+        type Target = u32;
+        fn into_raw(self) -> *const u32 {
+            Arc::into_raw(self.0)
+        }
+        unsafe fn from_raw(p: *const u32) -> Self {
+            // SAFETY: the caller's contract
+            TRef(unsafe { Arc::from_raw(p) })
+        }
+        unsafe fn get_rcu(p: *const u32) -> Option<Self> {
+            // SAFETY: a slot's reference keeps it (host tests)
+            unsafe { Arc::increment_strong_count(p) };
+            // SAFETY: the count just taken
+            Some(TRef(unsafe { Arc::from_raw(p) }))
+        }
+    }
+
+    impl Clone for TRef {
+        fn clone(&self) -> Self {
+            TRef(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn grow_moves() {
+        let f = Arc::new(5u32);
+        let mut o = SlotsOwner::<TRef>::alloc(2).unwrap();
+        assert!(o.replace(1, Some(TRef(f.clone()))).is_none());
+        let old = o.grow(SlotsOwner::alloc(4).unwrap());
+        assert_eq!(o.len(), 4);
+        assert_eq!(old.0.as_ptr(1), Arc::as_ptr(&f));
+        drop(old);
+        assert_eq!(Arc::strong_count(&f), 2);
+        assert!(o.get(1).is_some());
+        assert!(o.replace(1, None).is_some());
+        assert_eq!(Arc::strong_count(&f), 1);
+        o.replace(3, Some(TRef(f.clone())));
+        drop(o);
+        assert_eq!(Arc::strong_count(&f), 1);
+    }
+}

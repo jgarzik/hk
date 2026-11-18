@@ -16,26 +16,33 @@ mod irqspin;
 pub mod lockdep;
 mod locked_by;
 mod mutex;
+pub mod qrwlock;
+pub mod qspinlock;
 mod racy;
 pub mod rcu;
 mod rwsem;
 mod seqlock;
+mod sole;
 pub mod spin;
 
 pub use irqflags::{IrqFlags, irqs_disabled, local_irq_restore, local_irq_save};
 pub use irqspin::{IrqRwLock, IrqRwReadGuard, IrqRwWriteGuard, IrqSpinlock, IrqSpinlockGuard};
-pub use locked_by::{LockedBy, LockedByEither, UniqueOwner};
+pub use locked_by::{
+    InstanceCell, InstanceGuard, InstanceLock, InstanceRef, InstanceRefMut, LockedBy, LockedByBoth,
+    LockedByEither, LockedCell, UniqueOwner,
+};
 pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 pub use seqlock::{SeqCount, SeqCountGuard, SeqLock, SeqWriteGuard};
+pub use sole::{Sole, SoleCell, Word};
 
 /// What the sleeping locks take from the scheduler
 #[cfg(not(test))]
 mod sched {
     pub use crate::sync::waitqueue::signal_pending_state;
     use crate::task::Task;
-    pub use crate::task::percpu::{TaskRef, current_tid, get_ticks, schedule, set_current_state};
+    pub use crate::task::percpu::{TaskRef, get_ticks, schedule, set_current_state};
     pub use crate::task::wake_q::WakeQ;
 
     /// The caller is a task that may sleep (not tid 0: an idle task or
@@ -47,6 +54,15 @@ mod sched {
     /// The current task, queued as a sleeping lock's waiter
     pub fn waiter_task() -> *const Task {
         &raw const *crate::task::percpu::current()
+    }
+
+    /// The current task's identity as a sleeping lock's owner (Linux
+    /// `current` in mutex->owner): its address, fixed for its life (a
+    /// tid is not: a non-leader's exec takes its leader's), its low
+    /// three bits clear (a `Task` is 8-aligned)
+    pub fn current_owner() -> u64 {
+        const _: () = assert!(core::mem::align_of::<Task>() >= 8);
+        waiter_task().addr() as u64
     }
 
     /// The current task has an RT policy (rwsem handoff at once)
@@ -102,6 +118,11 @@ mod sched {
 
     pub fn signal_pending_state(_: SleepState) -> bool {
         false
+    }
+
+    /// A per-thread owner identity, its low three bits clear
+    pub fn current_owner() -> u64 {
+        current_tid() << 3
     }
 
     pub fn waiter_task() -> *const Task {

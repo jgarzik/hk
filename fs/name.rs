@@ -14,8 +14,11 @@ use core::borrow::Borrow;
 use core::fmt;
 use core::ops::Deref;
 
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+use crate::sync::rcu::{RcuPuts, RcuReadGuard};
 use crate::util::error::KernelError;
-use crate::util::kalloc::try_arc_slice;
+use crate::util::kalloc::try_arc;
 
 /// An owned file name (a path component, or a whole path where a path is
 /// stored: a symlink target, an executable's name)
@@ -89,6 +92,20 @@ impl fmt::Debug for FileName {
 /// its last byte the NUL: names shorter than this stay inline)
 pub const DNAME_INLINE_LEN: usize = 40;
 
+/// A dentry name's inline room in words (Linux DNAME_INLINE_WORDS)
+const DNAME_INLINE_WORDS: usize = DNAME_INLINE_LEN / 8;
+
+/// A long name's block (Linux struct external_name): its bytes, never
+/// changed, and the deferred puts a dentry's reference goes through
+/// when a rename replaces its name ([`DNameSlot`]), so an RCU reader
+/// still on it keeps it (Linux copy_name's kfree_rcu)
+pub struct ExternalName {
+    puts: RcuPuts,
+    bytes: Box<[u8]>,
+}
+
+crate::rcu_puts!(ExternalName, puts);
+
 /// A dentry's name (Linux struct qstr over d_shortname or an
 /// external_name) and its hash: a short name inline, a longer one in a
 /// refcounted block allocated, fallibly, before any lock is taken. A
@@ -109,7 +126,7 @@ enum DNameRepr {
         buf: [u8; DNAME_INLINE_LEN],
     },
     /// Linux external_name (its count is the Arc's)
-    External(Arc<[u8]>),
+    External(Arc<ExternalName>),
 }
 
 impl DName {
@@ -122,7 +139,14 @@ impl DName {
                 buf[..b.len()].copy_from_slice(b);
                 DNameRepr::Inline { len, buf }
             }
-            _ => DNameRepr::External(try_arc_slice(b)?),
+            _ => {
+                let mut v = crate::util::kmem::try_vec(b.len(), 0u8)?;
+                v.copy_from_slice(b);
+                DNameRepr::External(try_arc(ExternalName {
+                    puts: RcuPuts::new(),
+                    bytes: v.into_boxed_slice(),
+                })?)
+            }
         };
         Ok(Self {
             hash: name_hash(b),
@@ -133,7 +157,7 @@ impl DName {
     pub fn as_bytes(&self) -> &[u8] {
         match &self.repr {
             DNameRepr::Inline { len, buf } => &buf[..usize::from(*len)],
-            DNameRepr::External(a) => a,
+            DNameRepr::External(a) => &a.bytes,
         }
     }
 
@@ -154,6 +178,157 @@ impl Default for DName {
                 buf: [0; DNAME_INLINE_LEN],
             },
         }
+    }
+}
+
+/// A dentry's name as an RCU walk reads it (Linux d_name over
+/// d_shortname / an external_name): the hash, the length, a long
+/// name's block and a short name's bytes, each an atomic, so a reader
+/// with no lock gets a picture that may be torn by a rename but never
+/// reads out of bounds (a short name is copied word by word from its
+/// fixed room, a long one read from its own unchanging block); the
+/// dentry's `d_seq` tells it to repeat. Changed (`store`) only under
+/// the dentry's d_lock held for writing, inside a `d_seq` write
+/// section.
+///
+/// # Invariants
+/// `ext` is null for a short name, else an `Arc::into_raw` of an
+/// [`ExternalName`] whose reference the slot owns; a reference the
+/// slot gave up is dropped no earlier than a grace period after it
+/// stopped being published here (`put_rcu`), or with the slot itself,
+/// which is dropped only when no reader can reach it (a dentry's free,
+/// a grace period after its kill).
+pub struct DNameSlot {
+    hash: AtomicU64,
+    len: AtomicU32,
+    ext: AtomicPtr<ExternalName>,
+    inline: [AtomicU64; DNAME_INLINE_WORDS],
+}
+
+impl DNameSlot {
+    pub fn new(n: DName) -> Self {
+        let s = Self {
+            hash: AtomicU64::new(0),
+            len: AtomicU32::new(0),
+            ext: AtomicPtr::new(core::ptr::null_mut()),
+            inline: [const { AtomicU64::new(0) }; DNAME_INLINE_WORDS],
+        };
+        s.store(n);
+        s
+    }
+
+    /// The name's hash (Linux d_name.hash), as of now
+    pub fn hash(&self) -> u64 {
+        self.hash.load(Ordering::Relaxed)
+    }
+
+    /// Become `n` (Linux copy_name), under the dentry's d_lock held for
+    /// writing, inside a `d_seq` write section: a long name's block is
+    /// shared, never copied, so nothing is allocated; the block it
+    /// replaces is let go a grace period from now (Linux kfree_rcu)
+    pub fn store(&self, n: DName) {
+        let mut buf = [0u8; DNAME_INLINE_LEN];
+        let new = match n.repr {
+            DNameRepr::Inline { len, buf: b } => {
+                buf = b;
+                self.len.store(u32::from(len), Ordering::Relaxed);
+                core::ptr::null_mut()
+            }
+            DNameRepr::External(a) => {
+                // At most NAME_MAX-ish; a length past u32 cannot be made
+                self.len.store(
+                    u32::try_from(a.bytes.len()).unwrap_or(u32::MAX),
+                    Ordering::Relaxed,
+                );
+                Arc::into_raw(a).cast_mut()
+            }
+        };
+        self.hash.store(n.hash, Ordering::Relaxed);
+        for (w, c) in self.inline.iter().zip(buf.as_chunks::<8>().0) {
+            w.store(u64::from_ne_bytes(*c), Ordering::Relaxed);
+        }
+        // INVARIANT: the new block's reference is the slot's; its bytes
+        // are seen by whoever loads the pointer (Release / Acquire)
+        let old = self.ext.swap(new, Ordering::AcqRel);
+        if let Some(old) = core::ptr::NonNull::new(old) {
+            // SAFETY: the slot's own reference (type invariant), given up
+            // once here
+            let a = unsafe { Arc::from_raw(old.as_ptr()) };
+            if crate::sync::rcu::can_queue() {
+                crate::sync::rcu::put_rcu(a);
+            } else {
+                // No other CPU reads: at once
+                drop(a);
+            }
+        }
+    }
+
+    /// A long name's block, borrowed for the guard
+    fn ext<'g>(&self, _g: &'g RcuReadGuard) -> Option<&'g ExternalName> {
+        let p = self.ext.load(Ordering::Acquire);
+        // SAFETY: a non-null `ext` held the slot's reference when read
+        // under `_g`; that reference is dropped no earlier than a grace
+        // period after it stopped being published (type invariant), so
+        // after `_g` ends
+        unsafe { p.as_ref() }
+    }
+
+    /// The short name's room, copied out of its words
+    fn inline_copy(&self) -> ([u8; DNAME_INLINE_LEN], usize) {
+        let mut buf = [0u8; DNAME_INLINE_LEN];
+        for (w, c) in self.inline.iter().zip(buf.as_chunks_mut::<8>().0) {
+            *c = w.load(Ordering::Relaxed).to_ne_bytes();
+        }
+        let len = usize::try_from(self.len.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+        (buf, len.min(DNAME_INLINE_LEN - 1))
+    }
+
+    /// `f` on the name's bytes as of now (Linux READ_ONCE of
+    /// d_name.name, then its bytes): possibly torn by a concurrent
+    /// rename unless the caller holds the dentry's d_lock or a bucket
+    /// lock it is in, else checked with `d_seq` after
+    pub fn read<R>(&self, g: &RcuReadGuard, f: impl FnOnce(&[u8]) -> R) -> R {
+        if let Some(e) = self.ext(g) {
+            return f(&e.bytes);
+        }
+        let (buf, len) = self.inline_copy();
+        f(&buf[..len])
+    }
+
+    /// A snapshot (Linux take_dentry_name_snapshot's body): a copy of a
+    /// short name, a reference to a long one; torn as `read`, so the
+    /// caller checks `d_seq`
+    pub fn snapshot(&self, g: &RcuReadGuard) -> DName {
+        let hash = self.hash();
+        let repr = match self.ext(g) {
+            Some(e) => {
+                let p = core::ptr::from_ref(e);
+                // SAFETY: `p` is the slot's `Arc::into_raw`, its count
+                // above zero for the guard (type invariant): one more
+                DNameRepr::External(unsafe {
+                    Arc::increment_strong_count(p);
+                    Arc::from_raw(p)
+                })
+            }
+            None => {
+                let (buf, len) = self.inline_copy();
+                DNameRepr::Inline {
+                    // Below DNAME_INLINE_LEN: fits
+                    len: len as u8,
+                    buf,
+                }
+            }
+        };
+        DName { hash, repr }
+    }
+}
+
+impl Drop for DNameSlot {
+    fn drop(&mut self) {
+        let p = *self.ext.get_mut();
+        // SAFETY: the slot's own reference (type invariant); `&mut`: no
+        // reader is left
+        drop(core::ptr::NonNull::new(p).map(|p| unsafe { Arc::from_raw(p.as_ptr()) }));
     }
 }
 
@@ -324,6 +499,33 @@ mod tests {
         assert!(c == l && c.as_bytes().len() == DNAME_INLINE_LEN);
         assert!(s.as_bytes() == [b'a'; DNAME_INLINE_LEN - 1] && s.hash() != l.hash());
         assert!(DName::default().is_empty());
+    }
+
+    /// A dentry's name slot reads back what it was given, short or long,
+    /// shares a long block (one more reference, dropped when replaced;
+    /// at once here, with no RCU callbacks), and a snapshot of either
+    /// equals the name
+    #[test]
+    fn slot_store_read_snapshot() {
+        let g = crate::sync::rcu::read_lock();
+        let long = DName::new(&[b'q'; 70]).unwrap();
+        let s = DNameSlot::new(DName::new(b"short").unwrap());
+        assert!(s.read(&g, |b| b == b"short"));
+        assert!(s.snapshot(&g) == DName::new(b"short").unwrap());
+        s.store(long.clone());
+        let DNameRepr::External(a) = &long.repr else {
+            panic!("long name inline");
+        };
+        assert_eq!(Arc::strong_count(a), 2);
+        assert!(s.read(&g, |b| b == [b'q'; 70]) && s.hash() == long.hash());
+        let snap = s.snapshot(&g);
+        assert!(snap == long && Arc::strong_count(a) == 3);
+        drop(snap);
+        s.store(DName::new(b"x").unwrap());
+        assert_eq!(Arc::strong_count(a), 1);
+        assert!(s.read(&g, |b| b == b"x"));
+        // A short name after a long one keeps no stale bytes
+        assert!(s.snapshot(&g).as_bytes() == b"x");
     }
 
     #[test]

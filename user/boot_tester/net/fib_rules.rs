@@ -24,8 +24,6 @@ const FRA_PRIORITY: u16 = 6;
 const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 const FRA_TABLE: u16 = 15;
 const FRA_PROTOCOL: u16 = 21;
-/// struct fib_rule_hdr
-const FRH_LEN: usize = 12;
 
 pub fn run_tests() {
     println(b"=== FIB rule Tests ===");
@@ -57,33 +55,19 @@ fn test_rule_dump() {
     }
 }
 
-/// An attribute's bytes: header and payload, zero-padded
-fn put_attr(out: &mut [u8], at: &mut usize, ty: u16, data: &[u8]) {
-    let len = 4 + data.len();
-    out[*at..*at + 2].copy_from_slice(&(len as u16).to_ne_bytes());
-    out[*at + 2..*at + 4].copy_from_slice(&ty.to_ne_bytes());
-    out[*at + 4..*at + len].copy_from_slice(data);
-    *at += (len + 3) & !3;
-}
-
-/// The RTM_NEWRULE body (after nlmsghdr) Linux sends for a default
-/// rule: fib_rule_hdr, FRA_TABLE, FRA_SUPPRESS_PREFIXLEN (-1),
-/// FRA_PROTOCOL, and FRA_PRIORITY unless 0
-fn expected(pref: u32, table: u8, out: &mut [u8; 64]) -> usize {
-    out[..FRH_LEN].copy_from_slice(&[AF_INET, 0, 0, 0, table, 0, 0, FR_ACT_TO_TBL, 0, 0, 0, 0]);
-    let mut at = FRH_LEN;
-    put_attr(out, &mut at, FRA_TABLE, &u32::from(table).to_ne_bytes());
-    put_attr(
-        out,
-        &mut at,
-        FRA_SUPPRESS_PREFIXLEN,
-        &u32::MAX.to_ne_bytes(),
-    );
-    put_attr(out, &mut at, FRA_PROTOCOL, &[RTPROT_KERNEL]);
+/// The RTM_NEWRULE Linux sends for a default rule: fib_rule_hdr,
+/// FRA_TABLE, FRA_SUPPRESS_PREFIXLEN (-1), FRA_PROTOCOL, and
+/// FRA_PRIORITY unless 0
+fn expected(pref: u32, table: u8) -> Req {
+    let frh = [AF_INET, 0, 0, 0, table, 0, 0, FR_ACT_TO_TBL, 0, 0, 0, 0];
+    let mut r = Req::new(RTM_NEWRULE, 0, &frh);
+    r.u32(FRA_TABLE, u32::from(table))
+        .u32(FRA_SUPPRESS_PREFIXLEN, u32::MAX)
+        .attr(FRA_PROTOCOL, &[RTPROT_KERNEL]);
     if pref != 0 {
-        put_attr(out, &mut at, FRA_PRIORITY, &pref.to_ne_bytes());
+        r.u32(FRA_PRIORITY, pref);
     }
-    at
+    r
 }
 
 const DEFAULTS: [(u32, u8); 3] = [
@@ -101,11 +85,11 @@ fn dump(nl: &mut Nl, family: u8) -> (i32, usize, usize) {
         if m.body.first() != Some(&AF_INET) {
             return;
         }
-        let mut want = [0u8; 64];
         let ok = match DEFAULTS.get(seen) {
             Some(&(pref, table)) => {
-                let len = expected(pref, table, &mut want);
-                m.ty == RTM_NEWRULE && m.flags == NLM_F_MULTI && m.body == &want[..len]
+                m.ty == RTM_NEWRULE
+                    && m.flags == NLM_F_MULTI
+                    && m.body == expected(pref, table).body()
             }
             None => false,
         };

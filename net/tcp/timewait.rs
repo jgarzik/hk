@@ -20,12 +20,12 @@
 //! locks may be taken under it).
 
 use crate::util::error::KernelError;
-use crate::util::kalloc::try_arc_cyclic;
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::Mutex;
 
-use super::cb::{Out, TwCb};
+use super::cb::{Live, Out, TwCb};
 use super::output::Tuple;
 use super::timer::now_ms;
 use crate::net::NetNamespace;
@@ -48,6 +48,9 @@ pub struct TimeWait {
     oif: u32,
     /// The control block and the deadline (ms) `timer` is armed for
     inner: Mutex<(TwCb, Option<u64>)>,
+    /// The lockless fields of the control block each event rebuilds
+    /// (written under `inner`; nothing reads them without it)
+    live: Arc<Live>,
     /// 2MSL (Linux tw_timer)
     timer: ArcTimer<TimeWait>,
     /// Its ehash chain link and bhash owner link (Linux tw_node,
@@ -77,6 +80,7 @@ impl TimeWait {
         oif: u32,
         cb: TwCb,
     ) -> Result<Arc<Self>, KernelError> {
+        let live = try_arc(Live::default())?;
         try_arc_cyclic(|me| Self {
             tuple,
             bind,
@@ -84,6 +88,7 @@ impl TimeWait {
             params,
             oif,
             inner: Mutex::new((cb, None)),
+            live,
             timer: ArcTimer::new(TimeWait::tw_timer),
             eh_link: NullsLink::new(),
             bind_link: Link::new(),
@@ -147,7 +152,7 @@ impl TimeWait {
             self.net.tcp.tw_unhash(self);
             return Some(skb);
         }
-        let mut cb = g.0.cb(super::cfg(&self.net));
+        let mut cb = g.0.cb(super::cfg(&self.net), Arc::clone(&self.live));
         cb.mib = Some(Arc::clone(&self.net.mib));
         cb.input(&s, skb, now, &mut out);
         g.0 = TwCb::from_cb(&cb);
@@ -189,7 +194,7 @@ impl TimeWait {
     fn tw_timer(tw: Arc<TimeWait>) {
         let mut out = Out::default();
         let mut g = tw.inner.lock();
-        let mut cb = g.0.cb(super::cfg(&tw.net));
+        let mut cb = g.0.cb(super::cfg(&tw.net), Arc::clone(&tw.live));
         cb.on_timer(now_ms(), &mut out);
         g.0 = TwCb::from_cb(&cb);
         tw.post(&mut g, &out);

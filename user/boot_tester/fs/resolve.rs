@@ -32,7 +32,7 @@ use crate::harness::{R, check, report_r};
 use hk_syscall::{
     O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_PATH, O_RDONLY, O_WRONLY, Stat, sys_close, sys_dup,
     sys_fstat, sys_getpid, sys_mkdir, sys_mount, sys_open, sys_openat, sys_openat2, sys_pipe2,
-    sys_rmdir, sys_symlink, sys_umount2,
+    sys_rmdir, sys_symlink, sys_umount2, sys_unlink,
 };
 
 const EXDEV: i64 = -18;
@@ -94,6 +94,8 @@ fn run(rootfd: i32) {
     report_r(b"RESOLVE_NO_MAGICLINKS", no_magiclinks(rootfd));
     report_r(b"RESOLVE_NO_SYMLINKS", cases(rootfd, &NO_SYMLINKS_CASES));
     report_r(b"RESOLVE_CACHED", cached(rootfd));
+    report_r(b"RESOLVE_CACHED_SYMLINK", cached_symlink(rootfd));
+    report_r(b"RESOLVE_CACHED_KERNFS", cached_kernfs(rootfd));
 }
 
 /// "/tmp/rs/root/<p>\0" in `b`
@@ -163,6 +165,16 @@ fn open2(dfd: i32, p: &[u8], flags: u64, mode: u64, resolve: u64) -> i64 {
     b[8..16].copy_from_slice(&mode.to_ne_bytes());
     b[16..].copy_from_slice(&resolve.to_ne_bytes());
     sys_openat2(dfd, p.as_ptr(), b.as_ptr(), 24)
+}
+
+/// open2 with RESOLVE_CACHED for O_PATH: the errno, or a descriptor
+/// (closed)
+fn cached_err(dfd: i32, p: &[u8]) -> i64 {
+    let r = open2(dfd, p, u64::from(O_PATH), 0, CACHED);
+    if r >= 0 {
+        sys_close(r as u64);
+    }
+    r
 }
 
 /// (st_dev, st_ino) of `fd`; closes it
@@ -494,10 +506,81 @@ const NO_SYMLINKS_CASES: [Case; 16] = [
     ),
 ];
 
+/// RESOLVE_CACHED through symlinks whose bodies the inode keeps (Linux
+/// pick_link in RCU mode: tmpfs's i_link; ramfs's page, cached): once
+/// followed a clock tick after its creation (relatime: an atime still
+/// to update leaves RCU mode, EAGAIN) a link resolves from the dcache
+/// alone, on ramfs and on tmpfs, a body ending in a slash included
+fn cached_symlink(rootfd: i32) -> R {
+    let mut b = [0u8; 128];
+    let r = sys_symlink(b"etc/passwd\0".as_ptr(), at(&mut b, b"freshlink").as_ptr());
+    check(b"symlink", r == 0, r)?;
+    // A later clock tick than the links' creation, then each followed
+    crate::helpers::msleep(30);
+    let cases: [(&[u8], u32, Want); 4] = [
+        (b"freshlink\0", 0, At(b"etc/passwd\0")),
+        (b"relsym\0", 0, At(b"etc/passwd\0")),
+        (b"reletc/passwd\0", 0, At(b"etc/passwd\0")),
+        (b"mnt/self\0", O_DIRECTORY, At(b"mnt\0")),
+    ];
+    for (p, fl, _) in cases {
+        let fd = sys_openat(rootfd, p.as_ptr(), O_PATH | fl, 0);
+        check(b"warm", fd >= 0, fd)?;
+        sys_close(fd as u64);
+    }
+    for (p, fl, w) in cases {
+        let fd = open2(rootfd, p, u64::from(O_PATH | fl), 0, CACHED);
+        check(b"cached through link", fd >= 0, fd)?;
+        check(
+            b"cached through link: same file",
+            id(fd) == want_id(rootfd, w),
+            0,
+        )?;
+    }
+    Ok(())
+}
+
+/// RESOLVE_CACHED through cgroup2 (Linux kernfs_dop_revalidate: ECHILD
+/// under LOOKUP_RCU): a cached file, or a name that failed, is EAGAIN;
+/// sysfs's too
+fn cached_kernfs(rootfd: i32) -> R {
+    let mut b = [0u8; 128];
+    let mp = at(&mut b, b"cg");
+    let r = sys_mkdir(mp.as_ptr(), 0o755);
+    check(b"mkdir", r == 0, r)?;
+    let r = sys_mount(b"none\0".as_ptr(), mp.as_ptr(), b"cgroup2\0".as_ptr(), 0, 0);
+    if r != 0 {
+        sys_rmdir(at(&mut b, b"cg").as_ptr());
+        return check(b"mount cgroup2", false, r);
+    }
+    let r = cached_kernfs_cases(rootfd);
+    sys_umount2(at(&mut b, b"cg").as_ptr(), 0);
+    sys_rmdir(at(&mut b, b"cg").as_ptr());
+    r
+}
+
+fn cached_kernfs_cases(rootfd: i32) -> R {
+    let mut b = [0u8; 128];
+    let fd = sys_open(at(&mut b, b"cg/cgroup.procs").as_ptr(), O_RDONLY, 0);
+    check(b"warm", fd >= 0, fd)?;
+    sys_close(fd as u64);
+    let r = cached_err(rootfd, b"cg/cgroup.procs\0");
+    check(b"cgroup file", r == EAGAIN, r)?;
+    let r = sys_open(at(&mut b, b"cg/nosuch").as_ptr(), O_RDONLY, 0);
+    check(b"lookup", r == ENOENT, r)?;
+    let r = cached_err(rootfd, b"cg/nosuch\0");
+    check(b"cgroup negative", r == EAGAIN, r)?;
+    let fd = sys_open(b"/sys/kernel\0".as_ptr(), O_PATH, 0);
+    check(b"warm sysfs", fd >= 0, fd)?;
+    sys_close(fd as u64);
+    let r = cached_err(rootfd, b"/sys/kernel\0");
+    check(b"sysfs dir", r == EAGAIN, r)
+}
+
 /// RESOLVE_CACHED: a path the dcache holds opens; a name never looked
-/// up is EAGAIN, and stays so after a failed lookup (ramfs keeps no
-/// negative entry: always_delete_dentry); a /proc fd link (revalidated,
-/// and magic) is EAGAIN
+/// up is EAGAIN, and stays so after a failed lookup or an unlink (ramfs
+/// keeps no negative entry: always_delete_dentry); a /proc fd link
+/// (revalidated, and magic) is EAGAIN
 fn cached(rootfd: i32) -> R {
     let mut b = [0u8; 128];
     let fd = sys_open(at(&mut b, b"etc/passwd").as_ptr(), O_RDONLY, 0);
@@ -513,6 +596,15 @@ fn cached(rootfd: i32) -> R {
     check(b"lookup", r == ENOENT, r)?;
     let r = open2(rootfd, b"etc/nosuch\0", u64::from(O_PATH), 0, CACHED);
     check(b"no negative entry", r == EAGAIN, r)?;
+    // An unlinked name leaves no negative entry either (Linux d_delete
+    // then the last dput: always_delete_dentry)
+    let fd = sys_open(at(&mut b, b"etc/gone").as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    check(b"create", fd >= 0, fd)?;
+    sys_close(fd as u64);
+    let r = sys_unlink(at(&mut b, b"etc/gone").as_ptr());
+    check(b"unlink", r == 0, r)?;
+    let r = open2(rootfd, b"etc/gone\0", u64::from(O_PATH), 0, CACHED);
+    check(b"unlinked: no negative entry", r == EAGAIN, r)?;
     let r = open2(rootfd, b"/proc/self/fd/0\0", u64::from(O_PATH), 0, CACHED);
     if r >= 0 {
         sys_close(r as u64);

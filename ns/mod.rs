@@ -146,13 +146,51 @@ pub struct MntNamespace {
     /// The user namespace that owns it (Linux mnt_namespace.user_ns),
     /// set at creation
     pub user_ns: Arc<UserNamespace>,
+    /// Its change number and pollers, also listed with it in the
+    /// namespace tree so a change reaches them by id with no reference
+    /// to the namespace
+    pub events: Arc<MntEvents>,
+}
+
+/// A mount namespace's change number and the pollers of its mount lists
+/// (Linux mnt_namespace.event, .poll)
+pub struct MntEvents {
+    /// Written under MOUNT_LOCK write (fs::mount), read lock-free by
+    /// pollers (Linux READ_ONCE(ns->event))
+    event: core::sync::atomic::AtomicU64,
+    pub poll: crate::sync::waitqueue::WaitQueue,
+}
+
+impl MntEvents {
+    const fn new() -> Self {
+        Self {
+            event: core::sync::atomic::AtomicU64::new(0),
+            poll: crate::sync::waitqueue::WaitQueue::new(),
+        }
+    }
+
+    /// Its number is now `e` (Linux touch_mnt_namespace's ns->event =
+    /// ++event), under MOUNT_LOCK write; pollers are woken by the caller
+    pub fn set(&self, e: u64) {
+        self.event.store(e, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The number of its last change (Linux READ_ONCE(ns->event))
+    pub fn event(&self) -> u64 {
+        self.event.load(core::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl MntNamespace {
     /// A new empty mount namespace owned by `user_ns`, not yet in the
     /// namespace tree, or ENOMEM (Linux alloc_mnt_ns)
     fn alloc(user_ns: Arc<UserNamespace>) -> Result<Arc<Self>, KernelError> {
-        try_arc(Self::with(NsCommon::new(inum::Inum::alloc()?), user_ns))
+        let events = try_arc(MntEvents::new())?;
+        try_arc(Self::with(
+            NsCommon::new(inum::Inum::alloc()?),
+            user_ns,
+            events,
+        ))
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
@@ -160,6 +198,7 @@ impl MntNamespace {
         let ns = arc_nofail(Self::with(
             NsCommon::init(inum::Inum::fixed(inum::MNT_INIT)),
             INIT_USER_NS.clone(),
+            arc_nofail(MntEvents::new()),
         ));
         // Linux mnt_init -> init_mount_tree: ns_tree_add(&init_mnt_ns)
         tree::add(&NsRef::Mnt(ns.clone()), tree::Nodes::nofail());
@@ -183,11 +222,12 @@ impl MntNamespace {
     }
 
     /// An empty namespace with common part `ns`, owned by `user_ns`
-    fn with(ns: NsCommon, user_ns: Arc<UserNamespace>) -> Self {
+    fn with(ns: NsCommon, user_ns: Arc<UserNamespace>, events: Arc<MntEvents>) -> Self {
         Self {
             root: RwLock::new(None),
             ns,
             user_ns,
+            events,
         }
     }
 
@@ -530,12 +570,9 @@ pub fn fork_nsproxy(
     child_fs: Option<&crate::fs::FsStruct>,
 ) -> KernelResult<Arc<NsProxy>> {
     let ns_flags = flags & CLONE_NS_FLAGS;
-    // CLONE_NEWNS with a shared fs struct is EINVAL, before any
-    // permission check (Linux copy_process); the child's own copy
-    // follows its new mounts
-    if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
-        return Err(KernelError::InvalidArgument);
-    }
+    // CLONE_NEWNS with a shared fs struct was refused before any work
+    // (`percpu::clone_flags_ok`, Linux copy_process); the child's own
+    // copy follows its new mounts
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);
     }

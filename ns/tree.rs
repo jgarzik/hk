@@ -122,6 +122,8 @@ impl Strong {
 struct Entry {
     ns: NsWeak,
     owner: Option<u64>,
+    /// A mount namespace's change number and pollers
+    mnt: Option<Arc<super::MntEvents>>,
 }
 
 /// The types with a tree, in `Trees::types` order
@@ -263,6 +265,10 @@ pub fn add(ns: &NsRef, nodes: Nodes) {
     let e = Entry {
         ns: ns.downgrade(),
         owner,
+        mnt: match ns {
+            NsRef::Mnt(m) => Some(m.events.clone()),
+            _ => None,
+        },
     };
     let unified = nodes.unified.into_node(id, e.clone());
     let ty = nodes.ty.into_node(id, e.clone());
@@ -307,6 +313,33 @@ pub fn remove(ns: &NsCommon) {
         (u, ty, o)
     };
     drop(nodes);
+}
+
+/// Mount namespace `id`, active or not, changed (Linux
+/// touch_mnt_namespace's ns->event): its number set to `event`, under
+/// MOUNT_LOCK write; no reference taken, nothing dropped; its pollers
+/// are woken by [`mnt_events`] after the caller's locks
+pub fn mnt_set_event(id: u64, event: u64) {
+    let t = NS_TREE.lock();
+    if let Some(e) = t
+        .get(Tree::Type(CLONE_NEWNS), id)
+        .and_then(|e| e.mnt.as_ref())
+    {
+        e.set(event);
+    }
+}
+
+/// The change number and pollers of mount namespace `id` (dropping the
+/// reference is at most a free, in any context)
+pub fn mnt_events(id: u64) -> Option<Arc<super::MntEvents>> {
+    NS_TREE.lock().get(Tree::Type(CLONE_NEWNS), id)?.mnt.clone()
+}
+
+/// The first mount namespace numbered `id` or more: its id and pollers
+pub fn mnt_events_from(id: u64) -> Option<(u64, Arc<super::MntEvents>)> {
+    let t = NS_TREE.lock();
+    let (k, e) = t.at(Tree::Type(CLONE_NEWNS), id)?;
+    Some((k, e.mnt.clone()?))
 }
 
 /// The namespace numbered `id` in `tree`, counted, if it may be handed

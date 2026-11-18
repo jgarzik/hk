@@ -9,16 +9,18 @@
 //! another user's symlink in a sticky world-writable directory
 //! (EACCES), hard-linking a file one may not read and write (EPERM), an
 //! O_CREAT open of another user's existing FIFO or regular file there
-//! (EACCES)
+//! (EACCES); such a symlink crossed on the way to another name is
+//! followed whatever the knob (Linux checks the trailing link only)
 
 use crate::harness::fail_num;
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
     AT_FDCWD, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, Timespec,
     UTIME_NOW, UTIME_OMIT, sys_chdir, sys_chmod, sys_chown, sys_close, sys_execve, sys_exit,
-    sys_faccessat, sys_fchmod, sys_fchown, sys_fork, sys_fstat, sys_link, sys_mkdir, sys_open,
-    sys_rename, sys_rmdir, sys_setfsuid, sys_setresgid, sys_setresuid, sys_setxattr, sys_stat,
-    sys_symlink, sys_truncate, sys_umask, sys_unlink, sys_utimensat, sys_wait4, sys_write,
+    sys_faccessat, sys_fchmod, sys_fchown, sys_fork, sys_fstat, sys_link, sys_mkdir, sys_mount,
+    sys_open, sys_rename, sys_rmdir, sys_setfsuid, sys_setresgid, sys_setresuid, sys_setxattr,
+    sys_stat, sys_symlink, sys_truncate, sys_umask, sys_umount2, sys_unlink, sys_utimensat,
+    sys_wait4, sys_write,
 };
 
 const EPERM: i64 = -1;
@@ -28,6 +30,7 @@ const EACCES: i64 = -13;
 const EEXIST: i64 = -17;
 const EISDIR: i64 = -21;
 const O_NOATIME: u32 = 0o1000000;
+const MS_BIND: u64 = 4096;
 const R_OK: i32 = 4;
 const W_OK: i32 = 2;
 const X_OK: i32 = 1;
@@ -719,7 +722,17 @@ fn protected() {
         b"/tmp/dac/prot/f\0".as_ptr(),
         b"/tmp/dac/plain/lnk\0".as_ptr(),
     );
+    // A third user's link to a directory in the sticky one
+    sys_symlink(b"/tmp/dac/plain\0".as_ptr(), b"/tmp/dac/prot/ld\0".as_ptr());
+    hk_syscall::sys_lchown(b"/tmp/dac/prot/ld\0".as_ptr(), OTHER, OTHER);
     mkfile(b"/tmp/dac/hl_src\0", b"y", 0o600, 0);
+    // A root file in the sticky directory with a third user's file from
+    // the plain one bind-mounted on it: the directory the last name was
+    // looked up in decides (Linux nd->dir_mode), not the mounted file's
+    mkfile(b"/tmp/dac/prot/m\0", b"", 0o666, 0);
+    mkfile(b"/tmp/dac/plain/o\0", b"o", 0o666, OTHER);
+    let (src, dst) = (b"/tmp/dac/plain/o\0", b"/tmp/dac/prot/m\0");
+    sys_mount(src.as_ptr(), dst.as_ptr(), core::ptr::null(), MS_BIND, 0);
     for (v, name) in [(0u8, &b"DAC_PROTECTED_OFF"[..]), (1, b"DAC_PROTECTED_ON")] {
         if !set_protected(v) {
             print(name);
@@ -732,6 +745,7 @@ fn protected() {
         sys_unlink(b"/tmp/dac/prot/hl\0".as_ptr());
     }
     set_protected(0);
+    sys_umount2(dst.as_ptr(), 0);
 }
 
 fn t_protected(name: &[u8]) -> u64 {
@@ -777,5 +791,18 @@ fn t_protected(name: &[u8]) -> u64 {
         0o666,
     ));
     bad += chk(name, b"O_CREAT via link", r, if on { EACCES } else { 0 });
+    let r = closed(sys_open(
+        b"/tmp/dac/prot/m\0".as_ptr(),
+        O_CREAT | O_RDWR,
+        0o666,
+    ));
+    bad += chk(name, b"O_CREAT mounted", r, if on { EACCES } else { 0 });
+    // Only the trailing link is checked (Linux pick_link's WALK_TRAILING):
+    // one crossed on the way is followed, the same one last is not
+    let dir = O_RDONLY | O_DIRECTORY;
+    let r = closed(sys_open(b"/tmp/dac/prot/ld/.\0".as_ptr(), dir, 0));
+    bad += chk(name, b"link crossed", r, 0);
+    let r = closed(sys_open(b"/tmp/dac/prot/ld/\0".as_ptr(), dir, 0));
+    bad += chk(name, b"link last", r, if on { EACCES } else { 0 });
     bad
 }

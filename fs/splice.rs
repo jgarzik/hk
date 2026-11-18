@@ -36,10 +36,10 @@ use crate::fs::superblock::MAX_LFS_FILESIZE;
 use crate::fs::syscall::MAX_RW_COUNT;
 use crate::io::pipe::PipePage;
 use crate::io::pipe::{
-    PIPE_RING, Pipe, PipeBuffer, PipeGuard, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
-    sigpipe,
+    Pipe, PipeBuffer, PipeGuard, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags, sigpipe,
 };
 use crate::mm::filemap::PAGE_SIZE;
+use crate::mm::page_alloc::Gfp;
 use crate::uaccess::{UserPtr, copy_from_user};
 use crate::util::error::KernelResult;
 use crate::util::kalloc::try_arc;
@@ -151,7 +151,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
 
     // Iterate through source buffers
     while copied < len && src_idx != src_guard.head && !dst_guard.is_full() {
-        let src_buf = &src_guard.bufs[src_idx];
+        let src_buf = src_guard.buf(src_idx);
 
         if let Some(ref page) = src_buf.page {
             let to_copy = (len - copied).min(src_buf.len as usize);
@@ -174,7 +174,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
             }
         }
 
-        src_idx = (src_idx + 1) % PIPE_RING;
+        src_idx = src_idx.wrapping_add(1);
     }
 
     // Wake readers on destination
@@ -385,10 +385,10 @@ fn move_bufs(
 
     while moved < len && !src_guard.is_empty() && !dst_guard.is_full() {
         let tail_idx = src_guard.tail;
-        let src_buf = &mut src_guard.bufs[tail_idx];
+        let src_buf = src_guard.buf_mut(tail_idx);
 
         if src_buf.is_empty() {
-            src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
+            src_guard.tail = src_guard.tail.wrapping_add(1);
             continue;
         }
 
@@ -413,7 +413,7 @@ fn move_bufs(
             // Consume from source
             if to_move == available {
                 src_buf.release();
-                src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
+                src_guard.tail = src_guard.tail.wrapping_add(1);
             } else {
                 src_buf.offset += to_move as u32;
                 src_buf.len -= to_move as u32;
@@ -421,7 +421,7 @@ fn move_bufs(
             src_guard.total_len = src_guard.total_len.saturating_sub(to_move);
             moved += to_move;
         } else {
-            src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
+            src_guard.tail = src_guard.tail.wrapping_add(1);
         }
     }
 
@@ -460,27 +460,24 @@ fn do_splice_file_to_pipe(
     len: usize,
     flags: u32,
 ) -> KernelResult<usize> {
-    let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
+    // Zeroed: a read that claims more than it wrote cannot pass old
+    // memory to the pipe's reader
+    let page = pipe_page(Gfp::HIGHUSER_MOVABLE.with(Gfp::ZERO)).ok_or(KernelError::OutOfMemory)?;
     let mut g = pipe.lock_room(flags & SPLICE_F_NONBLOCK != 0)?;
 
-    // A copy through a buffer, not page cache pages: works for every file
-    let mut buf = [0u8; PAGE_SIZE];
-    let to_read = len.min(PAGE_SIZE);
+    // Read into the new page, not page cache pages: works for every
+    // file (Linux copy_splice_read)
+    // SAFETY: under Pipe.inner; the page is fresh (zero-filled by its
+    // allocation), in no pipe yet, and this is its only reference
+    let buf = unsafe { &mut page.bytes()[..len.min(PAGE_SIZE)] };
     // pread at the offset, else read (advances the file position)
     let n = match off_in {
-        Some(off_in) => file.pread(&mut buf[..to_read], off_in),
-        None => file.read(&mut buf[..to_read]),
+        Some(off_in) => file.pread(buf, off_in),
+        None => file.read(buf),
     }
     .map_err(read_err)?;
     if n == 0 {
         return Ok(0);
-    }
-
-    // SAFETY: `page` is a fresh, kernel-mapped frame of PAGE_SIZE bytes
-    // owned by this call; `n <= to_read <= PAGE_SIZE` bytes of `buf` are
-    // copied in
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::arch::phys_to_virt(page.frame), n);
     }
     // Not mergeable: only pipe_write makes such buffers (Linux
     // copy_splice_read's default_pipe_buf_ops, no CAN_MERGE)
@@ -517,29 +514,21 @@ fn do_splice_pipe_to_file(
     let mut wake = false;
     while written < len && !g.is_empty() {
         let tail = g.tail;
-        let pb = &g.bufs[tail];
+        let pb = g.buf(tail);
         let Some(page) = pb.page.clone().filter(|_| !pb.is_empty()) else {
-            g.bufs[tail].release();
-            g.tail = (tail + 1) % PIPE_RING;
+            g.buf_mut(tail).release();
+            g.tail = tail.wrapping_add(1);
             continue;
         };
-        let (offset, avail) = (pb.offset, pb.len as usize);
+        let (offset, avail) = (pb.offset as usize, pb.len as usize);
         let to_write = (len - written).min(avail);
-
-        let mut buf = [0u8; PAGE_SIZE];
-        // SAFETY: the pipe buffer holds `page` (kernel-mapped, PAGE_SIZE)
-        // with valid data at `offset..offset + avail` inside it, and
-        // `to_write <= avail` bytes of it are copied out
-        unsafe {
-            let src = crate::arch::phys_to_virt(page.frame)
-                .cast_const()
-                .add(offset as usize);
-            core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_write);
-        }
-
+        // Written from the pipe's page (Linux iter_file_splice_write's
+        // bvec over the buffers)
+        // SAFETY: read under Pipe.inner
+        let buf = unsafe { &page.bytes()[offset..offset + to_write] };
         let r = match off_out {
-            Some(o) => file.pwrite(&buf[..to_write], o + written as u64),
-            None => file.write(&buf[..to_write]),
+            Some(o) => file.pwrite(buf, o + written as u64),
+            None => file.write(buf),
         };
         let n = match r {
             Ok(n) => n.min(to_write),
@@ -549,10 +538,10 @@ fn do_splice_pipe_to_file(
             }
         };
         // Consume exactly what was written
-        let pb = &mut g.bufs[tail];
+        let pb = g.buf_mut(tail);
         if n == avail {
             pb.release();
-            g.tail = (tail + 1) % PIPE_RING;
+            g.tail = tail.wrapping_add(1);
             wake = true;
         } else {
             pb.offset += n as u32;
@@ -583,13 +572,23 @@ fn do_splice_pipe_to_file(
     Ok(written)
 }
 
+/// A page of heap for a file-to-file copy (Linux do_splice_direct
+/// goes through the task's internal pipe, whose pages copy_splice_read
+/// allocates)
+fn bounce_page() -> KernelResult<alloc::vec::Vec<u8>> {
+    crate::util::kmem::try_vec(PAGE_SIZE, 0u8)
+}
+
 /// Allocate a page for pipe buffer
 fn allocate_pipe_page() -> Option<Arc<PipePage>> {
-    use crate::FRAME_ALLOCATOR;
-
     // User data (Linux GFP_HIGHUSER | __GFP_ACCOUNT): stops at the low
     // watermark like the user pages it was copied from
-    let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
+    pipe_page(Gfp::HIGHUSER_MOVABLE)
+}
+
+/// A page for a pipe buffer, allocated with `gfp`
+fn pipe_page(gfp: Gfp) -> Option<Arc<PipePage>> {
+    let frame = crate::FRAME_ALLOCATOR.alloc_gfp(gfp)?;
     try_arc(PipePage::new(frame)).ok()
 }
 
@@ -804,7 +803,7 @@ fn do_sendfile_to_file(
     out_file: &FileRef,
     count: usize,
 ) -> KernelResult<usize> {
-    let mut buf = [0u8; PAGE_SIZE];
+    let mut buf = bounce_page()?;
     let mut transferred = 0;
 
     while transferred < count {
@@ -893,7 +892,7 @@ fn store_pos(ptr: UserPtr<i64>, f: &File, end: u64) -> KernelResult<()> {
 fn copy_files_ok(
     fin: &File,
     fout: &File,
-) -> Result<(Arc<crate::fs::Inode>, Arc<crate::fs::Inode>), KernelError> {
+) -> Result<(crate::fs::InodeRef, crate::fs::InodeRef), KernelError> {
     let (Some(iin), Some(iout)) = (fin.get_inode(), fout.get_inode()) else {
         return Err(KernelError::InvalidArgument);
     };
@@ -939,7 +938,7 @@ fn copy_len(
     if !same_sb {
         return Err(KernelError::CrossDevice);
     }
-    let swap = |i: &crate::fs::Inode| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire);
+    let swap = |i: &crate::fs::Inode| i.is_swapfile();
     if swap(&iin) || swap(&iout) {
         return Err(KernelError::TextBusy);
     }
@@ -961,7 +960,7 @@ fn copy_len(
     }
     // Overlapping ranges of one file
     let (i, o, c) = (i128::from(pos_in), i128::from(pos_out), i128::from(count));
-    if Arc::ptr_eq(&iin, &iout) && o + c > i && o < i + c {
+    if crate::fs::InodeRef::ptr_eq(&iin, &iout) && o + c > i && o < i + c {
         return Err(KernelError::InvalidArgument);
     }
     verify_pos(pos_in, count)?;
@@ -981,7 +980,7 @@ fn copy_range(
     let len = copy_len(fin, pos_in, fout, pos_out, len)?;
     // Checked: both offsets stay valid through `len`
     let (pos_in, pos_out) = (pos_in as u64, pos_out as u64);
-    let mut buf = [0u8; PAGE_SIZE];
+    let mut buf = bounce_page()?;
     let mut copied: u64 = 0;
     while copied < len {
         let want = ((len - copied) as usize).min(PAGE_SIZE);

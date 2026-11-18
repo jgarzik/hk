@@ -242,15 +242,18 @@ pub fn run_all_tests() {
     fs::namei::run_tests();
     io::cloexec::run_tests();
     io::close_range::run_tests();
+    io::fdget::run_tests();
     fs::append::run_tests();
     mount::mountflags::run_tests();
     fs::fs_times::run_tests();
     mount::mounts::run_tests();
     mount::mntns_check::run_tests();
     mount::mountinfo::run_tests();
+    mount::mount_poll::run_tests();
     proc::sysfs::run_tests();
     proc::tracefs::run_tests();
     mount::pnode::run_tests();
+    mount::detach::run_tests();
     proc::proc_dcache::run_tests();
     process::process::run_tests();
     fs::file_io::run_tests();
@@ -281,6 +284,7 @@ pub fn run_all_tests() {
     process::groups::run_tests();
     fs::fifo::run_tests();
     io::pipe_packet::run_tests();
+    io::pipe_size::run_tests();
     fs::splice::run_tests();
     fs::deep_chain::run_tests();
     fs::anon_inode::run_tests();
@@ -344,6 +348,7 @@ pub fn run_all_tests() {
     isolated(b"DPATH_UMOUNT", mount::dpath_umount::run_tests);
     isolated(b"DPATH_RENAME", fs::dpath_rename::run_tests);
     isolated(b"VFAT_CI_DENTRY", fs::vfat_names::run_tests);
+    isolated(b"VFAT_DOTDOT", fs::vfat_disk::run_tests);
     fs::tmpfs::run_tests();
     time::timerfd::run_tests();
     time::posix_timer::run_tests();
@@ -421,6 +426,7 @@ pub fn run_all_tests() {
     process::kcmp::run_tests();
     mm::process_vm::run_tests();
     io::tty::run_tests();
+    io::tty_mode::run_tests();
     proc::cgroup::run_tests();
     proc::cgroup_race::run_tests();
     mm::mempolicy::run_tests();

@@ -92,7 +92,8 @@ use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 static ALLOCATOR: mm::heap::KernelAlloc = mm::heap::KernelAlloc::new();
 
 /// Global frame allocator
-static FRAME_ALLOCATOR: mm::frame_alloc::FrameAllocator = mm::frame_alloc::FrameAllocator::new();
+static FRAME_ALLOCATOR: mm::frame_alloc::FrameAllocator =
+    mm::frame_alloc::FrameAllocator::new(&mm::frame_alloc::ZONE_PCP);
 
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
@@ -186,6 +187,16 @@ pub(crate) fn kmain() -> ! {
 
     // Initialize SMP (bring up additional CPUs)
     if let Some(mut acpi_info) = CurrentArch::parse_acpi() {
+        // Every possible CPU's per-CPU area, before anything sizes
+        // per-CPU data by the CPU count (Linux setup_per_cpu_areas from
+        // the possible map prefilled from the MADT/DT): each enabled CPU
+        // listed, plus the boot CPU if the list leaves it out (the
+        // bring-up loop then numbers every entry as an AP)
+        let me = CurrentArch::current_hw_cpu_id();
+        let en = || acpi_info.cpus.iter().filter(|c| c.enabled);
+        let bsp_missing = !en().any(|c| c.hw_cpu_id == me);
+        crate::cpu::setup_areas((en().count() + usize::from(bsp_missing)) as u32);
+
         // Initialize power management from ACPI/device tree
         if let Some(power_info) = &acpi_info.power_info {
             CurrentArch::power_init(power_info);
@@ -270,13 +281,17 @@ pub(crate) fn kmain() -> ! {
         .leak()
         + task::percpu::KERNEL_STACK_SIZE as u64;
 
+    // The default cgroup hierarchy's root before the first task and its
+    // namespaces (Linux cgroup_init_early, early in start_kernel; here
+    // once the heap is up)
+    cgroup::cgroup_init_early();
+
     // The per-CPU scheduler with its idle task, then pid 1 (the idle
-    // tasks are tid 0, Linux swapper). ppid=0 (no parent), pgid=sid=0
+    // tasks are tid 0, Linux swapper). No parent, pgid=sid=0
     // like Linux's init_task (init/init_task.c); init calls setsid()
     // itself if it wants a session
     task::percpu::init();
     let init = task::percpu::create_user_task(task::percpu::UserTaskConfig {
-        ppid: 0, // init has no parent
         pgid: 0, // inherited from init_task, not a group leader
         sid: 0,  // not a session leader until setsid()
         kstack_top: kernel_stack,
@@ -318,10 +333,14 @@ pub(crate) fn kmain() -> ! {
     pseudo_init(&fs::pseudo::BDEV);
     // start_kernel's nsfs_init, after proc_root_init
     pseudo_init(&fs::pseudo::NSFS);
+    // then cgroup_init: the controllers' states in the root cgroup
+    cgroup::cgroup_init();
     fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
-    // tracefs (Linux tracefs_init, a core initcall; trace files, fs_initcall)
+    // tracefs (Linux tracefs_init, a core initcall), then the trace
+    // files (tracer_init_tracefs, event_trace_init: fs initcalls)
+    fs::tracefs::init();
     trace::init();
     // sock_init, a core initcall after kernel/'s (ksysfs)
     pseudo_init(&fs::pseudo::SOCKFS);

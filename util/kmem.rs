@@ -59,6 +59,20 @@ pub fn try_vec<T: Clone>(n: usize, v: T) -> Result<Vec<T>, KernelError> {
     Ok(x)
 }
 
+/// [`try_vec`] with each item made by `f`, for a type that is not
+/// `Clone`
+pub fn try_vec_with<T>(n: usize, f: impl FnMut() -> T) -> Result<Vec<T>, KernelError> {
+    fits::<T>(n)?;
+    if n > 0 && core::mem::size_of::<T>() > 0 {
+        inject()?;
+    }
+    let mut x = Vec::new();
+    x.try_reserve_exact(n)
+        .map_err(|_| KernelError::OutOfMemory)?;
+    x.resize_with(n, f);
+    Ok(x)
+}
+
 /// A copy of `s`, or ENOMEM. For buffers made from a packet on a
 /// receive path: where Linux's GFP_ATOMIC allocation (skb_clone,
 /// alloc_skb) fails and the packet is dropped, the caller drops it too.

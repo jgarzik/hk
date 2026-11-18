@@ -92,6 +92,10 @@ pub struct Submit {
     sq_head: u32,
     /// Registered files
     files: Option<Vec<Option<FileRef>>>,
+    /// Where a search for a free registered slot starts (Linux
+    /// file_table.alloc_hint): past the last slot filled, at the last
+    /// emptied, 0 at registration
+    file_hint: usize,
     /// Registered buffers (Linux buf_table)
     bufs: Option<Vec<Option<Arc<rsrc::RegBuf>>>>,
     /// user_data of poll and timeout requests noted but never completed;
@@ -151,7 +155,10 @@ struct Link {
     /// Inside a chain
     on: bool,
     /// Its members so far
-    sqes: KVec<IoUringSqe>,
+    sqes: KVec<opreq::Sqe>,
+    /// A member failed its checks (Linux REQ_F_FAIL on the head): the
+    /// chain is still gathered, then failed whole
+    failed: bool,
 }
 
 /// A request a drain held back (Linux io_defer_entry, allocated before
@@ -167,6 +174,48 @@ struct Deferred {
 crate::adapter!(DeferredLink, Deferred, link);
 
 impl Submit {
+    /// [`IoRing::fixed_install`] with the submission lock held (Linux
+    /// __io_fixed_fd_install): its result, and the file it replaced, to
+    /// release after the lock
+    pub fn fixed_install(
+        &mut self,
+        file: FileRef,
+        file_index: u32,
+    ) -> (KernelResult<i32>, Option<FileRef>) {
+        let alloc = file_index == IORING_FILE_INDEX_ALLOC;
+        let hint = self.file_hint;
+        // Linux io_file_bitmap_get first (ENFILE: no table, or full)
+        let idx = if alloc {
+            let t = self.files.as_deref().unwrap_or(&[]);
+            let n = t.len();
+            match (hint.min(n)..n)
+                .chain(0..hint.min(n))
+                .find(|&i| t[i].is_none())
+            {
+                Some(i) => i,
+                None => return (Err(KernelError::SystemFileLimit), None),
+            }
+        } else {
+            file_index as usize - 1
+        };
+        // Then io_install_fixed_file: EBADF, ENXIO, EINVAL
+        if is_uring(&file) {
+            return (Err(KernelError::BadFd), None);
+        }
+        let Some(t) = self.files.as_mut() else {
+            return (Err(KernelError::NoDeviceOrAddress), None);
+        };
+        let Some(slot) = t.get_mut(idx) else {
+            return (Err(KernelError::InvalidArgument), None);
+        };
+        let old = slot.replace(file);
+        if old.is_none() {
+            // Linux io_file_bitmap_set
+            self.file_hint = idx + 1;
+        }
+        (Ok(if alloc { idx as i32 } else { 0 }), old)
+    }
+
     /// Registered buffer `i` (EFAULT for none: Linux io_import_reg_buf)
     pub fn fixed_buf(&self, i: u16) -> KernelResult<&Arc<rsrc::RegBuf>> {
         self.bufs
@@ -202,6 +251,7 @@ impl IoRing {
             submit: Mutex::new(Submit {
                 sq_head: 0,
                 files: None,
+                file_hint: 0,
                 bufs: None,
                 pending: KVec::new(),
             }),
@@ -245,6 +295,16 @@ impl IoRing {
                 break;
             }
         }
+        // A chain the batch ended inside is queued as it is (Linux
+        // io_submit_state_end: io_queue_sqe_fallback of the link head)
+        if !link.sqes.is_empty() {
+            let l = core::mem::take(&mut link);
+            if l.failed {
+                self.fail_chain(&l.sqes);
+            } else {
+                self.chain(&mut s, l.sqes);
+            }
+        }
         // The SQEs are copied: their slots are user space's again
         self.rings.set_sq_head(s.sq_head);
         done
@@ -255,27 +315,61 @@ impl IoRing {
     /// batch. A chain's members are gathered and run together (`chain`);
     /// a drain, and what follows it while one is held back, waits on the
     /// defer list for the requests before it (Linux io_drain_req).
-    fn submit_sqe(self: &Arc<Self>, s: &mut Submit, sqe: &IoUringSqe, link: &mut Link) -> bool {
-        let linked = sqe.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK) != 0;
-        if let Err(e) = init_check(sqe, self.iopoll) {
-            self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
-            // The chain it ended is cancelled with it
-            for m in core::mem::take(link).sqes.iter() {
-                self.post_cqe(m.user_data, KernelError::Canceled.to_errno_neg(), 0);
-            }
+    fn submit_sqe(self: &Arc<Self>, s: &mut Submit, raw: &IoUringSqe, link: &mut Link) -> bool {
+        let linked = raw.flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK) != 0;
+        // Linux io_init_req: the checks, then the opcode's prep, which
+        // copies what it needs of user memory now (IORING_FEAT_SUBMIT_STABLE)
+        let prepped = init_check(raw, self.iopoll).and_then(|()| ops::prep(raw));
+        let (mut sqe, err) = match prepped {
+            Ok(open) => (
+                opreq::Sqe {
+                    sqe: *raw,
+                    open,
+                    err: None,
+                },
+                None,
+            ),
+            Err(e) => (
+                opreq::Sqe {
+                    sqe: *raw,
+                    open: None,
+                    err: Some(e),
+                },
+                Some(e),
+            ),
+        };
+        // Linux io_submit_fail_init: a failure inside a chain fails the
+        // chain but it is still gathered; one outside a chain (or ending
+        // one) ends the batch
+        if let Some(e) = err
+            && !link.on
+            && !linked
+        {
+            self.post_cqe(raw.user_data, e.to_errno_neg(), 0);
             return false;
         }
         if link.on || linked {
-            if let Err(e) = link.sqes.try_push(*sqe) {
-                self.post_cqe(sqe.user_data, e.to_errno_neg(), 0);
+            link.failed |= err.is_some();
+            let ud = sqe.user_data;
+            if let Err(e) = link.sqes.try_push(sqe) {
+                self.post_cqe(ud, e.to_errno_neg(), 0);
+                link.failed = true;
             }
             link.on = linked;
             if !linked {
-                let sqes = core::mem::take(&mut link.sqes);
-                self.chain(s, sqes);
+                let l = core::mem::take(link);
+                if l.failed {
+                    self.fail_chain(&l.sqes);
+                } else {
+                    self.chain(s, l.sqes);
+                }
+                // The batch ends at a failed SQE (Linux: the chain's
+                // last member failed its init)
+                return err.is_none();
             }
             return true;
         }
+        let sqe = &mut sqe;
         let drain = sqe.flags & IOSQE_IO_DRAIN != 0;
         if (drain || !self.defer.lock().is_empty()) && self.defer_sqe(s, sqe, drain) {
             return true;
@@ -290,7 +384,7 @@ impl IoRing {
     }
 
     /// Run the operation of `sqe`: its result, None if queued
-    fn issue(self: &Arc<Self>, s: &mut Submit, sqe: &IoUringSqe) -> Option<KernelResult<i32>> {
+    fn issue(self: &Arc<Self>, s: &mut Submit, sqe: &mut opreq::Sqe) -> Option<KernelResult<i32>> {
         match sqe.opcode {
             IORING_OP_READ => return rw::rw(self, s, sqe, false, Kind::Buf),
             IORING_OP_WRITE => return rw::rw(self, s, sqe, true, Kind::Buf),
@@ -311,14 +405,17 @@ impl IoRing {
                 Err(KernelError::WouldBlock) => rw::punt(self, sqe, opreq::Body::Op),
                 r => Some(r),
             },
-            ops::How::TryNoWait | ops::How::Punt => rw::punt(self, sqe, opreq::Body::Op),
+            ops::How::TryNoWait | ops::How::Punt => {
+                let b = sqe.take_body();
+                rw::punt(self, sqe, b)
+            }
         }
     }
 
     /// A worker's request for `sqe`, not yet in flight: what it needs of
     /// the submission resolved now (a read or write's file, iovecs or
     /// registered buffer; Linux io_prep_rw), a failure kept as its result
-    fn prep(self: &Arc<Self>, s: &Submit, sqe: &IoUringSqe) -> KernelResult<opreq::OpReq> {
+    fn prep(self: &Arc<Self>, s: &Submit, sqe: &mut opreq::Sqe) -> KernelResult<opreq::OpReq> {
         let t = tctx::tctx()?;
         let rw = match sqe.opcode {
             IORING_OP_READ | IORING_OP_READV | IORING_OP_READ_FIXED => Some(false),
@@ -327,25 +424,25 @@ impl IoRing {
         };
         let body = match rw {
             Some(write) => rw::prep_body(self, s, sqe, write).unwrap_or_else(opreq::Body::Failed),
-            None => opreq::Body::Op,
+            None => sqe.take_body(),
         };
-        Ok(opreq::OpReq::new(self, &t, *sqe, body))
+        Ok(opreq::OpReq::new(self, &t, sqe.sqe, body))
     }
 
     /// Run a link chain (Linux IOSQE_IO_LINK): its members in order, in a
     /// worker; with an operation that needs the submission state (the
     /// poll/timeout bookkeeping) it runs here instead
-    fn chain(self: &Arc<Self>, s: &mut Submit, sqes: KVec<IoUringSqe>) {
+    fn chain(self: &Arc<Self>, s: &mut Submit, mut sqes: KVec<opreq::Sqe>) {
         if sqes.iter().any(|q| needs_submit(q.opcode)) {
-            return self.chain_inline(s, &sqes);
+            return self.chain_inline(s, &mut sqes);
         }
         let mut c = match KVec::try_with_capacity(sqes.len()) {
             Ok(c) => c,
             Err(e) => return self.fail_all(&sqes, e),
         };
         let mut unbound = false;
-        for q in sqes.iter() {
-            match self.prep(s, q) {
+        for i in 0..sqes.len() {
+            match self.prep(s, &mut sqes[i]) {
                 Ok(mut o) => {
                     unbound |= o.unbound();
                     o.count();
@@ -363,7 +460,7 @@ impl IoRing {
     }
 
     /// A chain run in io_uring_enter, its members to their ends in order
-    fn chain_inline(self: &Arc<Self>, s: &mut Submit, sqes: &[IoUringSqe]) {
+    fn chain_inline(self: &Arc<Self>, s: &mut Submit, sqes: &mut [opreq::Sqe]) {
         let mut failed = false;
         for q in sqes {
             let res = if failed {
@@ -378,7 +475,9 @@ impl IoRing {
                 // one breaks the chain)
                 match self.prep(s, q) {
                     Ok(o) => {
-                        failed = o.run_linked();
+                        // The submission lock is held here (Linux
+                        // io_ring_submit_lock: not taken again)
+                        failed = o.run_linked(Some(&mut *s));
                         continue;
                     }
                     Err(e) => Err(e),
@@ -394,8 +493,18 @@ impl IoRing {
         }
     }
 
+    /// A chain one of whose members failed its checks (Linux
+    /// io_fail_links): those members complete with their errors, the
+    /// rest ECANCELED
+    fn fail_chain(&self, sqes: &[opreq::Sqe]) {
+        for q in sqes {
+            let e = q.err.unwrap_or(KernelError::Canceled);
+            self.post_cqe(q.user_data, e.to_errno_neg(), 0);
+        }
+    }
+
     /// Fail every SQE of `sqes` with `e`
-    fn fail_all(&self, sqes: &[IoUringSqe], e: KernelError) {
+    fn fail_all(&self, sqes: &[opreq::Sqe], e: KernelError) {
         for q in sqes {
             self.post_cqe(q.user_data, e.to_errno_neg(), 0);
         }
@@ -403,7 +512,7 @@ impl IoRing {
 
     /// Hold `sqe` back on the defer list (Linux io_drain_req): false if
     /// it may run now (nothing in flight or held back)
-    fn defer_sqe(self: &Arc<Self>, s: &Submit, sqe: &IoUringSqe, drain: bool) -> bool {
+    fn defer_sqe(self: &Arc<Self>, s: &Submit, sqe: &mut opreq::Sqe, drain: bool) -> bool {
         {
             let d = self.defer.lock();
             if d.is_empty() && self.inflight.load(Ordering::Acquire) == 0 {
@@ -593,6 +702,20 @@ impl IoRing {
         self.rings.cq_tail() != self.rings.cq_head() || self.overflowed.load(Ordering::Acquire)
     }
 
+    /// Install `file` in a registered slot (Linux io_fixed_fd_install,
+    /// under uring_lock): `file_index` 1-based, or
+    /// IORING_FILE_INDEX_ALLOC for the first free one from the hint
+    /// (wrapping; ENFILE if none); EBADF for an io_uring, ENXIO without a
+    /// table, EINVAL past it. 0, or the slot allocated; a file it
+    /// replaced is released after the lock
+    pub fn fixed_install(&self, file: FileRef, file_index: u32) -> KernelResult<i32> {
+        let mut s = self.submit.lock();
+        let (r, old) = s.fixed_install(file, file_index);
+        drop(s);
+        drop(old);
+        r
+    }
+
     /// Register files for fixed file access (Linux
     /// io_sqe_files_register): EBUSY if some are
     fn register_files(&self, fds: &[i32]) -> KernelResult<()> {
@@ -616,6 +739,8 @@ impl IoRing {
             }
         }
         s.files = Some(files.into_vec());
+        // Linux io_file_table_set_alloc_range(ctx, 0, nr)
+        s.file_hint = 0;
         Ok(())
     }
 
@@ -663,6 +788,7 @@ impl IoRing {
         let mut old = KVec::try_with_capacity(fds.len())?;
         let fd_table = current().files().ok_or(KernelError::BadFd)?;
         let mut s = self.submit.lock();
+        let mut hint = s.file_hint;
         let reg = s.files.as_mut().ok_or(KernelError::NoDeviceOrAddress)?;
         let offset = offset as usize;
         if offset.checked_add(fds.len()).is_none_or(|e| e > reg.len()) {
@@ -678,10 +804,19 @@ impl IoRing {
             // The slot is emptied first, so a bad fd leaves it empty
             // (Linux: io_reset_rsrc_node before the fget)
             // Capacity is reserved; this cannot fail
-            let _ = old.try_push(reg[offset + i].take());
+            let gone = reg[offset + i].take();
+            if gone.is_some() {
+                // Linux io_file_bitmap_clear
+                hint = offset + i;
+            }
+            let _ = old.try_push(gone);
             if fd != -1 {
                 match reg_file(t.get(fd)) {
-                    Ok(f) => reg[offset + i] = Some(f),
+                    Ok(f) => {
+                        reg[offset + i] = Some(f);
+                        // Linux io_file_bitmap_set
+                        hint = offset + i + 1;
+                    }
                     Err(e) => {
                         err = Some(e);
                         break;
@@ -690,6 +825,7 @@ impl IoRing {
             }
             done += 1;
         }
+        s.file_hint = hint;
         drop(t);
         drop(s);
         drop(old);

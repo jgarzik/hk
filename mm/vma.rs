@@ -261,10 +261,9 @@ pub struct Vma {
     /// anonymous VMA): `start / 4KB` when created, kept by mremap,
     /// advanced by a split, lowered when a stack grows down
     pub pgoff: u64,
-    /// Per-VMA NUMA memory policy (set by mbind)
-    ///
-    /// If None, the task's default mempolicy is used.
-    pub mempolicy: Option<crate::mm::mempolicy::TaskMempolicy>,
+    /// NUMA memory policy (Linux vm_policy, set by mbind); None: the
+    /// task's
+    pub mempolicy: Option<crate::mm::mempolicy::Mempolicy>,
     /// The SysV shm attachment this VMA is (counted in shm_nattch)
     pub shm: Option<crate::ipc::shm::ShmAttach>,
 }
@@ -376,7 +375,7 @@ impl Vma {
     }
 
     /// The inode of the mapped file (its i_mmap lists this VMA)
-    pub fn inode(&self) -> Option<Arc<crate::fs::Inode>> {
+    pub fn inode(&self) -> Option<crate::fs::InodeRef> {
         self.file.as_ref().and_then(|f| f.mapping_inode())
     }
 
@@ -420,6 +419,7 @@ impl Vma {
     /// - VMA flags (flags)
     /// - File backing (both anonymous or same file with contiguous offsets)
     /// - anon_vma (must be same Arc for anonymous mappings)
+    /// - memory policy (Linux vma_merge: mpol_equal)
     pub fn can_merge_with(&self, other: &Vma) -> bool {
         // Must be adjacent (this VMA ends where other begins)
         if self.end != other.start {
@@ -431,6 +431,9 @@ impl Vma {
         }
         // Must have same flags
         if self.flags != other.flags {
+            return false;
+        }
+        if !crate::mm::mempolicy::mpol_equal(self.mempolicy.as_ref(), other.mempolicy.as_ref()) {
             return false;
         }
         // Must have same anon_vma (or both None)

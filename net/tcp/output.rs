@@ -213,7 +213,7 @@ impl TcpCb {
             }
         }
         if sent {
-            if self.tmr.is_none_or(|t| t.0 != Tmr::Rtx) {
+            if self.live.tmr.get().is_none_or(|t| t.0 != Tmr::Rtx) {
                 self.arm_rtx(now);
             }
             let flight = self.snd_max.wrapping_sub(self.snd_una);
@@ -228,14 +228,14 @@ impl TcpCb {
     /// Room in the window from `snd_nxt`, and whether cwnd is the
     /// smaller window
     fn room(&self) -> (u32, bool) {
-        let wnd = self.snd_wnd.min(self.cong.cwnd);
+        let wnd = self.snd_wnd.min(self.cong.cwnd());
         let end = self.snd_una.wrapping_add(wnd);
         let room = if after(end, self.snd_nxt) {
             end.wrapping_sub(self.snd_nxt)
         } else {
             0
         };
-        (room, self.cong.cwnd < self.snd_wnd)
+        (room, self.cong.cwnd() < self.snd_wnd)
     }
 
     /// Hold a partial segment (Linux tcp_nagle_check with Minshall's
@@ -280,7 +280,7 @@ impl TcpCb {
         }
         let avail = self.write_seq.wrapping_sub(self.snd_nxt);
         let (room, cwnd_bound) = self.room();
-        let n = self.len_at_nxt().min(self.mss).min(room);
+        let n = self.len_at_nxt().min(self.live.mss.get()).min(room);
         let rexmit = before(self.snd_nxt, self.snd_max);
         let fin = self.fin_queued && self.snd_nxt.wrapping_add(n) == self.write_seq && room > n;
         if n == 0 && !fin {
@@ -290,7 +290,7 @@ impl TcpCb {
         let in_flight = self.snd_nxt != self.snd_una;
         // Retransmissions are never held (Linux tcp_retransmit_skb
         // ignores Nagle and cork)
-        if n < self.mss && !fin && push != Push::Force && !rexmit {
+        if n < self.live.mss.get() && !fin && push != Push::Force && !rexmit {
             // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in
             // flight, wait for a full segment unless this ends the queue
             if n < avail && in_flight && n < self.max_wnd / 2 {
@@ -321,17 +321,17 @@ impl TcpCb {
         }
         if self.snd_nxt == self.snd_max
             && !in_flight
-            && now.saturating_sub(self.lsndtime) > self.rto
+            && now.saturating_sub(self.lsndtime) > self.live.rto.get()
         {
             // Idle longer than an RTO: restart from the initial window
-            self.cong.restart(now - self.lsndtime, self.rto);
+            self.cong.restart(now - self.lsndtime, self.live.rto.get());
         }
         let next = seq.wrapping_add(n + u32::from(fin));
         let new = after(next, self.snd_max);
         if self.snd_nxt == self.snd_max && self.rtt_seq.is_none() {
             self.rtt_seq = Some((next, now));
         }
-        if n < self.mss {
+        if n < self.live.mss.get() {
             self.snd_sml = next;
         }
         if new && n > 0 {
@@ -458,9 +458,9 @@ impl TcpCb {
             return;
         };
         let (seq, len) = (head.tcp.seq, head.len());
-        let mss = self.mss as usize;
+        let mss = self.live.mss.get() as usize;
         if len > mss {
-            if !self.send_rtx_at(seq, self.mss, flags::ACK, out) {
+            if !self.send_rtx_at(seq, self.live.mss.get(), flags::ACK, out) {
                 self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
                 return;
             }
@@ -502,7 +502,7 @@ impl TcpCb {
     /// tcp_retrans_try_collapse / tcp_collapse_retrans: the next skb's
     /// data and FIN move into it)
     fn collapse_head(&mut self) {
-        let mss = self.mss as usize;
+        let mss = self.live.mss.get() as usize;
         loop {
             let mut c = self.rtx.cursor_front_mut();
             let (Some(h), Some(n)) = (c.current(), c.peek_next()) else {
@@ -543,9 +543,13 @@ impl TcpCb {
     /// memory): arm the probe timer (Linux tcp_check_probe_timer)
     pub(super) fn check_persist(&mut self, now: u64) {
         let pending = self.snd_nxt != self.write_seq.wrapping_add(u32::from(self.fin_queued));
-        if self.may_send() && pending && self.snd_una == self.snd_max && self.tmr.is_none() {
+        if self.may_send()
+            && pending
+            && self.snd_una == self.snd_max
+            && self.live.tmr.get().is_none()
+        {
             let t = self.rto_cur().max(RTO_MIN);
-            self.tmr = Some((Tmr::Probe, now + t));
+            self.live.tmr.set(Some((Tmr::Probe, now + t)));
         }
     }
 }

@@ -257,9 +257,8 @@ pub static NS_FILE_OPS: NsFileOps = NsFileOps;
 /// nsfs's dentry operations (Linux ns_dentry_operations): its names
 /// are plain bytes; a dentry's kill clears its namespace's stash
 pub static NS_DENTRY_OPS: DentryOps = DentryOps {
-    d_hash: crate::fs::name::name_hash,
-    d_compare: |a, b| a == b,
     d_prune: Some(ns_prune_dentry),
+    ..DentryOps::NONE
 };
 
 /// A namespace file inode's private data (Linux i_private): the

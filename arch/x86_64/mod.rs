@@ -34,6 +34,7 @@ pub mod pit;
 pub mod power;
 pub mod process;
 pub mod ptrace;
+pub mod qspin;
 pub mod rtc;
 pub mod signal;
 pub mod smp;
@@ -540,6 +541,9 @@ fn init_vfat_ramdisk(root_dentry: &crate::fs::DentryRef, _dev_dentry: &crate::fs
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(multiboot_info: u64) -> ! {
+    // SAFETY: first thing on the boot CPU: nothing used a per-CPU
+    // variable yet
+    unsafe { crate::cpu::setup_boot_area() };
     // SAFETY: the bootloader's info structure (RDI), in memory the boot
     // tables map; it and its modules are reserved (memblock_init)
     unsafe { multiboot2::set_boot(multiboot_info) };

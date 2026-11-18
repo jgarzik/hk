@@ -62,6 +62,16 @@ SECTIONS
     . = ALIGN(4K);
     __end_rodata = .;
 
+    /* Per-CPU variables' template (Linux .data..percpu, __per_cpu_load):
+     * the pristine image each CPU's area is copied from; ahead of .data,
+     * whose .data.* would take it */
+    .data..percpu ALIGN(4K) : AT(ADDR(.data..percpu) - KERNEL_MAP) {
+        __per_cpu_start = .;
+        KEEP(*(.data..percpu .data..percpu.*))
+        . = ALIGN(64);
+        __per_cpu_end = .;
+    }
+
     /* Read-write data (no-execute) */
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_MAP) {
         _sdata = .;
@@ -72,6 +82,10 @@ SECTIONS
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        /* The boot CPU's per-CPU area (cpu::setup_boot_area) */
+        . = ALIGN(4K);
+        __per_cpu_area0 = .;
+        . += __per_cpu_end - __per_cpu_start;
         __bss_end = .;
     }
 

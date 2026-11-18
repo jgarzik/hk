@@ -125,6 +125,11 @@ impl Req {
         self.attr(ty, &v.to_ne_bytes())
     }
 
+    /// What follows the nlmsghdr: family header and attributes
+    pub fn body(&self) -> &[u8] {
+        &self.buf[16..self.len]
+    }
+
     pub fn flags(&self) -> u16 {
         u16::from_ne_bytes([self.buf[6], self.buf[7]])
     }
