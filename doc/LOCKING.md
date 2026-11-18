@@ -2960,7 +2960,10 @@ one only if neither I_FREEING nor I_WILL_FREE is set (Linux igrab,
 __iget): since those bits are set under `i_lock` in the same hold that
 dropped the count to zero, no reference is taken to an inode in its
 teardown, and the teardown runs once. `i_state` is written only under
-`i_lock` and read lock-free (Linux inode_state_read_once). `i_lock` is
+`i_lock` and read lock-free (Linux inode_state_read_once): its writers
+and `Inode::__iget` take the lock's `ILocked` borrow and assert it is
+this inode's (`Inode::assert_locked`), `__iget` that neither bit is
+set. `i_lock` is
 a spin leaf above the d_locks (it guards the inode's dentries too,
 Linux i_dentry): taken by igrab under `INODE_HASH_LOCK`,
 `INODE_SB_LIST_LOCK` or a `BdiWriteback.list_lock` (Linux:

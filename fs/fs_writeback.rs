@@ -244,9 +244,10 @@ fn io_list_del(l: &mut WbLists, inode: &Inode) {
 ///
 /// # Safety
 /// `inode` is not yet evicted: a reference is held, or it is not
-/// I_FREEING under its `i_lock` (`_il`), with `list_lock` (`l`) held,
+/// I_FREEING under its `i_lock` (`il`), with `list_lock` (`l`) held,
 /// which its eviction takes to unlink it.
-unsafe fn io_list_move_locked(l: &mut WbLists, inode: &Inode, _il: &ILocked, to: u8) -> bool {
+unsafe fn io_list_move_locked(l: &mut WbLists, inode: &Inode, il: &ILocked, to: u8) -> bool {
+    inode.assert_locked(il);
     let first = !has_dirty_io(l);
     io_list_del(l, inode);
     let Some(list) = list_of(l, to) else {
@@ -323,6 +324,7 @@ pub(super) fn inode_wait_for_writeback<'a>(
     mut l: MutexGuard<'a, ILocked>,
 ) -> MutexGuard<'a, ILocked> {
     use crate::sync::waitqueue::WaitEntry;
+    inode.assert_locked(&l);
     if inode.state() & I_SYNC == 0 {
         return l;
     }
@@ -346,6 +348,7 @@ pub(super) fn inode_wait_for_writeback<'a>(
 /// dropped here, after which the inode may go
 fn inode_sleep_on_writeback(inode: &Inode, l: MutexGuard<'_, ILocked>) {
     use crate::sync::waitqueue::WaitEntry;
+    inode.assert_locked(&l);
     let q = sync_waitqueue(inode);
     let w = core::pin::pin!(WaitEntry::new());
     q.prepare_to_wait(w.as_ref(), crate::task::percpu::SleepState::Uninterruptible);

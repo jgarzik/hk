@@ -1217,13 +1217,25 @@ impl Inode {
         self.i_state.load(Ordering::Acquire)
     }
 
-    /// Set `bits` of `i_state`, under `i_lock` (`_l`)
-    pub(super) fn set_state(&self, _l: &ILocked, bits: u32) {
+    /// Panics unless `l` is this inode's `i_lock` data, which is
+    /// borrowed only through a guard of it (Rust-for-Linux LockedBy's
+    /// owner check): so `l` proves its `i_lock` held
+    pub(super) fn assert_locked(&self, l: &ILocked) {
+        assert!(
+            core::ptr::eq(l, self.i_lock.data_ptr()),
+            "inode: another inode's i_lock"
+        );
+    }
+
+    /// Set `bits` of `i_state`, under `i_lock` (`l`)
+    pub(super) fn set_state(&self, l: &ILocked, bits: u32) {
+        self.assert_locked(l);
         self.i_state.fetch_or(bits, Ordering::Release);
     }
 
-    /// Clear `bits` of `i_state`, under `i_lock` (`_l`)
-    pub(super) fn clear_state(&self, _l: &ILocked, bits: u32) {
+    /// Clear `bits` of `i_state`, under `i_lock` (`l`)
+    pub(super) fn clear_state(&self, l: &ILocked, bits: u32) {
+        self.assert_locked(l);
         self.i_state.fetch_and(!bits, Ordering::Release);
     }
 
@@ -1234,11 +1246,16 @@ impl Inode {
     }
 
     /// A reference to an inode borrowed with none, under its `i_lock`
-    /// (`_l`) with neither I_FREEING nor I_WILL_FREE set, so its count
+    /// (`l`) with neither I_FREEING nor I_WILL_FREE set, so its count
     /// is above zero (Linux __iget: those bits are set in the hold that
-    /// drops it to zero)
-    pub(super) fn __iget(&self, _l: &ILocked) -> InodeRef {
-        debug_assert!(self.state() & (I_FREEING | I_WILL_FREE) == 0);
+    /// drops it to zero; its callers test them first). Panics if `l` is
+    /// not its `i_lock` or either bit is set.
+    pub(super) fn __iget(&self, l: &ILocked) -> InodeRef {
+        self.assert_locked(l);
+        assert!(
+            self.state() & (I_FREEING | I_WILL_FREE) == 0,
+            "inode: __iget of a freed inode"
+        );
         self.i_count.fetch_add(1, Ordering::Relaxed);
         // INVARIANT: the reference just taken
         InodeRef(NonNull::from(self))
