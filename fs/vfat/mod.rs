@@ -1549,10 +1549,23 @@ fn fat_dir_readahead(sb_data: &VfatSbData, phys: u64) {
     }
 }
 
+/// Linux fat__get_entry's report of a directory block skipped, rate
+/// limited (fat_msg_ratelimit)
+fn dir_bread_failed(phys: u64) {
+    use crate::util::ratelimit::{
+        DEFAULT_RATELIMIT_BURST, DEFAULT_RATELIMIT_INTERVAL, RatelimitState,
+    };
+    static RS: RatelimitState =
+        RatelimitState::new(DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST);
+    if RS.ratelimit("fat__get_entry") {
+        crate::printkln!("FAT-fs: Directory bread(block {}) failed", phys);
+    }
+}
+
 /// Walk the slots of the directory at `start` (0: none) block by
 /// block through the device's buffers (Linux fat_get_entry: sb_bread,
-/// each cluster read ahead from its first block; a block that cannot
-/// be read is skipped), the chain followed as it goes (`Chain`, EIO if
+/// each cluster read ahead from its first block; a block that failed
+/// I/O is skipped, ENOMEM returned), the chain followed as it goes (`Chain`, EIO if
 /// corrupt): `f` ends the walk with Break. None: the chain ended first.
 fn dir_walk<B>(
     sb_data: &VfatSbData,
@@ -1573,9 +1586,16 @@ fn dir_walk<B>(
             if k == 0 {
                 fat_dir_readahead(sb_data, phys);
             }
-            // Linux fat__get_entry: skip this block
-            let Ok(bh) = buffer::bread(&sb_data.bdev, phys, bs) else {
-                continue;
+            // Linux fat__get_entry: skip a block that failed I/O; no
+            // memory is an error (Linux's sb_bread cannot fail for it,
+            // __GFP_NOFAIL)
+            let bh = match buffer::bread(&sb_data.bdev, phys, bs) {
+                Ok(bh) => bh,
+                Err(KernelError::Io) => {
+                    dir_bread_failed(phys);
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             bh.read_data(0, &mut buf);
             for (i, b) in (0u64..).zip(buf.as_chunks::<32>().0) {

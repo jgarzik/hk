@@ -946,21 +946,27 @@ fn folio_init_buffers(phys: u64, head: &BufferHead, bdev: &Arc<BlockDevice>, siz
 }
 
 /// Make the device-cache page holding `block` and its buffers of
-/// `size` (Linux grow_dev_folio): false if retrying cannot help
-fn grow_dev_folio(bdev: &Arc<BlockDevice>, block: u64, index: u64, size: usize) -> bool {
+/// `size` (Linux grow_dev_folio): false if retrying cannot help;
+/// ENOMEM if the page or its buffers cannot be allocated (Linux's
+/// callers pass __GFP_NOFAIL, which hk's allocators lack)
+fn grow_dev_folio(
+    bdev: &Arc<BlockDevice>,
+    block: u64,
+    index: u64,
+    size: usize,
+) -> Result<bool, KernelError> {
     let m = &bdev.bd_inode.i_data;
-    let Ok(phys) = filemap::grab(m, index) else {
-        return false;
-    };
+    let phys = filemap::grab(m, index)?;
     let mut end_block = 0;
+    let mut r = Ok(());
     // SAFETY: `grab` returned it locked
     match unsafe { folio_buffers(phys) } {
         Some(h) if h.size() == size => end_block = folio_init_buffers(phys, h, bdev, size),
         // Old buffers of another size (a changed block size): retry once
         // they could be freed
         Some(_) if !try_to_free_buffers(Some(m), phys) => end_block = u64::MAX,
-        _ => {
-            if let Some(head) = folio_alloc_buffers(phys, size, false) {
+        _ => match folio_alloc_buffers(phys, size, false) {
+            Some(head) => {
                 // Atomic with __find_get_block, which does not take the
                 // page lock
                 let _g = m.i_private_lock.lock();
@@ -970,16 +976,17 @@ fn grow_dev_folio(bdev: &Arc<BlockDevice>, block: u64, index: u64, size: usize) 
                 // SAFETY: attached, under the page lock
                 end_block = folio_init_buffers(phys, unsafe { &*head }, bdev, size);
             }
-        }
+            None => r = Err(KernelError::OutOfMemory),
+        },
     }
     crate::mm::page::unlock_page(phys);
     filemap::put_page(phys);
-    block < end_block
+    r.map(|()| block < end_block)
 }
 
 /// Linux grow_buffers: the block's page and buffers, unless it lies
 /// past the largest page-cache offset
-fn grow_buffers(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> bool {
+fn grow_buffers(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> Result<bool, KernelError> {
     let pos = block.checked_mul(size as u64);
     let Some(pos) = pos.filter(|&p| p <= crate::fs::superblock::MAX_LFS_FILESIZE) else {
         crate::printkln!(
@@ -987,13 +994,14 @@ fn grow_buffers(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> bool {
             block,
             bdev.name
         );
-        return false;
+        return Ok(false);
     };
     grow_dev_folio(bdev, block, pos / PAGE_SIZE as u64, size)
 }
 
 /// Linux __getblk_slow: grow the cache until the buffer is found. hk's
-/// folios are a page: a block larger than a page is EINVAL.
+/// folios are a page: a block larger than a page is EINVAL. EIO for a
+/// block past the device; ENOMEM where Linux's __GFP_NOFAIL retries.
 fn getblk_slow(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> Result<BhRef, KernelError> {
     if size > PAGE_SIZE || !size.is_power_of_two() {
         return Err(KernelError::InvalidArgument);
@@ -1008,7 +1016,7 @@ fn getblk_slow(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> Result<BhRef
         return Err(KernelError::InvalidArgument);
     }
     loop {
-        if !grow_buffers(bdev, block, size) {
+        if !grow_buffers(bdev, block, size)? {
             return Err(KernelError::Io);
         }
         if let Some(bh) = find_get_block_nonatomic(bdev, block, size) {
@@ -1106,7 +1114,7 @@ pub fn find_get_block_nonatomic(bdev: &BlockDevice, block: u64, size: usize) -> 
 
 /// The buffer of `block` (`size` bytes) in the device's cache, made if
 /// absent; referenced, not locked, maybe not uptodate (Linux
-/// bdev_getblk). EIO past the device, ENOMEM.
+/// bdev_getblk). EIO past the device, ENOMEM (`getblk_slow`).
 pub fn bdev_getblk(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> Result<BhRef, KernelError> {
     crate::sync::might_sleep();
     match find_get_block_nonatomic(bdev, block, size) {
@@ -1164,7 +1172,8 @@ fn bread_slow(bh: BhRef) -> Result<BhRef, KernelError> {
 }
 
 /// Read `block` (`size` bytes) of the device through its cache (Linux
-/// __bread_gfp): referenced and uptodate; EIO if unreadable
+/// __bread_gfp): referenced and uptodate; EIO if unreadable, ENOMEM if
+/// its buffer cannot be made (`getblk_slow`)
 pub fn bread(bdev: &Arc<BlockDevice>, block: u64, size: usize) -> Result<BhRef, KernelError> {
     let bh = bdev_getblk(bdev, block, size)?;
     if bh.uptodate() {

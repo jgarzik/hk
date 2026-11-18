@@ -61,6 +61,12 @@
 //!   inode is iput with i_nlink 0 and fat_evict_inode truncates it, so
 //!   a crafted image loses a live directory's data there; hk checks
 //!   before any inode exists.
+//! - VFAT_DIR_NOMEM: a lookup in a directory whose block is not cached
+//!   yet (a fresh mount), with each of its allocations failing in turn
+//!   (fail-nth), finds the file or is ENOMEM, never ENOENT: a block
+//!   that cannot be read for want of memory is not skipped as an
+//!   unreadable one (Linux sb_bread cannot fail for memory,
+//!   __GFP_NOFAIL; fat__get_entry skips only a block that failed I/O)
 
 use crate::harness::T;
 use crate::helpers::{find_blkdev, host_mode};
@@ -218,6 +224,7 @@ pub fn run_tests() {
     dirty_expire(dev);
     dirsync(dev);
     bad_dir(dev);
+    dir_nomem(dev);
     sys_umount2(MNT.as_ptr(), 0);
     sys_rmdir(MNT.as_ptr());
     t.done();
@@ -381,6 +388,82 @@ fn bad_dir(dev: &[u8]) {
     t.ok(b"restore", poke(dev, off, &saved), 0);
     t.eq(b"mount restored", mount(dev), 0);
     t.eq(b"rmdir", sys_rmdir(bad.as_ptr()), 0);
+    t.done();
+}
+
+/// VFAT_DIR_NOMEM: NM/F looked up after each remount with its 1st,
+/// 2nd, ... allocation failing; PAD's clusters, taken first, put NM's
+/// block in another page of the device than the root's, so the lookup
+/// in NM makes that page's buffers
+fn dir_nomem(dev: &[u8]) {
+    use crate::io::fault_inject::{get, set};
+    const ENOMEM: i64 = -12;
+    /// Most failure points tried
+    const MAX_NTH: u32 = 300;
+    let (pad, nm, f) = (b"/tmp/vdk/PAD\0", b"/tmp/vdk/NM\0", b"/tmp/vdk/NM/F\0");
+    let fd = sys_open(b"/proc/self/fail-nth\0".as_ptr(), O_RDWR, 0);
+    if fd < 0 {
+        crate::helpers::skip(b"VFAT_DIR_NOMEM", b"no /proc/self/fail-nth");
+        return;
+    }
+    let fd = fd as i32;
+    let mut t = T::new(b"VFAT_DIR_NOMEM");
+    let p = sys_open(pad.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if t.ok(b"create PAD", p >= 0, p) {
+        let buf = [0x5au8; 4096];
+        for _ in 0..8 {
+            sys_write(p as u64, buf.as_ptr(), buf.len() as u64);
+        }
+        sys_close(p as u64);
+    }
+    t.eq(b"mkdir", sys_mkdir(nm.as_ptr(), 0o755), 0);
+    let c = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if t.ok(b"create", c >= 0, c) {
+        sys_close(c as u64);
+    }
+    t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0);
+    if !host_mode()
+        && let Some(fa) = Fat::open(dev)
+    {
+        // The test needs NM's block alone in its page (else the root's
+        // walk made its buffers)
+        let page = |c: u32| fa.cl_off(c) / 4096;
+        let at = fa.find(fa.root, b"NM         ").map(|e| page(start(&e)));
+        t.ok(b"NM on disk", at.is_some(), 0);
+        let mut c = Some(fa.root);
+        while let (Some(x), Some(at)) = (c, at) {
+            t.ok(b"NM's page apart from the root's", page(x) != at, at as i64);
+            c = fa.next(x);
+        }
+    }
+    let mut done = false;
+    for nth in 1..=MAX_NTH {
+        // A fresh mount: the device's cache is dropped with its last
+        // opener, so NM's block is read (and its buffers made) again
+        if !t.eq(b"mount", mount(dev), 0) {
+            break;
+        }
+        set(fd, nth);
+        let r = sys_stat(f.as_ptr(), &mut Stat::default());
+        let left = get(fd);
+        set(fd, 0);
+        if !t.eq(b"umount", sys_umount2(MNT.as_ptr(), 0), 0) {
+            break;
+        }
+        if !t.ok(b"stat 0 or ENOMEM", r == 0 || r == ENOMEM, r) {
+            break;
+        }
+        if left != 0 {
+            done = true;
+            break;
+        }
+    }
+    t.ok(b"all failure points run", done, 0);
+    sys_close(fd as u64);
+    t.eq(b"remount", mount(dev), 0);
+    sys_unlink(f.as_ptr());
+    sys_rmdir(nm.as_ptr());
+    sys_unlink(pad.as_ptr());
     t.done();
 }
 

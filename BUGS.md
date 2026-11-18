@@ -721,6 +721,10 @@ waiting).
   page (BLKBSZSET up to 64K) gives its cache page-sized buffers, and
   bdev_getblk of such a block is EINVAL (Linux makes large folios of
   one block each, mapping_set_folio_min_order).
+- No __GFP_NOFAIL: bread and bdev_getblk fail ENOMEM when the
+  device-cache page or its buffers cannot be allocated
+  (`getblk_slow`), where Linux's (__bread_gfp, __getblk) retry until
+  they can; their callers return it.
 - No buffer-head count limit (Linux buffer_heads_over_limit, which
   makes reclaim strip buffers), no page migration of buffered pages,
   no BH_Delay / BH_Unwritten / BH_Boundary users.
