@@ -65,7 +65,8 @@ static SYSFS_SOPS: SysfsSops = SysfsSops;
 /// The network namespace a sysfs superblock shows (Linux
 /// kernfs_test_super's info->ns)
 fn sb_ns(sb: &SuperBlock) -> Option<u64> {
-    sb.fs_info_as::<kernfs::vfs::KfSuper>().map(|k| k.ns)
+    let g = crate::sync::rcu::read_lock();
+    sb.fs_info_rcu::<kernfs::vfs::KfSuper>(&g).map(|k| k.ns)
 }
 
 /// The namespace's superblock, shared by its mounts (Linux
@@ -75,8 +76,7 @@ fn mount(
     fc: &crate::fs::superblock::FsContext<'_>,
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     let ns = crate::net::current_net_ns().id;
-    let info: Arc<dyn crate::fs::superblock::SuperBlockData> =
-        try_arc(kernfs::vfs::KfSuper { ns })?;
+    let info = crate::fs::superblock::FsInfo::new(try_arc(kernfs::vfs::KfSuper { ns })?)?;
     let sb =
         crate::fs::superblock::sget(fc, &SYSFS_SOPS, Some(&|sb| sb_ns(sb) == Some(ns)), &|sb| {
             // Linux kernfs_set_super
@@ -97,9 +97,10 @@ fn mount(
 }
 
 /// sysfs's kill_sb (Linux sysfs_kill_sb -> kernfs_kill_sb:
-/// kill_anon_super; the kernfs info goes with the superblock's memory)
+/// kill_anon_super, then the kernfs info freed)
 fn sysfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
     crate::fs::superblock::kill_anon_super(sb, g);
+    sb.kill_fs_info();
 }
 
 pub static SYSFS_TYPE: FileSystemType = FileSystemType {

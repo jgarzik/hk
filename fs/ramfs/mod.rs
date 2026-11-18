@@ -1265,9 +1265,10 @@ pub(crate) fn fill_root(
     Ok(())
 }
 
-/// ramfs's kill_sb (Linux ramfs_kill_sb): kill_anon_super (its
-/// fs_info goes with the superblock's memory)
+/// ramfs's kill_sb (Linux ramfs_kill_sb): its fs_info (none here, its
+/// options unkept), then kill_anon_super
 fn ramfs_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    sb.kill_fs_info();
     crate::fs::superblock::kill_anon_super(sb, g);
 }
 

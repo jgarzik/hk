@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs::KernelError;
-use crate::fs::inode::{AsAny, Gid, Uid};
+use crate::fs::inode::{Gid, Uid};
 use crate::fs::superblock::{
     FileSystemType, StatFs, SuperBlock, SuperBlockData, SuperOps, TMPFS_MAGIC, sb_flag_word,
 };
@@ -157,15 +157,10 @@ pub struct ShmemSb {
 
 impl SuperBlockData for ShmemSb {}
 
-impl AsAny for ShmemSb {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-}
-
-/// `f` on `sb`'s tmpfs data; None if `sb` is not a tmpfs
+/// `f` on `sb`'s tmpfs data; None if `sb` is not a tmpfs, or once its
+/// put_super released the data
 pub fn with<R>(sb: &SuperBlock, f: impl FnOnce(&ShmemSb) -> R) -> Option<R> {
-    sb.fs_info_as::<ShmemSb>().map(f)
+    sb.fs_info::<ShmemSb>().map(|t| f(&t))
 }
 
 /// The block limit of tmpfs `sb` (0: none); None if not a tmpfs
@@ -462,6 +457,12 @@ impl SuperOps for TmpfsSuperOps {
     fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
         with(sb, |t| t.show(out));
     }
+
+    /// Its limits and accounting go (Linux shmem_put_super: the sbinfo
+    /// freed)
+    fn put_super(&self, sb: &SuperBlock) {
+        sb.kill_fs_info();
+    }
 }
 
 pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
@@ -530,10 +531,12 @@ pub(crate) fn tmpfs_mount(
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
     let o = parse(fc.data)?;
     let t = try_arc(ShmemSb::new(&o)?)?;
+    let (mode, uid, gid) = (t.mode, t.uid, t.gid);
+    let info = crate::fs::superblock::FsInfo::new(t)?;
     crate::fs::superblock::get_tree_nodev(fc, &TMPFS_SUPER_OPS, |sb| {
-        let (mode, uid, gid) = (t.mode, t.uid, t.gid);
-        sb.set_fs_info(t);
-        super::fill_root(sb, mode, uid, gid)
+        sb.set_fs_info(info);
+        // Linux shmem_fill_super's failed: shmem_put_super
+        super::fill_root(sb, mode, uid, gid).inspect_err(|_| sb.kill_fs_info())
     })
 }
 

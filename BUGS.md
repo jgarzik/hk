@@ -312,10 +312,18 @@ lo (hk has no checksum offload states).
 - No FSINFO: the free count and next-free hint are kept in memory
   only (Linux fat_set_state / fat_clusters_flush).
 - `fs/inode.rs` `Inode.sb` is a `Weak` (an inode may be evicted after
-  its superblock's shutdown), so every reach of a filesystem's data
-  from an inode (vfat `fat_get_block`'s `superblock()`) upgrades it,
-  an `Arc` count; Linux MSDOS_SB(inode->i_sb) is two plain pointer
-  loads.
+  its superblock's shutdown; Linux evicts every inode in
+  generic_shutdown_super before put_super), so every reach of a
+  filesystem's data from an inode (vfat `fat_get_block`) upgrades it
+  and takes a reference to `s_fs_info` (`msdos_sb`), two `Arc`
+  counts; Linux MSDOS_SB(inode->i_sb) is two plain pointer loads. A
+  vfat inode evicted after put_super finds no data (EIO): an unlinked
+  one's clusters stay allocated (`VfatInodeOps::evict_inode`), and an
+  operation already running when put_super ran keeps the data, its
+  FAT inode and device I/O going past kill_block_super's release
+  (`fs/pageio/fs_writeback.rs` `wb_writeback` with no superblock
+  given takes no s_umount per inode's superblock: Linux
+  __writeback_inodes_wb skips one super_trylock_shared fails on).
 
 ## O_DIRECT gaps
 

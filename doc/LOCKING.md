@@ -332,7 +332,10 @@ form whose lock is typed (Linux a `__rcu` pointer written under a
 named lock: signal->pids[] under tasklist_lock): `read` under a
 guard, `protected` (rcu_dereference_protected) under a borrow of the
 lock's `UniqueOwner` data `O`, `replace` under a mutable borrow of
-it. `RcuPtr<T>` owns nothing (Linux task->real_parent): `set` is
+it. `RcuOnceArc<T>` is the nullable form set once and emptied once by
+atomic exchanges, so it needs no lock (Linux sb->s_fs_info): `read`
+under a guard, `get` a reference, `take` the version as `RcuRetired`.
+`RcuPtr<T>` owns nothing (Linux task->real_parent): `set` is
 rcu_assign_pointer, `get` (unsafe) rcu_dereference, valid only on
 the caller's argument that its target is freed a grace period after
 no reader can reach it (`Task::parent`). `util::rculist::RcuList` (Linux rculist.h) is an
@@ -3135,15 +3138,19 @@ Order: `i_rwsem` -> page and buffer locks (the bread) -> `ipos` ->
 `VfatSbData.fat`.
 
 **vfat superblock data** (`fs/vfat/mod.rs`, Linux msdos_sb_info in
-s_fs_info): `VfatSbData` is the superblock's `s_fs_info` (a
-`spin::Once`, set by the fill, fixed after and freed with the
-superblock's memory), so `msdos_sb` (Linux MSDOS_SB) borrows it from
-the superblock with no lock or count; fat_get_block reaches it so.
-`VfatSbData.fat_inode` (spin `Mutex<Option<InodeRef>>` leaf, thread
-context) is held only to take a reference to the FAT's inode, or to
-take the inode itself in put_super (Linux fat_put_super's iput, which
-may sleep, so it is dropped after the lock); nothing else is taken
-under it.
+s_fs_info): `VfatSbData` is the superblock's `s_fs_info` (Superblock
+lists below), set by the fill and released by put_super (Linux
+fat_put_super: iput of the FAT's inode, then call_rcu of the rest),
+or by a fill that fails after setting it (Linux out_fail), in thread
+context. `msdos_sb` (Linux MSDOS_SB) takes a reference to it for an
+operation, none of whose drops is in atomic context; it is EIO once
+released, so an inode evicted after the shutdown (`Inode.sb` is a
+`Weak`; Linux evicts every inode before put_super) does no I/O on the
+device kill_block_super releases next. `VfatSbData.fat_inode` is a
+plain `InodeRef` (Linux sbi->fat_inode) living as long as the data:
+the FAT's blocks are put on its metadata list with no lock taken.
+Short reads (`cluster_size`, `opts_of`) borrow the data under an RCU
+guard.
 
 **vfat directory blocks** (`fs/vfat/mod.rs`, Linux fs/fat/dir.c): a
 directory is walked block by block in the device's buffers
@@ -3512,9 +3519,21 @@ the SB_DEAD wakeup's `var_waitqueue` lock) guards `super_blocks`
 (`SuperBlock.s_instances`, a `LockedBy` cell of the lock's data). Both
 are `util::list::WeakList`s: a `Weak` per superblock, linked by `sget`
 and unlinked by its last passive put (`Drop for SuperBlock`, Linux
-put_super, which frees `s_fs_info` too: nothing in it sleeps to
-release, a filesystem's ->put_super takes out what would), so the lists allocate nothing under the lock (only a new
-superblock's anonymous device number may, GFP_ATOMIC, below). A superblock has two counts, as in
+put_super), so the lists allocate nothing under the lock (only a new
+superblock's anonymous device number may, GFP_ATOMIC, below). A
+filesystem's data (`SuperBlock.s_fs_info`, Linux s_fs_info, an
+`RcuOnceArc`) is set once by its fill or sget's set and released, as
+Linux, by its ->put_super (vfat, tmpfs) or ->kill_sb (procfs, sysfs,
+cgroup2, ramfs, tracefs) or a fill that fails after setting it, in
+thread context (`kill_fs_info`: out of the cell, a grace period
+(synchronize_rcu), then the reference dropped there; Linux frees it
+by kfree_rcu / call_rcu, but here the data's drop may sleep: an
+inode's put, a pid namespace's), never with the superblock's memory,
+whose drop may come in any context (only a superblock never listed,
+sget's set having failed, still holds it then, dropped in sget's
+thread context). Readers borrow it under an RCU guard (`fs_info_rcu`:
+sget's tests, short reads) or take a reference (`fs_info`), dropped
+in thread context; once released it reads as None. A superblock has two counts, as in
 Linux: active references (`SbActive`, `SuperBlock.s_active`, Linux
 s_active; never raised from zero) and passive ones (the `Arc`, Linux
 s_passive). Its life's flags in `s_flags` (Linux SB_BORN: set when its
@@ -3528,9 +3547,10 @@ releases it, waits for SB_BORN or SB_DYING and takes s_umount for
 reading unless it is dying (Linux super_lock_shared), runs its
 callback (which may sleep), and drops the previous reference with the
 lock released. `sget` (Linux sget_fc) runs its test under it, on
-superblocks not yet dead (sysfs: `SuperBlock.s_fs_info` read, a
-`spin::Once` set once and then fixed, read with no lock), and a new
-superblock's `set`, which stores its identity: `s_fs_info` set, and
+superblocks not yet dead (sysfs, cgroup2: `SuperBlock.s_fs_info`
+borrowed under an RCU guard), and a new superblock's `set`, which
+stores its identity: `s_fs_info` set (an atomic exchange; its
+wrapper allocated before), and
 an anonymous device number taken
 from `UNNAMED_DEV_IDA` (Linux get_anon_bdev under sb_lock: the
 `util::ida::Ida` IrqSpinlock leaf, its bitmap grown GFP_ATOMIC; freed
@@ -3602,7 +3622,7 @@ writes i_uid there); a uid=/gid= remount walks the superblock's inodes
 | `KNode.iattr` | spin Mutex, leaf (Linux kernfs_iattr_rwsem) | written by chmod/chown/utimes under the inode's i_rwsem; read (copied out) when lookup builds an inode, under the parent's i_rwsem |
 | `AttrNode.ops`, `BinNode.ops` | spin RwLock, leaf | read (clone) under an active reference by show()/store(); cleared by `KNode::remove` after the drain, with no lock held, the operations dropped after it is released (a removed node kept by a dentry or open file pins nothing) |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks, and across a read's copy to the caller (may fault: -> mmap_lock; no active reference held then, Linux seq_read_iter under m->lock); a write copies its data in before taking it; under f_pos_lock for read/write |
-| `SB_LOCK` (sget) | spin Mutex (under it only `SuperBlock.s_fs_info` read by a test or set by a set (a `spin::Once`), `UNNAMED_DEV_IDA` (IrqSpinlock leaf, its bitmap grown GFP_ATOMIC), and the SB_DEAD wakeup's `var_waitqueue` lock) | a network namespace's sysfs superblock, and the default cgroup hierarchy's cgroup2 one (cgroupfs `CgSuper`, shared by every cgroup2 mount), is found in its type's `fs_supers` by `sget` (Linux kernfs_get_tree: kernfs_test_super on the kernfs root and namespace), its test reading `SuperBlock.s_fs_info` under the lock; the match is then taken by `grab_super` with the lock released |
+| `SB_LOCK` (sget) | spin Mutex (under it only `SuperBlock.s_fs_info` read by a test (RCU guard) or set by a set (an atomic exchange), `UNNAMED_DEV_IDA` (IrqSpinlock leaf, its bitmap grown GFP_ATOMIC), and the SB_DEAD wakeup's `var_waitqueue` lock) | a network namespace's sysfs superblock, and the default cgroup hierarchy's cgroup2 one (cgroupfs `CgSuper`, shared by every cgroup2 mount), is found in its type's `fs_supers` by `sget` (Linux kernfs_get_tree: kernfs_test_super on the kernfs root and namespace), its test reading `SuperBlock.s_fs_info` under the lock; the match is then taken by `grab_super` with the lock released |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
 guards the device's "dead" flag, set first by `del` (a dead device is

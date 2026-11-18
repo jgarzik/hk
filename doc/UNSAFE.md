@@ -50,7 +50,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | intrusive red-black tree `RbRoot` / `RbNode` / `RbCursorMut` over a `ListPtr` (`util/rbtree.rs`, Linux rb_node embedded, `skb->rbnode`) | owning intrusive container, membership checked |
 | RCU callback head `RcuHead` / `HasRcuHead`, `call_rcu` (`sync/rcu.rs`, Linux rcu_head) | embedded queue node, claimed once |
 | slab RCU head `Page::slab_rcu_head` / `slab_rcu_end` (`mm/page.rs`, Linux struct slab's rcu_head in a union with slab_list, freelist and counters) | `RcuHead` over struct page fields dead once the slab is off its lists (layout const-asserted; a head has no uninitialized byte), zeroed back by its callback |
-| RCU pointers `RcuArc`, `RcuLockedArc` (nullable, writers proven by a `UniqueOwner`), `RcuPtr` (no ownership, unsafe read) (`sync/rcu.rs`, Linux `__rcu`) | published pointer, old version released after a grace period |
+| RCU pointers `RcuArc`, `RcuLockedArc` (nullable, writers proven by a `UniqueOwner`), `RcuOnceArc` (nullable, set and taken by atomic exchange), `RcuPtr` (no ownership, unsafe read) (`sync/rcu.rs`, Linux `__rcu`) | published pointer, old version released after a grace period |
 | dentry reference `DentryRef` (`fs/dentry.rs`, Linux dget/dput on d_lockref), mount reference `MountRef` (`fs/mntput.rs`, Linux mntget/mntput on mnt_pcp) | counted pointer, last put deferred (RCU free, queued teardown) |
 | repeated deferred put `RcuPuts` / `HasRcuPuts`, `put_rcu` (`sync/rcu.rs`) | embedded counted queue node |
 | RCU-readable dentry name `DNameSlot` over `ExternalName` (`fs/name.rs`, Linux d_name over d_shortname / external_name) | atomics a reader may see torn, never out of bounds; a replaced long block released after a grace period (`put_rcu`) |

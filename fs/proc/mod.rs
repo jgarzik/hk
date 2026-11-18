@@ -571,8 +571,8 @@ pub struct ProcRcu {
     pid: Option<ProcPid>,
     kind: RcuKind,
     ctl: Option<&'static crate::sysctl::Ctl>,
-    /// The superblock's options (`ProcOpts`)
-    opts: Option<Arc<dyn crate::fs::superblock::SuperBlockData>>,
+    /// The superblock's options
+    opts: Option<Arc<opts::ProcOpts>>,
 }
 
 impl AsAny for ProcRcu {
@@ -612,10 +612,7 @@ enum RcuKind {
 }
 
 impl ProcRcu {
-    fn of(
-        d: &ProcfsInodeData,
-        opts: Option<Arc<dyn crate::fs::superblock::SuperBlockData>>,
-    ) -> Self {
+    fn of(d: &ProcfsInodeData, opts: Option<Arc<opts::ProcOpts>>) -> Self {
         use ProcfsInodeData as D;
         let kind = match d {
             D::Directory { .. } | D::File { .. } | D::FixedLink(_) => RcuKind::Static,
@@ -649,10 +646,7 @@ impl ProcRcu {
 
     /// The superblock's options
     fn opts(&self) -> Option<&opts::ProcOpts> {
-        self.opts
-            .as_ref()?
-            .as_any()
-            .downcast_ref::<opts::ProcOpts>()
+        self.opts.as_deref()
     }
 
     /// The task, borrowed for `g` (Linux pid_task under rcu_read_lock)
@@ -664,7 +658,9 @@ impl ProcRcu {
 /// A new procfs inode's data, and what an RCU walk reads of it, before
 /// the inode is visible
 fn set_data(inode: &InodeRef, data: ProcfsInodeData) -> Result<(), KernelError> {
-    let opts = inode.superblock().and_then(|sb| sb.fs_info_arc());
+    let opts = inode
+        .superblock()
+        .and_then(|sb| sb.fs_info::<opts::ProcOpts>());
     inode.set_private_rcu(try_arc(ProcRcu::of(&data, opts))?);
     inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
     Ok(())
@@ -2766,17 +2762,18 @@ pub fn proc_flush_pid(
     });
 }
 
-/// procfs's kill_sb (Linux proc_kill_sb): kill_anon_super; its options
-/// (the pid namespace reference) go with the superblock's memory
+/// procfs's kill_sb (Linux proc_kill_sb): kill_anon_super, then its
+/// options (the pid namespace reference) go, a grace period on
 fn proc_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
     crate::fs::superblock::kill_anon_super(sb, g);
+    sb.kill_fs_info();
 }
 
 /// Mount function for procfs
 fn procfs_mount(
     fc: &crate::fs::superblock::FsContext<'_>,
 ) -> Result<crate::fs::superblock::SbLocked, KernelError> {
-    let opts = try_arc(opts::ProcOpts::new(fc.data)?)?;
+    let opts = crate::fs::superblock::FsInfo::new(try_arc(opts::ProcOpts::new(fc.data)?)?)?;
     crate::fs::superblock::get_tree_nodev(fc, &PROCFS_SUPER_OPS, |sb| {
         sb.set_fs_info(opts);
         procfs_fill(sb)

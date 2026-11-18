@@ -5,6 +5,7 @@
 
 use alloc::sync::{Arc, Weak};
 
+use crate::sync::rcu::{RcuOnceArc, RcuReadGuard};
 use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
 use crate::util::list::{Adapter, Link, WeakList};
@@ -437,16 +438,21 @@ const SB_ACTIVE: u32 = 1 << 30;
 /// The last passive reference is gone (Linux put_super's final part):
 /// off super_blocks and its type's fs_supers (the lists' contract,
 /// `WeakList`: no walker reaches it once its fields start to go), then
-/// its memory, its `s_fs_info` with it. The filesystem was shut down
-/// already, by its last active reference ([`SbActive`]), its
-/// ->put_super taking out of `s_fs_info` what sleeps to release, so
-/// nothing here sleeps; it takes sb_lock,
-/// so a passive reference is never dropped under it.
+/// its memory. The filesystem was shut down already, by its last
+/// active reference ([`SbActive`]), its ->put_super or ->kill_sb
+/// releasing `s_fs_info` (Linux), so nothing here sleeps; it takes
+/// sb_lock, so a passive reference is never dropped under it. Only a
+/// superblock never listed (`destroy_unused_super`: sget's set failed)
+/// still holds its data, dropped here in sget's thread context.
 impl Drop for SuperBlock {
     fn drop(&mut self) {
         debug_assert!(
             self.super_flags(SB_DEAD),
             "superblock: freed without its shutdown"
+        );
+        debug_assert!(
+            self.s_fs_info.is_none() || !self.s_list.is_linked(),
+            "superblock: fs info outlived its kill_sb"
         );
         let weaks = {
             let mut l = SB_LOCK.lock();
@@ -1102,11 +1108,12 @@ pub struct SuperBlock {
     s_blocksize_bits: core::sync::atomic::AtomicU8,
 
     /// Its filesystem's data (Linux s_fs_info): set once, by its fill
-    /// or sget's set, then fixed and freed with the superblock's memory,
-    /// so whoever borrows the superblock reads it with no lock or
-    /// count (Linux MSDOS_SB(sb) etc.). What must go at the shutdown
-    /// (an inode, a device) the filesystem's ->put_super takes out
-    s_fs_info: spin::Once<Arc<dyn SuperBlockData>>,
+    /// or sget's set; released by the filesystem's ->put_super or
+    /// ->kill_sb (or its failed fill) in thread context, a grace period
+    /// after it leaves the cell (`kill_fs_info`). Read under an RCU
+    /// guard or as a reference ([`SuperBlock::fs_info`]): once released
+    /// it reads as None (EIO to a filesystem's late callers)
+    s_fs_info: RcuOnceArc<FsInfo>,
 
     /// The block device a device filesystem is mounted from (Linux
     /// s_bdev): a reference to the device, not an open
@@ -1133,8 +1140,6 @@ pub struct SuperBlock {
     /// syncfs (Linux s_wb_err)
     pub s_wb_err: crate::util::errseq::ErrSeq,
 }
-
-use super::inode::AsAny;
 
 /// A superblock's `s_wb_err` stays a valid atomic after the value is
 /// dropped (its last passive reference), while a `Weak` keeps the
@@ -1166,7 +1171,7 @@ pub fn sb_wb_err_set(sb: &Weak<SuperBlock>, e: KernelError) {
 pub const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
 
 /// Trait for filesystem-specific superblock data
-pub trait SuperBlockData: Send + Sync + AsAny {}
+pub trait SuperBlockData: core::any::Any + Send + Sync {}
 
 impl SuperBlock {
     /// Its dentries hash and compare names with `op` (Linux
@@ -1199,7 +1204,7 @@ impl SuperBlock {
             s_dev: AtomicU32::new(0),
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
             s_blocksize_bits: core::sync::atomic::AtomicU8::new(crate::mm::page::PAGE_SHIFT as u8),
-            s_fs_info: spin::Once::new(),
+            s_fs_info: RcuOnceArc::none(),
             s_bdev: spin::Once::new(),
             s_bdev_file: Mutex::new(None),
             s_inodes: super::inode::sb_inodes(),
@@ -1442,28 +1447,55 @@ impl SuperBlock {
     }
 
     /// Give it its filesystem's data (Linux sb->s_fs_info = ...): once,
-    /// before anything reads it
-    pub fn set_fs_info(&self, data: Arc<dyn SuperBlockData>) {
-        let mut d = Some(data);
-        self.s_fs_info
-            .call_once(|| d.take().expect("superblock: set_fs_info"));
-        debug_assert!(d.is_none(), "superblock: fs info set twice");
+    /// by its fill or sget's set, before anything reads it
+    pub fn set_fs_info(&self, data: Arc<FsInfo>) {
+        let set = self.s_fs_info.set(data);
+        debug_assert!(set.is_ok(), "superblock: fs info set twice");
     }
 
-    /// Its filesystem's data, if set (Linux sb->s_fs_info)
-    pub fn fs_info(&self) -> Option<&dyn SuperBlockData> {
-        self.s_fs_info.get().map(|d| &**d)
+    /// A reference to its filesystem's data as a `T` (Linux
+    /// MSDOS_SB(sb) etc.); None once its put_super or kill_sb released
+    /// it, or for another type. Dropped in thread context: the last
+    /// reference may be the one that frees it
+    pub fn fs_info<T: SuperBlockData>(&self) -> Option<Arc<T>> {
+        let a: Arc<dyn core::any::Any + Send + Sync> = self.fs_info_arc()?;
+        a.downcast::<T>().ok()
     }
 
-    /// A reference to its filesystem's data, for what outlives the
-    /// borrow (an inode's RCU-read copy of procfs's options)
+    /// Its filesystem's data as a `T`, borrowed for the RCU read `g`
+    /// (Linux rcu_dereference(sb->s_fs_info): sget's tests)
+    pub fn fs_info_rcu<'a, T: SuperBlockData>(&'a self, g: &'a RcuReadGuard) -> Option<&'a T> {
+        let d: &dyn core::any::Any = &*self.s_fs_info.read(g)?.0;
+        d.downcast_ref::<T>()
+    }
+
+    /// A reference to its filesystem's data (an inode's RCU-read copy
+    /// of procfs's options)
     pub fn fs_info_arc(&self) -> Option<Arc<dyn SuperBlockData>> {
-        self.s_fs_info.get().cloned()
+        let g = crate::sync::rcu::read_lock();
+        let d = self.s_fs_info.read(&g).map(|d| d.0.clone());
+        drop(g);
+        d
     }
 
-    /// Its filesystem's data as a `T`; None if unset or another type
-    pub fn fs_info_as<T: 'static>(&self) -> Option<&T> {
-        self.fs_info()?.as_any().downcast_ref::<T>()
+    /// Release its filesystem's data (Linux the free of s_fs_info by
+    /// ->put_super, ->kill_sb or a failed fill_super): out of the cell,
+    /// then after a grace period (its RCU readers) its reference goes,
+    /// here, in thread context (the data's drop may sleep: an inode's
+    /// put, a namespace's); a reference still held elsewhere frees it
+    /// at its own drop
+    pub fn kill_fs_info(&self) {
+        drop(self.s_fs_info.take());
+    }
+}
+
+/// What `SuperBlock.s_fs_info` holds: sized, so an RCU pointer names
+/// it; made before `set_fs_info` (which may run under sb_lock)
+pub struct FsInfo(Arc<dyn SuperBlockData>);
+
+impl FsInfo {
+    pub fn new(data: Arc<dyn SuperBlockData>) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self(data))
     }
 }
 
@@ -1685,6 +1717,49 @@ mod tests {
         fs_supers: FsSupers::new(WeakList::new()),
     };
 
+    /// Drops of `T4Data`
+    static T4_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A filesystem's data that counts its drop
+    struct T4Data;
+
+    impl SuperBlockData for T4Data {}
+
+    impl Drop for T4Data {
+        fn drop(&mut self) {
+            T4_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Another type's data
+    struct NullData;
+
+    impl SuperBlockData for NullData {}
+
+    fn t4_mount(fc: &FsContext<'_>) -> Result<SbLocked, KernelError> {
+        let info = FsInfo::new(try_arc(T4Data)?)?;
+        get_tree_nodev(fc, &NULL_SUPER_OPS, |sb| {
+            sb.set_fs_info(info);
+            t_fill(sb, &crate::fs::inode::NULL_INODE_OPS)
+        })
+    }
+
+    /// Linux kernfs_kill_sb's shape: kill_anon_super, then the data
+    fn t4_kill_sb(sb: &SuperBlock, g: SbUmount<'_>) {
+        kill_anon_super(sb, g);
+        sb.kill_fs_info();
+    }
+
+    static T4: FileSystemType = FileSystemType {
+        name: "sbtest4",
+        fs_flags: 0,
+        mount: t4_mount,
+        kill_sb: t4_kill_sb,
+        file_ops: &crate::fs::RAMFS_FILE_OPS,
+        next: FsNext::new(None),
+        fs_supers: FsSupers::new(WeakList::new()),
+    };
+
     fn get(t: &'static FileSystemType) -> Result<SbActive, KernelError> {
         vfs_get_tree(&FsContext::new(t, b"")).map(SbLocked::unlock)
     }
@@ -1756,5 +1831,25 @@ mod tests {
         assert!(!Arc::ptr_eq(&c, &passive));
         assert_eq!(c.s_active.load(Ordering::Relaxed), 1);
         assert_eq!(T2_FILLS.load(Ordering::Relaxed), 2);
+    }
+
+    /// s_fs_info goes at the filesystem's kill_sb (Linux: in thread
+    /// context, the shutdown's), not with the superblock's memory: a
+    /// passive reference outliving the umount finds none; a reference
+    /// taken before keeps the data until it drops
+    #[test]
+    fn fs_info_goes_at_kill_sb() {
+        let active = get(&T4).unwrap();
+        let passive = Arc::clone(&active);
+        let held = active.fs_info::<T4Data>().unwrap();
+        assert!(active.fs_info::<NullData>().is_none());
+        drop(active);
+        assert!(passive.fs_info::<T4Data>().is_none());
+        assert!(passive.s_fs_info.is_none());
+        assert_eq!(T4_DROPS.load(Ordering::Relaxed), 0);
+        drop(held);
+        assert_eq!(T4_DROPS.load(Ordering::Relaxed), 1);
+        drop(passive);
+        assert_eq!(T4_DROPS.load(Ordering::Relaxed), 1);
     }
 }

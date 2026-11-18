@@ -499,6 +499,105 @@ impl<T, O: UniqueOwner> Drop for RcuLockedArc<T, O> {
     }
 }
 
+/// An RCU-protected `Option<Arc<T>>` given a version once by its
+/// object's setup and emptied once by its teardown (Linux a `__rcu`
+/// pointer the setup assigns and the teardown frees a grace period
+/// later: sb->s_fs_info). Both are atomic exchanges, so neither needs
+/// a lock. Readers borrow the version under an [`RcuReadGuard`] or
+/// take a reference to it; [`take`](Self::take) hands it back as
+/// [`RcuRetired`], released a grace period later.
+///
+/// # Invariants
+/// `ptr` is null or the `Arc::into_raw` of the current version, which
+/// the cell owns; a version taken out leaves only as an `RcuRetired`.
+pub struct RcuOnceArc<T> {
+    ptr: AtomicPtr<T>,
+}
+
+// SAFETY: an `Arc<T>` moves between threads and is shared through it
+unsafe impl<T: Send + Sync> Send for RcuOnceArc<T> {}
+// SAFETY: as above
+unsafe impl<T: Send + Sync> Sync for RcuOnceArc<T> {}
+
+impl<T> RcuOnceArc<T> {
+    /// Holding nothing
+    pub const fn none() -> Self {
+        // INVARIANT: null
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Publish `v` if the cell holds nothing (Linux rcu_assign_pointer);
+    /// `v` comes back if it holds a version already
+    pub fn set(&self, v: Arc<T>) -> Result<(), Arc<T>> {
+        let p = Arc::into_raw(v).cast_mut();
+        // INVARIANT: on success the cell owns `p`
+        match self.ptr.compare_exchange(
+            core::ptr::null_mut(),
+            p,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            // SAFETY: `p` is the `into_raw` above, never published
+            Err(_) => Err(unsafe { Arc::from_raw(p) }),
+        }
+    }
+
+    /// The current version, valid while `g` is held (Linux
+    /// rcu_dereference)
+    pub fn read<'a>(&'a self, _g: &'a RcuReadGuard) -> Option<&'a T> {
+        let p = self.ptr.load(Ordering::Acquire);
+        // SAFETY: null or a version the cell owns (type invariant); one
+        // taken out since stays allocated until a grace period after
+        // (`RcuRetired`), which `_g` keeps from ending while 'a lasts
+        unsafe { p.as_ref() }
+    }
+
+    /// A reference to the current version, if any
+    pub fn get(&self) -> Option<Arc<T>> {
+        let g = read_lock();
+        let a = self.read(&g).map(|v| {
+            let p = core::ptr::from_ref(v);
+            // SAFETY: `v` is borrowed from a version still allocated
+            // (`read`, `g` held), an `Arc::into_raw`, so its count is live
+            unsafe {
+                Arc::increment_strong_count(p);
+                Arc::from_raw(p)
+            }
+        });
+        drop(g);
+        a
+    }
+
+    /// The cell holds nothing
+    pub fn is_none(&self) -> bool {
+        self.ptr.load(Ordering::Relaxed).is_null()
+    }
+
+    /// Empty the cell; the version it held comes back, released after
+    /// a grace period
+    pub fn take(&self) -> RcuRetired<T> {
+        // INVARIANT: the cell holds nothing; the old leaves as RcuRetired
+        let old = self.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: null or a version the swap took out of the cell, whose
+        // one owner this is (type invariant)
+        RcuRetired((!old.is_null()).then(|| unsafe { Arc::from_raw(old) }))
+    }
+}
+
+impl<T> Drop for RcuOnceArc<T> {
+    fn drop(&mut self) {
+        let p = *self.ptr.get_mut();
+        if !p.is_null() {
+            // SAFETY: no reader borrows `self` any more (`&mut`), so the
+            // current version has its one owner here (type invariant)
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
 /// An RCU-protected pointer that owns nothing (Linux a `__rcu` pointer
 /// to an object its own owner frees a grace period after no reader can
 /// reach it any more: task->real_parent). Storing is safe; a read

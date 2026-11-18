@@ -391,17 +391,11 @@ impl SuperOps for TracefsSops {
 /// read by show_options
 struct FsInfo(SpinMutex<(u32, u32, u16)>);
 
-impl AsAny for FsInfo {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-}
-
 impl crate::fs::superblock::SuperBlockData for FsInfo {}
 
 /// `f` on the superblock's options
 fn with_fsi<R>(sb: &SuperBlock, f: impl FnOnce(&FsInfo) -> R) -> Option<R> {
-    sb.fs_info_as::<FsInfo>().map(f)
+    sb.fs_info::<FsInfo>().map(|o| f(&o))
 }
 
 /// Linux tracefs_apply_options(sb, true): the root's mode, owner and
@@ -497,7 +491,7 @@ fn tracefs_d_delete(_: &Dentry) -> bool {
 fn fill_super(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     sb.set_d_op(&TRACEFS_DOPS);
     let fsi = FsInfo(SpinMutex::new((0, 0, TRACEFS_DEFAULT_MODE)));
-    sb.set_fs_info(try_arc(fsi)?);
+    sb.set_fs_info(crate::fs::superblock::FsInfo::new(try_arc(fsi)?)?);
     let mode = InodeMode::directory(TRACEFS_DEFAULT_MODE);
     let ri = new_inode(Arc::downgrade(sb), 1, mode, (0, 0), (None, None))?;
     sb.set_root(DentryRef::new(Dentry::new_root(ri, Arc::downgrade(sb)))?);
@@ -514,11 +508,19 @@ fn mount(
     Ok(sb)
 }
 
+/// tracefs's kill_sb: kill_anon_super, then its options freed (Linux
+/// kill_anon_super alone, leaking the tracefs_fs_info its fill took
+/// from the fs_context)
+fn kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
+    crate::fs::superblock::kill_anon_super(sb, g);
+    sb.kill_fs_info();
+}
+
 pub static TRACEFS_TYPE: FileSystemType = FileSystemType {
     name: "tracefs",
     fs_flags: fs_flags::FS_PSEUDO,
     mount,
-    kill_sb: crate::fs::superblock::kill_anon_super,
+    kill_sb,
     file_ops: &TRACEFS_FOPS,
     next: crate::fs::superblock::FsNext::new(None),
     fs_supers: crate::fs::superblock::FsSupers::new(crate::util::list::WeakList::new()),
