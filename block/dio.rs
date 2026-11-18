@@ -378,7 +378,10 @@ impl<'a> Dio<'a> {
             if let Some((None, left)) = at.cur(map)
                 && self.op == BioOp::Read
             {
-                let n = cur.zero(segs, left);
+                // SAFETY: a read's pages, pinned for writing until its
+                // bios end: `DioIter::get_pages`' pins, kept by `send`'s
+                // callers, or `AsyncIo::segs` (that trait's contract)
+                let n = unsafe { cur.zero(segs, left) };
                 at.advance(map, n);
                 sent += n;
                 continue;
@@ -687,15 +690,18 @@ impl Cursor {
 
     /// Zero the next `max` bytes of `segs` at most, stepping over them
     /// (a read's hole); the bytes
-    fn zero(&mut self, segs: &[PageSeg], max: usize) -> usize {
+    ///
+    /// # Safety
+    /// `segs` are pages pinned for writing while this runs (a read's
+    /// destination).
+    unsafe fn zero(&mut self, segs: &[PageSeg], max: usize) -> usize {
         let mut done = 0;
         while done < max
             && let Some(s) = segs.get(self.i)
         {
             let n = (s.len as usize - self.at).min(max - done);
-            // SAFETY: a page of the I/O, pinned for writing while it
-            // lives (a read's destination: `DioIter::get_pages`,
-            // `AsyncIo::segs`); the piece lies in it
+            // SAFETY: a pinned page (contract above); the piece lies in
+            // it
             unsafe { zero_frame_racy(s.phys, s.off as usize + self.at, n) };
             done += n;
             self.at += n;
