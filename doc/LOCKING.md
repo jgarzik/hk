@@ -2655,9 +2655,11 @@ buffer lock.)
   `read_page` waits for the unlock without the lock
   (`filemap_read_folio`, `wait_on_page_locked`, Linux folio_wait_locked)
   and returns the page as it then is: a truncate meanwhile may have
-  removed it (as Linux do_read_cache_folio; one whose read failed for
-  it, its PG_uptodate cleared by the removal, is looked up again), and
-  a page found locked is waited for unlocked, then looked up again.
+  removed it, its data still valid (removal leaves PG_uptodate, as
+  Linux __filemap_remove_folio; do_read_cache_folio returns it), a
+  read that failed is EIO, and a page found locked is waited for
+  unlocked, then looked up again (a truncation is found by its
+  `Page.mapping` once locked).
 - `AddressSpace.invalidate_lock` (sleeping `RwSem`, thread context;
   Linux invalidate_lock): held shared by a read or fault that creates
   or fills a page (`read_page`, Linux filemap_create_folio,

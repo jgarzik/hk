@@ -695,10 +695,7 @@ pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
             let Some(phys) = add_new(m, index)? else {
                 continue;
             };
-            match read_done(m, phys, filemap_read_folio(inode, phys, index)) {
-                Some(r) => return r,
-                None => continue,
-            }
+            return read_done(phys, filemap_read_folio(inode, phys, index));
         };
         if uptodate(phys) {
             return Ok(phys);
@@ -726,28 +723,15 @@ pub fn read_page(inode: &Inode, index: u64) -> Result<u64, KernelError> {
         }
         let r = filemap_read_folio(inode, phys, index);
         drop(inv);
-        match read_done(m, phys, r) {
-            Some(r) => return r,
-            None => continue,
-        }
+        return read_done(phys, r);
     }
 }
 
 /// `read_page`'s result for the page `phys` its read `r` filled: the
-/// page, or the error with the reference dropped; None (look again) if
-/// the read failed because a truncate removed the page meanwhile: hk's
-/// removal clears PG_uptodate, which Linux's leaves set
-fn read_done(
-    m: &AddressSpace,
-    phys: u64,
-    r: Result<(), KernelError>,
-) -> Option<Result<u64, KernelError>> {
-    let Err(e) = r else {
-        return Some(Ok(phys));
-    };
-    let gone = page(phys).mapping.load(Ordering::Acquire) != m.key();
-    put_page(phys);
-    (!gone).then_some(Err(e))
+/// page (truncated meanwhile or not: its data stays valid, as Linux
+/// returns it), or the error with the reference dropped
+fn read_done(phys: u64, r: Result<(), KernelError>) -> Result<u64, KernelError> {
+    r.map(|()| phys).inspect_err(|_| put_page(phys))
 }
 
 /// Remove the locked page `phys` from `m` (Linux
@@ -767,7 +751,6 @@ pub fn remove(m: &AddressSpace, phys: u64) {
         crate::sync::Sole::sole_add(&m.nrpages, u64::MAX);
     }
     test_clear_dirty(pg);
-    pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
     count_file(m, -1);
     m.uncharge(1);
     put_page(phys);
@@ -819,7 +802,6 @@ fn truncate_final(m: &AddressSpace) {
         let pg = page(phys);
         pg.mapping.store(0, Ordering::Release);
         test_clear_dirty(pg);
-        pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
         put_page(phys);
     });
     m.nrpages.store(0, Ordering::Relaxed);
