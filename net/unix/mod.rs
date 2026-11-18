@@ -759,16 +759,17 @@ impl UnixSock {
     fn release_sock(&self, embryo: bool) {
         self.sk.net.unix.remove(self);
         self.unhash_bsd();
-        // Off its bucket, so no lookup reads it; put last (Linux
-        // unix_release_sock's path_put)
-        let path = self.path.lock().take();
-        let (state, peer) = {
+        // The path taken under the state lock as Linux (off its bucket
+        // now, so no lookup reads it), put last (unix_release_sock's
+        // path_put)
+        let (state, peer, path) = {
             let mut st = self.st.lock();
             self.dead.store(true, Ordering::Release);
             self.sk.or_shutdown(SHUTDOWN_MASK);
+            let path = self.path.lock().take();
             let state = self.state();
             self.set_state(CLOSE);
-            (state, st.take())
+            (state, st.take(), path)
         };
         self.sk.state_change();
         self.peer_wait.wake_all();

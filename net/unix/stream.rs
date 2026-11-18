@@ -153,8 +153,10 @@ fn try_connect(
     newsk.sk.set_flag(sf::PASSCRED, pass);
     newsk.sk.set_flag(sf::PASSSEC, other.sk.flag(sf::PASSSEC));
     *newsk.addr.write() = other.addr();
-    // Linux unix_stream_connect: path_get(&otheru->path)
-    *newsk.path.lock() = other.path.lock().clone();
+    // Linux unix_stream_connect: path_get(&otheru->path), the copy
+    // made before the embryo's lock (both are `UnixSock.path`, a leaf)
+    let path = other.path.lock().clone();
+    *newsk.path.lock() = path;
     let pc = other.peercred.lock().clone();
     *s.peercred.lock() = pc;
     s.set_state(ESTABLISHED);
