@@ -1932,6 +1932,59 @@ pub fn cont_write_begin(
     block_write_begin(inode, pos, len, get_block)
 }
 
+/// Zero the file from byte `from` to the end of its block in the page
+/// cache (Linux block_truncate_page), so a later grow never shows the
+/// old bytes: the block read in first if mapped and not uptodate, then
+/// dirty; nothing at a block boundary or in a hole
+pub fn block_truncate_page(
+    inode: &Inode,
+    from: u64,
+    get_block: GetBlock,
+) -> Result<(), KernelError> {
+    let blocksize = buffer_size(inode);
+    let length = (from % blocksize as u64) as usize;
+    // Block boundary? Nothing to do
+    if length == 0 {
+        return Ok(());
+    }
+    let index = from / PAGE_SIZE as u64;
+    let offset = (from % PAGE_SIZE as u64) as usize;
+    let iblock = index * (PAGE_SIZE / blocksize) as u64 + (offset / blocksize) as u64;
+    let phys = filemap::grab(&inode.i_data, index)?;
+    // SAFETY: `grab` returned it locked, held until the unlock below
+    let head = unsafe { folio_create_buffers(inode, phys, 0) };
+    let bh = ring(head)
+        .nth(offset / blocksize)
+        .expect("a page's buffers cover it");
+    let r = (|| {
+        if !bh.mapped() {
+            get_block(inode, iblock, bh, false)?;
+            // Unmapped? It's a hole - nothing to do
+            if !bh.mapped() {
+                return Ok(());
+            }
+        }
+        // Ok, it's mapped. Make sure it's up-to-date
+        if filemap::uptodate(phys) {
+            bh.set_uptodate();
+        }
+        if !bh.uptodate() {
+            lock_buffer(bh);
+            if bh.uptodate() {
+                unlock_buffer(bh);
+            } else {
+                bh_read_locked(bh, true)?;
+            }
+        }
+        zero_frame(phys, offset, blocksize - length);
+        mark_buffer_dirty(bh);
+        Ok(())
+    })();
+    crate::mm::page::unlock_page(phys);
+    filemap::put_page(phys);
+    r
+}
+
 /// Grow the file to `size` through an empty write there (Linux
 /// generic_cont_expand_simple): ->write_begin zeroes up to it and
 /// ->write_end raises i_size

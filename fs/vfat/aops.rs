@@ -126,6 +126,13 @@ pub fn fat_write_failed(inode: &Inode, to: u64) {
     let _ = fat_truncate_blocks(inode, inode.get_size());
 }
 
+/// Zero the file from `from` to the end of its block (Linux
+/// fat_block_truncate_page), before a truncate to `from`: the tail of
+/// that block on the disk never shows if the file grows again
+pub fn fat_block_truncate_page(inode: &Inode, from: u64) -> Result<(), KernelError> {
+    buffer::block_truncate_page(inode, from, fat_get_block)
+}
+
 /// A page's device and the disk runs holding its bytes
 type PageRuns = (Arc<BlockDevice>, Vec<(u64, usize)>);
 

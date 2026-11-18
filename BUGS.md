@@ -299,7 +299,8 @@ lo (hk has no checksum offload states).
   vfat_create, vfat_rename etc. take it).
 - A directory's i_size is 0 and its cluster count (`VfatInodeData.clusters`,
   Linux i_blocks) not kept (Linux: its chain length, fat_calc_dir_size),
-  so `fat_chain_add` checks only a file's count against its chain.
+  so `fat_chain_add` counts only a file's clusters (and checks them
+  against its chain).
 - No FSINFO: the free count and next-free hint are kept in memory
   only (Linux fat_set_state / fat_clusters_flush).
 

@@ -102,6 +102,30 @@ fn fat_truncate_blocks(inode: &Inode, offset: u64) -> Result<(), KernelError> {
     fat_free(&sb_data, inode, nr_clusters as usize)
 }
 
+/// Release unwritten fallocated clusters on inode eviction (Linux
+/// fat_free_eofblocks): those past mmu_private's cluster go, and the
+/// entry is written with the new chain (a file of no bytes gets no
+/// first cluster again)
+fn fat_free_eofblocks(inode: &Inode) {
+    let (Some(cs), Ok(d), Ok(mmu)) = (
+        cluster_size(inode),
+        get_inode_data(inode),
+        mmu_private(inode),
+    ) else {
+        return;
+    };
+    let cs = u64::from(cs);
+    if u64::from(d.clusters) * cs <= mmu.next_multiple_of(cs) {
+        return;
+    }
+    let _ = fat_truncate_blocks(inode, mmu);
+    if super::fs_writeback::sync_inode_metadata(inode, fatent::inode_needs_sync(inode)).is_err() {
+        crate::printkln!(
+            "FAT-fs: Failed to update on disk inode for unused fallocated blocks, inode could be corrupted. Please run fsck"
+        );
+    }
+}
+
 /// Point `inode` at the chain at `start` (Linux MSDOS_I(inode)->i_start
 /// and i_logstart)
 fn set_start(inode: &Inode, start: u32) -> Result<(), KernelError> {
@@ -1666,9 +1690,9 @@ fn entry_bh(sb_data: &VfatSbData, off: u64) -> Result<(BhRef, usize), KernelErro
 /// end of `inode`'s (Linux fat_chain_add): the last cluster's entry
 /// linked to it, synced if the inode's changes are (inode_needs_sync);
 /// with no chain yet the inode points at it, dirty (a directory on a
-/// dirsync mount synced). Then its cluster count (Linux i_blocks) adds
-/// them; a file's is checked against the chain first (a directory's is
-/// not kept: BUGS, vfat gaps).
+/// dirsync mount synced). Then a file's cluster count (Linux i_blocks),
+/// checked against the chain, adds them (a directory's is not kept:
+/// BUGS, vfat gaps).
 fn fat_chain_add(
     sb_data: &VfatSbData,
     inode: &Inode,
@@ -1693,9 +1717,11 @@ fn fat_chain_add(
     }
     let had = with_vi(inode, |v| {
         let mut d = v.d.lock();
-        let had = (!d.is_dir).then_some(d.clusters);
-        d.clusters += nr_cluster;
-        had
+        let had = d.clusters;
+        if !d.is_dir {
+            d.clusters += nr_cluster;
+        }
+        (!d.is_dir).then_some(had)
     })?;
     if let Some(had) = had.filter(|&h| h != new_fclus) {
         crate::printkln!("FAT-fs: clusters badly computed ({new_fclus} != {had})");
@@ -2153,8 +2179,9 @@ impl InodeOps for VfatInodeOps {
     /// Linux fat_evict_inode: an unlinked file's clusters are freed with
     /// its inode, at once (fat_truncate_blocks(inode, 0); the last
     /// reference goes where sleeping is allowed, as Linux iput); a linked
-    /// one's metadata buffers are written first (mmb_sync); then its list
-    /// is emptied (mmb_invalidate)
+    /// one's metadata buffers are written first (mmb_sync) and its
+    /// fallocated clusters past mmu_private freed (fat_free_eofblocks);
+    /// then its list is emptied (mmb_invalidate)
     fn evict_inode(&self, inode: &Inode) {
         if inode.get_nlink() == 0 {
             if let (Ok(d), Some(sb)) = (get_inode_data(inode), inode.superblock())
@@ -2165,6 +2192,7 @@ impl InodeOps for VfatInodeOps {
             }
         } else {
             let _ = with_mmb(inode, buffer::mmb_sync);
+            fat_free_eofblocks(inode);
         }
         let _ = with_mmb(inode, buffer::mmb_invalidate);
     }
@@ -2412,9 +2440,11 @@ impl InodeOps for VfatInodeOps {
     }
 
     /// Linux fat_setattr(ATTR_SIZE): direct I/O in flight waited for
-    /// (inode_dio_wait); growing is fat_cont_expand; shrinking drops the
-    /// pages past the end (truncate_setsize, mappings included) before
-    /// the clusters go (fat_truncate_blocks). The VFS holds i_rwsem.
+    /// (inode_dio_wait); growing is fat_cont_expand; otherwise the rest
+    /// of the new last block is zeroed (fat_block_truncate_page), the
+    /// pages past the end dropped (truncate_setsize, mappings included)
+    /// and then the clusters past it freed, fallocated ones too
+    /// (fat_truncate_blocks). The VFS holds i_rwsem.
     fn truncate(&self, inode: &InodeRef, length: u64) -> Result<(), KernelError> {
         let d = get_inode_data(inode)?;
         if d.is_dir {
@@ -2430,11 +2460,10 @@ impl InodeOps for VfatInodeOps {
         if length > old {
             return fat_cont_expand(inode, length);
         }
-        if length < old {
-            filemap::truncate_setsize(inode, length);
-            fat_truncate_blocks(inode, length)?;
-            with_vi(inode, |v| v.d.lock().file_size = length as u32)?;
-        }
+        aops::fat_block_truncate_page(inode, length)?;
+        filemap::truncate_setsize(inode, length);
+        fat_truncate_blocks(inode, length)?;
+        with_vi(inode, |v| v.d.lock().file_size = length as u32)?;
         // Linux fat_setattr: mark_inode_dirty
         super::fs_writeback::mark_inode_dirty(inode);
         Ok(())

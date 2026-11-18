@@ -3056,7 +3056,8 @@ sbi->free_clusters: counted by the first statfs,
 `i_rwsem` (write, truncate and fallocate paths), under a file page's
 lock too where fat_get_block allocates the cluster a write reaches
 (->write_begin; Linux fat_add_cluster under the folio lock: page lock
--> FAT lock), or with nothing held (eviction).
+-> FAT lock), or from an eviction (an unlinked file's chain, a linked
+one's fallocated clusters past mmu_private: fat_free_eofblocks).
 Under it the FAT's blocks are read (`bread`: page lock, buffer lock,
 block I/O) and changed in their pinned buffers, which go on the FAT
 inode's metadata list (`MappingMetadataBhs.lock`, spin leaf; Linux
@@ -3139,7 +3140,8 @@ the bytes allocated and initialized, changed only under the inode's
 `i_rwsem` (cont_write_begin's zeroing and fat_get_block's allocation
 from ->write_begin, truncate, a failed write) and read under it (the
 direct I/O checks; fat_bmap with `create`, which only the write paths
-pass for blocks past the size). An atomic only so the shared inode
+pass for blocks past the size), or by the eviction, which nothing
+else reaches (fat_free_eofblocks). An atomic only so the shared inode
 can hold it; `i_rwsem` orders every access.
 
 **Dentry** (`fs/dentry.rs`):
