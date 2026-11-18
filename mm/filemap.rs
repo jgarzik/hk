@@ -231,6 +231,12 @@ impl AddressSpace {
         (!p.is_null()).then(|| unsafe { &*p })
     }
 
+    /// Its inode's superblock `Weak`, cloned (keeps the memory, not the
+    /// superblock)
+    pub fn host_sb(&self) -> Option<alloc::sync::Weak<crate::fs::superblock::SuperBlock>> {
+        self.host().map(|i| (*i.sb).clone())
+    }
+
     /// The device number of its inode, if a device's (a block device's
     /// cache): read with the mapping borrowed
     pub fn host_rdev(&self) -> Option<crate::fs::chardev::DevId> {
@@ -879,6 +885,24 @@ pub fn mapping_set_error(inode: &Inode, e: KernelError) {
     inode.i_data.wb_err.set(e);
     if let Some(sb) = inode.superblock() {
         sb.s_wb_err.set(e);
+    }
+}
+
+/// `mapping_set_error` from any context, taking no reference: the
+/// mapping's `wb_err` and its inode's superblock's `s_wb_err`, reached
+/// through the inode's `Weak` (`superblock::sb_wb_err_set`; Linux
+/// mapping_set_error from a bio completion)
+///
+/// # Safety
+/// The mapping's inode has not dropped its superblock `Weak` (its
+/// teardown is not past `destroy_inode` dropping its `i_data`): the
+/// caller holds a reference, or a locked buffer of a page still in the
+/// mapping (the teardown's truncate waits for every buffer's lock,
+/// `discard_buffer`, before `i_data` is gone).
+pub unsafe fn mapping_set_error_raw(m: &AddressSpace, e: KernelError) {
+    m.wb_err.set(e);
+    if let Some(h) = m.host() {
+        crate::fs::superblock::sb_wb_err_set(&h.sb, e);
     }
 }
 

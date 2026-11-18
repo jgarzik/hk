@@ -703,26 +703,46 @@ fn bh_end_async_write(bio: Box<Bio>) {
 
 /// A write of the buffer failed (Linux mark_buffer_write_io_error):
 /// BH_Write_EIO, and EIO on its page's mapping and on the mapping of
-/// the list it is on. Any context (a bio completion): the mappings are
-/// reached under an RCU read guard and get the error on their
-/// `wb_err`; the superblock's `s_wb_err` gets it from the thread that
-/// sees the failure (`filemap::write_range` on ->writepage's error),
-/// since reaching the superblock takes a reference hardirq cannot drop
+/// the list it is on, each on its `wb_err` and its superblock's
+/// `s_wb_err` (Linux mapping_set_error). Any context (a bio
+/// completion): the mappings are reached under an RCU read guard and
+/// the superblocks without a reference (`filemap::mapping_set_error_raw`)
 pub fn mark_buffer_write_io_error(bh: &BufferHead) {
     bh.set(BH_WRITE_EIO);
     let g = crate::sync::rcu::read_lock();
     if let Some(m) = filemap::folio_mapping(bh.folio(), &g) {
-        m.wb_err.set(KernelError::Io);
+        if bh.locked() {
+            // SAFETY: a locked buffer of a page in `m`: the teardown of
+            // `m`'s inode waits for its lock before it drops `i_data`,
+            // then its superblock `Weak`
+            unsafe { filemap::mapping_set_error_raw(m, KernelError::Io) };
+        } else if let Some(i) = filemap::host_igrab(m) {
+            // Not under I/O: a caller in thread context (an unlocked
+            // buffer pins no inode), with a reference taken
+            // SAFETY: the reference keeps the inode whole
+            unsafe { filemap::mapping_set_error_raw(&i.i_data, KernelError::Io) };
+            drop(g);
+            drop(i);
+            return mmb_set_error(bh);
+        }
     }
+    drop(g);
+    mmb_set_error(bh);
+}
+
+/// EIO on the mapping and superblock of the list the buffer is on
+/// (mark_buffer_write_io_error's mmb->mapping part)
+fn mmb_set_error(bh: &BufferHead) {
+    let _g = crate::sync::rcu::read_lock();
     let mmb = bh.b_mmb.load(Ordering::Acquire);
-    // SAFETY: a listed buffer's list is alive, and is freed a grace
-    // period after its last buffer leaves it (`mmb_mark_buffer_dirty`'s
-    // contract); this read is inside an RCU read section
+    // SAFETY: a listed buffer's list is alive: its drop empties it, then
+    // waits a grace period (`Drop for MappingMetadataBhs`), and this
+    // read is inside an RCU read section
     if let Some(mmb) = unsafe { mmb.as_ref() } {
         // SAFETY: the list's mapping outlives it (`MappingMetadataBhs::new`)
         unsafe { &*mmb.mapping }.wb_err.set(KernelError::Io);
+        crate::fs::superblock::sb_wb_err_set(&mmb.sb, KernelError::Io);
     }
-    drop(g);
 }
 
 // ============================================================================
@@ -1920,6 +1940,12 @@ pub struct MappingMetadataBhs {
     list: AssocHead,
     /// The mapping whose fsync writes them (Linux mmb->mapping)
     mapping: *const AddressSpace,
+    /// Its inode's superblock, for a write error's `s_wb_err` from a
+    /// completion (Linux mmb->mapping->host->i_sb): kept until the
+    /// list's drop has waited out every reader
+    sb: Weak<SuperBlock>,
+    /// A buffer was ever on it: its drop waits a grace period
+    used: core::sync::atomic::AtomicBool,
 }
 
 // SAFETY: the links are atomics changed only under `lock`; `mapping`
@@ -1935,17 +1961,26 @@ impl MappingMetadataBhs {
     /// `mapping` outlives the list (it is the inode's own, the list in
     /// the inode).
     pub unsafe fn new(mapping: &AddressSpace) -> Self {
+        let sb = mapping.host_sb().unwrap_or_default();
         Self {
             lock: crate::sync::spin::Mutex::new(()),
             list: AssocHead::new(),
             mapping,
+            sb,
+            used: core::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 impl Drop for MappingMetadataBhs {
+    /// Emptied, then a grace period, so a completion that read a
+    /// buffer's `b_mmb` before is done with it before the memory and the
+    /// superblock `Weak` go (Linux: the inode holding it is freed by RCU)
     fn drop(&mut self) {
         mmb_invalidate(self);
+        if self.used.load(Ordering::Relaxed) {
+            crate::sync::rcu::synchronize();
+        }
     }
 }
 
@@ -1989,8 +2024,9 @@ pub fn mmb_has_buffers(mmb: &MappingMetadataBhs) -> bool {
 ///
 /// # Safety
 /// `mmb` stays at its address while buffers are on it, and its memory
-/// is freed only a grace period after it was emptied (dropped or
-/// `mmb_invalidate`; Linux frees the inode holding it by RCU).
+/// is freed only by its drop (which waits a grace period) or a grace
+/// period after an `mmb_invalidate` (Linux frees the inode holding it
+/// by RCU).
 pub unsafe fn mmb_mark_buffer_dirty(bh: &BufferHead, mmb: &MappingMetadataBhs) {
     mark_buffer_dirty(bh);
     if !bh.b_mmb.load(Ordering::Acquire).is_null() {
@@ -2006,6 +2042,7 @@ pub unsafe fn mmb_mark_buffer_dirty(bh: &BufferHead, mmb: &MappingMetadataBhs) {
     {
         return;
     }
+    mmb.used.store(true, Ordering::Relaxed);
     // SAFETY: under the list's lock, `bh` on no list (b_mmb was null);
     // the list stays put while it holds buffers (the caller's contract)
     unsafe { mmb.list.add_tail(&bh.b_assoc_buffers) };

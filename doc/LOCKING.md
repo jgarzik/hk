@@ -2733,6 +2733,15 @@ after it is zeroed on the disk.)
   `mark_buffer_write_io_error`): the list's memory is freed a grace
   period after its last buffer left (`mmb_mark_buffer_dirty`'s
   contract, Linux's RCU-freed inode).
+- A write error (`mark_buffer_write_io_error`, from the completion)
+  reaches the page's mapping and its superblock's `s_wb_err` with no
+  reference taken (`filemap::mapping_set_error_raw`): the buffer is
+  locked, and an inode's teardown waits for every buffer lock of its
+  pages (truncation's discard_buffer) before it drops `i_data` and
+  then its superblock `Weak`, which keeps the superblock's memory
+  (`s_wb_err` has no drop glue). A list's (`MappingMetadataBhs`)
+  mapping and superblock likewise: its drop empties it, then waits a
+  grace period before its `Weak` goes.
 - `mark_buffer_dirty` never sleeps: the page's mapping is reached under
   an RCU read guard (`filemap::folio_mapping`: a mapping is part of an
   inode freed by RCU) for its count and DIRTY mark (`i_pages`); the
@@ -6219,8 +6228,10 @@ is `SCHED:FAIL scheduling while atomic`).
   (`IrqSpinlock` -> wait queue wakeup); the lock-free DMA API unmaps
 - Buffer head completion (`fs/buffer.rs` bh_end_*): the buffer's bits,
   the ring's `b_uptodate_lock` (IrqSpinlock leaf), the page's flags,
-  the buffer's and the page's wait queues, and, under an RCU read
-  guard, the mapping's `wb_err` (an atomic errseq) on a write error
+  the buffer's and the page's wait queues, and on a write error, under
+  an RCU read guard, the mapping's `wb_err` and its superblock's
+  `s_wb_err` (atomic errseqs; the superblock reached through the
+  inode's `Weak`, no reference taken: `superblock::sb_wb_err_set`)
 - AIO completion (a bio's end of an AIO request): `Kioctx.comp`
   (IrqSpinlock) to post the event into the shared ring, then the
   request's eventfd (`Eventfd.inner`), the io_getevents wakeup and the

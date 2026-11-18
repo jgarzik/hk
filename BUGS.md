@@ -724,13 +724,6 @@ fat_zeroed_cluster zeroes the buffers (sb_getblk, mark_buffer_dirty).
   per-CPU LRU of another CPU, a holder) leaves its mapping with its
   buffers and its frame (Linux frees both later in shrink_folio_list,
   from the file LRU, which hk lacks: Memory management gaps).
-- A write error in a bio's completion (`mark_buffer_write_io_error`,
-  hardirq) reaches the mapping's `wb_err` only; the superblock's
-  `s_wb_err` (syncfs) gets it when the thread that sees the failure
-  records it (`filemap::write_range` on ->writepage's EIO), not from
-  sync_dirty_buffer's or mmb_sync's EIO (Linux mapping_set_error sets
-  both in the completion: hk reaches the superblock through a `Weak`,
-  whose reference hardirq cannot drop).
 - hk's folios are a page: a block device's soft block size above a
   page (BLKBSZSET up to 64K) gives its cache page-sized buffers, and
   bdev_getblk of such a block is EINVAL (Linux makes large folios of

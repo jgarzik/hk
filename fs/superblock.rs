@@ -3,7 +3,7 @@
 //! Each mounted filesystem has a superblock that holds filesystem-wide
 //! state and provides operations for managing inodes.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::{Mutex, RwLock};
 use crate::sync::{LockedBy, UniqueOwner};
@@ -1127,6 +1127,31 @@ pub struct SuperBlock {
 
 use super::inode::AsAny;
 
+/// A superblock's `s_wb_err` stays a valid atomic after the value is
+/// dropped (its last passive reference), while a `Weak` keeps the
+/// memory: `sb_wb_err_set`
+const _: () = assert!(!core::mem::needs_drop::<crate::util::errseq::ErrSeq>());
+
+/// Record a writeback error on the superblock `sb` names, taking no
+/// reference (Linux errseq_set(&inode->i_sb->s_wb_err), any context: a
+/// bio's completion in hardirq, where dropping a reference could free
+/// the superblock). An inode names its superblock by such a `Weak`,
+/// which keeps the memory until the inode's teardown drops it; a
+/// superblock already shut down takes the error harmlessly. A `Weak`
+/// of no superblock (`Weak::new`) does nothing.
+pub fn sb_wb_err_set(sb: &Weak<SuperBlock>, e: KernelError) {
+    if Weak::ptr_eq(sb, &Weak::new()) {
+        return;
+    }
+    let p = Weak::as_ptr(sb);
+    // SAFETY: the live `Weak` keeps the allocation (ArcInner) of a real
+    // superblock; `s_wb_err` is an atomic with no drop glue (asserted
+    // above), so its bytes stay a valid `ErrSeq` even once the value was
+    // dropped, and only atomic operations touch it
+    let err = unsafe { &(*p).s_wb_err };
+    err.set(e);
+}
+
 /// Largest file offset on a 64-bit kernel (Linux MAX_LFS_FILESIZE,
 /// LLONG_MAX): the default `s_maxbytes`
 pub const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
@@ -1516,6 +1541,22 @@ mod tests {
     }
 
     static EVICT_OPS: EvictOps = EvictOps;
+
+    /// A buffer write error reaches s_wb_err through the inode's `Weak`
+    /// with no reference taken (syncfs reports it), and harmlessly once
+    /// the superblock's last passive reference went
+    #[test]
+    fn wb_err_through_weak() {
+        let sb = alloc_super(&T1, &NULL_SUPER_OPS, 0).unwrap();
+        let since = sb.s_wb_err.sample();
+        let w = Arc::downgrade(&sb);
+        sb_wb_err_set(&w, KernelError::Io);
+        assert_eq!(sb.s_wb_err.check(since), Some(KernelError::Io));
+        assert_eq!(Arc::strong_count(&sb), 1);
+        destroy_unused_super(sb);
+        sb_wb_err_set(&w, KernelError::Io);
+        sb_wb_err_set(&Weak::new(), KernelError::Io);
+    }
 
     /// A root directory whose eviction `EvictOps` checks
     fn t_fill(sb: &Arc<SuperBlock>, ops: &'static dyn InodeOps) -> Result<(), KernelError> {
