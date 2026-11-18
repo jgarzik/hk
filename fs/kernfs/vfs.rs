@@ -68,8 +68,7 @@ fn sb_ns(inode: &Inode) -> u64 {
     let Some(sb) = inode.superblock() else {
         return 0;
     };
-    let Some(p) = sb.get_private() else { return 0 };
-    p.as_any().downcast_ref::<KfSuper>().map_or(0, |k| k.ns)
+    sb.fs_info_as::<KfSuper>().map_or(0, |k| k.ns)
 }
 
 /// The node behind `inode`

@@ -401,8 +401,7 @@ impl crate::fs::superblock::SuperBlockData for FsInfo {}
 
 /// `f` on the superblock's options
 fn with_fsi<R>(sb: &SuperBlock, f: impl FnOnce(&FsInfo) -> R) -> Option<R> {
-    let p = sb.get_private()?;
-    p.as_any().downcast_ref::<FsInfo>().map(f)
+    sb.fs_info_as::<FsInfo>().map(f)
 }
 
 /// Linux tracefs_apply_options(sb, true): the root's mode, owner and
@@ -498,7 +497,7 @@ fn tracefs_d_delete(_: &Dentry) -> bool {
 fn fill_super(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
     sb.set_d_op(&TRACEFS_DOPS);
     let fsi = FsInfo(SpinMutex::new((0, 0, TRACEFS_DEFAULT_MODE)));
-    sb.set_private(try_arc(fsi)?);
+    sb.set_fs_info(try_arc(fsi)?);
     let mode = InodeMode::directory(TRACEFS_DEFAULT_MODE);
     let ri = new_inode(Arc::downgrade(sb), 1, mode, (0, 0), (None, None))?;
     sb.set_root(DentryRef::new(Dentry::new_root(ri, Arc::downgrade(sb)))?);

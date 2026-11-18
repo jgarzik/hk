@@ -815,9 +815,7 @@ impl crate::fs::superblock::SuperBlockData for CgSuper {}
 /// Whether `sb` shows the hierarchy `root` (Linux kernfs_test_super:
 /// the same kernfs root and namespace tag)
 fn shows(sb: &SuperBlock, root: &Arc<crate::cgroup::CgroupRoot>) -> bool {
-    let p = sb.private.read();
-    p.as_ref()
-        .and_then(|p| p.as_any().downcast_ref::<CgSuper>())
+    sb.fs_info_as::<CgSuper>()
         .is_some_and(|c| Arc::ptr_eq(&c.root, root))
 }
 
@@ -834,7 +832,7 @@ fn cgroupfs_mount(
     let test = |sb: &SuperBlock| shows(sb, &root);
     let sb = crate::fs::superblock::sget(fc, &CGROUPFS_SUPER_OPS, Some(&test), &|sb| {
         // Linux kernfs_set_super
-        sb.set_private(info.clone());
+        sb.set_fs_info(info.clone());
         crate::fs::superblock::set_anon_super(sb)
     })?;
     if !sb.has_root() {
@@ -934,12 +932,10 @@ fn cgroupfs_fill(sb: &Arc<SuperBlock>) -> Result<(), KernelError> {
 }
 
 /// cgroup2's kill_sb (Linux cgroup_kill_sb, ending in kernfs_kill_sb:
-/// kill_anon_super, then the kernfs info freed; the default hierarchy
-/// is never killed)
+/// kill_anon_super, the kernfs info going with the superblock's
+/// memory; the default hierarchy is never killed)
 fn cgroup_kill_sb(sb: &SuperBlock, g: crate::fs::superblock::SbUmount<'_>) {
     crate::fs::superblock::kill_anon_super(sb, g);
-    let info = sb.private.write().take();
-    drop(info);
 }
 
 /// Cgroupfs filesystem type

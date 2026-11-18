@@ -437,8 +437,10 @@ const SB_ACTIVE: u32 = 1 << 30;
 /// The last passive reference is gone (Linux put_super's final part):
 /// off super_blocks and its type's fs_supers (the lists' contract,
 /// `WeakList`: no walker reaches it once its fields start to go), then
-/// its memory. The filesystem was shut down already, by its last active
-/// reference ([`SbActive`]), so nothing here sleeps; it takes sb_lock,
+/// its memory, its `s_fs_info` with it. The filesystem was shut down
+/// already, by its last active reference ([`SbActive`]), its
+/// ->put_super taking out of `s_fs_info` what sleeps to release, so
+/// nothing here sleeps; it takes sb_lock,
 /// so a passive reference is never dropped under it.
 impl Drop for SuperBlock {
     fn drop(&mut self) {
@@ -1099,8 +1101,12 @@ pub struct SuperBlock {
     /// it makes inodes. Read lock-free.
     s_blocksize_bits: core::sync::atomic::AtomicU8,
 
-    /// Filesystem-specific private data
-    pub private: RwLock<Option<Arc<dyn SuperBlockData>>>,
+    /// Its filesystem's data (Linux s_fs_info): set once, by its fill
+    /// or sget's set, then fixed and freed with the superblock's memory,
+    /// so whoever borrows the superblock reads it with no lock or
+    /// count (Linux MSDOS_SB(sb) etc.). What must go at the shutdown
+    /// (an inode, a device) the filesystem's ->put_super takes out
+    s_fs_info: spin::Once<Arc<dyn SuperBlockData>>,
 
     /// The block device a device filesystem is mounted from (Linux
     /// s_bdev): a reference to the device, not an open
@@ -1193,7 +1199,7 @@ impl SuperBlock {
             s_dev: AtomicU32::new(0),
             s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
             s_blocksize_bits: core::sync::atomic::AtomicU8::new(crate::mm::page::PAGE_SHIFT as u8),
-            private: RwLock::new(None),
+            s_fs_info: spin::Once::new(),
             s_bdev: spin::Once::new(),
             s_bdev_file: Mutex::new(None),
             s_inodes: super::inode::sb_inodes(),
@@ -1435,14 +1441,29 @@ impl SuperBlock {
         self.s_bdev.get()
     }
 
-    /// Set filesystem-specific private data
-    pub fn set_private(&self, data: Arc<dyn SuperBlockData>) {
-        *self.private.write() = Some(data);
+    /// Give it its filesystem's data (Linux sb->s_fs_info = ...): once,
+    /// before anything reads it
+    pub fn set_fs_info(&self, data: Arc<dyn SuperBlockData>) {
+        let mut d = Some(data);
+        self.s_fs_info
+            .call_once(|| d.take().expect("superblock: set_fs_info"));
+        debug_assert!(d.is_none(), "superblock: fs info set twice");
     }
 
-    /// Get filesystem-specific private data
-    pub fn get_private(&self) -> Option<Arc<dyn SuperBlockData>> {
-        self.private.read().clone()
+    /// Its filesystem's data, if set (Linux sb->s_fs_info)
+    pub fn fs_info(&self) -> Option<&dyn SuperBlockData> {
+        self.s_fs_info.get().map(|d| &**d)
+    }
+
+    /// A reference to its filesystem's data, for what outlives the
+    /// borrow (an inode's RCU-read copy of procfs's options)
+    pub fn fs_info_arc(&self) -> Option<Arc<dyn SuperBlockData>> {
+        self.s_fs_info.get().cloned()
+    }
+
+    /// Its filesystem's data as a `T`; None if unset or another type
+    pub fn fs_info_as<T: 'static>(&self) -> Option<&T> {
+        self.fs_info()?.as_any().downcast_ref::<T>()
     }
 }
 

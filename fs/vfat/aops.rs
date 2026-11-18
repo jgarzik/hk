@@ -16,7 +16,7 @@ use crate::mm::filemap::{self, AddressSpace, Aops};
 use crate::util::error::KernelError;
 
 use super::fatent::{fat_alloc_clusters, fat_free_clusters};
-use super::{VfatSbData, cache, fat_chain_add, fat_truncate_blocks, with_sbi, with_vi};
+use super::{VfatSbData, cache, fat_chain_add, fat_truncate_blocks, msdos_sb, with_vi};
 
 /// A vfat file's page cache I/O (Linux fat_aops)
 pub struct VfatAops;
@@ -103,9 +103,8 @@ pub fn fat_get_block(
     let bits = inode.blkbits();
     let mut max_blocks = (bh.size() >> bits) as u64;
     let sb = inode.superblock().ok_or(KernelError::Io)?;
-    with_sbi(&sb, |sbi| {
-        fat_map_blocks((&sb, sbi), inode, iblock, &mut max_blocks, bh, create)
-    })??;
+    let sbi = msdos_sb(&sb)?;
+    fat_map_blocks((&sb, sbi), inode, iblock, &mut max_blocks, bh, create)?;
     bh.set_size((max_blocks << bits) as usize);
     Ok(())
 }
@@ -122,7 +121,7 @@ fn fat_get_block_bmap(
     let sb = inode.superblock().ok_or(KernelError::Io)?;
     let bits = inode.blkbits();
     let mut max_blocks = (bh.size() >> bits) as u64;
-    let (bmap, mapped) = with_sbi(&sb, |sbi| cache::fat_bmap(sbi, inode, iblock, false, true))??;
+    let (bmap, mapped) = cache::fat_bmap(msdos_sb(&sb)?, inode, iblock, false, true)?;
     if bmap != 0 {
         buffer::map_bh(bh, &sb, bmap)?;
         max_blocks = max_blocks.min(mapped);

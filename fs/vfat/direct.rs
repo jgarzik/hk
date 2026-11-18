@@ -49,6 +49,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::block::dio::{self, AsyncIo, Extent};
+use crate::fs::SuperBlock;
 use crate::fs::file::{File, RwFlags};
 use crate::fs::inode::{Inode, InodeRef};
 use crate::fs::iov_iter::{IovDest, IovSource};
@@ -61,7 +62,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
 use super::aops::{fat_get_block, fat_write_failed};
-use super::{VfatSbData, get_sb_data, mmu_private, vfat_write};
+use super::{VfatSbData, mmu_private, msdos_sb, vfat_write};
 
 /// Last byte of `count` (> 0) bytes at `pos`
 fn last(pos: u64, count: usize) -> u64 {
@@ -130,9 +131,8 @@ fn map(
 }
 
 /// The filesystem of `inode`
-fn sb_of(inode: &Inode) -> Result<VfatSbData, KernelError> {
-    let sb = inode.superblock().ok_or(KernelError::Io)?;
-    get_sb_data(&sb)
+fn sb_of(inode: &Inode) -> Result<Arc<SuperBlock>, KernelError> {
+    inode.superblock().ok_or(KernelError::Io)
 }
 
 /// O_DIRECT read of `to` at `pos` (Linux generic_file_read_iter with
@@ -166,8 +166,9 @@ fn direct_read(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize, K
     if pos >= size {
         return Ok(0);
     }
-    let sb = sb_of(inode)?;
-    let bs = blocksize(&sb, pos, to.alignment())?;
+    let s = sb_of(inode)?;
+    let sb = msdos_sb(&s)?;
+    let bs = blocksize(sb, pos, to.alignment())?;
     filemap::write_and_wait_range(inode, pos, last(pos, count))?;
     // The block holding the last byte is read whole (Linux: up to
     // i_size aligned to the block)
@@ -234,8 +235,9 @@ fn direct_write(
     if mmu_private(inode)? < end {
         return Ok(0);
     }
-    let sb = sb_of(inode)?;
-    let r = blocksize(&sb, pos, from.alignment())
+    let s = sb_of(inode)?;
+    let sb = msdos_sb(&s)?;
+    let r = blocksize(sb, pos, from.alignment())
         .and_then(|_| map(inode, pos, count, true))
         .and_then(|m| match m {
             Some(m) => {
@@ -476,8 +478,9 @@ fn read_async(
     if pos >= size {
         return Ok(Some(0));
     }
-    let sb = sb_of(inode)?;
-    let bs = blocksize(&sb, pos, IovDest::async_io(&*io).alignment())?;
+    let s = sb_of(inode)?;
+    let sb = msdos_sb(&s)?;
+    let bs = blocksize(sb, pos, IovDest::async_io(&*io).alignment())?;
     filemap::write_and_wait_range(inode, pos, last(pos, count))?;
     let len = (size.next_multiple_of(bs) - pos).min(count as u64) as usize;
     let m = map(inode, pos, len, false)?.ok_or(KernelError::Io)?;
@@ -513,7 +516,8 @@ fn write_async(
         return sync(&*io);
     }
     let lock = inode.lock();
-    let sb = sb_of(inode)?;
+    let s = sb_of(inode)?;
+    let sb = msdos_sb(&s)?;
     let end = pos
         .checked_add(count as u64)
         .ok_or(KernelError::InvalidArgument)?;
@@ -522,7 +526,7 @@ fn write_async(
         && mmu_private(inode)? >= end
         && inode.i_data.nrpages() == 0
         && inode.write_limit(pos, count) == Ok(count)
-        && blocksize(&sb, pos, IovSource::async_io(&*io).alignment()).is_ok();
+        && blocksize(sb, pos, IovSource::async_io(&*io).alignment()).is_ok();
     if !fits {
         drop(lock);
         return sync(&*io);

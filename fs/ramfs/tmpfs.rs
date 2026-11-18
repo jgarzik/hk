@@ -165,8 +165,7 @@ impl AsAny for ShmemSb {
 
 /// `f` on `sb`'s tmpfs data; None if `sb` is not a tmpfs
 pub fn with<R>(sb: &SuperBlock, f: impl FnOnce(&ShmemSb) -> R) -> Option<R> {
-    let p = sb.get_private()?;
-    p.as_ref().as_any().downcast_ref::<ShmemSb>().map(f)
+    sb.fs_info_as::<ShmemSb>().map(f)
 }
 
 /// The block limit of tmpfs `sb` (0: none); None if not a tmpfs
@@ -463,13 +462,6 @@ impl SuperOps for TmpfsSuperOps {
     fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
         with(sb, |t| t.show(out));
     }
-
-    /// Its limits and accounting go (Linux shmem_put_super: the
-    /// sbinfo freed)
-    fn put_super(&self, sb: &SuperBlock) {
-        let info = sb.private.write().take();
-        drop(info);
-    }
 }
 
 pub static TMPFS_SUPER_OPS: TmpfsSuperOps = TmpfsSuperOps;
@@ -540,7 +532,7 @@ pub(crate) fn tmpfs_mount(
     let t = try_arc(ShmemSb::new(&o)?)?;
     crate::fs::superblock::get_tree_nodev(fc, &TMPFS_SUPER_OPS, |sb| {
         let (mode, uid, gid) = (t.mode, t.uid, t.gid);
-        sb.set_private(t);
+        sb.set_fs_info(t);
         super::fill_root(sb, mode, uid, gid)
     })
 }

@@ -311,12 +311,11 @@ lo (hk has no checksum offload states).
   against its chain).
 - No FSINFO: the free count and next-free hint are kept in memory
   only (Linux fat_set_state / fat_clusters_flush).
-- `fs/superblock.rs` `SuperBlock.private` sits behind a spin `RwLock`,
-  so every reach of a filesystem's data (vfat `with_sbi`, once per
-  fat_get_block) takes it and an `Arc` count, and the inode's `sb`
-  `Weak` is upgraded too; Linux MSDOS_SB(inode->i_sb) is two plain
-  pointer loads (s_fs_info is set at fill_super, freed after the last
-  inode).
+- `fs/inode.rs` `Inode.sb` is a `Weak` (an inode may be evicted after
+  its superblock's shutdown), so every reach of a filesystem's data
+  from an inode (vfat `fat_get_block`'s `superblock()`) upgrades it,
+  an `Arc` count; Linux MSDOS_SB(inode->i_sb) is two plain pointer
+  loads.
 
 ## O_DIRECT gaps
 

@@ -194,8 +194,7 @@ impl ProcOpts {
 
 /// `f` on the options of the procfs superblock `sb`
 pub fn with_sb<R>(sb: &SuperBlock, f: impl FnOnce(&ProcOpts) -> R) -> Option<R> {
-    let p = sb.get_private()?;
-    p.as_any().downcast_ref::<ProcOpts>().map(f)
+    sb.fs_info_as::<ProcOpts>().map(f)
 }
 
 /// `f` on the options of the procfs superblock `inode` is on
