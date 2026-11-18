@@ -23,6 +23,7 @@ use hk_syscall::{
 
 const O_DIRECT: u32 = hk_syscall::O_DIRECT;
 const EINVAL: i64 = -22;
+const EBUSY: i64 = -16;
 const MNT: &[u8] = b"/tmp/vfat_dio\0";
 const UNIT: usize = 512;
 const MIB: usize = 1 << 20;
@@ -496,7 +497,9 @@ fn write_short() -> R {
 /// A vfat file is a swap area (Linux generic_swapfile_activate over
 /// fat's ->bmap: its page-aligned runs of blocks, written straight to
 /// the disk): anonymous pages paged out to it come back intact, before
-/// and after swapoff
+/// and after swapoff. The area is its file, whatever path names it
+/// (Linux: IS_SWAPFILE under the inode lock, swapoff by f_mapping):
+/// swapon by another spelling is EBUSY, swapoff by one works.
 fn swapfile_io() -> R {
     const PAGES: usize = 256;
     const ANON: usize = 64;
@@ -510,9 +513,15 @@ fn swapfile_io() -> R {
     put(b"SWAP.BIN", b.bytes(0, PAGES * 4096))?;
     let mut p = [0u8; 64];
     path(b"SWAP.BIN", &mut p);
+    // The same file through "//"
+    let mut q = [0u8; 64];
+    path(b"/SWAP.BIN", &mut q);
     let on = swap_on(&p);
+    let mut again = -1;
     let r = (|| {
         check(b"swapon", on == 0, on)?;
+        again = swap_on(&q);
+        check(b"swapon other path", again == EBUSY, again)?;
         let a = Buf::new(ANON * 4096)?;
         let word = |i: usize| (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let words = |a: &Buf| {
@@ -533,8 +542,8 @@ fn swapfile_io() -> R {
             .position(|(i, &w)| w != word(i));
         check(b"data", bad.is_none(), bad.map_or(0, |i| i as i64))?;
         sys_madvise(a.at, (ANON * 4096) as u64, MADV_PAGEOUT);
-        let off = swap_off(&p);
-        check(b"swapoff", off == 0, off)?;
+        let off = swap_off(&q);
+        check(b"swapoff other path", off == 0, off)?;
         let bad = words(&a)
             .iter()
             .enumerate()
@@ -546,6 +555,9 @@ fn swapfile_io() -> R {
         )
     })();
     if on == 0 && r.is_err() {
+        swap_off(&p);
+    }
+    if again == 0 {
         swap_off(&p);
     }
     sys_unlink(p.as_ptr());

@@ -2277,10 +2277,17 @@ pub struct Zone {
   spinlock only `trylock_page` (zap, a write fault's swap-cache reuse).
   I/O happens under the page lock, never under a spinlock.
 - `SWAP_INFO` (spin `RwLock`, read mostly): the devices; `SWAPON`
-  (sleeping `Mutex`, Linux swapon_mutex) serializes swapon/swapoff.
-  swapon holds the swap file's (or device inode's) `i_rwsem` from the
-  extents' mapping to S_SWAPFILE (Linux swapon's inode_lock):
-  `SWAPON` -> `i_rwsem` -> page and buffer locks (->bmap's FAT reads).
+  (sleeping `Mutex`, Linux swapon_mutex) serializes swapon/swapoff
+  whole (deviation: Linux reserves the type under swap_lock,
+  alloc_swap_info, and takes swapon_mutex only around enable and
+  teardown, after inode_lock: i_rwsem -> swapon_mutex). swapon holds
+  the mapping host's `i_rwsem` (the swap file's inode, or the device's
+  bdev inode; Linux swapon's inode_lock) from the IS_SWAPFILE check
+  (EBUSY, whatever path names the file) through the header's read
+  (page cache), the extents' mapping, S_SWAPFILE and the write-back
+  that follows it (inode_drain_writes) to the area's publication:
+  `SWAPON` -> `i_rwsem` -> invalidate_lock -> page and buffer locks
+  (the header read, ->bmap's FAT reads).
   swapoff (`try_to_unuse`) clears SWP_WRITEOK, then walks `MMLIST`
   and faults the device's swap PTEs of each address space in, its
   mmap_lock held for reading.
@@ -6020,7 +6027,7 @@ list taken whole under its lock) takes the marks out under `Marks.list`, release
 | `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
 | `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `Inode.i_flags` | fs/inode.rs | atomic word (fetch_or / fetch_and: bits of different writers share it, Linux inode_set_flags' cmpxchg) | S_DEAD (set by rmdir or a replacing rename under the directory's `i_rwsem`), S_SWAPFILE (set and cleared by swapon/swapoff), I_LINKABLE (an O_TMPFILE file not opened O_EXCL may get its first name, Linux i_state under i_lock: set before the file is reachable, tested and cleared by linkat under the inode's `i_rwsem`, `link_locked`); read lock-free |
-| `Inode.i_writecount`, `Inode.i_flags` S_SWAPFILE | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
+| `Inode.i_writecount`, `Inode.i_flags` S_SWAPFILE | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write` through a file's `DenyWrite`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: tested, set and cleared by swapon/swapoff
 under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
 writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
 | `BdiWriteback.pass` | mm/writeback.rs, fs/pageio/fs_writeback.rs | sleeping `sync::Mutex` | serializes writeback passes over one disk's lists (`wb_writeback`: sync, syncfs, a superblock's shutdown and vfat's remount (under its s_umount write), the periodic writeback; Linux runs them one at a time from the wb's work list), held across their I/O: pass -> page lock -> i_mmap -> PTE lock, and `list_lock` taken and released under it per step; an inode's metadata is written under it after its pages (`__writeback_single_inode` -> ->write_inode: pass -> the device's page cache (vfat's entry block, bread) -> vfat `VfatSbData.ipos` (spin); a sync(2)/syncfs pass is for_sync, so no ->sync_inode_metadata under it), a data-integrity pass sleeps under it on an inode another writer has (I_SYNC: that writer takes no `pass`), and an inode's last reference may go under it (eviction, which may write that inode back first). fsync and the write-back before an eviction write an inode without it (`writeback_single_inode`), under I_SYNC |
