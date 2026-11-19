@@ -17,12 +17,17 @@
 //!
 //! ## Locking
 //!
-//! `IcmpRate.st` (`crate::sync::spin::Mutex`, per namespace, thread only) is a leaf
-//! taken around the token-bucket arithmetic only.
+//! The global credit is two atomics, updated lock-free (Linux
+//! icmp_global_allow: a stamp compare-exchange, then the credit).
+//! `IcmpRate.peers` (`crate::sync::spin::Mutex`, per namespace, thread
+//! only; Linux inet_peer_base.lock) is a leaf over the peer tree: a new
+//! peer's node is allocated GFP_ATOMIC under it, as Linux inet_getpeer
+//! does, and peers collected by the walk's GC are freed after it.
 
 use crate::mm::page_alloc::Gfp;
-use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+use crate::util::rbtree::{RbTree, RbTreeNode, RbTreeNodeReservation};
 
 use crate::sync::spin::Mutex;
 
@@ -130,20 +135,23 @@ pub fn unreach_err(code: u8) -> (crate::util::error::KernelError, bool) {
 // Rate limiting (pure token buckets + per-namespace state)
 // ============================================================================
 
-/// Global credit (Linux icmp_global_allow / icmp_global_consume), ms
-#[derive(Clone, Copy, Debug, Default)]
+/// Global credit (Linux net->ipv4.icmp_global_credit and _stamp), ms
+#[derive(Debug, Default)]
 pub struct Global {
-    pub credit: i64,
-    pub stamp: u64,
+    credit: AtomicI64,
+    stamp: AtomicU64,
 }
 
 impl Global {
-    /// May an error go out now?
-    pub fn allow(&mut self, now: u64, per_sec: i64, burst: i64) -> bool {
-        if self.credit > 0 {
+    /// May an error go out now? (Linux icmp_global_allow: many CPUs may
+    /// find credit at once and overspend it, an accepted race; one
+    /// refill per stamp, won by compare-exchange)
+    pub fn allow(&self, now: u64, per_sec: i64, burst: i64) -> bool {
+        if self.credit.load(Ordering::Relaxed) > 0 {
             return true;
         }
-        let delta = now.saturating_sub(self.stamp).min(1000);
+        let old = self.stamp.load(Ordering::Relaxed);
+        let delta = now.saturating_sub(old).min(1000);
         if delta < 20 {
             return false;
         }
@@ -151,14 +159,24 @@ impl Global {
         if incr == 0 {
             return false;
         }
-        self.stamp = now;
-        self.credit = (self.credit + incr).min(burst);
+        if self
+            .stamp
+            .compare_exchange(old, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let _ = self
+                .credit
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some((c + incr).min(burst))
+                });
+        }
         true
     }
 
-    /// An error was sent: spend 0..2 credits (random, like Linux)
-    pub fn consume(&mut self, credits: i64) {
-        self.credit -= credits;
+    /// An error was sent: spend `credits` (Linux icmp_global_consume:
+    /// may go negative)
+    pub fn consume(&self, credits: i64) {
+        self.credit.fetch_sub(credits, Ordering::Relaxed);
     }
 }
 
@@ -195,26 +213,42 @@ impl XrLim {
     }
 }
 
-/// Peers remembered for rate limiting (least recently used evicted)
-const MAX_PEERS: usize = 256;
-
-struct RateState {
-    global: Global,
-    peers: BTreeMap<Ipv4Addr, XrLim>,
+/// A peer (Linux struct inet_peer: its rate limiter and dtime, the
+/// last use, in ms)
+struct Peer {
+    lim: XrLim,
+    dtime: u64,
 }
 
-/// A namespace's ICMP rate-limit state
+/// GC candidates per lookup (Linux PEER_MAX_GC)
+const PEER_MAX_GC: usize = 32;
+/// Peer time to live under high load and normally (Linux
+/// inet_peer_minttl, inet_peer_maxttl), ms
+const PEER_MINTTL: u64 = 120_000;
+const PEER_MAXTTL: u64 = 600_000;
+
+/// Peers past which entries are dropped aggressively (Linux
+/// inet_initpeers: 1% of memory in entries, 4096 to 65536 + 128)
+fn peer_threshold() -> usize {
+    static T: spin::Once<usize> = spin::Once::new();
+    *T.call_once(|| {
+        let entry = core::mem::size_of::<RbTreeNode<Ipv4Addr, Peer>>().next_multiple_of(64);
+        (crate::FRAME_ALLOCATOR.buffer_pages() * 4096 / (100 * entry)).clamp(4096, 65536 + 128)
+    })
+}
+
+/// A namespace's ICMP rate-limit state (Linux net->ipv4.icmp_global_*
+/// and net->ipv4.peers)
 pub struct IcmpRate {
-    st: Mutex<RateState>,
+    global: Global,
+    peers: Mutex<RbTree<Ipv4Addr, Peer>>,
 }
 
 impl Default for IcmpRate {
     fn default() -> Self {
         Self {
-            st: Mutex::new(RateState {
-                global: Global::default(),
-                peers: BTreeMap::new(),
-            }),
+            global: Global::default(),
+            peers: Mutex::new(RbTree::new()),
         }
     }
 }
@@ -224,26 +258,61 @@ impl IcmpRate {
         let s = &net.sysctl;
         let per_sec = i64::from(s.icmp_msgs_per_sec.load(Ordering::Relaxed));
         let burst = i64::from(s.icmp_msgs_burst.load(Ordering::Relaxed));
-        self.st.lock().global.allow(now, per_sec, burst)
+        self.global.allow(now, per_sec, burst)
     }
 
+    /// Linux icmpv4_xrlim_allow: the peer for `dst` (inet_getpeer_v4,
+    /// made GFP_ATOMIC under the lock if new), then its limiter
+    /// (inet_peer_xrlim_allow; no peer, no limit). Peers the lookup
+    /// passed that outlived their time to live go (inet_peer_gc).
     fn peer_allow(&self, dst: Ipv4Addr, now: u64, timeout: u64) -> bool {
-        let mut st = self.st.lock();
-        if st.peers.len() >= MAX_PEERS && !st.peers.contains_key(&dst) {
-            let old = st.peers.iter().min_by_key(|(_, p)| p.last).map(|(k, _)| *k);
-            if let Some(k) = old {
-                st.peers.remove(&k);
+        let threshold = peer_threshold();
+        let mut gc = [Ipv4Addr(0); PEER_MAX_GC];
+        let mut ngc = 0;
+        let mut dead: [Option<RbTreeNode<Ipv4Addr, Peer>>; PEER_MAX_GC] =
+            [const { None }; PEER_MAX_GC];
+        let mut t = self.peers.lock();
+        let total = t.len();
+        let ttl = if total >= threshold {
+            0
+        } else {
+            PEER_MAXTTL - (PEER_MAXTTL - PEER_MINTTL) * total as u64 / threshold as u64
+        };
+        let mut visit = |k: &Ipv4Addr, p: &Peer| {
+            if ngc < PEER_MAX_GC && *k != dst && now.saturating_sub(p.dtime) >= ttl {
+                gc[ngc] = *k;
+                ngc += 1;
             }
+        };
+        let ok = match t.get_mut_visiting(&dst, &mut visit) {
+            Some(p) => {
+                p.dtime = now;
+                p.lim.allow(now, timeout)
+            }
+            None => match RbTreeNodeReservation::new_gfp(Gfp::ATOMIC) {
+                Ok(r) => {
+                    let mut p = Peer {
+                        lim: XrLim::new(now),
+                        dtime: now,
+                    };
+                    let ok = p.lim.allow(now, timeout);
+                    let _ = t.insert(r.into_node(dst, p));
+                    ok
+                }
+                Err(_) => true,
+            },
+        };
+        for (k, d) in gc[..ngc].iter().zip(dead.iter_mut()) {
+            *d = t.remove_node(k);
         }
-        st.peers
-            .entry(dst)
-            .or_insert_with(|| XrLim::new(now))
-            .allow(now, timeout)
+        drop(t);
+        drop(dead);
+        ok
     }
 
     fn consume(&self) {
         let c = i64::from(crate::random::get_random_u32() % 3);
-        self.st.lock().global.consume(c);
+        self.global.consume(c);
     }
 }
 
@@ -765,18 +834,19 @@ mod tests {
 
     #[test]
     fn global_bucket() {
-        let mut g = Global::default();
+        let g = Global::default();
+        let credit = |g: &Global| g.credit.load(Ordering::Relaxed);
         // First call after a long idle refills to the burst
         assert!(g.allow(10_000, 1000, 50));
-        assert_eq!(g.credit, 50);
+        assert_eq!(credit(&g), 50);
         g.consume(50);
         // Too soon to refill (< 20 ms)
         assert!(!g.allow(10_010, 1000, 50));
         // 20 ms at 1000/s = 20 credits
         assert!(g.allow(10_020, 1000, 50));
-        assert_eq!(g.credit, 20);
+        assert_eq!(credit(&g), 20);
         // Disabled rate
-        let mut g = Global::default();
+        let g = Global::default();
         assert!(!g.allow(10_000, 0, 50));
     }
 

@@ -830,8 +830,6 @@ in bpf maps and the swap cache. ROADMAP
 phase A (A0-A3).
 
 Phase A2 (net) remaining:
-- ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
-  with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
 - TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the
