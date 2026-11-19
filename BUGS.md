@@ -106,6 +106,13 @@ whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
 a group's pick at once (with no connected members), before scoring
 the rest of the hash2 chain.
 
+A TIME_WAIT event other than a takeover SYN (a segment, the 2MSL
+timer) rebuilds a full control block from the entry (`TwCb::cb`),
+whose lockless fields (`Live`) it allocates GFP_ATOMIC per event: a
+flood of segments to TIME_WAIT tuples allocates per segment, and an
+allocation failure drops the segment or ends the entry early. Linux
+tcp_timewait_state_process works on the tw itself.
+
 A socket on RCU lists (ping, raw, UDP, packet, netlink) leaves "sockets: used" a grace
 period after its close: the chain's `Arc` is released by
 `RcuHRef::defer_put`, and the count drops with the `Sock`. Linux

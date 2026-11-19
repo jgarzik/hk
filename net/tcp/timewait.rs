@@ -152,19 +152,24 @@ impl TimeWait {
     pub fn rcv(self: &Arc<Self>, skb: Box<SkBuff>, now: u64) -> Option<Box<SkBuff>> {
         let mut out = Out::default();
         let s = skb.tcp();
-        // The control block an event rebuilds needs lockless fields of
-        // its own, scratch for the event: made GFP_ATOMIC before the
-        // lock (an entry keeps none, so it stays small); none, no
-        // event (the segment is dropped, the peer sends again)
+        // A new connection's SYN takes the tuple over with nothing
+        // allocated (Linux TCP_TW_SYN)
+        if self.syn_takeover(&s) {
+            return Some(skb);
+        }
+        // Any other event rebuilds a control block, which needs
+        // lockless fields of its own, scratch for the event: made
+        // GFP_ATOMIC before the lock (an entry keeps none, so it stays
+        // small); none, no event (the segment is dropped, the peer
+        // sends again)
         let Ok(live) = try_arc_gfp(Live::default(), Gfp::ATOMIC) else {
             return None;
         };
         let mut g = self.inner.lock();
+        // A SYN that became acceptable between the two holds
         if g.0.tw_syn_ok(&s) {
-            self.sync(&mut g, true);
             drop(g);
-            self.unhash();
-            return Some(skb);
+            return self.syn_takeover(&s).then_some(skb);
         }
         let mut cb = g.0.cb(super::cfg(&self.net), live);
         cb.mib = Some(Arc::clone(&self.net.mib));
@@ -177,6 +182,19 @@ impl TimeWait {
         // The control block's queues go after the lock
         drop(cb);
         None
+    }
+
+    /// `s` is a SYN that may reuse the tuple: the entry ends, and the
+    /// caller hands the segment to a listener
+    fn syn_takeover(self: &Arc<Self>, s: &crate::net::skb::TcpSkbCb) -> bool {
+        let mut g = self.inner.lock();
+        if !g.0.tw_syn_ok(s) {
+            return false;
+        }
+        self.sync(&mut g, true);
+        drop(g);
+        self.unhash();
+        true
     }
 
     fn post(self: &Arc<Self>, g: &mut (TwCb, Option<u64>), out: &Out) {

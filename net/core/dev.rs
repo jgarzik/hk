@@ -442,9 +442,6 @@ fn this_softnet() -> &'static Softnet {
     SOFTNET.this()
 }
 
-/// Start one `softnet/N` thread per CPU that runs a scheduler (after
-/// scheduling is enabled). Work queued earlier (IRQs during boot) is
-/// picked up on the threads' first pass.
 /// Each possible CPU's backlog NAPI, made at boot (Linux net_dev_init
 /// sets up every softnet_data's backlog), so `netif_rx` never allocates
 pub fn net_dev_init() {
@@ -453,6 +450,9 @@ pub fn net_dev_init() {
     }
 }
 
+/// Start one `softnet/N` thread per CPU that runs a scheduler (after
+/// scheduling is enabled). Work queued earlier (IRQs during boot) is
+/// picked up on the threads' first pass.
 pub fn softnet_init() {
     let mut started = 0;
     for cpu in 0..crate::cpu::nr_cpu_ids() as usize {

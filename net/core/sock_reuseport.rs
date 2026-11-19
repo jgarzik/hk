@@ -116,6 +116,14 @@ impl<S: HasRcuPuts + Send + Sync> ReuseCb<S> {
         Self(RcuLockedArc::none())
     }
 
+    /// In no group, read without the lock (Linux
+    /// rcu_access_pointer(sk->sk_reuseport_cb)): exact for its owner,
+    /// whose socket lock orders its joins (bind) with its leave and
+    /// connect
+    pub fn is_none(&self) -> bool {
+        self.0.as_ptr().is_null()
+    }
+
     /// `me` starts a group of its own (Linux reuseport_alloc)
     pub fn alloc(&self, me: &Arc<S>, o: &mut ReuseLocked) -> Result<(), KernelError> {
         let m = members(INIT_SOCKS)?;
@@ -184,11 +192,15 @@ impl<S: HasRcuPuts + Send + Sync> ReuseCb<S> {
                     .is_some_and(|s| core::ptr::eq(s, me))
             });
             if let Some(i) = i {
-                m.n.store(n - 1, Ordering::Release);
+                // The last member into its slot first, then the count
+                // (Linux __reuseport_detach_sock): a reader never picks
+                // the leaving socket, and every other member stays
+                // reachable
                 if i != n - 1 {
                     let last = m.socks[n - 1].get_protected(o);
                     m.socks[i].replace(last, o).defer_put();
                 }
+                m.n.store(n - 1, Ordering::Release);
                 m.socks[n - 1].replace(None, o).defer_put();
             }
         }

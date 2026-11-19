@@ -62,12 +62,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsiz
 use crate::mm::page_alloc::Gfp;
 use crate::net::skb::{SkBuff, SkbCb, SkbQueue};
 use crate::sync::UniqueOwner;
-use crate::sync::rcu::{RcuHead, RcuPuts};
+use crate::sync::rcu::RcuPuts;
 use crate::sync::spin::Mutex;
 use crate::util::kalloc::try_arc_gfp;
-use crate::util::list::Link;
 use crate::util::rcuhlist::{HNode, RcuHList};
-use crate::util::rculist::RcuList;
 
 use crate::net::sock::{Sock, wait_on};
 use crate::net::socket::{ProtoOps, SOCK_DGRAM, SOCK_RAW};
@@ -250,11 +248,9 @@ pub struct NlSock {
     /// The chain reference's deferred release (Linux SOCK_RCU_FREE)
     rcu: RcuPuts,
     /// On its namespace's multicast list of its protocol (Linux
-    /// sk_bind_node), from its first subscription to its release;
-    /// written under `NL_TABLE.lock`
-    mc_link: Link,
-    on_mc: AtomicBool,
-    mc_rcu: RcuHead,
+    /// sk_bind_node) while it subscribes to any group; written under
+    /// `NL_TABLE.lock`, free for a new insert as soon as it leaves
+    mc_node: HNode,
     me: Weak<NlSock>,
 }
 
@@ -295,9 +291,7 @@ impl NlSock {
             wait: WaitQueue::new(),
             node: HNode::new(),
             rcu: RcuPuts::new(),
-            mc_link: Link::new(),
-            on_mc: AtomicBool::new(false),
-            mc_rcu: RcuHead::new(),
+            mc_node: HNode::new(),
             me: me.clone(),
         })
     }
@@ -379,7 +373,7 @@ impl NlSock {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some((cur & !0xFFFF_FFFF) | g)
             });
-        self.mc_join();
+        self.mc_update();
         Ok(())
     }
 
@@ -407,15 +401,18 @@ impl NlSock {
         self.sk.net.id == net.id && self.sk.protocol == proto && self.portid() == portid
     }
 
-    /// Subscribed to a group: on the multicast list from now on (Linux
-    /// netlink_update_subscriptions' sk_add_bind_node)
-    fn mc_join(self: &Arc<Self>) {
-        let _o = NL_TABLE.lock.lock();
-        if self.groups_all() != 0
-            && !self.dead.load(Ordering::Acquire)
-            && !self.on_mc.swap(true, Ordering::AcqRel)
-        {
-            self.sk.net.nl.mc(self.sk.protocol).push_back(self.clone());
+    /// Its subscriptions changed: on its multicast list while it has
+    /// any, off it with none (Linux netlink_update_subscriptions:
+    /// sk_add_bind_node, __sk_del_bind_node); the list's reference goes
+    /// a grace period after it leaves
+    fn mc_update(self: &Arc<Self>) {
+        let mut o = NL_TABLE.lock.lock();
+        let list = self.sk.net.nl.mc(self.sk.protocol);
+        let want = self.groups_all() != 0 && !self.dead.load(Ordering::Acquire);
+        if want && !self.mc_node.is_hashed() {
+            list.add_head(self.clone(), &mut o);
+        } else if !want && let Some(u) = list.del_init(self, &mut o) {
+            u.defer_put();
         }
     }
 
@@ -458,10 +455,10 @@ impl NlSock {
         let bit = 1u64 << (group - 1);
         if on {
             self.groups.fetch_or(bit, Ordering::AcqRel);
-            self.mc_join();
         } else {
             self.groups.fetch_and(!bit, Ordering::AcqRel);
         }
+        self.mc_update();
         Ok(())
     }
 
@@ -770,11 +767,32 @@ pub fn broadcast(net: &NetNamespace, protocol: i32, skb: SkBuff, exclude: u32, g
     let bit = 1u64 << (group - 1);
     let list = net.nl.mc(protocol);
     if gfp.has(Gfp::RECLAIM) {
-        let socks = list.snapshot();
+        let socks = mc_snapshot(list);
         deliver(socks.iter().map(|s| &**s), skb, exclude, bit, gfp);
     } else {
         let g = crate::sync::rcu::read_lock();
         deliver(list.iter_ref(&g).map(|s| s.item()), skb, exclude, bit, gfp);
+    }
+}
+
+/// References to the sockets on `list`, for a broadcast whose clones
+/// may sleep: sized under the table lock, allocated with no lock, then
+/// filled under RCU without allocating; again if the list grew
+fn mc_snapshot(list: &RcuHList<NlMcNode, NlLocked>) -> Vec<Arc<NlSock>> {
+    loop {
+        let n = list.iter_locked(&NL_TABLE.lock.lock()).count();
+        let mut v = Vec::with_capacity(n + 1);
+        let g = crate::sync::rcu::read_lock();
+        for s in list.iter_ref(&g) {
+            if v.len() == v.capacity() {
+                break;
+            }
+            v.push(s.get());
+        }
+        drop(g);
+        if v.len() < v.capacity() {
+            return v;
+        }
     }
 }
 
@@ -812,8 +830,7 @@ const MAX_LINKS: usize = 32;
 
 crate::hadapter!(NlNode, NlSock, node);
 crate::rcu_puts!(NlSock, rcu);
-crate::adapter!(NlMcLink, NlSock, mc_link);
-crate::rcu_head!(NlSock, mc_rcu);
+crate::hadapter!(NlMcNode, NlSock, mc_node);
 
 /// The data of the netlink table's lock: the proof its holder writes
 /// the port id chains and the multicast lists' membership
@@ -876,11 +893,8 @@ impl NlSock {
                 u.defer_put();
             }
         }
-        if self.on_mc.swap(false, Ordering::AcqRel) {
-            let mc = self.sk.net.nl.mc(self.sk.protocol);
-            if let Some(u) = mc.remove_first(|x| core::ptr::eq(x, self)) {
-                u.defer();
-            }
+        if let Some(u) = self.sk.net.nl.mc(self.sk.protocol).del_init(self, &mut o) {
+            u.defer_put();
         }
     }
 }
@@ -888,19 +902,19 @@ impl NlSock {
 /// A namespace's netlink state: per protocol, its sockets subscribed to
 /// any group (Linux nl_table[].mc_list, net_eq filtered there)
 pub struct NlNet {
-    mc: [RcuList<NlMcLink>; MAX_LINKS],
+    mc: [RcuHList<NlMcNode, NlLocked>; MAX_LINKS],
 }
 
 impl Default for NlNet {
     fn default() -> Self {
         Self {
-            mc: [const { RcuList::new() }; MAX_LINKS],
+            mc: [const { RcuHList::new() }; MAX_LINKS],
         }
     }
 }
 
 impl NlNet {
-    fn mc(&self, protocol: i32) -> &RcuList<NlMcLink> {
+    fn mc(&self, protocol: i32) -> &RcuHList<NlMcNode, NlLocked> {
         &self.mc[protocol as usize % MAX_LINKS]
     }
 

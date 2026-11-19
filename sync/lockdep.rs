@@ -20,7 +20,7 @@
 //! - a heap allocation in atomic context with no GFP named
 //!   (`might_alloc`, Linux might_alloc), once per site, as
 //!   `MIGHT_ALLOC:FAIL LOCKDEP:ATOMIC_ALLOC` with the lock that made it
-//!   atomic (builds without the feature report the first one as
+//!   atomic (builds without the feature report the first eight as
 //!   `MIGHT_ALLOC:FAIL`, `sync::might_alloc_fail`).
 //!
 //! State: a per-CPU stack of held tracked locks (the kernel is not

@@ -157,6 +157,9 @@ impl Frags {
         if self.tree.len() >= MAX_FRAGS {
             return Ins::Kill;
         }
+        // No device reference while queued (Linux ip_frag_queue keeps
+        // the ifindex in qp->iif; skb->dev shares rbnode's storage)
+        skb.dev = None;
         skb.cb = SkbCb::Frag(FragCb {
             off: off as u32,
             end: end as u32,
@@ -408,8 +411,16 @@ impl FragTable {
             Gfp::ATOMIC,
         )
         .ok()?;
+        // Armed before it can be found (Linux inet_frag_create's
+        // mod_timer before the insert): a kill by whoever finds it
+        // stops a pending timer, never one armed after
+        let secs = net.sysctl.frag_time.load(Ordering::Relaxed).max(1) as u64;
+        let at = crate::net::neigh::now_ms().saturating_add(secs * 1000);
+        q.timer.reset(&q, at.saturating_mul(1_000_000));
         let mut b = head.lock();
         if let Some(old) = b.find(|x| mine(x)) {
+            drop(b);
+            q.timer.stop();
             return Some(old);
         }
         // Counted, then `dead` checked; `net_exit` sets `dead`, then
@@ -418,13 +429,12 @@ impl FragTable {
         self.queues.fetch_add(1, Ordering::SeqCst);
         if self.dead.load(Ordering::SeqCst) {
             self.queues.fetch_sub(1, Ordering::Relaxed);
+            drop(b);
+            q.timer.stop();
             return None;
         }
         b.add_head_rcu(q.clone());
         drop(b);
-        let secs = net.sysctl.frag_time.load(Ordering::Relaxed).max(1) as u64;
-        let at = crate::net::neigh::now_ms().saturating_add(secs * 1000);
-        q.timer.reset(&q, at.saturating_mul(1_000_000));
         Some(q)
     }
 

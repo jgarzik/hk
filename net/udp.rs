@@ -154,7 +154,9 @@ impl UdpSock {
     fn unhash(&self) {
         let port = self.inet.get().sport;
         let mut g = slot(&self.sk.net, port).lock();
-        self.reuse.detach(self, &mut sock_reuseport::lock());
+        if !self.reuse.is_none() {
+            self.reuse.detach(self, &mut sock_reuseport::lock());
+        }
         if let Some(u) = g.del_rcu(self) {
             drop(g);
             u.defer();
@@ -421,7 +423,9 @@ impl ProtoOps for UdpSock {
         drop(s);
         self.connected.store(true, Ordering::Release);
         // Linux __ip4_datagram_connect: reuseport_has_conns_set
-        self.reuse.set_conns(&sock_reuseport::lock());
+        if !self.reuse.is_none() {
+            self.reuse.set_conns(&sock_reuseport::lock());
+        }
         Ok(())
     }
 
@@ -854,6 +858,10 @@ fn queue_rcv(net: &crate::net::NetNamespace, s: &UdpSock, skb: SkBuff) {
 /// GFP_ATOMIC (a failed clone counts a drop on that socket), the first
 /// the skb itself
 fn mcast_deliver(net: &crate::net::NetNamespace, skb: SkBuff, k: &Key) {
+    // One walk, never again from the start (that would deliver twice):
+    // a socket moving to another slot meanwhile (disconnect, autobind)
+    // may lead it off this slot's rest, as Linux's hlist walk of the
+    // slot (sk_for_each_entry_offset_rcu) may
     let g = crate::sync::rcu::read_lock();
     let mut first: Option<&UdpSock> = None;
     let socks = slot(net, k.dport).iter_rcu(&g).map(|e| e.get());
@@ -962,6 +970,8 @@ pub fn proc_net_udp(net: &crate::net::NetNamespace) -> Vec<u8> {
         );
         m.pad('\n');
         let raw = |a: Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
+        // A socket moving slots meanwhile may be missed or listed
+        // twice, as Linux's seq walk of the slots
         let g = crate::sync::rcu::read_lock();
         for (i, head) in table().iter().enumerate() {
             for e in head.iter_rcu(&g) {

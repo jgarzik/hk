@@ -264,18 +264,27 @@ fn alloc_pages_fail(order: u32, at: &'static core::panic::Location<'static>) {
     CurrentArch::dump_stack();
 }
 
-/// The first heap allocation made in atomic context with no GFP named
+/// A heap allocation made in atomic context with no GFP named
 /// (`lockdep::might_alloc` without the feature): `MIGHT_ALLOC:FAIL`, the
 /// context and this CPU's stack (Linux __might_resched's report and
-/// dump_stack); once, set before printing (printing may allocate)
+/// dump_stack). The first `REPORTS` of a boot (no call site to tell
+/// them apart without lockdep; one fix need not hide the next), counted
+/// before printing (printing may allocate)
 #[cfg(not(any(feature = "lockdep", test)))]
 #[cold]
 #[inline(never)]
 pub fn might_alloc_fail(size: usize, align: usize) {
     use crate::arch::{CurrentArch, HaltOps};
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static REPORTED: AtomicBool = AtomicBool::new(false);
-    if REPORTED.swap(true, Ordering::Relaxed) {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    const REPORTS: u32 = 8;
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    /// A report in progress: one the printing makes is not reported
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= REPORTS {
+        BUSY.store(false, Ordering::Release);
         return;
     }
     crate::printkln!(
@@ -288,6 +297,7 @@ pub fn might_alloc_fail(size: usize, align: usize) {
         crate::task::percpu::current_tid()
     );
     CurrentArch::dump_stack();
+    BUSY.store(false, Ordering::Release);
 }
 
 #[cfg(not(any(feature = "lockdep", test)))]
