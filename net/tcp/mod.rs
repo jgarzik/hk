@@ -783,7 +783,7 @@ impl TcpSock {
     /// connection's is dropped if the socket left the tuple `t` it was
     /// found by between the lookup and taking its lock
     fn do_rcv(&self, g: &mut Inner, skb: Box<SkBuff>, t: Tuple, now: u64, out: &mut Out) {
-        let s = &skb.tcp.clone();
+        let s = &skb.tcp().clone();
         if g.cb.state == TcpState::Listen {
             return self.conn_request(s, t, now);
         }
@@ -869,7 +869,7 @@ impl TcpSock {
             drop(self.rcv(skb, t));
             return;
         }
-        let s = skb.tcp;
+        let s = skb.tcp();
         drop(skb);
         self.conn_request(&s, t, now_ms());
     }
@@ -1380,9 +1380,9 @@ impl SockHooks<Inner> for TcpSock {
 fn tuple_of(skb: &SkBuff) -> Option<Tuple> {
     Some(Tuple {
         laddr: skb.daddr?,
-        lport: skb.tcp.dport,
+        lport: skb.tcp().dport,
         raddr: skb.saddr?,
-        rport: skb.tcp.sport,
+        rport: skb.tcp().sport,
     })
 }
 
@@ -1418,7 +1418,7 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
         return;
     };
     let _ = skb.pull(doff);
-    skb.tcp = s;
+    skb.set_tcp(s);
     let Some(t) = tuple_of(&skb) else {
         return;
     };

@@ -155,7 +155,7 @@ impl TimeWait {
     /// gives it to a listener.
     pub fn rcv(self: &Arc<Self>, skb: Box<SkBuff>, now: u64) -> Option<Box<SkBuff>> {
         let mut out = Out::default();
-        let s = skb.tcp;
+        let s = skb.tcp();
         let mut g = self.inner.lock();
         if g.0.tw_syn_ok(&s) {
             self.sync(&mut g, true);

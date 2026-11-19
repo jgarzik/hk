@@ -825,10 +825,6 @@ locks in net, fs, io, task, cgroup and keys, and IRQ-safe locks
 in bpf maps and the swap cache. ROADMAP
 phase A (A0-A3).
 
-Phase A2 (net) remaining:
-- `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
-  enum side by side (Linux: one skb->cb); size matters for stacks.
-
 ## Deferred file release gaps
 
 **Location**: `fs/file.rs` (`FileRef`, `fput`), `task/task_work.rs`,

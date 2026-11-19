@@ -49,7 +49,7 @@ impl SegIn<'_> {
     fn skb(&self) -> Box<SkBuff> {
         let mut skb = SkBuff::alloc_tx(self.data.len(), Gfp::KERNEL).unwrap();
         skb.put_slice(self.data).unwrap();
-        skb.tcp = super::cb::Seg {
+        skb.set_tcp(super::cb::Seg {
             seq: self.seq,
             ack: self.ack,
             flags: self.flags,
@@ -58,13 +58,13 @@ impl SegIn<'_> {
             ws: self.ws,
             ts: self.ts,
             ..Default::default()
-        };
-        skb.tcp.set_len(self.data.len() as u32);
+        });
+        skb.tcp_mut().set_len(self.data.len() as u32);
         skb
     }
 
     fn hdr(&self) -> super::cb::Seg {
-        self.skb().tcp
+        self.skb().tcp()
     }
 }
 
@@ -80,11 +80,11 @@ impl Feed for TcpCb {
     /// (`TcpSock::syn_recv_sock`): made a full socket, fed again
     fn feed(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         let skb = s.skb();
-        let h = skb.tcp;
+        let h = skb.tcp();
         self.input(&h, skb, now, out);
         if let Some(skb) = out.req_ack.take() {
             self.req_full = true;
-            let h = skb.tcp;
+            let h = skb.tcp();
             self.input(&h, skb, now, out);
         }
     }
@@ -99,13 +99,13 @@ fn wire(out: &Out) -> Vec<Seg> {
     out.segs
         .iter()
         .map(|skb| Seg {
-            seq: skb.tcp.seq,
-            ack: skb.tcp.ack,
-            flags: skb.tcp.flags,
-            wnd: skb.tcp.wnd,
-            mss: skb.tcp.mss,
-            ws: skb.tcp.ws,
-            ts: skb.tcp.ts,
+            seq: skb.tcp().seq,
+            ack: skb.tcp().ack,
+            flags: skb.tcp().flags,
+            wnd: skb.tcp().wnd,
+            mss: skb.tcp().mss,
+            ws: skb.tcp().ws,
+            ts: skb.tcp().ts,
             data: skb.data().to_vec(),
         })
         .collect()
@@ -1081,11 +1081,11 @@ fn ooo_insert_and_take() {
     assert_eq!((o.pieces(), o.bytes()), (3, 34));
     assert!(o.take(100).is_none());
     let a = o.take(110).unwrap();
-    assert_eq!((a.tcp.seq, a.data()), (110, &[1u8; 10][..]));
+    assert_eq!((a.tcp().seq, a.data()), (110, &[1u8; 10][..]));
     let b = o.take(120).unwrap();
-    assert_eq!((b.tcp.seq, b.data()), (120, &[2u8; 12][..]));
+    assert_eq!((b.tcp().seq, b.data()), (120, &[2u8; 12][..]));
     let c = o.take(132).unwrap();
-    assert_eq!((c.tcp.seq, c.data()), (132, &[3u8; 8][..]));
+    assert_eq!((c.tcp().seq, c.data()), (132, &[3u8; 8][..]));
     assert!(o.is_empty() && o.bytes() == 0);
     // Same start, longer: replaces and swallows what it covers
     o.insert(piece(200, 5, 1));
@@ -1094,7 +1094,7 @@ fn ooo_insert_and_take() {
     assert!(o.insert(piece(200, 22, 7)));
     assert_eq!((o.pieces(), o.bytes()), (2, 27));
     // An skb RCV.NXT already passed is dropped on the way
-    assert_eq!(o.take(230).map(|s| s.tcp.seq), None);
+    assert_eq!(o.take(230).map(|s| s.tcp().seq), None);
     assert!(o.is_empty());
 }
 
