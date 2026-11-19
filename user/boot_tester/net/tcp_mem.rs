@@ -172,7 +172,10 @@ fn pair(seed: usize) -> u64 {
         });
     }
     close(c);
-    let (n, bad, _) = recv_pat(s, seed, LEN, 16384);
+    let (n, bad, last) = recv_pat(s, seed, LEN, 16384);
+    if n != LEN {
+        stalled(seed, n, last);
+    }
     close(s);
     let st = wait_child(pid);
     if n != LEN {
@@ -183,5 +186,30 @@ fn pair(seed: usize) -> u64 {
         6
     } else {
         0
+    }
+}
+
+/// A pair's reader came up short (the 20 s timeout): what the stack
+/// shows then, for the next occurrence (BUGS.md): the connections and
+/// the TCP extended counters (drops for memory, pruning, pressure)
+fn stalled(seed: usize, n: usize, last: i64) {
+    use crate::helpers::{print, print_num, println};
+    print(b"TCP_MEM_PRESSURE: pair ");
+    print_num(seed as i64);
+    print(b" got ");
+    print_num(n as i64);
+    print(b" last recv ");
+    print_num(last);
+    println(b"");
+    let mut buf = [0u8; 8192];
+    for path in [
+        &b"/proc/net/tcp\0"[..],
+        b"/proc/net/netstat\0",
+        b"/proc/net/snmp\0",
+    ] {
+        let r = read_file(path, &mut buf);
+        if r > 0 {
+            print(&buf[..r as usize]);
+        }
     }
 }

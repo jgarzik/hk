@@ -139,10 +139,12 @@ fn round(r: usize) -> Result<bool, i32> {
     let mut st = 0i32;
     sys_wait4(sender, &mut st, 0, 0);
     let mut got = [false; MAX_KIDS];
+    let mut status = [0i32; MAX_KIDS];
     for (k, &c) in kids[..n].iter().enumerate() {
         sys_kill(c, SIGUSR2);
         sys_wait4(c, &mut st, 0, 0);
         got[k] = st == 1 << 8;
+        status[k] = st;
     }
     if wait_sig(bit(SIGUSR1), 0) != SIGUSR1 as i64 {
         return Err(2);
@@ -151,7 +153,29 @@ fn round(r: usize) -> Result<bool, i32> {
         return Err(3);
     };
     if got[..last].iter().any(|g| !g) {
+        report(r, last, n, &got, &status);
         return Err(10 + r as i32);
     }
     Ok(got[last])
+}
+
+/// A round failed: which children before `last` (of `n`) missed the
+/// signal and their wait statuses (exit 0: SIGUSR2 came first, 2: the
+/// wait failed), for the next occurrence (BUGS.md)
+fn report(r: usize, last: usize, n: usize, got: &[bool], status: &[i32]) {
+    use crate::helpers::{print, print_num, println};
+    print(b"FORK_PGRP_SIGNAL: round ");
+    print_num(r as i64);
+    print(b" last ");
+    print_num(last as i64);
+    print(b" of ");
+    print_num(n as i64);
+    println(b"");
+    for k in (0..last).filter(|&k| !got[k]).take(8) {
+        print(b"FORK_PGRP_SIGNAL: child ");
+        print_num(k as i64);
+        print(b" status ");
+        print_num(i64::from(status[k]));
+        println(b"");
+    }
 }
