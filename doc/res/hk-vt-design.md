@@ -9,12 +9,11 @@ Design and plan for doc/ROADMAP.md phase V; its P0 prerequisites are in phases C
 | 2 | Scrollback | **Follow Linux**: none in fbcon; vgacon only within VGA RAM. |
 | 3 | Dell keyboard | **USB on a root port**: xHCI interrupt endpoints + HID boot keyboard first; no hub driver now. |
 | 4 | arm64 display | **virtio-gpu 2D**, checked outside the gate. |
-| 5 | Hangup | **In the prerequisites, before switching (P4)**: vhangup, TIOCVHANGUP, SAK, session-leader exit. |
+| 5 | Hangup | **In the prerequisites, before switching (P4)**: TIOCVHANGUP, SAK. |
 | 6 | QEMU display flag | **Pin `-vga std`** (x86) in run-qemu.sh and linux-boot-tester.sh (one check-linux cache invalidation). |
 | 7 | ttyflip thread | **Per-port flip work** on the new IRQ-safe work items; the thread goes. |
 | 8 | ABI version | **Linux 6.8** (the reference VM); newer features (VT_GETCONSIZECSRPOS, bracketed-paste TIOCL) when the reference is upgraded. |
 | 9 | Screen tests | **`make check-gfx`**, optional, outside `make gate`, run at phase ends. |
-| 10 | Group stop | **In the prerequisites, with hangup**: SIGTSTP/SIGTTOU/SIGTTIN stop the group (Ctrl-Z; real tty_check_change). |
 | 11 | Ctrl-Alt-Del | **In P6**: reboot(2) CAD_ON/CAD_OFF + cad_pid + the keyboard trigger. |
 | 12 | sysfs + uevent | On the existing sysfs/uevent core: /sys/class/tty (tty0/active + poll), /sys/class/input, uevents for vcs/input nodes are in scope here. |
 
@@ -123,7 +122,7 @@ QEMU virt: no display by default → dummycon. P9: virtio-gpu 2D (rule 4; resour
 P0 Prerequisites (ROADMAP C and Y; with the rest of hangup; highest blast radius)
 - 0a Tty core: TtyDriver ops (install, close, ioctl fall-through, resize, stop, start, init_termios) on both serial drivers; leaked dynamic ttys (flip input moves to per-port work in 0c). Tests: existing tty. LOCKING: flip list.
 - 0b Console core: port register_console (console_cmdline, preferred, CON_CONSDEV ordering, default enable, name+index match, device() -> (tty, index)); console_device → /dev/console; ttyS0 a real console; arm64 of_console_check (stdout-path); per-console kmsg-seq replay (PRINTBUFFER) replacing global `flushed`; /proc/consoles; earlyprintk/earlycon boot consoles from current vgacon/GfxConsole writers. Tests: CONSOLE_PROC, STDIO_CONSOLE_FDS. LOCKING §3.6/§3.9.
-- 0c IRQ-safe deferred work: static Work, atomic PENDING + intrusive list, no alloc; ttyflip becomes per-port flip work on it (rule 7). LOCKING §3.1.
+- 0c ttyflip becomes per-port flip work on the IRQ-safe workqueue (rule 7). LOCKING §3.1.
 - 0d IoMem bulk ops, ioremap_wc (x86 PAT WC, arm64 Normal-NC), FbSurface on IoMem.
 - 0e Hangup (rule 5), the rest: TIOCVHANGUP, SAK and carrier loss (vhangup, session-leader exit, port removal, hung-up file ops and per-process ctty are done). Tests on hk + Linux.
 - 0g Pin `-vga std` in run-qemu.sh and linux-boot-tester.sh (rule 6), with a probe test of the VT environment on both kernels.
@@ -139,4 +138,4 @@ P9 Display: virtio-gpu 2D (rule 4; arm64 and x86; fbcon damage/flush hook), chec
 Staged (BUGS.md, missing features): sysrq, selection/gpm, blanking timer, mousedev, USB hub driver, ptys (xterm/ssh, not VTs), VT ABI newer than Linux 6.8 (rule 8).
 
 ## 13. Prerequisite gaps found elsewhere (and where they are handled)
-TTY: no TIOCVHANGUP, SAK or carrier-loss hangup (P0e, ROADMAP Y); flip thread iterates only serial ttys (per-port work, P0c). queue_work not IRQ-safe (allocates, spin Mutexes) (P0c). No WC ioremap; GfxConsole/VgaCon raw pointers (P0d). Console core: console= only raises priority (not enable/preferred), serial is a BOOT console, no per-console replay, no /proc/consoles, no DT stdout-path (P0b, ROADMAP Y). reboot(2) no CAD_ON/OFF (P6, ROADMAP C). No misc major registry for uinput (P5). USB: no interrupt transfer submission and no HID driver (the endpoint contexts exist; P7); no hub driver (staged, BUGS.md). Interrupt routing: IOAPIC/MSI for the Dell (HADL H0, ROADMAP D).
+TTY: no TIOCVHANGUP, SAK or carrier-loss hangup (P0e, ROADMAP Y); flip thread iterates only serial ttys (per-port work, P0c). No WC ioremap; GfxConsole/VgaCon raw pointers (P0d). Console core: console= only raises priority (not enable/preferred), serial is a BOOT console, no per-console replay, no /proc/consoles, no DT stdout-path (P0b, ROADMAP Y). reboot(2) no CAD_ON/OFF (P6, ROADMAP C). No misc major registry for uinput (P5). USB: no interrupt transfer submission and no HID driver (the endpoint contexts exist; P7); no hub driver (staged, BUGS.md). Interrupt routing: IOAPIC/MSI for the Dell (HADL H0, ROADMAP D).

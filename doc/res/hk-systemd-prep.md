@@ -3,7 +3,7 @@
 Research for booting Debian 13 (trixie: kernel 6.12, systemd 257) with
 systemd, from 2026-10-14; re-verify each item against the tree and
 systemd's sources before scheduling. hk already has tmpfs, devtmpfs,
-sysfs, cgroup2, /proc mountinfo, NETLINK_KOBJECT_UEVENT, openat2,
+sysfs, cgroup2, tracefs, /proc mountinfo, NETLINK_KOBJECT_UEVENT, openat2,
 memfd_create, close_range and name_to_handle_at.
 
 ## Must have
@@ -18,7 +18,7 @@ memfd_create, close_range and name_to_handle_at.
 
 ## Optional (units skip a missing mount point: never create stub
 directories for them)
-mqueue, configfs, debugfs, tracefs, securityfs, pstore, fusectl,
+mqueue, configfs, debugfs, securityfs, pstore, fusectl,
 hugetlbfs, bpf, efivarfs, binfmt_misc.
 
 ## Not useful

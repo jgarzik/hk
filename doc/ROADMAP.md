@@ -49,8 +49,8 @@ PTRACE_EVENT, REBOOT_CAD.
   arm64 stdout-path, per-console log replay, /proc/consoles,
   earlyprintk/earlycon boot consoles. `console/active` stays in Linux
   order.
-- IRQ-safe deferred work (static, intrusive, no allocation); each port's
-  flip buffer pushed by its own work item.
+- Each port's flip buffer pushed by its own work item on the IRQ-safe
+  workqueue (the ttyflip thread goes).
 - ioremap_wc (x86 PAT WC, arm64 Normal-NC) and bulk IoMem copies.
 - Hangup by TIOCVHANGUP and carrier loss (vhangup, session-leader
   exit and port removal hang up already).
@@ -70,7 +70,7 @@ hash. Tests PTY_BASIC, PROC_BASICS, DEB_SH, DEB_RCS.
 ## 4. I — Debian networking
 
 ifupdown with dhclient (AF_PACKET and raw paths);
-/proc/sys/net/ipv4/{conf,neigh}/*, /proc/net/{snmp,raw,icmp}; SIOCETHTOOL
+/proc/sys/net/ipv4/{conf,neigh}/*, /proc/net/{raw,icmp}; SIOCETHTOOL
 where dhclient or ifup need it; Linux errnos where AF_INET6 is tried.
 Test DEB_NET (DHCP on QEMU slirp, ip addr, ping, TCP fetch, DNS).
 
@@ -134,7 +134,7 @@ The streaming DMA API kept and typed (no raw physical addresses, unmap
 on completion), `DmaAddr` with a private constructor, `DmaRing<T: Pod>`
 with volatile access (e1000, then virtio, xHCI), xHCI rings through
 the DMA API, ordered IoMem writes plus `_relaxed` variants, PL011/
-PL031 registers and xHCI's interrupt handler on IoMem, xHCI quirks as bitflags; releases the
+PL031 registers on IoMem, xHCI quirks as bitflags; releases the
 matching BUGS.md "unsafe not yet wrapped" items.
 
 ## 10. D — Dell OptiPlex 3020 bring-up
@@ -149,16 +149,15 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 
 - M3 aarch64 DT information in its own type, not AcpiInfo; remaining
   "(stub for now)" banners.
-- M5 the 20 functions over 150 lines (do_clone, sys_prctl,
-  kmain, sys_mmap, exec_file, tty_ioctl, sys_fcntl, do_semctl,
-  do_select_internal, sys_mremap, procfs_mount, the NUMA/SRAT parsers,
-  exit_current, both setup_rt_frame, fanotify_mark, waitid, adjtimex,
-  setns) split into per-command or per-step helpers.
+- M5 the functions over 150 lines (copy_process, sys_prctl,
+  kmain, do_mmap, exec_file, sys_semctl, sys_mremap, the arm64 DT NUMA
+  parser, exit_current, waitid, adjtimex) split into per-command or
+  per-step helpers.
 - S1 O(n²) VMA loops to iterators; sentinels to Option;
   `from_ne_bytes(..try_into().unwrap())` to `pod!`; `current_mm()`;
   struct-update syntax in user/;
   one LE/BE byte reader, no slice `unwrap` on
-  device or disk data; pointer-cast lints.
+  device or disk data.
 - S2 `# Arguments`/`# Returns` blocks and `// ====` banners removed;
   history and speculative comments rewritten to the current state;
   `TODO(unsafe)` lines kept.

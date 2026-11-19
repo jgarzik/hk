@@ -35,9 +35,8 @@ Most of their blocks belong in a missing wrapper:
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
-- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: xhci's
-  interrupt handler (USBSTS, IMAN), gfx framebuffer, vgacon, rtc,
-  pci_quirks, aarch64 serial, x86 power.
+- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: gfx
+  framebuffer, vgacon, rtc, pci_quirks, aarch64 serial, x86 power.
 - **Lists:** an intrusive `CursorMut` for the walk-and-remove loops
   (futex, waitqueue, sched, percpu).
 - **Callbacks:** smp calls with a plain `usize` (`smp_call_function_many`
@@ -507,8 +506,8 @@ hub6, where Linux moves the port (uart_change_port).
   wakeup ...), no /sys/power, /sys/firmware/{acpi,dmi,efi} or
   /sys/class/dmi/id: the directories exist empty.
 - Missing classes: rtc (PL031 has no /dev/rtc0), input (Phase V),
-  misc, graphics/drm, pci_bus; no /sys/kernel/{security,debug,tracing,
-  config} mount points (hk has none of those filesystems).
+  misc, graphics/drm, pci_bus; no /sys/kernel/{security,debug,config}
+  mount points (hk has none of those filesystems).
 - Topology: places differ from Linux on QEMU: COM1's ttyS0 sits below
   /sys/devices/platform/serial8250 (Linux binds 8250_pnp to the ACPI
   PNP0501 device), PL011/PL031 are platform devices (Linux: amba bus),
@@ -1061,7 +1060,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **`task/percpu.rs` is the largest file** (before C): scheduler core,
   do_clone, exit, wait, credential setters, several sleep APIs. Split
   like Linux (sched/core, fork, exit, cred). Other giant functions:
-  copy_process, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
+  copy_process, sys_prctl, sys_semctl, do_mmap, exec_file.
 - **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
