@@ -696,7 +696,7 @@ Kernel mappings (3.2 Kernel Page Tables): vmalloc FLUSH (sleeping;
     leaf; no mapping or flush under it); vmstack FLUSH (sleeping,
     thread context; held across the stack area's TLB flush) → IOREMAP,
     vmstack SLOTS (spin leaves; no mapping or flush under them); KTABLES
-    (spin, thread context) → frame allocator
+    (spin leaf, thread context; table frames allocated before it)
 
 AIO (3.11, io/aio/): Kioctx.ring_lock (sleeping) → mmap_lock (the
     copy of events to user space); Mm.ioctx and AIO_NR (spin leaves);
@@ -2522,8 +2522,10 @@ layout in `doc/MEMORY.md`
   under `IOREMAP` (ioremap) and `vmstack::SLOTS` (stacks), both
   `spin::Mutex` leaves, thread context only; a mapping adds missing
   tables under `KTABLES` (`spin::Mutex` leaf, thread context, in
-  `mm/ioremap.rs`; `FRAME_ALLOCATOR` is taken under it for table
-  frames). Linux: `vmap_area_lock` + `init_mm.page_table_lock`. Their
+  `mm/ioremap.rs`; a table's frame is allocated before it and freed
+  after it when another mapping added the table first, as Linux
+  __pte_alloc_kernel). Linux: `vmap_area_lock` +
+  `init_mm.page_table_lock`. Their
   entries are only accessed atomically: an upper entry is only ever
   added (a release store under `KTABLES`), so a walker that does not
   add (iounmap, a `VmArea` unmap) reads them with acquire loads and no
