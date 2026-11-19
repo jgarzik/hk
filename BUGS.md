@@ -828,10 +828,6 @@ phase A (A0-A3).
 Phase A2 (net) remaining:
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
-- TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the
-  socket is answered by `conn_request` before `apply` copies
-  `listen_opts`, so the first children get default options
-  (TCP_NODELAY, keepalive, MAXSEG, SYNCNT, DEFER_ACCEPT, congestion).
 - TCP `release_cb` runs `finish`/`apply` even with no deferred flags
   (Linux tcp_release_cb returns early), and its wakeups run inside
   `SockLock::drain` while the socket is still owned.

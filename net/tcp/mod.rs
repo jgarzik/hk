@@ -2030,6 +2030,11 @@ impl ProtoOps for TcpSock {
         });
         g.cb.state = TcpState::Listen;
         self.sk.set_flag(sf::ACCEPTCONN, true);
+        // The options children copy, set before the listener can be
+        // found: a SYN backlogged while this call owns the socket is
+        // answered at its release, before `apply` would copy them
+        // (Linux tcp_conn_request reads the listener itself)
+        *self.listen_opts.lock() = g.cb.opts;
         self.sk.net.tcp.listen_add(self.inet.get().sport, me);
         Ok(())
     }
