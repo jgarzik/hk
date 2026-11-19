@@ -25,7 +25,7 @@ Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMA
 
 - e1000.rs and virtio_net.rs duplicate one NAPI skeleton (poll: swap causes, link, tx reclaim, rx under lock, deliver after unlock, napi_complete_done + rearm under rx with netif_running and MISSED recheck; open; stop; 2 KiB bounce per descriptor; Ops glue + wrapper). Per-chip: cause ack/mask, ring format and doorbell, link status. That is the engine boundary.
 - e1000 descriptors: raw volatile field writes through DmaCoherent::cpu_addr; publish-last coded by hand. Registers are bare consts (nothing says ICR is read-clear, IMC/IMS write-only). reset() spins a fixed iteration count without a time base (`hw/net/e1000.rs`).
-- xhci: two `Trb` types (`hw/usb/xhci.rs`, `hw/usb/transfer.rs`), three open-coded cycle-bit rings, u32 quirks + match, global USB_CONTROLLER.
+- xhci: three open-coded cycle-bit rings (`CommandRing`, `EventRing`, `TransferRing`), u32 quirks + match.
 - Block: blk-mq `MqOps` (queue_rq/commit/complete in hardirq under hctx IrqSpinlock) is a sound engine boundary; block/scsi.rs `ScsiHost` (USB mass storage) is the base for libata/SAT.
 - Net: `SkBuff` (net/skb.rs), `netif_rx`/`netif_receive_skb` (net/core/dev.rs), `NetDeviceOps::xmit(Box<SkBuff>)`.
 - Helpers to build on: hw/pci/quirks.rs `PciFixup`, hw/virtio/ring.rs `Vring` + host `Fake` device (test template), typed `request_irq`/`IrqRegistration` (irq.rs), arch barriers (dma_wmb/dma_rmb/wmb), util/pod.rs, bitflags, offset_of!.

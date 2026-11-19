@@ -88,7 +88,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 - Value: high, easy.
 
 ### 5. N_TTY line discipline core: `tty/n_tty.rs` `NTtyData`, `receive_char`, `canon_char`, `copy`, `inq`, `set_icanon`
-- Coverage: none. Pure: `NTtyData::new()`, `Termios::default()`, an `Effects`.
+- Coverage: output (ONLCR) and flow control only. Pure: `NTtyData::new()`, `Termios::default()`, an `Effects`.
 - Cases: canonical line assembly and one-line-per-read; short read buffer splits a
   line, next read continues; VERASE / VWERASE (IEXTEN only) / VKILL with ECHOK vs
   ECHOKE echo strings; VEOF on empty line = 0-byte read, VEOF mid-line returns the
@@ -99,13 +99,13 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   queued bytes one line); `inq` counting with EOF marks; VMIN in raw mode.
 - Value: high (every shell, getty), easy.
 
-### 7. IPv4 receive validation and checksums: `net/ipv4.rs` `ip_options_ok`, `ip_check`, `ip_checksum`, `pseudo_header_checksum`; `net/udp.rs` `csum_ok`/`add_words`/`fold`/`udp_checksum`; `net/tcp/output.rs` `checksum`
+### 7. IPv4 receive validation and checksums: `net/ipv4.rs` `ip_options_check`, `ip_check`, `ip_checksum`, `pseudo_header_checksum`; `net/udp.rs` `csum_ok`/`add_words`/`fold`/`udp_checksum`; `net/tcp/output.rs` `checksum`
 - Coverage: `ip_checksum` has `checksum_long_input` (carry, odd length, large
   input); none for the rest (TCP option parsing is well tested).
 - Cases: RFC 1071 example vector; UDP 0 -> 0xFFFF; the three checksum
   implementations agree on random data and verify to 0xFFFF/0 when the checksum is
   inserted.
-- `ip_options_ok`: EOL ends, NOP, length 0/1 rejected, length past end rejected,
+- `ip_options_check`: EOL ends, NOP, length 0/1 rejected, length past end rejected,
   LSRR/SSRR rejected. `ip_check` (with `SkBuff::alloc`): version != 4, IHL < 5, IHL
   past data, bad checksum, total length < IHL or > data, Ethernet padding trimmed.
 - Value: high (peer input), easy.
@@ -205,7 +205,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 - Coverage: `block/sd.rs` has state-machine and index tests only.
 - Cases: READ(10)/WRITE(10) byte layout (big-endian LBA and length); vendor/product
   trimming; last_lba 0xFFFFFFFF switches to READ CAPACITY(16) (`capacity_16`);
-  CBW signature/flags/length layout, CSW signature check. `ScsiHost` is a trait: a
+  CBW signature/flags/length layout. `ScsiHost` is a trait: a
   mock host returning canned buffers tests the command helpers without hardware.
 - Value: low-medium (OptiPlex USB disks), easy.
 

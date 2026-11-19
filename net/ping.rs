@@ -444,9 +444,9 @@ pub struct PingNet {
     rover: AtomicU16,
 }
 
-/// Linux ping_hashslot: the identifier mixed with the namespace
+/// Linux ping_hashslot: the identifier plus the namespace's random mix
 fn slot(net: &NetNamespace, ident: u16) -> &'static RcuHList<PingNode, PingLocked> {
-    let mix = net.id as usize;
+    let mix = net.hash_mix as usize;
     &PING_TABLE.hash[usize::from(ident).wrapping_add(mix) % PING_HTABLE_SIZE]
 }
 

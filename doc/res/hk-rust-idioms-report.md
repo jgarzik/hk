@@ -12,7 +12,6 @@ items belong to doc/ROADMAP.md phase S1.
 | 5 | Struct update `..Default::default()` in user/ | medium | low | med |
 | 7 | One `util/bytes` LE/BE reader on `first_chunk` | small | low | low |
 | 8 | `is_multiple_of` for `% a == 0` | none | none | low |
-| 9 | xhci MMIO through `IoMem` | none | none | low |
 
 ---
 
@@ -64,12 +63,6 @@ round-ups are gone, except `mm/heap.rs round_up` (run-time power-of-two
 alignment on the allocation path: a mask, not a division), the wrapping
 `mm/syscall.rs page_align` (Linux PAGE_ALIGN) and `mm/huge_page.rs` (mask
 helpers next to their align-down twins).
-
-## 9. xhci MMIO (rule 8)
-
-hw/usb/xhci.rs registers are `IoMem` (`Regs`) except the IRQ handler's
-USBSTS/IMAN acks through raw `(op_regs + off) as *const u32` (rule 8 / rule 2
-wrapper).
 
 ## Smaller, optional
 

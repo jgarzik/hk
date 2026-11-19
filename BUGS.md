@@ -35,9 +35,8 @@ Most of their blocks belong in a missing wrapper:
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
-- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: xhci's
-  interrupt handler (USBSTS, IMAN), gfx framebuffer, vgacon, rtc,
-  pci_quirks, aarch64 serial, x86 power.
+- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: gfx
+  framebuffer, vgacon, rtc, pci_quirks, aarch64 serial, x86 power.
 - **Lists:** an intrusive `CursorMut` for the walk-and-remove loops
   (futex, waitqueue, sched, percpu).
 - **Callbacks:** smp calls with a plain `usize` (`smp_call_function_many`
@@ -98,6 +97,26 @@ so memory pressure does not clamp windows), no orphan count limit
 (tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
+
+UDP has the port hash only (Linux udp_table.hash), not the second
+hash by address and port (hash2) Linux looks up in when a slot is
+long, and so walks a whole slot per datagram. Its lookup scores the
+whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
+a group's pick at once (with no connected members), before scoring
+the rest of the hash2 chain.
+
+A TIME_WAIT event other than a takeover SYN (a segment, the 2MSL
+timer) rebuilds a full control block from the entry (`TwCb::cb`),
+whose lockless fields (`Live`) it allocates GFP_ATOMIC per event: a
+flood of segments to TIME_WAIT tuples allocates per segment, and an
+allocation failure drops the segment or ends the entry early. Linux
+tcp_timewait_state_process works on the tw itself.
+
+A socket on RCU lists (ping, raw, UDP, packet, netlink) leaves "sockets: used" a grace
+period after its close: the chain's `Arc` is released by
+`RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
+drops the count at sk_free (the last reference, at unhash) and defers
+only the memory (SOCK_RCU_FREE).
 No SYN cookies (a full listener drops SYNs). Echo and timestamp
 replies skip the ICMP rate limits (Linux icmp_reply applies them when
 icmp_ratemask names the reply type, which the default does not).
@@ -487,8 +506,8 @@ hub6, where Linux moves the port (uart_change_port).
   wakeup ...), no /sys/power, /sys/firmware/{acpi,dmi,efi} or
   /sys/class/dmi/id: the directories exist empty.
 - Missing classes: rtc (PL031 has no /dev/rtc0), input (Phase V),
-  misc, graphics/drm, pci_bus; no /sys/kernel/{security,debug,tracing,
-  config} mount points (hk has none of those filesystems).
+  misc, graphics/drm, pci_bus; no /sys/kernel/{security,debug,config}
+  mount points (hk has none of those filesystems).
 - Topology: places differ from Linux on QEMU: COM1's ttyS0 sits below
   /sys/devices/platform/serial8250 (Linux binds 8250_pnp to the ACPI
   PNP0501 device), PL011/PL031 are platform devices (Linux: amba bus),
@@ -796,49 +815,6 @@ creation, but nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
 bpf_map_charge_memlock / memcg accounting), so many maps can still use
 up memory.
 
-## Heap allocations in atomic context
-
-**Location**: `mm/slab.rs` (`heap_gfp`), `sync/lockdep.rs`
-(`might_alloc`); sites listed by LOCKDEP
-
-The heap takes no GFP: in atomic context (a spin lock of any kind,
-preemption or interrupts off) it allocates without reclaim down to the
-min watermark (in effect GFP_NOWAIT), where Linux requires the GFP
-named and might_alloc reports an unnamed (GFP_KERNEL) one. A LOCKDEP
-boot lists each site once (`LOCKDEP:ATOMIC_ALLOC`, with the IRQ-safe
-lock, spin lock or `local_irq_save` it was made under; the shutdown
-summary counts them): mostly collections grown, or copied, under spin
-locks in net, fs, io, task, cgroup and keys, and IRQ-safe locks
-in bpf maps and the swap cache. ROADMAP
-phase A (A0-A3).
-
-Phase A2 (net) remaining:
-- IPv4 reassembly (`net/inet/frag.rs` `FragTable.st`): Linux per-queue
-  locks and timers, fragments in the skb rbtree, inet_frag_alloc
-  GFP_ATOMIC.
-- ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
-  with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
-- Raw, UDP, packet and netlink socket tables still allocate under their
-  spin locks: hslot/RCU tables, sock_reuseport groups (GFP_ATOMIC under
-  reuseport_lock), packet RCU sklist, netlink RCU portid table.
-- `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
-  enum side by side (Linux: one skb->cb); size matters for stacks.
-- TCP (`net/tcp/mod.rs`): a SYN backlogged while `listen()` owns the
-  socket is answered by `conn_request` before `apply` copies
-  `listen_opts`, so the first children get default options
-  (TCP_NODELAY, keepalive, MAXSEG, SYNCNT, DEFER_ACCEPT, congestion).
-- TCP `release_cb` runs `finish`/`apply` even with no deferred flags
-  (Linux tcp_release_cb returns early), and its wakeups run inside
-  `SockLock::drain` while the socket is still owned.
-- TCP `child_ready`/`child_gone` scan the SYN queue (`remove_first`)
-  under `TcpSock.queue`; the intrusive `accept_link` can unlink in O(1).
-- No debug check that a listener owns its bhash port (the old
-  `assert_owner` raced a close on the lockless SYN path); re-add on
-  the locked path only.
-- `net/tcp/table.rs` keeps separate established and TIME_WAIT nulls
-  tables (two walks per miss, two bucket locks in hash_unique); Linux
-  has one ehash for both.
-
 ## Deferred file release gaps
 
 **Location**: `fs/file.rs` (`FileRef`, `fput`), `task/task_work.rs`,
@@ -1084,7 +1060,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **`task/percpu.rs` is the largest file** (before C): scheduler core,
   do_clone, exit, wait, credential setters, several sleep APIs. Split
   like Linux (sched/core, fork, exit, cred). Other giant functions:
-  copy_process, sys_prctl, sys_semctl, sys_mmap, exec_file, sys_fcntl.
+  copy_process, sys_prctl, sys_semctl, do_mmap, exec_file.
 - **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
@@ -1148,8 +1124,8 @@ Tag = roadmap phase (doc/ROADMAP.md).
    odd offset, connect takes even ones while any is free. Not
    reproduced in long looped runs (with SOCKCORE_PORT_PARITY before
    each; x86 and arm64 LOCKDEP e1000, 8 CPUs, CPU spinners, TIME_WAIT
-   churn); LOCKDEP builds assert that a listener receiving a SYN owns
-   its port in bhash (`TcpSock::assert_owner`). On failure the test
+   churn); debug and LOCKDEP builds assert that a new listener owns
+   its port in bhash (`TcpSock::listen`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
 
@@ -1162,18 +1138,27 @@ Tag = roadmap phase (doc/ROADMAP.md).
 12. **FORK_PGRP_SIGNAL flake** (hk x86, once in three local `check`
     runs): `FORK_PGRP_SIGNAL:FAIL got 11`: in round 1 a child forked
     before the group's SIGUSR1 showed pending in its parent did not
-    get it (`user/boot_tester/signal/fork_delay.rs` `round`). A
-    process-group kill racing fork (Linux copy_process's
-    signal->multiprocess delay and its recheck under siglock) may
-    miss a child that joined the group before the walk.
+    get it (`user/boot_tester/signal/fork_delay.rs` `round`). The
+    paths match Linux: a fork's multiprocess delay is linked under the
+    parent's siglock (`signal::fork_signals_begin`), a group kill
+    walks the group under TASKLIST read (`pgrp_send`), and the child
+    joins the group and takes the delayed set in one TASKLIST write
+    hold (`copy_process`, `install_fork_signal`). A failing round now
+    prints the children that missed it and their wait statuses (0:
+    SIGUSR2 came first, 2: the wait failed).
 
 13. **TCP_MEM_PRESSURE flake** (hk x86, once in four local `check`
     runs, in a gate): `TCP_MEM_PRESSURE:FAIL pair status got 1024`: a
     pair's reader got less than 128 KiB before its 20 s receive
     timeout (`user/boot_tester/net/tcp_mem.rs` `pair`, exit 4) with
-    every tcp_mem limit at 4 pages. A connection stalled under memory
-    pressure: a forced charge for an empty queue, or the window or
-    retransmit timer after a drop, may not restart it.
+    every tcp_mem limit at 4 pages. The receive side forces the charge
+    for an empty queue and drops into a non-empty one with a zero
+    window ACK (`TcpCb::rmem_ok`, Linux tcp_data_queue), the send side
+    keeps its tcp_wmem[0] floor (`wmem_schedule`), as Linux; what
+    restarts a stalled sender (the window update when the reader
+    drains, the probe or retransmit timer and its backoff) is not
+    ruled out. A stalled pair now prints its byte count, the last recv
+    result, /proc/net/tcp and the TcpExt and Tcp counters.
 
 14. **FD_ALLOC_SCALE flake on Linux** (`check-linux`, under host load):
     `FD_ALLOC_SCALE:FAIL 5`: the batch of dup()s at ~33000 descriptors

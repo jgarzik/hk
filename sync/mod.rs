@@ -203,6 +203,103 @@ pub fn in_atomic() -> bool {
     crate::arch::preempt_count() != 0 || irqs_disabled() || CurrentArch::interrupt_depth() != 0
 }
 
+/// A page allocation of 2^`order` pages whose GFP may sleep (direct
+/// reclaim): in atomic context it is a bug (Linux prepare_alloc_pages
+/// -> might_alloc -> might_sleep_if). Reported once per call site (up
+/// to 16) as `MIGHT_ALLOC:FAIL` with the caller and this CPU's stack, in
+/// every build; the allocation goes on without reclaim. Exempt as
+/// `lockdep::might_alloc`: interrupt handlers, reclaim, tasks that
+/// cannot sleep, outside Scheduling and Running.
+#[track_caller]
+#[inline]
+pub fn might_alloc_pages(order: u32) {
+    #[cfg(not(test))]
+    if in_atomic()
+        && !in_interrupt()
+        && crate::cpu::try_this_id().is_some()
+        && crate::system_state::checks_apply()
+        && sched::can_sleep()
+        && !crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC)
+    {
+        alloc_pages_fail(order, core::panic::Location::caller());
+    }
+    #[cfg(test)]
+    let _ = order;
+}
+
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+fn alloc_pages_fail(order: u32, at: &'static core::panic::Location<'static>) {
+    use crate::arch::{CurrentArch, HaltOps};
+    use core::sync::atomic::{AtomicPtr, Ordering};
+    /// Call sites reported (each once; past the table, none more)
+    static SEEN: [AtomicPtr<core::panic::Location<'static>>; 16] =
+        [const { AtomicPtr::new(core::ptr::null_mut()) }; 16];
+    let me = core::ptr::from_ref(at).cast_mut();
+    let new = SEEN.iter().find_map(|s| {
+        match s.compare_exchange(
+            core::ptr::null_mut(),
+            me,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Some(true),
+            Err(p) if p == me => Some(false),
+            Err(_) => None,
+        }
+    });
+    if new != Some(true) {
+        return;
+    }
+    crate::printkln!(
+        "MIGHT_ALLOC:FAIL page allocation of order {} with a GFP that may sleep \
+         in atomic context at {} (preempt count {}, irqs off {}, tid {})",
+        order,
+        at,
+        crate::arch::preempt_count(),
+        irqs_disabled(),
+        crate::task::percpu::current_tid()
+    );
+    CurrentArch::dump_stack();
+}
+
+/// A heap allocation made in atomic context with no GFP named
+/// (`lockdep::might_alloc` without the feature): `MIGHT_ALLOC:FAIL`, the
+/// context and this CPU's stack (Linux __might_resched's report and
+/// dump_stack). The first `REPORTS` of a boot (no call site to tell
+/// them apart without lockdep; one fix need not hide the next), counted
+/// before printing (printing may allocate)
+#[cfg(not(any(feature = "lockdep", test)))]
+#[cold]
+#[inline(never)]
+pub fn might_alloc_fail(size: usize, align: usize) {
+    use crate::arch::{CurrentArch, HaltOps};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    const REPORTS: u32 = 8;
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    /// A report in progress: one the printing makes is not reported
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= REPORTS {
+        BUSY.store(false, Ordering::Release);
+        return;
+    }
+    crate::printkln!(
+        "MIGHT_ALLOC:FAIL heap allocation of {} (align {}) in atomic context \
+         with no GFP named (preempt count {}, irqs off {}, tid {})",
+        size,
+        align,
+        crate::arch::preempt_count(),
+        irqs_disabled(),
+        crate::task::percpu::current_tid()
+    );
+    CurrentArch::dump_stack();
+    BUSY.store(false, Ordering::Release);
+}
+
 #[cfg(not(any(feature = "lockdep", test)))]
 #[cold]
 fn atomic_sleep(at: &'static core::panic::Location<'static>) {

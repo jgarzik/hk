@@ -4,7 +4,7 @@
 //! poll/epoll readiness. The eth0 DNS exchange is in netdev.rs.
 
 use hk_syscall::{
-    EPOLL_CTL_ADD, EPOLLIN, EpollEvent, IoVec, MsgHdr, SHUT_RD, SockAddrIn, sys_close,
+    EPOLL_CTL_ADD, EPOLLIN, EpollEvent, IoVec, MsgHdr, POLLIN, SHUT_RD, SockAddrIn, sys_close,
     sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_read, sys_sendmsg, sys_shutdown,
     sys_write,
 };
@@ -22,6 +22,7 @@ pub fn run_tests() {
     test_dontwait();
     test_sizes();
     test_bind_rules();
+    test_reuseport_group();
     test_ephemeral();
     test_rcvbuf_drops();
     test_pktinfo();
@@ -224,6 +225,75 @@ fn test_bind_rules() {
     for s in [d, e, f, g, h] {
         close(s);
     }
+    t.done();
+}
+
+/// Members a SO_REUSEPORT group of four on 127.0.0.1 receive
+/// datagrams from 64 source ports: each arrives once, spread over more
+/// than one member (Linux reuseport_select_sock by flow hash); a
+/// SO_REUSEPORT socket on the wildcard address and that port is no
+/// member and gets none (the exact address scores higher); with the
+/// group gone it gets them
+fn test_reuseport_group() {
+    let mut t = T::new(b"UDP_REUSEPORT_GROUP");
+    let mk = |ip: [u8; 4], p: u16| {
+        let s = udp();
+        setint(s, SOL_SOCKET, SO_REUSEPORT, 1);
+        (s, bind(s, ip, p))
+    };
+    let (first, r) = mk(LO, 0);
+    t.eq(b"bind", r, 0);
+    let p = port(first);
+    let mut g = [first; 4];
+    for s in g.iter_mut().skip(1) {
+        let (fd, r) = mk(LO, p);
+        t.eq(b"join", r, 0);
+        *s = fd;
+    }
+    let (any, r) = mk(ANY, p);
+    t.eq(b"wildcard", r, 0);
+    let mut buf = [0u8; 8];
+    let drain = |fd: i32, buf: &mut [u8]| {
+        let mut n = 0;
+        while recv(fd, buf, MSG_DONTWAIT) > 0 {
+            n += 1;
+        }
+        n
+    };
+    for i in 0..64u8 {
+        let c = udp();
+        send_to(c, &[i], LO, p, 0);
+        close(c);
+    }
+    // lo delivers through the backlog: gather until all arrived
+    let mut counts = [0i64; 4];
+    for _ in 0..200 {
+        for (n, &s) in counts.iter_mut().zip(g.iter()) {
+            *n += drain(s, &mut buf);
+        }
+        if counts.iter().sum::<i64>() >= 64 {
+            break;
+        }
+        crate::helpers::msleep(10);
+    }
+    let total: i64 = counts.iter().sum();
+    t.eq(b"each once", total, 64);
+    t.ok(
+        b"spread",
+        counts.iter().filter(|&&n| n > 0).count() > 1,
+        total,
+    );
+    t.eq(b"wildcard none", drain(any, &mut buf), 0);
+    for s in g {
+        close(s);
+    }
+    let c = udp();
+    send_to(c, b"x", LO, p, 0);
+    close(c);
+    let (n, _) = poll1(any, POLLIN, 2000);
+    t.eq(b"wildcard ready", n, 1);
+    t.eq(b"wildcard after", drain(any, &mut buf), 1);
+    close(any);
     t.done();
 }
 

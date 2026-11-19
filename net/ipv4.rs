@@ -17,7 +17,7 @@ use crate::net::ethernet::{self, ETH_ALEN, EtherType};
 use crate::net::inet::frag::Defrag;
 use crate::net::inet::route::{self, IpInput};
 use crate::net::mib::*;
-use crate::net::skb::{NET_SKB_PAD, SkBuff};
+use crate::net::skb::SkBuff;
 use crate::net::tcp;
 use crate::net::udp;
 
@@ -361,15 +361,9 @@ pub fn ip_rcv(mut skb: Box<SkBuff>) {
         return ip_local_deliver(skb);
     }
     // Linux ip_local_deliver -> ip_defrag
-    if let Defrag::Whole(pkt) = net.frags.add(&net, skb.data()) {
-        // Linux ip_frag_reasm: the reassembled skb, or out_nomem
-        match rebuild(&skb, &pkt) {
-            Some(whole) => {
-                net.mib.ip.inc(IPSTATS_MIB_REASMOKS);
-                ip_local_deliver(whole);
-            }
-            None => net.mib.ip.inc(IPSTATS_MIB_REASMFAILS),
-        }
+    if let Defrag::Whole(whole) = net.frags.add(&net, skb) {
+        net.mib.ip.inc(IPSTATS_MIB_REASMOKS);
+        ip_local_deliver(whole);
     }
 }
 
@@ -452,17 +446,6 @@ pub fn ip_options_check(opt: &[u8]) -> Opts {
         }
     }
     if srr { Opts::SourceRoute } else { Opts::Ok }
-}
-
-/// A reassembled datagram as a received skb (device and link-layer
-/// classification of its last fragment)
-fn rebuild(last: &SkBuff, pkt: &[u8]) -> Option<Box<SkBuff>> {
-    let mut s = SkBuff::alloc(NET_SKB_PAD, pkt.len(), Gfp::ATOMIC)?;
-    s.put_slice(pkt)?;
-    s.dev = last.dev.clone();
-    s.pkt_type = last.pkt_type;
-    s.ip_bcast = last.ip_bcast;
-    Some(s)
 }
 
 /// Deliver a whole datagram for us to its protocol (Linux

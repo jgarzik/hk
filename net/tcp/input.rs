@@ -540,7 +540,11 @@ impl TcpCb {
     /// acknowledged head loses its acknowledged bytes (tcp_trim_head)
     fn clean_rtx(&mut self, ack: u32) {
         let mut delivered = 0;
-        while self.rtx.first().is_some_and(|f| !after(f.tcp.end_seq, ack)) {
+        while self
+            .rtx
+            .first()
+            .is_some_and(|f| !after(f.tcp().end_seq, ack))
+        {
             drop(self.rtx.pop_first());
             delivered += 1;
         }
@@ -549,10 +553,10 @@ impl TcpCb {
         self.net_add(LINUX_MIB_TCPDELIVERED, delivered);
         let mut c = self.rtx.cursor_front_mut();
         let _ = c.with_current_mut(|h| {
-            if before(h.tcp.seq, ack) {
-                let n = (ack.wrapping_sub(h.tcp.seq) as usize).min(h.len());
+            if before(h.tcp().seq, ack) {
+                let n = (ack.wrapping_sub(h.tcp().seq) as usize).min(h.len());
                 let _ = h.pull(n);
-                h.tcp.seq = ack;
+                h.tcp_mut().seq = ack;
             }
         });
     }
@@ -636,8 +640,8 @@ impl TcpCb {
             return;
         }
         if len != 0 {
-            skb.tcp.seq = seq;
-            skb.tcp.end_seq = seq.wrapping_add(len as u32);
+            skb.tcp_mut().seq = seq;
+            skb.tcp_mut().end_seq = seq.wrapping_add(len as u32);
             self.queue_data(skb, now, out);
         }
         if fin {
@@ -722,7 +726,7 @@ impl TcpCb {
         let len = skb.len();
         self.stats.bytes_received += len as u64;
         skb.dev = None;
-        if skb.tcp.seq != self.rcv_nxt {
+        if skb.tcp().seq != self.rcv_nxt {
             self.ooo.insert(skb);
             let m = core::mem::take(&mut self.ooo.merged);
             self.net_add(LINUX_MIB_TCPOFOMERGE, m);

@@ -1059,15 +1059,13 @@ impl Xhci {
     /// reset under the lock, its TDs given back (Shutdown) and its
     /// commands completed, the command timer cancelled
     pub(super) fn stop(&self) {
-        let slots: Vec<u8> = {
-            let st = self.lock.lock();
-            (1..st.devs.len())
-                .filter(|&s| st.devs[s].is_some())
-                .map(|s| s as u8)
-                .collect()
-        };
-        for slot in slots {
-            self.free_dev(slot);
+        // One slot at a time, nothing collected under the lock (Linux
+        // usb_disconnect walks the hub's children)
+        let nslots = self.lock.lock().devs.len();
+        for slot in 1..nslots {
+            if self.lock.lock().devs[slot].is_some() {
+                self.free_dev(slot as u8);
+            }
         }
         let mut st = self.lock.lock();
         st.xhc_state |= xhc_state::HALTED | xhc_state::REMOVING;

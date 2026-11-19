@@ -19,8 +19,9 @@
 //! socket's `TcpSock.lock` slock (thread context only; table and timer
 //! locks may be taken under it).
 
+use crate::mm::page_alloc::Gfp;
 use crate::util::error::KernelError;
-use crate::util::kalloc::{try_arc, try_arc_cyclic};
+use crate::util::kalloc::{try_arc_cyclic, try_arc_gfp};
 use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::Mutex;
@@ -34,7 +35,6 @@ use crate::net::ipv4::IpParams;
 use crate::net::skb::SkBuff;
 use crate::sync::rcu::RcuPuts;
 use crate::time::timer::ArcTimer;
-use crate::util::hlist_nulls::NullsLink;
 use crate::util::list::Link;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -48,14 +48,12 @@ pub struct TimeWait {
     oif: u32,
     /// The control block and the deadline (ms) `timer` is armed for
     inner: Mutex<(TwCb, Option<u64>)>,
-    /// The lockless fields of the control block each event rebuilds
-    /// (written under `inner`; nothing reads them without it)
-    live: Arc<Live>,
     /// 2MSL (Linux tw_timer)
     timer: ArcTimer<TimeWait>,
-    /// Its ehash chain link and bhash owner link (Linux tw_node,
+    /// Its ehash entry while hashed (a leaf: set before the hand-over,
+    /// taken by whoever unhashes it), its bhash owner link (Linux
     /// tw_bind_node), and whether its socket took the port with bind()
-    pub(super) eh_link: NullsLink,
+    eh: Mutex<Option<Arc<super::table::Eh>>>,
     pub(super) bind_link: Link,
     pub(super) by_bind: bool,
     /// Ended by its namespace's teardown: the timer is never armed
@@ -80,7 +78,6 @@ impl TimeWait {
         oif: u32,
         cb: TwCb,
     ) -> Result<Arc<Self>, KernelError> {
-        let live = try_arc(Live::default())?;
         try_arc_cyclic(|me| Self {
             tuple,
             bind,
@@ -88,15 +85,25 @@ impl TimeWait {
             params,
             oif,
             inner: Mutex::new((cb, None)),
-            live,
             timer: ArcTimer::new(TimeWait::tw_timer),
-            eh_link: NullsLink::new(),
+            eh: Mutex::new(None),
             bind_link: Link::new(),
             by_bind,
             killed: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             me: me.clone(),
         })
+    }
+
+    /// Its ehash entry, before it replaces its socket there
+    pub(super) fn set_eh(&self, eh: Arc<super::table::Eh>) {
+        *self.eh.lock() = Some(eh);
+    }
+
+    /// Leave the tables (once: the entry is taken)
+    fn unhash(self: &Arc<Self>) {
+        let eh = self.eh.lock().take();
+        self.net.tcp.tw_unhash(self, eh);
     }
 
     /// Its namespace
@@ -144,15 +151,27 @@ impl TimeWait {
     /// gives it to a listener.
     pub fn rcv(self: &Arc<Self>, skb: Box<SkBuff>, now: u64) -> Option<Box<SkBuff>> {
         let mut out = Out::default();
-        let s = skb.tcp;
-        let mut g = self.inner.lock();
-        if g.0.tw_syn_ok(&s) {
-            self.sync(&mut g, true);
-            drop(g);
-            self.net.tcp.tw_unhash(self);
+        let s = skb.tcp();
+        // A new connection's SYN takes the tuple over with nothing
+        // allocated (Linux TCP_TW_SYN)
+        if self.syn_takeover(&s) {
             return Some(skb);
         }
-        let mut cb = g.0.cb(super::cfg(&self.net), Arc::clone(&self.live));
+        // Any other event rebuilds a control block, which needs
+        // lockless fields of its own, scratch for the event: made
+        // GFP_ATOMIC before the lock (an entry keeps none, so it stays
+        // small); none, no event (the segment is dropped, the peer
+        // sends again)
+        let Ok(live) = try_arc_gfp(Live::default(), Gfp::ATOMIC) else {
+            return None;
+        };
+        let mut g = self.inner.lock();
+        // A SYN that became acceptable between the two holds
+        if g.0.tw_syn_ok(&s) {
+            drop(g);
+            return self.syn_takeover(&s).then_some(skb);
+        }
+        let mut cb = g.0.cb(super::cfg(&self.net), live);
         cb.mib = Some(Arc::clone(&self.net.mib));
         cb.input(&s, skb, now, &mut out);
         g.0 = TwCb::from_cb(&cb);
@@ -165,10 +184,23 @@ impl TimeWait {
         None
     }
 
+    /// `s` is a SYN that may reuse the tuple: the entry ends, and the
+    /// caller hands the segment to a listener
+    fn syn_takeover(self: &Arc<Self>, s: &crate::net::skb::TcpSkbCb) -> bool {
+        let mut g = self.inner.lock();
+        if !g.0.tw_syn_ok(s) {
+            return false;
+        }
+        self.sync(&mut g, true);
+        drop(g);
+        self.unhash();
+        true
+    }
+
     fn post(self: &Arc<Self>, g: &mut (TwCb, Option<u64>), out: &Out) {
         self.sync(g, out.done);
         if out.done {
-            self.net.tcp.tw_unhash(self);
+            self.unhash();
         }
     }
 
@@ -186,15 +218,21 @@ impl TimeWait {
         self.killed.store(true, Ordering::Relaxed);
         self.sync(&mut g, true);
         drop(g);
-        self.net.tcp.tw_unhash(self);
+        self.unhash();
     }
 
     /// 2MSL passed (`ktimers/N`; Linux tw_timer_handler): the entry
     /// leaves the tables; the timer's reference goes with `tw`
     fn tw_timer(tw: Arc<TimeWait>) {
         let mut out = Out::default();
+        // As `rcv`; with no memory the entry ends now (Linux skips
+        // TIME_WAIT when it cannot allocate one)
+        let Ok(live) = try_arc_gfp(Live::default(), Gfp::ATOMIC) else {
+            tw.kill();
+            return;
+        };
         let mut g = tw.inner.lock();
-        let mut cb = g.0.cb(super::cfg(&tw.net), Arc::clone(&tw.live));
+        let mut cb = g.0.cb(super::cfg(&tw.net), live);
         cb.on_timer(now_ms(), &mut out);
         g.0 = TwCb::from_cb(&cb);
         tw.post(&mut g, &out);

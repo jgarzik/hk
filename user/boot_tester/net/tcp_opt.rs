@@ -5,7 +5,9 @@
 //! against a dead peer (a blackhole route), /proc/net/tcp lines and the
 //! TCP sysctls.
 
-use hk_syscall::{SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_setsockopt, sys_shutdown};
+use hk_syscall::{
+    SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_listen, sys_setsockopt, sys_shutdown,
+};
 
 use crate::harness::T;
 use crate::net::nl::{self, Nl, Req};
@@ -49,6 +51,7 @@ pub fn run_tests() {
     test_sysctls();
     test_echo_4mb();
     test_keepalive_dead_peer();
+    test_listen_opts();
 }
 
 /// The fields of struct tcp_info the tests read
@@ -524,5 +527,44 @@ fn test_keepalive_dead_peer() {
     );
     t.eq(b"unblackhole", blackhole(&mut nl, false, ECHO) as i64, 0);
     close(fd);
+    t.done();
+}
+
+/// A listener's options reach its first children: a client child
+/// connects as fast as it can while the parent sets TCP_NODELAY on a
+/// bound socket and listens, so SYNs arrive while listen() owns the
+/// socket (backlogged, answered at its release); the first accepted
+/// child has TCP_NODELAY (Linux children inherit nonagle), every round
+fn test_listen_opts() {
+    let mut t = T::new(b"TCP_LISTEN_OPTS");
+    for round in 0..30 {
+        let l = tcp();
+        bind(l, LO, 0);
+        let p = port(l);
+        setint(l, IPPROTO_TCP, TCP_NODELAY, 1);
+        let pid = sys_fork();
+        if pid == 0 {
+            for _ in 0..20_000 {
+                let c = tcp();
+                let r = connect(c, LO, p);
+                close(c);
+                if r == 0 {
+                    sys_exit(0);
+                }
+            }
+            sys_exit(1);
+        }
+        sys_listen(l, 8);
+        let a = accept(l);
+        t.ok(b"accept", a >= 0, round);
+        t.eq(
+            b"nodelay",
+            i64::from(getint(a, IPPROTO_TCP, TCP_NODELAY).1),
+            1,
+        );
+        close(a);
+        t.eq(b"client", i64::from((wait_child(pid) >> 8) & 0xff), 0);
+        close(l);
+    }
     t.done();
 }

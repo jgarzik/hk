@@ -65,10 +65,10 @@ fn fragment(skb: &mut SkBuff, at: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
     let mut n = SkBuff::alloc_tx(rest, gfp)?;
     n.put_slice(&skb.data()[at..])?;
     skb.trim(rest)?;
-    n.tcp = skb.tcp;
-    n.tcp.seq = skb.tcp.seq.wrapping_add(at as u32);
-    skb.tcp.end_seq = n.tcp.seq;
-    skb.tcp.flags &= !(flags::FIN | flags::PSH);
+    n.set_tcp(skb.tcp());
+    n.tcp_mut().seq = skb.tcp().seq.wrapping_add(at as u32);
+    skb.tcp_mut().end_seq = n.tcp().seq;
+    skb.tcp_mut().flags &= !(flags::FIN | flags::PSH);
     Some(n)
 }
 
@@ -149,7 +149,7 @@ impl TcpCb {
         let Some(mut c) = clone_data(skb, out.gfp) else {
             return false;
         };
-        c.tcp = self.hdr(seq, fl, skb.len() as u32);
+        c.set_tcp(self.hdr(seq, fl, skb.len() as u32));
         out.segs.push_back(c);
         true
     }
@@ -164,7 +164,7 @@ impl TcpCb {
             self.dack.at = Some(self.clock + DELACK_MAX);
             return;
         };
-        skb.tcp = self.hdr(seq, fl, 0);
+        skb.set_tcp(self.hdr(seq, fl, 0));
         out.segs.push_back(skb);
     }
 
@@ -259,7 +259,7 @@ impl TcpCb {
         if before(self.snd_nxt, self.snd_max) {
             self.rtx
                 .iter()
-                .find(|s| s.tcp.seq == self.snd_nxt)
+                .find(|s| s.tcp().seq == self.snd_nxt)
                 .map_or(0, |s| s.len() as u32)
         } else {
             self.wq.front().map_or(0, |s| s.len() as u32)
@@ -368,8 +368,8 @@ impl TcpCb {
                 let Some(mut s) = SkBuff::alloc_tx(0, out.gfp) else {
                     return false;
                 };
-                s.tcp.seq = self.write_seq;
-                s.tcp.end_seq = self.write_seq;
+                s.tcp_mut().seq = self.write_seq;
+                s.tcp_mut().end_seq = self.write_seq;
                 s
             }
         };
@@ -380,15 +380,16 @@ impl TcpCb {
             };
             self.wq.push_front(rest);
         }
-        if !self.transmit(&skb, skb.tcp.seq, fl, out) {
+        if !self.transmit(&skb, skb.tcp().seq, fl, out) {
             self.requeue(skb);
             return false;
         }
-        skb.tcp.flags |= fl;
+        skb.tcp_mut().flags |= fl;
         if fl & flags::FIN != 0 {
-            skb.tcp.end_seq = skb.tcp.end_seq.wrapping_add(1);
+            skb.tcp_mut().end_seq = skb.tcp().end_seq.wrapping_add(1);
         }
-        self.rtx.insert_by(skb, |a, b| before(a.tcp.seq, b.tcp.seq));
+        self.rtx
+            .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
         true
     }
 
@@ -405,7 +406,7 @@ impl TcpCb {
     /// without memory
     fn send_rtx_at(&mut self, seq: u32, n: u32, fl: u8, out: &mut Out) -> bool {
         let gfp = out.gfp;
-        let mut c = self.rtx.cursor_floor_mut(|s| !after(s.tcp.seq, seq));
+        let mut c = self.rtx.cursor_floor_mut(|s| !after(s.tcp().seq, seq));
         let cut = c.with_current_mut(|s| {
             if s.len() > n as usize {
                 fragment(s, n as usize, gfp).map(Some)
@@ -416,7 +417,8 @@ impl TcpCb {
         match cut {
             Some(Some(rest)) => {
                 if let Some(r) = rest {
-                    self.rtx.insert_by(r, |a, b| before(a.tcp.seq, b.tcp.seq));
+                    self.rtx
+                        .insert_by(r, |a, b| before(a.tcp().seq, b.tcp().seq));
                 }
             }
             _ => return false,
@@ -424,7 +426,7 @@ impl TcpCb {
         let Some(clone) = self
             .rtx
             .iter()
-            .find(|s| s.tcp.seq == seq)
+            .find(|s| s.tcp().seq == seq)
             .and_then(|s| clone_data(s, gfp))
         else {
             return false;
@@ -435,7 +437,7 @@ impl TcpCb {
 
     /// Send `c`, a copy of a queued skb's payload, at `seq` with `fl`
     fn send_clone(&mut self, mut c: Box<SkBuff>, seq: u32, fl: u8, out: &mut Out) {
-        c.tcp = self.hdr(seq, fl, c.len() as u32);
+        c.set_tcp(self.hdr(seq, fl, c.len() as u32));
         out.segs.push_back(c);
     }
 
@@ -457,7 +459,7 @@ impl TcpCb {
         let Some(head) = self.rtx.first() else {
             return;
         };
-        let (seq, len) = (head.tcp.seq, head.len());
+        let (seq, len) = (head.tcp().seq, head.len());
         let mss = self.live.mss.get() as usize;
         if len > mss {
             if !self.send_rtx_at(seq, self.live.mss.get(), flags::ACK, out) {
@@ -470,7 +472,7 @@ impl TcpCb {
                 return;
             };
             let mut fl = flags::ACK;
-            if head.tcp.has(flags::FIN) {
+            if head.tcp().has(flags::FIN) {
                 fl |= flags::FIN;
             }
             if head.is_empty() && fl & flags::FIN == 0 {
@@ -508,11 +510,11 @@ impl TcpCb {
             let (Some(h), Some(n)) = (c.current(), c.peek_next()) else {
                 return;
             };
-            if h.tcp.has(flags::FIN)
+            if h.tcp().has(flags::FIN)
                 || h.len() + n.len() > mss
                 || n.len() > h.tailroom()
-                || h.tcp.end_seq != n.tcp.seq
-                || after(n.tcp.end_seq, self.snd_nxt)
+                || h.tcp().end_seq != n.tcp().seq
+                || after(n.tcp().end_seq, self.snd_nxt)
             {
                 return;
             }
@@ -523,8 +525,8 @@ impl TcpCb {
             let mut c = self.rtx.cursor_front_mut();
             let _ = c.with_current_mut(|h| {
                 let _ = h.put_slice(next.data());
-                h.tcp.end_seq = next.tcp.end_seq;
-                h.tcp.flags |= next.tcp.flags & (flags::FIN | flags::PSH);
+                h.tcp_mut().end_seq = next.tcp().end_seq;
+                h.tcp_mut().flags |= next.tcp().flags & (flags::FIN | flags::PSH);
             });
         }
     }
@@ -648,7 +650,7 @@ fn put_hdr(h: &Seg, t: &Tuple, b: &mut [u8; HLEN_MAX]) -> usize {
 /// tcp_transmit_skb's header part); None if the headroom is short
 pub fn push_hdr(skb: &mut SkBuff, t: &Tuple) -> Option<()> {
     let mut b = [0u8; HLEN_MAX];
-    let n = put_hdr(&skb.tcp, t, &mut b);
+    let n = put_hdr(&skb.tcp(), t, &mut b);
     skb.push(n)?.copy_from_slice(&b[..n]);
     let c = checksum(t.laddr, t.raddr, skb.data());
     skb.data_mut()[16..18].copy_from_slice(&c.to_be_bytes());
@@ -661,7 +663,7 @@ pub fn push_hdr(skb: &mut SkBuff, t: &Tuple) -> Option<()> {
 /// for unknown tuples, a listener's stray-ACK reset)
 pub fn build(h: &Seg, t: &Tuple, gfp: Gfp) -> Option<Box<SkBuff>> {
     let mut skb = SkBuff::alloc_tx(0, gfp)?;
-    skb.tcp = *h;
+    skb.set_tcp(*h);
     push_hdr(&mut skb, t)?;
     Some(skb)
 }
@@ -841,19 +843,19 @@ mod tests {
     fn fragment_moves_the_tail() {
         let mut skb = SkBuff::alloc_tx(10, Gfp::KERNEL).unwrap();
         skb.put_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap();
-        skb.tcp.seq = 100;
-        skb.tcp.flags = flags::ACK | flags::PSH | flags::FIN;
-        skb.tcp.set_len(10);
+        skb.tcp_mut().seq = 100;
+        skb.tcp_mut().flags = flags::ACK | flags::PSH | flags::FIN;
+        skb.tcp_mut().set_len(10);
         let rest = fragment(&mut skb, 4, Gfp::KERNEL).unwrap();
         assert_eq!(
-            (skb.data(), skb.tcp.seq, skb.tcp.end_seq),
+            (skb.data(), skb.tcp().seq, skb.tcp().end_seq),
             (&[1, 2, 3, 4][..], 100, 104)
         );
-        assert_eq!(skb.tcp.flags, flags::ACK);
+        assert_eq!(skb.tcp().flags, flags::ACK);
         assert_eq!(
-            (rest.data().len(), rest.tcp.seq, rest.tcp.end_seq),
+            (rest.data().len(), rest.tcp().seq, rest.tcp().end_seq),
             (6, 104, 111)
         );
-        assert!(rest.tcp.has(flags::FIN | flags::PSH));
+        assert!(rest.tcp().has(flags::FIN | flags::PSH));
     }
 }

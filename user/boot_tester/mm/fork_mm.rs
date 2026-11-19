@@ -994,7 +994,10 @@ fn shm_rmid_exit() {
     const NAME: &[u8] = b"SHM_RMID_EXIT";
     // Larger than the Linux MemFree noise allowed below
     const SIZE: u64 = 96 << 20;
-    let tol = if host_mode() { 64 * 1024 } else { 512 };
+    // System-wide MemFree also moves with everything else the kernel
+    // allocates meanwhile (slab growth, deferred frees): a lost segment
+    // is 96 MiB, so 4 MiB (1/24 of it) still catches any real loss
+    let tol = if host_mode() { 64 * 1024 } else { 4096 };
     settle();
     let before = meminfo(b"MemFree:");
     let (to_parent, from_child) = pipe();
@@ -1069,7 +1072,10 @@ fn stress_worker(id: i32, a: u64, size: u64, w: u64) -> u64 {
 fn shm_stress() {
     const NAME: &[u8] = b"SHM_STRESS";
     const SIZE: u64 = 96 << 20;
-    let tol = if host_mode() { 64 * 1024 } else { 512 };
+    // System-wide MemFree also moves with everything else the kernel
+    // allocates meanwhile (slab growth, deferred frees): a lost segment
+    // is 96 MiB, so 4 MiB (1/24 of it) still catches any real loss
+    let tol = if host_mode() { 64 * 1024 } else { 4096 };
     settle();
     let before = meminfo(b"MemFree:");
     let id = sys_shmget(IPC_PRIVATE, SIZE as usize, IPC_CREAT | 0o600) as i32;

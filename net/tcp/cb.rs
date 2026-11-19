@@ -318,7 +318,7 @@ impl Out {
             return false;
         };
         h.set_len(0);
-        skb.tcp = h;
+        skb.set_tcp(h);
         self.segs.push_back(skb);
         true
     }
@@ -612,7 +612,7 @@ pub struct Ooo {
 
 /// `skb`'s payload end (its `end_seq` less a FIN)
 fn data_end(skb: &SkBuff) -> u32 {
-    skb.tcp.seq.wrapping_add(skb.len() as u32)
+    skb.tcp().seq.wrapping_add(skb.len() as u32)
 }
 
 impl Ooo {
@@ -636,15 +636,15 @@ impl Ooo {
     /// Queue `skb` (payload at `skb.tcp.seq`, beyond RCV.NXT): false if
     /// it was dropped (covered already, or the queue is full)
     pub fn insert(&mut self, skb: Box<SkBuff>) -> bool {
-        let (seq, end) = (skb.tcp.seq, data_end(&skb));
-        let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp.seq, seq));
+        let (seq, end) = (skb.tcp().seq, data_end(&skb));
+        let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp().seq, seq));
         if let Some(prev) = c.current() {
             if !after(end, data_end(prev)) {
                 // Wholly inside one held (Linux: DSACK, drop)
                 self.merged += 1;
                 return false;
             }
-            if prev.tcp.seq == seq {
+            if prev.tcp().seq == seq {
                 // It covers `prev` (Linux rb_replace_node)
                 let len = skb.len();
                 let old = c.replace_current(skb);
@@ -659,14 +659,14 @@ impl Ooo {
         }
         self.bytes += skb.len();
         self.tree
-            .insert_by(skb, |a, b| before(a.tcp.seq, b.tcp.seq));
+            .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
         self.drop_covered(seq, end);
         true
     }
 
     /// Remove the skbs after the one at `seq` that [`seq`, `end`) covers
     fn drop_covered(&mut self, seq: u32, end: u32) {
-        let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp.seq, seq));
+        let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp().seq, seq));
         c.move_next();
         while let Some(n) = c.current() {
             if after(data_end(n), end) {
@@ -684,7 +684,7 @@ impl Ooo {
     pub fn prune_after(&mut self, seq: u32) -> bool {
         let mut c = self.tree.cursor_back_mut();
         match c.current() {
-            Some(l) if after(l.tcp.seq, seq) => {}
+            Some(l) if after(l.tcp().seq, seq) => {}
             _ => return false,
         }
         if let Some(gone) = c.remove_current() {
@@ -699,15 +699,15 @@ impl Ooo {
     pub fn take(&mut self, nxt: u32) -> Option<Box<SkBuff>> {
         loop {
             let first = self.tree.first()?;
-            if after(first.tcp.seq, nxt) {
+            if after(first.tcp().seq, nxt) {
                 return None;
             }
             let mut skb = self.tree.pop_first()?;
             self.bytes -= skb.len();
             if after(data_end(&skb), nxt) {
-                let skip = nxt.wrapping_sub(skb.tcp.seq) as usize;
+                let skip = nxt.wrapping_sub(skb.tcp().seq) as usize;
                 let _ = skb.pull(skip);
-                skb.tcp.seq = nxt;
+                skb.tcp_mut().seq = nxt;
                 return Some(skb);
             }
         }
@@ -1128,7 +1128,7 @@ impl TcpCb {
             if got < k {
                 let _ = skb.trim(k - got);
             }
-            skb.tcp.end_seq = skb.tcp.end_seq.wrapping_add(got as u32);
+            skb.tcp_mut().end_seq = skb.tcp().end_seq.wrapping_add(got as u32);
             self.write_seq = self.write_seq.wrapping_add(got as u32);
             done += got;
             if !skb.is_empty() {
@@ -1161,12 +1161,12 @@ impl TcpCb {
             self.wq.push_back(t);
         }
         let mut skb = SkBuff::alloc_tx(self.live.mss.get() as usize, Gfp::KERNEL)?;
-        skb.tcp = Seg {
+        skb.set_tcp(Seg {
             seq: self.write_seq,
             end_seq: self.write_seq,
             flags: flags::ACK,
             ..Default::default()
-        };
+        });
         Some(skb)
     }
 
@@ -1272,7 +1272,7 @@ impl TcpCb {
             if !after(data_end(skb), seq) {
                 continue;
             }
-            let off = seq.wrapping_sub(skb.tcp.seq) as usize;
+            let off = seq.wrapping_sub(skb.tcp().seq) as usize;
             let piece = &skb.data()[off..];
             let piece = &piece[..piece.len().min(want - done)];
             match sink(piece) {

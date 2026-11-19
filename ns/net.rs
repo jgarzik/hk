@@ -28,8 +28,7 @@ use spin::Lazy;
 use crate::net::device::{DevList, LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::inet::fib::Fib;
 use crate::net::inet::port::PortRange;
-use crate::net::netlink::NlTable;
-use crate::net::udp::UdpTable;
+use crate::net::netlink::NlNet;
 use crate::util::error::KernelError;
 use crate::util::rculist::RcuList;
 
@@ -53,6 +52,11 @@ pub struct NetNamespace {
     /// namespace tag of its devices
     pub id: u64,
 
+    /// Random value mixed into the hashes of tables every namespace
+    /// shares (Linux net->hash_mix, net_hash_mix): another namespace
+    /// cannot tell which slot one of this namespace's keys takes
+    pub hash_mix: u32,
+
     /// Its inode number and nsfs dentry (Linux ns)
     pub ns: super::NsCommon,
 
@@ -70,13 +74,10 @@ pub struct NetNamespace {
     pub fib: Fib,
 
     /// netlink sockets bound in this namespace
-    pub nl: NlTable,
+    pub nl: NlNet,
 
     /// TCP connection, listener and port tables
     pub tcp: crate::net::tcp::table::TcpTables,
-
-    /// UDP sockets by local port
-    pub udp: UdpTable,
 
     /// net.ipv4.ip_local_port_range
     pub port_range: PortRange,
@@ -92,9 +93,6 @@ pub struct NetNamespace {
 
     /// Ping sockets by echo identifier
     pub ping: crate::net::ping::PingNet,
-
-    /// Raw sockets by protocol
-    pub raw: crate::net::raw::RawTable,
 
     /// AF_UNIX sockets and abstract names
     pub unix: crate::net::unix::UnixTable,
@@ -197,6 +195,8 @@ impl NetNamespace {
         Ok(Self {
             // Linux net->net_cookie: the namespace's id
             id: ns.ns_id,
+            // Linux preinit_net
+            hash_mix: crate::random::get_random_u32(),
             ns,
             user_ns,
             devices: RcuList::new(),
@@ -204,13 +204,11 @@ impl NetNamespace {
             fib: Fib::new()?,
             nl: Default::default(),
             tcp: Default::default(),
-            udp: UdpTable::default(),
             port_range: PortRange::default(),
             sysctl: Default::default(),
             frags: Default::default(),
             icmp: Default::default(),
             ping: Default::default(),
-            raw: Default::default(),
             unix: Default::default(),
             packet: Default::default(),
             ip_id_key: [
@@ -477,6 +475,8 @@ fn cleanup_net() {
     drop(l);
     for net in &nets {
         crate::net::rtnl::netns_exit(net);
+        // Linux ipv4_frags_exit_net
+        crate::net::inet::frag::net_exit(net);
         // Linux loopback_net_exit
         *net.loopback.write() = None;
     }

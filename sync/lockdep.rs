@@ -17,9 +17,11 @@
 //!   restores the outer interrupt state while an inner lock is held,
 //!   and an interrupt that takes that lock spins forever on its CPU.
 //!
-//! Audit list, not a failure (yet): a heap allocation in atomic context
-//! (`might_alloc`, Linux might_alloc), once per site, as
-//! `LOCKDEP:ATOMIC_ALLOC`.
+//! - a heap allocation in atomic context with no GFP named
+//!   (`might_alloc`, Linux might_alloc), once per site, as
+//!   `MIGHT_ALLOC:FAIL LOCKDEP:ATOMIC_ALLOC` with the lock that made it
+//!   atomic (builds without the feature report the first eight as
+//!   `MIGHT_ALLOC:FAIL`, `sync::might_alloc_fail`).
 //!
 //! State: a per-CPU stack of held tracked locks (the kernel is not
 //! preemptive and a task never sleeps holding one, so per-CPU equals
@@ -80,10 +82,38 @@ pub fn rcu_lock(_at: Loc) {}
 #[inline(always)]
 pub fn rcu_unlock() {}
 
-/// The heap is about to allocate `size` bytes (no-op without `lockdep`)
+/// The heap is about to allocate `size` bytes: in atomic context it
+/// must have named a GFP (Linux might_alloc -> might_sleep_if, built
+/// with CONFIG_DEBUG_ATOMIC_SLEEP). Cheapest test first: an allocation
+/// with preemption and interrupts on stops at it. Not checked in an
+/// interrupt handler (implicitly GFP_ATOMIC), where a GFP was named
+/// (`util::kalloc::with_gfp`), within reclaim (PF_MEMALLOC), in a task
+/// that cannot sleep (idle, boot), or outside Scheduling and Running
+/// (`system_state`, as Linux's __might_resched). Host unit tests have
+/// no CPU state to check.
 #[cfg(not(feature = "lockdep"))]
 #[inline(always)]
-pub fn might_alloc(_size: usize, _align: usize) {}
+pub fn might_alloc(size: usize, align: usize) {
+    #[cfg(not(test))]
+    {
+        use crate::arch::{CurrentArch, PerCpuOps};
+        if crate::arch::preempt_count() == 0 && !crate::sync::irqs_disabled() {
+            return;
+        }
+        if CurrentArch::interrupt_depth() != 0
+            || crate::cpu::try_this_id().is_none()
+            || crate::util::kalloc::named_gfp().is_some()
+            || !crate::system_state::checks_apply()
+            || !crate::task::percpu::can_sleep()
+            || crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC)
+        {
+            return;
+        }
+        crate::sync::might_alloc_fail(size, align);
+    }
+    #[cfg(test)]
+    let _ = (size, align);
+}
 
 #[cfg(feature = "lockdep")]
 mod imp {
@@ -543,10 +573,10 @@ mod imp {
     /// (implicitly GFP_ATOMIC), within reclaim (PF_MEMALLOC), or while
     /// booting or shutting down (`system_state`, as Linux's
     /// __might_resched).
-    /// Listed once per site as `LOCKDEP:ATOMIC_ALLOC` (an audit list,
-    /// not a failure): the innermost `IrqSpinlock` taken, else the
-    /// innermost tracked spin lock, else the RCU read-side section, else
-    /// where interrupts went off.
+    /// Reported once per site as `MIGHT_ALLOC:FAIL LOCKDEP:ATOMIC_ALLOC`
+    /// (the boot tests fail on it): the innermost `IrqSpinlock` taken,
+    /// else the innermost tracked spin lock, else the RCU read-side
+    /// section, else where interrupts went off.
     pub fn might_alloc(size: usize, align: usize) {
         use crate::arch::{CurrentArch, PerCpuOps};
         let Some(c) = this_cpu() else {
@@ -587,7 +617,7 @@ mod imp {
         c.busy.set(true);
         NATOMIC.fetch_add(1, Ordering::Relaxed);
         crate::printkln!(
-            "LOCKDEP:ATOMIC_ALLOC heap allocation of {} (align {}) in atomic context: \
+            "MIGHT_ALLOC:FAIL LOCKDEP:ATOMIC_ALLOC heap allocation of {} (align {}) in atomic context: \
              IRQ-safe lock taken at {}; spin lock {} taken at {}; rcu at {}; \
              irqs off at {}; preempt count {}, tid {}",
             size,

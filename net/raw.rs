@@ -12,20 +12,27 @@
 //!
 //! ## Locking (thread context only)
 //!
-//! `RawTable.socks` (`crate::sync::spin::RwLock`, per namespace) -> `Inet.addr`;
-//! delivery clones the matching `Arc`s and queues (`RxQueue`, leaf)
-//! after dropping the table lock. `RawSock.filter` is an atomic.
+//! `RAW_TABLE.lock` (spin, Linux raw_v4_hashinfo.lock, one for every
+//! namespace: chain writes) -> `Inet.addr`. Delivery and ICMP-error
+//! fan-out walk a chain under RCU (Linux raw_v4_input, raw_icmp_error),
+//! reading each candidate's `Inet.addr` and queueing (`RxQueue`,
+//! `Sock.errq`: leaves) with GFP_ATOMIC under the guard. A socket's
+//! table reference is released a grace period after it leaves (Linux
+//! SOCK_RCU_FREE), possibly in `rcuc/N`: its drop takes no sleeping
+//! lock. `RawSock.filter` is an atomic.
 
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::INUSE_RAW;
 use crate::util::kalloc::try_arc;
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::sync::spin::RwLock;
+use crate::sync::UniqueOwner;
+use crate::sync::rcu::RcuPuts;
+use crate::sync::spin::Mutex;
+use crate::util::rcuhlist::{HNode, RcuHList};
 
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP, ipf};
 use crate::net::dgram::{self, RxQueue};
@@ -60,6 +67,11 @@ pub struct RawSock {
     /// ICMP_FILTER: bit n set = drop ICMP type n
     filter: AtomicU32,
     rxq: RxQueue,
+    /// Link on its protocol's chain (Linux sk_node)
+    node: HNode,
+    /// The table reference's deferred release (Linux SOCK_RCU_FREE's
+    /// rcu head)
+    rcu: RcuPuts,
 }
 
 /// socket(AF_INET, SOCK_RAW, protocol) (Linux inet_create for raw:
@@ -86,13 +98,15 @@ pub fn create(protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelError> {
         connected: AtomicBool::new(false),
         filter: AtomicU32::new(0),
         rxq: RxQueue::default(),
+        node: HNode::new(),
+        rcu: RcuPuts::new(),
     })?;
     if protocol == IPPROTO_RAW {
         s.inet.set_hdrincl(true);
     }
     // The "port" is the protocol (Linux inet_sport = htons(inet_num))
     s.inet.addr.lock().sport = protocol as u16;
-    net.raw.insert(&s);
+    raw_hash_sk(&s);
     Ok(s)
 }
 
@@ -212,7 +226,7 @@ impl ProtoOps for RawSock {
     }
 
     fn release(&self) {
-        self.sk.net.raw.remove(self);
+        raw_unhash_sk(self);
         self.sk.set_shutdown(SHUTDOWN_MASK);
         self.rxq.clear();
         self.sk.purge_err();
@@ -421,47 +435,80 @@ impl ProtoOps for RawSock {
 // Table (per namespace) and delivery
 // ============================================================================
 
-/// Raw sockets of a namespace by protocol
-#[derive(Default)]
-pub struct RawTable {
-    socks: RwLock<BTreeMap<u16, Vec<Arc<RawSock>>>>,
+/// Chains of the raw table (Linux RAW_HTABLE_LOG)
+const RAW_HTABLE_LOG: u32 = 8;
+
+crate::hadapter!(RawNode, RawSock, node);
+crate::rcu_puts!(RawSock, rcu);
+
+/// The data of the raw table's lock (Linux raw_hashinfo.lock): the
+/// proof its holder writes the chains
+///
+/// # Invariants
+/// One value exists, in [`RAW_TABLE`].
+pub struct RawLocked(());
+
+// SAFETY: one value exists (type invariant), reachable only through the
+// table's lock
+unsafe impl UniqueOwner for RawLocked {}
+
+/// Raw sockets of every namespace, hashed by protocol and namespace
+/// (Linux struct raw_hashinfo: hlist chains read under RCU, changed
+/// under the table lock)
+struct RawTable {
+    hash: [RcuHList<RawNode, RawLocked>; 1 << RAW_HTABLE_LOG],
+    lock: Mutex<RawLocked>,
 }
 
-impl RawTable {
-    /// Hash `s` (Linux raw_hash_sk)
-    fn insert(&self, s: &Arc<RawSock>) {
-        self.socks.write().entry(s.num).or_default().push(s.clone());
-        s.sk.net.mib.inuse_add(INUSE_RAW, true);
-    }
+static RAW_TABLE: RawTable = RawTable {
+    hash: [const { RcuHList::new() }; 1 << RAW_HTABLE_LOG],
+    lock: Mutex::new(RawLocked(())),
+};
 
-    /// Unhash `s` (Linux raw_unhash_sk)
-    fn remove(&self, s: &RawSock) {
-        let mut t = self.socks.write();
-        if let Some(v) = t.get_mut(&s.num) {
-            let n = v.len();
-            v.retain(|o| !core::ptr::eq(Arc::as_ptr(o), s));
-            if v.len() < n {
-                s.sk.net.mib.inuse_add(INUSE_RAW, false);
-            }
-            if v.is_empty() {
-                t.remove(&s.num);
-            }
+/// Linux raw_hashfunc: hash_32 of the namespace's random mix and the
+/// protocol
+fn slot(net: &NetNamespace, proto: u16) -> &'static RcuHList<RawNode, RawLocked> {
+    let h = (net.hash_mix ^ u32::from(proto)).wrapping_mul(0x61C8_8647) >> (32 - RAW_HTABLE_LOG);
+    &RAW_TABLE.hash[h as usize]
+}
+
+/// Linux raw_hash_sk
+fn raw_hash_sk(s: &Arc<RawSock>) {
+    slot(&s.sk.net, s.num).add_head(s.clone(), &mut RAW_TABLE.lock.lock());
+    s.sk.net.mib.inuse_add(INUSE_RAW, true);
+}
+
+/// Linux raw_unhash_sk: off its chain; the table's reference goes after
+/// a grace period (Linux SOCK_RCU_FREE)
+fn raw_unhash_sk(s: &RawSock) {
+    let gone = slot(&s.sk.net, s.num).del_init(s, &mut RAW_TABLE.lock.lock());
+    if let Some(g) = gone {
+        s.sk.net.mib.inuse_add(INUSE_RAW, false);
+        g.defer_put();
+    }
+}
+
+/// Call `f` on each socket of `net` for `proto` matching the addresses
+/// and device, under RCU (Linux sk_for_each_rcu + raw_v4_match);
+/// whether any matched
+fn for_each_match(
+    net: &NetNamespace,
+    proto: u8,
+    raddr: Ipv4Addr,
+    laddr: Ipv4Addr,
+    dif: u32,
+    mut f: impl FnMut(&RawSock),
+) -> bool {
+    let proto = u16::from(proto);
+    let g = crate::sync::rcu::read_lock();
+    let mut any = false;
+    for s in slot(net, proto).iter_ref(&g) {
+        if s.sk.net.id == net.id && s.num == proto && s.matches(raddr, laddr, dif) {
+            any = true;
+            f(&s);
         }
     }
-
-    /// Sockets of `proto` matching the addresses and device
-    fn matching(&self, proto: u8, raddr: Ipv4Addr, laddr: Ipv4Addr, dif: u32) -> Vec<Arc<RawSock>> {
-        self.socks
-            .read()
-            .get(&u16::from(proto))
-            .map(|v| {
-                v.iter()
-                    .filter(|s| s.matches(raddr, laddr, dif))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
+    any
 }
 
 /// Give every matching raw socket a copy of a packet for us (Linux
@@ -474,40 +521,33 @@ pub fn raw_deliver(net: &NetNamespace, skb: &SkBuff) -> bool {
     };
     let (saddr, daddr) = (skb.saddr.unwrap_or_default(), skb.daddr.unwrap_or_default());
     let dif = skb.dev.as_ref().map_or(0, |d| d.ifindex());
-    let socks = net.raw.matching(skb.ip_protocol, saddr, daddr, dif);
-    if socks.is_empty() {
-        return false;
-    }
     let info = RxInfo::of(net, skb);
     let icmp = skb.ip_protocol == IPPROTO_ICMP;
-    for s in socks {
+    for_each_match(net, skb.ip_protocol, saddr, daddr, dif, |s| {
         if icmp && skb.data().first().is_none_or(|&t| s.filtered(t)) {
-            continue;
+            return;
         }
         // No clone, no delivery (Linux raw_v4_input: a failed
         // skb_clone(GFP_ATOMIC) skips the socket); the clone reads from
         // its IP header (Linux raw_rcv's skb_push)
         let Some(mut c) = skb.clone_gfp(Gfp::ATOMIC) else {
-            continue;
+            return;
         };
         if c.push(nhoff).is_none() {
-            continue;
+            return;
         }
         dgram::prepare(&mut c, info, 0);
         let _ = s.rxq.enqueue(&s.sk, c);
-    }
-    true
+    })
 }
 
 /// An ICMP error about a packet of a raw socket's protocol (Linux
 /// raw_icmp_error + raw_err)
 pub fn raw_err(net: &NetNamespace, e: &IcmpErr<'_>) {
-    for s in net
-        .raw
-        .matching(e.proto(), e.inner_daddr(), e.inner_saddr(), e.rx.ifindex)
-    {
-        err_one(&s, e);
-    }
+    let (daddr, saddr) = (e.inner_daddr(), e.inner_saddr());
+    for_each_match(net, e.proto(), daddr, saddr, e.rx.ifindex, |s| {
+        err_one(s, e)
+    });
 }
 
 fn err_one(s: &RawSock, e: &IcmpErr<'_>) {

@@ -49,8 +49,8 @@ static IOREMAP: Mutex<Alloc<WORDS>> = Mutex::new(Alloc::new());
 /// Serializes adding lower tables to the vmalloc area (ioremap window
 /// and kernel stacks), shared by every address space (Linux
 /// init_mm.page_table_lock): two mappings in one new table must not
-/// both create it. Spin leaf, thread context; frames are allocated
-/// under it.
+/// both create it. Spin leaf, thread context; a table's frame is
+/// allocated before it and freed after it if another mapping won.
 static KTABLES: Mutex<()> = Mutex::new(());
 
 /// First-fit page allocator over a `W`-word bitmap (1 = used),
@@ -327,7 +327,6 @@ unsafe fn entry(table: u64, idx: usize) -> &'static AtomicU64 {
 /// alone, and `pa` a page the caller may map there (device memory, or a
 /// frame it owns and hands over).
 unsafe fn map_page(va: u64, pa: u64, prot: u64) -> Result<(), KernelError> {
-    let _tables = KTABLES.lock();
     // SAFETY: the swapper root, live forever
     let top = unsafe { entry(swapper_phys(), idx(va, 39)) }.load(Ordering::Acquire);
     // The window's top-level entry exists from boot (kmap::init)
@@ -335,7 +334,7 @@ unsafe fn map_page(va: u64, pa: u64, prot: u64) -> Result<(), KernelError> {
     let mut t = CurrentArch::pte_addr(top);
     for shift in [30, 21] {
         // SAFETY: the kernel tables under the swapper are never freed;
-        // KTABLES held while missing ones are added
+        // missing ones are added under KTABLES
         t = unsafe { table(entry(t, idx(va, shift))) }?;
     }
     // SAFETY: a kernel table, never freed; the entry is the caller's
@@ -347,12 +346,14 @@ unsafe fn map_page(va: u64, pa: u64, prot: u64) -> Result<(), KernelError> {
 }
 
 /// Table frame under an upper entry, added if absent; EBUSY for a huge
-/// or block entry (never split here: a kernel bug to map inside one)
+/// or block entry (never split here: a kernel bug to map inside one).
+/// A missing table's frame is allocated first and installed under
+/// KTABLES unless another mapping got there first, which frees it
+/// (Linux __pte_alloc_kernel: allocate, then init_mm.page_table_lock).
 ///
 /// # Safety
 ///
-/// `e` is an upper entry of a kernel page table under the swapper,
-/// KTABLES held.
+/// `e` is an upper entry of a kernel page table under the swapper.
 unsafe fn table(e: &AtomicU64) -> Result<u64, KernelError> {
     let v = e.load(Ordering::Acquire);
     if CurrentArch::pte_is_table(v) {
@@ -362,10 +363,21 @@ unsafe fn table(e: &AtomicU64) -> Result<u64, KernelError> {
         crate::printkln!("WARNING: ioremap: window already mapped by huge/block entry {v:#x}");
         return Err(KernelError::Busy);
     }
-    let t = alloc_table()?;
+    let new = alloc_table()?;
+    let tables = KTABLES.lock();
+    let v = e.load(Ordering::Acquire);
+    if CurrentArch::pte_present(v) {
+        drop(tables);
+        crate::FRAME_ALLOCATOR.free_pages(new, 0);
+        return if CurrentArch::pte_is_table(v) {
+            Ok(CurrentArch::pte_addr(v))
+        } else {
+            Err(KernelError::Busy)
+        };
+    }
     // Release: lock-free walkers that see the entry see the zeroed table
-    e.store(CurrentArch::mk_table(t), Ordering::Release);
-    Ok(t)
+    e.store(CurrentArch::mk_table(new), Ordering::Release);
+    Ok(new)
 }
 
 /// Unmap a single page (clear the entry, keep the tables); the page it

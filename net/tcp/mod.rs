@@ -103,7 +103,7 @@ use crate::sync::rcu::RcuPuts;
 use crate::time::timer::ArcTimer;
 use crate::util::hlist_nulls::NullsLink;
 use crate::util::kalloc::with_gfp;
-use crate::util::list::{ArcList, Link};
+use crate::util::list::{Link, OwnedList, Owner};
 
 pub use self::cb::TcpState;
 
@@ -153,6 +153,8 @@ struct Inner {
     cb: TcpCb,
     /// Hashed in ehash under this tuple
     tuple: Option<Tuple>,
+    /// Its ehash entry while hashed (set and taken with `tuple`)
+    eh: Option<Arc<table::Eh>>,
     /// Owns its local port in bhash
     bound: bool,
     /// The listener of a child still in SYN_RECEIVED
@@ -168,17 +170,18 @@ struct Inner {
 
 /// A listener's queues (Linux request_sock_queue + accept queue):
 /// children linked through their own `accept_link` (Linux
-/// rskq_accept_head through req->dl_next), on one list at a time
+/// rskq_accept_head through req->dl_next), on one list at a time, which
+/// their `accept_owner` names, so a child leaves either in O(1)
 struct Accept {
     backlog: u32,
     /// Children in SYN_RECEIVED (hk keeps full child sockets where Linux
     /// has request socks; the count is bounded by the backlog)
-    syn: ArcList<AcceptLink>,
+    syn: OwnedList<AcceptLink>,
     /// Established, not yet accepted
-    ready: ArcList<AcceptLink>,
+    ready: OwnedList<AcceptLink>,
 }
 
-crate::adapter!(AcceptLink, TcpSock, accept_link);
+crate::owned_adapter!(AcceptLink, TcpSock, accept_link, accept_owner);
 
 impl Accept {
     /// Linux sk_acceptq_is_full
@@ -242,13 +245,10 @@ pub struct TcpSock {
     /// icsk_delack_timer, sk_timer), armed by `sync_timers` under the
     /// socket lock
     timers: [ArcTimer<TcpSock>; 3],
-    /// Its ehash and lhash chain links and key (Linux sk_nulls_node,
-    /// sk_portpair / sk_addrpair), its bhash owner link (sk_bind_node)
-    /// and whether it took the port with bind()/listen() (written under
-    /// the bhash chain lock)
-    eh_link: NullsLink,
+    /// Its lhash chain link (its ehash entry is `Inner.eh`), its bhash
+    /// owner link (sk_bind_node) and whether it took the port with
+    /// bind()/listen() (written under the bhash chain lock)
     lh_link: NullsLink,
-    ehkey: table::EhKey,
     bind_link: Link,
     by_bind: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
@@ -257,6 +257,8 @@ pub struct TcpSock {
     rcu_puts: RcuPuts,
     /// A child's place on its listener's SYN or accept queue
     accept_link: Link,
+    /// The accept queue `accept_link` is on
+    accept_owner: Owner,
     /// A listener's options as its children inherit them, for the
     /// lockless SYN path (Linux reads the listener's fields with no
     /// lock): copied at the end of every locked step in LISTEN; leaf
@@ -387,6 +389,7 @@ impl TcpSock {
             lock: SockLock::new(Inner {
                 cb,
                 tuple: None,
+                eh: None,
                 bound: false,
                 orphan: None,
                 parent: None,
@@ -404,14 +407,13 @@ impl TcpSock {
                 ArcTimer::new(TcpSock::delack_timer),
                 ArcTimer::new(TcpSock::keepalive_timer),
             ],
-            eh_link: NullsLink::new(),
             lh_link: NullsLink::new(),
-            ehkey: table::EhKey::new(),
             bind_link: Link::new(),
             by_bind: AtomicBool::new(false),
             inuse: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             accept_link: Link::new(),
+            accept_owner: Owner::new(),
             listen_opts: Mutex::new(cb::Opts::default()),
             me: me.clone(),
         })
@@ -553,7 +555,12 @@ impl TcpSock {
                 g.cb.tw_clone(),
             )
         });
-        let Ok(tw) = tw else {
+        // Its ehash entry, GFP_ATOMIC with it
+        let tw = tw.and_then(|tw| {
+            let eh = table::Eh::new(&self.sk.net, Ent::Tw(tw.clone()), Gfp::ATOMIC)?;
+            Ok((tw, eh))
+        });
+        let Ok((tw, tw_eh)) = tw else {
             // Out of memory: close without TIME_WAIT (Linux tcp_time_wait
             // falls back to tcp_done); `post` leaves the tables
             self.sk.net.mib.net.inc(LINUX_MIB_TCPTIMEWAITOVERFLOW);
@@ -562,7 +569,11 @@ impl TcpSock {
             out.done = true;
             return;
         };
-        self.sk.net.tcp.tw_hashdance(&self.arc(), &tw);
+        tw.set_eh(tw_eh.clone());
+        self.sk
+            .net
+            .tcp
+            .tw_hashdance(&self.arc(), g.eh.take(), &tw, &tw_eh);
         g.bound = false;
         // Linux tcp_time_wait -> tcp_done -> inet_csk_destroy_sock
         g.orphan = None;
@@ -574,8 +585,9 @@ impl TcpSock {
 
     /// Leave ehash (Linux inet_unhash)
     fn unhash_conn(&self, g: &mut Inner) {
-        if let Some(t) = g.tuple.take() {
-            self.sk.net.tcp.unhash(&t, &self.arc());
+        g.tuple = None;
+        if let Some(eh) = g.eh.take() {
+            self.sk.net.tcp.unhash(&eh, self);
         }
     }
 
@@ -771,7 +783,7 @@ impl TcpSock {
     /// connection's is dropped if the socket left the tuple `t` it was
     /// found by between the lookup and taking its lock
     fn do_rcv(&self, g: &mut Inner, skb: Box<SkBuff>, t: Tuple, now: u64, out: &mut Out) {
-        let s = &skb.tcp.clone();
+        let s = &skb.tcp().clone();
         if g.cb.state == TcpState::Listen {
             return self.conn_request(s, t, now);
         }
@@ -857,7 +869,7 @@ impl TcpSock {
             drop(self.rcv(skb, t));
             return;
         }
-        let s = skb.tcp;
+        let s = skb.tcp();
         drop(skb);
         self.conn_request(&s, t, now_ms());
     }
@@ -928,6 +940,11 @@ impl TcpSock {
             a.daddr = t.raddr;
             a.dport = t.rport;
         }
+        // Its ehash entry, GFP_ATOMIC with the child, before any lock
+        let Ok(eh) = table::Eh::new(&self.sk.net, Ent::Sk(c.clone()), Gfp::ATOMIC) else {
+            self.listen_drop();
+            return;
+        };
         let mut out = Out::default();
         let o = open(&self.sk.net, &t, self.oif());
         let mut b = c.lock.bh_lock();
@@ -946,11 +963,12 @@ impl TcpSock {
         (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = caps;
         cb.passive(s, o, now, &mut out);
         g.cb = cb;
-        if !self.sk.net.tcp.hash(t, &c) {
+        if !self.sk.net.tcp.hash(t, &eh, &c) {
             self.listen_drop();
             return;
         }
         g.tuple = Some(t);
+        g.eh = Some(eh);
         g.parent = Some(self.me.clone());
         let queued = match self.queue.lock().as_mut() {
             Some(q) => {
@@ -986,10 +1004,7 @@ impl TcpSock {
         let Some(q) = q.as_mut() else {
             return false;
         };
-        let r = q
-            .syn
-            .remove_first(|x| core::ptr::eq(x, Arc::as_ptr(c)))
-            .unwrap_or_else(|| c.clone());
+        let r = q.syn.remove(c).unwrap_or_else(|| c.clone());
         q.ready.push_back(r);
         // Under `queue` (Linux sk_acceptq_added)
         self.ack_backlog
@@ -999,11 +1014,7 @@ impl TcpSock {
 
     /// A child died before being accepted
     fn child_gone(&self, c: &TcpSock) {
-        let gone = self
-            .queue
-            .lock()
-            .as_mut()
-            .and_then(|q| q.syn.remove_first(|x| core::ptr::eq(x, c)));
+        let gone = self.queue.lock().as_mut().and_then(|q| q.syn.remove(c));
         // The queue's reference goes after its lock (the caller holds
         // another)
         drop(gone);
@@ -1052,8 +1063,11 @@ impl TcpSock {
                 rport: dport,
             };
             let range = self.sk.net.port_range.get();
-            let t = self.sk.net.tcp.connect(&me, want, range)?;
+            // Made as the owner, before the tables' spin locks
+            let eh = table::Eh::new(&self.sk.net, Ent::Sk(me.clone()), Gfp::KERNEL)?;
+            let t = self.sk.net.tcp.connect(&me, &eh, want, range)?;
             g.tuple = Some(t);
+            g.eh = Some(eh);
             if a.sport == 0 {
                 g.bound = true;
             }
@@ -1334,7 +1348,12 @@ impl SockHooks<Inner> for TcpSock {
     /// Linux tcp_release_cb, under `slock`: the timers that fired, an
     /// MTU reduction (tcp_v4_mtu_reduced) and the soft error left while
     /// owned; then the lockless view of the owner's work is published
-    /// and the wakeups made
+    /// and the wakeups made. With no deferred work it still publishes
+    /// that view (Linux returns early: it writes sk_state and the other
+    /// lockless fields in place, where steps that skip `apply`, such as
+    /// listen() and TCP_CONGESTION, rely on this one). Wakeups made
+    /// while still owned are Linux's too (release_sock runs the backlog
+    /// and release_cb before sock_release_ownership).
     fn release_cb(&self, g: &mut Inner, flags: u32) {
         let mut out = Out::default();
         let now = now_ms();
@@ -1361,9 +1380,9 @@ impl SockHooks<Inner> for TcpSock {
 fn tuple_of(skb: &SkBuff) -> Option<Tuple> {
     Some(Tuple {
         laddr: skb.daddr?,
-        lport: skb.tcp.dport,
+        lport: skb.tcp().dport,
         raddr: skb.saddr?,
-        rport: skb.tcp.sport,
+        rport: skb.tcp().sport,
     })
 }
 
@@ -1399,7 +1418,7 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
         return;
     };
     let _ = skb.pull(doff);
-    skb.tcp = s;
+    skb.set_tcp(s);
     let Some(t) = tuple_of(&skb) else {
         return;
     };
@@ -2025,12 +2044,27 @@ impl ProtoOps for TcpSock {
         }
         *self.queue.lock() = Some(Accept {
             backlog,
-            syn: ArcList::new(),
-            ready: ArcList::new(),
+            syn: OwnedList::new(),
+            ready: OwnedList::new(),
         });
         g.cb.state = TcpState::Listen;
         self.sk.set_flag(sf::ACCEPTCONN, true);
-        self.sk.net.tcp.listen_add(self.inet.get().sport, me);
+        // The options children copy, set before the listener can be
+        // found: a SYN backlogged while this call owns the socket is
+        // answered at its release, before `apply` would copy them
+        // (Linux tcp_conn_request reads the listener itself)
+        *self.listen_opts.lock() = g.cb.opts;
+        let port = self.inet.get().sport;
+        self.sk.net.tcp.listen_add(port, me);
+        // Debug and LOCKDEP builds: a listener owns its port in bhash.
+        // Checked here, as the owner (a close cannot race it), not on
+        // the lockless SYN path, where one can
+        if cfg!(any(debug_assertions, feature = "lockdep")) {
+            assert!(
+                self.sk.net.tcp.owns(port, &self.arc()),
+                "tcp: listener on port {port} is no bhash owner"
+            );
+        }
         Ok(())
     }
 

@@ -69,8 +69,6 @@ pub struct SkBuff {
     /// Its node in a TCP socket's out-of-order or retransmit tree
     /// (Linux skb->rbnode); an skb is on one list or tree at a time
     rb: RbNode,
-    /// TCP's control block (Linux TCP_SKB_CB in skb->cb)
-    pub tcp: TcpSkbCb,
     /// The buffer: headroom, packet data, tailroom (a Vec so a message
     /// built in one is adopted whole, `from_vec`)
     buf: Vec<u8>,
@@ -135,6 +133,11 @@ pub enum SkbCb {
     Pkt(crate::net::packet::PktCb),
     /// A netlink message (Linux NETLINK_CB)
     Nl(crate::net::netlink::NlCb),
+    /// An IPv4 fragment in a reassembly queue (Linux FRAG_CB)
+    Frag(crate::net::inet::frag::FragCb),
+    /// A TCP segment: the sequence space it covers and its header
+    /// fields (Linux TCP_SKB_CB)
+    Tcp(TcpSkbCb),
     /// An AF_UNIX message (Linux UNIXCB and the skb's sock_wfree
     /// destructor); boxed, so every skb stays small (skbs are passed by
     /// value down the receive path)
@@ -152,6 +155,8 @@ impl SkbCb {
             Self::Exterr(e) => Self::Exterr(*e),
             Self::Pkt(p) => Self::Pkt(*p),
             Self::Nl(n) => Self::Nl(n.clone()),
+            Self::Frag(f) => Self::Frag(*f),
+            Self::Tcp(t) => Self::Tcp(*t),
         }
     }
 }
@@ -397,7 +402,6 @@ impl SkBuff {
             list: Link::new(),
             qowner: Owner::new(),
             rb: RbNode::new(),
-            tcp: self.tcp,
             buf,
             data: self.data,
             tail: self.tail,
@@ -453,6 +457,36 @@ pub struct TcpSkbCb {
     /// The ports of a received segment (its header is pulled)
     pub sport: u16,
     pub dport: u16,
+}
+
+impl SkBuff {
+    /// TCP's control block (Linux TCP_SKB_CB): empty unless TCP set it
+    #[inline]
+    pub fn tcp(&self) -> TcpSkbCb {
+        match self.cb {
+            SkbCb::Tcp(t) => t,
+            _ => TcpSkbCb::default(),
+        }
+    }
+
+    /// TCP's control block to change, made empty first if the cb holds
+    /// another protocol's
+    #[inline]
+    pub fn tcp_mut(&mut self) -> &mut TcpSkbCb {
+        if !matches!(self.cb, SkbCb::Tcp(_)) {
+            self.cb = SkbCb::Tcp(TcpSkbCb::default());
+        }
+        match &mut self.cb {
+            SkbCb::Tcp(t) => t,
+            _ => unreachable!("skb: cb just set"),
+        }
+    }
+
+    /// Set TCP's control block
+    #[inline]
+    pub fn set_tcp(&mut self, t: TcpSkbCb) {
+        self.cb = SkbCb::Tcp(t);
+    }
 }
 
 /// A queue of skbs, each owned through `P` (Linux sk_buff_head with the
