@@ -157,6 +157,7 @@ pub fn insert_driver_pages(mm: &Mm, map: &MmStruct, vma: &super::Vma) -> Result<
 /// A frame for user data: below the low watermark it reclaims (swaps
 /// pages out) where the caller may sleep, else none (the kernel's
 /// allocations may go on to min; see `page_alloc::alloc_mark`)
+#[track_caller]
 pub(crate) fn alloc_user() -> Option<u64> {
     FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_MOVABLE)
 }
@@ -643,8 +644,9 @@ fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Resul
     let mut spare = None;
     loop {
         match wp_locked(mm, ptep, pte, addr, area, &mut spare) {
-            // Out of memory under the PTE lock: reclaim without it
-            // (Linux wp_page_copy allocates before taking it)
+            // A copy needs a page: allocated without the PTE lock, then
+            // the entry is checked again (Linux do_wp_page unlocks, and
+            // wp_page_copy allocates before taking it again)
             Err(VmFault::Retry) => spare = Some(alloc_user().ok_or(VmFault::Oom)?),
             r => {
                 if let Some(p) = spare {
@@ -656,8 +658,8 @@ fn do_wp_page(mm: &Mm, ptep: Pte<'_>, pte: u64, addr: u64, area: &Area) -> Resul
     }
 }
 
-/// `do_wp_page` under the PTE lock; the copy's page comes from `spare`
-/// if there is one, else `Retry` asks for one when none is free at once
+/// `do_wp_page` under the PTE lock; the copy's page comes from `spare`,
+/// else `Retry` asks for one (nothing is allocated under the lock)
 fn wp_locked(
     mm: &Mm,
     ptep: Pte<'_>,
@@ -696,7 +698,7 @@ fn wp_locked(
         }
         return Ok(());
     }
-    let new = spare.take().or_else(alloc_user).ok_or(VmFault::Retry)?;
+    let new = spare.take().ok_or(VmFault::Retry)?;
     // `old` stays mapped (and referenced) until the PTE is switched
     // SAFETY: the new frame is ours; `old` stays mapped and referenced
     unsafe { super::page::copy_page(new, old) };
