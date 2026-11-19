@@ -6,9 +6,11 @@
 //! [`TcpTables`] is its handle on them (`NetNamespace.tcp`).
 //!
 //! - `ehash`: four-tuple -> connection (SYN_SENT, SYN_RECEIVED children,
-//!   synchronized states) or TIME_WAIT entry; tuples are unique. Each
-//!   bucket holds a chain of sockets and one of TIME_WAIT entries
-//!   (Linux before 3.x had the twchain too), hlist_nulls RCU chains.
+//!   synchronized states) or TIME_WAIT entry; tuples are unique. One
+//!   hlist_nulls RCU chain per bucket holds both (Linux: sock_common
+//!   heads both kinds), each through an [`Eh`] node naming its
+//!   namespace, tuple and owner; a socket entering TIME_WAIT is
+//!   replaced by its entry under the bucket's one lock.
 //! - `lhash`: listeners by (namespace, local port), an hlist_nulls RCU
 //!   chain per bucket (Linux lhash2; address and device scored).
 //! - `bhash`: bind buckets (Linux inet_bind_bucket) by (namespace,
@@ -33,8 +35,7 @@
 //! reader never sees a freed entry (Linux: the hash's sock_hold plus
 //! SLAB_TYPESAFE_BY_RCU). Writers take the chain's bucket lock (spin,
 //! thread context; Linux inet_ehash_lockp, ilb2->lock). Order: bhash
-//! chain -> bind bucket owners -> ehash socket chain -> ehash TIME_WAIT
-//! chain (the same bucket's, in the TIME_WAIT hand-over); `Inet.addr`
+//! chain -> bind bucket owners -> ehash bucket; `Inet.addr`
 //! of candidates is read under the bhash locks and under RCU. Socket
 //! locks (`TcpSock.lock`, owner or slock) are never taken under a table
 //! lock (callers may hold their own).
@@ -53,14 +54,15 @@ use crate::mm::page_alloc::Gfp;
 use crate::net::NetNamespace;
 use crate::net::inet::port::{self, BindInfo, Flow, Parity};
 use crate::net::ipv4::{IPPROTO_TCP, Ipv4Addr};
+use crate::sync::rcu::RcuPuts;
 use crate::util::error::KernelError;
-use crate::util::hlist_nulls::{NullsGuard, NullsHead};
+use crate::util::hlist_nulls::{NullsGuard, NullsHead, NullsLink};
 use crate::util::kalloc::try_arc_gfp;
 use crate::util::list::{ArcList, Link};
 
-crate::nulls_adapter!(pub(super) SkEhash, TcpSock, eh_link);
+crate::nulls_adapter!(pub(super) EhLink, Eh, link);
+crate::rcu_puts!(Eh, rcu);
 crate::nulls_adapter!(pub(super) SkLhash, TcpSock, lh_link);
-crate::nulls_adapter!(pub(super) TwEhash, TimeWait, eh_link);
 crate::adapter!(pub(super) SkBind, TcpSock, bind_link);
 crate::adapter!(pub(super) TwBind, TimeWait, bind_link);
 crate::adapter!(BucketLink, BindBucket, link);
@@ -70,6 +72,41 @@ crate::adapter!(BucketLink, BindBucket, link);
 pub enum Ent {
     Sk(Arc<TcpSock>),
     Tw(Arc<TimeWait>),
+}
+
+/// An ehash entry (Linux the hash part of struct sock_common: skc_net,
+/// the four-tuple, skc_nulls_node), with a reference to what it hashes.
+/// Made before any table lock by whoever hashes it; its key is set
+/// before each insert. The entry keeps its owner alive while hashed;
+/// the owner holds it to unhash it, and the chain's reference goes a
+/// grace period after (`NullsUnlinked::defer`).
+pub struct Eh {
+    link: NullsLink,
+    net: usize,
+    key: EhKey,
+    ent: Ent,
+    rcu: RcuPuts,
+}
+
+impl Eh {
+    /// An unhashed entry of `net` for `ent`, allocated with `gfp`
+    pub fn new(net: &NetNamespace, ent: Ent, gfp: Gfp) -> Result<Arc<Self>, KernelError> {
+        try_arc_gfp(
+            Self {
+                link: NullsLink::new(),
+                net: net_id(net),
+                key: EhKey::new(),
+                ent,
+                rcu: RcuPuts::new(),
+            },
+            gfp,
+        )
+    }
+
+    /// The tuple it was last hashed under
+    fn tuple(&self) -> Tuple {
+        self.key.get()
+    }
 }
 
 /// A port's owners (Linux inet_bind_bucket)
@@ -114,9 +151,8 @@ impl Owners {
 
 /// The tables (Linux struct inet_hashinfo)
 struct Hashinfo {
-    /// Sockets and TIME_WAIT entries of each ehash bucket
-    esk: Box<[NullsHead<SkEhash>]>,
-    etw: Box<[NullsHead<TwEhash>]>,
+    /// Connections and TIME_WAIT entries, one chain per bucket
+    ehash: Box<[NullsHead<EhLink>]>,
     lhash: Box<[NullsHead<SkLhash>]>,
     bhash: Box<[Mutex<ArcList<BucketLink>>]>,
 }
@@ -136,8 +172,7 @@ pub fn init() {
     let mut bhash = alloc::vec::Vec::new();
     bhash.resize_with(n, || Mutex::new(ArcList::new()));
     HASHINFO.call_once(|| Hashinfo {
-        esk: NullsHead::table(n).expect("tcp: ehash"),
-        etw: NullsHead::table(n).expect("tcp: ehash"),
+        ehash: NullsHead::table(n).expect("tcp: ehash"),
         lhash: NullsHead::table(LHASH).expect("tcp: lhash"),
         bhash: bhash.into_boxed_slice(),
     });
@@ -162,7 +197,7 @@ fn porthash(net: usize, port: u16) -> u64 {
     port::secure_hash(0x7463_7062_6861, &[net as u64, u64::from(port)])
 }
 
-/// A socket's ehash key (Linux sk_portpair / sk_addrpair): written
+/// An entry's ehash key (Linux sk_portpair / sk_addrpair): written
 /// before it is hashed, read by lockless lookups
 pub(super) struct EhKey {
     addrs: core::sync::atomic::AtomicU64,
@@ -188,6 +223,17 @@ impl EhKey {
         self.addrs.load(Ordering::Relaxed) == a && self.ports.load(Ordering::Relaxed) == p
     }
 
+    fn get(&self) -> Tuple {
+        let a = self.addrs.load(Ordering::Relaxed);
+        let p = self.ports.load(Ordering::Relaxed);
+        Tuple {
+            laddr: Ipv4Addr((a >> 32) as u32),
+            raddr: Ipv4Addr(a as u32),
+            lport: (p >> 16) as u16,
+            rport: p as u16,
+        }
+    }
+
     fn words(t: &Tuple) -> (u64, u32) {
         (
             (u64::from(t.laddr.0) << 32) | u64::from(t.raddr.0),
@@ -209,12 +255,16 @@ pub struct TcpTables {
 /// 2MSL. A lookup that followed a moved entry walks its bucket again
 /// (`find_rcu`).
 pub fn twsk_purge(nets: &[Arc<NetNamespace>]) {
-    for t in hi().etw.iter() {
+    let theirs = |e: &Eh| matches!(e.ent, Ent::Tw(_)) && nets.iter().any(|n| e.net == net_id(n));
+    for b in hi().ehash.iter() {
         loop {
             let tw = {
                 let g = crate::sync::rcu::read_lock();
-                t.find_rcu(&g, |e| nets.iter().any(|n| n.tcp.mine_tw(e)))
-                    .map(|e| e.arc())
+                b.find_rcu(&g, |e| theirs(e))
+                    .and_then(|e| match &e.get().ent {
+                        Ent::Tw(tw) => Some(tw.clone()),
+                        Ent::Sk(_) => None,
+                    })
             };
             let Some(tw) = tw else { break };
             tw.kill();
@@ -240,14 +290,9 @@ impl TcpTables {
         core::ptr::from_ref(self).addr()
     }
 
-    fn esk(&self, t: &Tuple) -> &'static NullsHead<SkEhash> {
+    fn ehead(&self, t: &Tuple) -> &'static NullsHead<EhLink> {
         let h = hi();
-        &h.esk[(ehashfn(self.id(), t) as usize) & (h.esk.len() - 1)]
-    }
-
-    fn etw(&self, t: &Tuple) -> &'static NullsHead<TwEhash> {
-        let h = hi();
-        &h.etw[(ehashfn(self.id(), t) as usize) & (h.etw.len() - 1)]
+        &h.ehash[(ehashfn(self.id(), t) as usize) & (h.ehash.len() - 1)]
     }
 
     fn lhead(&self, port: u16) -> &'static NullsHead<SkLhash> {
@@ -264,8 +309,9 @@ impl TcpTables {
         net_id(&s.sk.net) == self.id()
     }
 
-    fn mine_tw(&self, t: &TimeWait) -> bool {
-        net_id(t.net()) == self.id()
+    /// `e` is this namespace's entry for `t`
+    fn is(&self, e: &Eh, t: &Tuple) -> bool {
+        e.net == self.id() && e.key.is(t)
     }
 
     // --- bind ----------------------------------------------------------------
@@ -411,21 +457,17 @@ impl TcpTables {
 
     // --- connections ---------------------------------------------------------
 
-    /// Hash `s` under `t` if no connection or TIME_WAIT entry of this
-    /// namespace has the tuple (Linux __inet_check_established's
-    /// uniqueness test and insert, under the ehash bucket lock)
-    fn hash_unique(&self, t: &Tuple, s: &Arc<TcpSock>, count: bool) -> bool {
-        let mut g = self.esk(t).lock();
-        if g.find(|x| self.mine_sk(x) && x.ehkey.is(t)).is_some() {
+    /// Hash `eh` (`s`'s entry) under `t` if no connection or TIME_WAIT
+    /// entry of this namespace has the tuple (Linux
+    /// __inet_check_established's uniqueness test and insert, under the
+    /// ehash bucket lock)
+    fn hash_unique(&self, t: &Tuple, eh: &Arc<Eh>, s: &TcpSock, count: bool) -> bool {
+        let mut g = self.ehead(t).lock();
+        if g.find(|x| self.is(x, t)).is_some() {
             return false;
         }
-        let tw = self.etw(t).lock();
-        if tw.find(|x| self.mine_tw(x) && x.tuple == *t).is_some() {
-            return false;
-        }
-        drop(tw);
-        s.ehkey.set(t);
-        g.add_head_rcu(s.clone());
+        eh.key.set(t);
+        g.add_head_rcu(eh.clone());
         // Linux inet_ehash_nolisten (a child counts once established)
         if count {
             tcp_inuse(s, true);
@@ -442,11 +484,12 @@ impl TcpTables {
     pub fn connect(
         &self,
         s: &Arc<TcpSock>,
+        eh: &Arc<Eh>,
         mut t: Tuple,
         range: (u16, u16),
     ) -> Result<Tuple, KernelError> {
         if t.lport != 0 {
-            return if self.hash_unique(&t, s, true) {
+            return if self.hash_unique(&t, eh, s, true) {
                 Ok(t)
             } else {
                 Err(KernelError::AddressNotAvailable)
@@ -464,12 +507,12 @@ impl TcpTables {
             let usable = self
                 .with_bucket(&mut c, p, false, |b| b.owners.lock().connect_only())
                 .unwrap_or(true);
-            if !usable || !self.hash_unique(&tp, s, true) {
+            if !usable || !self.hash_unique(&tp, eh, s, true) {
                 return false;
             }
             if !self.own(&mut c, s, p, false) {
                 drop(c);
-                self.unhash(&tp, s);
+                self.unhash(eh, s);
                 return false;
             }
             true
@@ -479,16 +522,17 @@ impl TcpTables {
         Ok(t)
     }
 
-    /// Insert a connection (a listener's child); false if `t` is taken
-    pub fn hash(&self, t: Tuple, s: &Arc<TcpSock>) -> bool {
-        self.hash_unique(&t, s, false)
+    /// Insert a connection (a listener's child) through its entry `eh`;
+    /// false if `t` is taken
+    pub fn hash(&self, t: Tuple, eh: &Arc<Eh>, s: &TcpSock) -> bool {
+        self.hash_unique(&t, eh, s, false)
     }
 
-    /// Remove `s`'s entry for `t` (Linux inet_unhash): the chain's
+    /// Remove `s`'s entry `eh` (Linux inet_unhash): the chain's
     /// reference goes a grace period later
-    pub fn unhash(&self, t: &Tuple, s: &Arc<TcpSock>) {
-        let mut g = self.esk(t).lock();
-        if let Some(u) = g.del_rcu(s) {
+    pub fn unhash(&self, eh: &Eh, s: &TcpSock) {
+        let mut g = self.ehead(&eh.tuple()).lock();
+        if let Some(u) = g.del_rcu(eh) {
             u.defer();
             tcp_inuse(s, false);
         }
@@ -497,29 +541,32 @@ impl TcpTables {
     /// The connection or TIME_WAIT entry for a segment's tuple, found
     /// under RCU (Linux __inet_lookup_established), its key checked
     /// again once referenced (an entry may be rehashed under another
-    /// tuple meanwhile)
+    /// tuple meanwhile: a connect() trying ports)
     pub fn lookup(&self, t: &Tuple) -> Option<Ent> {
         let g = crate::sync::rcu::read_lock();
-        while let Some(e) = self
-            .esk(t)
-            .find_rcu(&g, |x| self.mine_sk(x) && x.ehkey.is(t))
-        {
-            let s = e.arc();
-            if s.ehkey.is(t) {
-                return Some(Ent::Sk(s));
+        let head = self.ehead(t);
+        loop {
+            let e = head.find_rcu(&g, |x| self.is(x, t))?;
+            let ent = e.get().ent.clone();
+            if e.get().key.is(t) {
+                return Some(ent);
             }
         }
-        self.etw(t)
-            .find_rcu(&g, |x| self.mine_tw(x) && x.tuple == *t)
-            .map(|e| Ent::Tw(e.arc()))
     }
 
     // --- TIME_WAIT -------------------------------------------------------------
 
-    /// `s` entered TIME_WAIT: `tw` replaces it in ehash and as port owner
-    /// (Linux inet_twsk_hashdance: the entry hashed before the socket
-    /// leaves, so a lookup finds one of them)
-    pub fn tw_hashdance(&self, s: &Arc<TcpSock>, tw: &Arc<TimeWait>) {
+    /// `s` entered TIME_WAIT: `tw` replaces it in ehash (its entry
+    /// `tw_eh` for `s`'s `eh`, hashed first under the bucket's one lock,
+    /// so a lookup finds one of them) and as port owner (Linux
+    /// inet_twsk_hashdance)
+    pub fn tw_hashdance(
+        &self,
+        s: &Arc<TcpSock>,
+        eh: Option<Arc<Eh>>,
+        tw: &Arc<TimeWait>,
+        tw_eh: &Arc<Eh>,
+    ) {
         let port = tw.tuple.lport;
         let mut c = self.bchain(port).lock();
         let _ = self.with_bucket(&mut c, port, false, |b| {
@@ -533,18 +580,20 @@ impl TcpTables {
         });
         drop(c);
         let mib = &s.sk.net.mib;
-        let mut g = self.esk(&tw.tuple).lock();
-        self.etw(&tw.tuple).lock().add_head_rcu(tw.clone());
+        tw_eh.key.set(&tw.tuple);
+        let mut g = self.ehead(&tw.tuple).lock();
+        g.add_head_rcu(tw_eh.clone());
         mib.inuse_add(INUSE_TW, true);
-        if let Some(u) = g.del_rcu(s) {
+        if let Some(u) = eh.and_then(|e| g.del_rcu(&e)) {
             u.defer();
             // Linux inet_twsk_hashdance: the socket leaves
             tcp_inuse(s, false);
         }
     }
 
-    /// A TIME_WAIT entry ends (2MSL, RST, or a new SYN took its tuple)
-    pub fn tw_unhash(&self, tw: &Arc<TimeWait>) {
+    /// A TIME_WAIT entry ends (2MSL, RST, or a new SYN took its tuple);
+    /// `eh` is its ehash entry, if it still had it
+    pub fn tw_unhash(&self, tw: &Arc<TimeWait>, eh: Option<Arc<Eh>>) {
         let port = tw.tuple.lport;
         let mut c = self.bchain(port).lock();
         let gone = self.with_bucket(&mut c, port, false, |b| {
@@ -556,8 +605,9 @@ impl TcpTables {
         self.prune(&mut c, port);
         drop(c);
         drop(gone);
-        let mut g = self.etw(&tw.tuple).lock();
-        if let Some(u) = g.del_rcu(tw) {
+        let Some(eh) = eh else { return };
+        let mut g = self.ehead(&tw.tuple).lock();
+        if let Some(u) = g.del_rcu(&eh) {
             u.defer();
             tw.net().mib.inuse_add(INUSE_TW, false);
         }
@@ -633,13 +683,17 @@ impl TcpTables {
                 .filter(|e| self.mine_sk(e.get()))
                 .for_each(|e| ls(e.get()));
         }
-        for (s, t) in h.esk.iter().zip(h.etw.iter()) {
-            s.iter_rcu(g)
-                .filter(|e| self.mine_sk(e.get()))
-                .for_each(|e| es(e.get()));
-            t.iter_rcu(g)
-                .filter(|e| self.mine_tw(e.get()))
-                .for_each(|e| tws(e.get()));
+        for b in h.ehash.iter() {
+            for e in b
+                .iter_rcu(g)
+                .map(|e| e.get())
+                .filter(|e| e.net == self.id())
+            {
+                match &e.ent {
+                    Ent::Sk(s) => es(s),
+                    Ent::Tw(t) => tws(t),
+                }
+            }
         }
     }
 }

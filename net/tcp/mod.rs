@@ -153,6 +153,8 @@ struct Inner {
     cb: TcpCb,
     /// Hashed in ehash under this tuple
     tuple: Option<Tuple>,
+    /// Its ehash entry while hashed (set and taken with `tuple`)
+    eh: Option<Arc<table::Eh>>,
     /// Owns its local port in bhash
     bound: bool,
     /// The listener of a child still in SYN_RECEIVED
@@ -243,13 +245,10 @@ pub struct TcpSock {
     /// icsk_delack_timer, sk_timer), armed by `sync_timers` under the
     /// socket lock
     timers: [ArcTimer<TcpSock>; 3],
-    /// Its ehash and lhash chain links and key (Linux sk_nulls_node,
-    /// sk_portpair / sk_addrpair), its bhash owner link (sk_bind_node)
-    /// and whether it took the port with bind()/listen() (written under
-    /// the bhash chain lock)
-    eh_link: NullsLink,
+    /// Its lhash chain link (its ehash entry is `Inner.eh`), its bhash
+    /// owner link (sk_bind_node) and whether it took the port with
+    /// bind()/listen() (written under the bhash chain lock)
     lh_link: NullsLink,
-    ehkey: table::EhKey,
     bind_link: Link,
     by_bind: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
@@ -390,6 +389,7 @@ impl TcpSock {
             lock: SockLock::new(Inner {
                 cb,
                 tuple: None,
+                eh: None,
                 bound: false,
                 orphan: None,
                 parent: None,
@@ -407,9 +407,7 @@ impl TcpSock {
                 ArcTimer::new(TcpSock::delack_timer),
                 ArcTimer::new(TcpSock::keepalive_timer),
             ],
-            eh_link: NullsLink::new(),
             lh_link: NullsLink::new(),
-            ehkey: table::EhKey::new(),
             bind_link: Link::new(),
             by_bind: AtomicBool::new(false),
             inuse: AtomicBool::new(false),
@@ -557,7 +555,12 @@ impl TcpSock {
                 g.cb.tw_clone(),
             )
         });
-        let Ok(tw) = tw else {
+        // Its ehash entry, GFP_ATOMIC with it
+        let tw = tw.and_then(|tw| {
+            let eh = table::Eh::new(&self.sk.net, Ent::Tw(tw.clone()), Gfp::ATOMIC)?;
+            Ok((tw, eh))
+        });
+        let Ok((tw, tw_eh)) = tw else {
             // Out of memory: close without TIME_WAIT (Linux tcp_time_wait
             // falls back to tcp_done); `post` leaves the tables
             self.sk.net.mib.net.inc(LINUX_MIB_TCPTIMEWAITOVERFLOW);
@@ -566,7 +569,11 @@ impl TcpSock {
             out.done = true;
             return;
         };
-        self.sk.net.tcp.tw_hashdance(&self.arc(), &tw);
+        tw.set_eh(tw_eh.clone());
+        self.sk
+            .net
+            .tcp
+            .tw_hashdance(&self.arc(), g.eh.take(), &tw, &tw_eh);
         g.bound = false;
         // Linux tcp_time_wait -> tcp_done -> inet_csk_destroy_sock
         g.orphan = None;
@@ -578,8 +585,9 @@ impl TcpSock {
 
     /// Leave ehash (Linux inet_unhash)
     fn unhash_conn(&self, g: &mut Inner) {
-        if let Some(t) = g.tuple.take() {
-            self.sk.net.tcp.unhash(&t, &self.arc());
+        g.tuple = None;
+        if let Some(eh) = g.eh.take() {
+            self.sk.net.tcp.unhash(&eh, self);
         }
     }
 
@@ -932,6 +940,11 @@ impl TcpSock {
             a.daddr = t.raddr;
             a.dport = t.rport;
         }
+        // Its ehash entry, GFP_ATOMIC with the child, before any lock
+        let Ok(eh) = table::Eh::new(&self.sk.net, Ent::Sk(c.clone()), Gfp::ATOMIC) else {
+            self.listen_drop();
+            return;
+        };
         let mut out = Out::default();
         let o = open(&self.sk.net, &t, self.oif());
         let mut b = c.lock.bh_lock();
@@ -950,11 +963,12 @@ impl TcpSock {
         (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = caps;
         cb.passive(s, o, now, &mut out);
         g.cb = cb;
-        if !self.sk.net.tcp.hash(t, &c) {
+        if !self.sk.net.tcp.hash(t, &eh, &c) {
             self.listen_drop();
             return;
         }
         g.tuple = Some(t);
+        g.eh = Some(eh);
         g.parent = Some(self.me.clone());
         let queued = match self.queue.lock().as_mut() {
             Some(q) => {
@@ -1049,8 +1063,11 @@ impl TcpSock {
                 rport: dport,
             };
             let range = self.sk.net.port_range.get();
-            let t = self.sk.net.tcp.connect(&me, want, range)?;
+            // Made as the owner, before the tables' spin locks
+            let eh = table::Eh::new(&self.sk.net, Ent::Sk(me.clone()), Gfp::KERNEL)?;
+            let t = self.sk.net.tcp.connect(&me, &eh, want, range)?;
             g.tuple = Some(t);
+            g.eh = Some(eh);
             if a.sport == 0 {
                 g.bound = true;
             }

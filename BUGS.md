@@ -828,9 +828,6 @@ phase A (A0-A3).
 Phase A2 (net) remaining:
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
-- `net/tcp/table.rs` keeps separate established and TIME_WAIT nulls
-  tables (two walks per miss, two bucket locks in hash_unique); Linux
-  has one ehash for both.
 
 ## Deferred file release gaps
 

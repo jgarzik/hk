@@ -34,7 +34,6 @@ use crate::net::ipv4::IpParams;
 use crate::net::skb::SkBuff;
 use crate::sync::rcu::RcuPuts;
 use crate::time::timer::ArcTimer;
-use crate::util::hlist_nulls::NullsLink;
 use crate::util::list::Link;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -53,9 +52,10 @@ pub struct TimeWait {
     live: Arc<Live>,
     /// 2MSL (Linux tw_timer)
     timer: ArcTimer<TimeWait>,
-    /// Its ehash chain link and bhash owner link (Linux tw_node,
+    /// Its ehash entry while hashed (a leaf: set before the hand-over,
+    /// taken by whoever unhashes it), its bhash owner link (Linux
     /// tw_bind_node), and whether its socket took the port with bind()
-    pub(super) eh_link: NullsLink,
+    eh: Mutex<Option<Arc<super::table::Eh>>>,
     pub(super) bind_link: Link,
     pub(super) by_bind: bool,
     /// Ended by its namespace's teardown: the timer is never armed
@@ -90,13 +90,24 @@ impl TimeWait {
             inner: Mutex::new((cb, None)),
             live,
             timer: ArcTimer::new(TimeWait::tw_timer),
-            eh_link: NullsLink::new(),
+            eh: Mutex::new(None),
             bind_link: Link::new(),
             by_bind,
             killed: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             me: me.clone(),
         })
+    }
+
+    /// Its ehash entry, before it replaces its socket there
+    pub(super) fn set_eh(&self, eh: Arc<super::table::Eh>) {
+        *self.eh.lock() = Some(eh);
+    }
+
+    /// Leave the tables (once: the entry is taken)
+    fn unhash(self: &Arc<Self>) {
+        let eh = self.eh.lock().take();
+        self.net.tcp.tw_unhash(self, eh);
     }
 
     /// Its namespace
@@ -149,7 +160,7 @@ impl TimeWait {
         if g.0.tw_syn_ok(&s) {
             self.sync(&mut g, true);
             drop(g);
-            self.net.tcp.tw_unhash(self);
+            self.unhash();
             return Some(skb);
         }
         let mut cb = g.0.cb(super::cfg(&self.net), Arc::clone(&self.live));
@@ -168,7 +179,7 @@ impl TimeWait {
     fn post(self: &Arc<Self>, g: &mut (TwCb, Option<u64>), out: &Out) {
         self.sync(g, out.done);
         if out.done {
-            self.net.tcp.tw_unhash(self);
+            self.unhash();
         }
     }
 
@@ -186,7 +197,7 @@ impl TimeWait {
         self.killed.store(true, Ordering::Relaxed);
         self.sync(&mut g, true);
         drop(g);
-        self.net.tcp.tw_unhash(self);
+        self.unhash();
     }
 
     /// 2MSL passed (`ktimers/N`; Linux tw_timer_handler): the entry
