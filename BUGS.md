@@ -828,9 +828,6 @@ phase A (A0-A3).
 Phase A2 (net) remaining:
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
-- TCP `release_cb` runs `finish`/`apply` even with no deferred flags
-  (Linux tcp_release_cb returns early), and its wakeups run inside
-  `SockLock::drain` while the socket is still owned.
 - TCP `child_ready`/`child_gone` scan the SYN queue (`remove_first`)
   under `TcpSock.queue`; the intrusive `accept_link` can unlink in O(1).
 - No debug check that a listener owns its bhash port (the old

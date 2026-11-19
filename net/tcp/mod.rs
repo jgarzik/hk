@@ -1334,7 +1334,12 @@ impl SockHooks<Inner> for TcpSock {
     /// Linux tcp_release_cb, under `slock`: the timers that fired, an
     /// MTU reduction (tcp_v4_mtu_reduced) and the soft error left while
     /// owned; then the lockless view of the owner's work is published
-    /// and the wakeups made
+    /// and the wakeups made. With no deferred work it still publishes
+    /// that view (Linux returns early: it writes sk_state and the other
+    /// lockless fields in place, where steps that skip `apply`, such as
+    /// listen() and TCP_CONGESTION, rely on this one). Wakeups made
+    /// while still owned are Linux's too (release_sock runs the backlog
+    /// and release_cb before sock_release_ownership).
     fn release_cb(&self, g: &mut Inner, flags: u32) {
         let mut out = Out::default();
         let now = now_ms();
