@@ -475,6 +475,8 @@ fn cleanup_net() {
     drop(l);
     for net in &nets {
         crate::net::rtnl::netns_exit(net);
+        // Linux ipv4_frags_exit_net
+        crate::net::inet::frag::net_exit(net);
         // Linux loopback_net_exit
         *net.loopback.write() = None;
     }

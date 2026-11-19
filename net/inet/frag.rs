@@ -54,8 +54,6 @@ const IP_MAX: usize = 65535;
 /// Fragments per queue (a 64 KB datagram over the minimum 68-byte MTU
 /// needs 1366)
 pub const MAX_FRAGS: usize = 2048;
-/// Bytes charged per fragment besides its payload
-const OVERHEAD: usize = 256;
 
 /// Queue identity (Linux ipq: saddr, daddr, id, protocol)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,9 +162,12 @@ impl Frags {
             end: end as u32,
             ihl: ihl as u16,
         });
+        // The skb as allocated, not its payload: a tiny fragment in a
+        // large buffer is charged the buffer (Linux add_frag_mem_limit
+        // of skb->truesize)
+        self.mem += skb.truesize();
         self.tree.insert_by(skb, |a, b| cb(a).off < cb(b).off);
         self.meat += end - off;
-        self.mem += end - off + OVERHEAD;
         if off == 0 {
             self.first_ihl = Some(ihl);
         }
@@ -288,6 +289,8 @@ fn bucket_index(net: &NetNamespace, k: &FragKey) -> usize {
 pub struct FragTable {
     mem: AtomicUsize,
     queues: AtomicUsize,
+    /// The namespace exits: no new queue (Linux fqdir->dead)
+    dead: core::sync::atomic::AtomicBool,
 }
 
 /// What `FragTable::add` decided
@@ -380,7 +383,7 @@ impl FragTable {
     /// GFP_ATOMIC allocation and an insert that keeps a racing one)
     fn find(&self, net: &Arc<NetNamespace>, key: &FragKey) -> Option<Arc<FragQueue>> {
         let high = net.sysctl.frag_high.load(Ordering::Relaxed);
-        if self.mem.load(Ordering::Relaxed) > high {
+        if self.mem.load(Ordering::Relaxed) > high || self.dead.load(Ordering::Relaxed) {
             return None;
         }
         let bkt = bucket_index(net, key);
@@ -409,9 +412,16 @@ impl FragTable {
         if let Some(old) = b.find(|x| mine(x)) {
             return Some(old);
         }
+        // Counted, then `dead` checked; `net_exit` sets `dead`, then
+        // reads the count (SeqCst both: one of them sees the other), so
+        // a queue it skips the walk for is never inserted
+        self.queues.fetch_add(1, Ordering::SeqCst);
+        if self.dead.load(Ordering::SeqCst) {
+            self.queues.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
         b.add_head_rcu(q.clone());
         drop(b);
-        self.queues.fetch_add(1, Ordering::Relaxed);
         let secs = net.sysctl.frag_time.load(Ordering::Relaxed).max(1) as u64;
         let at = crate::net::neigh::now_ms().saturating_add(secs * 1000);
         q.timer.reset(&q, at.saturating_mul(1_000_000));
@@ -433,6 +443,32 @@ impl FragTable {
                 ..Default::default()
             },
         )
+    }
+}
+
+/// `net` exits: no new queue, and each of its queues killed and freed
+/// now (Linux fqdir_pre_exit, then fqdir_exit's walk), not left to
+/// its timer
+pub fn net_exit(net: &NetNamespace) {
+    let t = &net.frags;
+    t.dead.store(true, Ordering::SeqCst);
+    if t.queues.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let mine = |q: &FragQueue| core::ptr::eq(q.net.as_ptr(), net);
+    for b in table() {
+        // One at a time: a queue's lock comes before its bucket's
+        loop {
+            // The bucket guard is a temporary of this statement only
+            let q = b.lock().find(|q| mine(q));
+            let Some(q) = q else { break };
+            let mut st = q.st.lock();
+            if !st.complete {
+                let dead = t.kill(&q, &mut st);
+                drop(st);
+                drop(dead);
+            }
+        }
     }
 }
 
@@ -600,10 +636,13 @@ mod tests {
         assert_eq!(ins(&mut q, 65528, 64, 1, false), Ins::Kill);
     }
 
+    /// Each fragment is charged its skb's truesize
     #[test]
     fn memory_charged() {
         let mut q = Frags::default();
-        ins(&mut q, 0, 800, 1, true);
-        assert_eq!(q.mem, 800 + OVERHEAD);
+        let f = frag(&HDR, 800, 1);
+        let ts = f.truesize();
+        assert_eq!(q.insert(f, 20, 0, true), Ins::More);
+        assert_eq!(q.mem, ts);
     }
 }

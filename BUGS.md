@@ -106,10 +106,6 @@ whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
 a group's pick at once (with no connected members), before scoring
 the rest of the hash2 chain.
 
-Reassembly queues of a namespace that goes away stay until their
-timers fire (up to `ipfrag_time`), then free their fragments; Linux
-fqdir_exit flushes them at once.
-
 A socket on RCU lists (ping, raw, UDP, packet, netlink) leaves "sockets: used" a grace
 period after its close: the chain's `Arc` is released by
 `RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
