@@ -4,8 +4,8 @@
 //! (duplicates tolerated, overlaps dropped).
 
 use hk_syscall::{
-    AF_INET, SOCK_RAW, sys_exit, sys_fork, sys_getsockopt, sys_setresuid, sys_setsockopt,
-    sys_socket, sys_wait4,
+    AF_INET, CLONE_NEWNET, SOCK_RAW, sys_exit, sys_fork, sys_getsockopt, sys_setresuid,
+    sys_setsockopt, sys_socket, sys_unshare, sys_wait4,
 };
 
 use crate::harness::T;
@@ -28,6 +28,7 @@ pub fn run_tests() {
     test_proto_unreach();
     test_peek();
     test_frag_overlap();
+    test_frag_expire();
 }
 
 /// MSG_PEEK leaves the packet (IP header included) queued; a short
@@ -315,5 +316,67 @@ fn test_frag_overlap() {
     t.eq(b"killed", recv(u, &mut buf, MSG_DONTWAIT), EAGAIN);
     close(fd);
     close(u);
+    t.done();
+}
+
+/// A first fragment whose datagram never completes: after
+/// net.ipv4.ipfrag_time (1 s, in a namespace of its own) its queue
+/// dies and an ICMP time exceeded (fragment reassembly) quoting it is
+/// sent (Linux ip_expire). The head's route is looked up again the
+/// full way, so the fragment comes from another host's address
+/// (10.9.9.2, spoofed) to ours on lo (10.9.9.1/24): a 127/8 or
+/// self-sourced one would be martian and get no error. The error to
+/// 10.9.9.2 leaves through lo, where a packet socket sees it.
+fn test_frag_expire() {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            crate::helpers::skip(b"RAW_FRAG_EXPIRE", b"unshare(CLONE_NEWNET) not permitted");
+            sys_exit(0);
+        }
+        crate::helpers::loopback_up();
+        frag_expire();
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+}
+
+fn frag_expire() {
+    use crate::net::nl::{NLM_F_CREATE, Nl, addr};
+    let mut t = T::new(b"RAW_FRAG_EXPIRE");
+    t.eq(
+        b"ipfrag_time",
+        crate::proc::sysctl::write_file(b"/proc/sys/net/ipv4/ipfrag_time\0", b"1"),
+        1,
+    );
+    let ok = Nl::open().map(|mut nl| addr(&mut nl, true, 1, [10, 9, 9, 1], 24, NLM_F_CREATE));
+    t.eq(b"address", i64::from(ok.unwrap_or(-1)), 0);
+    // AF_PACKET, SOCK_DGRAM, ETH_P_IP: frames from the IP header on
+    let ps = sys_socket(17, 2, 0x0800u16.to_be() as i32) as i32;
+    t.ok(b"packet socket", ps >= 0, i64::from(ps));
+    let fd = raw(IPPROTO_RAW);
+    let mut pkt = [0u8; 36];
+    iphdr(&mut pkt, 17, 0x2001, 0x2000);
+    pkt[12..16].copy_from_slice(&[10, 9, 9, 2]);
+    pkt[16..20].copy_from_slice(&[10, 9, 9, 1]);
+    t.eq(b"first", send_to(fd, &pkt, [10, 9, 9, 1], 0, 0), 36);
+    let mut buf = [0u8; 128];
+    let mut got = false;
+    for _ in 0..40 {
+        let (r, _) = poll1(ps, 1, 100);
+        if r != 1 {
+            continue;
+        }
+        let n = recv(ps, &mut buf, MSG_DONTWAIT);
+        // ICMP time exceeded (reassembly) quoting the fragment's header
+        if n >= 48 && buf[9] == 1 && buf[20] == 11 && buf[21] == 1 {
+            got = buf[32..34] == 0x2001u16.to_be_bytes();
+            break;
+        }
+    }
+    t.ok(b"time exceeded", got, 0);
+    close(fd);
+    close(ps);
     t.done();
 }

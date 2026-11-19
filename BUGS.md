@@ -106,6 +106,10 @@ whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
 a group's pick at once (with no connected members), before scoring
 the rest of the hash2 chain.
 
+Reassembly queues of a namespace that goes away stay until their
+timers fire (up to `ipfrag_time`), then free their fragments; Linux
+fqdir_exit flushes them at once.
+
 A socket on RCU lists (ping, raw, UDP, packet, netlink) leaves "sockets: used" a grace
 period after its close: the chain's `Arc` is released by
 `RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
@@ -826,9 +830,6 @@ in bpf maps and the swap cache. ROADMAP
 phase A (A0-A3).
 
 Phase A2 (net) remaining:
-- IPv4 reassembly (`net/inet/frag.rs` `FragTable.st`): Linux per-queue
-  locks and timers, fragments in the skb rbtree, inet_frag_alloc
-  GFP_ATOMIC.
 - ICMP global limiter (icmp_global_allow) and inet_peer on the RbTree
   with `new_gfp(ATOMIC)` nodes and Linux's GC thresholds.
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`

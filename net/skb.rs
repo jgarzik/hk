@@ -135,6 +135,8 @@ pub enum SkbCb {
     Pkt(crate::net::packet::PktCb),
     /// A netlink message (Linux NETLINK_CB)
     Nl(crate::net::netlink::NlCb),
+    /// An IPv4 fragment in a reassembly queue (Linux FRAG_CB)
+    Frag(crate::net::inet::frag::FragCb),
     /// An AF_UNIX message (Linux UNIXCB and the skb's sock_wfree
     /// destructor); boxed, so every skb stays small (skbs are passed by
     /// value down the receive path)
@@ -152,6 +154,7 @@ impl SkbCb {
             Self::Exterr(e) => Self::Exterr(*e),
             Self::Pkt(p) => Self::Pkt(*p),
             Self::Nl(n) => Self::Nl(n.clone()),
+            Self::Frag(f) => Self::Frag(*f),
         }
     }
 }

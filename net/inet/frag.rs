@@ -1,9 +1,13 @@
 //! IPv4 reassembly (Linux net/ipv4/ip_fragment.c, inet_fragment.c)
 //!
 //! Fragments of a datagram (keyed by source, destination, id and
-//! protocol) collect in a `FragQueue` until the first and last pieces
-//! are in and the payload has no holes. Peer-reachable, so everything
-//! is bounded like Linux:
+//! protocol) collect in a [`FragQueue`] until the first and last pieces
+//! are in and the payload has no holes. As Linux, each queue is an
+//! object of its own (struct inet_frag_queue): found in a hash table
+//! under RCU, made GFP_ATOMIC on the first fragment, with its own lock,
+//! its own expiry timer, and the fragments themselves (the received
+//! skbs, nothing copied) in an rbtree by offset. Peer-reachable, so
+//! everything is bounded like Linux:
 //! - memory: fragments are charged to the namespace; above
 //!   `ipfrag_high_thresh` new fragments are dropped (Linux
 //!   inet_frag_find); queues die after `ipfrag_time` (30 s), sending
@@ -12,24 +16,38 @@
 //!   (RFC 5722 style, Linux IPFRAG_OVERLAP); an exact duplicate is
 //!   dropped alone; inconsistent last-fragment lengths, empty
 //!   fragments and datagrams beyond 65535 bytes kill the queue;
-//! - CPU: fragments live in an ordered map (log-time insert) and a
-//!   queue holds at most `MAX_FRAGS` of them.
+//! - CPU: a log-time insert, and a queue holds at most `MAX_FRAGS`
+//!   fragments.
 //!
 //! ## Locking
 //!
-//! `FragTable.st` is a `crate::sync::spin::Mutex` (thread only: softnet and the
-//! reassembly timer on ktimers/N), a leaf: completed datagrams and expiry
-//! ICMP errors are handled after it is dropped.
+//! A hash bucket's lock (spin, `util::hlist_nulls`; Linux the fqdir
+//! rhashtable's bucket locks) orders the insert of a new queue against
+//! a racing one; lookups walk a bucket under RCU and take a reference.
+//! `FragQueue.st` (spin, Linux q->lock; thread only: softnet and the
+//! queue's timer on ktimers/N) holds its fragments and lengths; killing
+//! a queue (Linux inet_frag_kill) unhashes it under it (order
+//! `FragQueue.st` -> bucket lock) and stops its timer. Nothing is
+//! allocated under either: a completed datagram is assembled, and an
+//! expiry's ICMP error sent, after `st` is dropped, from the fragments
+//! taken out of the dead queue. A queue's table reference goes a grace
+//! period after it is unhashed, possibly in `rcuc/N`.
 
-use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::sync::spin::Mutex;
-
+use crate::mm::page_alloc::Gfp;
+use crate::net::NetNamespace;
+use crate::net::inet::route::IpInput;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::mib::*;
-use crate::util::kmem::{KVec, try_to_vec};
+use crate::net::skb::{SkBuff, SkbCb, SkbTree};
+use crate::sync::rcu::RcuPuts;
+use crate::sync::spin::Mutex;
+use crate::time::timer::ArcTimer;
+use crate::util::hlist_nulls::{NullsHead, NullsLink};
+use crate::util::kalloc::try_arc_gfp;
 
 /// Largest IPv4 datagram
 const IP_MAX: usize = 65535;
@@ -40,12 +58,29 @@ pub const MAX_FRAGS: usize = 2048;
 const OVERHEAD: usize = 256;
 
 /// Queue identity (Linux ipq: saddr, daddr, id, protocol)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FragKey {
     pub saddr: Ipv4Addr,
     pub daddr: Ipv4Addr,
     pub id: u16,
     pub proto: u8,
+}
+
+/// Where a queued fragment's payload lies (Linux FRAG_CB's
+/// ip_defrag_offset): payload bytes [`off`, `end`) of the datagram,
+/// after its own `ihl`-byte IP header in the skb
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FragCb {
+    off: u32,
+    end: u32,
+    ihl: u16,
+}
+
+fn cb(skb: &SkBuff) -> FragCb {
+    match skb.cb {
+        SkbCb::Frag(c) => c,
+        _ => FragCb::default(),
+    }
 }
 
 /// Result of adding a fragment
@@ -64,37 +99,33 @@ pub enum Ins {
     Done,
 }
 
-/// One datagram being reassembled
+/// A queue's fragments and lengths (under `FragQueue.st`)
 #[derive(Default)]
-pub struct FragQueue {
-    /// payload offset -> payload bytes
-    frags: BTreeMap<usize, Vec<u8>>,
+struct Frags {
+    /// The fragments by payload offset (Linux q->rb_fragments)
+    tree: SkbTree,
     /// Payload length (exact once the last fragment is in)
     len: usize,
     /// Payload bytes received
     meat: usize,
     last_in: bool,
-    /// IP header of the first fragment (offset 0), options included,
-    /// plus the start of its payload (for ICMP time exceeded)
-    first: Option<Vec<u8>>,
-    /// Bytes charged
-    pub mem: usize,
-    /// Expiry (ms)
-    pub expires: u64,
+    /// Header length of the first fragment, once it is in (Linux
+    /// INET_FRAG_FIRST_IN)
+    first_ihl: Option<usize>,
+    /// Bytes charged to the namespace
+    mem: usize,
+    /// Killed: no more fragments (Linux INET_FRAG_COMPLETE)
+    complete: bool,
+    /// Input device of the latest fragment (Linux qp->iif)
+    iif: u32,
 }
 
-impl FragQueue {
-    pub fn new(expires: u64) -> Self {
-        Self {
-            expires,
-            ..Default::default()
-        }
-    }
-
-    /// Add `data` at payload offset `off` (`more`: MF set); `hdr` is the
-    /// fragment's IP header (kept for offset 0). Linux ip_frag_queue.
-    pub fn insert(&mut self, off: usize, data: &[u8], more: bool, hdr: &[u8]) -> Ins {
-        let mut end = off + data.len();
+impl Frags {
+    /// Add `skb`, an IP fragment whose header is `ihl` bytes, at payload
+    /// offset `off` (`more`: MF set); Linux ip_frag_queue. A dropped
+    /// fragment is freed.
+    fn insert(&mut self, mut skb: Box<SkBuff>, ihl: usize, off: usize, more: bool) -> Ins {
+        let mut end = off + skb.len() - ihl;
         if !more {
             if end < self.len || (self.last_in && end != self.len) {
                 return Ins::Kill;
@@ -113,9 +144,9 @@ impl FragQueue {
         // The whole datagram, with the first fragment's header, must fit
         // in 16 bits (ping of death): never truncate a length later
         let fihl = if off == 0 {
-            hdr.len()
+            ihl
         } else {
-            self.first_ihl()
+            self.first_ihl.unwrap_or(crate::net::ipv4::IP_HLEN_MIN)
         };
         if end <= off || fihl + self.len > IP_MAX {
             return Ins::Kill;
@@ -125,31 +156,19 @@ impl FragQueue {
             Some(false) => return Ins::Dup,
             None => return Ins::Overlap,
         }
-        if self.frags.len() >= MAX_FRAGS {
+        if self.tree.len() >= MAX_FRAGS {
             return Ins::Kill;
         }
-        // Out of memory kills the queue, as Linux ip_frag_reasm's
-        // out_nomem does (the caller frees it)
-        let first = if off == 0 {
-            let mut f = KVec::new();
-            if f.try_extend_from_slice(hdr).is_err()
-                || f.try_extend_from_slice(&data[..(end - off).min(8)])
-                    .is_err()
-            {
-                return Ins::Kill;
-            }
-            Some(f.into_vec())
-        } else {
-            None
-        };
-        let Ok(piece) = try_to_vec(&data[..end - off]) else {
-            return Ins::Kill;
-        };
-        self.frags.insert(off, piece);
+        skb.cb = SkbCb::Frag(FragCb {
+            off: off as u32,
+            end: end as u32,
+            ihl: ihl as u16,
+        });
+        self.tree.insert_by(skb, |a, b| cb(a).off < cb(b).off);
         self.meat += end - off;
         self.mem += end - off + OVERHEAD;
-        if first.is_some() {
-            self.first = first;
+        if off == 0 {
+            self.first_ihl = Some(ihl);
         }
         if self.done() { Ins::Done } else { Ins::More }
     }
@@ -157,112 +176,147 @@ impl FragQueue {
     /// Where [off, end) fits: Some(true) free, Some(false) exact
     /// duplicate of a stored piece, None overlap (Linux
     /// inet_frag_queue_insert)
-    fn place(&self, off: usize, end: usize) -> Option<bool> {
-        if let Some((&o, d)) = self.frags.range(..=off).next_back() {
-            let e = o + d.len();
-            if off < e {
-                return (off >= o && end <= e).then_some(false);
-            }
-        }
-        match self.frags.range(off..).next() {
-            Some((&o, _)) if o < end => None,
+    fn place(&mut self, off: usize, end: usize) -> Option<bool> {
+        let (off, end) = (off as u32, end as u32);
+        let c = self.tree.cursor_floor_mut(|x| cb(x).off <= off);
+        let next = match c.current().map(cb) {
+            Some(p) if off < p.end => return (end <= p.end).then_some(false),
+            Some(_) => c.peek_next().map(cb),
+            None => None,
+        };
+        // Nothing at or before `off`: the first one is next
+        let next = next.or_else(|| self.tree.first().map(cb).filter(|f| f.off > off));
+        match next {
+            Some(n) if n.off < end => None,
             _ => Some(true),
         }
     }
 
-    /// Header length of the first fragment (minimum until it arrived)
-    fn first_ihl(&self) -> usize {
-        self.first
-            .as_ref()
-            .map_or(crate::net::ipv4::IP_HLEN_MIN, |f| {
-                ((f[0] & 0x0f) as usize) * 4
-            })
-    }
-
     fn done(&self) -> bool {
-        self.last_in && self.first.is_some() && self.meat == self.len
+        self.last_in && self.first_ihl.is_some() && self.meat == self.len
     }
+}
 
-    /// First fragment's header + leading payload, if it arrived
-    pub fn first(&self) -> Option<&[u8]> {
-        self.first.as_deref()
+/// The whole datagram from a complete queue's fragments: the first
+/// one's header (fixed up), then each payload; in an skb made GFP_ATOMIC
+/// with `last`'s receive metadata (Linux ip_frag_reasm); None beyond
+/// 65535 bytes or out of memory (Linux out_oversize, out_nomem)
+fn assemble(f: &Frags, last: &Meta) -> Option<Box<SkBuff>> {
+    let ihl = f.first_ihl?;
+    if ihl + f.len > IP_MAX {
+        return None;
     }
+    let mut s = SkBuff::alloc(crate::net::skb::NET_SKB_PAD, ihl + f.len, Gfp::ATOMIC)?;
+    let first = f.tree.first()?;
+    s.put_slice(&first.data()[..ihl])?;
+    for frag in f.tree.iter() {
+        let c = cb(frag);
+        let from = usize::from(c.ihl);
+        s.put_slice(&frag.data()[from..from + (c.end - c.off) as usize])?;
+    }
+    let out = s.data_mut();
+    let tot = u16::try_from(out.len()).ok()?;
+    out[2..4].copy_from_slice(&tot.to_be_bytes());
+    out[6] = 0;
+    out[7] = 0;
+    out[10] = 0;
+    out[11] = 0;
+    let c = crate::net::ipv4::ip_checksum(&out[..ihl]);
+    out[10..12].copy_from_slice(&c.to_be_bytes());
+    s.dev = last.dev.clone();
+    s.pkt_type = last.pkt_type;
+    s.ip_bcast = last.ip_bcast;
+    Some(s)
+}
 
-    /// The whole datagram: first header (fixed up) + payload; None if
-    /// incomplete, beyond 65535 bytes (Linux "Oversized IP packet") or
-    /// out of memory (Linux ip_frag_reasm's out_nomem)
-    pub fn assemble(&self) -> Option<Vec<u8>> {
-        let first = self.first.as_ref()?;
-        let ihl = ((first[0] & 0x0f) as usize) * 4;
-        if !self.done() || ihl + self.len > IP_MAX {
-            return None;
-        }
-        let mut out = KVec::try_with_capacity(ihl + self.len).ok()?;
-        out.try_extend_from_slice(&first[..ihl]).ok()?;
-        for d in self.frags.values() {
-            out.try_extend_from_slice(d).ok()?;
-        }
-        let mut out = out.into_vec();
-        let tot = u16::try_from(out.len()).ok()?;
-        out[2..4].copy_from_slice(&tot.to_be_bytes());
-        out[6] = 0;
-        out[7] = 0;
-        out[10] = 0;
-        out[11] = 0;
-        let c = crate::net::ipv4::ip_checksum(&out[..ihl]);
-        out[10..12].copy_from_slice(&c.to_be_bytes());
-        Some(out)
-    }
+/// What the reassembled skb takes from the fragment that completed it
+struct Meta {
+    dev: Option<Arc<crate::net::NetDevice>>,
+    pkt_type: crate::net::ethernet::PktType,
+    ip_bcast: bool,
+}
+
+/// One datagram being reassembled (Linux struct ipq / inet_frag_queue)
+pub struct FragQueue {
+    key: FragKey,
+    /// Its bucket's index (the namespace may be gone at expiry)
+    bkt: usize,
+    /// Its namespace (Linux q->fqdir->net)
+    net: Weak<NetNamespace>,
+    st: Mutex<Frags>,
+    /// Link on its hash bucket (Linux q->node)
+    link: NullsLink,
+    /// Expiry (Linux q->timer, ip_expire)
+    timer: ArcTimer<FragQueue>,
+    rcu: RcuPuts,
+}
+
+crate::nulls_adapter!(FragHash, FragQueue, link);
+crate::rcu_puts!(FragQueue, rcu);
+
+/// Queues of every namespace (Linux each fqdir's rhashtable)
+static FRAG_TABLE: spin::Once<Box<[NullsHead<FragHash>]>> = spin::Once::new();
+
+/// Size the table from memory (one bucket per 2 MiB, 256 to 64 Ki)
+pub fn init() {
+    let n = (crate::FRAME_ALLOCATOR.buffer_pages() >> 9)
+        .next_power_of_two()
+        .clamp(256, 1 << 16);
+    FRAG_TABLE.call_once(|| NullsHead::table(n).expect("ipfrag: hash table"));
+}
+
+fn table() -> &'static [NullsHead<FragHash>] {
+    FRAG_TABLE.get().expect("ipfrag table not initialized")
+}
+
+/// Linux ipqhashfn: a keyed hash of the key and the namespace's mix
+fn bucket_index(net: &NetNamespace, k: &FragKey) -> usize {
+    let h = crate::net::inet::port::secure_hash(
+        0x6970_6672_6167,
+        &[
+            u64::from(net.hash_mix),
+            (u64::from(k.saddr.0) << 32) | u64::from(k.daddr.0),
+            (u64::from(k.id) << 8) | u64::from(k.proto),
+        ],
+    );
+    h as usize & (table().len() - 1)
+}
+
+/// A namespace's reassembly accounting (Linux struct fqdir's mem and
+/// the rhashtable's nelems)
+#[derive(Default)]
+pub struct FragTable {
+    mem: AtomicUsize,
+    queues: AtomicUsize,
 }
 
 /// What `FragTable::add` decided
 pub enum Defrag {
     /// Keep waiting (or dropped)
     Pending,
-    /// Complete datagram (IP header first)
-    Whole(Vec<u8>),
+    /// The complete datagram (IP header first)
+    Whole(Box<SkBuff>),
 }
-
-struct State {
-    q: BTreeMap<FragKey, FragQueue>,
-    mem: usize,
-}
-
-/// A namespace's reassembly queues
-pub struct FragTable {
-    st: Mutex<State>,
-}
-
-impl Default for FragTable {
-    fn default() -> Self {
-        Self {
-            st: Mutex::new(State {
-                q: BTreeMap::new(),
-                mem: 0,
-            }),
-        }
-    }
-}
-
-/// Registered tables, for the expiry timer
-static TABLES: Mutex<Vec<Weak<crate::net::NetNamespace>>> = Mutex::new(Vec::new());
-static ALARM: crate::time::timer::Alarm = crate::time::timer::Alarm::new(frag_timer);
 
 impl FragTable {
-    /// Add a fragment (`pkt` = whole IP packet, header validated) of a
-    /// datagram for us in `net`. `high`: ipfrag_high_thresh;
-    /// `timeout`: ipfrag_time in ms. Counted as Linux ip_defrag does:
-    /// ReasmReqds for each, ReasmFails (and ReasmOverlaps) when the
-    /// queue dies; the caller counts ReasmOKs for a `Whole`.
-    pub fn add(&self, net: &Arc<crate::net::NetNamespace>, pkt: &[u8]) -> Defrag {
+    /// Queues and bytes held (as /proc/net/sockstat's FRAG line shows
+    /// them)
+    pub fn usage(&self) -> (usize, usize) {
+        (
+            self.queues.load(Ordering::Relaxed),
+            self.mem.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Add `skb`, a fragment for us (header validated) in `net`
+    /// (Linux ip_defrag). Counted as Linux does: ReasmReqds for each,
+    /// ReasmFails (and ReasmOverlaps) when the queue dies or the
+    /// datagram cannot be built; the caller counts ReasmOKs for a
+    /// `Whole`.
+    pub fn add(&self, net: &Arc<NetNamespace>, skb: Box<SkBuff>) -> Defrag {
         let ip = &net.mib.ip;
         ip.inc(IPSTATS_MIB_REASMREQDS);
-        let s = &net.sysctl;
-        let high = s.frag_high.load(core::sync::atomic::Ordering::Relaxed);
-        let secs = s
-            .frag_time
-            .load(core::sync::atomic::Ordering::Relaxed)
-            .max(1) as u64;
+        let pkt = skb.data();
         let ihl = ((pkt[0] & 0x0f) as usize) * 4;
         let fo = u16::from_be_bytes([pkt[6], pkt[7]]);
         let key = FragKey {
@@ -273,126 +327,166 @@ impl FragTable {
         };
         let off = ((fo & 0x1fff) as usize) * 8;
         let more = fo & 0x2000 != 0;
-        let now = crate::net::neigh::now_ms();
-        let mut st = self.st.lock();
-        if st.mem > high {
-            // Linux ip_find fails: no queue
+        let Some(q) = self.find(net, &key) else {
+            // Linux ip_find fails: over the memory limit, or no memory
+            ip.inc(IPSTATS_MIB_REASMFAILS);
+            return Defrag::Pending;
+        };
+        let meta = Meta {
+            dev: skb.dev.clone(),
+            pkt_type: skb.pkt_type,
+            ip_bcast: skb.ip_bcast,
+        };
+        let mut st = q.st.lock();
+        if st.complete {
+            // Lost a race with its completion or expiry (Linux
+            // ip_frag_queue's INET_FRAG_COMPLETE check)
+            drop(st);
             ip.inc(IPSTATS_MIB_REASMFAILS);
             return Defrag::Pending;
         }
-        let fresh = !st.q.contains_key(&key);
-        let q =
-            st.q.entry(key)
-                .or_insert_with(|| FragQueue::new(now + secs * 1000));
-        let before = q.mem;
-        let r = q.insert(off, &pkt[ihl..], more, &pkt[..ihl]);
-        let after = q.mem;
-        st.mem = st.mem + after - before;
-        let out = match r {
+        let before = st.mem;
+        st.iif = meta.dev.as_ref().map_or(0, |d| d.ifindex());
+        let r = st.insert(skb, ihl, off, more);
+        self.mem.fetch_add(st.mem - before, Ordering::Relaxed);
+        match r {
             Ins::More | Ins::Dup => Defrag::Pending,
             Ins::Kill | Ins::Overlap => {
+                let dead = self.kill(&q, &mut st);
+                drop(st);
+                drop(dead);
                 if r == Ins::Overlap {
                     ip.inc(IPSTATS_MIB_REASM_OVERLAPS);
                 }
                 ip.inc(IPSTATS_MIB_REASMFAILS);
-                self.remove(&mut st, &key);
                 Defrag::Pending
             }
             Ins::Done => {
-                let whole = st.q.get(&key).and_then(|q| q.assemble());
-                self.remove(&mut st, &key);
-                // Linux ip_frag_reasm's out_nomem; ReasmOKs once the
-                // caller made the datagram's skb
-                if whole.is_none() {
-                    ip.inc(IPSTATS_MIB_REASMFAILS);
+                let dead = self.kill(&q, &mut st);
+                drop(st);
+                match assemble(&dead, &meta) {
+                    Some(s) => Defrag::Whole(s),
+                    None => {
+                        ip.inc(IPSTATS_MIB_REASMFAILS);
+                        Defrag::Pending
+                    }
                 }
-                whole.map_or(Defrag::Pending, Defrag::Whole)
             }
-        };
-        let exp = st.q.get(&key).map(|q| q.expires);
+        }
+    }
+
+    /// The queue for `key`, made if there is none and memory allows
+    /// (Linux inet_frag_find: lookup under RCU, then inet_frag_create's
+    /// GFP_ATOMIC allocation and an insert that keeps a racing one)
+    fn find(&self, net: &Arc<NetNamespace>, key: &FragKey) -> Option<Arc<FragQueue>> {
+        let high = net.sysctl.frag_high.load(Ordering::Relaxed);
+        if self.mem.load(Ordering::Relaxed) > high {
+            return None;
+        }
+        let bkt = bucket_index(net, key);
+        let head = &table()[bkt];
+        let mine = |q: &FragQueue| q.key == *key && q.net.as_ptr() == Arc::as_ptr(net);
+        {
+            let g = crate::sync::rcu::read_lock();
+            if let Some(q) = head.find_rcu(&g, |q| mine(q)) {
+                return Some(q.arc());
+            }
+        }
+        let q = try_arc_gfp(
+            FragQueue {
+                key: *key,
+                bkt,
+                net: Arc::downgrade(net),
+                st: Mutex::new(Frags::default()),
+                link: NullsLink::new(),
+                timer: ArcTimer::new(ip_expire),
+                rcu: RcuPuts::new(),
+            },
+            Gfp::ATOMIC,
+        )
+        .ok()?;
+        let mut b = head.lock();
+        if let Some(old) = b.find(|x| mine(x)) {
+            return Some(old);
+        }
+        b.add_head_rcu(q.clone());
+        drop(b);
+        self.queues.fetch_add(1, Ordering::Relaxed);
+        let secs = net.sysctl.frag_time.load(Ordering::Relaxed).max(1) as u64;
+        let at = crate::net::neigh::now_ms().saturating_add(secs * 1000);
+        q.timer.reset(&q, at.saturating_mul(1_000_000));
+        Some(q)
+    }
+
+    /// Kill `q` (Linux inet_frag_kill, `q.st` held): no more fragments,
+    /// off the table, its timer stopped, its charge returned; its
+    /// fragments come back to be used or freed after the lock
+    fn kill(&self, q: &FragQueue, st: &mut Frags) -> Frags {
+        if unhash(q, st) {
+            self.queues.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.mem.fetch_sub(st.mem, Ordering::Relaxed);
+        core::mem::replace(
+            st,
+            Frags {
+                complete: true,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// Mark `q` complete, stop its timer and take it off the table (`q.st`
+/// held); whether it was on it
+fn unhash(q: &FragQueue, st: &mut Frags) -> bool {
+    st.complete = true;
+    q.timer.stop();
+    let gone = table()[q.bkt].lock().del_rcu(q);
+    gone.map(|g| g.defer()).is_some()
+}
+
+/// A queue's timer expired (Linux ip_expire, ktimers/N): kill it and,
+/// if its first fragment was in and its route still holds, send ICMP
+/// time exceeded (reassembly) from that fragment's header and first 8
+/// payload bytes
+fn ip_expire(q: Arc<FragQueue>) {
+    let Some(net) = q.net.upgrade() else {
+        // Its namespace is gone (its accounting with it): off the table,
+        // its fragments freed after the lock
+        let mut st = q.st.lock();
+        unhash(&q, &mut st);
+        let dead = core::mem::take(&mut *st);
         drop(st);
-        if fresh && exp.is_some() {
-            register(net);
-        }
-        if let Some(e) = exp {
-            ALARM.arm(e.saturating_mul(1_000_000));
-        }
-        out
-    }
-
-    fn remove(&self, st: &mut State, key: &FragKey) {
-        if let Some(q) = st.q.remove(key) {
-            st.mem -= q.mem;
-        }
-    }
-
-    /// Bytes held (ipfrag memory)
-    pub fn mem(&self) -> usize {
-        self.st.lock().mem
-    }
-
-    /// Queues and bytes held (Linux fqdir's rhashtable nelems and
-    /// frag_mem_limit, as /proc/net/sockstat's FRAG line shows them)
-    pub fn usage(&self) -> (usize, usize) {
-        let st = self.st.lock();
-        (st.q.len(), st.mem)
-    }
-
-    /// Drop expired queues; returns the first-fragment headers of those
-    /// that had one (for ICMP time exceeded) and the next expiry
-    fn expire(&self, net: &crate::net::NetNamespace, now: u64) -> (Vec<Vec<u8>>, Option<u64>) {
-        let mut st = self.st.lock();
-        let dead: Vec<FragKey> =
-            st.q.iter()
-                .filter(|(_, q)| q.expires <= now)
-                .map(|(k, _)| *k)
-                .collect();
-        let mut firsts = Vec::new();
-        for k in dead {
-            if let Some(q) = st.q.remove(&k) {
-                st.mem -= q.mem;
-                // Linux ip_expire
-                net.mib.ip.inc(IPSTATS_MIB_REASMFAILS);
-                net.mib.ip.inc(IPSTATS_MIB_REASMTIMEOUT);
-                if let Some(f) = q.first {
-                    firsts.push(f);
-                }
-            }
-        }
-        let next = st.q.values().map(|q| q.expires).min();
-        (firsts, next)
-    }
-}
-
-fn register(net: &Arc<crate::net::NetNamespace>) {
-    let mut t = TABLES.lock();
-    if !t.iter().any(|w| w.as_ptr() == Arc::as_ptr(net)) {
-        t.push(Arc::downgrade(net));
-    }
-}
-
-/// Expiry timer (ktimers/N): free timed-out queues, report them
-fn frag_timer(_: u64) {
-    ALARM.fired();
-    let nets: Vec<Arc<crate::net::NetNamespace>> = {
-        let mut t = TABLES.lock();
-        t.retain(|w| w.strong_count() > 0);
-        t.iter().filter_map(|w| w.upgrade()).collect()
+        drop(dead);
+        return;
     };
-    let now = crate::net::neigh::now_ms();
-    let mut next: Option<u64> = None;
-    for net in nets {
-        let (firsts, n) = net.frags.expire(&net, now);
-        for f in firsts {
-            crate::net::icmp::frag_expired(&net, &f);
-        }
-        next = match (next, n) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+    let mut st = q.st.lock();
+    if st.complete {
+        return;
     }
-    if let Some(at) = next {
-        ALARM.arm(at.max(now + 10).saturating_mul(1_000_000));
+    let dead = net.frags.kill(&q, &mut st);
+    drop(st);
+    net.mib.ip.inc(IPSTATS_MIB_REASMFAILS);
+    net.mib.ip.inc(IPSTATS_MIB_REASMTIMEOUT);
+    let Some(ihl) = dead.first_ihl else {
+        return;
+    };
+    let Some(first) = dead.tree.first() else {
+        return;
+    };
+    // The head has no route: look it up again on the input device, the
+    // full way (Linux ip_route_input_noref; a looped skb's output dst
+    // is gone), so a loopback-addressed or self-sourced datagram gets
+    // no error (martian), as on Linux
+    if net.dev_get_by_index(dead.iif).is_none() {
+        return;
+    }
+    let d = first.data();
+    let saddr = Ipv4Addr::from_be_bytes([d[12], d[13], d[14], d[15]]);
+    let daddr = Ipv4Addr::from_be_bytes([d[16], d[17], d[18], d[19]]);
+    let rt = crate::net::inet::route::classify_in(&net, saddr, daddr, false);
+    if matches!(rt, IpInput::Local | IpInput::Broadcast) {
+        crate::net::icmp::frag_expired(&net, &d[..(ihl + 8).min(d.len())]);
     }
 }
 
@@ -404,64 +498,81 @@ mod tests {
         0x45, 0, 0, 0, 0, 1, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
     ];
 
-    fn data(n: usize, v: u8) -> Vec<u8> {
-        alloc::vec![v; n]
+    /// A fragment: `hdr`, then `n` payload bytes of `v`
+    fn frag(hdr: &[u8], n: usize, v: u8) -> Box<SkBuff> {
+        let mut s = SkBuff::alloc(0, hdr.len() + n, Gfp::KERNEL).unwrap();
+        s.put_slice(hdr).unwrap();
+        s.put_slice(&alloc::vec![v; n]).unwrap();
+        s
+    }
+
+    fn ins(f: &mut Frags, off: usize, n: usize, v: u8, more: bool) -> Ins {
+        f.insert(frag(&HDR, n, v), 20, off, more)
+    }
+
+    fn meta() -> Meta {
+        Meta {
+            dev: None,
+            pkt_type: Default::default(),
+            ip_bcast: false,
+        }
     }
 
     #[test]
     fn in_order_and_reordered() {
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(0, &data(16, 1), true, &HDR), Ins::More);
-        assert_eq!(q.insert(16, &data(8, 2), false, &HDR), Ins::Done);
-        let d = q.assemble().unwrap();
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 0, 16, 1, true), Ins::More);
+        assert_eq!(ins(&mut q, 16, 8, 2, false), Ins::Done);
+        let s = assemble(&q, &meta()).unwrap();
+        let d = s.data();
         assert_eq!(d.len(), 44);
         assert_eq!(u16::from_be_bytes([d[2], d[3]]), 44);
         assert_eq!(&d[20..36], &[1; 16]);
         assert_eq!(&d[36..], &[2; 8]);
         assert_eq!(crate::net::ipv4::ip_checksum(&d[..20]), 0);
 
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(16, &data(4, 2), false, &HDR), Ins::More);
-        assert_eq!(q.insert(8, &data(8, 3), true, &HDR), Ins::More);
-        assert_eq!(q.insert(0, &data(8, 1), true, &HDR), Ins::Done);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 16, 4, 2, false), Ins::More);
+        assert_eq!(ins(&mut q, 8, 8, 3, true), Ins::More);
+        assert_eq!(ins(&mut q, 0, 8, 1, true), Ins::Done);
     }
 
     #[test]
     fn overlap_kills_duplicate_drops() {
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(0, &data(16, 1), true, &HDR), Ins::More);
-        assert_eq!(q.insert(0, &data(16, 1), true, &HDR), Ins::Dup);
-        assert_eq!(q.insert(8, &data(8, 1), true, &HDR), Ins::Dup);
-        assert_eq!(q.insert(8, &data(16, 9), true, &HDR), Ins::Overlap);
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(16, &data(16, 1), true, &HDR), Ins::More);
-        assert_eq!(q.insert(8, &data(16, 1), true, &HDR), Ins::Overlap);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 0, 16, 1, true), Ins::More);
+        assert_eq!(ins(&mut q, 0, 16, 1, true), Ins::Dup);
+        assert_eq!(ins(&mut q, 8, 8, 1, true), Ins::Dup);
+        assert_eq!(ins(&mut q, 8, 16, 9, true), Ins::Overlap);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 16, 16, 1, true), Ins::More);
+        assert_eq!(ins(&mut q, 8, 16, 1, true), Ins::Overlap);
     }
 
     #[test]
     fn inconsistent_lengths_kill() {
         // Two different last fragments
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(16, &data(8, 1), false, &HDR), Ins::More);
-        assert_eq!(q.insert(16, &data(16, 1), false, &HDR), Ins::Kill);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 16, 8, 1, false), Ins::More);
+        assert_eq!(ins(&mut q, 16, 16, 1, false), Ins::Kill);
         // Data beyond the last fragment
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(8, &data(8, 1), false, &HDR), Ins::More);
-        assert_eq!(q.insert(16, &data(8, 1), true, &HDR), Ins::Kill);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 8, 8, 1, false), Ins::More);
+        assert_eq!(ins(&mut q, 16, 8, 1, true), Ins::Kill);
         // Empty fragment
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(8, &data(4, 1), true, &HDR), Ins::Kill);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 8, 4, 1, true), Ins::Kill);
         // Beyond 65535
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(65528, &data(16, 1), false, &HDR), Ins::Kill);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 65528, 16, 1, false), Ins::Kill);
     }
 
     #[test]
     fn non_final_trimmed_to_8() {
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(0, &data(13, 1), true, &HDR), Ins::More);
-        assert_eq!(q.insert(8, &data(8, 2), false, &HDR), Ins::Done);
-        assert_eq!(q.assemble().unwrap().len(), 36);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 0, 13, 1, true), Ins::More);
+        assert_eq!(ins(&mut q, 8, 8, 2, false), Ins::Done);
+        assert_eq!(assemble(&q, &meta()).unwrap().len(), 36);
     }
 
     #[test]
@@ -470,29 +581,29 @@ mod tests {
         // 65535 with a short header of its own
         let mut big = [0u8; 60];
         big[0] = 0x4f;
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(0, &data(8, 1), true, &big), Ins::More);
-        assert_eq!(q.insert(65464, &data(16, 2), false, &HDR), Ins::Kill);
+        let mut q = Frags::default();
+        assert_eq!(q.insert(frag(&big, 8, 1), 60, 0, true), Ins::More);
+        assert_eq!(ins(&mut q, 65464, 16, 2, false), Ins::Kill);
         // Same pieces, first fragment last
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(65464, &data(16, 2), false, &HDR), Ins::More);
-        assert_eq!(q.insert(0, &data(8, 1), true, &big), Ins::Kill);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 65464, 16, 2, false), Ins::More);
+        assert_eq!(q.insert(frag(&big, 8, 1), 60, 0, true), Ins::Kill);
         // Exactly 65535 is fine and its header says so
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(0, &data(65512, 1), true, &HDR), Ins::More);
-        assert_eq!(q.insert(65512, &data(3, 2), false, &HDR), Ins::Done);
-        let d = q.assemble().unwrap();
-        assert_eq!(d.len(), 65535);
-        assert_eq!(u16::from_be_bytes([d[2], d[3]]), 65535);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 0, 65512, 1, true), Ins::More);
+        assert_eq!(ins(&mut q, 65512, 3, 2, false), Ins::Done);
+        let s = assemble(&q, &meta()).unwrap();
+        assert_eq!(s.len(), 65535);
+        assert_eq!(u16::from_be_bytes([s.data()[2], s.data()[3]]), 65535);
         // Largest offset with a payload overflowing 16 bits
-        let mut q = FragQueue::new(0);
-        assert_eq!(q.insert(65528, &data(64, 1), false, &HDR), Ins::Kill);
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 65528, 64, 1, false), Ins::Kill);
     }
 
     #[test]
     fn memory_charged() {
-        let mut q = FragQueue::new(0);
-        q.insert(0, &data(800, 1), true, &HDR);
+        let mut q = Frags::default();
+        ins(&mut q, 0, 800, 1, true);
         assert_eq!(q.mem, 800 + OVERHEAD);
     }
 }
