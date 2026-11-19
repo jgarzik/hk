@@ -249,8 +249,14 @@ pub struct NlSock {
     rcu: RcuPuts,
     /// On its namespace's multicast list of its protocol (Linux
     /// sk_bind_node) while it subscribes to any group; written under
-    /// `NL_TABLE.lock`, free for a new insert as soon as it leaves
+    /// `NL_TABLE.lock`. It rejoins only a grace period after it left
+    /// (`mc_left` leaves so far, `mc_settled` of them a grace period
+    /// old; both under `NL_TABLE.lock`): a broadcast walking under RCU
+    /// may stand on it, and back at the chain's head it would lead that
+    /// walk over sockets it already served
     mc_node: HNode,
+    mc_left: AtomicU32,
+    mc_settled: AtomicU32,
     me: Weak<NlSock>,
 }
 
@@ -292,6 +298,8 @@ impl NlSock {
             node: HNode::new(),
             rcu: RcuPuts::new(),
             mc_node: HNode::new(),
+            mc_left: AtomicU32::new(0),
+            mc_settled: AtomicU32::new(0),
             me: me.clone(),
         })
     }
@@ -404,15 +412,33 @@ impl NlSock {
     /// Its subscriptions changed: on its multicast list while it has
     /// any, off it with none (Linux netlink_update_subscriptions:
     /// sk_add_bind_node, __sk_del_bind_node); the list's reference goes
-    /// a grace period after it leaves
+    /// a grace period after it leaves. Rejoining after a leave first
+    /// waits out a grace period, with no lock held (thread context:
+    /// bind, NETLINK_ADD_MEMBERSHIP), where Linux's broadcast walk
+    /// excludes list changes (netlink_lock_table)
     fn mc_update(self: &Arc<Self>) {
-        let mut o = NL_TABLE.lock.lock();
-        let list = self.sk.net.nl.mc(self.sk.protocol);
-        let want = self.groups_all() != 0 && !self.dead.load(Ordering::Acquire);
-        if want && !self.mc_node.is_hashed() {
-            list.add_head(self.clone(), &mut o);
-        } else if !want && let Some(u) = list.del_init(self, &mut o) {
-            u.defer_put();
+        loop {
+            let mut o = NL_TABLE.lock.lock();
+            let list = self.sk.net.nl.mc(self.sk.protocol);
+            let want = self.groups_all() != 0 && !self.dead.load(Ordering::Acquire);
+            if want && !self.mc_node.is_hashed() {
+                let left = self.mc_left.load(Ordering::Relaxed);
+                if self.mc_settled.load(Ordering::Relaxed) != left {
+                    drop(o);
+                    crate::sync::rcu::synchronize();
+                    // The leaves up to `left` are a grace period old; a
+                    // later one is not, and is looked at again
+                    let _o = NL_TABLE.lock.lock();
+                    self.mc_settled.store(left, Ordering::Relaxed);
+                    continue;
+                }
+                list.add_head(self.clone(), &mut o);
+            } else if !want && let Some(u) = list.del_init(self, &mut o) {
+                let n = self.mc_left.load(Ordering::Relaxed).wrapping_add(1);
+                self.mc_left.store(n, Ordering::Relaxed);
+                u.defer_put();
+            }
+            return;
         }
     }
 
