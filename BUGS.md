@@ -828,9 +828,6 @@ phase A (A0-A3).
 Phase A2 (net) remaining:
 - `SkBuff` carries TCP's control block (`tcp`) and the typed `cb`
   enum side by side (Linux: one skb->cb); size matters for stacks.
-- No debug check that a listener owns its bhash port (the old
-  `assert_owner` raced a close on the lockless SYN path); re-add on
-  the locked path only.
 - `net/tcp/table.rs` keeps separate established and TIME_WAIT nulls
   tables (two walks per miss, two bucket locks in hash_unique); Linux
   has one ehash for both.
@@ -1144,8 +1141,8 @@ Tag = roadmap phase (doc/ROADMAP.md).
    odd offset, connect takes even ones while any is free. Not
    reproduced in long looped runs (with SOCKCORE_PORT_PARITY before
    each; x86 and arm64 LOCKDEP e1000, 8 CPUs, CPU spinners, TIME_WAIT
-   churn); LOCKDEP builds assert that a listener receiving a SYN owns
-   its port in bhash (`TcpSock::assert_owner`). On failure the test
+   churn); debug and LOCKDEP builds assert that a new listener owns
+   its port in bhash (`TcpSock::listen`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
 

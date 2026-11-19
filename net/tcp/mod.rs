@@ -2037,7 +2037,17 @@ impl ProtoOps for TcpSock {
         // answered at its release, before `apply` would copy them
         // (Linux tcp_conn_request reads the listener itself)
         *self.listen_opts.lock() = g.cb.opts;
-        self.sk.net.tcp.listen_add(self.inet.get().sport, me);
+        let port = self.inet.get().sport;
+        self.sk.net.tcp.listen_add(port, me);
+        // Debug and LOCKDEP builds: a listener owns its port in bhash.
+        // Checked here, as the owner (a close cannot race it), not on
+        // the lockless SYN path, where one can
+        if cfg!(any(debug_assertions, feature = "lockdep")) {
+            assert!(
+                self.sk.net.tcp.owns(port, &self.arc()),
+                "tcp: listener on port {port} is no bhash owner"
+            );
+        }
         Ok(())
     }
 
