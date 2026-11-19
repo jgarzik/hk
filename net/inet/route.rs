@@ -419,16 +419,35 @@ pub enum IpInput {
 /// Classify a packet received on `dev` (Linux ip_route_input_slow,
 /// route_localnet=0, no forwarding, no multicast routing yet)
 pub fn input(net: &NetNamespace, saddr: Ipv4Addr, daddr: Ipv4Addr, dev: &NetDevice) -> IpInput {
-    classify(saddr, daddr, dev.is_loopback(), |a| net.fib.addr_type(a))
+    classify_in(net, saddr, daddr, dev.is_loopback())
+}
+
+/// `classify` against `net`'s tables and addresses
+pub fn classify_in(
+    net: &NetNamespace,
+    saddr: Ipv4Addr,
+    daddr: Ipv4Addr,
+    loopback: bool,
+) -> IpInput {
+    classify(
+        saddr,
+        daddr,
+        loopback,
+        |a| net.fib.addr_type(a),
+        |a| crate::net::inet::ifaddr::ip_dev_find(net, a).is_some(),
+    )
 }
 
 /// Pure classification: `loopback` = received on `lo` (already routed on
-/// output); `addr_type` = Linux inet_addr_type (local table)
+/// output); `addr_type` = Linux inet_addr_type (local table); `ours` =
+/// an address assigned to one of the namespace's devices (Linux
+/// inet_lookup_ifaddr_rcu)
 pub fn classify(
     saddr: Ipv4Addr,
     daddr: Ipv4Addr,
     loopback: bool,
     addr_type: impl Fn(Ipv4Addr) -> RouteType,
+    ours: impl Fn(Ipv4Addr) -> bool,
 ) -> IpInput {
     if daddr.is_multicast() {
         return IpInput::Drop("multicast destination");
@@ -452,9 +471,10 @@ pub fn classify(
     if saddr.is_loopback() || daddr.is_loopback() {
         return IpInput::Drop("loopback address on non-loopback device");
     }
-    // Limited broadcast may come from 0.0.0.0 (DHCP)
+    // Limited broadcast may come from 0.0.0.0 (DHCP); another source is
+    // validated (Linux brd_input's fib_validate_source)
     if daddr.is_broadcast() {
-        return if saddr.is_unspecified() || addr_type(saddr) != RouteType::Local {
+        return if saddr.is_unspecified() || !ours(saddr) {
             IpInput::Broadcast
         } else {
             IpInput::Drop("martian source")
@@ -466,8 +486,10 @@ pub fn classify(
     if zeronet(daddr) {
         return IpInput::Drop("martian destination (0.0.0.0/8)");
     }
-    // Source validation: our own or a broadcast address is spoofed
-    if matches!(addr_type(saddr), RouteType::Local | RouteType::Broadcast) {
+    // Source validation (Linux fib_validate_source with rp_filter off,
+    // its default, and no custom local routes or rules): one of our own
+    // addresses is spoofed
+    if ours(saddr) {
         return IpInput::Drop("martian source");
     }
     match addr_type(daddr) {
@@ -496,8 +518,13 @@ mod tests {
         }
     }
 
+    /// Assigned addresses: eth0's and lo's
+    fn ours(a: Ipv4Addr) -> bool {
+        a == ip(10, 0, 2, 15) || a == ip(127, 0, 0, 1)
+    }
+
     fn eth(saddr: Ipv4Addr, daddr: Ipv4Addr) -> IpInput {
-        classify(saddr, daddr, false, types)
+        classify(saddr, daddr, false, types, ours)
     }
 
     #[test]
@@ -540,14 +567,33 @@ mod tests {
         assert!(d(ip(0, 0, 0, 0), ip(10, 0, 2, 15)));
         assert!(d(ip(10, 0, 2, 3), ip(0, 0, 0, 0)));
         assert!(d(ip(10, 0, 2, 3), ip(224, 0, 0, 1)));
-        assert!(d(ip(10, 0, 2, 255), ip(10, 0, 2, 15)));
         // Spoofed own address
         assert!(d(ip(10, 0, 2, 15), ip(10, 0, 2, 15)));
+        assert!(d(ip(10, 0, 2, 15), ip(255, 255, 255, 255)));
+    }
+
+    /// With rp_filter off only assigned addresses are spoofed sources
+    /// (Linux fib_validate_source's inet_lookup_ifaddr_rcu): a subnet
+    /// broadcast source, or another address a local route covers, is not
+    #[test]
+    fn source_validated_by_address() {
+        assert_eq!(eth(ip(10, 0, 2, 255), ip(10, 0, 2, 15)), IpInput::Local);
+        let lo24 = |a: Ipv4Addr| {
+            if (a.0 >> 8) == u32::from_be_bytes([0, 10, 9, 9]) {
+                RouteType::Local
+            } else {
+                types(a)
+            }
+        };
+        let r = classify(ip(10, 9, 9, 2), ip(10, 9, 9, 1), false, lo24, |a| {
+            a == ip(10, 9, 9, 1)
+        });
+        assert_eq!(r, IpInput::Local);
     }
 
     #[test]
     fn loopback_device() {
-        let lo = |s, t| classify(s, t, true, types);
+        let lo = |s, t| classify(s, t, true, types, ours);
         assert_eq!(lo(ip(127, 0, 0, 1), ip(127, 0, 0, 1)), IpInput::Local);
         assert_eq!(lo(ip(127, 0, 0, 1), ip(10, 0, 2, 255)), IpInput::Broadcast);
         assert_eq!(lo(ip(10, 0, 2, 15), ip(10, 0, 2, 15)), IpInput::Local);
