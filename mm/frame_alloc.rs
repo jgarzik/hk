@@ -110,11 +110,13 @@ impl FrameAllocator {
     }
 
     /// Allocate a frame with `gfp`
+    #[track_caller]
     pub fn alloc_gfp(&self, gfp: Gfp) -> Option<u64> {
         self.zone.alloc_pages(0, gfp).map(phys)
     }
 
     /// Allocate 2^order contiguous frames (count 1 on the first)
+    #[track_caller]
     pub fn alloc_pages(&self, order: u32, gfp: Gfp) -> Option<u64> {
         self.zone.alloc_pages(order, gfp).map(phys)
     }
@@ -127,6 +129,7 @@ impl FrameAllocator {
     }
 
     /// Allocate a kernel frame
+    #[track_caller]
     pub fn alloc(&self) -> Option<u64> {
         self.alloc_gfp(Gfp::KERNEL)
     }

@@ -28,7 +28,8 @@
 //! names another GFP ([`with_gfp`], [`try_box_gfp`], [`try_arc_gfp`];
 //! Rust-for-Linux `KBox::new(x, GFP_ATOMIC)`). Only a site where Linux
 //! itself allocates GFP_ATOMIC or GFP_NOWAIT in atomic context names
-//! one; an unnamed allocation there is listed by lockdep's might_alloc.
+//! one; an unnamed allocation there fails the boot (`MIGHT_ALLOC:FAIL`,
+//! `sync::lockdep::might_alloc`, in every build).
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};

@@ -316,8 +316,8 @@ Linux RCU, the non-preemptible flavor (kernel/rcu/tree.c with one flat
 level instead of the rcu_node tree). A reader holds an `RcuReadGuard`
 (`rcu::read_lock`, Linux rcu_read_lock): it raises the preempt count,
 so a reader never sleeps (`might_sleep` reports it), an unnamed
-allocation in it is listed by might_alloc (1.5; lockdep builds show
-where it began), and its CPU passes no quiescent state while it holds
+allocation in it fails the boot (`MIGHT_ALLOC:FAIL`, 1.5; lockdep
+builds show where it began), and its CPU passes no quiescent state while it holds
 one. `RcuArc<T>` is an RCU-protected pointer (Linux `__rcu`, never
 NULL once initialized): `read`
 borrows the current version for the guard's lifetime
@@ -470,13 +470,18 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   context switch counts on the CPU) catches a release that re-enables
   interrupts while the count is nonzero.
 
-Also listed, once per site, as `LOCKDEP:ATOMIC_ALLOC` (an audit list,
-not yet a failure; ROADMAP phase A): a heap allocation with no GFP named
-(implicitly GFP_KERNEL) in atomic context, i.e. a spin lock of any kind
-held, preemption or interrupts off (Linux might_alloc ->
-might_sleep_if). Not checked where the call named a GFP, in an
-interrupt handler, under PF_MEMALLOC, or while booting or shutting down
-(`system_state`). The site is the innermost
+Also reported, once per site, as `MIGHT_ALLOC:FAIL LOCKDEP:ATOMIC_ALLOC`
+(the boot fails on it): a heap allocation with no GFP named (implicitly
+GFP_KERNEL) in atomic context, i.e. a spin lock of any kind held,
+preemption or interrupts off (Linux might_alloc -> might_sleep_if,
+CONFIG_DEBUG_ATOMIC_SLEEP). Builds without lockdep check it too, from
+the preempt count and interrupt state alone, and report the first one
+as `MIGHT_ALLOC:FAIL` with the CPU's stack; every build reports a page
+allocation whose GFP may sleep in atomic context, once per caller
+(`sync::might_alloc_pages`, Linux prepare_alloc_pages' might_alloc).
+Not checked where the call named a GFP, in an interrupt handler, under
+PF_MEMALLOC, in a task that cannot sleep, or while booting or shutting
+down (`system_state`). The site is the innermost
 `IrqSpinlock` taken (`lock`/`try_lock` are `#[track_caller]` in lockdep
 builds; each CPU keeps the sites of the ones it holds, report only,
 like Linux's preempt_disable_ip), else the innermost tracked spin lock,

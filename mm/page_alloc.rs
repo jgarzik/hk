@@ -558,7 +558,11 @@ impl Zone {
     /// tries once more (Linux __alloc_pages_slowpath); atomic and
     /// opportunistic ones (a huge page the fault can do without) fail
     /// at once.
+    #[track_caller]
     pub fn alloc_pages(&self, order: u32, gfp: Gfp) -> Option<u64> {
+        if gfp.has(Gfp::RECLAIM) {
+            crate::sync::might_alloc_pages(order);
+        }
         if order > MAX_ORDER {
             return None;
         }

@@ -11,22 +11,21 @@ phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |
 |---|-------|----------|
-| 1 | A — heap allocations out of atomic context | the LOCKDEP ATOMIC_ALLOC list; before more code grows collections under spin locks |
-| 2 | C — ptrace event stops, reboot CAD | strace -f, gdb; init's Ctrl-Alt-Del |
-| 3 | Y — tty and console core | prerequisite of devpts (4) and VT (7) |
-| 4 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
-| 5 | I — Debian networking | DEB_NET |
-| 6 | T — device topology | SCSI midlayer for AHCI, USB hubs |
-| 7 | V — virtual terminals | console, keyboard, logind/Xorg ABI |
-| 8 | J — reclaim and OOM | long Debian runs |
-| 9 | N — credentials and login | DEB_LOGIN, DEB_SU; check-debian joins the gate |
-| 10 | M4 — DMA and MMIO | typed DMA for the real-hardware drivers |
-| 11 | D — Dell OptiPlex 3020 bring-up | interrupt routing, xHCI, AHCI, UEFI, NIC |
-| 12 | M3 — rest of the bus/DT cleanup | after the drivers settle |
-| 13 | M5 — split functions over 150 lines | pure moves |
-| 14 | S1 — idioms | small, wide |
-| 15 | S2 — docs | last: describes the final code |
-| 16 | E — eBPF attach points, then a JIT | the engine (`bpf/`) is now specified and tested; README wishlist; not Debian-blocking |
+| 1 | C — ptrace event stops, reboot CAD | strace -f, gdb; init's Ctrl-Alt-Del |
+| 2 | Y — tty and console core | prerequisite of devpts (3) and VT (6) |
+| 3 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
+| 4 | I — Debian networking | DEB_NET |
+| 5 | T — device topology | SCSI midlayer for AHCI, USB hubs |
+| 6 | V — virtual terminals | console, keyboard, logind/Xorg ABI |
+| 7 | J — reclaim and OOM | long Debian runs |
+| 8 | N — credentials and login | DEB_LOGIN, DEB_SU; check-debian joins the gate |
+| 9 | M4 — DMA and MMIO | typed DMA for the real-hardware drivers |
+| 10 | D — Dell OptiPlex 3020 bring-up | interrupt routing, xHCI, AHCI, UEFI, NIC |
+| 11 | M3 — rest of the bus/DT cleanup | after the drivers settle |
+| 12 | M5 — split functions over 150 lines | pure moves |
+| 13 | S1 — idioms | small, wide |
+| 14 | S2 — docs | last: describes the final code |
+| 15 | E — eBPF attach points, then a JIT | the engine (`bpf/`) is now specified and tested; README wishlist; not Debian-blocking |
 
 Not scheduled: HADL proper (`doc/ideas/HADL-driver-architecture-research.md`:
 typed register vocabulary, Ethernet engine, chip descriptions, signed
@@ -34,36 +33,14 @@ driver packages and loader, native escape modules). Only its
 preparatory items are in the phases above (M4, D's firmware
 loading); HADL itself waits for the owner's go-ahead.
 
-## 1. A — heap allocations out of atomic context
-
-Every site a LOCKDEP boot lists as `LOCKDEP:ATOMIC_ALLOC` (BUGS.md
-"Heap allocations in atomic context": any spin lock, preemption or
-interrupts off) moves its allocation out, in Linux's shape: first ask
-whether Linux allocates there at all (intrusive links, iteration under
-the lock or RCU instead of a copied snapshot), then a sleeping lock
-where Linux has one, allocation before the lock (preload, retry if it
-grew), and a GFP named at the call where Linux itself allocates
-GFP_ATOMIC/GFP_NOWAIT under that lock. Each sub-phase starts with a
-design pass and ends with /code-review and the heavy gate.
-
-- A0 infrastructure: the full might_alloc audit; GFP named per call;
-  RCU; an intrusive rbtree and RCU hash lists, each with a first user;
-  the locks Linux makes sleeping (cgroup_mutex, key->sem, kernfs_rwsem,
-  ep->mtx, mark_mutex, net_rwsem, lock_sock, cb_mutex...).
-- A1 task, ipc, time, signal, keys, cgroup, fs, io, mm, block, hw, bpf,
-  base.
-- A2 net.
-- A3 an unnamed allocation in atomic context fails in every build
-  (`MIGHT_ALLOC:FAIL`, Linux CONFIG_DEBUG_ATOMIC_SLEEP).
-
-## 2. C — ptrace event stops, reboot CAD
+## 1. C — ptrace event stops, reboot CAD
 
 ptrace exec, fork, clone and exit event stops (PTRACE_O_TRACEEXEC and
 friends, PTRACE_EVENT_FORK..PTRACE_EVENT_EXIT; BUGS.md "ptrace stop
 gaps"); reboot CAD_ON/CAD_OFF (C_A_D, cad_pid; EINVAL today). Tests
 PTRACE_EVENT, REBOOT_CAD.
 
-## 3. Y — tty and console core
+## 2. Y — tty and console core
 
 - TtyDriver ops (install, ioctl fall-through, resize, init_termios)
   on the serial drivers.
@@ -79,7 +56,7 @@ PTRACE_EVENT, REBOOT_CAD.
   exit and port removal hang up already).
 - `-vga std` pinned in run-qemu.sh and linux-boot-tester.sh.
 
-## 4. H — Debian kernel interfaces
+## 3. H — Debian kernel interfaces
 
 devpts and ptys (ptmx, TIOCGPTN/TIOCSPTLCK/TIOCGPTPEER, newinstance);
 /proc: cmdline, stat, uptime, loadavg, filesystems, cpuinfo, swaps,
@@ -90,14 +67,14 @@ in Linux form; harness `tools/debian-root.sh` (apt-get download,
 dpkg-deb -x, fakeroot cpio) and `check-debian{,-arm}`, cached by input
 hash. Tests PTY_BASIC, PROC_BASICS, DEB_SH, DEB_RCS.
 
-## 5. I — Debian networking
+## 4. I — Debian networking
 
 ifupdown with dhclient (AF_PACKET and raw paths);
 /proc/sys/net/ipv4/{conf,neigh}/*, /proc/net/{snmp,raw,icmp}; SIOCETHTOOL
 where dhclient or ifup need it; Linux errnos where AF_INET6 is tried.
 Test DEB_NET (DHCP on QEMU slirp, ip addr, ping, TCP fetch, DNS).
 
-## 6. T — device topology
+## 5. T — device topology
 
 Missing intermediate subsystems, built in Linux's shape (no faked
 paths):
@@ -114,7 +91,7 @@ paths):
 - x86 ttyS0 below the ACPI PNP0501 device waits for ACPI namespace
   enumeration (D).
 
-## 7. V — virtual terminals
+## 6. V — virtual terminals
 
 Linux drivers/tty/vt equivalence:
 - P1 VT core and dummycon: tty1..63 and tty0, con_write C0 controls
@@ -138,20 +115,20 @@ Linux drivers/tty/vt equivalence:
   KIOCSOUND/KDMKTONE.
 - P9 virtio-gpu 2D (checked in check-gfx).
 
-## 8. J — reclaim and OOM
+## 7. J — reclaim and OOM
 
 kswapd, priority reclaim, the slab shrinker API, the OOM killer with
 oom_score_adj; shmem/tmpfs pages swap out (Linux shmem_writeout). Test: 1000 fork+exec of a dynamic binary with slab flat;
 OOM kill semantics.
 
-## 9. N — credentials and login
+## 8. N — credentials and login
 
 setuid/setgid exec and file capabilities (NOSUID honored),
 PR_CAPBSET_*, ambient capabilities, securebits; interactive login on a
 pty. Tests DEB_LOGIN (agetty autologin, bash job control), DEB_SU.
 `check-debian{,-arm}` joins `make gate`.
 
-## 10. M4 — DMA and MMIO
+## 9. M4 — DMA and MMIO
 
 The streaming DMA API kept and typed (no raw physical addresses, unmap
 on completion), `DmaAddr` with a private constructor, `DmaRing<T: Pod>`
@@ -160,7 +137,7 @@ the DMA API, ordered IoMem writes plus `_relaxed` variants, PL011/
 PL031 registers and xHCI's interrupt handler on IoMem, xHCI quirks as bitflags; releases the
 matching BUGS.md "unsafe not yet wrapped" items.
 
-## 11. D — Dell OptiPlex 3020 bring-up
+## 10. D — Dell OptiPlex 3020 bring-up
 
 In the Dell order: IOAPIC with ACPI _PRT routing, MSI and MSI-X (x86
 LAPIC messages; arm64 GICv3 ITS/GICv2m on QEMU virt), ACPI namespace
@@ -168,7 +145,7 @@ enumeration enough for PNP devices; request_firmware (Linux
 firmware_class paths); xHCI on Lynx Point; AHCI 8c02 through libata
 and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 
-## 12–15. M3, M5, S1, S2
+## 11–14. M3, M5, S1, S2
 
 - M3 aarch64 DT information in its own type, not AcpiInfo; remaining
   "(stub for now)" banners.
@@ -186,7 +163,7 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
   history and speculative comments rewritten to the current state;
   `TODO(unsafe)` lines kept.
 
-## 16. E — eBPF attach points, then a JIT
+## 15. E — eBPF attach points, then a JIT
 
 hk's single BPF engine (`bpf/`: RFC 9669 interpreter over checked
 regions, iterative verifier, Linux's classic converter) runs seccomp

@@ -573,8 +573,8 @@ pub struct KernelPages;
 /// one the call named (`util::kalloc::with_gfp`), else GFP_KERNEL, down
 /// to the min watermark; the page allocator reclaims for it only where
 /// the caller may sleep, else it drains the per-CPU lists and fails (an
-/// unnamed allocation in atomic context, which lockdep's might_alloc
-/// lists). GFP_ATOMIC (Linux's partial allowance below min) in an
+/// unnamed allocation in atomic context, which `might_alloc` reports as
+/// `MIGHT_ALLOC:FAIL`). GFP_ATOMIC (Linux's partial allowance below min) in an
 /// interrupt handler unless it named one, and within reclaim
 /// (PF_MEMALLOC, which overrides a named one as in Linux
 /// __gfp_pfmemalloc_flags). User data, kernel buffers of it included
