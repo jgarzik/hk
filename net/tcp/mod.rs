@@ -103,7 +103,7 @@ use crate::sync::rcu::RcuPuts;
 use crate::time::timer::ArcTimer;
 use crate::util::hlist_nulls::NullsLink;
 use crate::util::kalloc::with_gfp;
-use crate::util::list::{ArcList, Link};
+use crate::util::list::{Link, OwnedList, Owner};
 
 pub use self::cb::TcpState;
 
@@ -168,17 +168,18 @@ struct Inner {
 
 /// A listener's queues (Linux request_sock_queue + accept queue):
 /// children linked through their own `accept_link` (Linux
-/// rskq_accept_head through req->dl_next), on one list at a time
+/// rskq_accept_head through req->dl_next), on one list at a time, which
+/// their `accept_owner` names, so a child leaves either in O(1)
 struct Accept {
     backlog: u32,
     /// Children in SYN_RECEIVED (hk keeps full child sockets where Linux
     /// has request socks; the count is bounded by the backlog)
-    syn: ArcList<AcceptLink>,
+    syn: OwnedList<AcceptLink>,
     /// Established, not yet accepted
-    ready: ArcList<AcceptLink>,
+    ready: OwnedList<AcceptLink>,
 }
 
-crate::adapter!(AcceptLink, TcpSock, accept_link);
+crate::owned_adapter!(AcceptLink, TcpSock, accept_link, accept_owner);
 
 impl Accept {
     /// Linux sk_acceptq_is_full
@@ -257,6 +258,8 @@ pub struct TcpSock {
     rcu_puts: RcuPuts,
     /// A child's place on its listener's SYN or accept queue
     accept_link: Link,
+    /// The accept queue `accept_link` is on
+    accept_owner: Owner,
     /// A listener's options as its children inherit them, for the
     /// lockless SYN path (Linux reads the listener's fields with no
     /// lock): copied at the end of every locked step in LISTEN; leaf
@@ -412,6 +415,7 @@ impl TcpSock {
             inuse: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             accept_link: Link::new(),
+            accept_owner: Owner::new(),
             listen_opts: Mutex::new(cb::Opts::default()),
             me: me.clone(),
         })
@@ -986,10 +990,7 @@ impl TcpSock {
         let Some(q) = q.as_mut() else {
             return false;
         };
-        let r = q
-            .syn
-            .remove_first(|x| core::ptr::eq(x, Arc::as_ptr(c)))
-            .unwrap_or_else(|| c.clone());
+        let r = q.syn.remove(c).unwrap_or_else(|| c.clone());
         q.ready.push_back(r);
         // Under `queue` (Linux sk_acceptq_added)
         self.ack_backlog
@@ -999,11 +1000,7 @@ impl TcpSock {
 
     /// A child died before being accepted
     fn child_gone(&self, c: &TcpSock) {
-        let gone = self
-            .queue
-            .lock()
-            .as_mut()
-            .and_then(|q| q.syn.remove_first(|x| core::ptr::eq(x, c)));
+        let gone = self.queue.lock().as_mut().and_then(|q| q.syn.remove(c));
         // The queue's reference goes after its lock (the caller holds
         // another)
         drop(gone);
@@ -2030,8 +2027,8 @@ impl ProtoOps for TcpSock {
         }
         *self.queue.lock() = Some(Accept {
             backlog,
-            syn: ArcList::new(),
-            ready: ArcList::new(),
+            syn: OwnedList::new(),
+            ready: OwnedList::new(),
         });
         g.cb.state = TcpState::Listen;
         self.sk.set_flag(sf::ACCEPTCONN, true);
