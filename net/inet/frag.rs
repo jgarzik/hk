@@ -233,6 +233,9 @@ fn assemble(f: &Frags, last: &Meta) -> Option<Box<SkBuff>> {
     s.dev = last.dev.clone();
     s.pkt_type = last.pkt_type;
     s.ip_bcast = last.ip_bcast;
+    // The head's parsed options stay (Linux ip_frag_reasm keeps
+    // IPCB(head)->opt)
+    s.ip_opt = first.ip_opt;
     Some(s)
 }
 
@@ -706,6 +709,20 @@ mod tests {
         // Largest offset with a payload overflowing 16 bits
         let mut q = Frags::default();
         assert_eq!(ins(&mut q, 65528, 64, 1, false), Ins::Kill);
+    }
+
+    /// The head fragment's parsed options survive, whichever fragment
+    /// completed the datagram
+    #[test]
+    fn head_options_kept() {
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 8, 8, 2, false), Ins::More);
+        let mut head = frag(&HDR, 8, 1);
+        head.ip_opt.rr = 20;
+        head.ip_opt.optlen = 8;
+        assert_eq!(q.insert(head, 20, 0, true), Ins::Done);
+        let s = assemble(&q, &meta()).unwrap();
+        assert_eq!((s.ip_opt.rr, s.ip_opt.optlen), (20, 8));
     }
 
     /// Each fragment is charged its skb's truesize
