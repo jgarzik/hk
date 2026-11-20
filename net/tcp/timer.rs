@@ -30,6 +30,7 @@ use super::cb::{
     Live, ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
 };
 use super::output::Push;
+use super::recovery::CaState;
 use crate::net::mib::*;
 use crate::util::error::KernelError;
 
@@ -161,13 +162,14 @@ impl TcpCb {
     }
 
     /// Retransmission timeout (Linux tcp_retransmit_timer): back off,
-    /// collapse the congestion window, resend from SND.UNA (go-back-N)
+    /// mark the flight lost and slow-start from one packet (CA_Loss,
+    /// tcp_enter_loss), resend the head
     fn rtx_timer(&mut self, now: u64, out: &mut Out) {
         let handshake = matches!(self.state, TcpState::SynSent | TcpState::SynReceived);
-        if !handshake && self.snd_una == self.snd_max {
+        if !handshake && self.packets_out == 0 && !self.syn_unacked {
             return;
         }
-        if !handshake && self.snd_wnd == 0 && !self.orphan {
+        if !handshake && self.snd_wnd == 0 && !self.orphan && self.packets_out != 0 {
             self.rtx_zero_window(now, out);
             return;
         }
@@ -187,36 +189,46 @@ impl TcpCb {
             self.timed_out(out);
             return;
         }
-        if self.live.backoff.get() == 0 && !handshake {
-            // Linux: the first timeout ends Reno recovery or disorder
-            if self.cong.in_recovery() {
-                self.net_stat(LINUX_MIB_TCPRENORECOVERYFAIL);
-            } else if self.cong.dupacks() != 0 {
-                self.net_stat(LINUX_MIB_TCPRENOFAILURES);
+        if self.live.retransmits.get() == 0 && !handshake {
+            // Linux: the first timeout ends a recovery or disorder
+            let mib = match self.ca_state {
+                CaState::Recovery if self.is_reno() => Some(LINUX_MIB_TCPRENORECOVERYFAIL),
+                CaState::Recovery => Some(LINUX_MIB_TCPSACKRECOVERYFAIL),
+                CaState::Loss => Some(LINUX_MIB_TCPLOSSFAILURES),
+                CaState::Disorder if self.is_reno() => Some(LINUX_MIB_TCPRENOFAILURES),
+                CaState::Disorder => Some(LINUX_MIB_TCPSACKFAILURES),
+                _ if self.sacked_out != 0 && self.is_reno() => Some(LINUX_MIB_TCPRENOFAILURES),
+                _ if self.sacked_out != 0 => Some(LINUX_MIB_TCPSACKFAILURES),
+                _ => None,
+            };
+            if let Some(m) = mib {
+                self.net_stat(m);
             }
         }
-        let flight = self.snd_max.wrapping_sub(self.snd_una);
-        self.cong.on_rto(flight);
+        if handshake {
+            // The SYN or SYN-ACK alone was out: one packet, lost
+            let ss = self.cong.loss_ssthresh(1);
+            self.cong.set_snd_ssthresh(ss);
+            self.cong.set_snd_cwnd(1);
+            self.cong.reset_cnt();
+        } else {
+            self.enter_loss();
+        }
         self.rtt_seq = None;
-        self.live.backoff.set(self.live.backoff.get() + 1);
         // Linux tcp_update_rto_stats
         self.live.retransmits.set(self.live.retransmits.get() + 1);
         self.stats.rto_count = self.stats.rto_count.wrapping_add(1);
-        if handshake {
-            self.syn_rtx = true;
-            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-            self.syn_rtx(out);
-        } else if self.syn_unacked {
+        if handshake || self.syn_unacked {
             // Closed in SYN_RECEIVED: the SYN-ACK heads the queue and
-            // goes alone (Linux tcp_retransmit_skb of the head; a SYN is
-            // never collapsed), the FIN behind it once that is acked
+            // goes alone (a SYN is never collapsed), what follows once
+            // it is acked (the loss state resends it)
+            self.syn_rtx = handshake || self.syn_rtx;
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             self.syn_rtx(out);
-            self.snd_nxt = self.snd_una.wrapping_add(1);
-        } else {
-            self.snd_nxt = self.snd_una;
-            self.output(now, out);
+        } else if let Some(head) = self.rtx_head() {
+            self.retransmit_skb(head, 1, now, out);
         }
+        self.live.backoff.set(self.live.backoff.get() + 1);
         self.arm_rtx(now);
     }
 
@@ -235,12 +247,11 @@ impl TcpCb {
             self.timed_out(out);
             return;
         }
-        // Linux tcp_enter_loss (the flight is lost: resent from SND.UNA
-        // once the window allows), then tcp_retransmit_skb of the head
-        let flight = self.snd_max.wrapping_sub(self.snd_una);
-        self.cong.on_rto(flight);
-        self.snd_nxt = self.snd_una;
-        self.retransmit_head(out);
+        // Linux tcp_enter_loss, then tcp_retransmit_skb of the head
+        self.enter_loss();
+        if let Some(head) = self.rtx_head() {
+            self.retransmit_skb(head, 1, now, out);
+        }
         self.live.backoff.set(self.live.backoff.get() + 1);
         self.arm_rtx(now);
     }

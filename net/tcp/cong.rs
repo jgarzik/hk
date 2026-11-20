@@ -1,12 +1,12 @@
-//! Congestion control (RFC 5681 slow start / congestion avoidance, fast
-//! retransmit and NewReno fast recovery, RFC 6582; RFC 6928 initial
-//! window; Linux tcp_cong.c)
+//! Congestion control (RFC 5681 slow start / congestion avoidance; RFC
+//! 6928 initial window; Linux tcp_cong.c)
 //!
 //! Pure arithmetic on byte counts; the control block calls the hooks
 //! and acts on their results. The parts that differ between algorithms
-//! (Linux tcp_congestion_ops: `ssthresh`, `cong_avoid`) sit behind
-//! [`CongOps`]; the loss/recovery machinery around them is common, as in
-//! Linux. Only Reno is built in (TCP_CONGESTION "reno"; Linux's default
+//! (Linux tcp_congestion_ops: `ssthresh`, `cong_avoid`, `undo_cwnd`)
+//! sit behind [`CongOps`]; the loss recovery around them (Linux
+//! tcp_input.c: the CA states, PRR, undo) is `recovery.rs`, which sees
+//! the window in packets (`snd_cwnd`, `snd_ssthresh`), as Linux. Only Reno is built in (TCP_CONGESTION "reno"; Linux's default
 //! CUBIC is not implemented, so hk's default is "reno").
 //!
 //! Growth follows Linux: slow start adds the bytes acknowledged (RFC
@@ -23,8 +23,6 @@ use core::fmt;
 use super::cb::{Live, before};
 use alloc::sync::Arc;
 
-/// Duplicate ACKs that trigger fast retransmit
-pub const DUPTHRESH: u32 = 3;
 /// Largest name of an algorithm with its NUL (Linux TCP_CA_NAME_MAX)
 pub const NAME_MAX: usize = 16;
 /// Largest congestion window, in bytes (Linux snd_cwnd_clamp, which is
@@ -32,6 +30,8 @@ pub const NAME_MAX: usize = 16;
 /// RFC 7323). More could never be sent, and the cap keeps cwnd + a few
 /// MSS far from u32 overflow however long recovery inflates it.
 pub const CWND_CLAMP: u32 = 0xffff << 14;
+/// Linux TCP_INFINITE_SSTHRESH
+pub const INFINITE_SSTHRESH: u32 = 0x7fff_ffff;
 
 /// What differs between congestion algorithms
 pub trait CongOps: Sync {
@@ -84,9 +84,6 @@ pub fn names() -> alloc::string::String {
 pub struct Cong {
     pub(super) live: Arc<Live>,
     mss: u32,
-    dupacks: u32,
-    /// In fast recovery until this sequence number is acknowledged
-    recover: Option<u32>,
     /// Bytes acknowledged towards the next congestion avoidance step
     /// (Linux snd_cwnd_cnt, in bytes)
     cnt: u32,
@@ -122,8 +119,6 @@ impl Cong {
         let c = Self {
             live,
             mss: super::cb::MSS_DEFAULT,
-            dupacks: 0,
-            recover: None,
             cnt: 0,
             limited: false,
             max_flight: 0,
@@ -189,10 +184,6 @@ impl Cong {
         }
     }
 
-    pub fn in_recovery(&self) -> bool {
-        self.recover.is_some()
-    }
-
     pub fn in_slow_start(&self) -> bool {
         self.live.cwnd.get() < self.live.ssthresh.get()
     }
@@ -254,66 +245,59 @@ impl Cong {
         }
     }
 
-    /// New data acknowledged (`acked` bytes, up to `ack`). Returns true
-    /// if a partial ACK in recovery asks to retransmit the next hole.
-    pub fn on_ack(&mut self, acked: u32, ack: u32) -> bool {
-        self.dupacks = 0;
-        if let Some(r) = self.recover {
-            if before(ack, r) {
-                // Partial ACK: deflate by what it covered, stay
-                let w = self.live.cwnd.get().saturating_sub(acked).max(self.mss);
-                self.set_cwnd(w.saturating_add(self.mss));
-                return true;
-            }
-            self.recover = None;
-            self.live.cwnd.set(self.live.ssthresh.get());
-            return false;
-        }
+    /// New data acknowledged outside a window reduction (Linux
+    /// tcp_cong_avoid, `acked` bytes): grow while cwnd-limited
+    pub fn on_ack(&mut self, acked: u32) {
         if self.cwnd_limited() {
             self.ops().cong_avoid(self, acked);
         }
-        false
     }
 
-    /// A duplicate ACK with `flight` bytes outstanding up to `snd_max`.
-    /// Returns true when the segment at snd_una must be retransmitted.
-    pub fn on_dupack(&mut self, flight: u32, snd_max: u32) -> bool {
-        self.dupacks = self.dupacks.saturating_add(1);
-        if self.recover.is_some() {
-            // One MSS per dupack (RFC 6582 inflation): a peer can send
-            // any number, so the window stops at the clamp
-            self.set_cwnd(self.live.cwnd.get().saturating_add(self.mss));
-            return false;
+    /// Linux tcp_snd_cwnd: the window in packets (at least one)
+    pub fn snd_cwnd(&self) -> u32 {
+        (self.live.cwnd.get() / self.mss.max(1)).max(1)
+    }
+
+    /// Linux tcp_snd_cwnd_set (and snd_cwnd_cnt = 0 where Linux's
+    /// callers reset it): the window to `pkts` packets
+    pub fn set_snd_cwnd(&mut self, pkts: u32) {
+        self.set_cwnd(pkts.saturating_mul(self.mss));
+    }
+
+    /// Linux snd_ssthresh in packets (TCP_INFINITE_SSTHRESH unset)
+    pub fn snd_ssthresh(&self) -> u32 {
+        match self.live.ssthresh.get() {
+            u32::MAX => INFINITE_SSTHRESH,
+            b => b / self.mss.max(1),
         }
-        if self.dupacks != DUPTHRESH {
-            return false;
-        }
-        self.live.ssthresh.set(self.ops().ssthresh(self, flight));
-        self.set_cwnd(
-            self.live
-                .ssthresh
-                .get()
-                .saturating_add(DUPTHRESH.saturating_mul(self.mss)),
-        );
-        self.cnt = 0;
-        self.recover = Some(snd_max);
-        true
     }
 
-    /// Duplicate ACKs since the last advance (Linux TCP_CA_Disorder
-    /// while below the threshold)
-    pub fn dupacks(&self) -> u32 {
-        self.dupacks
+    pub fn set_snd_ssthresh(&mut self, pkts: u32) {
+        self.live.ssthresh.set(if pkts >= INFINITE_SSTHRESH {
+            u32::MAX
+        } else {
+            pkts.saturating_mul(self.mss)
+        });
     }
 
-    /// Retransmission timeout with `flight` bytes outstanding (loss
-    /// window of one segment)
-    pub fn on_rto(&mut self, flight: u32) {
-        self.live.ssthresh.set(self.ops().ssthresh(self, flight));
-        self.live.cwnd.set(self.mss);
+    /// The algorithm's slow start threshold after a loss with
+    /// `in_flight` packets out (Linux icsk_ca_ops->ssthresh), packets
+    pub fn loss_ssthresh(&self, in_flight: u32) -> u32 {
+        let b = self
+            .ops()
+            .ssthresh(self, in_flight.saturating_mul(self.mss));
+        (b / self.mss.max(1)).max(2)
+    }
+
+    /// The window to restore on undo (Linux icsk_ca_ops->undo_cwnd,
+    /// tcp_reno_undo_cwnd: max(cwnd, prior_cwnd)), packets
+    pub fn undo_cwnd(&self, prior_cwnd: u32) -> u32 {
+        self.snd_cwnd().max(prior_cwnd)
+    }
+
+    /// Linux snd_cwnd_cnt = 0
+    pub fn reset_cnt(&mut self) {
         self.cnt = 0;
-        self.dupacks = 0;
-        self.recover = None;
     }
 
     /// Sending again after `idle` ms with nothing in flight (Linux
@@ -362,19 +346,19 @@ mod tests {
         c.live.ssthresh.set(13_000);
         limited(&mut c);
         // Slow start: every acknowledged byte, up to ssthresh
-        c.on_ack(2000, 1);
+        c.on_ack(2000);
         assert_eq!(c.cwnd(), 12_000);
         // Crossing ssthresh: the rest counts towards avoidance
-        c.on_ack(2000, 2);
+        c.on_ack(2000);
         assert_eq!(c.cwnd(), 13_000);
         // Avoidance: one MSS per cwnd acknowledged
         for _ in 0..12 {
-            c.on_ack(1000, 3);
+            c.on_ack(1000);
         }
         assert_eq!(c.cwnd(), 14_000);
-        c.on_ack(13_000, 4);
+        c.on_ack(13_000);
         assert_eq!(c.cwnd(), 14_000);
-        c.on_ack(1000, 5);
+        c.on_ack(1000);
         assert_eq!(c.cwnd(), 15_000);
     }
 
@@ -385,61 +369,31 @@ mod tests {
         // Only 2000 bytes ever in flight: slow start stops at 2x that
         c.on_sent(2000, 0, 2000, false);
         for i in 0..20 {
-            c.on_ack(1000, i);
+            c.on_ack(1000);
         }
         assert_eq!(c.cwnd(), 10_000);
         c.on_sent(6000, 2000, 8000, false);
         for i in 0..20 {
-            c.on_ack(1000, 2000 + i);
+            c.on_ack(1000);
         }
         assert_eq!(c.cwnd(), 12_000);
     }
 
     #[test]
-    fn fast_recovery() {
+    fn packet_units() {
         let mut c = Cong::default();
         c.set_mss(1000);
-        c.live.cwnd.set(10_000);
-        assert!(!c.on_dupack(10_000, 500));
-        assert!(!c.on_dupack(10_000, 500));
-        assert!(c.on_dupack(10_000, 500));
-        assert_eq!(c.ssthresh(), 5000);
-        assert_eq!(c.cwnd(), 8000);
-        assert!(!c.on_dupack(10_000, 500));
-        assert_eq!(c.cwnd(), 9000);
-        // Partial ACK: retransmit the next hole
-        assert!(c.on_ack(1000, 100));
-        // Full ACK ends recovery at ssthresh
-        assert!(!c.on_ack(1000, 500));
-        assert_eq!(c.cwnd(), 5000);
-        c.on_rto(4000);
-        assert_eq!((c.cwnd(), c.ssthresh()), (1000, 2000));
-    }
-
-    #[test]
-    fn dupack_flood_stays_clamped() {
-        let mut c = Cong::default();
-        c.set_mss(1000);
-        for _ in 0..3 {
-            c.on_dupack(10_000, 500);
-        }
-        assert!(c.in_recovery());
-        // A peer repeating one ACK forever: cwnd stops at the clamp
-        c.live.cwnd.set(CWND_CLAMP - 500);
-        for _ in 0..4 {
-            assert!(!c.on_dupack(10_000, 500));
-        }
+        assert_eq!((c.snd_cwnd(), c.snd_ssthresh()), (10, INFINITE_SSTHRESH));
+        c.set_snd_cwnd(7);
+        c.set_snd_ssthresh(5);
+        assert_eq!((c.cwnd(), c.ssthresh()), (7000, 5000));
+        assert_eq!((c.snd_cwnd(), c.snd_ssthresh()), (7, 5));
+        // Reno halves the flight, at least two packets
+        assert_eq!((c.loss_ssthresh(10), c.loss_ssthresh(1)), (5, 2));
+        assert_eq!(c.undo_cwnd(9), 9);
+        // The clamp holds however many packets are asked for
+        c.set_snd_cwnd(u32::MAX);
         assert_eq!(c.cwnd(), CWND_CLAMP);
-        // ...and a partial ACK on top of it neither overflows nor passes it
-        assert!(c.on_ack(0, 100));
-        assert_eq!(c.cwnd(), CWND_CLAMP);
-        c.live.cwnd.set(u32::MAX);
-        assert!(c.on_ack(0, 100));
-        assert_eq!(c.cwnd(), CWND_CLAMP);
-        // the dupack count saturates rather than wrapping back to DUPTHRESH
-        c.dupacks = u32::MAX;
-        assert!(!c.on_dupack(10_000, 500));
-        assert_eq!(c.dupacks, u32::MAX);
     }
 
     #[test]

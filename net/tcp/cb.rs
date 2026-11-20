@@ -34,6 +34,7 @@ use alloc::sync::Arc;
 use super::ack::Dack;
 use super::cong::Cong;
 use super::mem;
+use super::recovery::{CaState, Rack};
 use super::sack::Dsack;
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::*;
@@ -176,6 +177,10 @@ pub struct Cfg {
     pub sack: bool,
     /// tcp_dsack: report duplicate segments in D-SACK blocks
     pub dsack: bool,
+    /// tcp_reordering: initial reordering degree (packets);
+    /// tcp_max_reordering: its bound
+    pub reordering: u32,
+    pub max_reordering: u32,
     /// tcp_rmem[0]: receive bytes a connection may always hold below
     /// the hard memory limit
     pub rmem_min: u32,
@@ -198,6 +203,8 @@ impl Default for Cfg {
             ts: 1,
             sack: true,
             dsack: true,
+            reordering: 3,
+            max_reordering: 300,
             rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
             keepidle: 7_200_000,
@@ -674,7 +681,7 @@ pub struct TcpCb {
     // --- send sequence space (RFC 9293 3.3.1) -----------------------------
     pub iss: u32,
     pub snd_una: u32,
-    /// Next sequence number to send (rewinds on retransmission timeout)
+    /// Next sequence number to send (Linux snd_nxt: never moves back)
     pub snd_nxt: u32,
     /// Highest sequence number sent + 1
     pub snd_max: u32,
@@ -781,6 +788,46 @@ pub struct TcpCb {
     pub(super) lsndtime: u64,
 
     pub(super) cong: Cong,
+
+    // --- loss recovery (Linux tcp_sock, tcp_input.c; `recovery.rs`) -------
+    /// Packets sent and not cumulatively acknowledged, of them SACKed
+    /// (without SACK: duplicate ACKs), marked lost and retransmitted
+    /// (Linux packets_out, sacked_out, lost_out, retrans_out)
+    pub(super) packets_out: u32,
+    pub(super) sacked_out: u32,
+    pub(super) lost_out: u32,
+    pub(super) retrans_out: u32,
+    /// Packets delivered and marked lost, ever (Linux delivered, lost)
+    pub(super) delivered: u32,
+    pub(super) lost: u32,
+    /// Reordering degree (packets) and times seen (Linux reordering,
+    /// reord_seen)
+    pub(super) reordering: u32,
+    pub(super) reord_seen: u32,
+    /// Congestion state (Linux icsk_ca_state)
+    pub(super) ca_state: CaState,
+    /// SND.NXT when the recovery or loss episode began (Linux high_seq)
+    pub(super) high_seq: u32,
+    /// Undo (Linux undo_marker, None for 0; undo_retrans; prior_ssthresh,
+    /// 0 for none; prior_cwnd), windows in packets
+    pub(super) undo_marker: Option<u32>,
+    pub(super) undo_retrans: i32,
+    pub(super) prior_ssthresh: u32,
+    pub(super) prior_cwnd: u32,
+    /// Proportional rate reduction (Linux prr_delivered, prr_out)
+    pub(super) prr_delivered: u32,
+    pub(super) prr_out: u32,
+    /// Where retransmission resumes: the seq of that skb (Linux
+    /// retransmit_skb_hint)
+    pub(super) rtx_hint: Option<u32>,
+    /// The skb after the highest SACKed one, by seq; None: past the
+    /// queue (Linux highest_sack)
+    pub(super) highest_sack: Option<u32>,
+    /// RACK loss detection state (Linux rack)
+    pub(super) rack: Rack,
+    /// The ACK being processed echoed this TSval (Linux
+    /// rx_opt.saw_tstamp and rcv_tsecr)
+    pub(super) rcv_tsecr: Option<u32>,
     /// Delayed ACK state
     pub(super) dack: Dack,
     /// The fields /proc/net/tcp reads with no lock: timers, RTO and
@@ -886,6 +933,26 @@ impl TcpCb {
             rcv_tstamp: Default::default(),
             lsndtime: Default::default(),
             cong: Cong::new(live.clone()),
+            packets_out: 0,
+            sacked_out: 0,
+            lost_out: 0,
+            retrans_out: 0,
+            delivered: 0,
+            lost: 0,
+            reordering: cfg.reordering,
+            reord_seen: 0,
+            ca_state: CaState::Open,
+            high_seq: 0,
+            undo_marker: None,
+            undo_retrans: -1,
+            prior_ssthresh: 0,
+            prior_cwnd: 0,
+            prr_delivered: 0,
+            prr_out: 0,
+            rtx_hint: None,
+            highest_sack: None,
+            rack: Rack::default(),
+            rcv_tsecr: None,
             dack: Default::default(),
             orphan: Default::default(),
             soft_err: Default::default(),
@@ -1060,10 +1127,9 @@ impl TcpCb {
         let old = self.live.mss.get();
         self.path_mss = m;
         self.update_mss();
-        if self.live.mss.get() < old && self.state.synced() && self.snd_nxt != self.snd_una {
-            self.snd_nxt = self.snd_una;
-            self.rtt_seq = None;
-            self.output(now, out);
+        if self.live.mss.get() < old && self.state.synced() && self.packets_out != 0 {
+            self.tick(now);
+            self.simple_retransmit(out);
         }
     }
 
@@ -1451,6 +1517,9 @@ impl TcpCb {
     fn purge_wq(&mut self) {
         self.wq = SkbHead::new();
         self.rtx = SkbTree::new();
+        // Linux tcp_write_queue_purge + tcp_clear_all_retrans_hints
+        self.packets_out = 0;
+        self.rtx_hint = None;
         if after(self.write_seq, self.snd_una) {
             self.write_seq = self.snd_una;
         }
@@ -1534,6 +1603,13 @@ impl TcpCb {
     pub(super) fn tcp_stat(&self, f: usize) {
         if let Some(m) = &self.mib {
             m.tcp.inc(f);
+        }
+    }
+
+    /// Linux TCP_ADD_STATS
+    pub(super) fn tcp_add(&self, f: usize, n: u64) {
+        if let Some(m) = &self.mib {
+            m.tcp.add(f, n);
         }
     }
 

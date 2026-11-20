@@ -459,6 +459,15 @@ pub struct TcpSkbCb {
     /// SACK option blocks, received or to send (Linux keeps the
     /// option's offset in TCP_SKB_CB(skb)->sacked and reads the header)
     pub sack: Sacks,
+    /// A sent skb's scoreboard tags (Linux TCP_SKB_CB(skb)->sacked:
+    /// TCPCB_SACKED_ACKED, _SACKED_RETRANS, _LOST, _EVER_RETRANS)
+    pub sacked: u8,
+    /// Segments a sent skb counts as, and their size when more than
+    /// one (Linux tcp_skb_pcount, tcp_gso_size)
+    pub pcount: u32,
+    pub gso_size: u32,
+    /// When a sent skb last went out, ms (Linux skb_mstamp_ns)
+    pub sent: u64,
     /// The ports of a received segment (its header is pulled)
     pub sport: u16,
     pub dport: u16,

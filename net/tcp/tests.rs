@@ -1513,10 +1513,22 @@ fn fin_wait1_resends_unacked_synack() {
         ..Default::default()
     };
     p.a.feed(&ack, p.now, &mut out);
-    let w = wire(&out);
+    // The ACK of the SYN-ACK clears the retransmission stamp, so the
+    // timeout looks spurious and is undone (Linux tcp_process_loss ->
+    // tcp_try_undo_loss, FLAG_SYN_ACKED): the FIN waits for the timer
+    assert!(wire(&out).is_empty());
+    assert_eq!(p.a.ca_state, super::recovery::CaState::Open);
+    let n = p.log.len();
+    assert!(p.tick());
+    let w: Vec<Seg> = p.log[n..]
+        .iter()
+        .filter(|(_, to_b, _)| *to_b)
+        .map(|(_, _, s)| s.clone())
+        .collect();
     assert_eq!(w.len(), 1);
     assert_eq!(w[0].flags, flags::FIN | flags::ACK);
     assert_eq!(w[0].seq, 101);
+    p.wire.clear();
     assert_eq!(p.a.state, TcpState::FinWait1);
     let mut out = Out::default();
     p.a.feed(&SegIn { ack: 102, ..ack }, p.now, &mut out);
@@ -1883,7 +1895,7 @@ fn iw10_slow_start_growth() {
     c.live.ssthresh.set(c.cwnd());
     let w = c.cwnd();
     c.on_sent(w, 0, 1, true);
-    c.on_ack(w, 2);
+    c.on_ack(w);
     assert_eq!(c.cwnd(), w + mss as u32);
 }
 
@@ -2404,4 +2416,106 @@ fn dsack_reports_duplicates() {
     let segs = take_to_b(&mut p);
     feed_b(&mut p, &segs[0]);
     assert_eq!(feed_b(&mut p, &segs[0])[0].sack.n, 0);
+}
+
+/// A pair without SACK, a's MIBs counted
+fn reno_pair(mss: u32) -> (Pair, alloc::sync::Arc<crate::net::mib::NetMib>) {
+    let off = Cfg {
+        sack: false,
+        ..cfg()
+    };
+    let mut p = Pair::with_cfgs(mss, 64 * 1024, off, off);
+    let m = crate::net::mib::NetMib::new().unwrap();
+    p.a.mib = Some(m.clone());
+    (p, m)
+}
+
+/// Data segments a sent, by seq: how often each went out
+fn sends(p: &Pair) -> alloc::collections::BTreeMap<u32, usize> {
+    let mut m = alloc::collections::BTreeMap::new();
+    for (_, to_b, s) in &p.log {
+        if *to_b && !s.data.is_empty() {
+            *m.entry(s.seq).or_insert(0) += 1;
+        }
+    }
+    m
+}
+
+/// Without SACK, three duplicate ACKs mark the head lost (Linux
+/// tcp_newreno_mark_lost): Recovery, one fast retransmission, the window
+/// reduced by PRR and set to ssthresh when recovery ends
+#[test]
+fn reno_fast_recovery_as_linux() {
+    use super::recovery::CaState;
+    use crate::net::mib::*;
+    let (mut p, m) = reno_pair(1000);
+    p.filter = |_, to_b, s, _| {
+        static DROPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        let third = s.seq == 1001 + 2 * 988;
+        if to_b && third && !DROPPED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    };
+    p.a.cong.set_snd_cwnd(20);
+    p.send_a(&pattern(10 * 988));
+    let t = p.now;
+    p.run();
+    assert_eq!(p.now, t, "no timeout");
+    assert_eq!(p.b.rcvq_len(), 10 * 988);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPRENORECOVERY), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPFASTRETRANS), 1);
+    assert_eq!(m.tcp.fold(TCP_MIB_RETRANSSEGS), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 0);
+    let s = sends(&p);
+    assert_eq!(s.values().filter(|&&n| n > 1).count(), 1);
+    assert_eq!(s[&(1001 + 2 * 988)], 2);
+    // Reno holds Recovery until data above high_seq is acked (RFC
+    // 6582, Linux tcp_is_non_sack_preventing_reopen)
+    assert_eq!(p.a.ca_state, CaState::Recovery);
+    p.send_a(&pattern(988));
+    p.run();
+    assert_eq!(p.a.ca_state, CaState::Open);
+    assert_eq!(
+        (
+            p.a.packets_out,
+            p.a.sacked_out,
+            p.a.lost_out,
+            p.a.retrans_out
+        ),
+        (0, 0, 0, 0)
+    );
+    // ssthresh: half the 8 packets out at the third duplicate (the
+    // algorithm's ssthresh); recovery ends at it
+    assert_eq!(p.a.cong.snd_ssthresh(), 4);
+    assert_eq!(p.a.cong.snd_cwnd(), 4);
+}
+
+/// A timeout marks the flight lost and slow-starts from one packet
+/// (Linux tcp_enter_loss, CA_Loss, TCPSlowStartRetrans)
+#[test]
+fn rto_enters_loss_as_linux() {
+    use super::recovery::CaState;
+    use crate::net::mib::*;
+    let (mut p, m) = reno_pair(1000);
+    p.filter = drop_all;
+    p.send_a(&pattern(6 * 988));
+    p.run();
+    assert_eq!(p.a.packets_out, 6);
+    p.filter = |_, to_b, _, _| if to_b { Fate::Drop } else { Fate::Pass };
+    assert!(p.tick());
+    assert_eq!(p.a.ca_state, CaState::Loss);
+    assert_eq!((p.a.lost_out, p.a.retrans_out), (6, 1));
+    assert_eq!(p.a.cong.snd_cwnd(), 1);
+    p.wire.clear();
+    p.filter = pass;
+    assert!(p.until(|p| p.b.rcvq_len() == 6 * 988, 20));
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 2);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPSLOWSTARTRETRANS), 5);
+    assert_eq!(p.a.ca_state, CaState::Loss);
+    p.send_a(&pattern(988));
+    p.run();
+    assert_eq!(p.a.ca_state, CaState::Open);
+    assert_eq!((p.a.packets_out, p.a.lost_out, p.a.retrans_out), (0, 0, 0));
 }

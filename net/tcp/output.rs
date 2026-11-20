@@ -3,10 +3,11 @@
 //!
 //! Data goes out skb by skb (Linux tcp_write_xmit): the write queue's
 //! head, cut at the MSS or the window (tcp_fragment), is cloned for
-//! transmission and moves to the retransmit queue; a retransmission
-//! (after a timeout rewound SND.NXT, or a fast retransmit of the head,
-//! which first merges small skbs behind it, tcp_retrans_try_collapse)
-//! sends the queued skb at SND.NXT again. Transmitted clones and
+//! transmission and moves to the retransmit queue, where the skbs
+//! marked lost are sent again as the window allows
+//! (tcp_xmit_retransmit_queue; `recovery.rs` decides what is lost),
+//! cut to the MSS or merged with the small skbs behind them
+//! (tcp_retrans_try_collapse). SND.NXT never moves back. Transmitted clones and
 //! header-only segments are allocated GFP_ATOMIC (Linux
 //! __tcp_push_pending_frames, tcp_send_ack, tcp_retransmit_skb); a
 //! failed allocation sends nothing now and the retransmit or probe
@@ -22,6 +23,7 @@ use alloc::boxed::Box;
 
 use super::ack::DELACK_MAX;
 use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, flags};
+use super::recovery::{CaState, tag, tso_segs};
 use crate::mm::page_alloc::Gfp;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::mib::*;
@@ -199,9 +201,8 @@ impl TcpCb {
         )
     }
 
-    /// Send what the peer's window and the congestion window allow,
-    /// from `snd_nxt` on (new data, or queued segments again after a
-    /// timeout rewound it), ending with the FIN once all data went out;
+    /// Send the new data the peer's window and the congestion window
+    /// allow, from `snd_nxt` on, ending with the FIN once all data went out;
     /// else an owed ACK (Linux tcp_write_xmit + tcp_send_ack / delayed
     /// ACK)
     pub fn output(&mut self, now: u64, out: &mut Out) {
@@ -239,17 +240,21 @@ impl TcpCb {
         self.check_persist(now);
     }
 
-    /// Room in the window from `snd_nxt`, and whether cwnd is the
-    /// smaller window
+    /// Room for new data: the bytes the peer's window leaves from
+    /// SND.NXT (Linux tcp_snd_wnd_test), none while the packets in
+    /// flight fill the congestion window (tcp_cwnd_test); and whether
+    /// cwnd was the limit
     fn room(&self) -> (u32, bool) {
-        let wnd = self.snd_wnd.min(self.cong.cwnd());
-        let end = self.snd_una.wrapping_add(wnd);
+        if self.in_flight() >= self.cong.snd_cwnd() {
+            return (0, true);
+        }
+        let end = self.snd_una.wrapping_add(self.snd_wnd);
         let room = if after(end, self.snd_nxt) {
             end.wrapping_sub(self.snd_nxt)
         } else {
             0
         };
-        (room, self.cong.cwnd() < self.snd_wnd)
+        (room, false)
     }
 
     /// Hold a partial segment (Linux tcp_nagle_check with Minshall's
@@ -267,21 +272,8 @@ impl TcpCb {
             && !after(self.snd_sml, self.snd_nxt)
     }
 
-    /// The payload length of the queued skb at `snd_nxt`: one of the
-    /// retransmit queue after a rewind, else the write queue's head
-    fn len_at_nxt(&self) -> u32 {
-        if before(self.snd_nxt, self.snd_max) {
-            self.rtx
-                .iter()
-                .find(|s| s.tcp().seq == self.snd_nxt)
-                .map_or(0, |s| s.len() as u32)
-        } else {
-            self.wq.front().map_or(0, |s| s.len() as u32)
-        }
-    }
-
-    /// Send the next segment `output` may send, if any: Some(it carried
-    /// the FIN)
+    /// Send the next new segment `output` may send, if any: Some(it
+    /// carried the FIN) (Linux tcp_write_xmit's loop body)
     fn next_seg(
         &mut self,
         now: u64,
@@ -295,21 +287,18 @@ impl TcpCb {
         let avail = self.write_seq.wrapping_sub(self.snd_nxt);
         let (room, cwnd_bound) = self.room();
         let mss = self.cur_mss();
-        let n = self.len_at_nxt().min(mss).min(room);
-        let rexmit = before(self.snd_nxt, self.snd_max);
+        let head = self.wq.front().map_or(0, |s| s.len() as u32);
+        let n = head.min(mss).min(room);
         let fin = self.fin_queued && self.snd_nxt.wrapping_add(n) == self.write_seq && room > n;
         if n == 0 && !fin {
             *limited |= avail > 0 && cwnd_bound;
             return None;
         }
         let in_flight = self.snd_nxt != self.snd_una;
-        // Retransmissions are never held (Linux tcp_retransmit_skb
-        // ignores Nagle and cork)
-        if n < mss && !fin && push != Push::Force && !rexmit {
+        if n < mss && !fin && push != Push::Force {
             // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in
             // flight, wait for a full segment unless this ends the queue
             if n < avail && in_flight && n < self.max_wnd / 2 {
-                *limited |= cwnd_bound;
                 return None;
             }
             if n == avail && self.nagle_hold(push) {
@@ -324,59 +313,42 @@ impl TcpCb {
         if fin {
             fl |= flags::FIN;
         }
-        let sent = if rexmit {
-            self.send_rtx_at(seq, n, fl, out)
-        } else {
-            self.send_new(n, fl, out)
-        };
-        if !sent {
-            // Linux tcp_retransmit_skb: __tcp_retransmit_skb failed
-            self.net_stat_if(rexmit, LINUX_MIB_TCPRETRANSFAIL);
+        if !self.send_new(n, fl, now, out) {
             return None;
         }
-        if self.snd_nxt == self.snd_max
-            && !in_flight
-            && now.saturating_sub(self.lsndtime) > self.live.rto.get()
-        {
+        if !in_flight && now.saturating_sub(self.lsndtime) > self.live.rto.get() {
             // Idle longer than an RTO: restart from the initial window
             self.cong.restart(now - self.lsndtime, self.live.rto.get());
         }
         let next = seq.wrapping_add(n + u32::from(fin));
-        let new = after(next, self.snd_max);
-        if self.snd_nxt == self.snd_max && self.rtt_seq.is_none() {
+        if self.rtt_seq.is_none() {
             self.rtt_seq = Some((next, now));
         }
         if n < mss {
             self.snd_sml = next;
         }
-        if new && n > 0 {
+        if n > 0 {
             self.data_sent(now);
             self.lsndtime = now;
         }
         // Linux tcp_event_new_data_sent
-        self.net_stat_if(new, LINUX_MIB_TCPORIGDATASENT);
-        if before(seq, self.snd_max) {
-            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-            self.stats.bytes_retrans += u64::from(n);
-            self.tcp_stat(TCP_MIB_RETRANSSEGS);
-            // After a timeout (Linux TCP_CA_Loss) every segment but
-            // the head, which the timer itself resent, is a slow start
-            // retransmission (tcp_xmit_retransmit_queue)
-            self.net_stat_if(seq != self.snd_una, LINUX_MIB_TCPSLOWSTARTRETRANS);
+        self.net_stat(LINUX_MIB_TCPORIGDATASENT);
+        // Linux tcp_write_xmit: new data sent while reducing counts in PRR
+        if self.in_cwnd_reduction() {
+            self.prr_out += 1;
         }
         self.stats.bytes_sent += u64::from(n);
         self.snd_nxt = next;
-        if new {
-            self.snd_max = next;
-        }
+        self.snd_max = next;
         Some(fin)
     }
 
     /// Send `n` bytes from the write queue's head (cut there if longer,
-    /// Linux tcp_fragment) and move them to the retransmit queue; a FIN
-    /// in `fl` rides on them, or on an skb of its own once the data is
-    /// gone (Linux tcp_send_fin). False without memory.
-    fn send_new(&mut self, n: u32, fl: u8, out: &mut Out) -> bool {
+    /// Linux tcp_fragment) and move them to the retransmit queue, one
+    /// packet more out (tcp_event_new_data_sent); a FIN in `fl` rides on
+    /// them, or on an skb of its own once the data is gone (Linux
+    /// tcp_send_fin). False without memory.
+    fn send_new(&mut self, n: u32, fl: u8, now: u64, out: &mut Out) -> bool {
         let mut skb = match self.wq.pop_front() {
             Some(s) => s,
             None => {
@@ -399,10 +371,16 @@ impl TcpCb {
             self.requeue(skb);
             return false;
         }
-        skb.tcp_mut().flags |= fl;
+        let t = skb.tcp_mut();
+        t.flags |= fl;
         if fl & flags::FIN != 0 {
-            skb.tcp_mut().end_seq = skb.tcp().end_seq.wrapping_add(1);
+            t.end_seq = t.end_seq.wrapping_add(1);
         }
+        t.sacked = 0;
+        t.pcount = 1;
+        t.gso_size = 0;
+        t.sent = now;
+        self.packets_out += 1;
         self.rtx
             .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
         true
@@ -416,40 +394,6 @@ impl TcpCb {
         }
     }
 
-    /// Send the queued skb at `seq` again, cut to `n` bytes first if
-    /// longer (Linux __tcp_retransmit_skb with tcp_fragment); false
-    /// without memory
-    fn send_rtx_at(&mut self, seq: u32, n: u32, fl: u8, out: &mut Out) -> bool {
-        let gfp = out.gfp;
-        let mut c = self.rtx.cursor_floor_mut(|s| !after(s.tcp().seq, seq));
-        let cut = c.with_current_mut(|s| {
-            if s.len() > n as usize {
-                fragment(s, n as usize, gfp).map(Some)
-            } else {
-                Some(None)
-            }
-        });
-        match cut {
-            Some(Some(rest)) => {
-                if let Some(r) = rest {
-                    self.rtx
-                        .insert_by(r, |a, b| before(a.tcp().seq, b.tcp().seq));
-                }
-            }
-            _ => return false,
-        }
-        let Some(clone) = self
-            .rtx
-            .iter()
-            .find(|s| s.tcp().seq == seq)
-            .and_then(|s| clone_data(s, gfp))
-        else {
-            return false;
-        };
-        self.send_clone(clone, seq, fl, out);
-        true
-    }
-
     /// Send `c`, a copy of a queued skb's payload, at `seq` with `fl`
     fn send_clone(&mut self, mut c: Box<SkBuff>, seq: u32, fl: u8, out: &mut Out) {
         c.set_tcp(self.hdr(seq, fl, c.len() as u32));
@@ -461,88 +405,304 @@ impl TcpCb {
         self.send_ctl(self.snd_nxt, flags::ACK, out);
     }
 
-    /// Resend the oldest unacknowledged segment (fast retransmit, NewReno
-    /// partial ACK; Linux tcp_retransmit_skb): the retransmit queue's
-    /// head, cut to the MSS, or merged with the small skbs behind it up
-    /// to the MSS (tcp_retrans_try_collapse); never an RTT sample (Karn)
-    pub(super) fn retransmit_head(&mut self, out: &mut Out) {
-        self.rtt_seq = None;
-        if self.syn_unacked {
-            self.syn_rtx(out);
-            return;
+    // --- the retransmit queue ------------------------------------------------
+
+    /// Cut the sent skb at `seq` after `len` bytes (Linux tcp_fragment,
+    /// TCP_FRAG_IN_RTX_QUEUE): the rest keeps its tags and send time,
+    /// both are segmented at `mss` and the packet counts follow; false
+    /// without memory
+    pub(super) fn rtx_fragment(&mut self, seq: u32, len: usize, mss: u32) -> bool {
+        let gfp = Gfp::ATOMIC;
+        let Some(Some((mut rest, old, p1, tags))) = self.rtx_with(seq, |s| {
+            let old = s.tcp().pcount;
+            let rest = fragment(s, len, gfp)?;
+            let (p1, g1) = tso_segs(s.len(), mss);
+            s.tcp_mut().pcount = p1;
+            s.tcp_mut().gso_size = g1;
+            Some((rest, old, p1, s.tcp().sacked))
+        }) else {
+            return false;
+        };
+        let (p2, g2) = tso_segs(rest.len(), mss);
+        rest.tcp_mut().pcount = p2;
+        rest.tcp_mut().gso_size = g2;
+        let diff = old as i32 - p1 as i32 - p2 as i32;
+        if diff != 0 && !before(self.snd_max, rest.tcp().end_seq) {
+            self.adjust_pcount(tags, diff);
         }
-        let Some(head) = self.rtx.first() else {
+        self.rtx
+            .insert_by(rest, |a, b| before(a.tcp().seq, b.tcp().seq));
+        true
+    }
+
+    /// Drop the first `n` bytes of the sent skb at `seq` (Linux
+    /// tcp_trim_head): its seq moves, the references to it follow, an
+    /// skb of several segments is segmented again; returns the packets
+    /// it no longer counts (its caller accounts for them)
+    pub(super) fn rtx_trim_head(&mut self, seq: u32, n: usize) -> u32 {
+        let Some((new, diff)) = self.rtx_with(seq, |s| {
+            let k = n.min(s.len());
+            let _ = s.pull(k);
+            let old = s.tcp().pcount;
+            if old > 1 {
+                let (p, g) = tso_segs(s.len(), s.tcp().gso_size);
+                s.tcp_mut().pcount = p;
+                s.tcp_mut().gso_size = g;
+            }
+            let t = s.tcp_mut();
+            t.seq = t.seq.wrapping_add(k as u32);
+            (t.seq, old - t.pcount)
+        }) else {
+            return 0;
+        };
+        if self.highest_sack == Some(seq) {
+            self.highest_sack = Some(new);
+        }
+        if self.rtx_hint == Some(seq) {
+            self.rtx_hint = Some(new);
+        }
+        diff
+    }
+
+    /// Merge the skb after the one at `seq` into it (Linux
+    /// tcp_collapse_retrans): its data, FIN and PSH move over and it
+    /// goes, one packet less out; false if the data does not fit
+    fn collapse_retrans(&mut self, seq: u32) -> bool {
+        let mut c = self.rtx.cursor_floor_mut(|s| !after(s.tcp().seq, seq));
+        c.move_next();
+        let Some(next) = c.remove_current() else {
+            return false;
+        };
+        let fits = self.rtx_with(seq, |h| h.tailroom() >= next.len()) == Some(true);
+        if !fits {
+            self.rtx
+                .insert_by(next, |a, b| before(a.tcp().seq, b.tcp().seq));
+            return false;
+        }
+        let nt = next.tcp();
+        self.rtx_with(seq, |h| {
+            let _ = h.put_slice(next.data());
+            let t = h.tcp_mut();
+            t.end_seq = nt.end_seq;
+            t.flags |= nt.flags & (flags::FIN | flags::PSH);
+            t.sacked |= nt.sacked & tag::EVER_RETRANS;
+        });
+        if self.highest_sack == Some(nt.seq) {
+            self.highest_sack = Some(seq);
+        }
+        if self.rtx_hint == Some(nt.seq) {
+            self.rtx_hint = Some(seq);
+        }
+        self.adjust_pcount(nt.sacked, nt.pcount as i32);
+        true
+    }
+
+    /// Merge the skbs after the one at `seq` into it while they fit in
+    /// `space` bytes and the peer's window (Linux
+    /// tcp_retrans_try_collapse with tcp_can_collapse: one segment, not
+    /// SACKed; nothing goes after a FIN)
+    fn retrans_try_collapse(&mut self, seq: u32, space: i64) {
+        let can = |s: &SkBuff| s.tcp().pcount <= 1 && s.tcp().sacked & tag::SACKED_ACKED == 0;
+        let Some(len) = self.rtx_with(seq, |s| s.len()) else {
             return;
         };
-        let (seq, len) = (head.tcp().seq, head.len());
-        let mss = self.cur_mss() as usize;
-        if len > mss {
-            if !self.send_rtx_at(seq, mss as u32, flags::ACK, out) {
-                self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
+        let mut space = space - len as i64;
+        let wnd_end = self.snd_una.wrapping_add(self.snd_wnd);
+        loop {
+            if self.rtx_with(seq, |s| can(s) && !s.tcp().has(flags::FIN)) != Some(true) {
                 return;
+            }
+            let Some(nseq) = self.rtx_next(seq) else {
+                return;
+            };
+            let Some((ok, nlen, nend)) =
+                self.rtx_with(nseq, |s| (can(s), s.len(), s.tcp().end_seq))
+            else {
+                return;
+            };
+            if !ok {
+                return;
+            }
+            space -= nlen as i64;
+            if space < 0 || after(nend, wnd_end) || !self.collapse_retrans(seq) {
+                return;
+            }
+        }
+    }
+
+    /// Send the sent skb at `seq` again, up to `segs` segments of it
+    /// (Linux __tcp_retransmit_skb: an acknowledged head is trimmed, an
+    /// skb beyond a shrunk window waits unless it heads the queue,
+    /// longer ones are cut, shorter ones merged with the next). Returns
+    /// the seq it went out at, None if nothing did
+    fn retransmit_raw(&mut self, seq: u32, segs: u32, now: u64, out: &mut Out) -> Option<u32> {
+        let mut seq = seq;
+        let (start, end) = self.rtx_with(seq, |s| (s.tcp().seq, s.tcp().end_seq))?;
+        if before(start, self.snd_una) {
+            if before(end, self.snd_una) {
+                return None;
+            }
+            self.rtx_trim_head(seq, self.snd_una.wrapping_sub(start) as usize);
+            seq = self.snd_una;
+        }
+        let cur_mss = self.cur_mss();
+        let wnd_end = self.snd_una.wrapping_add(self.snd_wnd);
+        let mut avail = i64::from(wnd_end.wrapping_sub(seq) as i32);
+        if avail <= 0 {
+            if seq != self.snd_una {
+                return None;
+            }
+            avail = i64::from(cur_mss);
+        }
+        let mut len = i64::from(cur_mss) * i64::from(segs.max(1));
+        if len > avail {
+            len = avail / i64::from(cur_mss) * i64::from(cur_mss);
+            if len == 0 {
+                len = avail;
+            }
+        }
+        let skb_len = self.rtx_with(seq, |s| s.len())? as i64;
+        if skb_len > len {
+            if !self.rtx_fragment(seq, len as usize, cur_mss) {
+                self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
+                return None;
             }
         } else {
-            self.collapse_head();
-            let Some(head) = self.rtx.first() else {
-                return;
-            };
-            let mut fl = flags::ACK;
-            if head.tcp().has(flags::FIN) {
-                fl |= flags::FIN;
+            let (tags, diff) = self.rtx_with(seq, |s| {
+                let old = s.tcp().pcount;
+                let (p, g) = tso_segs(s.len(), cur_mss);
+                s.tcp_mut().pcount = p;
+                s.tcp_mut().gso_size = g;
+                (s.tcp().sacked, old as i32 - p as i32)
+            })?;
+            if diff != 0 {
+                self.adjust_pcount(tags, diff);
             }
-            if head.is_empty() && fl & flags::FIN == 0 {
-                return;
+            let avail = avail.min(i64::from(cur_mss));
+            if skb_len < avail {
+                self.retrans_try_collapse(seq, avail);
             }
-            let Some(clone) = clone_data(head, out.gfp) else {
-                self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
-                return;
-            };
-            self.send_clone(clone, seq, fl, out);
         }
-        let n = len.min(mss);
-        self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
+        let gfp = out.gfp;
+        let Some(Some((clone, fl, pc))) = self.rtx_with(seq, |s| {
+            let fl = flags::ACK | (s.tcp().flags & (flags::FIN | flags::PSH));
+            clone_data(s, gfp).map(|c| (c, fl, s.tcp().pcount))
+        }) else {
+            self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
+            return None;
+        };
+        let n = clone.len();
+        self.send_clone(clone, seq, fl, out);
+        self.tcp_add(TCP_MIB_RETRANSSEGS, u64::from(pc));
+        self.stats.total_retrans = self.stats.total_retrans.wrapping_add(pc);
         self.stats.bytes_retrans += n as u64;
-        self.tcp_stat(TCP_MIB_RETRANSSEGS);
+        self.rtx_with(seq, |s| {
+            let t = s.tcp_mut();
+            t.sacked |= tag::EVER_RETRANS;
+            t.sent = now;
+        });
+        Some(seq)
     }
 
-    /// `retransmit_head` in fast recovery (Linux
-    /// tcp_xmit_retransmit_queue outside TCP_CA_Loss)
-    pub(super) fn fast_retransmit(&mut self, out: &mut Out) {
-        if self.state.synced() {
-            self.net_stat(LINUX_MIB_TCPFASTRETRANS);
-        }
-        self.retransmit_head(out);
-    }
-
-    /// Merge the skbs after the retransmit queue's head into it while
-    /// they fit its room and the MSS and were sent up to SND.NXT (Linux
-    /// tcp_retrans_try_collapse / tcp_collapse_retrans: the next skb's
-    /// data and FIN move into it)
-    fn collapse_head(&mut self) {
-        let mss = self.cur_mss() as usize;
-        loop {
-            let mut c = self.rtx.cursor_front_mut();
-            let (Some(h), Some(n)) = (c.current(), c.peek_next()) else {
-                return;
-            };
-            if h.tcp().has(flags::FIN)
-                || h.len() + n.len() > mss
-                || n.len() > h.tailroom()
-                || h.tcp().end_seq != n.tcp().seq
-                || after(n.tcp().end_seq, self.snd_nxt)
-            {
-                return;
+    /// Linux tcp_retransmit_skb: `retransmit_raw`, then the skb is a
+    /// retransmission in flight; the first retransmission of an episode
+    /// stamps it (retrans_stamp: the skb's previous send) and each one
+    /// counts towards undo. Returns the seq it went out at.
+    pub(super) fn retransmit_skb(
+        &mut self,
+        seq: u32,
+        segs: u32,
+        now: u64,
+        out: &mut Out,
+    ) -> Option<u32> {
+        let sent = self.rtx_with(seq, |s| s.tcp().sent).unwrap_or(now);
+        let r = self.retransmit_raw(seq, segs, now, out);
+        let mut pc = 1;
+        if let Some(at) = r
+            && let Some((tags, p)) = self.rtx_with(at, |s| {
+                let old = s.tcp().sacked;
+                s.tcp_mut().sacked |= tag::RETRANS;
+                (old, s.tcp().pcount)
+            })
+        {
+            pc = p;
+            if tags & tag::SACKED_RETRANS == 0 {
+                self.retrans_out += p;
             }
-            c.move_next();
-            let Some(next) = c.remove_current() else {
-                return;
+        }
+        if self.rtx_stamp.is_none() {
+            self.rtx_stamp = Some(sent);
+        }
+        if self.undo_retrans < 0 {
+            self.undo_retrans = 0;
+        }
+        self.undo_retrans += pc as i32;
+        // Karn: no RTT sample from a retransmitted range
+        self.rtt_seq = None;
+        r
+    }
+
+    /// Linux tcp_xmit_retransmit_queue: resend what is marked lost and
+    /// not retransmitted yet, oldest first, while the window allows
+    pub(super) fn xmit_retransmit_queue(&mut self, out: &mut Out) {
+        if self.packets_out == 0 || self.syn_unacked {
+            return;
+        }
+        let now = self.clock;
+        let head = self.rtx_head();
+        let start = match self.rtx_hint {
+            Some(h) => {
+                let c = self.rtx.cursor_floor_mut(|s| !after(s.tcp().seq, h));
+                c.current().map(|s| s.tcp().seq).or(head)
+            }
+            None => head,
+        };
+        let mut hole = false;
+        let mut rearm = false;
+        let mut cur = start;
+        while let Some(seq) = cur {
+            if !hole {
+                self.rtx_hint = Some(seq);
+            }
+            let segs = i64::from(self.cong.snd_cwnd()) - i64::from(self.in_flight());
+            if segs <= 0 || self.retrans_out >= self.lost_out {
+                break;
+            }
+            let Some(sacked) = self.rtx_with(seq, |s| s.tcp().sacked) else {
+                break;
             };
-            let mut c = self.rtx.cursor_front_mut();
-            let _ = c.with_current_mut(|h| {
-                let _ = h.put_slice(next.data());
-                h.tcp_mut().end_seq = next.tcp().end_seq;
-                h.tcp_mut().flags |= next.tcp().flags & (flags::FIN | flags::PSH);
-            });
+            if sacked & tag::LOST == 0 {
+                if !hole && sacked & (tag::SACKED_RETRANS | tag::SACKED_ACKED) == 0 {
+                    hole = true;
+                }
+                cur = self.rtx_next(seq);
+                continue;
+            }
+            let mib = if self.ca_state != CaState::Loss {
+                LINUX_MIB_TCPFASTRETRANS
+            } else {
+                LINUX_MIB_TCPSLOWSTARTRETRANS
+            };
+            if sacked & (tag::SACKED_ACKED | tag::SACKED_RETRANS) != 0 {
+                cur = self.rtx_next(seq);
+                continue;
+            }
+            // One segment per transmit: hk has no GSO (Linux max_segs)
+            let Some(at) = self.retransmit_skb(seq, 1, now, out) else {
+                break;
+            };
+            let pc = self.rtx_with(at, |s| s.tcp().pcount).unwrap_or(1);
+            self.net_add(mib, u64::from(pc));
+            if self.in_cwnd_reduction() {
+                self.prr_out += pc;
+            }
+            if Some(at) == self.rtx_head() {
+                rearm = true;
+            }
+            cur = self.rtx_next(at);
+        }
+        if rearm {
+            self.arm_rtx(now);
         }
     }
 

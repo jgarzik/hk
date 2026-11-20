@@ -3,10 +3,10 @@
 //!
 //! `struct tcp_info` is laid out field by field in its uapi order (280
 //! bytes, the current Linux size; getsockopt truncates to the caller's
-//! length like Linux). Fields hk has no counterpart for (SACK, pacing,
+//! length like Linux). Fields hk has no counterpart for (pacing,
 //! delivery rate, ECN) are 0, or ~0 for the pacing rates as Linux
-//! reports without pacing. Counts Linux keeps in packets (cwnd,
-//! ssthresh, unacked) are bytes / MSS.
+//! reports without pacing. cwnd and ssthresh, which hk keeps in bytes,
+//! are bytes / MSS.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -20,10 +20,6 @@ use crate::fs::proc::seq::{self, SeqBuf};
 const OPT_TIMESTAMPS: u8 = 1;
 const OPT_SACK: u8 = 2;
 const OPT_WSCALE: u8 = 4;
-/// Linux TCP_CA_Open / TCP_CA_Recovery / TCP_CA_Loss
-const CA_OPEN: u8 = 0;
-const CA_RECOVERY: u8 = 3;
-const CA_LOSS: u8 = 4;
 /// Linux TCP_INFINITE_SSTHRESH
 const INFINITE_SSTHRESH: u32 = 0x7fff_ffff;
 /// sizeof(struct tcp_info)
@@ -84,19 +80,6 @@ impl Buf {
     }
 }
 
-impl TcpCb {
-    /// Linux TCP_CA_* state
-    fn ca_state(&self) -> u8 {
-        if self.cong.in_recovery() {
-            CA_RECOVERY
-        } else if self.live.backoff.get() > 0 && self.snd_una != self.snd_max {
-            CA_LOSS
-        } else {
-            CA_OPEN
-        }
-    }
-}
-
 /// `struct tcp_info` of `cb` at `now`
 pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let mut b = Buf(Vec::with_capacity(INFO_LEN));
@@ -104,7 +87,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let st = &cb.stats;
     let synced = cb.state.synced();
     b.u8(cb.state.linux());
-    b.u8(cb.ca_state());
+    b.u8(cb.ca_state as u8);
     // tcpi_retransmits, tcpi_probes, tcpi_backoff
     b.u8(cb.live.retransmits.get().min(255) as u8);
     b.u8(cb.live.probes.get().min(255) as u8);
@@ -126,10 +109,11 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32((cb.live.ato.get() * 1000) as u32);
     b.u32(mss);
     b.u32(cb.dack.rcv_mss);
-    b.u32(pkts(cb.snd_max.wrapping_sub(cb.snd_una), mss)); // unacked
-    for _ in 0..4 {
-        b.u32(0); // sacked, lost, retrans, fackets
-    }
+    b.u32(cb.packets_out); // unacked
+    b.u32(cb.sacked_out);
+    b.u32(cb.lost_out);
+    b.u32(cb.retrans_out);
+    b.u32(0); // fackets (no longer kept, as Linux)
     b.ms_ago(now, cb.lsndtime); // last_data_sent
     b.u32(0); // last_ack_sent
     b.ms_ago(now, st.last_data_recv);
@@ -147,7 +131,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     });
     b.u32(pkts(cb.cong.cwnd(), mss));
     b.u32(cb.adv_mss);
-    b.u32(3); // reordering (tcp_reordering)
+    b.u32(cb.reordering);
     b.u32(0); // rcv_rtt
     b.u32(cb.full_space()); // rcv_space
     b.u32(st.total_retrans);
@@ -170,7 +154,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u64(st.bytes_sent);
     b.u64(st.bytes_retrans);
     b.u32(0); // dsack_dups
-    b.u32(0); // reord_seen
+    b.u32(cb.reord_seen);
     b.u32(0); // rcv_ooopack
     b.u32(if synced { cb.snd_wnd } else { 0 });
     b.u32(if synced { cb.rcv_wnd() } else { 0 });

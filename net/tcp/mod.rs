@@ -53,6 +53,7 @@ pub mod info;
 pub mod input;
 pub mod mem;
 pub mod output;
+pub mod recovery;
 pub mod sack;
 pub mod table;
 #[cfg(test)]
@@ -304,6 +305,8 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         ts: s.tcp_timestamps.load(Ordering::Relaxed),
         sack: s.tcp_sack.load(Ordering::Relaxed) != 0,
         dsack: s.tcp_dsack.load(Ordering::Relaxed) != 0,
+        reordering: s.tcp_reordering.load(Ordering::Relaxed).max(1) as u32,
+        max_reordering: s.tcp_max_reordering.load(Ordering::Relaxed).max(1) as u32,
         rmem_min: s.tcp_rmem[0].load(Ordering::Relaxed).max(1) as u32,
         rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
         keepidle: secs(&s.tcp_keepalive_time),

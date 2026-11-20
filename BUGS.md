@@ -89,7 +89,8 @@ Planned fix:
 **Location**: `net/`
 
 Listed because real traffic reaches them: TCP's sender ignores SACK
-blocks (no scoreboard; NewReno recovery only), no SACK compression
+blocks (no SACK scoreboard: every peer is recovered as Reno, Linux
+tcp_is_reno; no RACK), no F-RTO (tcp_frto, TCPSpuriousRTOs), no SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no CUBIC (only "reno"; Linux defaults to cubic), no
@@ -133,8 +134,7 @@ receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
 MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
 prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
 ACK counts TCPPureAcks, where Linux's fast path skips it), receive
-coalescing and collapse, undo and F-RTO (TCP*Undo, TCPSpuriousRTOs),
-the CA_Loss state (TCPLossFailures), RcvPruned (no tcp_can_ingest),
+coalescing and collapse, F-RTO (TCPSpuriousRTOs), RcvPruned (no tcp_can_ingest),
 SACK/DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and

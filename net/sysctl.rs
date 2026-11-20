@@ -47,6 +47,9 @@ pub struct NetSysctl {
     pub tcp_sack: AtomicU8,
     /// Nonzero: report duplicate segments in D-SACK blocks (RFC 2883)
     pub tcp_dsack: AtomicU8,
+    /// Initial reordering degree of a connection (packets) and its bound
+    pub tcp_reordering: AtomicI32,
+    pub tcp_max_reordering: AtomicI32,
     /// Nonzero: a TIME_WAIT entry ignores an in-window RST (RFC 1337)
     pub tcp_rfc1337: AtomicU8,
     /// tcp_rmem min / default / max (only max is used: window scale)
@@ -85,6 +88,8 @@ impl Default for NetSysctl {
             tcp_timestamps: AtomicU8::new(1),
             tcp_sack: AtomicU8::new(1),
             tcp_dsack: AtomicU8::new(1),
+            tcp_reordering: AtomicI32::new(3),
+            tcp_max_reordering: AtomicI32::new(300),
             tcp_rfc1337: AtomicU8::new(0),
             tcp_rmem: [
                 AtomicI32::new(4096),
@@ -454,6 +459,23 @@ pub static CTLS: &[NetCtl] = &[
         mode: 0o644,
         show: |n| get_u8(n, |s| &s.tcp_dsack),
         store: |n, v| set_u8(n, |s| &s.tcp_dsack, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_reordering",
+        mode: 0o644,
+        show: |n| get_i32(n, |s| &s.tcp_reordering),
+        store: |n, v| {
+            let max = n.sysctl.tcp_max_reordering.load(Ordering::Relaxed);
+            set_int(n, |s| &s.tcp_reordering, v, 1, i64::from(max))
+        },
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_max_reordering",
+        mode: 0o644,
+        show: |n| get_i32(n, |s| &s.tcp_max_reordering),
+        store: |n, v| set_int(n, |s| &s.tcp_max_reordering, v, 1, INT_MAX),
         text: None,
     },
     NetCtl {
