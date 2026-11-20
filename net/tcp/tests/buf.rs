@@ -548,6 +548,60 @@ fn send_memory_grows_with_payload() {
     assert!(n > 6 * 1024 && n < 8 * 1024, "{n}");
 }
 
+/// Linux tcp_bound_to_half_wnd: half the largest window seen (all of
+/// it up to TCP_MSS_DEFAULT), at least 68 bytes of packet
+fn half_wnd(c: &TcpCb, mss: u32) -> u32 {
+    let w = c.max_wnd;
+    let cut = if w > 536 { w >> 1 } else { w };
+    if cut != 0 && mss > cut {
+        cut.max(68 - (20 + c.opt_len()))
+    } else {
+        mss
+    }
+}
+
+/// The send MSS is bounded by half the peer's largest window (Linux
+/// tcp_sync_mss -> tcp_bound_to_half_wnd): on loopback against a small
+/// receive buffer the active side's comes from the SYN-ACK's window,
+/// the passive side's from the handshake's last ACK; it grows with
+/// the window (tcp_ack_update_window: a larger max_window resyncs it).
+/// A zero window then takes about Linux's 7 KiB of SO_SNDBUF 4096.
+#[test]
+fn mss_bound_to_half_wnd() {
+    let (mut p, _) = mib_pair_buf(65_483, 8192, crate::net::tcp::buf::RCVBUF_LOCK);
+    let full = 65_483 - p.a.opt_len();
+    assert!(p.a.max_wnd < full);
+    assert_eq!(p.a.live.mss.get(), half_wnd(&p.a, full));
+    assert!(p.a.live.mss.get() < full / 4, "{}", p.a.live.mss.get());
+    assert_eq!(p.b.live.mss.get(), half_wnd(&p.b, full));
+    assert!(p.b.live.mss.get() < full);
+    // A default buffer: the window grows as b reads, the MSS follows
+    let mut p = Pair::with_cap(65_483, 1 << 22);
+    let before = p.a.live.mss.get();
+    assert_eq!(before, half_wnd(&p.a, full));
+    assert!(before < full, "{before}");
+    let data = pattern(200_000);
+    let mut sent = 0;
+    for _ in 0..2000 {
+        sent += p.send_a(&data[sent..]);
+        p.run();
+        p.read_b(1 << 20);
+        if sent == data.len() {
+            break;
+        }
+    }
+    assert!(p.a.live.mss.get() > before);
+    assert_eq!(p.a.live.mss.get(), half_wnd(&p.a, full));
+    // Against a zero window from the start
+    let (mut p, _) = mib_pair_buf(65_483, 8192, crate::net::tcp::buf::RCVBUF_LOCK);
+    p.a.snd_wnd = 0;
+    let n = fill_sndbuf(&mut p);
+    let mss = p.a.live.mss.get() as usize;
+    let k = 8192_usize.div_ceil(HEAD_TRUESIZE + mss);
+    assert_eq!(n, k * mss);
+    assert!(n < 12 * 1024, "{n}");
+}
+
 /// TCP_LINGER2 (Linux tp->linger2, tcp_fin_time): a positive value is
 /// the orphan's FIN_WAIT_2 lifetime (at least 3.5 RTO); negative, an
 /// orphan reaching FIN_WAIT_2 is done with a reset (TCPAbortOnData),

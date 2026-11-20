@@ -621,10 +621,10 @@ fn lost_window_update_recovered_by_probe() {
     let rest = pattern(5000);
     p.send_a(&rest);
     // b's window shuts with part of the data held (its delayed ACKs
-    // fire)
+    // fire; a's segments are at most half b's small window)
     assert!(p.until(|p| p.a.snd_wnd == 0, 20));
     let held = p.b.rcvq_len();
-    assert!((3000..8000).contains(&held), "{held}");
+    assert!((2000..8000).contains(&held), "{held}");
     p.filter = drop_window_updates;
     let first = p.read_b(10_000);
     p.run();

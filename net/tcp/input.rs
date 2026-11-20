@@ -126,7 +126,14 @@ impl TcpCb {
         // Linux tcp_create_openreq_child: the request became a socket
         self.tcp_stat_if(self.passive, TCP_MIB_PASSIVEOPENS);
         self.snd_wnd = self.seg_wnd(s);
-        self.max_wnd = self.max_wnd.max(self.snd_wnd);
+        if self.passive {
+            // Linux tcp_create_openreq_child: max_window from the ACK,
+            // then tcp_v4_syn_recv_sock's tcp_sync_mss
+            self.max_wnd = self.snd_wnd;
+            self.update_mss();
+        } else {
+            self.max_wnd = self.max_wnd.max(self.snd_wnd);
+        }
         self.snd_wl1 = s.seq;
         // The handshake's RTT (Linux tcp_ack of the SYN-ACK,
         // tcp_synack_rtt_meas): our SYN's or SYN-ACK's unless it was
@@ -639,7 +646,11 @@ impl TcpCb {
         if self.send_head() {
             self.slow_start_after_idle_check(self.clock);
         }
-        self.max_wnd = self.max_wnd.max(nwin);
+        if nwin > self.max_wnd {
+            // Linux tcp_ack_update_window: tcp_sync_mss
+            self.max_wnd = nwin;
+            self.update_mss();
+        }
         if old_wnd == 0 && nwin > 0 && self.live.tmr.get().is_some_and(|t| t.0 == Tmr::Probe) {
             // Linux tcp_ack_probe
             self.live.tmr.set(None);

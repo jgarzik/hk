@@ -1283,15 +1283,28 @@ impl TcpCb {
     }
 
     /// Recompute the send MSS (Linux tcp_sync_mss: the peer's and the
-    /// user's clamp, then the option bytes come off)
+    /// user's clamp, the option bytes off, then at most half the
+    /// peer's largest window)
     pub(super) fn update_mss(&mut self) {
         let mut m = self.peer_mss.min(self.path_mss);
         if self.opts.user_mss != 0 {
             m = m.min(self.opts.user_mss);
         }
-        self.live
-            .mss
-            .set(m.saturating_sub(self.opt_len()).max(MSS_MIN));
+        let m = m.saturating_sub(self.opt_len()).max(MSS_MIN);
+        self.live.mss.set(self.bound_half_wnd(m));
+    }
+
+    /// Linux tcp_bound_to_half_wnd: a packet of `size` bytes cut to half
+    /// the peer's largest window (to all of a window up to
+    /// TCP_MSS_DEFAULT), no less than 68 bytes with the header
+    fn bound_half_wnd(&self, size: u32) -> u32 {
+        let w = self.max_wnd;
+        let cut = if w > MSS_DEFAULT { w >> 1 } else { w };
+        if cut != 0 && size > cut {
+            cut.max(68 - (super::output::HLEN as u32 + self.opt_len()))
+        } else {
+            size
+        }
     }
 
     /// The path MTU to the peer changed (ICMP frag needed): shrink the
