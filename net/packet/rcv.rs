@@ -260,6 +260,9 @@ crate::rcu_head!(PacketSock, rcu);
 #[derive(Default)]
 pub struct PacketTable {
     sklist: RcuList<PacketLink>,
+    /// Fanout groups (Linux fanout_list, its entries of this
+    /// namespace; changed under the fanout mutex)
+    pub(super) fanouts: crate::sync::spin::RwLock<Vec<Arc<super::fanout::Fanout>>>,
 }
 
 impl PacketTable {
@@ -308,7 +311,8 @@ impl PacketSock {
     /// ptype_all for ETH_P_ALL, ptype_base otherwise; outgoing frames
     /// only go to ptype_all, never back to their sender)
     fn wants(&self, t: &Tap<'_>, proto: u16) -> bool {
-        if !self.flag(pf::RUNNING) {
+        // A fanout member's frames come through its group
+        if !self.flag(pf::RUNNING) || self.fanout.lock().is_some() {
             return false;
         }
         let (num, ifindex) = self.bound();
@@ -323,7 +327,7 @@ impl PacketSock {
 
     /// Queue a copy of a tapped frame (Linux packet_rcv), or put it in
     /// the receive ring (tpacket_rcv)
-    fn rcv(&self, t: &Tap<'_>, proto: u16) {
+    pub(super) fn rcv(&self, t: &Tap<'_>, proto: u16) {
         let raw = self.sk.stype == SOCK_RAW;
         let data = if raw { t.frame } else { &t.frame[ETH_HLEN..] };
         let mut snap = data.len();
@@ -400,6 +404,7 @@ pub fn tap(t: &Tap<'_>) {
             s.rcv(t, proto);
         }
     });
+    super::fanout::deliver(&net, t, proto);
 }
 
 /// `/proc/net/packet` (Linux packet_seq_show; socket addresses

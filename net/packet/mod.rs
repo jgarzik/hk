@@ -39,6 +39,7 @@
 //! under RTNL) is changed under RTNL, which device promiscuity changes
 //! need: RTNL -> `mclist`.
 
+mod fanout;
 mod opts;
 mod rcv;
 mod ring;
@@ -99,6 +100,8 @@ mod pf {
     pub const TX_HAS_OFF: u32 = 1 << 6;
     /// PACKET_LOSS (Linux PACKET_SOCK_TP_LOSS)
     pub const TP_LOSS: u32 = 1 << 7;
+    /// Short of room, skipped by rollover (Linux PACKET_SOCK_PRESSURE)
+    pub const PRESSURE: u32 = 1 << 8;
 }
 
 /// A link-layer address (struct sockaddr_ll)
@@ -176,6 +179,12 @@ pub struct PacketSock {
     rx: crate::sync::spin::Mutex<ring::RxRing>,
     /// The transmit ring (Linux po->tx_ring)
     tx: crate::sync::spin::Mutex<tx::TxRing>,
+    /// Its own `Arc`, weakly (a fanout group's member list holds it)
+    me: spin::Once<alloc::sync::Weak<PacketSock>>,
+    /// Its fanout group (Linux po->fanout; changed under `FANOUT` and
+    /// `bind_lock`) and rollover state (po->rollover)
+    fanout: crate::sync::spin::Mutex<Option<Arc<fanout::Fanout>>>,
+    rollover: crate::sync::spin::Mutex<Option<Arc<fanout::Rollover>>>,
     /// The V3 ring's retire timer (Linux prb_bdqc.retire_blk_timer)
     retire: Arc<v3::Retire>,
     /// User mappings of the rings (Linux po->mapped)
@@ -223,6 +232,9 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         pg_vec_lock: crate::sync::Mutex::new(()),
         rx: crate::sync::spin::Mutex::new(ring::RxRing::default()),
         tx: crate::sync::spin::Mutex::new(tx::TxRing::default()),
+        me: spin::Once::new(),
+        fanout: crate::sync::spin::Mutex::new(None),
+        rollover: crate::sync::spin::Mutex::new(None),
         retire: try_arc(v3::Retire::new())?,
         mapped: try_arc(ring::Mapped::default())?,
         tp_version: AtomicU32::new(ring::TPACKET_V1),
@@ -235,6 +247,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         rcu: crate::sync::rcu::RcuHead::new(),
     })?;
     s.retire.attach(&s);
+    s.me.call_once(|| Arc::downgrade(&s));
     // Linux packet_create: hooked at once when a protocol is given
     if proto != 0 {
         let g = s.bind_lock.lock();
@@ -319,15 +332,28 @@ impl PacketSock {
     /// Hook the socket on the tap (Linux __register_prot_hook)
     fn register_hook(&self, _g: &BindGuard<'_>) {
         if !self.flag(pf::RUNNING) {
+            if let Some(f) = self.fanout.lock().clone() {
+                self.fanout_link(&f);
+            }
             self.set_flag(pf::RUNNING, true);
         }
+    }
+
+    /// Clear RUNNING, out of the fanout group if in one
+    fn unhook(&self) {
+        if self.flag(pf::RUNNING)
+            && let Some(f) = self.fanout.lock().clone()
+        {
+            self.fanout_unlink(&f);
+        }
+        self.set_flag(pf::RUNNING, false);
     }
 
     /// Unhook it (Linux __unregister_prot_hook): with `sync` the lock
     /// is dropped for a grace period, after which no tap still
     /// delivers by the old binding (Linux synchronize_net)
     fn unregister_hook<'a>(&'a self, g: BindGuard<'a>, sync: bool) -> BindGuard<'a> {
-        self.set_flag(pf::RUNNING, false);
+        self.unhook();
         if !sync {
             return g;
         }
@@ -340,7 +366,7 @@ impl PacketSock {
     /// packet_notifier NETDEV_DOWN / UNREGISTER)
     fn unhook_err(&self, _g: &BindGuard<'_>) {
         if self.flag(pf::RUNNING) {
-            self.set_flag(pf::RUNNING, false);
+            self.unhook();
             self.sk.set_err(KernelError::NetworkDown);
         }
     }
@@ -383,6 +409,9 @@ impl PacketSock {
         let mut g = self.bind_lock.lock();
         let (cur, cur_if) = self.bound();
         let proto = if proto != 0 { proto } else { cur };
+        if self.fanout.lock().is_some() {
+            return Err(KernelError::InvalidArgument);
+        }
         let dev = lookup()?;
         let new_if = dev.as_ref().map_or(0, |d| d.ifindex() as i32);
         // Linux compares po->prot_hook.dev, none once unlisted
@@ -561,6 +590,8 @@ impl ProtoOps for PacketSock {
                 let _ = ring::set_ring(self, &ring::Req::default(), true, true);
             }
         }
+        // Linux fanout_release: the group goes with its last member
+        fanout::release(self);
         self.rxq.clear();
         self.sk.purge_err();
         // Linux packet_release's sock_put: the last reference
@@ -598,6 +629,7 @@ impl ProtoOps for PacketSock {
     /// Linux packet_poll: datagram_poll, and readable while the ring
     /// has a filled frame
     fn poll(&self) -> u16 {
+        fanout::try_clear_pressure(self);
         let mut mask = self.rxq.poll(&self.sk);
         if self.ring_readable() {
             mask |= crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM;
@@ -694,6 +726,7 @@ impl ProtoOps for PacketSock {
             return Err(KernelError::WouldBlock);
         }
         let f = self.rxq.recv(&self.sk, flags)?;
+        fanout::try_clear_pressure(self);
         rcv::deliver(self, m, &f, flags)
     }
 }

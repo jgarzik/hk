@@ -25,7 +25,10 @@ const PACKET_RESERVE: i32 = 12;
 const PACKET_TX_RING: i32 = 13;
 const PACKET_LOSS: i32 = 14;
 const PACKET_TIMESTAMP: i32 = 17;
+const PACKET_FANOUT: i32 = 18;
 const PACKET_TX_HAS_OFF: i32 = 19;
+const PACKET_ROLLOVER_STATS: i32 = 21;
+const PACKET_FANOUT_DATA: i32 = 22;
 const PACKET_IGNORE_OUTGOING: i32 = 23;
 
 /// sizeof(struct tpacket_req), sizeof(struct tpacket_req3)
@@ -134,6 +137,8 @@ fn set_packet(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
             let val = int_exact(v)?;
             unless_ring(s, || s.set_flag(pf::TP_LOSS, val != 0))
         }
+        PACKET_FANOUT => super::fanout::set(s, v),
+        PACKET_FANOUT_DATA => super::fanout::set_data(s, v),
         PACKET_TIMESTAMP => {
             s.tp_tstamp.store(int_exact(v)? as u32, Ordering::Release);
             Ok(())
@@ -322,7 +327,7 @@ fn set_filter(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
 
 /// struct sock_fprog { u16 len; struct sock_filter *filter; } (Linux
 /// copy_bpf_fprog_from_user + __get_filter)
-fn read_fprog(v: OptIn, locked: bool) -> Result<Filter, KernelError> {
+pub(super) fn read_fprog(v: OptIn, locked: bool) -> Result<Filter, KernelError> {
     if v.len != FPROG_LEN {
         return Err(KernelError::InvalidArgument);
     }
@@ -377,6 +382,8 @@ fn get_packet(s: &PacketSock, opt: i32, v: Option<OptIn>) -> Result<OptOut, Kern
         PACKET_TIMESTAMP => int(&s.tp_tstamp),
         PACKET_IGNORE_OUTGOING => flag(pf::IGNORE_OUTGOING),
         PACKET_TX_HAS_OFF => flag(pf::TX_HAS_OFF),
+        PACKET_FANOUT => Ok(super::fanout::get(s)),
+        PACKET_ROLLOVER_STATS => super::fanout::rollover_stats(s),
         _ => Err(KernelError::NoProtocolOption),
     }
 }

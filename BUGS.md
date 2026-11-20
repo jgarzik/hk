@@ -307,7 +307,7 @@ without it).
 
 **Location**: `net/packet/`
 
-Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), PACKET_FANOUT,
+Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT),
 PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
 (ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
 socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
@@ -326,6 +326,11 @@ The TPACKET_V3 retire timeout without tp_retire_blk_tov is always
 derives it from the block size on links of 1 Gb/s and up, e.g. e1000,
 r8169). tp_rxhash (TP_FT_REQ_FILL_RXHASH) is a jhash of the flow, not
 Linux's siphash flow-dissector hash.
+Fanout: PACKET_FANOUT_FLAG_DEFRAG is kept but IPv4 fragments are not
+reassembled before hashing (Linux ip_check_defrag); PACKET_FANOUT_EBPF
+groups take no program (hk has no bpf(2): PACKET_FANOUT_DATA is EBADF
+or EINVAL, frames go to member 0); the flow hash is a jhash of the
+IPv4 5-tuple, not Linux's siphash flow dissector.
 Ring blocks are physically contiguous (`mm::shared::PgVec`): a
 tp_block_size past the buddy allocator's largest order is ENOMEM where
 Linux alloc_one_pg_vec_page falls back to vzalloc.
