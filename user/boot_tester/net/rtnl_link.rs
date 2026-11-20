@@ -29,6 +29,8 @@ const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_CARRIER: u16 = 33;
 const IFLA_PROTO_DOWN: u16 = 39;
 const IFLA_PERM_ADDRESS: u16 = 54;
+const IFLA_XDP: u16 = 43;
+const IFLA_XDP_FD: u16 = 1;
 
 const EBADF: i64 = -9;
 const ESRCH: i64 = -3;
@@ -180,6 +182,19 @@ fn test_unsupported() {
             r.attr(IFLA_PROTO_DOWN, &[0]);
         }),
         EOPNOTSUPP,
+    );
+    // `ip link set dev lo xdp off` with nothing attached: a no-op, 0
+    // (Linux dev_xdp_attach with no old or new program)
+    let mut xdp = [0u8; 8];
+    xdp[..2].copy_from_slice(&8u16.to_ne_bytes());
+    xdp[2..4].copy_from_slice(&IFLA_XDP_FD.to_ne_bytes());
+    xdp[4..].copy_from_slice(&(-1i32).to_ne_bytes());
+    t.eq(
+        b"xdp off",
+        lo_req(&mut nl, RTM_SETLINK, &|r| {
+            r.attr(IFLA_XDP, &xdp);
+        }),
+        0,
     );
     t.eq(
         b"missing master",

@@ -963,11 +963,21 @@ fn setlink_xdp(b: &[u8]) -> Result<(), KernelError> {
     if flags & !XDP_FLAGS_MASK != 0 || (flags & XDP_FLAGS_MODES).count_ones() > 1 {
         return Err(KernelError::InvalidArgument);
     }
-    if x.has(IFLA_XDP_FD) {
-        if flags & XDP_FLAGS_REPLACE != 0 && !x.has(IFLA_XDP_EXPECTED_FD) {
+    if let Some(fd) = x.u32(IFLA_XDP_FD)? {
+        let replace = flags & XDP_FLAGS_REPLACE != 0;
+        if replace && !x.has(IFLA_XDP_EXPECTED_FD) {
             return Err(KernelError::InvalidArgument);
         }
-        return Err(KernelError::OperationNotSupported);
+        // A detach with nothing attached succeeds (Linux dev_xdp_attach:
+        // new == old == NULL, the driver untouched), unless REPLACE
+        // expects a program (EEXIST); hk attaches none (EOPNOTSUPP)
+        if (fd as i32) >= 0 {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let expected = x.u32(IFLA_XDP_EXPECTED_FD)?.map_or(-1, |e| e as i32);
+        if replace && expected >= 0 {
+            return Err(KernelError::AlreadyExists);
+        }
     }
     Ok(())
 }
