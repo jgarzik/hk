@@ -149,7 +149,12 @@ impl RawSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output_flow(&self.sk.net, daddr, saddr, oif, self.inet.anysrc())?;
+        // Linux raw_sendmsg's flowi4_init_output: the socket's
+        // protocol, no ports
+        let proto = u8::try_from(self.sk.protocol).unwrap_or(0);
+        let mut k = self.sk.out_key(proto, 0, 0);
+        k.anysrc = self.inet.anysrc();
+        let rt = route::output_key(&self.sk.net, daddr, saddr, oif, &k)?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
         }

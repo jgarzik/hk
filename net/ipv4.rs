@@ -558,6 +558,10 @@ pub struct IpParams {
     /// Options for the header (Linux ipc.opt / inet_opt) and the
     /// final destination a source route ends with
     pub opt: Option<TxOpt>,
+    /// The sending socket's SO_MARK and owner, for a sender routing per
+    /// packet (TCP: Linux keeps the connect-time flow's)
+    pub mark: u32,
+    pub uid: u32,
 }
 
 /// Options an outgoing header carries (Linux ip_options_build's opt
@@ -596,6 +600,8 @@ impl Default for IpParams {
             confirm: false,
             anysrc: false,
             opt: None,
+            mark: 0,
+            uid: 0,
         }
     }
 }

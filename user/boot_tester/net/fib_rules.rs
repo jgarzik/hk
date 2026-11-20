@@ -6,6 +6,8 @@
 //!   prohibit / blackhole actions, goto resolved and unresolved, local
 //!   first), FIB_RULE_UNRESOLVED / IIF_DETACHED in dumps, a table-less
 //!   rule given table 1, delete by attributes, RTNLGRP_IPV4_RULE events
+//! - NL_RULE_SOCKET (new namespace): fwmark and uidrange rules route a
+//!   socket by its SO_MARK and owner, as the connected source shows
 //! - NL_RULE_DUMP (in a new network namespace, so only the defaults
 //!   exist): an AF_INET RTM_GETRULE dump returns exactly the three rules
 //!   Linux installs (fib_default_rules_init), byte for byte as
@@ -35,6 +37,7 @@ pub fn run_tests() {
     println(b"=== FIB rule Tests ===");
     test_rule_dump();
     run_engine_tests();
+    run_socket_tests();
 }
 
 /// The checks run in a child in a new network namespace (exit 2: no
@@ -144,6 +147,8 @@ const FRA_SRC: u16 = 2;
 const FRA_IIFNAME: u16 = 3;
 const FRA_GOTO: u16 = 4;
 const FRA_OIFNAME: u16 = 17;
+const FRA_FWMARK: u16 = 10;
+const FRA_UID_RANGE: u16 = 20;
 const RTA_SRC: u16 = 2;
 const RTA_TABLE: u16 = 15;
 const FR_ACT_GOTO: u8 = 2;
@@ -399,5 +404,98 @@ fn rule_engine(name: &'static [u8]) -> bool {
     r.attr(FRA_SRC, &[10, 20, 0, 0]).u32(FRA_TABLE, 100);
     t.eq(b"del by match", i64::from(nl.ack(&mut r)), 0);
     t.ok(b"gone", find_rule(&mut nl, 1000, FRA_SRC).is_none(), 0);
+    !t.failed()
+}
+
+/// NL_RULE_SOCKET, in a new network namespace
+fn run_socket_tests() {
+    crate::net::rtnl_ack::in_netns(b"NL_RULE_SOCKET", rule_socket);
+}
+
+/// A route `dst/plen` through lo in `table` preferring source `src`
+fn src_route(nl: &mut Nl, dst: [u8; 4], plen: u8, table: u32, src: [u8; 4]) -> i64 {
+    let mut r = Req::new(
+        RTM_NEWROUTE,
+        NLM_F_CREATE | NLM_F_EXCL,
+        &rtmsg(plen, 0, RTPROT_BOOT, RT_SCOPE_LINK, RTN_UNICAST),
+    );
+    r.attr(RTA_DST, &dst)
+        .u32(RTA_OIF, 1)
+        .u32(RTA_TABLE, table)
+        .attr(RTA_PREFSRC, &src);
+    i64::from(nl.ack(&mut r))
+}
+
+/// The source a UDP socket connected to `dst` gets, with SO_MARK
+/// `mark` if nonzero
+fn udp_src(dst: [u8; 4], mark: u32) -> [u8; 4] {
+    use crate::net::sk::{close, connect, name, udp};
+    let fd = udp();
+    if mark != 0 {
+        let m = mark as i32;
+        sys_setsockopt(fd, 1, 36, &m as *const i32 as *const u8, 4);
+    }
+    let src = if connect(fd, dst, 9) == 0 {
+        name(fd).0
+    } else {
+        [0; 4]
+    };
+    close(fd);
+    src
+}
+
+/// Policy routing of a socket's traffic: an fwmark rule takes the
+/// socket's SO_MARK, a uidrange rule its owner's uid (Linux
+/// ip_route_connect with sk_mark and sk_uid); the table's route picks
+/// the source
+fn rule_socket(name: &'static [u8]) -> bool {
+    let mut t = T::new(name);
+    let Some(mut nl) = Nl::open() else {
+        t.ok(b"open", false, 0);
+        return false;
+    };
+    let (a, b) = ([10, 60, 0, 1], [10, 60, 0, 2]);
+    t.eq(b"lo up", i64::from(set_link_up(&mut nl, 1, true)), 0);
+    t.eq(
+        b"addr a",
+        i64::from(addr(&mut nl, true, 1, a, 32, NLM_F_CREATE)),
+        0,
+    );
+    t.eq(
+        b"addr b",
+        i64::from(addr(&mut nl, true, 1, b, 32, NLM_F_CREATE)),
+        0,
+    );
+    let dst = [10, 70, 0, 0];
+    t.eq(b"main route", src_route(&mut nl, dst, 24, 254, a), 0);
+    t.eq(b"table route", src_route(&mut nl, dst, 24, 200, b), 0);
+    let ce = NLM_F_CREATE | NLM_F_EXCL;
+    let mark = |r: &mut Req| {
+        r.u32(FRA_FWMARK, 7).u32(FRA_TABLE, 200);
+    };
+    let mut r = rule_req(RTM_NEWRULE, ce, frh(0, 0, 0, FR_ACT_TO_TBL), 100, &mark);
+    t.eq(b"fwmark rule", i64::from(nl.ack(&mut r)), 0);
+    let uid = |r: &mut Req| {
+        let mut u = [0u8; 8];
+        u[..4].copy_from_slice(&1234u32.to_ne_bytes());
+        u[4..].copy_from_slice(&1234u32.to_ne_bytes());
+        r.attr(FRA_UID_RANGE, &u).u32(FRA_TABLE, 200);
+    };
+    let mut r = rule_req(RTM_NEWRULE, ce, frh(0, 0, 0, FR_ACT_TO_TBL), 101, &uid);
+    t.eq(b"uid rule", i64::from(nl.ack(&mut r)), 0);
+    let d = [10, 70, 0, 5];
+    t.ok(b"plain", udp_src(d, 0) == a, 0);
+    t.ok(b"marked", udp_src(d, 7) == b, 0);
+    t.ok(b"other mark", udp_src(d, 8) == a, 0);
+    // A socket made by uid 1234
+    let pid = sys_fork();
+    if pid == 0 {
+        if hk_syscall::sys_setresuid(1234, 1234, 1234) != 0 {
+            sys_exit(3);
+        }
+        sys_exit(if udp_src(d, 0) == b { 0 } else { 1 });
+    }
+    let st = wait_child(pid);
+    t.eq(b"uid", i64::from(st), 0);
     !t.failed()
 }

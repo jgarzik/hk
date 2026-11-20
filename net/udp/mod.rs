@@ -288,8 +288,14 @@ impl UdpSock {
         daddr: Ipv4Addr,
         saddr: Ipv4Addr,
         oif: u32,
+        dport: u16,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output_flow(&self.sk.net, daddr, saddr, oif, self.inet.anysrc())
+        // Linux ip_route_connect / udp_sendmsg's flowi4_init_output
+        let mut k = self
+            .sk
+            .out_key(IPPROTO_UDP as u8, self.inet.get().sport, dport);
+        k.anysrc = self.inet.anysrc();
+        let rt = route::output_key(&self.sk.net, daddr, saddr, oif, &k)
             .inspect_err(|e| self.sk.net.mib.route_err(e))?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
@@ -763,7 +769,7 @@ impl ProtoOps for UdpSock {
         let _g = self.op.lock();
         self.autobind_locked()?;
         let cur = self.inet.get();
-        let rt = self.route(daddr, cur.saddr, self.sk.bound_dev_if())?;
+        let rt = self.route(daddr, cur.saddr, self.sk.bound_dev_if(), dport)?;
         // Linux __ip4_datagram_connect: addresses before the rehash
         let mut s = self.inet.addr.lock();
         s.daddr = rt.daddr;
@@ -914,7 +920,7 @@ impl ProtoOps for UdpSock {
         };
         // Linux udp_sendmsg: a source route goes to its first hop
         let opt = c.opt(&self.inet, daddr);
-        let rt = self.route(ipv4::TxOpt::first_hop(&opt, daddr), saddr, oif)?;
+        let rt = self.route(ipv4::TxOpt::first_hop(&opt, daddr), saddr, oif, dport)?;
         // Linux udp_sendmsg's do_confirm; then ip_make_skb or
         // ip_append_data send nothing for a probe
         if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {

@@ -264,6 +264,20 @@ impl Sock {
         }
     }
 
+    /// The flow keys of this socket's output lookups (Linux
+    /// flowi4_init_output's sk_mark and sk_uid: the socket inode's
+    /// owner, the creator's fsuid), with `proto` and the ports
+    pub fn out_key(&self, proto: u8, sport: u16, dport: u16) -> crate::net::inet::route::OutKey {
+        crate::net::inet::route::OutKey {
+            mark: self.mark.load(Ordering::Relaxed),
+            uid: self.cred.fsuid,
+            proto,
+            sport,
+            dport,
+            anysrc: false,
+        }
+    }
+
     /// A child (accept) inheriting the listener's options and owner
     /// (Linux sk_clone_lock: sk_uid comes from the listener, never from
     /// whatever task runs the receive path); not counted until

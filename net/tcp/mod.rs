@@ -436,7 +436,17 @@ pub(super) fn xmit(net: &NetNamespace, t: &Tuple, seg: &Seg, p: IpParams, oif: u
 /// Route and send `skb` (its TCP header on) to `t` (route each time;
 /// no cached dst); false without a route
 fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) -> bool {
-    let Ok(rt) = route::output_flow(net, t.raddr, t.laddr, oif, p.anysrc) else {
+    // Linux ip_route_connect's flow (tcp_v4_connect), the socket's
+    // mark and owner with the connection's ports
+    let k = route::OutKey {
+        mark: p.mark,
+        uid: p.uid,
+        proto: IPPROTO_TCP,
+        sport: t.lport,
+        dport: t.rport,
+        anysrc: p.anysrc,
+    };
+    let Ok(rt) = route::output_key(net, t.raddr, t.laddr, oif, &k) else {
         return false;
     };
     let mut skb = skb;
@@ -807,7 +817,9 @@ impl TcpSock {
             self.sk.store_err(e as u32);
         }
         if let Some(t) = t {
-            let p = self.inet.params();
+            let mut p = self.inet.params();
+            let k = self.sk.out_key(0, 0, 0);
+            (p.mark, p.uid) = (k.mark, k.uid);
             send_segs(&self.sk.net, &t, out, p, self.oif(), confirm);
         }
         if out.err.is_some() {
@@ -1648,9 +1660,10 @@ impl TcpSock {
                 return Err(KernelError::AlreadyConnected);
             }
             let a = self.inet.get();
-            let rt =
-                route::output_flow(&self.sk.net, daddr, a.saddr, self.oif(), self.inet.anysrc())
-                    .inspect_err(|e| self.sk.net.mib.route_err(e))?;
+            let mut k = self.sk.out_key(IPPROTO_TCP, a.sport, dport);
+            k.anysrc = self.inet.anysrc();
+            let rt = route::output_key(&self.sk.net, daddr, a.saddr, self.oif(), &k)
+                .inspect_err(|e| self.sk.net.mib.route_err(e))?;
             if matches!(rt.rtype, RouteType::Broadcast | RouteType::Multicast) {
                 return Err(KernelError::NetworkUnreachable);
             }

@@ -102,27 +102,45 @@ fn zeronet(a: Ipv4Addr) -> bool {
     (a.0 >> 24) == 0
 }
 
-/// Route a locally generated packet to `daddr` from `saddr` (0 = pick
-/// one) through `oif` (0 = any); the MTU reflects a learned path MTU
+/// What an output lookup knows of its sender besides the addresses
+/// (Linux flowi4_init_output's mark, uid, proto and ports): a socket's
+/// SO_MARK and owner, its protocol and ports; zeros for packets of no
+/// socket (Linux sock_net_uid(net, NULL): the namespace's root, 0 here)
+#[derive(Clone, Copy, Default)]
+pub struct OutKey {
+    pub mark: u32,
+    pub uid: u32,
+    pub proto: u8,
+    pub sport: u16,
+    pub dport: u16,
+    /// `saddr` may be an address that is not local (Linux
+    /// FLOWI_FLAG_ANYSRC: IP_TRANSPARENT, IP_HDRINCL)
+    pub anysrc: bool,
+}
+
+/// Route a locally generated packet of no socket (`output_key` with
+/// zero mark, uid and ports)
 pub fn output(
     net: &NetNamespace,
     daddr: Ipv4Addr,
     saddr: Ipv4Addr,
     oif: u32,
 ) -> Result<Rtable, KernelError> {
-    output_flow(net, daddr, saddr, oif, false)
+    output_key(net, daddr, saddr, oif, &OutKey::default())
 }
 
-/// As [`output`]; `anysrc` lets `saddr` be an address that is not local
-/// (Linux FLOWI_FLAG_ANYSRC: IP_TRANSPARENT, IP_HDRINCL)
-pub fn output_flow(
+/// Route a locally generated packet to `daddr` from `saddr` (0 = pick
+/// one) through `oif` (0 = any), the rules seeing `k` (Linux
+/// ip_route_output_key_hash with the flow flowi4_init_output built);
+/// the MTU reflects a learned path MTU
+pub fn output_key(
     net: &NetNamespace,
     daddr: Ipv4Addr,
     saddr: Ipv4Addr,
     oif: u32,
-    anysrc: bool,
+    k: &OutKey,
 ) -> Result<Rtable, KernelError> {
-    let mut rt = output_fib(net, daddr, saddr, oif, anysrc)?;
+    let mut rt = output_fib(net, daddr, saddr, oif, k)?;
     // Linux __mkroute_output: find_exception on the nexthop, then
     // rt_bind_exception
     let genid = fnhe_genid(net);
@@ -142,7 +160,7 @@ fn output_fib(
     mut daddr: Ipv4Addr,
     mut saddr: Ipv4Addr,
     oif: u32,
-    anysrc: bool,
+    k: &OutKey,
 ) -> Result<Rtable, KernelError> {
     let lo = || net.loopback().ok_or(KernelError::NetworkUnreachable);
     if !saddr.is_unspecified() {
@@ -156,7 +174,7 @@ fn output_fib(
         }
         // Linux ip_route_output_key_hash_rcu: a source not ours only
         // with FLOWI_FLAG_ANYSRC
-        if !anysrc {
+        if !k.anysrc {
             src_dev(net, saddr)?;
         }
     }
@@ -187,6 +205,11 @@ fn output_fib(
         saddr,
         oif,
         iif: LOOPBACK_IFINDEX,
+        mark: k.mark,
+        uid: k.uid,
+        proto: k.proto,
+        sport: k.sport,
+        dport: k.dport,
         ..Default::default()
     };
     let res = match net.fib.lookup(&key) {

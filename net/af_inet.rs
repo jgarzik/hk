@@ -214,6 +214,8 @@ impl Inet {
             confirm: false,
             anysrc: self.anysrc(),
             opt: None,
+            mark: 0,
+            uid: 0,
         }
     }
 

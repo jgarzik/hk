@@ -716,11 +716,13 @@ Attribute policies are checked as attributes are read, not all at
 parse time (Linux nla_parse validates every one first, so with several
 bad attributes another may be named), and extended ACKs never carry
 NLMSGERR_ATTR_POLICY (Linux netlink_policy_dump_write_attr).
-Routing rules (`net/core/fib_rules.rs`): route lookups know only the
-destination, the source, the output interface and lo as input (Linux
-flowi4 also carries the socket's mark, uid, TOS, protocol and ports,
-and `ip route get` passes RTA_MARK/RTA_UID/RTA_IP_PROTO/ports): rules on
-fwmark, uidrange, tos/dscp, ipproto or ports see zeros. Rule dumps of
+Routing rules (`net/core/fib_rules.rs`): output lookups carry the
+socket's SO_MARK, owner uid, protocol and ports for UDP, TCP connect
+and data, raw and ping sockets, but never the TOS (rules on tos/dscp
+see 0), and TCP segments sent without the socket lock's send path
+(retransmit timers, TIME_WAIT, resets, SYN-ACKs) and ICMP replies carry
+no mark or uid (Linux: the connect-time flow, the skb's mark); `ip
+route get` passes no RTA_MARK/RTA_UID/RTA_IP_PROTO/ports. Rule dumps of
 other families are EAFNOSUPPORT (Linux lists the IPv6 and IPv4/IPv6
 multicast-routing defaults; hk registers no rules for them). Rule
 changes take RTNL (current Linux: RTNL only for the first custom rule,
