@@ -11,7 +11,7 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::net::NetNamespace;
 use crate::sysctl::range;
@@ -120,6 +120,31 @@ impl NetSysctl {
 
     pub fn somaxconn(&self) -> u32 {
         self.somaxconn.load(Ordering::Relaxed).max(0) as u32
+    }
+}
+
+/// A namespace's sysctl registration (Linux the ctl_table_headers of
+/// net->sysctls): shared by its /proc/sys/net inodes, which hold it,
+/// not the namespace, and marked unregistering once the namespace's
+/// teardown starts (Linux start_unregistering from the pernet exits in
+/// cleanup_net)
+#[derive(Default)]
+pub struct SysctlSet {
+    /// Linux header->unregistering: set once, by `cleanup_net`; read
+    /// with no lock and no reference by revalidate and d_delete
+    /// (proc_sys_revalidate, proc_sys_delete)
+    unregistering: AtomicBool,
+}
+
+impl SysctlSet {
+    /// The namespace is going: its sysctls are no longer found
+    pub fn unregistering(&self) -> bool {
+        self.unregistering.load(Ordering::Acquire)
+    }
+
+    /// Mark it going (Linux start_unregistering)
+    pub fn start_unregistering(&self) {
+        self.unregistering.store(true, Ordering::Release);
     }
 }
 

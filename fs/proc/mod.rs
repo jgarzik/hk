@@ -796,10 +796,9 @@ fn revalidate_ref(inode: &Inode) -> bool {
         return false;
     }
     // A /proc/sys/net entry of a namespace that is going is invalid
-    // (Linux proc_sys_revalidate: !unregistering); the namespace is
-    // looked at with the data's lock released
-    if let Some(live) = with_data(inode, sysctl_live).flatten() {
-        return live.live();
+    // (Linux proc_sys_revalidate: !unregistering)
+    if with_data(inode, sysctl_unregistering).unwrap_or(false) {
+        return false;
     }
     let fd_of = |d: &ProcfsInodeData| match d {
         ProcfsInodeData::FdSymlink { fd, .. } | ProcfsInodeData::FdinfoFile { fd, .. } => Some(*fd),
@@ -2655,30 +2654,13 @@ fn sysctl_permission(
     crate::sysctl::permission(p, cred, mask)
 }
 
-/// What says whether a /proc/sys/net entry's namespace is still there,
-/// copied out of its data (checked with the data's lock released: the
-/// check may drop the namespace's last reference)
-enum SysctlLive {
-    File(crate::sysctl::Entry),
-    Dir(proc_sysctl::NetDir),
-}
-
-impl SysctlLive {
-    fn live(&self) -> bool {
-        match self {
-            Self::File(e) => e.live(),
-            Self::Dir(d) => d.live(),
-        }
-    }
-}
-
-fn sysctl_live(d: &ProcfsInodeData) -> Option<SysctlLive> {
+/// A /proc/sys/net entry whose namespace's teardown started (Linux
+/// PROC_I(inode)->sysctl->unregistering: a flag read, no reference)
+fn sysctl_unregistering(d: &ProcfsInodeData) -> bool {
     match d {
-        ProcfsInodeData::Sysctl { ctl } if ctl.net_id().is_some() => {
-            Some(SysctlLive::File(ctl.clone()))
-        }
-        ProcfsInodeData::SysctlDir { net: Some(n), .. } => Some(SysctlLive::Dir(n.clone())),
-        _ => None,
+        ProcfsInodeData::Sysctl { ctl } => ctl.unregistering(),
+        ProcfsInodeData::SysctlDir { net: Some(n), .. } => n.unregistering(),
+        _ => false,
     }
 }
 
@@ -2899,15 +2881,13 @@ static PROC_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::Dentry
 /// procfs's d_delete at a dentry's last put: a negative one never
 /// stays (Linux: procfs lookups instantiate none, an ENOENT leaves no
 /// dentry), nor a /proc/sys/net entry of a namespace that is going
-/// (Linux proc_sys_delete: the header unregistering); the namespace is
-/// looked at with the inode data's lock released
+/// (Linux proc_sys_delete: the header's unregistering flag, read with
+/// no reference taken)
 fn proc_d_delete(d: &Dentry) -> bool {
     let Some(inode) = d.get_inode() else {
         return true;
     };
-    with_data(&inode, sysctl_live)
-        .flatten()
-        .is_some_and(|l| !l.live())
+    with_data(&inode, sysctl_unregistering).unwrap_or(false)
 }
 
 /// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that

@@ -85,6 +85,10 @@ pub struct NetNamespace {
     /// /proc/sys/net values (`net::sysctl`)
     pub sysctl: crate::net::sysctl::NetSysctl,
 
+    /// Its sysctl registration, held by its /proc/sys/net inodes
+    /// (Linux net->sysctls' headers)
+    pub sysctls: Arc<crate::net::sysctl::SysctlSet>,
+
     /// IPv4 reassembly queues
     pub frags: crate::net::inet::frag::FragTable,
 
@@ -206,6 +210,7 @@ impl NetNamespace {
             tcp: Default::default(),
             port_range: PortRange::default(),
             sysctl: Default::default(),
+            sysctls: try_arc(Default::default())?,
             frags: Default::default(),
             icmp: Default::default(),
             ping: Default::default(),
@@ -474,6 +479,8 @@ fn cleanup_net() {
     });
     drop(l);
     for net in &nets {
+        // Linux the sysctl pernet exits: unregister_net_sysctl_table
+        net.sysctls.start_unregistering();
         crate::net::rtnl::netns_exit(net);
         // Linux ipv4_frags_exit_net
         crate::net::inet::frag::net_exit(net);

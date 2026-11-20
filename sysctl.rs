@@ -55,6 +55,7 @@ pub enum Entry {
         ctl: &'static NetCtl,
         net: Weak<NetNamespace>,
         id: u64,
+        set: alloc::sync::Arc<crate::net::sysctl::SysctlSet>,
     },
 }
 
@@ -82,6 +83,7 @@ impl Entry {
             ctl,
             net: alloc::sync::Arc::downgrade(net),
             id: net.id,
+            set: net.sysctls.clone(),
         }
     }
 
@@ -90,6 +92,7 @@ impl Entry {
     fn grab(&self) -> Result<Grab, KernelError> {
         match self {
             Self::Global(c) => Ok(Grab::Global(c)),
+            Self::Net { set, .. } if set.unregistering() => Err(KernelError::NotFound),
             Self::Net { ctl, net, .. } => net
                 .upgrade()
                 .and_then(|n| n.maybe_get())
@@ -98,9 +101,13 @@ impl Entry {
         }
     }
 
-    /// Still registered (Linux !head->unregistering)
-    pub fn live(&self) -> bool {
-        self.grab().is_ok()
+    /// Its namespace's teardown started (Linux head->unregistering):
+    /// a flag read, no reference taken
+    pub fn unregistering(&self) -> bool {
+        match self {
+            Self::Global(_) => false,
+            Self::Net { set, .. } => set.unregistering(),
+        }
     }
 
     /// Its permission data

@@ -33,6 +33,7 @@ use crate::sysctl::Entry;
 pub struct NetDir {
     net: Weak<NetNamespace>,
     pub id: u64,
+    set: Arc<crate::net::sysctl::SysctlSet>,
 }
 
 impl NetDir {
@@ -40,21 +41,26 @@ impl NetDir {
         Self {
             net: Arc::downgrade(net),
             id: net.id,
+            set: net.sysctls.clone(),
         }
     }
 
     /// In use, or ENOENT once the namespace is going (Linux
     /// sysctl_head_grab on an unregistering header)
     fn grab(&self) -> Result<NetRef, KernelError> {
+        if self.unregistering() {
+            return Err(KernelError::NotFound);
+        }
         self.net
             .upgrade()
             .and_then(|n| n.maybe_get())
             .ok_or(KernelError::NotFound)
     }
 
-    /// Still registered (Linux proc_sys_revalidate: !unregistering)
-    pub fn live(&self) -> bool {
-        self.grab().is_ok()
+    /// The namespace's teardown started (Linux head->unregistering):
+    /// a flag read, no reference taken
+    pub fn unregistering(&self) -> bool {
+        self.set.unregistering()
     }
 }
 

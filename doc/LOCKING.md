@@ -3340,7 +3340,7 @@ holder's. The last holder's put of a hashed dentry its filesystem
 keeps no unused copy of (`DentryOps::d_delete`, Linux retain_dentry:
 a negative one of ramfs, tmpfs, devtmpfs, tracefs, procfs; a procfs
 /proc/sys/net entry of a namespace that is going, proc_sys_delete,
-checked with no d_lock held) first takes
+its `SysctlSet` unregistering flag, read with no reference) first takes
 it out of the tree as the shrinker does (`d_delete_unused` ->
 `prune_one`: the parent's d_lock, then its own, both written; the
 tree's references put after them), so no reference to a hashed dentry
@@ -5907,7 +5907,7 @@ not rely on either.
 | driver `netdev` / `Napi.poller` (`spin::Once<Weak<..>>`) | set once at probe, before the IRQ is registered and the NAPI added | read lock-free by polls (thread) | ISRs never read them (they use the driver struct passed as IRQ data) |
 | `icmp::ICMP_ECHO_REPLY_WQ` | `WaitQueue` | woken by ICMP input (softnet) | kernel self-test waiter only (`selftest.rs`), woken after the reply is recorded |
 | `UnixSock.peer_wait` | `WaitQueue` | thread only | Linux peer_wait: dgram senders blocked on a full peer wait here (no lock held); woken (POLLOUT) by the peer's reads and release; a linked `peer_wake` entry's callback (Linux unix_dgram_peer_wake_relay), under this head, is unlinked by the waker (`add_wait_queue_once`), clears `peer_wake_to` and wakes its socket's `Sock.wq`: `peer_wait` head -> `Sock.wq` head, never the reverse |
-| `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range, ip_local_port_range) is one packed atomic word, so readers never see half an update; the boot port/ISN secret is a `spin::Once`. A /proc/sys/net inode is bound to the namespace it was looked up in (`sysctl::Entry`, `proc_sysctl::NetDir`: a `Weak` and the id, Linux the inode's ctl_table_header of net->sysctls); each open, read, write and ref-mode revalidate takes an active reference for its duration (`maybe_get`, Linux sysctl_head_grab / use_table), ENOENT once there is none, never under the inode data's lock (the drop may be the last); procfs's `d_compare` (`proc_sysctl::compare`, Linux proc_sys_compare) reads the candidate's `ProcRcu.net` id and the caller's own nsproxy, no lock |
+| `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range, ip_local_port_range) is one packed atomic word, so readers never see half an update; the boot port/ISN secret is a `spin::Once`. A /proc/sys/net inode is bound to the namespace it was looked up in (`sysctl::Entry`, `proc_sysctl::NetDir`: a `Weak`, the id and the namespace's `SysctlSet`, Linux the inode's ctl_table_header of net->sysctls); each open, read and write takes an active reference for its duration (`maybe_get`, Linux sysctl_head_grab / use_table), ENOENT once the set is unregistering or there is none, never under the inode data's lock (the drop may be the last). `SysctlSet.unregistering` (Linux header->unregistering) is set once, Release, by `cleanup_net` before the namespace's devices go (Linux the sysctl pernet exits' start_unregistering); ref-mode revalidate and procfs's d_delete read it Acquire under the inode data's read lock, taking no reference (proc_sys_revalidate, proc_sys_delete), so a dput never drops a namespace's reference; procfs's `d_compare` (`proc_sysctl::compare`, Linux proc_sys_compare) reads the candidate's `ProcRcu.net` id and the caller's own nsproxy, no lock |
 | `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier`, `promiscuity`, `allmulti` | atomics | any (`promiscuity`/`allmulti` written only under RTNL) | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
 | e1000 `rx` ring | `spin::Mutex<Option<..>>` | thread only (NAPI poll, open, stop, remove) | leaf; frames are allocated under it with `Gfp::ATOMIC` (Linux napi_alloc_skb; dropped and counted without memory), linked on an `SkbHead` through their own `list` and delivered after it is dropped; also holds `napi_off` (NAPI disabled by `stop`), read by remove after `unregister_netdev` to disable a NAPI that never was; taken out (rings freed) by remove after the chip reset and IRQ free |
 | e1000 `tx` ring | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
@@ -6015,7 +6015,7 @@ netdev_wait_allrefs) because skbs in socket queues hold them.
 A namespace has active references (`NetRef`, Linux net->ns.count:
 tasks' nsproxies and user sockets) and passive ones (its `Arc`, Linux
 net->passive: the memory; TIME_WAIT entries, devices' back pointers,
-walkers; /proc/sys/net inodes hold only a `Weak`). Dropping the last active reference, in any context (a
+walkers; /proc/sys/net inodes hold only a `Weak` and its `SysctlSet`). Dropping the last active reference, in any context (a
 socket's table reference released in `rcuc/N`), pushes the namespace
 on a lock-free list (`CLEANUP_LIST`, Linux cleanup_list) and queues one
 static work item on the `netns` workqueue, allocating nothing (Linux
