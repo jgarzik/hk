@@ -77,7 +77,7 @@ fn test_datagram() {
     let mut seen = false;
     for _ in 0..20 {
         let n = recv(raw, &mut buf, MSG_DONTWAIT);
-        if n >= 32 && buf[0] == 0x48 && buf[22..24] == rp.to_be_bytes() {
+        if n >= 36 && buf[0] == 0x48 && buf[34..36] == rp.to_be_bytes() {
             seen = buf[20..32] == want;
             break;
         }
