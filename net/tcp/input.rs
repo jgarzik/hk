@@ -670,6 +670,8 @@ impl TcpCb {
             let (t, tx) = (f.tcp(), skb_mstamp_us(f));
             let acked_pcount;
             let mut fully = true;
+            // Where the skb starts once its acked head is trimmed
+            let mut at = t.seq;
             if after(t.end_seq, self.snd_una) {
                 if t.pcount() == 1 || !after(self.snd_una, t.seq) {
                     break;
@@ -678,6 +680,7 @@ impl TcpCb {
                 if acked_pcount == 0 {
                     break;
                 }
+                at = self.snd_una;
                 fully = false;
             } else {
                 acked_pcount = t.pcount();
@@ -710,7 +713,8 @@ impl TcpCb {
             }
             self.packets_out = self.packets_out.saturating_sub(acked_pcount);
             pkts_acked += acked_pcount;
-            self.rate_skb_delivered(st, t.seq);
+            // Linux tcp_rate_skb_delivered: the skb as trimmed
+            self.rate_skb_delivered(st, at);
             flg |= flag::DATA_ACKED;
             fully_acked = fully;
             if !fully {
@@ -1037,5 +1041,41 @@ impl TcpCb {
             TcpState::FinWait2 => self.time_wait(out),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mm::page_alloc::Gfp;
+
+    /// A partially acknowledged skb of two segments is trimmed, then
+    /// sampled as trimmed (Linux tcp_clean_rtx_queue: tcp_tso_acked,
+    /// then tcp_rate_skb_delivered on the same skb)
+    #[test]
+    fn partial_ack_rate_sample() {
+        let mut cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
+        let seq = 1000;
+        let mut skb = SkBuff::alloc_tx(2000, Gfp::KERNEL).unwrap();
+        skb.put_slice(&[0; 2000]).unwrap();
+        let t = skb.tcp_mut();
+        t.seq = seq;
+        t.end_seq = seq + 2000;
+        t.set_pcount(2);
+        t.set_gso_size(1000);
+        t.tx_delivered = 5;
+        t.tx_delivered_mstamp = 1;
+        skb.tstamp = 1000;
+        cb.rtx
+            .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
+        cb.packets_out = 2;
+        cb.snd_max = seq + 2000;
+        cb.snd_nxt = cb.snd_max;
+        cb.snd_una = seq + 1000;
+        let mut st = SackState::default();
+        cb.clean_rtx_queue(seq, seq, &mut st);
+        assert_eq!(cb.rtx_head(), Some(seq + 1000));
+        assert_eq!(cb.packets_out, 1);
+        assert_eq!(st.prior_delivered, Some(5));
     }
 }
