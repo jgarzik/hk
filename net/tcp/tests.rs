@@ -16,6 +16,8 @@ use crate::util::error::KernelError;
 
 /// Buffers and memory (`buf.rs`)
 mod buf;
+/// Passive Fast Open children (`fastopen.rs`)
+mod fastopen;
 
 /// A segment as the wire sees it: header fields and payload
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

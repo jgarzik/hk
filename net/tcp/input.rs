@@ -236,15 +236,19 @@ impl TcpCb {
         // The handshake's RTT (Linux tcp_ack of the SYN-ACK,
         // tcp_synack_rtt_meas): our SYN's or SYN-ACK's unless it was
         // resent (Karn), else the timestamp echo; none: RFC 6298 5.7's
-        // 3 s (tcp_init_metrics)
-        let rtt = if self.syn_rtx {
-            -1
-        } else {
-            self.tcp_mstamp.saturating_sub(self.syn_mstamp) as i64
-        };
-        let mut st = SackState::default();
-        (st.seq_rtt_us, st.ca_rtt_us) = (rtt, rtt);
-        self.ack_update_rtt(s, flag::SYN_ACKED, &mut st);
+        // 3 s (tcp_init_metrics). A child measures only without an
+        // estimate yet (tcp_rcv_state_process: a Fast Open child's
+        // tcp_ack may have sampled the data it sent)
+        if !self.passive || self.srtt_us == 0 {
+            let rtt = if self.syn_rtx {
+                -1
+            } else {
+                self.tcp_mstamp.saturating_sub(self.syn_mstamp) as i64
+            };
+            let mut st = SackState::default();
+            (st.seq_rtt_us, st.ca_rtt_us) = (rtt, rtt);
+            self.ack_update_rtt(s, flag::SYN_ACKED, &mut st);
+        }
         if self.srtt_us == 0 {
             self.set_rto_fallback();
         }
@@ -587,17 +591,27 @@ impl TcpCb {
                 out.req_ack = Some(skb);
                 return;
             }
-            self.update_ts_recent(s);
-            // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
-            self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
-            self.snd_una = s.ack;
-            if !self.passive {
+            if self.passive {
+                // Linux tcp_create_openreq_child: the child's SND.UNA is
+                // past its SYN-ACK; tcp_rcv_state_process then runs
+                // tcp_ack(FLAG_SLOWPATH), which cleans what a Fast Open
+                // child sent meanwhile from the retransmit queue
+                self.snd_una = self.iss.wrapping_add(1);
+                self.syn_unacked = false;
+                if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
+                    return;
+                }
+            } else {
+                self.update_ts_recent(s);
+                // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
+                self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
+                self.snd_una = s.ack;
                 // Simultaneous open: our SYN is on the retransmit queue,
                 // acked in tcp_ack (tcp_clean_rtx_queue, TCPDelivered)
                 self.count_delivered(1);
                 self.net_stat(LINUX_MIB_TCPDELIVERED);
+                self.syn_unacked = false;
             }
-            self.syn_unacked = false;
             // SYN-ACK delivery, which tcp_ack does not track
             self.count_delivered(1);
             self.established(s, now, out);
