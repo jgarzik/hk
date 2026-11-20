@@ -672,6 +672,16 @@ const fn box_of<T>() -> (usize, usize) {
     (core::mem::size_of::<T>(), core::mem::align_of::<T>())
 }
 
+/// The block an `Arc<T>` allocates: its two counts, then `T`
+/// (`kalloc::arc_layout`, as a const)
+const fn arc_of<T>() -> (usize, usize) {
+    let (size, align) = box_of::<T>();
+    let word = core::mem::align_of::<usize>();
+    let align = if align > word { align } else { word };
+    let off = (2 * core::mem::size_of::<usize>()).next_multiple_of(align);
+    ((off + size).next_multiple_of(align), align)
+}
+
 macro_rules! named_cache {
     ($name:literal, $layout:expr) => {{
         crate::percpu! {
@@ -692,6 +702,12 @@ pub static INODE_CACHE: KmemCache =
 pub static BH_CACHE: KmemCache = named_cache!(
     "buffer_head",
     box_of::<crate::fs::pageio::buffer::BufferHead>()
+);
+/// TCP TIME_WAIT entries (`Arc<TimeWait>`; Linux tcp_prot's twsk_slab,
+/// "tw_sock_TCP")
+pub static TW_CACHE: KmemCache = named_cache!(
+    "tw_sock_TCP",
+    arc_of::<crate::net::tcp::timewait::TimeWait>()
 );
 
 /// Pages for the caches made here (host tests: their own)
@@ -732,7 +748,13 @@ static OWN: [&KmemCache; 1] = [&FILP_CACHE];
 /// allocation of exactly their type's layout (another type of the same
 /// size and alignment shares it, like Linux slab merging); keeps them
 /// out of the kmalloc caches and counted per type.
-static NAMED: [&KmemCache; 4] = [&VMA_CACHE, &DENTRY_CACHE, &INODE_CACHE, &BH_CACHE];
+static NAMED: [&KmemCache; 5] = [
+    &VMA_CACHE,
+    &DENTRY_CACHE,
+    &INODE_CACHE,
+    &BH_CACHE,
+    &TW_CACHE,
+];
 
 /// The cache that serves a layout: a named cache of exactly that
 /// layout, else the kmalloc class
@@ -1090,6 +1112,11 @@ pub mod tests {
         assert!(core::ptr::eq(cache_for(s, a).unwrap(), &DENTRY_CACHE));
         let (s, a) = box_of::<crate::fs::inode::Inode>();
         assert!(core::ptr::eq(cache_for(s, a).unwrap(), &INODE_CACHE));
+        use crate::net::tcp::timewait::TimeWait;
+        let l = crate::util::kalloc::arc_layout::<TimeWait>();
+        assert_eq!(arc_of::<TimeWait>(), (l.size(), l.align()));
+        let tw = cache_for(l.size(), l.align()).unwrap();
+        assert!(core::ptr::eq(tw, &TW_CACHE));
     }
 
     #[test]

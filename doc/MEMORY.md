@@ -38,7 +38,8 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
   the kernel half) and `ap_entry` switches to the kernel table.
 - **Kernel memory**: the heap is the slab allocator (`mm/slab.rs`,
   kmalloc caches 8 B-8 KB, pages above; named caches for VMAs,
-  dentries and inodes, chosen by exact layout) over the page allocator,
+  dentries, inodes, buffer heads and TCP TIME_WAIT entries, chosen by
+  exact layout) over the page allocator,
   through the direct map (a 256 KB boot arena in the image serves boot
   until the page allocator is up); DMA buffers are physically
   contiguous frame runs, also through the direct map. Kernel stacks
