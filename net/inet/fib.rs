@@ -963,7 +963,9 @@ pub fn fib_del_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa
     if scan.ok & LOCAL_OK == 0 {
         del(RouteType::Local, ifa.local, 32);
         // The local address finally disappeared: flush stray routes
-        if scan.gone && net.fib.dev_addr_type(Some(dev), ifa.local) != RouteType::Local {
+        // Local on any device keeps its routes (Linux
+        // inet_addr_type_dev_table: __inet_dev_addr_type with no device)
+        if scan.gone && net.fib.dev_addr_type(None, ifa.local) != RouteType::Local {
             let n = fib_sync_down_addr(rtnl, net, ifa.local);
             if n > 0 {
                 fib_flush(rtnl, net, n);

@@ -22,6 +22,7 @@ pub fn run_tests() {
     crate::helpers::println(b"=== FIB Flush Tests ===");
     test_linkdown();
     test_prefsrc();
+    test_shared_addr();
 }
 
 /// A main-table /32 route to `dst`: via `gw` (0 = on link) through
@@ -198,6 +199,56 @@ fn test_prefsrc() {
         r.attr(RTA_DST, &[198, 51, 100, k]);
         nl.ack(&mut r);
     }
+    addr(&mut nl, false, i, TEST_IP, 24, 0);
+    set_link_up(&mut nl, i, false);
+    match result {
+        Ok(()) => pass(N),
+        Err((what, v)) => fail_why(N, what, v),
+    }
+}
+
+/// FIB_DEL_SHARED_ADDR: an address still local on another device keeps
+/// the routes preferring it when one copy goes (Linux fib_del_ifaddr:
+/// inet_addr_type_dev_table looks on every device)
+fn test_shared_addr() {
+    const N: &[u8] = b"FIB_DEL_SHARED_ADDR";
+    let Some(mut nl) = Nl::open() else {
+        return fail_why(N, b"open", 0);
+    };
+    let Some(eth) = first_ether(&mut nl) else {
+        return fail_why(N, b"no ethernet link", 0);
+    };
+    let i = eth.index;
+    set_link_up(&mut nl, i, true);
+    let dst = [198, 51, 100, 200];
+    let result = (|| -> Result<(), (&'static [u8], i64)> {
+        let e = addr(&mut nl, true, i, TEST_IP, 24, NLM_F_CREATE | NLM_F_EXCL);
+        if e != 0 {
+            return Err((b"newaddr eth", e as i64));
+        }
+        let e = addr(&mut nl, true, 1, TEST_IP, 32, NLM_F_CREATE | NLM_F_EXCL);
+        if e != 0 {
+            return Err((b"newaddr lo", e as i64));
+        }
+        let e = route32(&mut nl, dst, [0; 4], 1, TEST_IP);
+        if e != 0 {
+            return Err((b"route via lo", e as i64));
+        }
+        let e = addr(&mut nl, false, 1, TEST_IP, 32, 0);
+        if e != 0 {
+            return Err((b"deladdr lo", e as i64));
+        }
+        let ours = |m: &Msg| m.attr_ip(12, RTA_DST) == Some(dst);
+        let n = count(&mut nl, RT_TABLE_MAIN, &mut |m| ours(m));
+        if n != 1 {
+            return Err((b"route left", n as i64));
+        }
+        Ok(())
+    })();
+    let mut r = Req::new(RTM_DELROUTE, 0, &rtmsg(32, RT_TABLE_MAIN, 0, 255, 0));
+    r.attr(RTA_DST, &dst);
+    nl.ack(&mut r);
+    addr(&mut nl, false, 1, TEST_IP, 32, 0);
     addr(&mut nl, false, i, TEST_IP, 24, 0);
     set_link_up(&mut nl, i, false);
     match result {
