@@ -126,7 +126,6 @@ impl TcpCb {
         self.snd_wnd = self.seg_wnd(s);
         self.max_wnd = self.max_wnd.max(self.snd_wnd);
         self.snd_wl1 = s.seq;
-        self.snd_wl2 = s.ack;
         // The handshake's RTT (Linux tcp_ack of the SYN-ACK,
         // tcp_synack_rtt_meas): our SYN's or SYN-ACK's unless it was
         // resent (Karn), else the timestamp echo; none: RFC 6298 5.7's
@@ -512,11 +511,8 @@ impl TcpCb {
         } else {
             self.net_stat(LINUX_MIB_TCPPUREACKS);
         }
-        if self.may_update_window(s) {
-            flg |= flag::WIN_UPDATE;
-        }
         self.update_ts_recent(s);
-        self.update_window(s, out);
+        flg |= self.ack_update_window(s, out);
         if !blocks.is_empty() {
             flg |= self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
         }
@@ -586,26 +582,34 @@ impl TcpCb {
         d
     }
 
-    /// The window of an acceptable ACK (SND.WL1/WL2 rule); one opening a
-    /// zero window stops the probes (Linux tcp_ack_probe)
-    fn update_window(&mut self, s: &SegIn, out: &mut Out) {
-        let old_wnd = self.snd_wnd;
-        if before(self.snd_wl1, s.seq) || (self.snd_wl1 == s.seq && !before(s.ack, self.snd_wl2)) {
-            self.snd_wnd = self.seg_wnd(s);
-            self.snd_wl1 = s.seq;
-            self.snd_wl2 = s.ack;
-            self.max_wnd = self.max_wnd.max(self.snd_wnd);
-            if old_wnd == 0
-                && self.snd_wnd > 0
-                && self.live.tmr.get().is_some_and(|t| t.0 == Tmr::Probe)
-            {
-                // Linux tcp_ack_probe
-                self.live.tmr.set(None);
-                self.live.backoff.set(0);
-                self.probes_tstamp = None;
-                out.wake |= wake::SPACE;
-            }
+    /// The window of an acceptable ACK, taken when Linux
+    /// tcp_may_update_window allows (tcp_ack_update_window: SND.WL1
+    /// follows; a changed window with data waiting may restart an idle
+    /// window); one opening a zero window stops the probes (Linux
+    /// tcp_ack_probe). Returns FLAG_WIN_UPDATE if taken
+    fn ack_update_window(&mut self, s: &SegIn, out: &mut Out) -> u32 {
+        if !self.may_update_window(s) {
+            return 0;
         }
+        self.snd_wl1 = s.seq;
+        let nwin = self.seg_wnd(s);
+        if self.snd_wnd == nwin {
+            return flag::WIN_UPDATE;
+        }
+        let old_wnd = self.snd_wnd;
+        self.snd_wnd = nwin;
+        if self.send_head() {
+            self.slow_start_after_idle_check(self.clock);
+        }
+        self.max_wnd = self.max_wnd.max(nwin);
+        if old_wnd == 0 && nwin > 0 && self.live.tmr.get().is_some_and(|t| t.0 == Tmr::Probe) {
+            // Linux tcp_ack_probe
+            self.live.tmr.set(None);
+            self.live.backoff.set(0);
+            self.probes_tstamp = None;
+            out.wake |= wake::SPACE;
+        }
+        flag::WIN_UPDATE
     }
 
     /// Linux tcp_ack_update_rtt: the RTT of the packets acked or SACKed

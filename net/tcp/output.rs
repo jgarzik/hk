@@ -236,7 +236,7 @@ impl TcpCb {
     }
 
     /// Data or a FIN not sent yet (Linux tcp_send_head)
-    fn send_head(&self) -> bool {
+    pub(super) fn send_head(&self) -> bool {
         self.snd_nxt != self.write_seq.wrapping_add(u32::from(self.fin_queued))
     }
 

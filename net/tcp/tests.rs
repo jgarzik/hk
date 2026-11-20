@@ -3148,3 +3148,29 @@ fn old_ack_updates_ts_recent() {
     assert_eq!(p.a.ts_recent, tsv);
     assert_eq!(p.a.snd_wnd, wnd);
 }
+
+/// A duplicate ACK at SND.WL1 may only grow the window or close it
+/// (Linux tcp_may_update_window: seq == wl1 needs nwin > snd_wnd or
+/// nwin == 0); a smaller nonzero window there is ignored
+#[test]
+fn dup_ack_does_not_shrink_window() {
+    let mut p = Pair::new(1000);
+    p.send_a(&pattern(5000));
+    p.run();
+    let wnd = p.a.snd_wnd;
+    assert!(wnd > 1 << p.a.snd_wscale);
+    let dup = SegIn {
+        seq: p.a.rcv_nxt,
+        ack: p.a.snd_una,
+        flags: flags::ACK,
+        wnd: 1,
+        ts: Some((p.a.ts_recent.wrapping_add(1), 0)),
+        ..Default::default()
+    };
+    p.a.feed(&dup, p.now, &mut Out::default());
+    assert_eq!(p.a.snd_wnd, wnd);
+    // A zero window at WL1 is taken
+    let zero = SegIn { wnd: 0, ..dup };
+    p.a.feed(&zero, p.now, &mut Out::default());
+    assert_eq!(p.a.snd_wnd, 0);
+}

@@ -773,8 +773,9 @@ pub struct TcpCb {
     pub snd_max: u32,
     /// Peer's window in bytes (scaled)
     pub snd_wnd: u32,
+    /// Linux snd_wl1: the sequence of the segment that last updated the
+    /// window
     pub(super) snd_wl1: u32,
-    pub(super) snd_wl2: u32,
     /// Largest window the peer offered (RFC 5961 ACK range)
     pub(super) max_wnd: u32,
     /// Unsent data (Linux sk_write_queue): skbs of up to an MSS each,
@@ -1005,7 +1006,6 @@ impl TcpCb {
             snd_max: Default::default(),
             snd_wnd: Default::default(),
             snd_wl1: Default::default(),
-            snd_wl2: Default::default(),
             max_wnd: Default::default(),
             wq: Default::default(),
             rtx: Default::default(),
@@ -1181,7 +1181,6 @@ impl TcpCb {
         self.snd_wnd = u32::from(s.wnd);
         self.max_wnd = self.snd_wnd;
         self.snd_wl1 = s.seq;
-        self.snd_wl2 = s.ack;
         self.peer_mss = s.mss.map_or(MSS_DEFAULT, |m| u32::from(m).max(64));
         match s.ws {
             Some(w) if self.wscale_ok => {
