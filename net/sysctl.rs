@@ -37,6 +37,8 @@ pub struct NetSysctl {
     pub icmp_msgs_burst: AtomicI32,
     pub tcp_syn_retries: AtomicU8,
     pub tcp_synack_retries: AtomicU8,
+    /// SYN cookies: 0 never, 1 when the SYN queue is full, 2 always
+    pub tcp_syncookies: AtomicU8,
     pub tcp_retries2: AtomicU8,
     /// tcp_fin_timeout in seconds
     pub tcp_fin_timeout: AtomicI32,
@@ -109,6 +111,8 @@ impl Default for NetSysctl {
             icmp_msgs_burst: AtomicI32::new(50),
             tcp_syn_retries: AtomicU8::new(6),
             tcp_synack_retries: AtomicU8::new(5),
+            // Linux tcp_sk_init
+            tcp_syncookies: AtomicU8::new(1),
             tcp_retries2: AtomicU8::new(15),
             tcp_fin_timeout: AtomicI32::new(60),
             tcp_window_scaling: AtomicU8::new(1),
@@ -487,6 +491,14 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_u8(n, |s| &s.tcp_synack_retries),
         store: |n, v| set_u8(n, |s| &s.tcp_synack_retries, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_syncookies",
+        mode: 0o644,
+        global: false,
+        show: |n| get_u8(n, |s| &s.tcp_syncookies),
+        store: |n, v| set_u8(n, |s| &s.tcp_syncookies, v),
         text: None,
     },
     NetCtl {

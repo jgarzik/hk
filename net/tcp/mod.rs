@@ -58,6 +58,7 @@ pub mod netns;
 pub mod output;
 pub mod recovery;
 pub mod sack;
+pub mod syncookies;
 pub mod table;
 #[cfg(test)]
 mod tests;
@@ -200,6 +201,12 @@ impl Accept {
     fn full(&self) -> bool {
         self.ready.len() as u32 > self.backlog
     }
+
+    /// Linux inet_csk_reqsk_queue_is_full: requests (SYN_RECEIVED
+    /// children) at the backlog
+    fn reqsk_full(&self) -> bool {
+        self.syn.len() as u32 >= self.backlog
+    }
 }
 
 /// A connection as lockless readers see it (Linux's fields tcp_poll,
@@ -278,6 +285,13 @@ pub struct TcpSock {
     /// lockless SYN path (Linux reads the listener's fields with no
     /// lock): copied at the end of every locked step in LISTEN; leaf
     listen_opts: Mutex<cb::Opts>,
+    /// A listener's last SYN queue overflow, jiffies (Linux
+    /// rx_opt.ts_recent_stamp of a listener: tcp_synq_overflow,
+    /// written and read with no lock)
+    synq_overflow_ts: AtomicU32,
+    /// The SYN flood warning was printed (Linux
+    /// queue->synflood_warned, once per socket)
+    synflood_warned: AtomicBool,
     me: Weak<TcpSock>,
 }
 
@@ -461,6 +475,8 @@ impl TcpSock {
             accept_link: Link::new(),
             accept_owner: Owner::new(),
             listen_opts: Mutex::new(cb::Opts::default()),
+            synq_overflow_ts: AtomicU32::new(0),
+            synflood_warned: AtomicBool::new(false),
             me: me.clone(),
         })
     }
@@ -886,7 +902,8 @@ impl TcpSock {
         let _ = skb.pull(doff);
         let s = &s;
         if g.cb.state == TcpState::Listen {
-            return self.conn_request(s, t, now, skb.tcp().tw_isn);
+            let isn = skb.tcp().tw_isn;
+            return self.conn_request(s, skb, t, now, isn);
         }
         if g.tuple != Some(t) {
             return;
@@ -970,23 +987,30 @@ impl TcpSock {
             drop(self.rcv(skb, t));
             return;
         }
-        let Some(s) = seg_of(&skb) else {
+        // The header, then the payload alone (Linux __skb_pull)
+        let mut skb = skb;
+        let Some((s, doff)) = output::parse(skb.data()) else {
             return;
         };
+        let _ = skb.pull(doff);
         let isn = skb.tcp().tw_isn;
-        drop(skb);
-        self.conn_request(&s, t, now_ms(), isn);
+        self.conn_request(&s, skb, t, now_ms(), isn);
     }
 
-    /// A segment in LISTEN (Linux tcp_rcv_state_process,
-    /// tcp_conn_request): a SYN makes a child in SYN_RECEIVED that
-    /// answers with SYN-ACK. Dropped when the accept queue or the SYN
-    /// queue is full (no syncookies). Takes no lock of the listener but
-    /// its queue's (the options and buffer sizes are read as published).
+    /// A segment in LISTEN (Linux tcp_v4_do_rcv's TCP_LISTEN case,
+    /// tcp_rcv_state_process, tcp_conn_request): an ACK may complete a
+    /// SYN cookie (`cookie_check`), else is answered with RST; a SYN
+    /// makes a child in SYN_RECEIVED that answers with SYN-ACK, or a
+    /// cookie SYN-ACK when the SYN queue is full (`syn_flood_action`).
+    /// Takes no lock of the listener but its queue's (the options and
+    /// buffer sizes are read as published). `skb` holds the payload.
     /// `isn`: a TIME_WAIT takeover's ISN (Linux tcp_tw_isn), else 0; such
     /// a request is not limited by the SYN queue (Linux: "TW buckets are
     /// converted to open requests without limitations")
-    fn conn_request(&self, s: &SegIn, t: Tuple, now: u64, isn: u32) {
+    fn conn_request(&self, s: &SegIn, skb: Box<SkBuff>, t: Tuple, now: u64, isn: u32) {
+        if !s.has(flags::SYN) && self.cookie_check(s, skb, t, now).is_none() {
+            return;
+        }
         if s.has(flags::RST) {
             return;
         }
@@ -1001,25 +1025,185 @@ impl TcpSock {
         if !s.has(flags::SYN) || s.has(flags::FIN) {
             return;
         }
-        {
+        let syncookies = self.sk.net.sysctl.tcp_syncookies.load(Ordering::Relaxed);
+        let (reqq_full, acceptq_full) = {
             let q = self.queue.lock();
             let Some(q) = q.as_ref() else {
                 return;
             };
-            if q.syn.len() as u32 >= q.backlog.max(1) && isn == 0 {
-                // Linux tcp_syn_flood_action without syncookies
-                self.sk.net.mib.net.inc(LINUX_MIB_TCPREQQFULLDROP);
+            (q.reqsk_full(), q.full())
+        };
+        let mut want_cookie = false;
+        if (syncookies == 2 || reqq_full) && isn == 0 {
+            want_cookie = self.syn_flood_action(syncookies);
+            if !want_cookie {
                 self.listen_drop();
                 return;
             }
-            if q.full() {
-                self.listen_overflow();
-                return;
-            }
+        }
+        if acceptq_full {
+            self.listen_overflow();
+            return;
         }
         let opts = *self.listen_opts.lock();
-        let caps = (self.sk.rcvbuf(), self.sk.sndbuf(), self.userlocks());
+        let caps = self.child_caps();
+        if want_cookie {
+            return self.cookie_synack(s, t, &opts, caps, now);
+        }
         self.child(s, t, opts, caps, now, isn);
+    }
+
+    /// The buffer limits a child inherits: receive, send, SO_RCVBUF set
+    fn child_caps(&self) -> (u32, u32, u8) {
+        (self.sk.rcvbuf(), self.sk.sndbuf(), self.userlocks())
+    }
+
+    /// Linux tcp_syn_flood_action: the SYN queue is full (or
+    /// tcp_syncookies is 2); true if a cookie answers. The first time,
+    /// a warning (not with tcp_syncookies 2; net_info_ratelimited)
+    fn syn_flood_action(&self, syncookies: u8) -> bool {
+        use crate::util::ratelimit::{
+            DEFAULT_RATELIMIT_BURST, DEFAULT_RATELIMIT_INTERVAL, RatelimitState,
+        };
+        static NET_RATELIMIT: RatelimitState =
+            RatelimitState::new(DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST);
+        let want = syncookies != 0;
+        let (mib, msg) = if want {
+            (LINUX_MIB_TCPREQQFULLDOCOOKIES, "Sending cookies")
+        } else {
+            (LINUX_MIB_TCPREQQFULLDROP, "Dropping request")
+        };
+        self.sk.net.mib.net.inc(mib);
+        if syncookies != 2
+            && !self.synflood_warned.swap(true, Ordering::Relaxed)
+            && NET_RATELIMIT.ratelimit("net_ratelimit")
+        {
+            let a = self.inet.get();
+            crate::printkln!(
+                "TCP: Possible SYN flooding on port {}:{}. {}.",
+                a.rcv_saddr,
+                a.sport,
+                msg
+            );
+        }
+        want
+    }
+
+    /// Answer the SYN `s` with a cookie SYN-ACK, keeping nothing (Linux
+    /// tcp_conn_request with want_cookie: cookie_init_sequence, counting
+    /// SyncookiesSent and noting the overflow, then tcp_v4_send_synack
+    /// with TCP_SYNACK_COOKIE; `opts` and `caps` the listener's)
+    fn cookie_synack(&self, s: &SegIn, t: Tuple, opts: &cb::Opts, caps: (u32, u32, u8), now: u64) {
+        let net = &self.sk.net;
+        let c = cfg(net);
+        let (r, mss) = syncookies::request(s, &c, opts.user_mss);
+        syncookies::synq_overflow(&self.synq_overflow_ts, now);
+        net.mib.net.inc(LINUX_MIB_SYNCOOKIESSENT);
+        let (isn, _) = syncookies::init_sequence(&t, s.seq, mss, now);
+        let oif = self.oif();
+        let a = syncookies::Synack {
+            rcvbuf: caps.0,
+            rcvbuf_locked: caps.2 & buf::RCVBUF_LOCK != 0,
+            window_clamp: opts.window_clamp,
+            user_mss: opts.user_mss,
+            adv_mss: route_mss(net, t.raddr, t.laddr, oif),
+            ts_off: if c.ts == 1 { ts_off(&t) } else { 0 },
+        };
+        let h = syncookies::synack(s, &r, isn, &c, &a, now);
+        xmit(net, &t, &h, self.inet.params(), oif);
+        net.mib.tcp.inc(TCP_MIB_OUTSEGS);
+    }
+
+    /// An ACK to the listener may complete a SYN cookie (Linux
+    /// tcp_v4_cookie_check -> cookie_v4_check, cookie_tcp_check): with
+    /// tcp_syncookies, after a recent SYN queue overflow, a valid cookie
+    /// whose timestamp names only enabled options makes the child
+    /// (`cookie_child`). Handed back when the listener answers the
+    /// segment itself (no cookie: RST); consumed when a child was made
+    /// or the accept queue is full (dropped)
+    fn cookie_check(&self, s: &SegIn, skb: Box<SkBuff>, t: Tuple, now: u64) -> Option<Box<SkBuff>> {
+        let net = &self.sk.net;
+        let on = net.sysctl.tcp_syncookies.load(Ordering::Relaxed) != 0;
+        if !on || !s.has(flags::ACK) || s.has(flags::RST) {
+            return Some(skb);
+        }
+        if syncookies::synq_no_recent_overflow(&self.synq_overflow_ts, now) {
+            return Some(skb);
+        }
+        let mss = syncookies::check(&t, s.seq, s.ack, now);
+        if mss == 0 {
+            net.mib.net.inc(LINUX_MIB_SYNCOOKIESFAILED);
+            return Some(skb);
+        }
+        net.mib.net.inc(LINUX_MIB_SYNCOOKIESRECV);
+        let c = cfg(net);
+        // tcp_parse_options: a timestamp only with tcp_timestamps; its
+        // echo less our offset (secure_tcp_ts_off: 0 unless the sysctl
+        // is 1)
+        let mut ts = s.ts.filter(|_| c.ts != 0);
+        let mut tsoff = 0;
+        if let Some((v, e)) = ts
+            && e != 0
+        {
+            tsoff = if c.ts == 1 { ts_off(&t) } else { 0 };
+            ts = Some((v, e.wrapping_sub(tsoff)));
+        }
+        let r = syncookies::timestamp_decode(ts, &c)?;
+        // tcp_v4_syn_recv_sock: a full accept queue drops it
+        if self.acceptq_full() {
+            self.listen_overflow();
+            return None;
+        }
+        let req = syncookies::Req { r, mss, tsoff };
+        self.cookie_child(s, skb, t, &req, now);
+        None
+    }
+
+    /// Make the child of a valid cookie ACK `s` (Linux
+    /// cookie_tcp_reqsk_alloc, tcp_get_cookie_sock: tcp_v4_syn_recv_sock
+    /// hashes it and inherits the port, inet_csk_reqsk_queue_add queues
+    /// it, then tcp_child_process feeds it the ACK, which completes the
+    /// handshake and wakes the listener). A tuple already in ehash drops
+    /// it silently (inet_ehash_nolisten's found_dup_sk)
+    fn cookie_child(&self, s: &SegIn, skb: Box<SkBuff>, t: Tuple, req: &syncookies::Req, now: u64) {
+        let syn = req.syn(s);
+        let o = Open {
+            iss: s.ack.wrapping_sub(1),
+            ts_off: req.tsoff,
+            mss: route_mss(&self.sk.net, t.raddr, t.laddr, self.oif()),
+        };
+        let opts = *self.listen_opts.lock();
+        let caps = self.child_caps();
+        let Some((c, eh)) = self.new_child(&t) else {
+            return;
+        };
+        let mut b = c.lock.bh_lock();
+        let Some(g) = b.get() else {
+            return;
+        };
+        let mut cb = self.child_cb(&c, opts, caps);
+        cb.cookie_open(&syn, o, now);
+        g.cb = cb;
+        if !self.sk.net.tcp.hash(t, &eh, &c) {
+            return;
+        }
+        g.tuple = Some(t);
+        g.eh = Some(eh);
+        if !self.sk.net.tcp.inherit(&c, t.lport) {
+            self.listen_drop();
+            c.forget(g);
+            return;
+        }
+        g.bound = true;
+        g.parent = Some(self.me.clone());
+        if !self.child_ready(&c) {
+            // Not listening any more (inet_csk_reqsk_queue_add fails)
+            c.forget(g);
+            return;
+        }
+        let mut out = Out::default();
+        g.cb.input(s, skb, now, &mut out);
+        c.finish(g, &mut out);
     }
 
     /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK
@@ -1029,24 +1213,7 @@ impl TcpSock {
     /// GFP_ATOMIC before any lock is taken (Linux inet_reqsk_alloc,
     /// sk_clone_lock)
     fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (u32, u32, u8), now: u64, isn: u32) {
-        // Out of memory: drop the SYN (Linux inet_reqsk_alloc failing in
-        // tcp_conn_request: tcp_listendrop)
-        let Ok(c) = with_gfp(Gfp::ATOMIC, || TcpSock::new(Sock::clone_from(&self.sk))) else {
-            self.listen_drop();
-            return;
-        };
-        c.inet.clone_opts(&self.inet);
-        {
-            let mut a = c.inet.addr.lock();
-            a.rcv_saddr = t.laddr;
-            a.saddr = t.laddr;
-            a.sport = t.lport;
-            a.daddr = t.raddr;
-            a.dport = t.rport;
-        }
-        // Its ehash entry, GFP_ATOMIC with the child, before any lock
-        let Ok(eh) = table::Eh::new(&self.sk.net, Ent::Sk(c.clone()), Gfp::ATOMIC) else {
-            self.listen_drop();
+        let Some((c, eh)) = self.new_child(&t) else {
             return;
         };
         let mut out = Out::default();
@@ -1059,22 +1226,7 @@ impl TcpSock {
         let Some(g) = b.get() else {
             return;
         };
-        // TCP_SYNCNT of a listener bounds its SYN-ACK retries (Linux
-        // reqsk_timer_handler)
-        let mut kc = cfg(&self.sk.net);
-        if opts.syncnt != 0 {
-            kc.synack_retries = opts.syncnt;
-        }
-        let mut cb = TcpCb::new(kc, Arc::clone(&c.live));
-        cb.mib = Some(Arc::clone(&self.sk.net.mib));
-        cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
-        cb.opts = opts;
-        // Linux tcp_ca_openreq_child: the namespace's default unless the
-        // listener chose one (icsk_ca_setsockopt)
-        if !cb.opts.ca_set {
-            cb.opts.ca = self.sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
-        }
-        (cb.rcvbuf, cb.sndbuf, cb.userlocks) = caps;
+        let mut cb = self.child_cb(&c, opts, caps);
         cb.passive(s, o, now, &mut out);
         g.cb = cb;
         if !self.sk.net.tcp.hash(t, &eh, &c) {
@@ -1093,18 +1245,70 @@ impl TcpSock {
         };
         if !queued {
             // The listener closed meanwhile (Linux: the request finds
-            // no listener): the child leaves the tables unanswered
-            g.parent = None;
-            g.cb.set_closed(&mut Out::default());
-            let mut gone = Out {
-                done: true,
-                ..Out::default()
-            };
-            let _ = c.post(g, &mut gone);
+            // no listener)
+            c.forget(g);
             return;
         }
         // SYN-ACK: nobody waits on a new child, no wakeup
         let _ = c.apply(g, &mut out);
+    }
+
+    /// A child for `t` and its ehash entry, allocated GFP_ATOMIC before
+    /// any lock is taken (Linux inet_reqsk_alloc, sk_clone_lock), the
+    /// listener's IP options and the tuple's addresses set; out of
+    /// memory the segment is dropped (tcp_listendrop)
+    fn new_child(&self, t: &Tuple) -> Option<(Arc<TcpSock>, Arc<table::Eh>)> {
+        let Ok(c) = with_gfp(Gfp::ATOMIC, || TcpSock::new(Sock::clone_from(&self.sk))) else {
+            self.listen_drop();
+            return None;
+        };
+        c.inet.clone_opts(&self.inet);
+        {
+            let mut a = c.inet.addr.lock();
+            a.rcv_saddr = t.laddr;
+            a.saddr = t.laddr;
+            a.sport = t.lport;
+            a.daddr = t.raddr;
+            a.dport = t.rport;
+        }
+        let Ok(eh) = table::Eh::new(&self.sk.net, Ent::Sk(c.clone()), Gfp::ATOMIC) else {
+            self.listen_drop();
+            return None;
+        };
+        Some((c, eh))
+    }
+
+    /// A closed control block for the child `c` with the listener's
+    /// options `opts` and buffer limits `caps`
+    fn child_cb(&self, c: &TcpSock, opts: cb::Opts, caps: (u32, u32, u8)) -> TcpCb {
+        // TCP_SYNCNT of a listener bounds its SYN-ACK retries (Linux
+        // reqsk_timer_handler)
+        let mut kc = cfg(&self.sk.net);
+        if opts.syncnt != 0 {
+            kc.synack_retries = opts.syncnt;
+        }
+        let mut cb = TcpCb::new(kc, Arc::clone(&c.live));
+        cb.mib = Some(Arc::clone(&self.sk.net.mib));
+        cb.opts = opts;
+        // Linux tcp_ca_openreq_child: the namespace's default unless the
+        // listener chose one (icsk_ca_setsockopt)
+        if !cb.opts.ca_set {
+            cb.opts.ca = self.sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
+        }
+        (cb.rcvbuf, cb.sndbuf, cb.userlocks) = caps;
+        cb
+    }
+
+    /// A new child its listener did not take leaves the tables
+    /// unanswered (nobody waits on it: no wakeup)
+    fn forget(&self, g: &mut Inner) {
+        g.parent = None;
+        g.cb.set_closed(&mut Out::default());
+        let mut gone = Out {
+            done: true,
+            ..Out::default()
+        };
+        let _ = self.post(g, &mut gone);
     }
 
     /// A child completed its handshake (Linux inet_csk_complete_hashdance;

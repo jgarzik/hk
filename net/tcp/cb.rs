@@ -1205,6 +1205,18 @@ impl TcpCb {
     /// tcp_create_openreq_child); options are those of the SYN that the
     /// sysctls allow
     pub fn passive(&mut self, syn: &SegIn, o: Open, now: u64, out: &mut Out) {
+        self.passive_open(syn, o, now, None);
+        if self.syn_seg(out) {
+            self.tcp_stat(TCP_MIB_OUTSEGS);
+        }
+        self.arm_rtx(now);
+    }
+
+    /// A request for `syn` in SYN_RECEIVED, nothing sent (Linux
+    /// tcp_openreq_init with tcp_create_openreq_child's setup)
+    /// `rwin_mss`: the MSS the initial window rounds to, when not our
+    /// own less the timestamp option (a cookie's request: its MSS)
+    fn passive_open(&mut self, syn: &SegIn, o: Open, now: u64, rwin_mss: Option<u32>) {
         self.open(&o, now);
         self.wscale_ok = self.cfg.wscale && syn.ws.is_some();
         self.ts_ok = self.cfg.ts != 0 && syn.ts.is_some();
@@ -1216,14 +1228,28 @@ impl TcpCb {
         // Linux tcp_openreq_init_rwin with the listener's buffer and
         // clamp, then tcp_create_openreq_child
         self.window_clamp = self.opts.window_clamp;
-        self.init_rwin(self.ts_ok);
+        match rwin_mss {
+            Some(m) => self.init_rwin_mss(m),
+            None => self.init_rwin(self.ts_ok),
+        }
         self.syn_rcvd(syn, now);
         self.set_state(TcpState::SynReceived);
         self.passive = true;
-        if self.syn_seg(out) {
-            self.tcp_stat(TCP_MIB_OUTSEGS);
-        }
-        self.arm_rtx(now);
+    }
+
+    /// A SYN cookie's request becomes the child (Linux cookie_v4_check
+    /// -> tcp_get_cookie_sock -> tcp_create_openreq_child): `syn` is the
+    /// SYN rebuilt from the cookie ACK (its sequence number less one, the
+    /// cookie's MSS, the options its timestamp carried), `o.iss` the
+    /// cookie. SYN_RECEIVED with the initial window cookie_v4_check
+    /// selects (rounded to the cookie's MSS) and no SYN-ACK timing
+    /// (snt_synack 0), already a full socket: its ACK is processed next,
+    /// as tcp_child_process does
+    pub fn cookie_open(&mut self, syn: &SegIn, o: Open, now: u64) {
+        let mss = syn.mss.map_or(MSS_DEFAULT, u32::from);
+        self.passive_open(syn, o, now, Some(mss));
+        self.syn_rtx = true;
+        self.req_full = true;
     }
 
     /// Record the peer's SYN: IRS, window, options (`wscale_ok`,

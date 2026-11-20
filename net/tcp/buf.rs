@@ -63,6 +63,56 @@ pub struct RcvqSpace {
     time: u64,
 }
 
+/// What Linux tcp_select_initial_window picks for `space` bytes of
+/// window space rounded to `mss`: the initial window, our window scale,
+/// the clamp (`clamp` 0: none yet)
+pub(super) struct InitWin {
+    pub rcv_wnd: u32,
+    pub wscale: u8,
+    pub clamp: u32,
+}
+
+/// Linux tcp_select_initial_window (also for a cookie's stateless
+/// SYN-ACK): `rmem_max` is tcp_rmem[2]
+pub(super) fn initial_window(
+    space: i64,
+    mss: u32,
+    wscale_ok: bool,
+    clamp: u32,
+    rmem_max: u32,
+) -> InitWin {
+    let clamp = if clamp == 0 {
+        MAX_WINDOW << MAX_WSCALE
+    } else {
+        clamp
+    };
+    let mut space = (space.max(0) as u32).min(clamp);
+    if space > mss {
+        space -= space % mss;
+    }
+    let rcv_wnd = space.min(MAX_WINDOW);
+    let mut wscale = 0;
+    if wscale_ok {
+        let s = space
+            .max(rmem_max)
+            .max(crate::net::sock::BUF_MAX)
+            .min(clamp)
+            .max(1);
+        let log = 31 - s.leading_zeros();
+        wscale = log.saturating_sub(15).min(u32::from(MAX_WSCALE)) as u8;
+    }
+    InitWin {
+        rcv_wnd,
+        wscale,
+        clamp: clamp.min(MAX_WINDOW << wscale),
+    }
+}
+
+/// Linux tcp_win_from_space at a scaling ratio
+pub(super) fn win_from_space(ratio: u8, space: i64) -> i64 {
+    (space * i64::from(ratio)) >> RMEM_TO_WIN_SCALE
+}
+
 impl TcpCb {
     /// Linux tcp_win_from_space: the window `space` bytes of buffer
     /// hold (negative for an overcommitted buffer)
@@ -119,25 +169,10 @@ impl TcpCb {
     /// the window offered from RCV.WUP (Linux tp->rcv_wnd), which
     /// `rcv_ssthresh` starts at
     pub(super) fn select_initial_window(&mut self, space: i64, mss: u32, wscale_ok: bool) {
-        if self.window_clamp == 0 {
-            self.window_clamp = MAX_WINDOW << MAX_WSCALE;
-        }
-        let mut space = (space.max(0) as u32).min(self.window_clamp);
-        if space > mss {
-            space -= space % mss;
-        }
-        let rcv_wnd = space.min(MAX_WINDOW);
-        self.rcv_wscale = 0;
-        if wscale_ok {
-            let s = space
-                .max(self.cfg.rmem_max)
-                .max(crate::net::sock::BUF_MAX)
-                .min(self.window_clamp)
-                .max(1);
-            let log = 31 - s.leading_zeros();
-            self.rcv_wscale = log.saturating_sub(15).min(u32::from(MAX_WSCALE)) as u8;
-        }
-        self.window_clamp = self.window_clamp.min(MAX_WINDOW << self.rcv_wscale);
+        let w = initial_window(space, mss, wscale_ok, self.window_clamp, self.cfg.rmem_max);
+        let rcv_wnd = w.rcv_wnd;
+        self.rcv_wscale = w.wscale;
+        self.window_clamp = w.clamp;
         self.rcv_wup = 0;
         self.rcv_adv = rcv_wnd;
         self.rcv_ssthresh = rcv_wnd;
@@ -148,12 +183,16 @@ impl TcpCb {
     /// bounds the clamp; our MSS less the timestamp option bytes
     /// rounds it
     pub(super) fn init_rwin(&mut self, ts: bool) {
+        self.init_rwin_mss(self.adv_mss - if ts { super::cb::TS_LEN } else { 0 });
+    }
+
+    /// `init_rwin` rounded to `mss` (cookie_v4_check: the request's)
+    pub(super) fn init_rwin_mss(&mut self, mss: u32) {
         let full = self.full_space();
         if self.userlocks & RCVBUF_LOCK != 0 && (self.window_clamp > full || self.window_clamp == 0)
         {
             self.window_clamp = full;
         }
-        let mss = self.adv_mss - if ts { super::cb::TS_LEN } else { 0 };
         self.select_initial_window(i64::from(full), mss, self.wscale_ok);
     }
 

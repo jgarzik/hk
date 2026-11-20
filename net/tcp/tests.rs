@@ -2112,6 +2112,78 @@ fn tw_reopens_with_newer_timestamp() {
     assert!(!matches!(tw.rcv(&s, now, false, None), TwStatus::Syn(_)));
 }
 
+/// A SYN cookie handshake (Linux tcp_conn_request with want_cookie, then
+/// cookie_v4_check): the stateless SYN-ACK carries the SYN's options in
+/// its timestamp, the ACK rebuilds the request with the cookie's MSS,
+/// and the child, ESTABLISHED by that ACK, carries data both ways
+#[test]
+fn syncookie_handshake() {
+    use super::output::Tuple;
+    use super::syncookies::{Req, Synack, check, init_sequence, request, synack, timestamp_decode};
+    use crate::net::ipv4::Ipv4Addr;
+    let t = Tuple {
+        laddr: Ipv4Addr(0x0a00_0001),
+        lport: 80,
+        raddr: Ipv4Addr(0x0a00_0002),
+        rport: 40000,
+    };
+    let mut p = Pair::bare();
+    p.now = 100_000;
+    let mut out = Out::default();
+    p.a.connect(open(1000, 1452), p.now, &mut out);
+    let syn = seg_in(&wire(&out)[0]).hdr();
+    let c = cfg();
+    let (r, mss) = request(&syn, &c, 0);
+    assert_eq!(mss, 1452);
+    let (isn, m) = init_sequence(&t, syn.seq, mss, p.now);
+    assert_eq!(m, 1440);
+    let lim = Synack {
+        rcvbuf: 128 * 1024,
+        rcvbuf_locked: false,
+        window_clamp: 0,
+        user_mss: 0,
+        adv_mss: 1460,
+        ts_off: 0,
+    };
+    let sa = synack(&syn, &r, isn, &c, &lim, p.now);
+    assert!(sa.ws.is_some() && sa.sack_perm && sa.ts.is_some());
+    assert_eq!(sa.ack, syn.seq.wrapping_add(1));
+    p.now += 10;
+    let mut out = Out::default();
+    let skb = SkBuff::alloc_tx(0, Gfp::KERNEL).unwrap();
+    p.a.input(&sa, skb, p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::Established);
+    let ack = wire(&out).remove(0);
+    let ah = seg_in(&ack).hdr();
+    let mss = check(&t, ah.seq, ah.ack, p.now);
+    assert_eq!(mss, 1440);
+    let req = Req {
+        r: timestamp_decode(ah.ts, &c).unwrap(),
+        mss,
+        tsoff: 0,
+    };
+    assert_eq!(req.r, r);
+    p.b.rcvbuf = 128 * 1024;
+    let o = Open {
+        iss: ah.ack.wrapping_sub(1),
+        ts_off: 0,
+        mss: 1460,
+    };
+    p.b.cookie_open(&req.syn(&ah), o, p.now);
+    let mut out = Out::default();
+    p.b.feed(&seg_in(&ack), p.now, &mut out);
+    assert_eq!(p.b.state, TcpState::Established);
+    assert!(p.b.ts_ok && p.b.sack_ok != 0 && p.b.wscale_ok);
+    assert_eq!(p.b.snd_wscale, p.a.rcv_wscale);
+    assert_eq!(Some(p.b.rcv_wscale), sa.ws);
+    assert_eq!(p.b.peer_mss, 1440);
+    p.take(false, out);
+    let data = pattern(100_000);
+    assert_eq!(transfer(&mut p, &data, 500), data);
+    core::mem::swap(&mut p.a, &mut p.b);
+    assert_eq!(transfer(&mut p, &data, 500), data);
+}
+
 // ============================================================================
 // Review findings (reproduce first)
 // ============================================================================

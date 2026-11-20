@@ -23,10 +23,10 @@ infallible, so each one is investigated, not written off.
   TIME_WAIT-derived ISN per CPU (41eecbd712b7, v6.10) without
   1bbf0ced1d9d ("tcp: fix stale per-CPU tcp_tw_isn leak enabling ISN
   prediction"): a value left by a dropped SYN makes a later SYN look
-  like a TIME_WAIT takeover, so it gets that predictable ISN. hk keeps
-  the ISN with the segment, as current Linux. TCP_TW_ISN's ISN check
-  skips on the host; drop the skip once the reference kernels carry
-  the fix.
+  like a TIME_WAIT takeover, so it gets that predictable ISN and never
+  a SYN cookie. hk keeps the ISN with the segment, as current Linux.
+  TCP_SYNCOOKIE and TCP_TW_ISN's ISN check skip on the host; drop the
+  skips once the reference kernels carry the fix.
 - **ICMP reply counted as echo reply:** Linux icmp_reply leaves
   fl4_icmp_type 0 and the ICMP control socket is SOCK_RAW, so
   __ip_make_skb's icmp_out_count counts every reply (timestamp replies
@@ -136,7 +136,11 @@ An skb holds no reference to its socket (Linux skb->sk with
 sk_wmem_alloc, released by sock_wfree): a closed socket's sent frames
 still queued on a device do not delay its __sk_free, so "sockets:
 used" drops while they are in flight.
-No SYN cookies (a full listener drops SYNs).
+A listener's requests are full child sockets in SYN_RECEIVED on its
+SYN queue (`TcpSock::child`), not Linux request socks (struct
+request_sock in ehash as TCP_NEW_SYN_RECV, inet_reqsk_alloc,
+reqsk_timer_handler): each costs a socket, and the request paths
+mirror tcp_check_req on the child's control block.
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
@@ -149,7 +153,8 @@ MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
 prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
 ACK counts TCPPureAcks, where Linux's fast path skips it), receive
 coalescing and collapse (tcp_prune_queue prunes the out-of-order
-queue without first collapsing either queue, tcp_collapse), Fast Open, syncookies, MD5/AO, forwarding and
+queue without first collapsing either queue, tcp_collapse), Fast Open,
+MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP sends are not charged to SO_SNDBUF (Linux sk_wmem_alloc through
 sock_alloc_send_skb, which blocks or fails a send past it; corked

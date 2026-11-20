@@ -62,6 +62,10 @@ pub(crate) struct Seg {
     pub seq: u32,
     pub ack: u32,
     pub flags: u8,
+    /// Timestamps option (TSval, TSecr)
+    pub ts: Option<(u32, u32)>,
+    /// Window scale option
+    pub ws: Option<u8>,
 }
 
 /// The played peer: the route, a raw socket to send, a packet socket
@@ -108,13 +112,16 @@ impl Peer {
 
     /// Send a segment VOID:PEER_PORT -> 127.0.0.1:`dport` (no options)
     pub(crate) fn send(&self, dport: u16, seq: u32, ack: u32, flags: u8) -> i64 {
-        self.send_full(dport, seq, ack, flags, &[], &[])
+        self.send_full(PEER_PORT, dport, seq, ack, flags, &[], &[])
     }
 
-    /// [`Peer::send`] with TCP options `opts` (padded by the caller to a
-    /// multiple of 4) and payload `data`; the IP length on success
+    /// [`Peer::send`] from port `sport`, with TCP options `opts` (padded
+    /// by the caller to a multiple of 4) and payload `data`; the IP
+    /// length on success
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn send_full(
         &self,
+        sport: u16,
         dport: u16,
         seq: u32,
         ack: u32,
@@ -134,7 +141,7 @@ impl Peer {
         p[2..4].copy_from_slice(&(n as u16).to_be_bytes());
         p[12..16].copy_from_slice(&VOID);
         let h = &mut p[20..n];
-        h[0..2].copy_from_slice(&PEER_PORT.to_be_bytes());
+        h[0..2].copy_from_slice(&sport.to_be_bytes());
         h[2..4].copy_from_slice(&dport.to_be_bytes());
         h[4..8].copy_from_slice(&seq.to_be_bytes());
         h[8..12].copy_from_slice(&ack.to_be_bytes());
@@ -150,6 +157,12 @@ impl Peer {
 
     /// The next segment within `ms` from 127.0.0.1:`port` to the peer
     pub(crate) fn from(&self, port: u16, ms: u64) -> Option<Seg> {
+        self.from_to(port, PEER_PORT, ms)
+    }
+
+    /// The next segment within `ms` from 127.0.0.1:`port` to the
+    /// peer's port `pport`
+    pub(crate) fn from_to(&self, port: u16, pport: u16, ms: u64) -> Option<Seg> {
         let end = now_ms() + ms;
         let mut b = [0u8; 256];
         loop {
@@ -168,7 +181,7 @@ impl Peer {
             if let Some(s) = parse(&b[..n.max(0) as usize])
                 && s.saddr == LO
                 && s.sport == port
-                && s.dport == PEER_PORT
+                && s.dport == pport
             {
                 return Some(s);
             }
@@ -192,14 +205,38 @@ fn parse(b: &[u8]) -> Option<Seg> {
     let ihl = usize::from(b[0] & 15) * 4;
     let h = b.get(ihl..ihl + 20)?;
     let be = |o: usize| u32::from_be_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
-    Some(Seg {
+    let doff = usize::from(h[12] >> 4) * 4;
+    let mut s = Seg {
         saddr: [b[12], b[13], b[14], b[15]],
         sport: u16::from_be_bytes([h[0], h[1]]),
         dport: u16::from_be_bytes([h[2], h[3]]),
         seq: be(4),
         ack: be(8),
         flags: h[13],
-    })
+        ..Seg::default()
+    };
+    let mut o = b.get(ihl + 20..ihl + doff).unwrap_or(&[]);
+    while let Some(&k) = o.first() {
+        if k == 0 {
+            break;
+        }
+        if k == 1 {
+            o = &o[1..];
+            continue;
+        }
+        let l = usize::from(*o.get(1).unwrap_or(&0));
+        if l < 2 || l > o.len() {
+            break;
+        }
+        let w = |i: usize| u32::from_be_bytes([o[i], o[i + 1], o[i + 2], o[i + 3]]);
+        match (k, l) {
+            (8, 10) => s.ts = Some((w(2), w(6))),
+            (3, 3) => s.ws = Some(o[2]),
+            _ => {}
+        }
+        o = &o[l..];
+    }
+    Some(s)
 }
 
 /// TCP checksum over the pseudo header and `seg`
