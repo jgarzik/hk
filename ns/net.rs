@@ -378,7 +378,7 @@ impl NetNamespace {
         let idx = self.next_ifindex.fetch_add(1, Ordering::Relaxed);
         dev.set_net(self, idx);
         // Linux inetdev_init from the NETDEV_REGISTER notifier
-        dev.in_dev().init(self);
+        dev.in_dev().init(self, dev.name());
         self.devices.push_back(dev.clone());
         // Sleeping sysfs work
         crate::net::sysfs::netdev_register_kobject(&dev);

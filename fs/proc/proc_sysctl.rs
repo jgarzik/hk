@@ -133,20 +133,24 @@ fn children(net: Option<&NetNamespace>, dir: &str, sel: Option<&Sel>) -> BTreeMa
 }
 
 /// The names of the per-device directory `d` in `net`: its fixed ones,
-/// then every device (Linux registers each device's table as the
-/// device registers; a device named like a fixed one never registers)
+/// then every device that registered its tables, under the name it
+/// registered them with (a device named like a fixed one is shadowed:
+/// Linux refuses it, sysctl_dev_name_is_allowed)
 fn dev_names(net: &NetNamespace, d: &'static DevDir, m: &mut BTreeMap<String, Child>) {
     for &(name, all) in (d.fixed)(net) {
         let sel = if all { Sel::All } else { Sel::Default };
         m.insert(String::from(name), Child::DevDir(d, sel));
     }
     for dev in net.devices() {
+        let Some(reg) = dev.in_dev().sysctl_reg() else {
+            continue;
+        };
+        let name = reg.name.clone();
         let sel = Sel::Dev {
             dev: Arc::downgrade(&dev),
-            name: String::from(dev.name()),
+            reg,
         };
-        m.entry(String::from(dev.name()))
-            .or_insert(Child::DevDir(d, sel));
+        m.entry(name).or_insert(Child::DevDir(d, sel));
     }
 }
 

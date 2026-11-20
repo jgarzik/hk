@@ -263,27 +263,59 @@ impl NetCtl {
     }
 }
 
+/// A device's registration of its per-device sysctl tables (Linux the
+/// ctl_table_headers devinet_sysctl_register and neigh_sysctl_register
+/// make for it): its directories' name, and whether it was taken back
+/// (Linux header->unregistering). A device registers as it registers
+/// (inetdev_init), unregisters as it is unregistered
+/// (inetdev_destroy), and does both on a rename (NETDEV_CHANGENAME):
+/// `InDevice::sysctl_register` / `sysctl_unregister`.
+pub struct DevSysctl {
+    pub name: String,
+    unregistering: AtomicBool,
+}
+
+impl DevSysctl {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            unregistering: AtomicBool::new(false),
+        }
+    }
+
+    /// Taken back: its directories and files are ENOENT from now on
+    pub fn unregistering(&self) -> bool {
+        self.unregistering.load(Ordering::Acquire)
+    }
+
+    /// Take it back (Linux unregister_net_sysctl_table)
+    pub fn start_unregistering(&self) {
+        self.unregistering.store(true, Ordering::Release);
+    }
+}
+
 /// What a per-device sysctl directory stands for (Linux the data a
 /// devinet or neigh table registered for "all", "default" or a device
-/// points at): a device by a weak reference and the name it was found
-/// under (Linux unregisters a device's tables at unregistration and
-/// re-registers them on rename)
+/// points at): a device by a weak reference, with the registration it
+/// was found through
 #[derive(Clone)]
 pub enum Sel {
     All,
     Default,
-    Dev { dev: Weak<NetDevice>, name: String },
+    Dev {
+        dev: Weak<NetDevice>,
+        reg: Arc<DevSysctl>,
+    },
 }
 
 impl Sel {
-    /// A device's directory whose device was unregistered or renamed
-    /// (Linux its header unregistering)
+    /// A device's directory whose registration was taken back (Linux
+    /// its header unregistering): the device was unregistered or
+    /// renamed
     pub fn gone(&self) -> bool {
         match self {
             Self::All | Self::Default => false,
-            Self::Dev { dev, name } => dev
-                .upgrade()
-                .is_none_or(|d| d.is_gone() || d.name() != name),
+            Self::Dev { reg, .. } => reg.unregistering(),
         }
     }
 

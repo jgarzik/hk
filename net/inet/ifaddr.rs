@@ -243,6 +243,10 @@ pub struct InDevice {
     pub cnf: crate::net::inet::devconf::DevConf,
     /// ARP parameters (Linux in_dev->arp_parms): net/ipv4/neigh/<dev>
     pub arp_parms: crate::net::neigh::NeighParms,
+    /// The registration of its net/ipv4/{conf,neigh}/<name> directories
+    /// (Linux cnf.sysctl, arp_parms->sysctl_table): set and taken
+    /// under RTNL, read by /proc lookups (spin leaf)
+    sysctl: crate::sync::spin::Mutex<Option<Arc<crate::net::sysctl::DevSysctl>>>,
 }
 
 impl Default for InDevice {
@@ -251,19 +255,48 @@ impl Default for InDevice {
             ifa_list: RcuList::new(),
             cnf: crate::net::inet::devconf::DevConf::dflt(),
             arp_parms: crate::net::neigh::NeighParms::arp_default(),
+            sysctl: crate::sync::spin::Mutex::new(None),
         }
     }
 }
 
 impl InDevice {
-    /// Registration in `net` (Linux inetdev_init): the namespace's
-    /// default configuration and ARP's default parameters
-    /// (neigh_parms_alloc), state bits included
-    pub fn init(&self, net: &crate::net::NetNamespace) {
+    /// Registration of `dev` (this device) in `net` (Linux
+    /// inetdev_init): the namespace's default configuration and ARP's
+    /// default parameters (neigh_parms_alloc), state bits included, and
+    /// its sysctl directories (devinet_sysctl_register)
+    pub fn init(&self, net: &crate::net::NetNamespace, name: &str) {
         self.cnf.copy_from(&net.devconf_dflt);
         if let Some(tbl) = crate::net::arp::arp_tbl_get() {
             self.arp_parms.copy_from(&tbl.parms);
         }
+        self.sysctl_register(name);
+    }
+
+    /// Register its net/ipv4/{conf,neigh}/`name` directories (Linux
+    /// devinet_sysctl_register: neigh_sysctl_register and
+    /// __devinet_sysctl_register), replacing any registration; without
+    /// memory it has none (Linux fails the device's registration)
+    pub fn sysctl_register(&self, name: &str) {
+        use crate::net::sysctl::DevSysctl;
+        let reg = crate::util::kalloc::try_arc(DevSysctl::new(alloc::string::String::from(name)));
+        let old = core::mem::replace(&mut *self.sysctl.lock(), reg.ok());
+        if let Some(o) = old {
+            o.start_unregistering();
+        }
+    }
+
+    /// Take its directories back (Linux devinet_sysctl_unregister):
+    /// their lookups and open files are ENOENT from now on
+    pub fn sysctl_unregister(&self) {
+        if let Some(o) = self.sysctl.lock().take() {
+            o.start_unregistering();
+        }
+    }
+
+    /// Its registration, if any
+    pub fn sysctl_reg(&self) -> Option<Arc<crate::net::sysctl::DevSysctl>> {
+        self.sysctl.lock().clone()
     }
 
     /// The addresses, while `g` is held (Linux in_dev_for_each_ifa_rcu)
@@ -529,10 +562,22 @@ pub fn inetdev_down(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) 
 /// inetdev_destroy, then fib_netdev_event -> fib_disable_ip(force)):
 /// every address is deleted and announced, then every route through it
 pub fn inetdev_destroy(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    // Linux inetdev_destroy -> devinet_sysctl_unregister
+    dev.in_dev().sysctl_unregister();
     while let Some(ifa) = dev.in_dev().ifa_list.find(|_| true) {
         inet_del_ifa(rtnl, net, dev, &ifa, NlInfo::default());
     }
     fib::fib_disable_ip(rtnl, net, dev, true);
+}
+
+/// `dev` was renamed (Linux inetdev_event NETDEV_CHANGENAME, RTNL
+/// held): its sysctl directories move to the new name
+/// (devinet_sysctl_unregister + devinet_sysctl_register); the old
+/// name's lookups and open files are ENOENT
+pub fn inetdev_changename(_rtnl: &RtnlGuard, dev: &NetDevice) {
+    let i = dev.in_dev();
+    i.sysctl_unregister();
+    i.sysctl_register(dev.name());
 }
 
 /// Type of `addr` in the namespace (Linux inet_addr_type)
