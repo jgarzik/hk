@@ -1395,7 +1395,7 @@ const BIND_LEAK_SLACK_KB: i64 = 1024;
 /// The device ends bound; eth0's flags are not kept (it runs before the
 /// network tests configure eth0).
 fn test_bind_fail_nth() {
-    const N: &[u8] = b"SYSFS_BIND_FAIL_NTH";
+    const N: &[u8] = b"SYSFS_BIND_FAULT_NTH";
     if host_mode() {
         return skip(N, b"MemFree accounting is hk's");
     }
@@ -1413,7 +1413,7 @@ fn test_bind_fail_nth() {
     match r {
         Err((why, v)) => fail_why(N, why, v),
         Ok(lost) => {
-            println(b"SYSFS_BIND_FAIL_NTH: MemFree lost (kB):");
+            println(b"SYSFS_BIND_FAULT_NTH: MemFree lost (kB):");
             crate::helpers::print_num(lost);
             println(b"");
             pass(N)
