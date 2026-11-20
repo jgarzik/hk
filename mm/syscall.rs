@@ -319,6 +319,11 @@ pub fn do_mmap(
     // the VMA is linked (Linux mmap_region: mapping_map_writable, EPERM
     // once F_SEAL_WRITE denies it)
     let _writable = WritableHold::new(&vma)?;
+    // The driver accepts the mapping's size and counts it (Linux
+    // f_op->mmap with the VMA built, e.g. packet_mmap's po->mapped)
+    if let Some(f) = vma.file.clone() {
+        vma.vm_ops = f.f_op.mmap_hold(&f, length)?;
+    }
     if noexec {
         vma.flags |= super::vma::VM_NOMAYEXEC;
     }

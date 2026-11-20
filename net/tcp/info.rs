@@ -3,10 +3,10 @@
 //!
 //! `struct tcp_info` is laid out field by field in its uapi order (280
 //! bytes, the current Linux size; getsockopt truncates to the caller's
-//! length like Linux). Fields hk has no counterpart for (SACK, pacing,
+//! length like Linux). Fields hk has no counterpart for (pacing,
 //! delivery rate, ECN) are 0, or ~0 for the pacing rates as Linux
-//! reports without pacing. Counts Linux keeps in packets (cwnd,
-//! ssthresh, unacked) are bytes / MSS.
+//! reports without pacing. cwnd, ssthresh and delivered are packets,
+//! as Linux keeps them.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -18,13 +18,9 @@ use crate::fs::proc::seq::{self, SeqBuf};
 
 /// tcpi_options bits
 const OPT_TIMESTAMPS: u8 = 1;
+const OPT_SACK: u8 = 2;
 const OPT_WSCALE: u8 = 4;
-/// Linux TCP_CA_Open / TCP_CA_Recovery / TCP_CA_Loss
-const CA_OPEN: u8 = 0;
-const CA_RECOVERY: u8 = 3;
-const CA_LOSS: u8 = 4;
-/// Linux TCP_INFINITE_SSTHRESH
-const INFINITE_SSTHRESH: u32 = 0x7fff_ffff;
+use super::cong::INFINITE_SSTHRESH;
 /// sizeof(struct tcp_info)
 pub const INFO_LEN: usize = 280;
 
@@ -57,11 +53,6 @@ pub fn retrans_to_secs(retrans: u8) -> u32 {
     period
 }
 
-/// Packets for `bytes` of segments of `mss`
-fn pkts(bytes: u32, mss: u32) -> u32 {
-    bytes.div_ceil(mss.max(1))
-}
-
 /// Little helper writing native-endian fields in order
 struct Buf(Vec<u8>);
 
@@ -83,19 +74,6 @@ impl Buf {
     }
 }
 
-impl TcpCb {
-    /// Linux TCP_CA_* state
-    fn ca_state(&self) -> u8 {
-        if self.cong.in_recovery() {
-            CA_RECOVERY
-        } else if self.live.backoff.get() > 0 && self.snd_una != self.snd_max {
-            CA_LOSS
-        } else {
-            CA_OPEN
-        }
-    }
-}
-
 /// `struct tcp_info` of `cb` at `now`
 pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let mut b = Buf(Vec::with_capacity(INFO_LEN));
@@ -103,13 +81,17 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let st = &cb.stats;
     let synced = cb.state.synced();
     b.u8(cb.state.linux());
-    b.u8(cb.ca_state());
-    b.u8(cb.live.backoff.get().min(255) as u8);
+    b.u8(cb.ca_state as u8);
+    // tcpi_retransmits, tcpi_probes, tcpi_backoff
+    b.u8(cb.live.retransmits.get().min(255) as u8);
     b.u8(cb.live.probes.get().min(255) as u8);
     b.u8(cb.live.backoff.get().min(255) as u8);
     let mut opt = 0;
     if cb.ts_ok {
         opt |= OPT_TIMESTAMPS;
+    }
+    if cb.sack_ok != 0 {
+        opt |= OPT_SACK;
     }
     if cb.wscale_ok {
         opt |= OPT_WSCALE;
@@ -121,30 +103,26 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32((cb.live.ato.get() * 1000) as u32);
     b.u32(mss);
     b.u32(cb.dack.rcv_mss);
-    b.u32(pkts(cb.snd_max.wrapping_sub(cb.snd_una), mss)); // unacked
-    for _ in 0..4 {
-        b.u32(0); // sacked, lost, retrans, fackets
-    }
+    b.u32(cb.packets_out); // unacked
+    b.u32(cb.sacked_out);
+    b.u32(cb.lost_out);
+    b.u32(cb.retrans_out);
+    b.u32(0); // fackets (no longer kept, as Linux)
     b.ms_ago(now, cb.lsndtime); // last_data_sent
     b.u32(0); // last_ack_sent
     b.ms_ago(now, st.last_data_recv);
     b.ms_ago(now, cb.rcv_tstamp);
     b.u32(cb.path_mss + super::cb::HDRS); // pmtu
-    b.u32(cb.full_space()); // rcv_ssthresh
+    b.u32(cb.rcv_ssthresh());
     let (srtt, var) = cb.rtt();
-    b.u32((srtt * 1000) as u32);
-    b.u32((var * 1000) as u32);
-    let ss = cb.cong.ssthresh();
-    b.u32(if ss >= INFINITE_SSTHRESH {
-        INFINITE_SSTHRESH
-    } else {
-        pkts(ss, mss)
-    });
-    b.u32(pkts(cb.cong.cwnd(), mss));
+    b.u32(srtt);
+    b.u32(var);
+    b.u32(cb.cong.snd_ssthresh().min(INFINITE_SSTHRESH));
+    b.u32(cb.cong.snd_cwnd());
     b.u32(cb.adv_mss);
-    b.u32(3); // reordering (tcp_reordering)
-    b.u32(0); // rcv_rtt
-    b.u32(cb.full_space()); // rcv_space
+    b.u32(cb.reordering);
+    b.u32(cb.rcv_rtt.rtt_us >> 3);
+    b.u32(cb.rcvq_space.space);
     b.u32(st.total_retrans);
     b.u64(u64::MAX); // pacing_rate
     b.u64(u64::MAX); // max_pacing_rate
@@ -153,19 +131,19 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32(st.segs_out);
     b.u32(st.segs_in);
     b.u32(cb.unsent() as u32);
-    b.u32(st.min_rtt.map_or(u32::MAX, |r| (r * 1000) as u32));
+    b.u32(cb.rtt_min.get()); // min_rtt (Linux tcp_min_rtt)
     b.u32(st.data_segs_in);
     b.u32(st.data_segs_out);
     b.u64(0); // delivery_rate
     for _ in 0..3 {
         b.u64(0); // busy_time, rwnd_limited, sndbuf_limited
     }
-    b.u32(pkts(st.bytes_acked.min(u64::from(u32::MAX)) as u32, mss)); // delivered
+    b.u32(cb.delivered);
     b.u32(0); // delivered_ce
     b.u64(st.bytes_sent);
     b.u64(st.bytes_retrans);
-    b.u32(0); // dsack_dups
-    b.u32(0); // reord_seen
+    b.u32(cb.dsack_dups);
+    b.u32(cb.reord_seen);
     b.u32(0); // rcv_ooopack
     b.u32(if synced { cb.snd_wnd } else { 0 });
     b.u32(if synced { cb.rcv_wnd() } else { 0 });
@@ -230,7 +208,8 @@ pub(super) struct ProcView {
     /// keepalive / FIN_WAIT2 timer; and its deadline (ms)
     pub tr: u8,
     pub when: u64,
-    pub backoff: u32,
+    /// Linux icsk_retransmits (the retrnsmt column)
+    pub retransmits: u32,
     pub probes: u32,
     pub rto: u64,
     pub ato: u64,
@@ -246,29 +225,28 @@ impl ProcView {
     /// (each field read once, racily: Linux get_tcp4_sock)
     pub fn of(l: &Live, state: TcpState) -> Self {
         let (tr, when) = match (l.tmr.get(), l.keep_at.get().or(l.wait_at.get())) {
-            (Some((Tmr::Rtx, t)), _) => (1, t),
+            (Some((Tmr::Rtx | Tmr::Reo | Tmr::LossProbe, t)), _) => (1, t),
             (Some((Tmr::Probe, t)), _) => (4, t),
             (None, Some(t)) => (2, t),
             _ => (0, 0),
         };
-        let mss = l.mss.get();
         let ss = l.ssthresh.get();
         let last = if state == TcpState::Listen {
             i64::from(l.fastopen.get())
         } else if ss >= INFINITE_SSTHRESH {
             -1
         } else {
-            i64::from(pkts(ss, mss))
+            i64::from(ss)
         };
         Self {
             tr,
             when,
-            backoff: l.backoff.get(),
+            retransmits: l.retransmits.get(),
             probes: l.probes.get(),
             rto: l.rto_cur(),
             ato: l.ato.get(),
             qp: (l.quick.get() << 1) | u32::from(l.pingpong.get()),
-            cwnd: pkts(l.cwnd.get(), mss),
+            cwnd: l.cwnd.get(),
             last,
         }
     }
@@ -308,7 +286,7 @@ fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
         rxq,
         v.tr,
         ticks(when),
-        v.backoff,
+        v.retransmits,
         uid,
         v.probes,
         ino,
@@ -335,7 +313,7 @@ fn tw_line(i: usize, tw: &super::timewait::TimeWait, now: u64) -> Line {
         t.lport,
         raw(t.raddr),
         t.rport,
-        TcpState::TimeWait.linux(),
+        tw.substate().linux(),
         0,
         0,
         3,
@@ -398,5 +376,15 @@ mod tests {
         let b = tcp_info(&cb, 0);
         assert_eq!(b.len(), INFO_LEN);
         assert_eq!(b[0], TcpState::Closed.linux());
+    }
+
+    /// tcpi_delivered is tp->delivered, a packet count (offset 192)
+    #[test]
+    fn info_delivered_packets() {
+        let mut cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
+        cb.delivered = 7;
+        cb.stats.bytes_acked = 100_000;
+        let b = tcp_info(&cb, 0);
+        assert_eq!(u32::from_ne_bytes(b[192..196].try_into().unwrap()), 7);
     }
 }

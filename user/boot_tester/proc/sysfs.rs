@@ -5,8 +5,9 @@
 //! what both have.
 
 use hk_syscall::{
-    LinuxStatFs, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chmod, sys_chown, sys_close,
-    sys_getdents64, sys_lseek, sys_open, sys_read, sys_readlink, sys_stat, sys_statfs, sys_write,
+    LinuxStatFs, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_bind, sys_chmod, sys_chown, sys_close,
+    sys_getdents64, sys_lseek, sys_open, sys_read, sys_readlink, sys_sendto, sys_socket, sys_stat,
+    sys_statfs, sys_write,
 };
 
 use crate::harness::{fail_why, pass};
@@ -38,6 +39,7 @@ pub fn run_tests() {
     test_unbind_usb();
     test_unbind_blk();
     test_unbind_net();
+    test_bind_fail_nth();
     test_chmod_keep();
 }
 
@@ -1291,8 +1293,10 @@ fn head<'a>(buf: &'a mut [u8; 256], action: &[u8], devpath: &[u8]) -> &'a [u8] {
 /// while unbound eth0 is gone from /sys/class/net and /proc/net/dev and
 /// the device has no driver link; "remove" (eth0) and "unbind" (the
 /// device) uevents arrive in that order, "add" and "bind" on rebind;
-/// eth0 comes back with a new ifindex and goes up with its link. Runs
-/// before the network tests configure eth0; its flags are restored
+/// eth0 comes back with a new ifindex and goes up with its link. The
+/// unbind completes while an address, a route and a packet socket
+/// hold eth0 (`hold_eth0`), which let it go. Runs before the network
+/// tests configure eth0; its flags are restored
 fn test_unbind_net() {
     const N: &[u8] = b"SYSFS_UNBIND_NET";
     let mut lk = [0u8; 256];
@@ -1337,9 +1341,11 @@ fn test_unbind_net() {
     let Some(fd) = uevent_sock() else {
         return fail_why(N, b"uevent socket", 0);
     };
+    let held = hold_eth0(old as u32);
     let r = unbind_rebind(fd, devpath, parent, name, drv);
     sys_close(fd as u64);
-    if let Err((why, v)) = r {
+    let held = held.and_then(released);
+    if let Err((why, v)) = r.and(held) {
         return fail_why(N, why, v);
     }
     let new = eth0_ifindex();
@@ -1370,6 +1376,183 @@ fn test_unbind_net() {
         return fail_why(N, b"restore flags", r);
     }
     pass(N);
+}
+
+/// Most failure points one bind is tried with
+const BIND_MAX_NTH: u32 = 2000;
+/// MemFree a run of failed binds may lose (kB): slab and page caches
+/// keep some; a probe leaking its rings or buffers loses megabytes
+const BIND_LEAK_SLACK_KB: i64 = 1024;
+
+/// eth0's NIC bound with its 1st, 2nd, ... allocation failing (fail-nth;
+/// a failed allocation in the probe: Linux its goto unwind) until a bind
+/// completes without reaching one: a failed bind leaves the device with
+/// no driver and no eth0, and over the run MemFree comes back (no ring,
+/// buffer or mapping leaks). failslab's and fail_page_alloc's
+/// ignore-gfp-wait are N and min-order 0 meanwhile (`Reach`), so the
+/// probe's GFP_KERNEL heap, page and coherent DMA allocations fail too.
+/// hk only: Linux's MemFree moves with its caches.
+/// The device ends bound; eth0's flags are not kept (it runs before the
+/// network tests configure eth0).
+fn test_bind_fail_nth() {
+    const N: &[u8] = b"SYSFS_BIND_FAULT_NTH";
+    if host_mode() {
+        return skip(N, b"MemFree accounting is hk's");
+    }
+    let fi = sys_open(b"/proc/self/fail-nth\0".as_ptr(), hk_syscall::O_RDWR, 0);
+    if fi < 0 {
+        return skip(N, b"no /proc/self/fail-nth");
+    }
+    // Sleeping slab and page allocations, single pages too, fail as
+    // well (Linux's defaults skip them)
+    let reach = crate::io::fault_inject::Reach::new(true);
+    let r = bind_fail_nth(fi as i32);
+    crate::io::fault_inject::set(fi as i32, 0);
+    drop(reach);
+    sys_close(fi as u64);
+    match r {
+        Err((why, v)) => fail_why(N, why, v),
+        Ok(lost) => {
+            println(b"SYSFS_BIND_FAULT_NTH: MemFree lost (kB):");
+            crate::helpers::print_num(lost);
+            println(b"");
+            pass(N)
+        }
+    }
+}
+
+/// The run of `test_bind_fail_nth`, with fail-nth at `fi`; MemFree lost
+fn bind_fail_nth(fi: i32) -> Result<i64, (&'static [u8], i64)> {
+    use crate::io::fault_inject::{get, set};
+    use crate::mm::mm_life::meminfo;
+    let mut dl = [0u8; 256];
+    let k = sys_readlink(
+        b"/sys/class/net/eth0/device/driver\0".as_ptr(),
+        dl.as_mut_ptr(),
+        255,
+    );
+    let drv = &dl[..k.max(0) as usize];
+    let at = drv
+        .windows(5)
+        .position(|w| w == b"/bus/")
+        .ok_or((&b"driver link"[..], k))?;
+    let drv = &drv[at..];
+    let mut nb = [0u8; 256];
+    let n = sys_readlink(
+        b"/sys/class/net/eth0/device\0".as_ptr(),
+        nb.as_mut_ptr(),
+        255,
+    );
+    let name = nb[..n.max(0) as usize]
+        .rsplit(|&c| c == b'/')
+        .next()
+        .unwrap_or(b"");
+    let (mut bp, mut up, mut dp) = ([0u8; 256], [0u8; 256], [0u8; 256]);
+    let bind = path(&mut bp, &[b"/sys", drv, b"/bind\0"]);
+    let unbind = path(&mut up, &[b"/sys", drv, b"/unbind\0"]);
+    let link = path(&mut dp, &[b"/sys", drv, b"/", name, b"\0"]);
+    let full = name.len() as i64;
+    if write_str(unbind, name) != full {
+        return Err((b"unbind", 0));
+    }
+    let before = meminfo(b"MemFree:");
+    let mut nth = 1;
+    loop {
+        if nth > BIND_MAX_NTH {
+            return Err((b"no bind without a failure", i64::from(nth)));
+        }
+        let fd = sys_open(bind.as_ptr(), O_WRONLY, 0);
+        if fd < 0 {
+            return Err((b"open bind", fd));
+        }
+        set(fi, nth);
+        let r = hk_syscall::sys_write(fd as u64, name.as_ptr(), name.len() as u64);
+        let left = get(fi);
+        set(fi, 0);
+        sys_close(fd as u64);
+        if r == full {
+            // Bound (a failure it absorbed, or none reached): unbound
+            // again, unless it is the last
+            if left != 0 {
+                break;
+            }
+            if write_str(unbind, name) != full {
+                return Err((b"unbind after an injected bind", i64::from(nth)));
+            }
+        } else if stat(link).is_ok() || proc_has_eth0() {
+            return Err((b"failed bind left the device bound", i64::from(nth)));
+        }
+        nth += 1;
+    }
+    // MemFree with the device unbound again, as before the run
+    if write_str(unbind, name) != full {
+        return Err((b"final unbind", 0));
+    }
+    let after = meminfo(b"MemFree:");
+    if write_str(bind, name) != full || !proc_has_eth0() {
+        return Err((b"final bind", 0));
+    }
+    let lost = before - after;
+    if lost > BIND_LEAK_SLACK_KB {
+        return Err((b"MemFree lost (kB)", lost));
+    }
+    Ok(lost)
+}
+
+/// Holders of eth0 (index `ifindex`, up) across its unbind (Linux
+/// netdev_wait_allrefs: they let it go, so the unbind completes): an
+/// address (a prefix and a local route through it), a route through
+/// it, and a packet socket bound to it, returned
+fn hold_eth0(ifindex: u32) -> Result<i32, (&'static [u8], i64)> {
+    use crate::net::nl::{self, NLM_F_CREATE, NLM_F_EXCL, Nl};
+    const AF_PACKET: u16 = 17;
+    const ETH_P_ALL: u16 = 0x0003;
+    let mut nl = Nl::open().ok_or((&b"netlink"[..], 0))?;
+    let x = NLM_F_CREATE | NLM_F_EXCL;
+    let r = nl::addr(&mut nl, true, ifindex, [10, 99, 0, 1], 24, x);
+    if r != 0 {
+        return Err((b"address", i64::from(r)));
+    }
+    let r = nl::route(&mut nl, true, [10, 98, 0, 0], 24, [0; 4], ifindex, x);
+    if r != 0 {
+        return Err((b"route", i64::from(r)));
+    }
+    let fd = sys_socket(i32::from(AF_PACKET), 3, i32::from(ETH_P_ALL.to_be()));
+    if fd < 0 {
+        return Err((b"packet socket", fd));
+    }
+    let mut sll = [0u8; 20];
+    sll[..2].copy_from_slice(&AF_PACKET.to_ne_bytes());
+    sll[2..4].copy_from_slice(&ETH_P_ALL.to_be_bytes());
+    sll[4..8].copy_from_slice(&(ifindex as i32).to_ne_bytes());
+    let r = sys_bind(fd as i32, sll.as_ptr(), sll.len() as u32);
+    if r != 0 {
+        sys_close(fd as u64);
+        return Err((b"packet bind", r));
+    }
+    Ok(fd as i32)
+}
+
+/// After the unbind: the packet socket from `hold_eth0` kept only the
+/// gone device's index (a send finds no device: ENXIO), and no route
+/// through the old eth0 is left (the new one is down, unaddressed)
+fn released(fd: i32) -> Result<(), (&'static [u8], i64)> {
+    const ENXIO: i64 = -6;
+    let frame = [0u8; 60];
+    let r = sys_sendto(fd, frame.as_ptr(), frame.len(), 0, core::ptr::null(), 0);
+    sys_close(fd as u64);
+    if r != ENXIO {
+        return Err((b"packet send after unbind", r));
+    }
+    let mut b = [0u8; 4096];
+    let n = read_file(b"/proc/net/route\0", &mut b).max(0) as usize;
+    if b[..n]
+        .split(|&c| c == b'\n')
+        .any(|l| l.starts_with(b"eth0\t"))
+    {
+        return Err((b"route through eth0 left", 0));
+    }
+    Ok(())
 }
 
 fn unbind_rebind(

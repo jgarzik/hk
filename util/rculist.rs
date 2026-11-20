@@ -231,6 +231,33 @@ impl<A: Adapter, P: ListPtr<Target = A::Item>> RcuList<A, P> {
         Some(unsafe { self.unlink(&mut e, cur) })
     }
 
+    /// Unlink every entry `f` accepts in one walk (Linux
+    /// list_for_each_entry_safe + list_del_rcu), handing each to
+    /// `gone`; returns how many. `f` and `gone` run under the writers'
+    /// lock, so neither may sleep or allocate (`gone` defers the entry,
+    /// or keeps it in room reserved beforehand).
+    pub fn remove_all(
+        &self,
+        mut f: impl FnMut(&A::Item) -> bool,
+        mut gone: impl FnMut(RcuUnlinked<A, P>),
+    ) -> usize {
+        let mut e = self.ends.lock();
+        let mut n = 0;
+        let mut cur = self.head.load(Relaxed);
+        while !cur.is_null() {
+            // SAFETY: a link of this list (invariant; `ends` held)
+            let next = unsafe { (*cur).next() };
+            // SAFETY: as above
+            if f(unsafe { &*A::item(cur) }) {
+                // SAFETY: a link of this list, `ends` held
+                gone(unsafe { self.unlink(&mut e, cur) });
+                n += 1;
+            }
+            cur = next;
+        }
+        n
+    }
+
     /// Unlink `item` (Linux list_del_rcu), no walk; as
     /// [`remove_first`](Self::remove_first)
     ///
@@ -626,6 +653,38 @@ mod tests {
         l.push_back(item(5));
         drop(l.remove_first(|i| i.v == 1));
         assert_eq!(values(&l), [5]);
+    }
+
+    /// One walk takes every match, the ends included, and keeps the
+    /// rest in order; a reader standing on a removed entry walks on
+    #[test]
+    fn remove_all_one_walk() {
+        let l = RcuList::<ItemLink>::new();
+        for v in 1..=8 {
+            l.push_back(item(v));
+        }
+        let g = read_lock();
+        let mut it = l.iter(&g);
+        assert_eq!(it.next().map(|i| i.v), Some(1));
+        let mut gone = Vec::with_capacity(8);
+        let n = l.remove_all(|i| i.v % 2 == 1 || i.v == 8, |u| gone.push(u));
+        assert_eq!(n, 5);
+        assert_eq!(
+            gone.iter().map(|u| u.item().v).collect::<Vec<_>>(),
+            [1, 3, 5, 7, 8]
+        );
+        assert_eq!(it.map(|i| i.v).collect::<Vec<_>>(), [2, 4, 6]);
+        drop(g);
+        assert_eq!(values(&l), [2, 4, 6]);
+        assert_eq!(l.count(), 3);
+        drop(gone);
+        l.push_back(item(9));
+        let mut rest = Vec::with_capacity(4);
+        assert_eq!(l.remove_all(|_| true, |u| rest.push(u)), 4);
+        drop(rest);
+        assert!(l.is_empty());
+        l.push_back(item(10));
+        assert_eq!(values(&l), [10]);
     }
 
     #[test]

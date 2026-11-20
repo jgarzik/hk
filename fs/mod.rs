@@ -47,6 +47,7 @@ pub mod pseudo;
 pub mod stat;
 
 // Filesystem implementations
+pub mod debugfs;
 pub mod kernfs;
 pub mod nullfs;
 pub mod proc;
@@ -59,7 +60,9 @@ pub use crate::util::error::KernelError;
 use crate::util::error::KernelResult;
 pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, DentryRef, is_subdir};
-pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, FileRef, RwFlags, flags, seek};
+pub use file::{
+    CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, FileRef, RwFlags, file_count, flags, seek,
+};
 pub use fsstruct::{FsStruct, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{
     DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, InodeRef, Uid,

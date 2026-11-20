@@ -230,6 +230,8 @@ impl ProtoOps for RawSock {
         self.sk.set_shutdown(SHUTDOWN_MASK);
         self.rxq.clear();
         self.sk.purge_err();
+        // Linux sk_common_release's sock_put: the last reference
+        self.sk.inuse_end();
     }
 
     /// Linux raw_bind: an address only (local, multicast or broadcast)
@@ -300,7 +302,7 @@ impl ProtoOps for RawSock {
     }
 
     fn poll(&self) -> u16 {
-        dgram::poll(&self.sk, &self.rxq)
+        dgram::poll(&self.sk, self.rxq.readable())
     }
 
     fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, KernelError> {

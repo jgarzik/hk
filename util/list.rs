@@ -369,6 +369,17 @@ impl<A: Adapter> List<A> {
         (!n.is_null()).then(|| unsafe { A::item(n) })
     }
 
+    /// The item before `item` (Linux list_prev_entry)
+    ///
+    /// # Safety
+    /// `item` is on this list.
+    pub unsafe fn prev(&self, item: *const A::Item) -> Option<*const A::Item> {
+        // SAFETY: `item` is a live entry of this list
+        let p = unsafe { (*Self::lk(item)).prev.load(Relaxed) };
+        // SAFETY: a non-null prev is an entry's link
+        (!p.is_null()).then(|| unsafe { A::item(p) })
+    }
+
     /// Remove and return the last item (Linux list_last_entry +
     /// list_del)
     pub fn pop_back(&mut self) -> Option<*const A::Item> {
@@ -683,6 +694,17 @@ impl<A: Adapter> PtrList<A, Arc<A::Item>> {
         // SAFETY: the reference just taken, of an Arc allocation
         Some(unsafe { Arc::from_raw(p) })
     }
+
+    /// A new reference to the first entry `f` accepts, left on the list
+    /// (Linux skb_queue_walk + a get under the list's lock)
+    pub fn find_arc(&self, mut f: impl FnMut(&A::Item) -> bool) -> Option<Arc<A::Item>> {
+        let p = core::ptr::from_ref(self.iter().find(|x| f(x))?);
+        // SAFETY: an entry of the list, which owns a strong reference to
+        // it from Arc::into_raw (type invariant)
+        unsafe { Arc::increment_strong_count(p) };
+        // SAFETY: the reference just taken, of an Arc allocation
+        Some(unsafe { Arc::from_raw(p) })
+    }
 }
 
 impl<A: Adapter, P: ListPtr<Target = A::Item>> Default for PtrList<A, P> {
@@ -860,6 +882,12 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         self.list.front()
     }
 
+    /// The last entry, borrowed for as long as the list is (Linux
+    /// skb_peek_tail)
+    pub fn last(&self) -> Option<&A::Item> {
+        self.list.back()
+    }
+
     /// A new reference to the first entry
     pub fn front(&self) -> Option<P> {
         // SAFETY: inserted with `into_raw`; the list holds that
@@ -880,6 +908,18 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         // SAFETY: an entry of the borrowed list, which holds a reference
         // to it while it is on it
         Some(unsafe { &*p })
+    }
+
+    /// A new reference to the entry before `item`; None if `item` is
+    /// the first or not on this list (Linux skb->prev)
+    pub fn prev(&self, item: &A::Item) -> Option<P> {
+        if !self.mine(item) {
+            return None;
+        }
+        // SAFETY: marked with this list's id, so on it (type invariant)
+        let p = unsafe { self.list.list.prev(core::ptr::from_ref(item)) }?;
+        // SAFETY: as in `front`
+        Some(unsafe { P::clone_raw(p) })
     }
 
     pub fn next(&self, item: &A::Item) -> Option<P> {

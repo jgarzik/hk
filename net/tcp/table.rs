@@ -171,11 +171,30 @@ pub fn init() {
         .clamp(1 << 10, 1 << 20);
     let mut bhash = alloc::vec::Vec::new();
     bhash.resize_with(n, || Mutex::new(ArcList::new()));
+    super::mem::set_max_orphans(n);
+    super::netns::set_max_tw_default(n);
     HASHINFO.call_once(|| Hashinfo {
         ehash: NullsHead::table(n).expect("tcp: ehash"),
         lhash: NullsHead::table(LHASH).expect("tcp: lhash"),
         bhash: bhash.into_boxed_slice(),
     });
+    // Linux tcp_metrics_init
+    super::metrics::init();
+    // Linux tcp_sk_init(init_net) -> tcp_set_hashinfo, after tcp_init
+    // sized the table: the initial namespace was made before it
+    crate::ns::net::init_net_ns()
+        .sysctl
+        .tcp_max_syn_backlog
+        .store(max_syn_backlog(), Ordering::Relaxed);
+}
+
+/// A namespace's initial tcp_max_syn_backlog (Linux tcp_set_hashinfo:
+/// max(128, ehash entries / 128), of the one table every namespace
+/// shares; 128 before it is sized)
+pub fn max_syn_backlog() -> i32 {
+    HASHINFO
+        .get()
+        .map_or(128, |h| (h.ehash.len() / 128).max(128) as i32)
 }
 
 fn hi() -> &'static Hashinfo {
@@ -247,6 +266,35 @@ impl EhKey {
 #[derive(Default)]
 pub struct TcpTables {
     _id: u8,
+    /// The namespace's Fast Open keys (Linux net->ipv4.tcp_fastopen_ctx,
+    /// replaced whole: tcp_fastopen_reset_cipher); leaf
+    fastopen_ctx: Mutex<Option<super::fastopen::Ctx>>,
+    /// Active Fast Open paused (Linux tfo_active_disable_stamp, ms, and
+    /// tfo_active_disable_times)
+    pub tfo_disable_stamp: core::sync::atomic::AtomicU64,
+    pub tfo_disable_times: core::sync::atomic::AtomicU32,
+}
+
+impl TcpTables {
+    /// Linux tcp_fastopen_init_key_once: a random primary key unless
+    /// the namespace has keys
+    pub fn fastopen_init_key_once(&self) {
+        let mut g = self.fastopen_ctx.lock();
+        if g.is_none() {
+            *g = Some(super::fastopen::Ctx::random());
+        }
+    }
+
+    /// The namespace's keys
+    pub fn fastopen_ctx(&self) -> Option<super::fastopen::Ctx> {
+        *self.fastopen_ctx.lock()
+    }
+
+    /// Replace the namespace's keys (Linux tcp_fastopen_reset_cipher
+    /// with no socket)
+    pub fn fastopen_reset(&self, c: super::fastopen::Ctx) {
+        *self.fastopen_ctx.lock() = Some(c);
+    }
 }
 
 /// End every TIME_WAIT entry of the namespaces `nets` going (Linux

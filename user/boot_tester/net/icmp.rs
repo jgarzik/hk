@@ -1,7 +1,8 @@
 //! ICMP errors delivered to UDP sockets (hk and Linux): port
 //! unreachable over lo (connected ECONNREFUSED, unconnected ignored,
 //! IP_RECVERR + MSG_ERRQUEUE with sock_extended_err), host unreachable
-//! after neighbour resolution fails on eth0, local EMSGSIZE errors.
+//! after neighbour resolution fails on eth0, local EMSGSIZE errors, a
+//! learned path MTU forgotten after net.ipv4.route.flush.
 
 use hk_syscall::POLLERR;
 
@@ -24,6 +25,7 @@ pub fn run_tests() {
         Ok(_) => {
             test_hostunreach();
             test_local_emsgsize();
+            test_pmtu_flush();
         }
         Err(e) => skip(b"ICMP_ETH0", e.as_bytes()),
     }
@@ -238,6 +240,73 @@ fn test_local_emsgsize() {
         t.ok(b"ee", false, 0);
     }
     close(fd);
+    t.done();
+}
+
+/// A frag-needed error (next-hop MTU `mtu`) quoting a UDP datagram
+/// `src:sport -> dst:dport`, checksummed; returns its length
+fn frag_needed(
+    out: &mut [u8],
+    mtu: u16,
+    src: [u8; 4],
+    sport: u16,
+    dst: [u8; 4],
+    dport: u16,
+) -> usize {
+    out[..36].fill(0);
+    out[0] = 3;
+    out[1] = 4;
+    out[6..8].copy_from_slice(&mtu.to_be_bytes());
+    // The quoted IP header: 1400 bytes, DF, UDP
+    out[8..20].copy_from_slice(&[0x45, 0, 0x05, 0x78, 0, 1, 0x40, 0, 64, 17, 0, 0]);
+    out[20..24].copy_from_slice(&src);
+    out[24..28].copy_from_slice(&dst);
+    out[28..30].copy_from_slice(&sport.to_be_bytes());
+    out[30..32].copy_from_slice(&dport.to_be_bytes());
+    out[32..34].copy_from_slice(&1380u16.to_be_bytes());
+    let c = crate::net::raw::csum(&out[..36]);
+    out[2..4].copy_from_slice(&c.to_be_bytes());
+    36
+}
+
+/// ICMP_PMTU_FLUSH: a frag-needed error for a connected UDP socket's
+/// datagram (sent to ourselves over lo) lowers its IP_MTU through a
+/// path MTU exception on the default route; after a write to
+/// net.ipv4.route.flush (Linux fnhe_genid_bump), and a send that
+/// routes again, IP_MTU is the device's again
+fn test_pmtu_flush() {
+    const IP_MTU: i32 = 14;
+    const DST: [u8; 4] = [203, 0, 113, 77];
+    const ME: [u8; 4] = [10, 0, 2, 15];
+    let mut t = T::new(b"ICMP_PMTU_FLUSH");
+    let u = udp();
+    t.eq(b"bind", bind(u, ME, 0), 0);
+    t.eq(b"connect", connect(u, DST, 9), 0);
+    t.eq(b"mtu before", getint(u, SOL_IP, IP_MTU).1 as i64, 1500);
+    let r = sys_socket(AF_INET, hk_syscall::SOCK_RAW, IPPROTO_ICMP) as i32;
+    let mut pkt = [0u8; 64];
+    let n = frag_needed(&mut pkt, 1280, ME, port(u), DST, 9);
+    t.eq(b"inject", send_to(r, &pkt[..n], ME, 0, 0), n as i64);
+    let mut mtu = 0;
+    for _ in 0..50 {
+        mtu = getint(u, SOL_IP, IP_MTU).1;
+        if mtu != 1500 {
+            break;
+        }
+        crate::net::nl::msleep(20);
+    }
+    t.eq(b"mtu learned", mtu as i64, 1280);
+    // The error the frag-needed left (EMSGSIZE on Linux) is cleared
+    getint(u, SOL_SOCKET, SO_ERROR);
+    t.eq(
+        b"flush",
+        write_file(b"/proc/sys/net/ipv4/route/flush\0", b"1\n"),
+        2,
+    );
+    t.eq(b"send", send(u, b"x", 0), 1);
+    t.eq(b"mtu after flush", getint(u, SOL_IP, IP_MTU).1 as i64, 1500);
+    close(r);
+    close(u);
     t.done();
 }
 

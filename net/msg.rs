@@ -1,32 +1,27 @@
 //! User I/O vectors of socket calls (Linux lib/iov_iter.c import_iovec /
 //! import_ubuf as used by net/socket.c)
 //!
-//! An `Iov` is validated once when imported: at most `UIO_MAXIOV`
-//! segments (EINVAL), every segment inside user space (EFAULT), and the
-//! total clamped to `MAX_RW_COUNT` like Linux, so no length arithmetic
-//! on it can overflow. Data is then copied with uaccess only.
+//! An `Iov` is validated once when imported (`fs::iov::import_iovec`):
+//! at most `UIO_MAXIOV` segments, every segment inside user space
+//! (EFAULT), and the total clamped to `MAX_RW_COUNT` like Linux, so no
+//! length arithmetic on it can overflow. Data is then copied with
+//! uaccess only.
 
 use alloc::vec::Vec;
 
+use crate::fs::FileRef;
+use crate::fs::io::import_ubuf;
+use crate::fs::iov::{IoVec, import_iovec};
 use crate::fs::iov_iter::{IovDest, IovSource};
-use crate::uaccess::{UserPtr, access_ok, copy_from_user, copy_to_user, get_user};
+use crate::fs::syscall::UIO_MAXIOV;
+use crate::task::fdtable::UnusedFd;
+use crate::uaccess::{UserPtr, copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
+use crate::util::kmem::try_to_vec;
 use core::mem::{offset_of, size_of};
 
-/// Most segments in one iovec array (Linux UIO_MAXIOV)
-pub const UIO_MAXIOV: usize = 1024;
-/// Largest single transfer (Linux MAX_RW_COUNT = INT_MAX & PAGE_MASK)
-pub const MAX_RW_COUNT: usize = 0x7fff_f000;
-
-/// One user segment
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IoVec {
-    pub base: u64,
-    pub len: usize,
-}
-
 /// A validated user I/O vector
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Iov {
     segs: Vec<IoVec>,
     /// Sum of the (clamped) segment lengths, <= MAX_RW_COUNT
@@ -34,51 +29,25 @@ pub struct Iov {
 }
 
 impl Iov {
-    /// One buffer (send/recv; Linux import_ubuf clamps before access_ok)
+    /// One buffer (send/recv; Linux import_ubuf)
     pub fn single(base: u64, len: u64) -> Result<Self, KernelError> {
-        let mut v = Self::default();
-        v.push(base, len.min(MAX_RW_COUNT as u64))?;
-        Ok(v)
+        let seg = import_ubuf(UserPtr::new(base), len)?;
+        Ok(Self {
+            segs: try_to_vec(&seg)?,
+            total: seg[0].iov_len as usize,
+        })
     }
 
-    /// The iovec of a user msghdr (Linux __copy_msghdr: EMSGSIZE above
-    /// UIO_MAXIOV segments)
+    /// The iovec of a user msghdr (Linux copy_msghdr_from_user:
+    /// __copy_msghdr's EMSGSIZE above UIO_MAXIOV segments, then
+    /// import_iovec)
     pub fn from_msg(ptr: u64, n: usize) -> Result<Self, KernelError> {
         if n > UIO_MAXIOV {
             return Err(KernelError::MessageTooLong);
         }
-        Self::import(ptr, n)
-    }
-
-    /// A user `struct iovec[n]` at `ptr` (readv-style: EINVAL above
-    /// UIO_MAXIOV)
-    pub fn import(ptr: u64, n: usize) -> Result<Self, KernelError> {
-        if n > UIO_MAXIOV {
-            return Err(KernelError::InvalidArgument);
-        }
-        let mut v = Self {
-            segs: Vec::with_capacity(n),
-            total: 0,
-        };
-        for i in 0..n as u64 {
-            let at = ptr.checked_add(i * 16).ok_or(KernelError::BadAddress)?;
-            let base = get_user::<u64>(at).map_err(|_| KernelError::BadAddress)?;
-            let at8 = at.checked_add(8).ok_or(KernelError::BadAddress)?;
-            let len = get_user::<u64>(at8).map_err(|_| KernelError::BadAddress)?;
-            v.push(base, len)?;
-        }
-        Ok(v)
-    }
-
-    fn push(&mut self, base: u64, len: u64) -> Result<(), KernelError> {
-        // Like Linux access_ok, an empty segment is never checked
-        if len > isize::MAX as u64 || (len != 0 && !access_ok(base, len as usize)) {
-            return Err(KernelError::BadAddress);
-        }
-        let len = (len as usize).min(MAX_RW_COUNT - self.total);
-        self.total += len;
-        self.segs.push(IoVec { base, len });
-        Ok(())
+        let segs = import_iovec(UserPtr::new(ptr), n as i32)?;
+        let total = segs.iter().map(|s| s.iov_len as usize).sum();
+        Ok(Self { segs, total })
     }
 
     /// Copy in the first `min(total, max)` bytes
@@ -103,15 +72,16 @@ impl Iov {
         let want = self.total.saturating_sub(skip).min(buf.len());
         let mut off = 0;
         for s in &self.segs {
+            let len = s.iov_len as usize;
             if off == want {
                 break;
             }
-            if skip >= s.len {
-                skip -= s.len;
+            if skip >= len {
+                skip -= len;
                 continue;
             }
-            let n = (s.len - skip).min(want - off);
-            if copy_from_user(&mut buf[off..off + n], s.base + skip as u64, n).is_err() {
+            let n = (len - skip).min(want - off);
+            if copy_from_user(&mut buf[off..off + n], s.iov_base + skip as u64, n).is_err() {
                 return if off > 0 {
                     Ok(off)
                 } else {
@@ -129,15 +99,16 @@ impl Iov {
     pub fn scatter(&self, mut skip: usize, data: &[u8]) -> Result<usize, KernelError> {
         let mut done = 0;
         for s in &self.segs {
+            let len = s.iov_len as usize;
             if done == data.len() {
                 break;
             }
-            if skip >= s.len {
-                skip -= s.len;
+            if skip >= len {
+                skip -= len;
                 continue;
             }
-            let n = (s.len - skip).min(data.len() - done);
-            copy_to_user(s.base + skip as u64, &data[done..done + n])
+            let n = (len - skip).min(data.len() - done);
+            copy_to_user(s.iov_base + skip as u64, &data[done..done + n])
                 .map_err(|_| KernelError::BadAddress)?;
             skip = 0;
             done += n;
@@ -169,6 +140,8 @@ pub const MSG_CONFIRM: i32 = 0x800;
 pub const MSG_ERRQUEUE: i32 = 0x2000;
 pub const MSG_NOSIGNAL: i32 = 0x4000;
 pub const MSG_MORE: i32 = 0x8000;
+/// Send data in the SYN (TCP Fast Open)
+pub const MSG_FASTOPEN: i32 = 0x2000_0000;
 pub const MSG_WAITFORONE: i32 = 0x10000;
 pub const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 
@@ -498,6 +471,11 @@ pub struct Cmsg {
     cap: usize,
     pub buf: Vec<u8>,
     pub trunc: bool,
+    /// Descriptors reserved for the files `buf` names, installed once
+    /// it is copied out (Linux receive_fd and scm_pidfd_recv: the
+    /// number put to user memory, then fd_install); dropped uninstalled
+    /// (put_unused_fd, fput) if the copy faults
+    fds: Vec<(UnusedFd, FileRef)>,
 }
 
 impl Cmsg {
@@ -506,6 +484,30 @@ impl Cmsg {
             cap,
             buf: Vec::new(),
             trunc: false,
+            fds: Vec::new(),
+        }
+    }
+
+    /// Reserve room for `n` more deferred installs
+    pub fn reserve_fds(&mut self, n: usize) -> Result<(), KernelError> {
+        self.fds
+            .try_reserve(n)
+            .map_err(|_| KernelError::OutOfMemory)
+    }
+
+    /// Install `file` at `fd` once the control data is copied out
+    /// (room reserved with `reserve_fds`); its number
+    pub fn defer_install(&mut self, fd: UnusedFd, file: FileRef) -> i32 {
+        let n = fd.fd();
+        self.fds.push((fd, file));
+        n
+    }
+
+    /// The control data reached user memory: install the files (Linux
+    /// fd_install)
+    pub fn install_fds(&mut self) {
+        for (fd, file) in self.fds.drain(..) {
+            fd.install(file);
         }
     }
 

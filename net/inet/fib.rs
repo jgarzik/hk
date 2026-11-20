@@ -10,7 +10,10 @@
 //!
 //! Address-derived routes (`fib_add_ifaddr`) have protocol `kernel`.
 //! Devices going down lose their routes except host-scope (local) ones;
-//! a device losing its last address loses all.
+//! a device losing its last address loses all; routes preferring a
+//! source address nobody owns any more go too. Like Linux, those routes
+//! are first marked dead (fib_sync_down_dev, fib_sync_down_addr), then
+//! unlinked in one walk per table (fib_flush, fib_table_flush).
 //!
 //! ## Locking
 //!
@@ -23,12 +26,16 @@
 //! lock and no copy, and a lookup takes a reference to the entry it
 //! returns. An entry removed or replaced is freed after a grace period
 //! (`RcuUnlinked::defer`, Linux alias_free_mem_rcu); notifications are
-//! sent outside the RCU guard. Order: RTNL -> device address lists ->
-//! FIB lists' writer locks (leaves).
+//! sent outside the RCU guard. An entry's dead mark (`fib_flags`,
+//! `pfsrc_removed`) is set under RTNL and read by lookups without a
+//! lock (Linux fi->fib_flags, read locklessly by fib_table_lookup).
+//! Order: RTNL -> device address lists -> FIB lists' writer locks
+//! (leaves).
 
 use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 use crate::sync::rcu::{RcuHead, RcuReadGuard};
 use crate::util::list::Link;
@@ -37,7 +44,8 @@ use crate::util::rculist::{RcuIter, RcuList, RcuRef, RcuUnlinked};
 use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::ifaddr::{
-    InIfaddr, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, inet_make_mask,
+    IFA_F_NOPREFIXROUTE, InIfaddr, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE,
+    RT_SCOPE_UNIVERSE, inet_make_mask,
 };
 use crate::net::inet::route::NhExceptions;
 use crate::net::ipv4::Ipv4Addr;
@@ -143,6 +151,13 @@ pub struct FibEntry {
     pub dev: Option<Arc<NetDevice>>,
     /// RTNH_F_* flags (ONLINK)
     pub flags: u32,
+    /// RTNH_F_DEAD once its device or preferred source is gone, until
+    /// `fib_flush` unlinks it (Linux fi->fib_flags): set under RTNL,
+    /// read by lookups without a lock
+    fib_flags: AtomicU32,
+    /// Dead because its preferred source went: announced when flushed
+    /// (Linux fi->pfsrc_removed); under RTNL
+    pfsrc_removed: AtomicBool,
     /// Learned exceptions of its nexthop (Linux nhc_exceptions): PMTU
     pub exceptions: NhExceptions,
     /// On its table's entries (Linux fa_list)
@@ -162,6 +177,11 @@ impl FibEntry {
 
     fn matches(&self, addr: Ipv4Addr) -> bool {
         addr.mask(inet_make_mask(self.dst_len)) == self.dst
+    }
+
+    /// Marked dead, waiting for `fib_flush` (RTNH_F_DEAD)
+    pub fn dead(&self) -> bool {
+        self.fib_flags.load(Relaxed) & RTNH_F_DEAD != 0
     }
 
     /// Same route identity as Linux's exact-duplicate check (alias with
@@ -245,6 +265,9 @@ impl FibTable {
                     return Ok(None);
                 }
                 return Err(err);
+            }
+            if e.dead() {
+                continue;
             }
             if key.oif != 0 && e.oif() != key.oif {
                 continue;
@@ -375,6 +398,12 @@ impl Fib {
 
     /// Linux inet_addr_type: classify `addr` by the local table
     pub fn addr_type(&self, addr: Ipv4Addr) -> RouteType {
+        self.dev_addr_type(None, addr)
+    }
+
+    /// Linux __inet_dev_addr_type on the local table: the type of
+    /// `addr` as if only `dev` existed (any device for None)
+    pub fn dev_addr_type(&self, dev: Option<&NetDevice>, addr: Ipv4Addr) -> RouteType {
         if (addr.0 >> 24) == 0 || addr.is_broadcast() {
             return RouteType::Broadcast;
         }
@@ -387,7 +416,7 @@ impl Fib {
         };
         let g = crate::sync::rcu::read_lock();
         match self.lookup_table(&g, RT_TABLE_LOCAL, &key) {
-            Ok(Some(e)) => e.rtype,
+            Ok(Some(e)) if dev.is_none_or(|d| e.oif() == d.ifindex()) => e.rtype,
             _ => RouteType::Unicast,
         }
     }
@@ -400,20 +429,53 @@ impl Fib {
         Ok(new)
     }
 
-    /// Unlink every route `pred` picks, handing each to `gone` (RTNL
-    /// held; `gone` runs outside RCU, so it may notify)
-    fn remove_each(
+    /// Mark dead the live routes `pred` picks, of table `table` or of
+    /// all (the marking of Linux fib_sync_down_dev / fib_sync_down_addr;
+    /// `pfsrc`: for a preferred source gone, announced when flushed).
+    /// RTNL held; returns how many.
+    fn mark_dead(
         &self,
+        table: Option<u32>,
+        pfsrc: bool,
         mut pred: impl FnMut(&FibEntry) -> bool,
-        mut gone: impl FnMut(RcuUnlinked<FibLink>),
-    ) {
-        // Tables are never removed; a reference each keeps the walk
-        // outside RCU
-        for t in self.tables.snapshot() {
-            while let Some(u) = t.entries.remove_first(&mut pred) {
-                gone(u);
+    ) -> usize {
+        let g = crate::sync::rcu::read_lock();
+        let mut n = 0;
+        for t in self.tables(&g) {
+            if table.is_some_and(|id| id != t.id) {
+                continue;
+            }
+            for e in t.entries(&g).filter(|e| !e.dead() && pred(e)) {
+                if pfsrc {
+                    e.pfsrc_removed.store(true, Relaxed);
+                }
+                e.fib_flags.fetch_or(RTNH_F_DEAD, Relaxed);
+                n += 1;
             }
         }
+        n
+    }
+
+    /// Unlink every dead route, one walk per table (Linux fib_flush's
+    /// fib_table_flush calls, flush_all false); RTNL held. Those gone
+    /// with their preferred source go to `pfsrc` while it has room (to
+    /// be announced), the others are freed after a grace period.
+    /// Returns how many went.
+    fn flush(&self, pfsrc: &mut Vec<RcuUnlinked<FibLink>>) -> usize {
+        let g = crate::sync::rcu::read_lock();
+        let mut n = 0;
+        for t in self.tables(&g) {
+            n += t.entries.remove_all(FibEntry::dead, |u| {
+                // Within the reserved capacity: no allocation under the
+                // list's lock
+                if u.item().pfsrc_removed.load(Relaxed) && pfsrc.len() < pfsrc.capacity() {
+                    pfsrc.push(u);
+                } else {
+                    u.defer();
+                }
+            });
+        }
+        n
     }
 
     /// Unlink the first route of table `id` that `pred` picks
@@ -482,6 +544,8 @@ fn fib_create_info(net: &NetNamespace, cfg: &FibConfig) -> Result<FibEntry, Kern
         gateway: cfg.gateway,
         dev: None,
         flags: cfg.flags,
+        fib_flags: AtomicU32::new(0),
+        pfsrc_removed: AtomicBool::new(false),
         exceptions: NhExceptions::default(),
         link: Link::new(),
         rcu: RcuHead::new(),
@@ -619,9 +683,23 @@ pub fn fib_table_delete(
     Ok(())
 }
 
-/// The routes an address implies (Linux fib_add_ifaddr's fib_magic calls)
-fn ifa_routes(dev: &NetDevice, ifa: &InIfaddr, prim_local: Ipv4Addr) -> Vec<FibConfig> {
-    let magic = |rtype: RouteType, dst: Ipv4Addr, dst_len: u8, priority: u32| FibConfig {
+/// Add or delete a route an address implies (Linux fib_magic): unicast
+/// goes to the main table, the other types to local; preferred source
+/// `prim` (the local address of the subnet's primary). Failures are
+/// ignored, as Linux does.
+#[allow(clippy::too_many_arguments)]
+fn fib_magic(
+    rtnl: &RtnlGuard,
+    net: &NetNamespace,
+    add: bool,
+    rtype: RouteType,
+    dst: Ipv4Addr,
+    dst_len: u8,
+    dev: &NetDevice,
+    prim: Ipv4Addr,
+    priority: u32,
+) {
+    let cfg = FibConfig {
         table: if rtype == RouteType::Unicast {
             RT_TABLE_MAIN
         } else {
@@ -637,157 +715,318 @@ fn ifa_routes(dev: &NetDevice, ifa: &InIfaddr, prim_local: Ipv4Addr) -> Vec<FibC
         },
         protocol: RTPROT_KERNEL,
         priority,
-        prefsrc: Some(prim_local),
+        prefsrc: Some(prim),
         oif: dev.ifindex(),
-        nlflags: NLM_F_CREATE | NLM_F_APPEND,
+        nlflags: if add { NLM_F_CREATE | NLM_F_APPEND } else { 0 },
         ..Default::default()
     };
-    let mut out = alloc::vec![magic(RouteType::Local, ifa.local, 32, 0)];
-    if !dev.is_up() {
-        return out;
-    }
-    if !ifa.broadcast.is_unspecified() && !ifa.broadcast.is_broadcast() {
-        out.push(magic(RouteType::Broadcast, ifa.broadcast, 32, 0));
-    }
-    let mask = ifa.mask();
-    let prefix = ifa.prefix();
-    if (prefix.0 >> 24) != 0 && !ifa.is_secondary() && (prefix != ifa.local || ifa.prefixlen < 32) {
-        if ifa.flags() & crate::net::inet::ifaddr::IFA_F_NOPREFIXROUTE == 0 {
-            let t = if dev.is_loopback() {
-                RouteType::Local
-            } else {
-                RouteType::Unicast
-            };
-            out.push(magic(t, prefix, ifa.prefixlen, ifa.rt_priority()));
-        }
-        if ifa.prefixlen < 31 {
-            out.push(magic(
-                RouteType::Broadcast,
-                Ipv4Addr(prefix.0 | !mask.0),
-                32,
-                0,
-            ));
-        }
-    }
-    out
+    let _ = if add {
+        fib_table_insert(rtnl, net, &cfg)
+    } else {
+        fib_table_delete(rtnl, net, &cfg)
+    };
 }
 
-/// Primary address of `ifa`'s subnet on `dev` (itself if primary)
-fn primary_local(dev: &NetDevice, ifa: &InIfaddr) -> Ipv4Addr {
-    if !ifa.is_secondary() {
-        return ifa.local;
-    }
-    let g = crate::sync::rcu::read_lock();
+/// Linux ipv4_is_zeronet
+fn zeronet(a: Ipv4Addr) -> bool {
+    (a.0 >> 24) == 0
+}
+
+/// The first address of `dev` in subnet `prefix/prefixlen`, while `g`
+/// is held (Linux inet_ifa_byprefix: primaries come first)
+fn ifa_byprefix<'a>(
+    dev: &'a NetDevice,
+    g: &'a RcuReadGuard,
+    prefix: Ipv4Addr,
+    prefixlen: u8,
+) -> Option<&'a InIfaddr> {
     dev.in_dev()
-        .addrs(&g)
-        .find(|p| !p.is_secondary() && p.same_subnet(ifa))
-        .map_or(ifa.local, |p| p.local)
+        .addrs(g)
+        .find(|i| i.prefixlen == prefixlen && i.matches(prefix))
 }
 
 /// Install the routes for `ifa` (Linux fib_add_ifaddr); existing ones are
 /// kept
 pub fn fib_add_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr) {
-    for cfg in ifa_routes(dev, ifa, primary_local(dev, ifa)) {
-        let _ = fib_table_insert(rtnl, net, &cfg);
-    }
-}
-
-/// Remove the routes of a deleted address (Linux fib_del_ifaddr +
-/// fib_sync_down_addr): routes still implied by a remaining address stay;
-/// routes using the address as preferred source go once nobody owns it;
-/// a device without addresses loses all its routes
-pub fn fib_del_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr) {
-    let mut still: Vec<FibConfig> = Vec::new();
-    for d in net.devices() {
-        for other in d.in_dev().ifa_list.snapshot() {
-            still.extend(ifa_routes(&d, &other, primary_local(&d, &other)));
-        }
-    }
-    let same = |a: &FibConfig, b: &FibConfig| {
-        a.table == b.table
-            && a.dst == b.dst
-            && a.dst_len == b.dst_len
-            && a.rtype == b.rtype
-            && a.prefsrc == b.prefsrc
-            && a.oif == b.oif
-    };
+    let mask = ifa.mask();
+    let addr = ifa.local;
+    let prefix = ifa.prefix();
     let prim = if ifa.is_secondary() {
-        primary_local(dev, ifa)
+        let g = crate::sync::rcu::read_lock();
+        match ifa_byprefix(dev, &g, prefix, ifa.prefixlen) {
+            Some(p) => p.local,
+            None => return,
+        }
     } else {
         ifa.local
     };
-    // Routes are computed as if the device were up, so a down device's
-    // leftovers are found too (deleting a missing one is harmless)
-    for mut cfg in ifa_routes_all(dev, ifa, prim) {
-        if still.iter().any(|s| same(s, &cfg)) {
+    let magic =
+        |rtype, dst, len, prio| fib_magic(rtnl, net, true, rtype, dst, len, dev, prim, prio);
+    magic(RouteType::Local, addr, 32, 0);
+    if !dev.is_up() {
+        return;
+    }
+    // A broadcast address explicitly assigned
+    if !ifa.broadcast.is_unspecified() && !ifa.broadcast.is_broadcast() {
+        magic(RouteType::Broadcast, ifa.broadcast, 32, 0);
+    }
+    if !zeronet(prefix) && !ifa.is_secondary() && (prefix != addr || ifa.prefixlen < 32) {
+        if ifa.flags() & IFA_F_NOPREFIXROUTE == 0 {
+            let t = if dev.is_loopback() {
+                RouteType::Local
+            } else {
+                RouteType::Unicast
+            };
+            magic(t, prefix, ifa.prefixlen, ifa.rt_priority());
+        }
+        // The network broadcast address, where it makes sense
+        if ifa.prefixlen < 31 {
+            magic(RouteType::Broadcast, Ipv4Addr(prefix.0 | !mask.0), 32, 0);
+        }
+    }
+}
+
+/// An address's metric changes (Linux fib_modify_prefix_metric, from
+/// inet_rtm_newaddr's NLM_F_REPLACE): its prefix route is added at
+/// `new_metric`, then the one at its old metric deleted
+pub fn fib_modify_prefix_metric(
+    rtnl: &RtnlGuard,
+    net: &NetNamespace,
+    dev: &NetDevice,
+    ifa: &InIfaddr,
+    new_metric: u32,
+) {
+    let prefix = ifa.prefix();
+    if !dev.is_up()
+        || ifa.is_secondary()
+        || ifa.flags() & IFA_F_NOPREFIXROUTE != 0
+        || zeronet(prefix)
+        || (prefix == ifa.local && ifa.prefixlen == 32)
+    {
+        return;
+    }
+    let t = if dev.is_loopback() {
+        RouteType::Local
+    } else {
+        RouteType::Unicast
+    };
+    let (len, prim) = (ifa.prefixlen, ifa.local);
+    fib_magic(rtnl, net, true, t, prefix, len, dev, prim, new_metric);
+    fib_magic(
+        rtnl,
+        net,
+        false,
+        t,
+        prefix,
+        len,
+        dev,
+        prim,
+        ifa.rt_priority(),
+    );
+}
+
+/// Which of a deleted address's routes another address of the device
+/// still implies (Linux fib_del_ifaddr's `ok` bits)
+const LOCAL_OK: u32 = 1;
+const BRD_OK: u32 = 2;
+const BRD0_OK: u32 = 4;
+const BRD1_OK: u32 = 8;
+
+/// What fib_del_ifaddr's scan of the remaining addresses found: the
+/// preferred source of the address's routes (its subnet's primary),
+/// the routes still implied, and whether the address itself is gone
+struct DelScan {
+    prim: Ipv4Addr,
+    ok: u32,
+    gone: bool,
+}
+
+/// Linux fib_del_ifaddr's scan of `dev`'s addresses (promote_secondaries
+/// off: no iprim); None if a secondary `ifa` has no primary
+fn del_ifaddr_scan(dev: &NetDevice, ifa: &InIfaddr) -> Option<DelScan> {
+    let g = crate::sync::rcu::read_lock();
+    let mask = ifa.mask();
+    let brd = Ipv4Addr(ifa.address.0 | !mask.0);
+    let any = Ipv4Addr(ifa.address.0 & mask.0);
+    let prim: &InIfaddr = if ifa.is_secondary() {
+        ifa_byprefix(dev, &g, any, ifa.prefixlen)?
+    } else {
+        ifa
+    };
+    let (mut ok, mut gone, mut same_prefsrc) = (0, true, false);
+    let mut prim1: Option<&InIfaddr> = None;
+    for ifa1 in dev.in_dev().addrs(&g) {
+        if core::ptr::eq(ifa1, ifa) {
+            // Promotion, keep the IP
+            gone = false;
             continue;
         }
-        cfg.nlflags = 0;
-        let _ = fib_table_delete(rtnl, net, &cfg);
-    }
-    if crate::net::inet::ifaddr::ip_dev_find(net, ifa.local).is_none() {
-        let local = ifa.local;
-        net.fib.remove_each(
-            |e| e.prefsrc == Some(local),
-            |e| {
-                rtnetlink::notify_route(net, e.item(), rtnetlink::RTM_DELROUTE, NlInfo::default());
-                e.defer();
-            },
-        );
-    }
-    if !dev.in_dev().has_addrs() {
-        fib_disable_dev(rtnl, net, dev, true);
-    }
-}
-
-/// `ifa_routes` for an up device (deletion must find all of them)
-fn ifa_routes_all(dev: &NetDevice, ifa: &InIfaddr, prim: Ipv4Addr) -> Vec<FibConfig> {
-    let mut v = ifa_routes(dev, ifa, prim);
-    if !dev.is_up() {
-        // Same computation with the up-only part included
-        let mask = ifa.mask();
-        let prefix = ifa.prefix();
-        let mk = |rtype: RouteType, dst: Ipv4Addr, dst_len: u8| FibConfig {
-            table: if rtype == RouteType::Unicast {
-                RT_TABLE_MAIN
+        // Ignore an address using another primary IP (prefsrc)
+        if ifa1.is_secondary() {
+            if ifa1.prefixlen == prim.prefixlen && prim.matches(ifa1.address) {
+                // Another address of our subnet
+                prim1 = Some(prim);
             } else {
-                RT_TABLE_LOCAL
-            },
-            dst,
-            dst_len,
-            rtype: rtype as u8,
-            scope: RT_SCOPE_NOWHERE,
-            protocol: RTPROT_KERNEL,
-            prefsrc: Some(prim),
-            oif: dev.ifindex(),
-            ..Default::default()
-        };
-        if !ifa.broadcast.is_unspecified() {
-            v.push(mk(RouteType::Broadcast, ifa.broadcast, 32));
-        }
-        let t = if dev.is_loopback() {
-            RouteType::Local
+                // Among the secondaries: same_prefsrc is known now
+                if !same_prefsrc {
+                    continue;
+                }
+                if prim1.is_none_or(|p| ifa1.prefixlen != p.prefixlen || !p.matches(ifa1.address)) {
+                    prim1 = ifa_byprefix(dev, &g, ifa1.address, ifa1.prefixlen);
+                }
+                match prim1 {
+                    Some(p) if p.local == prim.local => {}
+                    _ => continue,
+                }
+            }
         } else {
-            RouteType::Unicast
-        };
-        v.push(mk(t, prefix, ifa.prefixlen));
-        v.push(mk(RouteType::Broadcast, Ipv4Addr(prefix.0 | !mask.0), 32));
+            if prim.local != ifa1.local {
+                continue;
+            }
+            prim1 = Some(ifa1);
+            if !core::ptr::eq(prim, ifa1) {
+                same_prefsrc = true;
+            }
+        }
+        if ifa.local == ifa1.local {
+            ok |= LOCAL_OK;
+        }
+        if ifa.broadcast == ifa1.broadcast {
+            ok |= BRD_OK;
+        }
+        if brd == ifa1.broadcast {
+            ok |= BRD1_OK;
+        }
+        if any == ifa1.broadcast {
+            ok |= BRD0_OK;
+        }
+        // A primary has network specific broadcasts
+        if prim1.is_some_and(|p| core::ptr::eq(p, ifa1)) && ifa1.prefixlen < 31 {
+            let m1 = ifa1.mask();
+            let brd1 = Ipv4Addr(ifa1.address.0 | !m1.0);
+            let any1 = Ipv4Addr(ifa1.address.0 & m1.0);
+            if !zeronet(any1) {
+                if ifa.broadcast == brd1 || ifa.broadcast == any1 {
+                    ok |= BRD_OK;
+                }
+                if brd == brd1 || brd == any1 {
+                    ok |= BRD1_OK;
+                }
+                if any == brd1 || any == any1 {
+                    ok |= BRD0_OK;
+                }
+            }
+        }
     }
-    for c in v.iter_mut() {
-        c.scope = RT_SCOPE_NOWHERE;
-    }
-    v
+    Some(DelScan {
+        prim: prim.local,
+        ok,
+        gone,
+    })
 }
 
-/// Drop routes through `dev` (Linux fib_disable_ip): all of them when
-/// `force`, else all but host-scope ones (local addresses stay reachable
-/// on a down device). Like Linux, no RTM_DELROUTE is sent for these.
-pub fn fib_disable_dev(_rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, force: bool) {
+/// Remove the routes of `ifa`, already off `dev`'s list (Linux
+/// fib_del_ifaddr): those another address of the device still implies
+/// stay; once the address is gone from the device, routes preferring
+/// it as source are flushed (fib_sync_down_addr) and announced
+pub fn fib_del_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr) {
+    let Some(scan) = del_ifaddr_scan(dev, ifa) else {
+        return;
+    };
+    let mask = ifa.mask();
+    let brd = Ipv4Addr(ifa.address.0 | !mask.0);
+    let any = Ipv4Addr(ifa.address.0 & mask.0);
+    let del = |rtype, dst, len| fib_magic(rtnl, net, false, rtype, dst, len, dev, scan.prim, 0);
+    let mut subnet = false;
+    if !ifa.is_secondary() && !zeronet(any) && (any != ifa.local || ifa.prefixlen < 32) {
+        if ifa.flags() & IFA_F_NOPREFIXROUTE == 0 {
+            let t = if dev.is_loopback() {
+                RouteType::Local
+            } else {
+                RouteType::Unicast
+            };
+            del(t, any, ifa.prefixlen);
+        }
+        subnet = true;
+    }
+    if scan.ok & BRD_OK == 0 {
+        del(RouteType::Broadcast, ifa.broadcast, 32);
+    }
+    if subnet && ifa.prefixlen < 31 {
+        if scan.ok & BRD1_OK == 0 {
+            del(RouteType::Broadcast, brd, 32);
+        }
+        if scan.ok & BRD0_OK == 0 {
+            del(RouteType::Broadcast, any, 32);
+        }
+    }
+    if scan.ok & LOCAL_OK == 0 {
+        del(RouteType::Local, ifa.local, 32);
+        // The local address finally disappeared: flush stray routes
+        // Local on any device keeps its routes (Linux
+        // inet_addr_type_dev_table: __inet_dev_addr_type with no device)
+        if scan.gone && net.fib.dev_addr_type(None, ifa.local) != RouteType::Local {
+            let n = fib_sync_down_addr(rtnl, net, ifa.local);
+            if n > 0 {
+                fib_flush(rtnl, net, n);
+            }
+        }
+    }
+}
+
+/// Mark dead the main-table routes preferring `local` as source (Linux
+/// fib_sync_down_addr, no l3mdev); returns how many
+fn fib_sync_down_addr(_rtnl: &RtnlGuard, net: &NetNamespace, local: Ipv4Addr) -> usize {
+    if local.is_unspecified() {
+        return 0;
+    }
+    net.fib
+        .mark_dead(Some(RT_TABLE_MAIN), true, |e| e.prefsrc == Some(local))
+}
+
+/// Mark dead the routes through `dev` (Linux fib_sync_down_dev for
+/// NETDEV_DOWN / NETDEV_UNREGISTER): all of them when `force`, else all
+/// but host-scope ones (local addresses stay reachable on a down
+/// device); returns how many
+fn fib_sync_down_dev(_rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, force: bool) -> usize {
     let idx = dev.ifindex();
-    net.fib.remove_each(
-        |e| e.oif() == idx && (force || e.scope != RT_SCOPE_HOST),
-        RcuUnlinked::defer,
-    );
+    net.fib.mark_dead(None, false, |e| {
+        e.oif() == idx && (force || e.scope != RT_SCOPE_HOST)
+    })
+}
+
+/// Unlink every dead route (Linux fib_flush). The `announce` routes
+/// fib_sync_down_addr marked get RTM_DELROUTE (Linux fib_table_flush's
+/// pfsrc_removed rtmsg_fib; one the list has no memory for is dropped,
+/// as rtmsg_fib drops one); the others go silently. hk has no route
+/// cache to flush after (Linux rt_cache_flush).
+fn fib_flush(_rtnl: &RtnlGuard, net: &NetNamespace, announce: usize) {
+    let mut pfsrc = Vec::new();
+    let _ = pfsrc.try_reserve_exact(announce);
+    net.fib.flush(&mut pfsrc);
+    for u in pfsrc {
+        rtnetlink::notify_route(net, u.item(), rtnetlink::RTM_DELROUTE, NlInfo::default());
+        u.defer();
+    }
+}
+
+/// Drop the routes through `dev` (Linux fib_disable_ip): all of them
+/// when `force`, else all but host-scope ones; like Linux, no
+/// RTM_DELROUTE is sent for these. Its ARP entries go too (arp_ifdown).
+pub fn fib_disable_ip(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, force: bool) {
+    if fib_sync_down_dev(rtnl, net, dev, force) > 0 {
+        fib_flush(rtnl, net, 0);
+    }
+    crate::net::arp::arp_tbl().flush_dev(dev);
+}
+
+/// An address left `dev` (Linux fib_inetaddr_event NETDEV_DOWN): its
+/// routes go, then every route through `dev` once it has no address
+pub fn fib_inetaddr_down(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr) {
+    fib_del_ifaddr(rtnl, net, dev, ifa);
+    if !dev.in_dev().has_addrs() {
+        fib_disable_ip(rtnl, net, dev, true);
+    }
 }
 
 #[cfg(test)]
@@ -816,6 +1055,8 @@ mod tests {
             gateway: None,
             dev: None,
             flags: 0,
+            fib_flags: AtomicU32::new(0),
+            pfsrc_removed: AtomicBool::new(false),
             exceptions: NhExceptions::default(),
             link: Link::new(),
             rcu: RcuHead::new(),
@@ -976,6 +1217,69 @@ mod tests {
         // A gateway reachable only via a universe-scope route is not
         // directly reachable
         assert!(f.lookup(&k).is_err());
+    }
+
+    /// Many routes marked dead go in one flush, every table walked once
+    /// (Linux fib_sync_down_addr + fib_flush): only main-table routes
+    /// with the preferred source are marked, a dead route is no longer
+    /// found, the rest stay in order, and the marked ones are handed
+    /// back for announcing while there is room
+    #[test]
+    fn flush_dead() {
+        const N: u32 = 600;
+        let f = Fib::new().unwrap();
+        let src = ip(192, 0, 2, 10);
+        let mut add = |table, dst: Ipv4Addr, prefsrc| {
+            let rtype = if table == RT_TABLE_LOCAL {
+                RouteType::Local
+            } else {
+                RouteType::Unicast
+            };
+            let mut e = entry(table, dst, 32, rtype, 0);
+            e.prefsrc = prefsrc;
+            f.insert(e, NLM_F_CREATE).unwrap();
+        };
+        for i in 0..N {
+            let d = Ipv4Addr(u32::from_be_bytes([198, 51, 0, 0]) + i);
+            // Every other main route prefers `src`
+            add(RT_TABLE_MAIN, d, (i % 2 == 0).then_some(src));
+        }
+        add(RT_TABLE_LOCAL, src, Some(src));
+        let n = f.mark_dead(Some(RT_TABLE_MAIN), true, |e| e.prefsrc == Some(src));
+        assert_eq!(n, N as usize / 2);
+        // Marked again: nothing new
+        assert_eq!(
+            f.mark_dead(Some(RT_TABLE_MAIN), true, |e| e.prefsrc == Some(src)),
+            0
+        );
+        assert!(matches!(
+            f.lookup(&key(ip(198, 51, 0, 0))),
+            Err(KernelError::NetworkUnreachable)
+        ));
+        assert_eq!(
+            f.lookup(&key(ip(198, 51, 0, 1))).unwrap().dst,
+            ip(198, 51, 0, 1)
+        );
+        // Room for some: the rest are freed unannounced
+        let mut pfsrc = Vec::with_capacity(10);
+        assert_eq!(f.flush(&mut pfsrc), N as usize / 2);
+        assert_eq!(pfsrc.len(), 10);
+        assert!(pfsrc.iter().all(|u| u.item().prefsrc == Some(src)));
+        pfsrc.into_iter().for_each(RcuUnlinked::defer);
+        assert_eq!(table_len(&f, RT_TABLE_MAIN), N as usize / 2);
+        assert_eq!(table_len(&f, RT_TABLE_LOCAL), 1);
+        let g = crate::sync::rcu::read_lock();
+        let left: Vec<u32> = f
+            .get_table(&g, RT_TABLE_MAIN)
+            .unwrap()
+            .entries(&g)
+            .map(|e| e.dst.0 - u32::from_be_bytes([198, 51, 0, 0]))
+            .collect();
+        drop(g);
+        assert!(left.iter().all(|i| i % 2 == 1));
+        assert!(left.is_sorted());
+        // Nothing dead: a flush removes nothing
+        assert_eq!(f.flush(&mut Vec::new()), 0);
     }
 
     #[test]

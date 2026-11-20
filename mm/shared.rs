@@ -9,9 +9,10 @@
 //! makes a Rust reference to its bytes: words it shares with user space
 //! are atomics, and records are copied in and out with volatile
 //! accesses, each field read exactly once into the copy (doc/UNSAFE.md
-//! rule 8).
+//! rule 8). A [`PgVec`] is several such regions mapped back to back
+//! (AF_PACKET rings).
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::FRAME_ALLOCATOR;
 use crate::util::error::KernelError;
@@ -19,15 +20,20 @@ use crate::util::pod::{FromBytes, IntoBytes};
 
 use super::PAGE_SIZE;
 
-/// Zeroed contiguous frames shared with user space
+/// Zeroed frames shared with user space: physically contiguous, or
+/// (a ring block too large for that, `new_pg_vec`) virtually
+/// contiguous in the vmalloc area
 ///
 /// # Invariants
-/// `phys` is the first of `pages` contiguous RAM frames from
-/// `alloc_contig`, zeroed when made, each holding one reference owned
-/// by the region (dropped in `Drop`).
+/// Without `vm`: `phys` is the first of `pages` contiguous RAM frames
+/// from `alloc_contig`, zeroed when made, each holding one reference
+/// owned by the region (dropped in `Drop`). With `vm`: its `pages`
+/// zeroed frames, mapped contiguously at its base, each with the
+/// reference it owns (`VmUser`), and `phys` unused.
 pub struct SharedRegion {
     phys: u64,
     pages: usize,
+    vm: Option<super::vmalloc::VmUser>,
 }
 
 impl SharedRegion {
@@ -43,7 +49,28 @@ impl SharedRegion {
             unsafe { super::page::clear_page(phys + i as u64 * PAGE_SIZE) };
         }
         // INVARIANT: contiguous fresh frames, zeroed, one reference each
-        Ok(Self { phys, pages })
+        Ok(Self {
+            phys,
+            pages,
+            vm: None,
+        })
+    }
+
+    /// A ring block of `bytes` (Linux alloc_one_pg_vec_page): physically
+    /// contiguous when the buddy allocator has it (__get_free_pages),
+    /// else vmalloc'ed pages (vzalloc), else ENOMEM; thread context
+    pub fn new_pg_vec(bytes: usize) -> Result<Self, KernelError> {
+        if let Ok(r) = Self::new(bytes) {
+            return Ok(r);
+        }
+        let pages = bytes.div_ceil(PAGE_SIZE as usize).max(1);
+        let vm = super::vmalloc::VmUser::new(pages).ok_or(KernelError::OutOfMemory)?;
+        // INVARIANT: the VmUser's zeroed, mapped frames
+        Ok(Self {
+            phys: 0,
+            pages,
+            vm: Some(vm),
+        })
     }
 
     /// Its size in pages
@@ -62,7 +89,10 @@ impl SharedRegion {
         if i >= self.pages as u64 {
             return None;
         }
-        let phys = self.phys + i * PAGE_SIZE;
+        let phys = match &self.vm {
+            Some(vm) => vm.frame(i as usize)?,
+            None => self.phys + i * PAGE_SIZE,
+        };
         // The region's own reference keeps the count above zero
         let held = FRAME_ALLOCATOR.incref(phys);
         debug_assert!(held, "shared region page without a reference");
@@ -75,8 +105,12 @@ impl SharedRegion {
             off.checked_add(size).is_some_and(|e| e <= self.len()) && off.is_multiple_of(align),
             "shared region access out of bounds"
         );
-        // In bounds of the contiguous frames (type invariant), checked above
-        crate::arch::phys_to_virt(self.phys).wrapping_add(off)
+        // In bounds of the frames, contiguous in the direct map or the
+        // vmalloc area (type invariant), checked above
+        match &self.vm {
+            Some(vm) => vm.base().wrapping_add(off),
+            None => crate::arch::phys_to_virt(self.phys).wrapping_add(off),
+        }
     }
 
     /// The 32-bit word at byte `off` (4-aligned, in bounds: asserted),
@@ -86,6 +120,14 @@ impl SharedRegion {
         // SAFETY: in bounds and aligned (checked); frames of the region,
         // which lives as long as the reference; an atomic tolerates the
         // other side's concurrent accesses
+        unsafe { &*p }
+    }
+
+    /// The 64-bit word at byte `off` (8-aligned, in bounds: asserted),
+    /// shared with user space (an `unsigned long` status word)
+    pub fn word64(&self, off: usize) -> &AtomicU64 {
+        let p = self.ptr(off, 8, 8).cast::<AtomicU64>();
+        // SAFETY: as in `word`
         unsafe { &*p }
     }
 
@@ -106,10 +148,103 @@ impl SharedRegion {
         // to which no Rust reference exists (module docs)
         unsafe { p.write_volatile(v) }
     }
+
+    /// Copy `src` to byte `off` (in bounds: asserted), byte by byte
+    /// volatile (Linux skb_copy_bits into a ring frame)
+    pub fn copy_in(&self, off: usize, src: &[u8]) {
+        let p = self.ptr(off, src.len(), 1);
+        for (i, b) in src.iter().enumerate() {
+            // SAFETY: byte `i` of the `src.len()` bytes checked in
+            // bounds, the region's frames, never referenced (module docs)
+            unsafe { p.add(i).write_volatile(*b) };
+        }
+    }
+
+    /// Copy `dst.len()` bytes at `off` (in bounds: asserted) out, each
+    /// read once (Linux tpacket_fill_skb taking a TX ring frame)
+    pub fn copy_out(&self, off: usize, dst: &mut [u8]) {
+        let p = self.ptr(off, dst.len(), 1);
+        for (i, b) in dst.iter_mut().enumerate() {
+            // SAFETY: as in `copy_in`; any byte is a valid u8
+            *b = unsafe { p.add(i).read_volatile() };
+        }
+    }
+
+    /// Zero `len` bytes at `off` (in bounds: asserted)
+    pub fn zero(&self, off: usize, len: usize) {
+        let p = self.ptr(off, len, 1);
+        for i in 0..len {
+            // SAFETY: as in `copy_in`
+            unsafe { p.add(i).write_volatile(0) };
+        }
+    }
+}
+
+/// Equal blocks shared with user space, each physically contiguous,
+/// the blocks not contiguous with each other (Linux af_packet's pg_vec
+/// from alloc_pg_vec: tp_block_nr blocks of tp_block_size bytes, which
+/// packet_mmap maps back to back)
+pub struct PgVec {
+    blocks: alloc::vec::Vec<SharedRegion>,
+    /// Pages per block (Linux pg_vec_pages)
+    block_pages: usize,
+}
+
+impl PgVec {
+    /// `nr` zeroed blocks of `block_size` bytes (a non-zero multiple of
+    /// the page size: asserted); ENOMEM (Linux alloc_pg_vec)
+    pub fn new(nr: usize, block_size: usize) -> Result<Self, KernelError> {
+        assert!(
+            block_size != 0 && block_size.is_multiple_of(PAGE_SIZE as usize),
+            "pg_vec block size"
+        );
+        let mut blocks = crate::util::kmem::KVec::try_with_capacity(nr)?;
+        for _ in 0..nr {
+            blocks.try_push(SharedRegion::new_pg_vec(block_size)?)?;
+        }
+        Ok(Self {
+            blocks: blocks.into_vec(),
+            block_pages: block_size / PAGE_SIZE as usize,
+        })
+    }
+
+    /// Block `i` (panics past the end)
+    pub fn block(&self, i: usize) -> &SharedRegion {
+        &self.blocks[i]
+    }
+
+    /// Number of blocks (Linux pg_vec_len)
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// No blocks
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// Size in pages, all blocks
+    pub fn pages(&self) -> usize {
+        self.blocks.len() * self.block_pages
+    }
+
+    /// Page `i` of the blocks laid back to back, with a reference taken
+    /// for its PTE (Linux packet_mmap's vm_insert_page loop); None past
+    /// the end
+    pub fn map_page(&self, i: u64) -> Option<u64> {
+        let b = self
+            .blocks
+            .get(usize::try_from(i).ok()? / self.block_pages)?;
+        b.map_page(i % self.block_pages as u64)
+    }
 }
 
 impl Drop for SharedRegion {
     fn drop(&mut self) {
+        // A vmalloc'ed region's frames go with its `VmUser`
+        if self.vm.is_some() {
+            return;
+        }
         for i in 0..self.pages {
             // A page still mapped keeps its frame until it is unmapped
             FRAME_ALLOCATOR.decref(self.phys + i as u64 * PAGE_SIZE);

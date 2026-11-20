@@ -1,53 +1,62 @@
 //! UDP (Linux net/ipv4/udp.c, datagram.c)
 //!
-//! Sockets live in the UDP table (Linux udp_table: hash slots by
-//! namespace and local port, sized from memory at boot), from
-//! bind/autobind until close (or disconnect of an autobound port).
-//! Binding follows Linux SO_REUSEADDR/SO_REUSEPORT rules
-//! (`inet::port::conflict`); ephemeral ports come from
-//! `ip_local_port_range` at a keyed-hash offset. Receive lookup scores
-//! candidates like Linux compute_score (exact address, connected peer,
-//! bound device), spreads a SO_REUSEPORT group by flow hash, and
-//! delivers broadcasts to every matching socket. The receive queue is
-//! bounded by SO_RCVBUF (drops counted); checksums are verified on
-//! receive.
+//! Sockets live in the UDP table (`table`: Linux udp_table's hash by
+//! port and hash2 by address and port), from bind/autobind until close
+//! (or disconnect of an autobound port). Binding follows Linux
+//! SO_REUSEADDR/SO_REUSEPORT rules (`inet::port::conflict`); ephemeral
+//! ports come from `ip_local_port_range` at a keyed-hash offset.
+//! Receive lookup scores candidates like Linux compute_score, spreads a
+//! SO_REUSEPORT group by flow hash, and delivers broadcasts to every
+//! matching socket. The receive queue is bounded by SO_RCVBUF (drops
+//! counted); checksums are verified on receive.
 //!
 //! ## Locking (thread context only)
 //!
 //! Order: `UdpSock.op` (sleeping `sync::Mutex`, Linux lock_sock:
-//! bind/connect/autobind, socket calls only) -> a hash slot's lock
-//! (spin, Linux hslot->lock; one at a time) -> `REUSEPORT_LOCK` ->
-//! `Inet.addr` (Mutex leaf); `UdpSock.rxq` is a separate leaf. Receive
-//! and ICMP-error lookups walk a slot under RCU (Linux
-//! __udp4_lib_lookup, __udp4_lib_mcast_deliver), reading each
-//! candidate's `Inet.addr`, and queue under the guard with GFP_ATOMIC.
-//! A socket's table reference is released a grace period after it
-//! leaves (Linux SOCK_RCU_FREE), possibly in `rcuc/N`: its drop takes
-//! no sleeping lock. No lock is held across a sleep or a transmit.
+//! bind/connect/disconnect/autobind, socket calls only) -> the table's
+//! slot locks (`table`) -> `Inet.addr` (Mutex leaf); `UdpSock.rxq` is a
+//! separate leaf. Receive and ICMP-error lookups walk slots under RCU,
+//! reading each candidate's `Inet.addr`, and queue under the guard with
+//! GFP_ATOMIC. A socket's table references are released a grace period
+//! after it leaves (Linux SOCK_RCU_FREE), possibly in `rcuc/N`: its
+//! drop takes no sleeping lock. Only `op` is held across a sleep or a
+//! transmit: a corked datagram (UDP_CORK, MSG_MORE) is appended to and
+//! sent under it, as Linux under lock_sock.
+
+pub mod mem;
+mod rxq;
+mod table;
+use rxq::UdpRxq;
+use table::Key;
+
+/// Size the table and udp_mem (Linux udp_init)
+pub fn init() {
+    table::init();
+    mem::init();
+}
 
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::INUSE_UDP;
 use crate::util::kalloc::try_arc_cyclic;
-use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use crate::net::sock_reuseport::{self, ReuseCb};
 use crate::sync::rcu::RcuPuts;
-use crate::util::hlist_nulls::{NullsHead, NullsLink};
+use crate::util::hlist_nulls::NullsLink;
 
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
 };
-use crate::net::dgram::{self, RxQueue};
+use crate::net::dgram;
 use crate::net::inet::fib::RouteType;
-use crate::net::inet::port::{self, BindInfo, Flow, Parity};
+use crate::net::inet::port::{BindInfo, Flow};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
 use crate::net::mib::*;
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, RecvMsg, SendMsg, cmsgs};
+use crate::net::msg::{MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, RecvMsg, SendMsg, cmsgs};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -62,18 +71,76 @@ pub const UDP_HLEN: usize = 8;
 pub const UDP_MAX: usize = 65507;
 /// Socket level of UDP options
 pub const SOL_UDP: i32 = 17;
+/// SOL_UDP options (Linux include/uapi/linux/udp.h)
+const UDP_CORK: i32 = 1;
+const UDP_ENCAP: i32 = 100;
+const UDP_NO_CHECK6_TX: i32 = 101;
+const UDP_NO_CHECK6_RX: i32 = 102;
+const UDP_SEGMENT: i32 = 103;
+const UDP_GRO: i32 = 104;
+/// UDP_ENCAP types taken without XFRM: none, L2TP (Linux
+/// udp_lib_setsockopt; UDP_ENCAP_ESPINUDP needs CONFIG_XFRM)
+const UDP_ENCAP_L2TPINUDP: i32 = 3;
+/// Linux UDP_MAX_SEGMENTS
+const UDP_MAX_SEGMENTS: usize = 1 << 7;
+
+/// `UdpSock.uflags` bits (Linux UDP_FLAGS_*)
+mod uf {
+    pub const CORK: u32 = 1 << 0;
+    pub const NO_CHECK6_TX: u32 = 1 << 1;
+    pub const NO_CHECK6_RX: u32 = 1 << 2;
+    pub const GRO_ENABLED: u32 = 1 << 3;
+}
+
+/// A corked datagram (Linux up->pending, up->len, inet->cork and the
+/// sk_write_queue it fills): where it goes (the route and destination
+/// port of inet->cork.fl), what the cork fixed, and its payload. The
+/// source port, TTL without IP_TTL cmsg, PMTU mode and IP ID are the
+/// socket's when it is sent, as Linux udp_send_skb and __ip_make_skb
+/// read them.
+struct Cork {
+    rt: route::Rtable,
+    dport: u16,
+    /// Linux cork->tos (the socket's or the IP_TOS cmsg's)
+    tos: u8,
+    /// Linux cork->ttl (an IP_TTL cmsg's; None: the socket's at send)
+    ttl: Option<u8>,
+    /// Linux cork->fragsize: the MTU when corked
+    fragsize: usize,
+    gso: u16,
+    /// Bytes appended, the UDP header counted (Linux up->len)
+    len: usize,
+    data: Vec<u8>,
+}
 /// A UDP socket
 pub struct UdpSock {
     sk: Sock,
     pub inet: Inet,
-    /// Socket lock: bind/connect/disconnect/autobind (Linux lock_sock,
-    /// which sleeps)
-    op: crate::sync::Mutex<()>,
+    /// Socket lock (Linux lock_sock, which sleeps): bind, connect,
+    /// disconnect, autobind, and the datagram being corked (Linux
+    /// up->pending with inet->cork and sk_write_queue)
+    op: crate::sync::Mutex<Option<Cork>>,
+    /// A datagram is corked (Linux up->pending): set and cleared under
+    /// `op`, read without it by sends choosing a path
+    pending: AtomicBool,
+    /// UDP_CORK, UDP_NO_CHECK6_*, UDP_GRO (Linux udp_flags)
+    uflags: AtomicU32,
+    /// UDP_SEGMENT (Linux gso_size)
+    gso_size: AtomicU16,
+    /// UDP_ENCAP (Linux encap_type)
+    encap_type: AtomicU16,
     /// Connected (Linux TCP_ESTABLISHED state for datagram sockets)
     connected: AtomicBool,
-    rxq: RxQueue,
+    /// SO_PEEK_OFF is set (Linux peeking_with_offset)
+    peeking_with_offset: AtomicBool,
+    rxq: UdpRxq,
     /// Link on its port's hash slot (Linux sk_node)
     link: NullsLink,
+    /// Link on its (address, port) hash2 slot (Linux udp_portaddr_node)
+    link2: NullsLink,
+    /// Its hash2 hash (Linux udp_portaddr_hash): set when hashed and
+    /// on rehash, under the socket lock
+    portaddr_hash: AtomicU32,
     /// Its SO_REUSEPORT group (Linux sk_reuseport_cb)
     reuse: ReuseCb<UdpSock>,
     /// The table reference's deferred release (Linux SOCK_RCU_FREE)
@@ -87,10 +154,17 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     Ok(try_arc_cyclic(|me| UdpSock {
         sk: Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_UDP),
         inet: Inet::default(),
-        op: crate::sync::Mutex::new(()),
+        op: crate::sync::Mutex::new(None),
+        pending: AtomicBool::new(false),
+        uflags: AtomicU32::new(0),
+        gso_size: AtomicU16::new(0),
+        encap_type: AtomicU16::new(0),
         connected: AtomicBool::new(false),
-        rxq: RxQueue::default(),
+        peeking_with_offset: AtomicBool::new(false),
+        rxq: UdpRxq::default(),
         link: NullsLink::new(),
+        link2: NullsLink::new(),
+        portaddr_hash: AtomicU32::new(0),
         reuse: ReuseCb::new(),
         rcu: RcuPuts::new(),
         me: me.clone(),
@@ -124,7 +198,7 @@ impl UdpSock {
             saddr: addr,
             ..Default::default()
         };
-        let p = udp_lib_get_port(&me, &info, port, flow)?;
+        let p = table::get_port(&me, &info, port, flow)?;
         // Linux udp_lib_get_port
         self.sk.net.mib.inuse_add(INUSE_UDP, true);
         Ok(p)
@@ -149,26 +223,21 @@ impl UdpSock {
         Ok(())
     }
 
-    /// Linux udp_lib_unhash: off its slot and out of its group; the
-    /// table's reference goes after a grace period
+    /// Linux udp_lib_unhash
     fn unhash(&self) {
-        let port = self.inet.get().sport;
-        let mut g = slot(&self.sk.net, port).lock();
-        if !self.reuse.is_none() {
-            self.reuse.detach(self, &mut sock_reuseport::lock());
-        }
-        if let Some(u) = g.del_rcu(self) {
-            drop(g);
-            u.defer();
+        if table::unhash(self) {
             self.sk.net.mib.inuse_add(INUSE_UDP, false);
         }
     }
 
-    /// Linux __udp_disconnect
+    /// Linux __udp_disconnect: the peer and bound device cleared; an
+    /// address bind() did not fix reset (rehashed if the port stays),
+    /// a port it did not fix released
     fn disconnect(&self) {
         let _g = self.op.lock();
         self.connected.store(false, Ordering::Release);
-        let unhash = {
+        self.sk.set_bound_dev_if(0);
+        let (addr_lock, port_lock) = {
             let mut a = self.inet.addr.lock();
             a.daddr = Ipv4Addr::default();
             a.dport = 0;
@@ -176,11 +245,13 @@ impl UdpSock {
                 a.rcv_saddr = Ipv4Addr::default();
                 a.saddr = Ipv4Addr::default();
             }
-            !a.port_lock
+            (a.addr_lock, a.port_lock)
         };
-        if unhash {
+        if !addr_lock && port_lock {
+            table::rehash(self);
+        }
+        if !port_lock {
             self.unhash();
-            self.inet.addr.lock().sport = 0;
         }
     }
 
@@ -230,6 +301,252 @@ impl UdpSock {
         Ok(rt.mtu as i32)
     }
 
+    /// Copy datagram `skb` from offset `off` (Linux udp_recvmsg): data
+    /// (MSG_TRUNC when the buffer is shorter than the rest, or is not
+    /// past it and shorter than the datagram), source address, SOL_SOCKET
+    /// and IP control messages. Returns the length recvmsg reports (the
+    /// datagram's with MSG_TRUNC in `flags`).
+    fn deliver(
+        &self,
+        m: &mut RecvMsg<'_>,
+        skb: &SkBuff,
+        flags: i32,
+        off: usize,
+    ) -> Result<usize, KernelError> {
+        let crate::net::skb::SkbCb::Inet(cb) = skb.cb else {
+            return Err(KernelError::InvalidArgument);
+        };
+        let data = skb.data();
+        let ulen = data.len();
+        let off = off.min(ulen);
+        let mut copied = m.data.len();
+        if copied > ulen - off {
+            copied = ulen - off;
+        } else if copied < ulen {
+            m.flags |= crate::net::msg::MSG_TRUNC;
+        }
+        let n = m.data.put(0, &data[off..off + copied])?;
+        if m.want_name {
+            m.name = Some(af_inet::sin_bytes(skb.saddr.unwrap_or_default(), cb.sport));
+        }
+        dgram::sock_cmsgs(&self.sk, m, skb.tstamp, skb.dropcount);
+        self.inet.recv_cmsgs(&mut m.cmsg, &cb.info);
+        Ok(if flags & crate::net::msg::MSG_TRUNC != 0 {
+            ulen
+        } else {
+            n
+        })
+    }
+
+    fn uflag(&self, f: u32) -> bool {
+        self.uflags.load(Ordering::Relaxed) & f != 0
+    }
+
+    fn set_uflag(&self, f: u32, on: bool) {
+        if on {
+            self.uflags.fetch_or(f, Ordering::Relaxed);
+        } else {
+            self.uflags.fetch_and(!f, Ordering::Relaxed);
+        }
+    }
+
+    /// Send `data` as a datagram, or with `gso` as datagrams of `gso`
+    /// bytes (Linux udp_send_skb, segmented in software as
+    /// __udp_gso_segment: hk has no GSO), counting it once; EMSGSIZE
+    /// past the MTU also queued with IP_RECVERR (Linux __ip_append_data)
+    fn send_out(
+        &self,
+        rt: &route::Rtable,
+        sport: u16,
+        dport: u16,
+        data: &[u8],
+        p: IpParams,
+        gso: u16,
+    ) -> Result<(), KernelError> {
+        let gso = usize::from(gso);
+        if gso != 0 {
+            let hlen = ipv4::IP_HLEN_MIN + UDP_HLEN;
+            if hlen + data.len().min(gso) > p.mtu(rt) {
+                return Err(KernelError::MessageTooLong);
+            }
+            if data.len() > gso * UDP_MAX_SEGMENTS {
+                return Err(KernelError::InvalidArgument);
+            }
+            // Linux udp_send_skb: segments need their checksums
+            if self.sk.flag(sf::NO_CHECK) {
+                return Err(KernelError::InvalidArgument);
+            }
+        }
+        let mib = &self.sk.net.mib;
+        let r = if gso != 0 && data.len() > gso {
+            let mut sent = true;
+            let mut r = Ok(true);
+            for chunk in data.chunks(gso) {
+                match self.xmit(rt, sport, dport, chunk, p) {
+                    Ok(s) => sent &= s,
+                    Err(e) => {
+                        r = Err(e);
+                        break;
+                    }
+                }
+            }
+            r.map(|_| sent)
+        } else {
+            self.xmit(rt, sport, dport, data, p)
+        };
+        match r {
+            // Linux udp_send_skb
+            Ok(sent) => {
+                if sent {
+                    mib.udp.inc(UDP_MIB_OUTDATAGRAMS);
+                }
+                Ok(())
+            }
+            Err(KernelError::MessageTooLong) => {
+                // Linux __ip_append_data: IP_RECVERR also queues it
+                // (msg_name port: the connected one)
+                let e = KernelError::MessageTooLong;
+                let a = self.inet.get();
+                af_inet::ip_local_error(&self.sk, &self.inet, e, rt.daddr, a.dport, rt.mtu);
+                Err(e)
+            }
+            Err(e) => {
+                // Linux udp_sendmsg's out: no kernel memory (the
+                // discard counted where it failed)
+                if e == KernelError::NoBufferSpace {
+                    mib.udp.inc(UDP_MIB_SNDBUFERRORS);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Append `data` (`ulen` bytes counted: the header too for the
+    /// first) to the corked datagram, sending it unless `more` (Linux
+    /// udp_sendmsg's do_append_data with ip_append_data): past the
+    /// largest datagram the socket may send, everything corked is
+    /// dropped (udp_flush_pending_frames) and EMSGSIZE also queued
+    /// with IP_RECVERR
+    fn append(
+        &self,
+        g: &mut Option<Cork>,
+        data: &[u8],
+        ulen: usize,
+        more: bool,
+    ) -> Result<(), KernelError> {
+        let Some(c) = g.as_mut() else {
+            return Err(KernelError::InvalidArgument);
+        };
+        // Linux __ip_append_data: a GSO cork may reach IP_MAX_MTU, else
+        // the MTU unless fragmenting is allowed
+        let mtu = if c.gso != 0 { 0xffff } else { c.fragsize };
+        let now = IpParams {
+            pmtudisc: self.inet.pmtudisc(),
+            ..Default::default()
+        };
+        let max = if now.may_frag() { 0xffff } else { mtu };
+        if c.len + ulen > max - ipv4::IP_HLEN_MIN {
+            let daddr = c.rt.daddr;
+            self.flush(g);
+            let e = KernelError::MessageTooLong;
+            let dport = self.inet.get().dport;
+            af_inet::ip_local_error(&self.sk, &self.inet, e, daddr, dport, mtu as u32);
+            return Err(e);
+        }
+        if c.data.try_reserve(data.len()).is_err() {
+            self.sk.net.mib.out_discard();
+            self.flush(g);
+            return Err(KernelError::NoBufferSpace);
+        }
+        c.len += ulen;
+        c.data.extend_from_slice(data);
+        if more {
+            return Ok(());
+        }
+        self.push(g)
+    }
+
+    /// Send the corked datagram (Linux udp_push_pending_frames): from
+    /// the socket's port now, which a disconnect may have cleared
+    fn push(&self, g: &mut Option<Cork>) -> Result<(), KernelError> {
+        let Some(c) = g.take() else {
+            return Ok(());
+        };
+        self.pending.store(false, Ordering::Relaxed);
+        let mut p = self.inet.params();
+        p.tos = c.tos;
+        p.ttl = c.ttl.unwrap_or(p.ttl);
+        let sport = self.inet.get().sport;
+        self.send_out(&c.rt, sport, c.dport, &c.data, p, c.gso)
+    }
+
+    /// Drop the corked datagram (Linux udp_flush_pending_frames)
+    fn flush(&self, g: &mut Option<Cork>) {
+        *g = None;
+        self.pending.store(false, Ordering::Relaxed);
+    }
+
+    /// The UDP_SEGMENT size of a send (Linux udp_cmsg_send): a SOL_UDP
+    /// message may only be UDP_SEGMENT (a u16)
+    fn cmsg_gso(&self, control: &[u8]) -> Result<u16, KernelError> {
+        let mut gso = self.gso_size.load(Ordering::Relaxed);
+        for r in cmsgs(control) {
+            let (level, ty, d) = r?;
+            if level != SOL_UDP {
+                continue;
+            }
+            if ty != UDP_SEGMENT || d.len() != 2 {
+                return Err(KernelError::InvalidArgument);
+            }
+            gso = u16::from_ne_bytes([d[0], d[1]]);
+        }
+        Ok(gso)
+    }
+
+    /// Linux udp_lib_setsockopt for SOL_UDP
+    fn udp_setsockopt(&self, opt: i32, v: OptIn) -> Result<(), KernelError> {
+        let val = v.int()?;
+        match opt {
+            UDP_CORK => {
+                self.set_uflag(uf::CORK, val != 0);
+                if val == 0 {
+                    let mut g = self.op.lock();
+                    // Linux ignores udp_push_pending_frames' result here
+                    let _ = self.push(&mut g);
+                }
+            }
+            UDP_ENCAP => match val {
+                0 | UDP_ENCAP_L2TPINUDP => self.encap_type.store(val as u16, Ordering::Relaxed),
+                _ => return Err(KernelError::NoProtocolOption),
+            },
+            UDP_NO_CHECK6_TX => self.set_uflag(uf::NO_CHECK6_TX, val != 0),
+            UDP_NO_CHECK6_RX => self.set_uflag(uf::NO_CHECK6_RX, val != 0),
+            UDP_SEGMENT => {
+                if !(0..=i32::from(u16::MAX)).contains(&val) {
+                    return Err(KernelError::InvalidArgument);
+                }
+                self.gso_size.store(val as u16, Ordering::Relaxed);
+            }
+            UDP_GRO => self.set_uflag(uf::GRO_ENABLED, val != 0),
+            _ => return Err(KernelError::NoProtocolOption),
+        }
+        Ok(())
+    }
+
+    /// Linux udp_lib_getsockopt
+    fn udp_getsockopt(&self, opt: i32) -> Result<OptOut, KernelError> {
+        let v = match opt {
+            UDP_CORK => i32::from(self.uflag(uf::CORK)),
+            UDP_ENCAP => i32::from(self.encap_type.load(Ordering::Relaxed)),
+            UDP_NO_CHECK6_TX => i32::from(self.uflag(uf::NO_CHECK6_TX)),
+            UDP_NO_CHECK6_RX => i32::from(self.uflag(uf::NO_CHECK6_RX)),
+            UDP_SEGMENT => i32::from(self.gso_size.load(Ordering::Relaxed)),
+            UDP_GRO => i32::from(self.uflag(uf::GRO_ENABLED)),
+            _ => return Err(KernelError::NoProtocolOption),
+        };
+        Ok(OptOut::Int(v))
+    }
+
     /// Build and send one datagram: whether it went out, false if the
     /// send's ENOBUFS was swallowed (`send_err`)
     fn xmit(
@@ -255,6 +572,11 @@ impl UdpSock {
         let saddr = rt.saddr;
         let csum = udp_checksum(saddr, rt.daddr, skb.data());
         skb.data_mut()[6..8].copy_from_slice(&csum.to_be_bytes());
+        // Linux __ip_append_data: CHECKSUM_PARTIAL on a device with
+        // NETIF_F_HW_CSUM (lo) for an unfragmented datagram with a
+        // checksum (udp_send_skb: none with SO_NO_CHECK); fragments are
+        // new skbs, without it
+        skb.csum_partial = rt.dev.is_loopback() && !self.sk.flag(sf::NO_CHECK);
         skb.saddr = Some(saddr);
         skb.daddr = Some(rt.daddr);
         // Linux udp_send_skb: what ip_send_skb failed with
@@ -356,10 +678,14 @@ impl ProtoOps for UdpSock {
     }
 
     fn release(&self) {
+        // Linux udp_destroy_sock: udp_flush_pending_frames
+        self.flush(&mut self.op.lock());
         self.unhash();
         self.sk.set_shutdown(SHUTDOWN_MASK);
         self.rxq.clear();
         self.sk.purge_err();
+        // Linux sk_common_release's sock_put: the last reference
+        self.sk.inuse_end();
     }
 
     /// Linux inet_bind for UDP
@@ -411,16 +737,21 @@ impl ProtoOps for UdpSock {
         self.autobind_locked()?;
         let cur = self.inet.get();
         let rt = self.route(daddr, cur.saddr, self.sk.bound_dev_if())?;
+        // Linux __ip4_datagram_connect: addresses before the rehash
         let mut s = self.inet.addr.lock();
+        s.daddr = rt.daddr;
+        s.dport = dport;
         if s.saddr.is_unspecified() {
             s.saddr = rt.saddr;
         }
-        if s.rcv_saddr.is_unspecified() {
+        let rehash = s.rcv_saddr.is_unspecified();
+        if rehash {
             s.rcv_saddr = rt.saddr;
         }
-        s.daddr = rt.daddr;
-        s.dport = dport;
         drop(s);
+        if rehash {
+            table::rehash(self);
+        }
         self.connected.store(true, Ordering::Release);
         // Linux __ip4_datagram_connect: reuseport_has_conns_set
         if !self.reuse.is_none() {
@@ -447,7 +778,7 @@ impl ProtoOps for UdpSock {
 
     /// Linux udp_poll / datagram_poll
     fn poll(&self) -> u16 {
-        dgram::poll(&self.sk, &self.rxq)
+        dgram::poll(&self.sk, self.rxq.readable())
     }
 
     fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, KernelError> {
@@ -481,6 +812,7 @@ impl ProtoOps for UdpSock {
         match level {
             SOL_SOCKET => None,
             SOL_IP => Some(self.inet.setsockopt(&self.sk, opt, v)),
+            SOL_UDP => Some(self.udp_setsockopt(opt, v)),
             _ => Some(Err(KernelError::NoProtocolOption)),
         }
     }
@@ -490,25 +822,52 @@ impl ProtoOps for UdpSock {
             SOL_SOCKET => None,
             SOL_IP if opt == af_inet::IP_MTU => Some(self.mtu().map(OptOut::Int)),
             SOL_IP => Some(self.inet.getsockopt(opt)),
-            SOL_UDP => Some(Err(KernelError::NoProtocolOption)),
+            SOL_UDP => Some(self.udp_getsockopt(opt)),
             // Linux do_ip_getsockopt: other levels are EOPNOTSUPP
             _ => Some(Err(KernelError::OperationNotSupported)),
         }
     }
 
-    /// Linux udp_sendmsg
+    /// Linux udp_sendmsg: with UDP_CORK or MSG_MORE the data is corked
+    /// (appended to a datagram sent when a send without either comes,
+    /// or UDP_CORK is cleared); a send to a corked socket appends,
+    /// whatever its address and control messages
     fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
+        // Linux inet_sendmsg -> inet_send_prepare: an unhashed socket
+        // (never bound, or disconnected) gets an ephemeral port before
+        // udp_sendmsg runs, a corked one too
+        self.autobind()?;
+        let len = m.data.len();
+        if len > 0xffff {
+            return Err(KernelError::MessageTooLong);
+        }
         if flags & MSG_OOB != 0 {
             return Err(KernelError::OperationNotSupported);
         }
-        let len = m.data.len();
+        let corkreq = self.uflag(uf::CORK) || flags & MSG_MORE != 0;
+        if self.pending.load(Ordering::Relaxed) {
+            let mut g = self.op.lock();
+            if g.is_some() {
+                // Linux do_append_data: any ip_append_data error (a
+                // fault copying the data included) drops the cork
+                let data = match m.data.take(len) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.flush(&mut g);
+                        return Err(e);
+                    }
+                };
+                self.append(&mut g, &data, len, corkreq)?;
+                return Ok(len);
+            }
+        }
         if len > UDP_MAX {
             return Err(KernelError::MessageTooLong);
         }
         let (daddr, dport, _connected) = self.dest(m)?;
+        let gso = self.cmsg_gso(&m.control)?;
         let c = tx_cmsgs(&m.control)?;
         let data = m.data.take(len)?;
-        self.autobind()?;
         let a: InetAddr = self.inet.get();
         let oif = if c.oif != 0 {
             c.oif
@@ -521,38 +880,41 @@ impl ProtoOps for UdpSock {
             c.saddr
         };
         let rt = self.route(daddr, saddr, oif)?;
-        let mut p = self.inet.params();
-        p.tos = c.tos.unwrap_or(p.tos);
-        p.ttl = c.ttl.unwrap_or(p.ttl);
-        // Linux sock_alloc_send_pskb: a pending (ICMP) error first
+        // Linux sock_alloc_send_pskb, for the datagram's first skb (a
+        // corked one's later appends allocate with no error check,
+        // __ip_append_data with transhdrlen 0): a pending error first
         if let Some(e) = self.sk.take_err() {
             return Err(e);
         }
-        let mib = &self.sk.net.mib;
-        match self.xmit(&rt, a.sport, dport, &data, p) {
-            Ok(sent) => {
-                // Linux udp_send_skb
-                if sent {
-                    mib.udp.inc(UDP_MIB_OUTDATAGRAMS);
-                }
-                Ok(len)
-            }
-            Err(KernelError::MessageTooLong) => {
-                // Linux __ip_append_data: IP_RECVERR also queues it
-                // (msg_name port: the connected one)
-                let e = KernelError::MessageTooLong;
-                af_inet::ip_local_error(&self.sk, &self.inet, e, daddr, a.dport, rt.mtu);
-                Err(e)
-            }
-            Err(e) => {
-                // Linux udp_sendmsg's out: no kernel memory (the
-                // discard counted where it failed)
-                if e == KernelError::NoBufferSpace {
-                    mib.udp.inc(UDP_MIB_SNDBUFERRORS);
-                }
-                Err(e)
-            }
+        if !corkreq {
+            let mut p = self.inet.params();
+            p.tos = c.tos.unwrap_or(p.tos);
+            p.ttl = c.ttl.unwrap_or(p.ttl);
+            self.send_out(&rt, a.sport, dport, &data, p, gso)?;
+            return Ok(len);
         }
+        let now = IpParams {
+            pmtudisc: self.inet.pmtudisc(),
+            ..Default::default()
+        };
+        let mut g = self.op.lock();
+        if g.is_some() {
+            // Linux: "socket already corked" by a racing send
+            return Err(KernelError::InvalidArgument);
+        }
+        *g = Some(Cork {
+            fragsize: now.mtu(&rt),
+            rt,
+            dport,
+            tos: c.tos.unwrap_or(self.inet.tos()),
+            ttl: c.ttl,
+            gso,
+            len: 0,
+            data: Vec::new(),
+        });
+        self.pending.store(true, Ordering::Relaxed);
+        self.append(&mut g, &data, len + UDP_HLEN, corkreq)?;
+        Ok(len)
     }
 
     /// Linux udp_recvmsg
@@ -560,230 +922,43 @@ impl ProtoOps for UdpSock {
         if flags & MSG_ERRQUEUE != 0 {
             return af_inet::ip_recv_error(&self.sk, &self.inet, m);
         }
-        let Some(d) = self.rxq.recv(&self.sk, flags)? else {
+        let mut off = self.sk.peek_offset(flags);
+        let Some(d) = self.rxq.recv(&self.sk, flags, &mut off)? else {
             return Ok(0);
         };
-        let r = dgram::deliver(&self.sk, &self.inet, m, &d, flags);
-        if flags & MSG_PEEK == 0 {
+        let peeking = flags & MSG_PEEK != 0;
+        let r = self.deliver(m, &d, flags, off.max(0) as usize);
+        if !peeking {
             // Linux udp_recvmsg: a datagram is counted when it is read
             let f = if r.is_ok() {
                 UDP_MIB_INDATAGRAMS
             } else {
+                self.sk.drops.fetch_add(1, Ordering::Relaxed);
                 UDP_MIB_INERRORS
             };
             self.sk.net.mib.udp.inc(f);
         }
+        // Linux skb_consume_udp: the peek offset moves past what a peek
+        // returned, back by what a read consumed
+        if let Ok(n) = r
+            && self.peeking_with_offset.load(Ordering::Relaxed)
+        {
+            let n = n as i32;
+            self.sk.peek_offset_bwd(if peeking { -n } else { n });
+        }
         r
     }
-}
 
-// ============================================================================
-// Socket table
-// ============================================================================
-
-crate::nulls_adapter!(UdpHash, UdpSock, link);
-crate::rcu_puts!(UdpSock, rcu);
-
-/// Hash slots of every namespace (Linux udp_table.hash)
-static UDP_TABLE: spin::Once<Box<[NullsHead<UdpHash>]>> = spin::Once::new();
-
-/// Size the table from memory (Linux udp_table_init:
-/// alloc_large_system_hash with one slot per 2 MiB, a power of two
-/// between UDP_HTABLE_SIZE_MIN and 64 Ki slots)
-pub fn init() {
-    let n = (crate::FRAME_ALLOCATOR.buffer_pages() >> 9)
-        .next_power_of_two()
-        .clamp(256, 1 << 16);
-    UDP_TABLE.call_once(|| NullsHead::table(n).expect("udp: hash table"));
-}
-
-fn table() -> &'static [NullsHead<UdpHash>] {
-    UDP_TABLE.get().expect("udp table not initialized")
-}
-
-/// Linux udp_hashfn: the port plus the namespace's random mix, masked
-fn slot_index(net: &crate::net::NetNamespace, port: u16) -> usize {
-    (usize::from(port).wrapping_add(net.hash_mix as usize)) & (table().len() - 1)
-}
-
-fn slot(net: &crate::net::NetNamespace, port: u16) -> &'static NullsHead<UdpHash> {
-    &table()[slot_index(net, port)]
-}
-
-/// Address `s` is bound to (for the bind rules), read under the slot
-/// lock (order: slot -> Inet.addr)
-fn bound_addr(s: &UdpSock) -> Ipv4Addr {
-    s.inet.get().rcv_saddr
-}
-
-/// Another socket of `net` on `port` conflicts with `info` (Linux
-/// udp_lib_lport_inuse), the slot locked
-fn inuse(
-    g: &crate::util::hlist_nulls::NullsGuard<'_, UdpHash>,
-    net: u64,
-    port: u16,
-    info: &BindInfo,
-) -> bool {
-    g.find(|o| {
-        o.sk.net.id == net
-            && o.inet.get().sport == port
-            && port::conflict(info, &o.bind_info(bound_addr(o)), false)
-    })
-    .is_some()
-}
-
-/// Hash `s` on `port` (0 = an ephemeral port) and set the port, all
-/// under the slot's lock, joining or starting a SO_REUSEPORT group
-/// (Linux udp_lib_get_port, udp_reuseport_add_sock): EADDRINUSE on a
-/// conflict, when the range is exhausted, or when the group cannot
-/// grow
-fn udp_lib_get_port(
-    s: &Arc<UdpSock>,
-    info: &BindInfo,
-    port: u16,
-    flow: Flow,
-) -> Result<u16, KernelError> {
-    let net = &*s.sk.net;
-    let take = |p: u16| -> Option<Result<u16, KernelError>> {
-        let mut g = slot(net, p).lock();
-        if inuse(&g, net.id, p, info) {
-            return None;
-        }
-        if s.sk.flag(sf::REUSEPORT) && reuseport_add(&g, s, p, info).is_err() {
-            return Some(Err(KernelError::AddressInUse));
-        }
-        s.inet.addr.lock().sport = p;
-        g.add_head_rcu(s.clone());
-        Some(Ok(p))
-    };
-    if port != 0 {
-        return take(port).unwrap_or(Err(KernelError::AddressInUse));
+    /// Linux sk_set_peek_off via udp_set_peek_off
+    fn set_peek_off(&self, val: i32) -> Option<Result<(), KernelError>> {
+        self.sk.set_peek_off(val);
+        self.peeking_with_offset.store(val >= 0, Ordering::Relaxed);
+        Some(Ok(()))
     }
-    let mut r = None;
-    let range = net.port_range.get();
-    port::ephemeral(range, flow, Parity::Any, |p| {
-        r = take(p);
-        r.is_some()
-    });
-    r.unwrap_or(Err(KernelError::AddressInUse))
-}
 
-/// Join the group of a socket on `port` with the same owner, device
-/// and address, or start one (Linux udp_reuseport_add_sock)
-fn reuseport_add(
-    g: &crate::util::hlist_nulls::NullsGuard<'_, UdpHash>,
-    s: &Arc<UdpSock>,
-    port: u16,
-    info: &BindInfo,
-) -> Result<(), KernelError> {
-    let net = s.sk.net.id;
-    let peer = g.find(|o| {
-        o.sk.net.id == net
-            && o.inet.get().sport == port
-            && o.sk.flag(sf::REUSEPORT)
-            && o.sk.cred.euid == info.uid
-            && o.sk.bound_dev_if() == info.dev
-            && bound_addr(o) == info.addr
-    });
-    let mut o = sock_reuseport::lock();
-    match peer {
-        Some(p) => s.reuse.add(s, &p.reuse, &mut o),
-        None => s.reuse.alloc(s, &mut o),
+    fn has_set_peek_off(&self) -> bool {
+        true
     }
-}
-
-/// A received datagram's addressing
-#[derive(Clone, Copy)]
-struct Key {
-    saddr: Ipv4Addr,
-    sport: u16,
-    daddr: Ipv4Addr,
-    dport: u16,
-    dif: u32,
-}
-
-/// Linux compute_score: -1 = no match
-fn score(s: &UdpSock, k: &Key) -> i32 {
-    let a = s.inet.get();
-    if a.rcv_saddr != k.daddr && !a.rcv_saddr.is_unspecified() {
-        return -1;
-    }
-    let mut sc = 2;
-    if !a.rcv_saddr.is_unspecified() {
-        sc += 4;
-    }
-    if s.connected.load(Ordering::Acquire) {
-        if a.daddr != k.saddr || a.dport != k.sport {
-            return -1;
-        }
-        sc += 8;
-    }
-    let dev = s.sk.bound_dev_if();
-    if dev != 0 {
-        if dev != k.dif {
-            return -1;
-        }
-        sc += 4;
-    }
-    sc
-}
-
-/// Linux udp_ehashfn: a keyed hash of the flow, for a reuseport pick
-fn flow_hash(net: &crate::net::NetNamespace, k: &Key) -> u32 {
-    port::secure_hash(
-        0x7564_7065_6861,
-        &[
-            net.id,
-            (u64::from(k.saddr.0) << 32) | u64::from(k.daddr.0),
-            (u64::from(k.sport) << 16) | u64::from(k.dport),
-        ],
-    ) as u32
-}
-
-/// Best socket for a unicast datagram (Linux udp4_lib_lookup2): each
-/// candidate scored once in a single walk under RCU, so a concurrent
-/// connect() or SO_BINDTODEVICE cannot make a second look disagree. A
-/// new best that is unconnected and in a SO_REUSEPORT group hands over
-/// to the member the flow hash picks; with connected members in the
-/// group, the pick is scored instead (Linux reuseport_has_conns).
-fn lookup(net: &crate::net::NetNamespace, k: &Key) -> Option<Arc<UdpSock>> {
-    let head = slot(net, k.dport);
-    let h = flow_hash(net, k);
-    let g = crate::sync::rcu::read_lock();
-    loop {
-        let mut best: Option<(i32, &UdpSock)> = None;
-        let mut it = head.iter_rcu(&g);
-        for e in it.by_ref() {
-            let s = e.get();
-            if s.sk.net.id != net.id || s.inet.get().sport != k.dport {
-                continue;
-            }
-            let sc = score(s, k);
-            if sc < 0 || best.is_some_and(|b| sc <= b.0) {
-                continue;
-            }
-            best = Some((sc, s));
-            if s.connected.load(Ordering::Acquire) {
-                continue;
-            }
-            if let Some((r, conns)) = s.reuse.select(h, &g) {
-                best = Some((if conns { score(r, k) } else { sc }, r));
-            }
-        }
-        if it.ended_at() == Some(head.nulls()) {
-            return best.filter(|b| b.0 >= 0).and_then(|b| b.1.me.upgrade());
-        }
-    }
-}
-
-/// Linux __udp_is_mcast_sock: broadcast receivers
-fn bcast_match(s: &UdpSock, k: &Key) -> bool {
-    let a = s.inet.get();
-    let conn = s.connected.load(Ordering::Acquire);
-    let dev = s.sk.bound_dev_if();
-    !(conn && (a.daddr != k.saddr || (a.dport != 0 && a.dport != k.sport))
-        || (!a.rcv_saddr.is_unspecified() && a.rcv_saddr != k.daddr)
-        || (dev != 0 && dev != k.dif))
 }
 
 /// Receive a UDP packet (from ip_rcv; thread context; the device's
@@ -828,9 +1003,9 @@ pub fn udp_rcv(mut skb: SkBuff) {
     }
     dgram::prepare(&mut skb, info, k.sport);
     if skb.ip_bcast || daddr.is_multicast() {
-        return mcast_deliver(&net, skb, &k);
+        return table::mcast_deliver(&net, skb, &k);
     }
-    match lookup(&net, &k) {
+    match table::lookup(&net, &k) {
         Some(s) => queue_rcv(&net, &s, skb),
         None => {
             udp.inc(UDP_MIB_NOPORTS);
@@ -842,7 +1017,8 @@ pub fn udp_rcv(mut skb: SkBuff) {
 /// Queue a datagram to `s`, counting a drop (Linux __udp_queue_rcv_skb:
 /// a full buffer is RcvbufErrors, no memory MemErrors, both InErrors)
 fn queue_rcv(net: &crate::net::NetNamespace, s: &UdpSock, skb: SkBuff) {
-    let Err(e) = s.rxq.enqueue(&s.sk, skb) else {
+    let rmem_min = net.sysctl.udp_rmem_min.load(Ordering::Relaxed) as usize;
+    let Err(e) = s.rxq.enqueue(&s.sk, rmem_min, skb) else {
         return;
     };
     let udp = &net.mib.udp;
@@ -851,40 +1027,6 @@ fn queue_rcv(net: &crate::net::NetNamespace, s: &UdpSock, skb: SkBuff) {
         dgram::QueueErr::NoMem => UDP_MIB_MEMERRORS,
     });
     udp.inc(UDP_MIB_INERRORS);
-}
-
-/// A broadcast or multicast datagram to every matching socket (Linux
-/// __udp4_lib_mcast_deliver): each but the first gets a clone made
-/// GFP_ATOMIC (a failed clone counts a drop on that socket), the first
-/// the skb itself
-fn mcast_deliver(net: &crate::net::NetNamespace, skb: SkBuff, k: &Key) {
-    // One walk, never again from the start (that would deliver twice):
-    // a socket moving to another slot meanwhile (disconnect, autobind)
-    // may lead it off this slot's rest, as Linux's hlist walk of the
-    // slot (sk_for_each_entry_offset_rcu) may
-    let g = crate::sync::rcu::read_lock();
-    let mut first: Option<&UdpSock> = None;
-    let socks = slot(net, k.dport).iter_rcu(&g).map(|e| e.get());
-    for s in socks
-        .filter(|s| s.sk.net.id == net.id && s.inet.get().sport == k.dport && bcast_match(s, k))
-    {
-        if first.is_none() {
-            first = Some(s);
-            continue;
-        }
-        match skb.clone_gfp(Gfp::ATOMIC) {
-            Some(c) => queue_rcv(net, s, c),
-            None => {
-                s.sk.drops.fetch_add(1, Ordering::Relaxed);
-                net.mib.udp.inc(UDP_MIB_RCVBUFERRORS);
-                net.mib.udp.inc(UDP_MIB_INERRORS);
-            }
-        }
-    }
-    match first {
-        Some(s) => queue_rcv(net, s, skb),
-        None => net.mib.udp.inc(UDP_MIB_IGNOREDMULTI),
-    }
 }
 
 /// An ICMP error about a datagram we sent (Linux udp_err): the socket
@@ -903,7 +1045,7 @@ pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr<'_>
         dport: sport,
         dif: e.rx.ifindex,
     };
-    let Some(s) = lookup(net, &k) else {
+    let Some(s) = table::lookup(net, &k) else {
         // Linux __udp4_lib_err: no socket for it
         net.mib.icmp.inc(ICMP_MIB_INERRORS);
         return;
@@ -973,8 +1115,8 @@ pub fn proc_net_udp(net: &crate::net::NetNamespace) -> Vec<u8> {
         // A socket moving slots meanwhile may be missed or listed
         // twice, as Linux's seq walk of the slots
         let g = crate::sync::rcu::read_lock();
-        for (i, head) in table().iter().enumerate() {
-            for e in head.iter_rcu(&g) {
+        for (i, slot) in table::hash_slots().iter().enumerate() {
+            for e in slot.head.iter_rcu(&g) {
                 let s = e.get();
                 if s.sk.net.id != net.id {
                     continue;

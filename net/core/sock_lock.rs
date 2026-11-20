@@ -286,6 +286,12 @@ impl<T> BhGuard<'_, T> {
         Ok(())
     }
 
+    /// Truesize queued since the backlog was last empty (Linux
+    /// sk_backlog.len)
+    pub fn backlog_len(&self) -> usize {
+        self.s.len
+    }
+
     /// Leave `flag` for the owner's release (Linux test_and_set_bit on
     /// sk_tsq_flags)
     pub fn defer(&mut self, flag: u32) {

@@ -580,7 +580,7 @@ pub struct KernelPages;
 /// __gfp_pfmemalloc_flags). User data, kernel buffers of it included
 /// (pipe pages), stops at low, so heap objects get low - min to
 /// themselves.
-fn heap_gfp() -> Gfp {
+pub(crate) fn heap_gfp() -> Gfp {
     #[cfg(not(test))]
     {
         use crate::arch::{CurrentArch, PerCpuOps};
@@ -600,7 +600,9 @@ fn heap_gfp() -> Gfp {
 
 impl SlabPages for KernelPages {
     fn alloc(&self, order: u32) -> Option<usize> {
-        let pa = crate::FRAME_ALLOCATOR.alloc_pages(order, heap_gfp())?;
+        // NOFAIL: the heap backs infallible allocations, its failure a
+        // panic; failslab injects into its fallible ones
+        let pa = crate::FRAME_ALLOCATOR.alloc_pages(order, heap_gfp().with(Gfp::NOFAIL))?;
         Some(crate::arch::phys_to_virt(pa) as usize)
     }
 
@@ -672,6 +674,16 @@ const fn box_of<T>() -> (usize, usize) {
     (core::mem::size_of::<T>(), core::mem::align_of::<T>())
 }
 
+/// The block an `Arc<T>` allocates: its two counts, then `T`
+/// (`kalloc::arc_layout`, as a const)
+const fn arc_of<T>() -> (usize, usize) {
+    let (size, align) = box_of::<T>();
+    let word = core::mem::align_of::<usize>();
+    let align = if align > word { align } else { word };
+    let off = (2 * core::mem::size_of::<usize>()).next_multiple_of(align);
+    ((off + size).next_multiple_of(align), align)
+}
+
 macro_rules! named_cache {
     ($name:literal, $layout:expr) => {{
         crate::percpu! {
@@ -692,6 +704,12 @@ pub static INODE_CACHE: KmemCache =
 pub static BH_CACHE: KmemCache = named_cache!(
     "buffer_head",
     box_of::<crate::fs::pageio::buffer::BufferHead>()
+);
+/// TCP TIME_WAIT entries (`Arc<TimeWait>`; Linux tcp_prot's twsk_slab,
+/// "tw_sock_TCP")
+pub static TW_CACHE: KmemCache = named_cache!(
+    "tw_sock_TCP",
+    arc_of::<crate::net::tcp::timewait::TimeWait>()
 );
 
 /// Pages for the caches made here (host tests: their own)
@@ -732,7 +750,13 @@ static OWN: [&KmemCache; 1] = [&FILP_CACHE];
 /// allocation of exactly their type's layout (another type of the same
 /// size and alignment shares it, like Linux slab merging); keeps them
 /// out of the kmalloc caches and counted per type.
-static NAMED: [&KmemCache; 4] = [&VMA_CACHE, &DENTRY_CACHE, &INODE_CACHE, &BH_CACHE];
+static NAMED: [&KmemCache; 5] = [
+    &VMA_CACHE,
+    &DENTRY_CACHE,
+    &INODE_CACHE,
+    &BH_CACHE,
+    &TW_CACHE,
+];
 
 /// The cache that serves a layout: a named cache of exactly that
 /// layout, else the kmalloc class
@@ -749,8 +773,10 @@ pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
         Some(c) => c.alloc(),
         None => {
             let order = large_order(size, align);
+            // NOFAIL as the slab refills: the heap backs infallible
+            // allocations too (fallible callers have failslab)
             crate::FRAME_ALLOCATOR
-                .alloc_pages(order, heap_gfp())
+                .alloc_pages(order, heap_gfp().with(Gfp::NOFAIL))
                 .map_or(core::ptr::null_mut(), crate::arch::phys_to_virt)
         }
     }
@@ -1090,6 +1116,11 @@ pub mod tests {
         assert!(core::ptr::eq(cache_for(s, a).unwrap(), &DENTRY_CACHE));
         let (s, a) = box_of::<crate::fs::inode::Inode>();
         assert!(core::ptr::eq(cache_for(s, a).unwrap(), &INODE_CACHE));
+        use crate::net::tcp::timewait::TimeWait;
+        let l = crate::util::kalloc::arc_layout::<TimeWait>();
+        assert_eq!(arc_of::<TimeWait>(), (l.size(), l.align()));
+        let tw = cache_for(l.size(), l.align()).unwrap();
+        assert!(core::ptr::eq(tw, &TW_CACHE));
     }
 
     #[test]

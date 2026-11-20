@@ -542,7 +542,7 @@ impl Default for IpParams {
 impl IpParams {
     /// MTU the packet is sized against (Linux ip_sk_use_pmtu: PROBE,
     /// INTERFACE and OMIT ignore the learned path MTU)
-    fn mtu(&self, rt: &route::Rtable) -> usize {
+    pub fn mtu(&self, rt: &route::Rtable) -> usize {
         if self.pmtudisc < pmtu::PROBE {
             rt.mtu as usize
         } else {
@@ -551,7 +551,7 @@ impl IpParams {
     }
 
     /// Larger datagrams may be fragmented (Linux ip_sk_ignore_df)
-    fn may_frag(&self) -> bool {
+    pub fn may_frag(&self) -> bool {
         self.pmtudisc < pmtu::DO || self.pmtudisc == pmtu::OMIT
     }
 

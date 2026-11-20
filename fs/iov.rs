@@ -1,15 +1,17 @@
 //! Scatter/gather I/O syscalls (readv, writev, preadv, pwritev, preadv2, pwritev2)
 
-use alloc::vec;
+use alloc::vec::Vec;
+use core::mem::size_of_val;
 
 use crate::fs::{KernelError, RwFlags};
-use crate::uaccess::{UserPtr, access_ok, copy_from_user};
+use crate::uaccess::{UserPtr, UserSlice, access_ok};
 use crate::util::error::KernelResult;
+use crate::util::kmem::try_vec;
 
 use super::io::{do_readv, do_writev, pos_arg, seg_len};
 use super::syscall::{
-    IOV_MAX, MAX_RW_COUNT, RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_HIPRI,
-    RWF_NOAPPEND, RWF_NOWAIT, RWF_SUPPORTED, RWF_SYNC,
+    MAX_RW_COUNT, RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_HIPRI, RWF_NOAPPEND,
+    RWF_NOWAIT, RWF_SUPPORTED, RWF_SYNC, UIO_MAXIOV,
 };
 
 /// Linux iovec structure for scatter/gather I/O
@@ -26,69 +28,65 @@ pub struct IoVec {
 }
 crate::pod!(IoVec { iov_base, iov_len });
 
-/// The `iovcnt` iovecs at `iov_ptr`, checked and cut to MAX_RW_COUNT
-/// in total (Linux import_iovec): EINVAL for a count outside
-/// 0..=IOV_MAX or a length negative as ssize_t, EFAULT for a bad array
-/// or buffer
-pub fn import_iovec(
-    iov: UserPtr<IoVec>,
-    iovcnt: i32,
-) -> Result<alloc::vec::Vec<IoVec>, KernelError> {
-    let iov_ptr = iov.addr();
-    // Check iovcnt bounds
-    if iovcnt < 0 {
-        return Err(KernelError::InvalidArgument);
-    }
-    if iovcnt == 0 {
-        return Ok(alloc::vec::Vec::new());
-    }
-    if iovcnt as usize > IOV_MAX {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    let iovcnt = iovcnt as usize;
-    let iov_size = core::mem::size_of::<IoVec>();
-    let total_size = iovcnt * iov_size;
-
-    // Validate iovec array pointer
-    if !access_ok(iov_ptr, total_size) {
+/// Copy `iov.len()` iovecs in from `uvec` (Linux copy_iovec_from_user):
+/// EFAULT for an array outside user space or a fault, EINVAL for a
+/// length negative as ssize_t, element by element in order
+fn copy_iovec_from_user(iov: &mut [IoVec], uvec: UserPtr<IoVec>) -> KernelResult<()> {
+    let size = size_of_val(iov);
+    if !access_ok(uvec.addr(), size) {
         return Err(KernelError::BadAddress);
     }
-
-    // Copy iovec array from user space
-    let mut iovecs = vec![IoVec::default(); iovcnt];
-    // SAFETY: IoVec is repr(C) plain data; the byte view covers exactly the
-    // `iovcnt` initialized elements of `iovecs`.
-    let bytes =
-        unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr().cast::<u8>(), total_size) };
-    if copy_from_user(bytes, iov_ptr, total_size).is_err() {
-        return Err(KernelError::BadAddress);
+    let mut r = UserSlice::new(uvec.addr(), size).reader();
+    for v in iov {
+        *v = r.read::<IoVec>()?;
+        if (v.iov_len as i64) < 0 {
+            return Err(KernelError::InvalidArgument);
+        }
     }
+    Ok(())
+}
 
-    // A length negative as ssize_t is EINVAL, for any segment before
-    // any address is checked (Linux copy_iovec_from_user)
-    if iovecs.iter().any(|v| (v.iov_len as i64) < 0) {
+/// The `nr_segs` iovecs at `uvec`, copied in but not checked against
+/// user space (Linux iovec_from_user): none for 0, EINVAL above
+/// UIO_MAXIOV, then as copy_iovec_from_user
+pub fn iovec_from_user(uvec: UserPtr<IoVec>, nr_segs: usize) -> KernelResult<Vec<IoVec>> {
+    if nr_segs == 0 {
+        return Ok(Vec::new());
+    }
+    if nr_segs > UIO_MAXIOV {
         return Err(KernelError::InvalidArgument);
     }
+    let mut iov = try_vec(nr_segs, IoVec::default())?;
+    copy_iovec_from_user(&mut iov, uvec)?;
+    Ok(iov)
+}
+
+/// The `iovcnt` iovecs at `uvec`, checked and cut to MAX_RW_COUNT in
+/// total (Linux import_iovec): EINVAL for a count outside
+/// 0..=UIO_MAXIOV or a length negative as ssize_t, EFAULT for a bad
+/// array or buffer
+pub fn import_iovec(uvec: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<Vec<IoVec>> {
+    let n = usize::try_from(iovcnt).map_err(|_| KernelError::InvalidArgument)?;
+    let mut iov = iovec_from_user(uvec, n)?;
     // One segment is cut to MAX_RW_COUNT, then checked (Linux
-    // import_ubuf); several are checked whole, then cut so the total
-    // stays within MAX_RW_COUNT (__import_iovec)
-    let single = iovecs.len() == 1;
+    // __import_iovec_ubuf -> import_ubuf); several are checked whole,
+    // then cut so the total stays within MAX_RW_COUNT (__import_iovec)
+    let single = iov.len() == 1;
     let mut total = 0usize;
-    for iov in &mut iovecs {
-        let mut len = iov.iov_len as usize;
+    for v in &mut iov {
+        let mut len = v.iov_len as usize;
         if single {
             len = len.min(MAX_RW_COUNT);
         }
-        if len != 0 && !access_ok(iov.iov_base, len) {
+        // Every segment, an empty one too (Linux access_ok(base, 0))
+        if !access_ok(v.iov_base, len) {
             return Err(KernelError::BadAddress);
         }
         len = len.min(MAX_RW_COUNT - total);
-        iov.iov_len = len as u64;
+        v.iov_len = len as u64;
         total += len;
     }
-
-    Ok(iovecs)
+    Ok(iov)
 }
 
 /// sys_readv - scatter read at the file position

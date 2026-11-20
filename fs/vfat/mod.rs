@@ -709,7 +709,7 @@ fn vfat_hashi(name: &[u8]) -> u64 {
 }
 
 /// Two names match without case or trailing dots (Linux vfat_cmpi)
-fn vfat_cmpi(stored: &[u8], name: &[u8]) -> bool {
+fn vfat_cmpi(_: &crate::fs::Dentry, stored: &[u8], name: &[u8]) -> bool {
     striptail(stored).eq_ignore_ascii_case(striptail(name))
 }
 

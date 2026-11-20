@@ -17,9 +17,19 @@
 //!   stays latched in ICR and fires when IMS is rewritten.
 //! - TX ring full: the frame is dropped (`tx_dropped`, ENOBUFS to the
 //!   sender), like a qdisc drop.
+//! - Probe (Linux e1000_probe): the function's memory space and bus
+//!   mastering on first; a failure after that turns bus mastering off
+//!   again (pci_disable_device), and everything allocated before it goes
+//!   with its owner in reverse order (the goto ladder): the rings and
+//!   buffers (`DmaBox`, freed on drop) and the register mapping
+//!   (`IoRemap`, unmapped on drop). The chip is reset before its rings
+//!   are programmed and again on a failure after that, so it never
+//!   addresses freed memory.
 //! - Remove (Linux e1000_remove): `unregister_netdev` (closes it: NAPI
 //!   off), NAPI off if it never was, the chip reset (masked, DMA
-//!   stopped), the IRQ freed, then the rings and buffers freed.
+//!   stopped), the IRQ freed, the rings and buffers freed, bus mastering
+//!   off (pci_disable_device); the registers are unmapped with the last
+//!   reference to the device state.
 //!
 //! ## Locking (doc/LOCKING.md, Network)
 //!
@@ -48,7 +58,8 @@ use crate::sync::spin::Mutex;
 use spin::Once;
 
 use crate::arch::barrier::{dma_rmb, dma_wmb, wmb};
-use crate::hw::dma::DmaCoherent;
+use crate::hw::dma::DmaBox;
+use crate::hw::mmio::IoRemap;
 use crate::hw::pci::PciDevice;
 use crate::net;
 use crate::net::dev::{
@@ -60,6 +71,7 @@ use crate::net::skb::{NET_SKB_PAD, SkBuff, SkbHead};
 use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{try_arc, try_box};
+use crate::util::kmem::KVec;
 
 // ============================================================================
 // Hardware Constants
@@ -201,8 +213,8 @@ mod txd_stat {
 
 /// RX ring: descriptors + bounce buffers (NAPI poll only)
 struct RxRing {
-    desc: DmaCoherent,
-    bufs: Vec<DmaCoherent>,
+    desc: DmaBox,
+    bufs: Vec<DmaBox>,
     /// Next descriptor to examine
     next: usize,
     /// NAPI is disabled (by `stop`; enabled from probe and by `open`)
@@ -211,8 +223,8 @@ struct RxRing {
 
 /// TX ring: descriptors + bounce buffers
 struct TxRing {
-    desc: DmaCoherent,
-    bufs: Vec<DmaCoherent>,
+    desc: DmaBox,
+    bufs: Vec<DmaBox>,
     /// Next descriptor to fill (software copy of TDT)
     tail: usize,
     /// Oldest descriptor not yet reclaimed
@@ -249,8 +261,8 @@ impl TxRing {
 struct E1000 {
     /// The PCI function (IRQ, DMA)
     pci: PciDevice,
-    /// Register window (BAR0, 128KB)
-    regs: crate::hw::mmio::IoMem,
+    /// Register window (BAR0, 128KB), unmapped with the last reference
+    regs: IoRemap,
     /// MAC address
     mac: [u8; 6],
     /// None once removed
@@ -581,25 +593,13 @@ impl E1000 {
         self.write_reg(reg::IMC, 0xFFFF_FFFF);
     }
 
-    /// Free the rings and buffers; the chip is reset (no more DMA)
+    /// Free the rings and buffers (Linux e1000_free_all_rx_resources,
+    /// e1000_free_all_tx_resources); the caller reset the chip, so it no
+    /// longer addresses them. Dropped after the locks.
     fn free_rings(&self) {
         let rx = self.rx.lock().take();
         let tx = self.tx.lock().take();
-        let mut mem = Vec::new();
-        if let Some(r) = rx {
-            mem.push(r.desc);
-            mem.extend(r.bufs);
-        }
-        if let Some(t) = tx {
-            mem.push(t.desc);
-            mem.extend(t.bufs);
-        }
-        for m in mem {
-            // SAFETY: the caller reset the chip, so it no longer
-            // accesses the memory; the rings, its only CPU users, are
-            // gone
-            unsafe { crate::hw::dma::dma_free_coherent(&self.pci, m) };
-        }
+        drop((rx, tx));
     }
 }
 
@@ -694,6 +694,7 @@ impl crate::base::Bound for E1000DeviceWrapper {
         drop(irq);
         netif_napi_del(&d.napi);
         d.free_rings();
+        d.pci.disable_device();
     }
 }
 
@@ -709,15 +710,19 @@ pub static E1000_DRIVER: crate::base::Driver = crate::base::Driver::new(
     e1000_probe,
 );
 
-fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaCoherent>, KernelError> {
-    let mut v = Vec::with_capacity(n);
+/// `n` bounce buffers; on a failure the ones made so far are freed
+fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaBox>, KernelError> {
+    let mut v = KVec::try_with_capacity(n)?;
     for _ in 0..n {
-        let b = crate::hw::dma::dma_alloc_coherent(pci, BUF_SIZE).ok_or(KernelError::NoDevice)?;
-        v.push(b);
+        v.try_push(DmaBox::alloc(pci, BUF_SIZE).ok_or(KernelError::OutOfMemory)?)?;
     }
-    Ok(v)
+    Ok(v.into_vec())
 }
 
+/// Linux e1000_probe: the function enabled and mastering the bus, then
+/// the device set up; a failure turns bus mastering off again (its
+/// err_pci_reg: pci_disable_device), the rest having been released by
+/// its owners
 fn e1000_probe(
     pdev: &Arc<crate::base::Device>,
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
@@ -737,21 +742,32 @@ fn e1000_probe(
         printkln!("e1000: BAR0 not configured");
         return Err(KernelError::NoDevice);
     }
-    let mmio_phys = u64::from(bar0 & !0xF);
+    // Linux pci_enable_device_mem, pci_set_master: the device DMAs
+    // descriptors and packets
+    pci.enable_memory_space();
+    pci.enable_bus_master();
+    let bound =
+        e1000_setup(pdev, pci, u64::from(bar0 & !0xF)).inspect_err(|_| pci.disable_device())?;
+    Ok(Box::write(slot, bound))
+}
+
+/// The probe's part after the function is enabled: on a failure each
+/// resource is released by its owner as it goes out of scope, in
+/// reverse order (rings and buffers freed, registers unmapped), with
+/// the chip reset whenever it was given the rings
+fn e1000_setup(
+    pdev: &Arc<crate::base::Device>,
+    pci: &PciDevice,
+    mmio_phys: u64,
+) -> Result<E1000DeviceWrapper, KernelError> {
     // SAFETY: BAR0 of this e1000, its 128KB register space
-    let Some(regs) = (unsafe { crate::hw::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
+    let Some(regs) = (unsafe { IoRemap::new(mmio_phys, 128 * 1024) }) else {
         printkln!("e1000: Failed to ioremap MMIO region");
         return Err(KernelError::NoDevice);
     };
 
-    // The device DMAs descriptors and packets: it must master the bus
-    pci.enable_memory_space();
-    pci.enable_bus_master();
-
-    let rx_desc =
-        crate::hw::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16).ok_or(KernelError::NoDevice)?;
-    let tx_desc =
-        crate::hw::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16).ok_or(KernelError::NoDevice)?;
+    let rx_desc = DmaBox::alloc(pci, RX_RING_SIZE * 16).ok_or(KernelError::OutOfMemory)?;
+    let tx_desc = DmaBox::alloc(pci, TX_RING_SIZE * 16).ok_or(KernelError::OutOfMemory)?;
     let rx_bufs = alloc_bufs(pci, RX_RING_SIZE)?;
     let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;
 
@@ -792,12 +808,11 @@ fn e1000_probe(
     );
 
     // Allocated while the chip is reset and its rings unprogrammed:
-    // ENOMEM leaves no DMA running
+    // ENOMEM frees them with no DMA running
     let device = try_arc(dev)?;
     let ops: Arc<dyn NetDeviceOps> = try_arc(E1000Ops {
         device: Arc::clone(&device),
-    })
-    .inspect_err(|_| device.free_rings())?;
+    })?;
 
     device.set_mac_filter();
     device.init_rx();
@@ -825,8 +840,8 @@ fn e1000_probe(
         Ok(irq) => irq,
         Err(e) => {
             printkln!("e1000: no IRQ ({:?}), RX disabled", e);
+            // The rings go with the device state: stop the chip's DMA
             device.reset();
-            device.free_rings();
             netif_napi_del(&device.napi);
             return Err(KernelError::NoDevice);
         }
@@ -836,12 +851,9 @@ fn e1000_probe(
     netdev.parent.call_once(|| pdev.clone());
     net::register_netdev(rtnl, Arc::clone(&netdev));
 
-    Ok(Box::write(
-        slot,
-        E1000DeviceWrapper {
-            netdev,
-            device,
-            irq: Mutex::new(Some(irq)),
-        },
-    ))
+    Ok(E1000DeviceWrapper {
+        netdev,
+        device,
+        irq: Mutex::new(Some(irq)),
+    })
 }

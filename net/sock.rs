@@ -18,9 +18,7 @@
 //! or not).
 
 use alloc::boxed::Box;
-use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::io::fasync::{FasyncList, POLL_ERR, POLL_IN, POLL_OUT, kill_fasync};
 use crate::io::poll::{
@@ -65,6 +63,10 @@ pub mod sf {
     pub const ACCEPTCONN: u32 = 1 << 14;
     /// SO_RCVBUF was set (Linux SOCK_RCVBUF_LOCK in sk_userlocks)
     pub const RCVBUF_LOCK: u32 = 1 << 15;
+    /// SO_PASSPIDFD (Linux SOCK_PASSPIDFD)
+    pub const PASSPIDFD: u32 = 1 << 16;
+    /// SO_SNDBUF was set (Linux SOCK_SNDBUF_LOCK in sk_userlocks)
+    pub const SNDBUF_LOCK: u32 = 1 << 17;
 }
 
 /// sock_extended_err origins (SO_EE_ORIGIN_*)
@@ -164,18 +166,30 @@ pub struct Sock {
     errmem: AtomicUsize,
     /// O_ASYNC files of the socket (Linux socket_wq.fasync_list)
     pub fasync: FasyncList,
+    /// The socket file's owner (F_SETOWN; Linux sk->sk_socket->file's
+    /// f_owner), set with the file: SIGURG goes to it
+    pub fown: spin::Once<alloc::sync::Arc<crate::io::fasync::FOwner>>,
     /// `wqf` bits
     wq_flags: AtomicU32,
-    /// Counted in its namespace's INUSE_ALL (`inuse_start`)
-    inuse: AtomicBool,
+    /// In its namespace's INUSE_ALL: `INUSE_*` (`inuse_start`,
+    /// `inuse_end`)
+    inuse: AtomicU8,
+    /// SO_PEEK_OFF: where the next MSG_PEEK reads from, -1 when off
+    /// (Linux sk_peek_off; READ_ONCE/WRITE_ONCE, no lock)
+    pub peek_off: AtomicI32,
 }
 
+/// `Sock.inuse`: not counted yet, counted, counted no more (for good)
+const INUSE_NOT_YET: u8 = 0;
+const INUSE_COUNTED: u8 = 1;
+const INUSE_ENDED: u8 = 2;
+
 impl Drop for Sock {
-    /// Linux __sk_free's sock_inuse_add
+    /// A socket whose protocol never called `inuse_end` (one Linux
+    /// frees from an RCU callback, as netlink, or one never released)
+    /// leaves the count here
     fn drop(&mut self) {
-        if *self.inuse.get_mut() {
-            self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, false);
-        }
+        self.inuse_end();
     }
 }
 
@@ -191,8 +205,29 @@ impl Sock {
     /// Counted from now on, once (Linux sk_alloc, or sk_clone_lock for
     /// a TCP child, which Linux makes only when its handshake completes)
     pub fn inuse_start(&self) {
-        if !self.inuse.swap(true, Ordering::Relaxed) {
+        if self
+            .inuse
+            .compare_exchange(
+                INUSE_NOT_YET,
+                INUSE_COUNTED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, true);
+        }
+    }
+
+    /// Its last reference went (Linux __sk_free's sock_inuse_add, run
+    /// at sk_free before the memory's RCU-deferred release with
+    /// SOCK_RCU_FREE): out of the count, once, never counted again. hk's
+    /// table references are released a grace period after unhashing,
+    /// so the protocols call this where Linux drops the last
+    /// sk_refcnt (datagram release, TCP destroy of an orphan)
+    pub fn inuse_end(&self) {
+        if self.inuse.swap(INUSE_ENDED, Ordering::Relaxed) == INUSE_COUNTED {
+            self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, false);
         }
     }
 
@@ -222,8 +257,10 @@ impl Sock {
             errq: SkbQueue::new(),
             errmem: AtomicUsize::new(0),
             fasync: FasyncList::new(),
+            fown: spin::Once::new(),
             wq_flags: AtomicU32::new(0),
-            inuse: AtomicBool::new(false),
+            inuse: AtomicU8::new(INUSE_NOT_YET),
+            peek_off: AtomicI32::new(-1),
         }
     }
 
@@ -245,6 +282,8 @@ impl Sock {
         s.linger
             .store(p.linger.load(Ordering::Relaxed), Ordering::Relaxed);
         s.bound_dev_if.store(p.bound_dev_if(), Ordering::Relaxed);
+        s.peek_off
+            .store(p.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
         s
     }
 
@@ -260,6 +299,38 @@ impl Sock {
         } else {
             self.flags.fetch_and(!f, Ordering::AcqRel);
         }
+    }
+
+    // --- peek offset (SO_PEEK_OFF) ---------------------------------------
+
+    /// Linux sk_set_peek_off
+    pub fn set_peek_off(&self, val: i32) {
+        self.peek_off.store(val, Ordering::Relaxed);
+    }
+
+    /// Where a read with `flags` starts (Linux sk_peek_offset): the
+    /// peek offset for MSG_PEEK (-1 when off), else 0
+    pub fn peek_offset(&self, flags: i32) -> i32 {
+        if flags & crate::net::msg::MSG_PEEK != 0 {
+            return self.peek_off.load(Ordering::Relaxed);
+        }
+        0
+    }
+
+    /// `n` bytes were consumed: an enabled offset moves back by them,
+    /// not below 0 (Linux sk_peek_offset_bwd)
+    pub fn peek_offset_bwd(&self, n: i32) {
+        let off = self.peek_off.load(Ordering::Relaxed);
+        if off >= 0 {
+            self.peek_off
+                .store(off.wrapping_sub(n).max(0), Ordering::Relaxed);
+        }
+    }
+
+    /// `n` bytes were peeked: an enabled offset moves past them (Linux
+    /// sk_peek_offset_fwd)
+    pub fn peek_offset_fwd(&self, n: i32) {
+        self.peek_offset_bwd(n.wrapping_neg());
     }
 
     // --- errors ----------------------------------------------------------
@@ -394,7 +465,32 @@ impl Sock {
     pub fn set_sndbuf(&self, v: i32, force: bool) {
         self.sndbuf
             .store(buf_size(v, force, MIN_SNDBUF), Ordering::Release);
+        self.set_flag(sf::SNDBUF_LOCK, true);
         self.write_space();
+    }
+
+    /// A protocol's initial buffers (Linux tcp_init_sock: tcp_rmem[1],
+    /// tcp_wmem[1])
+    pub fn init_bufs(&self, rcv: u32, snd: u32) {
+        self.rcvbuf.store(rcv, Ordering::Release);
+        self.sndbuf.store(snd, Ordering::Release);
+    }
+
+    /// A protocol tuned the receive buffer from `old` to `new` (Linux
+    /// WRITE_ONCE(sk->sk_rcvbuf) under the socket lock): unless
+    /// SO_RCVBUF changed it meanwhile, which wins
+    pub fn tune_rcvbuf(&self, old: u32, new: u32) {
+        let _ = self
+            .rcvbuf
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// As `tune_rcvbuf`, the send buffer (Linux tcp_sndbuf_expand,
+    /// sk_stream_moderate_sndbuf)
+    pub fn tune_sndbuf(&self, old: u32, new: u32) {
+        let _ = self
+            .sndbuf
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     pub fn rcvlowat(&self) -> i32 {
@@ -518,6 +614,20 @@ impl Sock {
         };
         if !skip {
             kill_fasync(&self.fasync, crate::signal::SIGIO, band);
+        }
+    }
+
+    /// Linux sk_send_sigurg: SIGURG to the file's owner, then, if it
+    /// has one, to the O_ASYNC files that chose a signal (SOCK_WAKE_URG)
+    pub fn send_sigurg(&self) {
+        if let Some(o) = self.fown.get()
+            && crate::io::fasync::send_sigurg(o)
+        {
+            kill_fasync(
+                &self.fasync,
+                crate::signal::SIGURG,
+                crate::io::fasync::POLL_PRI,
+            );
         }
     }
 

@@ -121,7 +121,7 @@ pub fn arc_layout<T>() -> Layout {
 
 /// `Box::new(v)`, or ENOMEM
 pub fn try_box<T>(v: T) -> Result<Box<T>, KernelError> {
-    if crate::mm::fault_inject::should_fail() {
+    if crate::mm::fault_inject::should_failslab() {
         return Err(KernelError::OutOfMemory);
     }
     let layout = Layout::new::<T>();
@@ -144,7 +144,7 @@ pub fn try_box<T>(v: T) -> Result<Box<T>, KernelError> {
 
 /// `Box::new_uninit()`, or ENOMEM: for a large `T` built in place
 pub fn try_box_uninit<T>() -> Result<Box<core::mem::MaybeUninit<T>>, KernelError> {
-    if crate::mm::fault_inject::should_fail() {
+    if crate::mm::fault_inject::should_failslab() {
         return Err(KernelError::OutOfMemory);
     }
     let layout = Layout::new::<T>();
@@ -171,6 +171,18 @@ pub fn try_arc<T>(v: T) -> Result<Arc<T>, KernelError> {
 /// `Arc::new_uninit()`, or ENOMEM: for a large `T` built in place
 pub fn try_arc_uninit<T>() -> Result<Arc<core::mem::MaybeUninit<T>>, KernelError> {
     reserved(arc_layout::<T>(), Arc::new_uninit)
+}
+
+/// `v` moved into `a`, an unshared block from [`try_arc_uninit`]: an
+/// object allocated before the resources it will hold (Linux
+/// alloc_etherdev before a probe sets up its queues), so a failed
+/// allocation leaves nothing to undo. Panics if `a` is shared.
+pub fn arc_write<T>(mut a: Arc<core::mem::MaybeUninit<T>>, v: T) -> Arc<T> {
+    Arc::get_mut(&mut a)
+        .expect("arc_write: an unshared block")
+        .write(v);
+    // SAFETY: the value was written just above
+    unsafe { a.assume_init() }
 }
 
 /// `Box::new([f(); N])` made item by item in the heap block, or ENOMEM:
@@ -251,7 +263,7 @@ pub fn arc_cyclic_nofail<T>(f: impl FnOnce(&Weak<T>) -> T) -> Arc<T> {
 /// Run `make`, whose first allocation is of `layout`, with a block of it
 /// reserved: ENOMEM if the block cannot be had
 fn reserved<R>(layout: Layout, make: impl FnOnce() -> R) -> Result<R, KernelError> {
-    if crate::mm::fault_inject::should_fail() {
+    if crate::mm::fault_inject::should_failslab() {
         return Err(KernelError::OutOfMemory);
     }
     // Host tests (std's allocator) and CPUs without per-CPU data yet

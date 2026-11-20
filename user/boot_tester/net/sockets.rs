@@ -3,10 +3,11 @@
 //! Tests for the network socket syscalls.
 
 use hk_syscall::{
-    AF_INET, IoVec, MsgHdr, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM,
-    SockAddrIn, Timespec, htonl, htons, make_ipv4, sys_bind, sys_close, sys_exit, sys_fork,
-    sys_getsockname, sys_getsockopt, sys_listen, sys_nanosleep, sys_recvfrom, sys_sendmsg,
-    sys_sendto, sys_setsockopt, sys_shutdown, sys_socket, sys_socketpair, sys_wait4,
+    AF_INET, AF_UNIX, IoVec, MsgHdr, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_NONBLOCK,
+    SOCK_STREAM, SockAddrIn, Timespec, htonl, htons, make_ipv4, sys_bind, sys_close, sys_exit,
+    sys_fork, sys_getsockname, sys_getsockopt, sys_listen, sys_nanosleep, sys_recvfrom,
+    sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_shutdown, sys_socket, sys_socketpair,
+    sys_wait4,
 };
 
 /// Socket level constants
@@ -39,7 +40,7 @@ struct Linger {
     l_onoff: i32,
     l_linger: i32,
 }
-use crate::harness::pass;
+use crate::harness::{T, pass};
 use crate::helpers::{print, print_num, println};
 
 /// Run all socket tests
@@ -62,6 +63,7 @@ pub fn run_tests() {
     // New syscall tests
     test_socketpair();
     test_sendmsg_recvmsg();
+    test_msg_iov_neg_len();
 
     // UDP data transfer tests
     test_udp_loopback();
@@ -440,6 +442,49 @@ fn test_sendmsg_recvmsg() {
     } else {
         println(b"SENDMSG_RECVMSG:FAIL");
     }
+}
+
+/// sendmsg and recvmsg with an iov_len negative as ssize_t: EINVAL,
+/// whether the only segment or the second (Linux copy_msghdr_from_user
+/// -> import_iovec -> copy_iovec_from_user), before the socket is used
+fn test_msg_iov_neg_len() {
+    const EINVAL: i64 = -22;
+    const MSG_DONTWAIT: i32 = 0x40;
+    let mut t = T::new(b"MSG_IOV_NEG_LEN");
+    let mut sv: [i32; 2] = [-1, -1];
+    let r = sys_socketpair(AF_UNIX, SOCK_DGRAM, 0, &mut sv as *mut [i32; 2]);
+    if !t.eq(b"socketpair", r, 0) {
+        return t.done();
+    }
+    let mut buf = [0u8; 8];
+    let p = buf.as_mut_ptr();
+    for (why, neg) in [
+        (b"len -1" as &[u8], usize::MAX),
+        (b"len 1<<63", 1usize << 63),
+    ] {
+        let mut one = [IoVec {
+            iov_base: p,
+            iov_len: neg,
+        }];
+        let mut two = [
+            IoVec {
+                iov_base: p,
+                iov_len: buf.len(),
+            },
+            IoVec {
+                iov_base: p,
+                iov_len: neg,
+            },
+        ];
+        for iov in [&mut one[..], &mut two[..]] {
+            let mut msg = MsgHdr::new(iov.as_mut_ptr(), iov.len());
+            t.eq(why, sys_sendmsg(sv[0], &msg, MSG_DONTWAIT), EINVAL);
+            t.eq(why, sys_recvmsg(sv[1], &mut msg, MSG_DONTWAIT), EINVAL);
+        }
+    }
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
+    t.done();
 }
 
 /// Fork-based UDP loopback test - client/server exchange

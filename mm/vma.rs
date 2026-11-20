@@ -266,6 +266,46 @@ pub struct Vma {
     pub mempolicy: Option<crate::mm::mempolicy::Mempolicy>,
     /// The SysV shm attachment this VMA is (counted in shm_nattch)
     pub shm: Option<crate::ipc::shm::ShmAttach>,
+    /// The driver's count of its mappings (Linux vm_ops open/close),
+    /// from `FileOps::mmap_hold`
+    pub vm_ops: Option<VmHold>,
+}
+
+/// A driver's accounting of the VMAs mapping its pages (Linux
+/// vm_operations_struct open/close, e.g. af_packet's po->mapped)
+pub trait VmOps: Send + Sync {
+    /// Another VMA maps the pages (fork, split; Linux vm_ops->open)
+    fn open(&self);
+    /// A VMA went (munmap, exit, exec; Linux vm_ops->close)
+    fn close(&self);
+}
+
+/// One VMA's place in its driver's count: cloned with the VMA (fork,
+/// split: `open`), dropped with it (`close`). Called with no lock of
+/// the driver's held; the callbacks only count (atomics), so they are
+/// safe under the mmap_lock and any mm spin lock.
+pub struct VmHold(Arc<dyn VmOps>);
+
+impl VmHold {
+    /// The hold of a new mapping that `ops` counted already (Linux
+    /// f_op->mmap counts the VMA it sets vm_ops on; open runs only for
+    /// copies)
+    pub fn new(ops: Arc<dyn VmOps>) -> Self {
+        Self(ops)
+    }
+}
+
+impl Clone for VmHold {
+    fn clone(&self) -> Self {
+        self.0.open();
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for VmHold {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 impl Vma {
@@ -451,7 +491,11 @@ impl Vma {
         }
         // Never merge SysV shm attachments (Linux: VMAs with a vm_ops
         // close are not merged)
-        if self.shm.is_some() || other.shm.is_some() {
+        if self.shm.is_some()
+            || other.shm.is_some()
+            || self.vm_ops.is_some()
+            || other.vm_ops.is_some()
+        {
             return false;
         }
         // Must have same file backing with contiguous offsets

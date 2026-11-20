@@ -27,11 +27,18 @@
 //! (IrqSpinlock).
 
 use super::cb::{
-    Live, ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
+    Live, ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_INIT, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb,
+    TcpState, Tmr,
 };
 use super::output::Push;
+use super::recovery::CaState;
 use crate::net::mib::*;
 use crate::util::error::KernelError;
+
+/// Linux usecs_to_jiffies with HZ 1000 (the timers' ms): rounded up
+pub(super) fn usecs_to_jiffies(us: u64) -> u64 {
+    us.div_ceil(1000)
+}
 
 impl Live {
     /// Current timeout: the base RTO backed off, at most RTO_MAX (Linux
@@ -46,73 +53,208 @@ impl TcpCb {
         self.live.rto_cur()
     }
 
-    /// (Re)start the retransmission timer (no later than the user
-    /// timeout, Linux tcp_clamp_rto_to_user_timeout)
+    /// (Re)start the retransmission timer
     pub(super) fn arm_rtx(&mut self, now: u64) {
+        self.live.tmr.set(Some((Tmr::Rtx, now + self.rto_cur())));
+    }
+
+    /// The retransmission timer after a timeout, no later than the user
+    /// timeout since the first retransmission (Linux
+    /// tcp_clamp_rto_to_user_timeout)
+    fn arm_rtx_clamped(&mut self, now: u64) {
         let mut t = self.rto_cur();
-        if let Some(left) = self.user_left(now) {
-            t = t.min(left.max(1));
+        let ut = u64::from(self.opts.user_timeout);
+        if ut != 0 {
+            let elapsed = now.saturating_sub(self.rtx_stamp.unwrap_or(now));
+            t = if elapsed >= ut {
+                1
+            } else {
+                t.min(ut - elapsed)
+            };
         }
         self.live.tmr.set(Some((Tmr::Rtx, now + t)));
     }
 
-    /// TCP_USER_TIMEOUT time left while retransmitting or probing
-    fn user_left(&self, now: u64) -> Option<u64> {
-        let ut = u64::from(self.opts.user_timeout);
-        let start = self.rtx_stamp?;
-        (ut != 0).then(|| (start + ut).saturating_sub(now))
-    }
-
-    /// RFC 6298 2.2/2.3 for a measured round trip `r` ms (srtt8 = 8 *
-    /// SRTT, rttvar4 = 4 * RTTVAR); a valid sample ends the backoff
-    pub(super) fn rtt_sample(&mut self, r: u64) {
-        let r = r.min(RTO_MAX);
-        self.stats.min_rtt = Some(self.stats.min_rtt.map_or(r, |m| m.min(r)));
-        if self.srtt8 == 0 {
-            self.srtt8 = (r * 8).max(1);
-            self.rttvar4 = r * 2;
+    /// Linux retransmits_timed_out: since the first retransmission of
+    /// this episode, `timeout` ms passed, or with `timeout` 0 the time
+    /// `boundary` exponentially backed-off retransmissions take
+    /// (tcp_model_timeout from TCP_RTO_MIN, TCP_TIMEOUT_INIT in the
+    /// handshake)
+    fn retransmits_timed_out(&self, boundary: u32, timeout: u64, now: u64) -> bool {
+        if self.live.retransmits.get() == 0 {
+            return false;
+        }
+        let Some(start) = self.rtx_stamp else {
+            return false;
+        };
+        let timeout = if timeout != 0 {
+            timeout
         } else {
-            let srtt = (self.srtt8 / 8) as i64;
-            let delta = r as i64 - srtt;
-            self.srtt8 = (self.srtt8 as i64 + delta).max(1) as u64;
-            let var = (self.rttvar4 / 4) as i64;
-            self.rttvar4 = (self.rttvar4 as i64 + delta.abs() - var).max(0) as u64;
-        }
-        self.live
-            .rto
-            .set((self.srtt8 / 8 + self.rttvar4.max(1)).clamp(RTO_MIN, RTO_MAX));
-        self.live.backoff.set(0);
+            let base = match self.state {
+                TcpState::SynSent | TcpState::SynReceived => RTO_INIT,
+                _ => RTO_MIN,
+            };
+            model_timeout(boundary, base)
+        };
+        now.saturating_sub(start) >= timeout
     }
 
-    /// RFC 6298 5.7: SYN retransmitted and no RTT measured
+    /// Linux tcp_orphan_retries: the sysctl (which may be 0), none after
+    /// an ICMP error once the RTO is at its maximum, 8 for 0 while it is
+    /// below (over 100 s from a 200 ms RTO)
+    pub(super) fn orphan_retries(&self, alive: bool) -> u32 {
+        let mut retries = self.cfg.orphan_retries;
+        if self.soft_err.is_some() && !alive {
+            retries = 0;
+        }
+        if retries == 0 && alive {
+            retries = ORPHAN_RETRIES;
+        }
+        retries
+    }
+
+    /// A retransmission timeout's verdict (Linux tcp_write_timeout): the
+    /// handshake gives up after its retry count, a connection when
+    /// retransmits_timed_out says so (tcp_retries2, or TCP_USER_TIMEOUT);
+    /// an orphan may be dropped for memory first. True if it is over.
+    fn write_timeout(&mut self, now: u64, out: &mut Out) -> bool {
+        let mut expired = false;
+        let mut retry_until;
+        if self.tfo {
+            // Linux tcp_fastopen_synack_timer: one more retry
+            // ("Paranoid") unless TCP_SYNCNT set it
+            retry_until = match self.opts.syncnt {
+                0 => self.cfg.synack_retries + 1,
+                n => n,
+            };
+            expired = self.live.retransmits.get() >= retry_until;
+        } else if self.passive && self.state == TcpState::SynReceived {
+            retry_until = self.syn_retries();
+            expired = self.syn_ack_recalc().0;
+        } else if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
+            retry_until = self.syn_retries();
+            expired = self.live.retransmits.get() >= retry_until;
+        } else {
+            retry_until = self.cfg.retries2;
+            if self.orphan {
+                let alive = self.rto_cur() < RTO_MAX;
+                retry_until = self.orphan_retries(alive);
+                let reset = alive || !self.retransmits_timed_out(retry_until, 0, now);
+                if self.out_of_resources(now, reset, out) {
+                    return true;
+                }
+            }
+        }
+        if !expired {
+            let ut = u64::from(self.opts.user_timeout);
+            expired = self.retransmits_timed_out(retry_until, ut, now);
+        }
+        // Linux tcp_fastopen_active_detect_blackhole: the third
+        // consecutive timeout (or giving up before it) of an active
+        // Fast Open connection pauses Fast Open
+        let timeouts = self.live.retransmits.get();
+        if (self.syn_fastopen || self.syn_data || self.syn_data_acked)
+            && (timeouts == 2 || (timeouts < 2 && expired))
+        {
+            out.tfo_disable = true;
+            self.net_stat(LINUX_MIB_TCPFASTOPENACTIVEFAIL);
+        }
+        if expired {
+            self.timed_out(out);
+        }
+        expired
+    }
+
+    /// Linux tcp_rtt_estimator (Jacobson, SIGCOMM '88, with Linux's
+    /// finer gain for a falling RTT): `mrtt_us` into srtt_us (8 x SRTT),
+    /// mdev_us (4 x mean deviation), mdev_max_us and rttvar_us, the
+    /// latter decaying towards the round's maximum deviation once per
+    /// round (rtt_seq), never below TCP_RTO_MIN
+    pub(super) fn rtt_estimator(&mut self, mrtt_us: i64) {
+        let mut m = mrtt_us;
+        let mut srtt = self.srtt_us;
+        let rto_min_us = (RTO_MIN * 1000) as u32;
+        if srtt != 0 {
+            m -= i64::from(srtt >> 3);
+            srtt = (i64::from(srtt) + m) as u32;
+            if m < 0 {
+                m = -m;
+                m -= i64::from(self.mdev_us >> 2);
+                if m > 0 {
+                    m >>= 3;
+                }
+            } else {
+                m -= i64::from(self.mdev_us >> 2);
+            }
+            self.mdev_us = (i64::from(self.mdev_us) + m) as u32;
+            if self.mdev_us > self.mdev_max_us {
+                self.mdev_max_us = self.mdev_us;
+                if self.mdev_max_us > self.rttvar_us {
+                    self.rttvar_us = self.mdev_max_us;
+                }
+            }
+            if super::cb::after(self.snd_una, self.rtt_seq) {
+                if self.mdev_max_us < self.rttvar_us {
+                    self.rttvar_us -= (self.rttvar_us - self.mdev_max_us) >> 2;
+                }
+                self.rtt_seq = self.snd_nxt;
+                self.mdev_max_us = rto_min_us;
+            }
+        } else {
+            srtt = (m << 3) as u32;
+            self.mdev_us = (m << 1) as u32;
+            self.rttvar_us = self.mdev_us.max(rto_min_us);
+            self.mdev_max_us = self.rttvar_us;
+            self.rtt_seq = self.snd_nxt;
+        }
+        self.srtt_us = srtt.max(1);
+    }
+
+    /// Linux tcp_set_rto / __tcp_set_rto / tcp_bound_rto: SRTT plus
+    /// rttvar, in ms rounded up, at most TCP_RTO_MAX
+    pub(super) fn set_rto(&mut self) {
+        let us = u64::from(self.srtt_us >> 3) + u64::from(self.rttvar_us);
+        self.live.rto.set(usecs_to_jiffies(us).min(RTO_MAX));
+    }
+
+    /// No RTT from the handshake (Linux tcp_init_metrics, RFC 6298 5.7):
+    /// TCP_TIMEOUT_FALLBACK
     pub(super) fn set_rto_fallback(&mut self) {
-        if self.srtt8 == 0 {
-            self.live.rto.set(RTO_FALLBACK);
-        }
+        self.rttvar_us = (RTO_FALLBACK * 1000) as u32;
+        self.mdev_us = self.rttvar_us;
+        self.mdev_max_us = self.rttvar_us;
+        self.live.rto.set(RTO_FALLBACK);
     }
 
-    /// Smoothed RTT and its variance in ms (TCP_INFO)
-    pub fn rtt(&self) -> (u64, u64) {
-        (self.srtt8 / 8, self.rttvar4 / 4)
+    /// Smoothed RTT and its variance in us (TCP_INFO tcpi_rtt,
+    /// tcpi_rttvar: srtt_us >> 3, mdev_us >> 2)
+    pub fn rtt(&self) -> (u32, u32) {
+        (self.srtt_us >> 3, self.mdev_us >> 2)
     }
 
-    /// Retransmissions allowed before giving up (Linux tcp_write_timeout)
-    fn retries(&self) -> u32 {
+    /// Handshake retransmissions allowed (Linux tcp_write_timeout's
+    /// syn retries; a request's SYN-ACKs, reqsk_timer_handler)
+    fn syn_retries(&self) -> u32 {
         match self.state {
             TcpState::SynSent => self.cfg.syn_retries,
-            TcpState::SynReceived => self.cfg.synack_retries,
-            _ if self.orphan => ORPHAN_RETRIES.min(self.cfg.retries2),
-            _ => self.cfg.retries2,
+            _ => self.cfg.synack_retries,
         }
     }
 
-    /// Retransmitting or probing for too long: the retry count, or the
-    /// user timeout when set (synchronized states)
-    fn gave_up(&self, count: u32, now: u64) -> bool {
-        if self.opts.user_timeout != 0 && self.state.synced() {
-            return self.user_left(now) == Some(0);
+    /// A request's timeout (Linux syn_ack_recalc, its retransmissions
+    /// so far being num_timeout): (expire, resend). With
+    /// TCP_DEFER_ACCEPT, a request acked by a bare ACK lives on until
+    /// the defer period ends and its SYN-ACK is resent only for the last
+    /// chance before that, so the peer's next ACK may complete it
+    pub(super) fn syn_ack_recalc(&self) -> (bool, bool) {
+        let n = self.live.retransmits.get();
+        let max = self.syn_retries();
+        let defer = u32::from(self.opts.defer_accept);
+        if defer == 0 {
+            return (n >= max, true);
         }
-        count >= self.retries()
+        let expire = n >= max && (!self.req_acked || n >= defer);
+        (expire, !self.req_acked || n + 1 >= defer)
     }
 
     /// Give up: the last soft (ICMP) error, else ETIMEDOUT (Linux
@@ -120,7 +262,7 @@ impl TcpCb {
     /// uncounted by its timer, reqsk_timer_handler)
     fn timed_out(&mut self, out: &mut Out) {
         let e = self.soft_err.take().unwrap_or(KernelError::TimedOut);
-        if self.passive && self.state == TcpState::SynReceived {
+        if self.passive && self.state == TcpState::SynReceived && !self.tfo {
             out.err = Some(e);
             self.set_closed(out);
             return;
@@ -134,11 +276,16 @@ impl TcpCb {
         self.tick(now);
         if self.live.wait_at.get().is_some_and(|t| t <= now) {
             self.live.wait_at.set(None);
-            match self.state {
-                TcpState::TimeWait => self.set_closed(out),
-                // Orphan in FIN_WAIT_2 too long (Linux tcp_keepalive_timer)
-                TcpState::FinWait2 => self.abort(out),
-                _ => {}
+            // Orphan in FIN_WAIT_2 (Linux tcp_keepalive_timer): what is
+            // left of tcp_fin_time beyond TIME_WAIT's length in a
+            // timewait entry, else it is over
+            if self.state == TcpState::FinWait2 && self.orphan {
+                let tmo = self.fin_time().saturating_sub(TIMEWAIT_LEN);
+                if self.opts.linger2 >= 0 && tmo > 0 {
+                    self.fw2_time_wait(tmo, out);
+                } else {
+                    self.abort(out);
+                }
             }
             return;
         }
@@ -155,65 +302,130 @@ impl TcpCb {
         if at > now {
             return;
         }
-        self.live.tmr.set(None);
+        // Linux tcp_write_timer_handler: icsk_pending stays set while
+        // the reordering and loss probe handlers run (tcp_rearm_rto
+        // reads it)
+        if !matches!(kind, Tmr::Reo | Tmr::LossProbe) {
+            self.live.tmr.set(None);
+        }
         match kind {
             Tmr::Rtx => self.rtx_timer(now, out),
             Tmr::Probe => self.probe_timer(now, out),
+            Tmr::Reo => self.rack_reo_timeout(now, out),
+            Tmr::LossProbe => self.send_loss_probe(now, out),
         }
     }
 
     /// Retransmission timeout (Linux tcp_retransmit_timer): back off,
-    /// collapse the congestion window, resend from SND.UNA (go-back-N)
+    /// mark the flight lost and slow-start from one packet (CA_Loss,
+    /// tcp_enter_loss), resend the head
     fn rtx_timer(&mut self, now: u64, out: &mut Out) {
         let handshake = matches!(self.state, TcpState::SynSent | TcpState::SynReceived);
-        if !handshake && self.snd_una == self.snd_max {
+        if !handshake && self.packets_out == 0 && !self.syn_unacked {
+            return;
+        }
+        if !handshake && self.snd_wnd == 0 && !self.orphan && self.packets_out != 0 {
+            self.rtx_zero_window(now, out);
             return;
         }
         // Linux tcp_retransmit_timer / tcp_syn_ack_timeout
         self.net_stat(LINUX_MIB_TCPTIMEOUTS);
-        if self.rtx_stamp.is_none() {
-            // The head went out about one (backed-off) RTO ago
-            self.rtx_stamp = Some(now.saturating_sub(self.rto_cur()));
-        }
-        // Linux tcp_write_timeout: reset while the RTO is short or the
-        // retries are not used up
-        let reset = self.rto_cur() < RTO_MAX || !self.gave_up(self.live.backoff.get(), now);
-        if !handshake && self.out_of_resources(now, reset, out) {
+        if self.write_timeout(now, out) {
             return;
         }
-        if self.gave_up(self.live.backoff.get(), now) {
+        if self.live.retransmits.get() == 0 && !handshake {
+            // Linux: the first timeout ends a recovery or disorder
+            let mib = match self.ca_state {
+                CaState::Recovery if self.is_reno() => Some(LINUX_MIB_TCPRENORECOVERYFAIL),
+                CaState::Recovery => Some(LINUX_MIB_TCPSACKRECOVERYFAIL),
+                CaState::Loss => Some(LINUX_MIB_TCPLOSSFAILURES),
+                CaState::Disorder if self.is_reno() => Some(LINUX_MIB_TCPRENOFAILURES),
+                CaState::Disorder => Some(LINUX_MIB_TCPSACKFAILURES),
+                _ if self.sacked_out != 0 && self.is_reno() => Some(LINUX_MIB_TCPRENOFAILURES),
+                _ if self.sacked_out != 0 => Some(LINUX_MIB_TCPSACKFAILURES),
+                _ => None,
+            };
+            if let Some(m) = mib {
+                self.net_stat(m);
+            }
+        }
+        // A request's SYN-ACK timer has no congestion state (Linux
+        // tcp_syn_ack_timeout); a SYN_SENT or SYN_RECV socket's does
+        let req = self.passive && self.state == TcpState::SynReceived && !self.tfo;
+        // A Fast Open child lowers its window at its second timeout
+        // (Linux tcp_fastopen_synack_timer)
+        if !req && (!self.tfo || self.live.retransmits.get() == 1) {
+            self.enter_loss();
+        }
+        // A deferred request waiting for data is not resent, its timer
+        // runs on (Linux reqsk_timer_handler: syn_ack_recalc, before
+        // num_timeout counts this timeout)
+        let resend = !req || self.syn_ack_recalc().1;
+        // Linux tcp_update_rto_stats
+        self.live.retransmits.set(self.live.retransmits.get() + 1);
+        self.stats.rto_count = self.stats.rto_count.wrapping_add(1);
+        if (handshake || self.syn_unacked) && resend {
+            // Closed in SYN_RECEIVED: the SYN-ACK heads the queue and
+            // goes alone (a SYN is never collapsed), what follows once
+            // it is acked (the loss state resends it)
+            self.syn_rtx = handshake || self.syn_rtx;
+            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
+            self.syn_rtx(out);
+            // tcp_retransmit_skb of the SYN: the episode's first stamp,
+            // one more retransmission towards undo
+            self.rtx_stamp.get_or_insert(now);
+            self.undo_retrans = self.undo_retrans.max(0) + 1;
+        } else if !handshake
+            && !self.syn_unacked
+            && let Some(head) = self.rtx_head()
+        {
+            self.retransmit_skb(head, 1, now, out);
+        }
+        self.live.backoff.set(self.live.backoff.get() + 1);
+        self.arm_rtx_clamped(now);
+    }
+
+    /// The receiver shrank its window over data in flight (Linux
+    /// tcp_retransmit_timer: "receiver dastardly shrinks window"): the
+    /// retransmissions become zero-window probes of the queue's head,
+    /// which may lie past the window, and never time the connection out
+    /// while the peer answers them ([`Self::rtx_probe0_timed_out`]); an
+    /// orphan takes the ordinary path, so it cannot hang forever
+    fn rtx_zero_window(&mut self, now: u64, out: &mut Out) {
+        if self.rtx_probe0_timed_out(now) {
             self.timed_out(out);
             return;
         }
-        if self.live.backoff.get() == 0 && !handshake {
-            // Linux: the first timeout ends Reno recovery or disorder
-            if self.cong.in_recovery() {
-                self.net_stat(LINUX_MIB_TCPRENORECOVERYFAIL);
-            } else if self.cong.dupacks() != 0 {
-                self.net_stat(LINUX_MIB_TCPRENOFAILURES);
-            }
+        // Linux tcp_enter_loss, then tcp_retransmit_skb of the head
+        self.enter_loss();
+        if let Some(head) = self.rtx_head() {
+            self.retransmit_skb(head, 1, now, out);
         }
-        let flight = self.snd_max.wrapping_sub(self.snd_una);
-        self.cong.on_rto(flight);
-        self.rtt_seq = None;
         self.live.backoff.set(self.live.backoff.get() + 1);
-        self.stats.rto_count = self.stats.rto_count.wrapping_add(1);
-        if handshake {
-            self.syn_rtx = true;
-            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-            self.syn_rtx(out);
-        } else if self.syn_unacked {
-            // Closed in SYN_RECEIVED: the SYN-ACK heads the queue and
-            // goes alone (Linux tcp_retransmit_skb of the head; a SYN is
-            // never collapsed), the FIN behind it once that is acked
-            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
-            self.syn_rtx(out);
-            self.snd_nxt = self.snd_una.wrapping_add(1);
-        } else {
-            self.snd_nxt = self.snd_una;
-            self.output(now, out);
+        self.arm_rtx_clamped(now);
+    }
+
+    /// A shrunk-window probe sequence gives up (Linux
+    /// tcp_rtx_probe0_timed_out): past TCP_USER_TIMEOUT, else when the
+    /// peer has been silent for longer than twice RTO_MAX (or the user
+    /// timeout, if shorter) and the probes have lasted that long
+    fn rtx_probe0_timed_out(&self, now: u64) -> bool {
+        // Since the first retransmission, else the head's send
+        let head = self.rtx.first().map(|s| super::cb::skb_mstamp_us(s) / 1000);
+        let start = self.rtx_stamp.or(head).unwrap_or(now);
+        let rtx_delta = now.saturating_sub(start);
+        let mut timeout = 2 * RTO_MAX;
+        let ut = u64::from(self.opts.user_timeout);
+        if ut != 0 {
+            if rtx_delta > ut {
+                return true;
+            }
+            timeout = timeout.min(ut);
         }
-        self.arm_rtx(now);
+        if now.saturating_sub(self.rcv_tstamp) <= timeout {
+            return false;
+        }
+        rtx_delta > timeout
     }
 
     /// Resend the SYN-ACK for a retransmitted SYN and restart the
@@ -226,12 +438,25 @@ impl TcpCb {
         self.arm_rtx(now);
     }
 
-    /// An orphan holding send data while TCP memory is past its hard
-    /// limit is dropped (Linux tcp_out_of_resources, its memory half):
-    /// with a reset when `reset`, when it sent within TIME_WAIT's length,
-    /// or when the peer's window is shut with nothing in flight
+    /// An orphan is dropped when there are too many orphans (counted
+    /// double for one idle past twice RTO_MAX or not to be reset, again
+    /// for one with an ICMP error) or it holds send data while TCP
+    /// memory is past its hard limit (Linux tcp_out_of_resources,
+    /// tcp_check_oom): with a reset when `reset`, when it sent within
+    /// TIME_WAIT's length, or when the peer's window is shut with
+    /// nothing in flight
     fn out_of_resources(&mut self, now: u64, reset: bool, out: &mut Out) -> bool {
-        if !self.orphan || !super::mem::out_of_memory(self.sndq_len()) {
+        if !self.orphan {
+            return false;
+        }
+        let mut shift = 0;
+        if now.saturating_sub(self.lsndtime) > 2 * RTO_MAX || !reset {
+            shift += 1;
+        }
+        if self.soft_err.is_some() {
+            shift += 1;
+        }
+        if !super::mem::check_oom(shift, self.wmem_queued) {
             return false;
         }
         let reset = reset
@@ -252,30 +477,69 @@ impl TcpCb {
     /// up on
     fn probe_timer(&mut self, now: u64, out: &mut Out) {
         if self.snd_una != self.snd_max || !self.may_send() {
+            self.live.probes.set(0);
+            self.probes_tstamp = None;
             return;
         }
         if self.snd_wnd != 0 {
             self.xmit(now, Push::Force, out);
             return;
         }
-        if self.rtx_stamp.is_none() {
-            self.rtx_stamp = Some(now);
+        // Linux tcp_probe_timer: TCP_USER_TIMEOUT since the first probe
+        let ut = u64::from(self.opts.user_timeout);
+        match self.probes_tstamp {
+            None => self.probes_tstamp = Some(now),
+            Some(t) if ut != 0 && now.saturating_sub(t) >= ut => {
+                self.timed_out(out);
+                return;
+            }
+            Some(_) => {}
         }
-        self.live.probes.set(self.live.probes.get() + 1);
-        if self.gave_up(self.live.probes.get() - 1, now) {
+        let mut max_probes = self.cfg.retries2;
+        if self.orphan {
+            let alive = self.rto_cur() < RTO_MAX;
+            max_probes = self.orphan_retries(alive);
+            if !alive && self.live.backoff.get() >= max_probes {
+                self.timed_out(out);
+                return;
+            }
+            if self.out_of_resources(now, true, out) {
+                return;
+            }
+        }
+        if self.live.probes.get() >= max_probes {
             self.timed_out(out);
             return;
         }
-        if self.out_of_resources(now, true, out) {
-            return;
-        }
+        // Linux tcp_send_probe0
         self.send_probe(LINUX_MIB_TCPWINPROBE, out);
-        self.live.backoff.set(self.live.backoff.get() + 1);
-        let mut t = self.rto_cur().max(RTO_MIN);
-        if let Some(left) = self.user_left(now) {
-            t = t.min(left.max(1));
+        self.live.probes.set(self.live.probes.get() + 1);
+        if self.live.backoff.get() < self.cfg.retries2 {
+            self.live.backoff.set(self.live.backoff.get() + 1);
         }
+        let t = self.probe0_when();
+        let t = self.clamp_probe0_to_user_timeout(t, now);
         self.live.tmr.set(Some((Tmr::Probe, now + t)));
+    }
+
+    /// Linux tcp_probe0_when: the RTO, at least TCP_RTO_MIN, backed off
+    /// (at most ilog2(TCP_RTO_MAX / TCP_RTO_MIN) + 1 times), at most
+    /// TCP_RTO_MAX
+    fn probe0_when(&self) -> u64 {
+        let shift = self.live.backoff.get().min(ilog2(RTO_MAX / RTO_MIN) + 1);
+        (self.live.rto.get().max(RTO_MIN) << shift).min(RTO_MAX)
+    }
+
+    /// Linux tcp_clamp_probe0_to_user_timeout: no later than
+    /// TCP_USER_TIMEOUT since the first probe, at least TCP_TIMEOUT_MIN
+    fn clamp_probe0_to_user_timeout(&self, when: u64, now: u64) -> u64 {
+        let ut = u64::from(self.opts.user_timeout);
+        let Some(t) = self.probes_tstamp.filter(|_| ut != 0) else {
+            return when;
+        };
+        let elapsed = now.saturating_sub(t);
+        let remaining = (ut as i64 - elapsed as i64).max(TIMEOUT_MIN as i64) as u64;
+        remaining.min(when)
     }
 
     // --- keepalive ------------------------------------------------------------
@@ -359,6 +623,26 @@ impl TcpCb {
         self.live.keep_at.set(Some(now + next));
     }
 }
+
+/// Linux ilog2
+fn ilog2(v: u64) -> u32 {
+    63 - v.max(1).leading_zeros()
+}
+
+/// Linux tcp_model_timeout (ms): the time `boundary` retransmissions
+/// take backing off from `rto_base`, doubling up to TCP_RTO_MAX
+pub(super) fn model_timeout(boundary: u32, rto_base: u64) -> u64 {
+    let thresh = ilog2(RTO_MAX / rto_base);
+    let (b, t) = (u64::from(boundary), u64::from(thresh));
+    if b <= t {
+        ((2u64 << b) - 1) * rto_base
+    } else {
+        ((2u64 << t) - 1) * rto_base + (b - t) * RTO_MAX
+    }
+}
+
+/// Linux TCP_TIMEOUT_MIN (2 jiffies), ms
+const TIMEOUT_MIN: u64 = 2;
 
 /// Which of a connection's timers a deadline is for
 pub const RTX: usize = 0;

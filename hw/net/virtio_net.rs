@@ -25,9 +25,16 @@
 //!   virtqueue_napi_complete).
 //! - Link: VIRTIO_NET_S_LINK_UP from the config status field (carrier
 //!   on/off); without STATUS the link is always up.
+//! - Probe (Linux virtnet_probe): the device state is allocated before
+//!   the queues (alloc_etherdev before init_vqs), so no allocation after
+//!   them can fail; a failure after the queues are set up resets the
+//!   device and frees their rings (`del_vqs`), then the bounce buffers
+//!   (`DmaBox`, freed on drop).
 //! - Remove (Linux virtnet_remove): `unregister_netdev` (closes it: NAPI
-//!   off), NAPI off if it never was, the IRQ freed, then the device is
-//!   reset and the rings and bounce buffers freed (`del_vqs`).
+//!   off), NAPI off if it never was, the device reset, the IRQ freed,
+//!   then the rings and bounce buffers freed (`del_vqs`). A reset that
+//!   does not complete leaks them instead (Linux vp_reset waits for it
+//!   without a limit).
 //!
 //! ## Locking (doc/LOCKING.md, Network)
 //!
@@ -50,7 +57,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::spin::Mutex;
 use spin::Once;
 
-use crate::hw::dma::DmaCoherent;
+use crate::hw::dma::DmaBox;
 use crate::hw::virtio::ring::{Sg, VringCb};
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 use crate::net;
@@ -62,7 +69,8 @@ use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff, SkbHead};
 use crate::printkln;
 use crate::util::error::KernelError;
-use crate::util::kalloc::{try_arc, try_box};
+use crate::util::kalloc::{arc_write, try_arc_uninit, try_box};
+use crate::util::kmem::try_vec_with;
 
 /// Device-specific feature bits
 mod feature {
@@ -91,16 +99,17 @@ const MAX_TX: usize = BUF_SIZE - HDR_LEN;
 const RXQ: u16 = 0;
 const TXQ: u16 = 1;
 
-/// Fixed-size bounce buffers in one coherent allocation
+/// Fixed-size bounce buffers in one coherent allocation (freed on
+/// drop: only once the device is reset, or never given them)
 struct Pool {
-    mem: DmaCoherent,
+    mem: DmaBox,
 }
 
 impl Pool {
     fn new(vdev: &VirtioDevice, n: u16) -> Result<Self, KernelError> {
-        crate::hw::dma::dma_alloc_coherent(vdev, n as usize * BUF_SIZE)
+        DmaBox::alloc(vdev, n as usize * BUF_SIZE)
             .map(|mem| Self { mem })
-            .ok_or(KernelError::NoDevice)
+            .ok_or(KernelError::OutOfMemory)
     }
 
     fn cpu(&self, i: usize) -> *mut u8 {
@@ -426,26 +435,9 @@ impl crate::base::Bound for VirtioNetWrapper {
         }
         // Quiet before its IRQ goes (Linux remove_vq_common: reset,
         // then del_vqs frees the IRQ)
-        let reset = d.vdev.reset();
+        let _ = d.vdev.reset();
         d.vdev.free_irq();
-        netif_napi_del(&d.napi);
-        let rx = d.rx.lock().take();
-        let tx = d.tx.lock().take();
-        let (Some(rx), Some(tx)) = (rx, tx) else {
-            return;
-        };
-        if reset.is_err() {
-            // The device may still use the memory: leak it
-            printkln!("virtio-net: {}: reset failed", self.netdev.name());
-            return;
-        }
-        // A failed reset leaks the rings rather than freeing them live
-        let _ = d.vdev.del_vqs([rx.vq, tx.vq]);
-        for p in [rx.pool, tx.pool] {
-            // SAFETY: the device is reset (no more DMA to the buffers)
-            // and the queues that used them are gone
-            unsafe { crate::hw::dma::dma_free_coherent(&*d.vdev, p.mem) };
-        }
+        virtnet_del_vqs(d);
     }
 }
 
@@ -466,17 +458,45 @@ fn read_mac(vdev: &VirtioDevice) -> [u8; 6] {
     mac
 }
 
+/// The RX and TX queues with their bounce buffers, every RX buffer
+/// posted (Linux init_vqs + the probe's buffer setup). On a failure
+/// what was set up goes again: the rings after a reset (`del_vqs`,
+/// Linux vp_find_vqs' error path), the buffers, never given to the
+/// device, with their owners.
 fn setup_queues(vdev: &VirtioDevice) -> Result<(RxQueue, TxQueue), KernelError> {
     let rvq = vdev.setup_vq(RXQ)?;
-    let tvq = vdev.setup_vq(TXQ)?;
+    let tvq = match vdev.setup_vq(TXQ) {
+        Ok(q) => q,
+        Err(e) => {
+            let _ = vdev.del_vqs([rvq]);
+            return Err(e);
+        }
+    };
+    let bufs = (|| {
+        let rp = Pool::new(vdev, rvq.num())?;
+        let tp = Pool::new(vdev, tvq.num())?;
+        let mut k = tvq.num();
+        let free = try_vec_with(usize::from(k), || {
+            k -= 1;
+            k
+        })?;
+        Ok((rp, tp, free))
+    })();
+    let (rpool, tpool, free) = match bufs {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = vdev.del_vqs([rvq, tvq]);
+            return Err(e);
+        }
+    };
     let mut rx = RxQueue {
-        pool: Pool::new(vdev, rvq.num())?,
+        pool: rpool,
         vq: rvq,
         napi_off: false,
     };
     let tx = TxQueue {
-        pool: Pool::new(vdev, tvq.num())?,
-        free: (0..tvq.num()).rev().collect(),
+        pool: tpool,
+        free,
         vq: tvq,
     };
     for i in 0..rx.vq.num() as usize {
@@ -489,43 +509,74 @@ fn setup_queues(vdev: &VirtioDevice) -> Result<(RxQueue, TxQueue), KernelError> 
     Ok((rx, tx))
 }
 
+/// Linux virtnet_del_vqs: the device reset and the queues' rings freed
+/// (del_vqs), the NAPI context deleted (virtnet_free_queues), then the
+/// bounce buffers freed; a reset that does not complete leaks rings and
+/// buffers alike (the device may still use them)
+fn virtnet_del_vqs(d: &VirtioNet) {
+    netif_napi_del(&d.napi);
+    let rx = d.rx.lock().take();
+    let tx = d.tx.lock().take();
+    let (Some(rx), Some(tx)) = (rx, tx) else {
+        return;
+    };
+    let pools = (rx.pool, tx.pool);
+    if d.vdev.del_vqs([rx.vq, tx.vq]).is_err() {
+        printkln!("virtio-net: {}: reset failed", d.vdev.bus_id());
+        core::mem::forget(pools);
+    }
+}
+
 impl VirtioDriver for VirtioNetDriver {
     fn features(&self) -> u64 {
         (1 << feature::MAC) | (1 << feature::STATUS)
     }
 
+    /// Linux virtnet_probe
     fn probe(
         &self,
         dev: &Arc<crate::base::Device>,
         vdev: Arc<VirtioDevice>,
     ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
-        // The binding's memory first: nothing to undo should it fail
+        // The binding's and the device state's memory first: nothing to
+        // undo should they fail (Linux alloc_etherdev before init_vqs)
         let slot = try_box(MaybeUninit::<VirtioNetWrapper>::uninit())?;
+        let dmem = try_arc_uninit::<VirtioNet>()?;
+        let omem = try_arc_uninit::<VirtioNetOps>()?;
         let mac = read_mac(&vdev);
         let (rx, tx) = setup_queues(&vdev)?;
         let rx_cb = rx.vq.cb();
-        let device = try_arc(VirtioNet {
-            vdev: Arc::clone(&vdev),
-            mac,
-            rx: Mutex::new(Some(rx)),
-            tx: Mutex::new(Some(tx)),
-            rx_cb,
-            napi: Napi::new(NAPI_POLL_WEIGHT),
-            netdev: Once::new(),
-            config_pending: AtomicBool::new(false),
-        })?;
-        let ops: Arc<dyn NetDeviceOps> = try_arc(VirtioNetOps {
-            device: Arc::clone(&device),
-        })?;
+        let device = arc_write(
+            dmem,
+            VirtioNet {
+                vdev: Arc::clone(&vdev),
+                mac,
+                rx: Mutex::new(Some(rx)),
+                tx: Mutex::new(Some(tx)),
+                rx_cb,
+                napi: Napi::new(NAPI_POLL_WEIGHT),
+                netdev: Once::new(),
+                config_pending: AtomicBool::new(false),
+            },
+        );
+        let ops: Arc<dyn NetDeviceOps> = arc_write(
+            omem,
+            VirtioNetOps {
+                device: Arc::clone(&device),
+            },
+        );
         let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
         net::dev::netif_napi_add(&device.napi, poller);
 
-        let irq = vdev
-            .request_irq(Arc::clone(&device) as Arc<dyn VirtioIrq>)
-            .map_err(|e| {
+        let irq = match vdev.request_irq(Arc::clone(&device) as Arc<dyn VirtioIrq>) {
+            Ok(irq) => irq,
+            Err(e) => {
                 printkln!("virtio-net: no IRQ ({:?})", e);
-                KernelError::NoDevice
-            })?;
+                // Linux virtnet_probe's free: reset, virtnet_del_vqs
+                virtnet_del_vqs(&device);
+                return Err(KernelError::NoDevice);
+            }
+        };
         vdev.ready();
         // Buffers were posted before DRIVER_OK; notify only now (spec 3.1.1)
         if let Some(rx) = device.rx.lock().as_mut() {

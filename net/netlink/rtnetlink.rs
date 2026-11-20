@@ -20,10 +20,10 @@ use super::attr::{
 };
 use super::*;
 use crate::net::NetNamespace;
-use crate::net::device::{NetDevice, flags as dflags};
+use crate::net::device::{NetDevice, flags as dflags, operstate};
 use crate::net::inet::fib::{
     self, FibConfig, FibEntry, FlowKey, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, RT_TABLE_MAIN,
-    RTNH_F_LINKDOWN, RouteType,
+    RTNH_F_DEAD, RTNH_F_LINKDOWN, RouteType,
 };
 use crate::net::inet::fib_rules::{self, FibRule};
 use crate::net::inet::ifaddr::{
@@ -32,7 +32,8 @@ use crate::net::inet::ifaddr::{
 use crate::net::inet::route;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::neigh::{self, NeighInfo, nud};
-use crate::net::rtnl;
+use crate::net::rtnl::{self, RtnlGuard};
+use crate::ns::NetRef;
 use crate::util::kmem::KVec;
 
 // Message types (Linux RTM_*)
@@ -70,21 +71,70 @@ const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
 const IFLA_QDISC: u16 = 6;
 const IFLA_STATS: u16 = 7;
+const IFLA_MASTER: u16 = 10;
 const IFLA_TXQLEN: u16 = 13;
+const IFLA_MAP: u16 = 14;
 const IFLA_OPERSTATE: u16 = 16;
 const IFLA_LINKMODE: u16 = 17;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_IFALIAS: u16 = 20;
+const IFLA_VFINFO_LIST: u16 = 22;
 const IFLA_STATS64: u16 = 23;
+const IFLA_VF_PORTS: u16 = 24;
+const IFLA_PORT_SELF: u16 = 25;
+const IFLA_AF_SPEC: u16 = 26;
 const IFLA_GROUP: u16 = 27;
+const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_PROMISCUITY: u16 = 30;
 const IFLA_NUM_TX_QUEUES: u16 = 31;
 const IFLA_NUM_RX_QUEUES: u16 = 32;
 const IFLA_CARRIER: u16 = 33;
 const IFLA_CARRIER_CHANGES: u16 = 35;
+const IFLA_LINK_NETNSID: u16 = 37;
 const IFLA_PROTO_DOWN: u16 = 39;
+const IFLA_GSO_MAX_SEGS: u16 = 40;
+const IFLA_GSO_MAX_SIZE: u16 = 41;
+const IFLA_XDP: u16 = 43;
+const IFLA_TARGET_NETNSID: u16 = 46;
 const IFLA_MIN_MTU: u16 = 50;
 const IFLA_MAX_MTU: u16 = 51;
 const IFLA_ALT_IFNAME: u16 = 53;
-const IFLA_MAX: u16 = 64;
+const IFLA_PERM_ADDRESS: u16 = 54;
+const IFLA_PROTO_DOWN_REASON: u16 = 55;
+const IFLA_GRO_MAX_SIZE: u16 = 58;
+const IFLA_TSO_MAX_SIZE: u16 = 59;
+const IFLA_TSO_MAX_SEGS: u16 = 60;
+const IFLA_ALLMULTI: u16 = 61;
+const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
+const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
+const IFLA_NETNS_IMMUTABLE: u16 = 67;
+const IFLA_HEADROOM: u16 = 68;
+const IFLA_TAILROOM: u16 = 69;
+const IFLA_MAX: u16 = 69;
+// IFLA_INFO_* (nested in IFLA_LINKINFO)
+const IFLA_INFO_DATA: u16 = 2;
+const IFLA_INFO_SLAVE_DATA: u16 = 5;
+const IFLA_INFO_MAX: u16 = 5;
+// IFLA_VF_INFO (nested in IFLA_VFINFO_LIST)
+const IFLA_VF_INFO: u16 = 1;
+// IFLA_XDP_* (nested in IFLA_XDP) and XDP_FLAGS_*
+const IFLA_XDP_FD: u16 = 1;
+const IFLA_XDP_ATTACHED: u16 = 2;
+const IFLA_XDP_FLAGS: u16 = 3;
+const IFLA_XDP_PROG_ID: u16 = 4;
+const IFLA_XDP_EXPECTED_FD: u16 = 8;
+const IFLA_XDP_MAX: u16 = 8;
+const XDP_FLAGS_MODES: u32 = 0xe;
+const XDP_FLAGS_REPLACE: u32 = 0x10;
+const XDP_FLAGS_MASK: u32 = 0x1f;
+/// IF_OPER_* the device module has no use for
+const IF_OPER_TESTING: u8 = 4;
+const IF_OPER_DORMANT: u8 = 5;
+/// Linux INIT_NETDEV_GROUP, IFALIASZ, ETH_ALEN
+const INIT_NETDEV_GROUP: u32 = 0;
+const IFALIASZ: usize = 256;
+const ETH_ALEN: usize = 6;
 
 // IFA_*
 const IFA_ADDRESS: u16 = 1;
@@ -278,7 +328,8 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8], explicit: bool) -> Result<Done, 
         RTM_NEWNEIGH => newneigh(sk, h, p),
         RTM_DELNEIGH => delneigh(sk, p),
         RTM_GETNEIGH => getneigh(sk, h, p),
-        RTM_NEWLINK | RTM_SETLINK => setlink(sk, h, p, nl),
+        RTM_NEWLINK => newlink(sk, h, p, nl),
+        RTM_SETLINK => setlink(sk, p, nl),
         RTM_GETLINK => getlink(sk, h, p),
         RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE | RTM_GETROUTE => match family {
             AF_INET => match h.ty {
@@ -543,7 +594,7 @@ fn link_dev(
     ifm: &IfInfo,
     a: &Attrs<'_>,
 ) -> Result<Option<Arc<NetDevice>>, KernelError> {
-    if ifm.index > 0 {
+    if ifm.index.cast_signed() > 0 {
         return Ok(net.dev_get_by_index(ifm.index));
     }
     let name = match a.str(IFLA_IFNAME, IFNAMSIZ)? {
@@ -565,53 +616,370 @@ fn getlink(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     Ok(Done::Ok)
 }
 
-/// RTM_NEWLINK / RTM_SETLINK on an existing device (Linux rtnl_newlink
-/// without link kinds): IFLA_MTU and ifi_flags/ifi_change
-fn setlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
+/// ifla_policy's NLA_REJECT attributes (read-only, EINVAL in requests)
+const IFLA_REJECT: [u16; 7] = [
+    IFLA_PERM_ADDRESS,
+    IFLA_TSO_MAX_SIZE,
+    IFLA_TSO_MAX_SEGS,
+    IFLA_ALLMULTI,
+    IFLA_NETNS_IMMUTABLE,
+    IFLA_HEADROOM,
+    IFLA_TAILROOM,
+];
+
+/// The parts of Linux ifla_policy the link requests rely on beyond the
+/// typed reads: rejected attributes, the txqlen range
+fn ifla_validate(a: &Attrs<'_>) -> Result<(), KernelError> {
+    if IFLA_REJECT.iter().any(|&t| a.has(t)) {
+        return Err(KernelError::InvalidArgument);
+    }
+    // NLA_POLICY_FULL_RANGE(NLA_U32, 0..INT_MAX)
+    if a.u32(IFLA_TXQLEN)?.is_some_and(|q| q > i32::MAX as u32) {
+        return Err(KernelError::Range);
+    }
+    Ok(())
+}
+
+/// At most one of the attributes naming a namespace (Linux
+/// rtnl_ensure_unique_netns)
+fn ensure_unique_netns(a: &Attrs<'_>) -> Result<(), KernelError> {
+    let n = [IFLA_NET_NS_PID, IFLA_NET_NS_FD, IFLA_TARGET_NETNSID]
+        .iter()
+        .filter(|&&t| a.has(t))
+        .count();
+    if n > 1 {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// The namespace a link request names, None for the socket's own
+/// (Linux rtnl_link_get_net_capable). hk assigns no namespace ids, so
+/// IFLA_TARGET_NETNSID names none (EINVAL, Linux get_net_ns_by_id
+/// failing). The CAP_NET_ADMIN check over the namespace's owner is the
+/// caller's own, made for every request (hk capabilities ignore user
+/// namespaces, BUGS.md).
+fn link_get_net(a: &Attrs<'_>) -> Result<Option<NetRef>, KernelError> {
+    if let Some(pid) = a.u32(IFLA_NET_NS_PID)? {
+        return Ok(Some(crate::ns::net::get_net_ns_by_pid(pid)?));
+    }
+    if let Some(fd) = a.u32(IFLA_NET_NS_FD)? {
+        return Ok(Some(crate::ns::net::get_net_ns_by_fd(fd)?));
+    }
+    if a.has(IFLA_TARGET_NETNSID) {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(None)
+}
+
+/// RTM_SETLINK (Linux rtnl_setlink)
+fn setlink(sk: &NlSock, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
     let ifm = ifinfo(p)?;
     let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
+    ifla_validate(&a)?;
+    ensure_unique_netns(&a)?;
+    let tgt = link_get_net(&a)?;
     let net = sk.net();
     // The lookup under RTNL too: an unregistered device is never found
     let r = rtnl::lock();
-    let found = match link_dev(net, &ifm, &a) {
-        Err(KernelError::InvalidArgument) if h.ty == RTM_NEWLINK => None,
-        r => r?,
+    let dev = link_dev(net, &ifm, &a)?.ok_or(KernelError::NoDevice)?;
+    do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl)?;
+    Ok(Done::Ok)
+}
+
+/// RTM_NEWLINK (Linux rtnl_newlink): no link kinds are registered, so
+/// it only changes existing devices (rtnl_changelink) or a group
+fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
+    let ifm = ifinfo(p)?;
+    let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
+    ifla_validate(&a)?;
+    ensure_unique_netns(&a)?;
+    let linkinfo = match a.get(IFLA_LINKINFO) {
+        Some(b) => Some(Attrs::parse(b, IFLA_INFO_MAX)?),
+        None => None,
     };
-    let Some(dev) = found else {
-        if h.ty == RTM_NEWLINK && h.flags & NLM_F_CREATE != 0 {
-            // Creating links (veth, bridge, ...) needs link kinds
-            return Err(KernelError::OperationNotSupported);
-        }
-        return Err(KernelError::NoDevice);
+    let tgt = link_get_net(&a)?;
+    if a.has(IFLA_LINK_NETNSID) {
+        // No namespace ids (Linux get_net_ns_by_id failing)
+        return Err(KernelError::InvalidArgument);
+    }
+    let net = sk.net();
+    let r = rtnl::lock();
+    // When creating, the device is looked up in the target namespace
+    let create = h.flags & NLM_F_CREATE != 0;
+    let dnet = match &tgt {
+        Some(t) if create && h.flags & NLM_F_EXCL != 0 => t,
+        _ => net,
     };
-    if h.ty == RTM_NEWLINK {
+    if ifm.index.cast_signed() < 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let specified = ifm.index != 0 || a.has(IFLA_IFNAME) || a.has(IFLA_ALT_IFNAME);
+    let dev = if specified {
+        link_dev(dnet, &ifm, &a)?
+    } else {
+        None
+    };
+    if let Some(dev) = dev {
+        // Linux rtnl_changelink
         if h.flags & NLM_F_EXCL != 0 {
             return Err(KernelError::AlreadyExists);
         }
         if h.flags & NLM_F_REPLACE != 0 {
             return Err(KernelError::OperationNotSupported);
         }
+        // Kind data needs the device's link ops, slave data its
+        // master's: hk devices have neither
+        if let Some(li) = &linkinfo
+            && (li.has(IFLA_INFO_DATA) || li.has(IFLA_INFO_SLAVE_DATA))
+        {
+            return Err(KernelError::OperationNotSupported);
+        }
+        do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl)?;
+        return Ok(Done::Ok);
     }
-    if ifm.index > 0
-        && let Some(n) = a.str(IFLA_IFNAME, IFNAMSIZ)?
-        && n != dev.name()
+    if !create {
+        let Some(group) = a.u32(IFLA_GROUP)?.filter(|_| !specified) else {
+            return Err(KernelError::NoDevice);
+        };
+        // Linux rtnl_group_changelink: every device is in the default
+        // group (0)
+        if group == INIT_NETDEV_GROUP {
+            for dev in net.devices() {
+                do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl)?;
+            }
+        }
+        return Ok(Done::Ok);
+    }
+    // Creating links (veth, bridge, ...) needs link kinds
+    Err(KernelError::OperationNotSupported)
+}
+
+/// Linux validate_linkmsg: hardware addresses at least the device's
+/// length (6: hk links are Ethernet-like), IFLA_AF_SPEC of known
+/// families (AF_INET, AF_INET6; Linux rtnl_af_lookup, EAFNOSUPPORT)
+fn validate_linkmsg(a: &Attrs<'_>) -> Result<(), KernelError> {
+    for t in [IFLA_ADDRESS, IFLA_BROADCAST] {
+        if a.get(t).is_some_and(|b| b.len() < ETH_ALEN) {
+            return Err(KernelError::InvalidArgument);
+        }
+    }
+    if let Some(b) = a.get(IFLA_AF_SPEC) {
+        for (af, _) in nested(b)? {
+            if af != u16::from(AF_INET) && af != u16::from(AF_INET6) {
+                return Err(KernelError::AddressFamilyNotSupported);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The (type, payload) attributes nested in `b` (Linux
+/// nla_for_each_nested); EINVAL if malformed
+fn nested(mut b: &[u8]) -> Result<Vec<(u16, &[u8])>, KernelError> {
+    let mut v = Vec::new();
+    while b.len() >= 4 {
+        let len = usize::from(u16::from_ne_bytes([b[0], b[1]]));
+        let ty = u16::from_ne_bytes([b[2], b[3]]) & 0x3fff;
+        if len < 4 || len > b.len() {
+            return Err(KernelError::InvalidArgument);
+        }
+        v.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
+        v.push((ty, &b[4..len]));
+        b = &b[align(len).min(b.len())..];
+    }
+    Ok(v)
+}
+
+/// The operational state IFLA_OPERSTATE `transition` would leave
+/// (Linux set_operstate; hk devices are never dormant or testing)
+fn set_operstate(cur: u8, transition: u8) -> u8 {
+    let oper_up = cur == operstate::IF_OPER_UP || cur == operstate::IF_OPER_UNKNOWN;
+    match transition {
+        operstate::IF_OPER_UP
+            if matches!(
+                cur,
+                IF_OPER_DORMANT | IF_OPER_TESTING | operstate::IF_OPER_UNKNOWN
+            ) =>
+        {
+            operstate::IF_OPER_UP
+        }
+        IF_OPER_TESTING | IF_OPER_DORMANT if oper_up => transition,
+        _ => cur,
+    }
+}
+
+/// Change device `dev` as link request `a` asks (Linux do_setlink), in
+/// Linux's order, each attribute applied or refused: an earlier one
+/// stays applied when a later one fails, as in Linux. What hk devices
+/// cannot do fails with the errno Linux gives for a device or driver
+/// without it; a setting equal to the device's fixed value is a no-op.
+#[allow(clippy::too_many_arguments)]
+fn do_setlink(
+    r: &RtnlGuard,
+    net: &NetNamespace,
+    dev: &Arc<NetDevice>,
+    tgt: Option<&NetNamespace>,
+    ifm: &IfInfo,
+    a: &Attrs<'_>,
+    nl: NlInfo,
+) -> Result<(), KernelError> {
+    use KernelError::{InvalidArgument, OperationNotSupported};
+    validate_linkmsg(a)?;
+    if let Some(t) = tgt
+        && !dev.net_is(t)
     {
-        // Renaming is not supported
-        return Err(KernelError::OperationNotSupported);
+        // Linux __dev_change_net_namespace: a netns-immutable device
+        // (lo) stays
+        if dev.is_loopback() {
+            return Err(InvalidArgument);
+        }
+        // Moving a device between namespaces is not supported yet
+        return Err(OperationNotSupported);
+    }
+    // No ndo_set_config, no ndo_set_mac_address in hk drivers
+    if a.has(IFLA_MAP) || a.has(IFLA_ADDRESS) {
+        return Err(OperationNotSupported);
     }
     if let Some(mtu) = a.u32(IFLA_MTU)? {
         // Linux do_setlink hands the u32 to an int parameter: above
         // INT_MAX it is negative and dev_set_mtu refuses it
-        rtnl::dev_set_mtu(&r, net, &dev, mtu.cast_signed(), nl)?;
+        rtnl::dev_set_mtu(r, net, dev, mtu.cast_signed(), nl)?;
+    }
+    // Devices stay in the default group
+    if a.u32(IFLA_GROUP)?.is_some_and(|g| g != INIT_NETDEV_GROUP) {
+        return Err(OperationNotSupported);
+    }
+    if ifm.index.cast_signed() > 0
+        && let Some(n) = a.str(IFLA_IFNAME, IFNAMSIZ)?
+        && !n.is_empty()
+        && n != dev.name()
+    {
+        // Renaming is not supported
+        return Err(OperationNotSupported);
+    }
+    // No aliases: only clearing (an empty one) is a no-op
+    if let Some(al) = a.get(IFLA_IFALIAS) {
+        if al.len() >= IFALIASZ {
+            return Err(InvalidArgument);
+        }
+        if !al.is_empty() {
+            return Err(OperationNotSupported);
+        }
+    }
+    if a.get(IFLA_BROADCAST)
+        .is_some_and(|b| b[..ETH_ALEN] != dev.link().broadcast)
+    {
+        return Err(OperationNotSupported);
     }
     if ifm.flags != 0 || ifm.change != 0 {
         let mut f = ifm.flags;
         if ifm.change != 0 {
             f = (f & ifm.change) | (dev.get_flags() & !ifm.change);
         }
-        rtnl::dev_change_flags(&r, net, &dev, f, nl)?;
+        rtnl::dev_change_flags(r, net, dev, f, nl)?;
     }
-    Ok(Done::Ok)
+    // Linux do_set_master: no device has a master; one named must
+    // exist and take slaves (ndo_add_slave)
+    if let Some(m) = a.u32(IFLA_MASTER)?
+        && m != 0
+    {
+        return Err(match net.dev_get_by_index(m) {
+            Some(_) => OperationNotSupported,
+            None => InvalidArgument,
+        });
+    }
+    // No ndo_change_carrier
+    if a.u8(IFLA_CARRIER)?.is_some() {
+        return Err(OperationNotSupported);
+    }
+    if a.u32(IFLA_TXQLEN)?.is_some_and(|q| q != dev.link().txqlen) {
+        return Err(OperationNotSupported);
+    }
+    // No GSO/GRO limits to set
+    if [
+        IFLA_GSO_MAX_SIZE,
+        IFLA_GSO_MAX_SEGS,
+        IFLA_GRO_MAX_SIZE,
+        IFLA_GSO_IPV4_MAX_SIZE,
+        IFLA_GRO_IPV4_MAX_SIZE,
+    ]
+    .iter()
+    .any(|&t| a.has(t))
+    {
+        return Err(OperationNotSupported);
+    }
+    // Operational state and link mode follow the carrier only
+    if let Some(t) = a.u8(IFLA_OPERSTATE)? {
+        let cur = dev.operstate();
+        if set_operstate(cur, t) != cur {
+            return Err(OperationNotSupported);
+        }
+    }
+    if a.u8(IFLA_LINKMODE)?.is_some_and(|m| m != 0) {
+        return Err(OperationNotSupported);
+    }
+    // The first VF entry decides (Linux do_setvfinfo: nothing to set is
+    // EINVAL, anything needs an ndo_set_vf_*: no SR-IOV)
+    if let Some(b) = a.get(IFLA_VFINFO_LIST)
+        && let Some(&(ty, vf)) = nested(b)?.first()
+    {
+        if ty != IFLA_VF_INFO || nested(vf)?.is_empty() {
+            return Err(InvalidArgument);
+        }
+        return Err(OperationNotSupported);
+    }
+    // No ndo_set_vf_port
+    if a.has(IFLA_VF_PORTS) {
+        return Err(OperationNotSupported);
+    }
+    if let Some(b) = a.get(IFLA_PORT_SELF) {
+        nested(b)?;
+        return Err(OperationNotSupported);
+    }
+    // No per-family link settings (Linux inet/inet6 set_link_af:
+    // devconf)
+    if a.get(IFLA_AF_SPEC).is_some_and(|b| !b.is_empty()) {
+        return Err(OperationNotSupported);
+    }
+    // No device supports proto_down
+    if a.has(IFLA_PROTO_DOWN) || a.has(IFLA_PROTO_DOWN_REASON) {
+        return Err(OperationNotSupported);
+    }
+    if let Some(b) = a.get(IFLA_XDP) {
+        setlink_xdp(b)?;
+    }
+    Ok(())
+}
+
+/// IFLA_XDP of a link request (Linux do_setlink): checked as Linux
+/// does; attaching a program is not supported (no XDP)
+fn setlink_xdp(b: &[u8]) -> Result<(), KernelError> {
+    let x = Attrs::parse(b, IFLA_XDP_MAX)?;
+    if x.has(IFLA_XDP_ATTACHED) || x.has(IFLA_XDP_PROG_ID) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let flags = x.u32(IFLA_XDP_FLAGS)?.unwrap_or(0);
+    if flags & !XDP_FLAGS_MASK != 0 || (flags & XDP_FLAGS_MODES).count_ones() > 1 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if let Some(fd) = x.u32(IFLA_XDP_FD)? {
+        let replace = flags & XDP_FLAGS_REPLACE != 0;
+        if replace && !x.has(IFLA_XDP_EXPECTED_FD) {
+            return Err(KernelError::InvalidArgument);
+        }
+        // A detach with nothing attached succeeds (Linux dev_xdp_attach:
+        // new == old == NULL, the driver untouched), unless REPLACE
+        // expects a program (EEXIST); hk attaches none (EOPNOTSUPP)
+        if (fd as i32) >= 0 {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let expected = x.u32(IFLA_XDP_EXPECTED_FD)?.map_or(-1, |e| e as i32);
+        if replace && expected >= 0 {
+            return Err(KernelError::AlreadyExists);
+        }
+    }
+    Ok(())
 }
 
 /// RTM_NEWLINK message for `dev` (Linux rtnl_fill_ifinfo subset)
@@ -1003,6 +1371,9 @@ pub fn fill_route(
     pid: u32,
 ) -> Result<(), KernelError> {
     let mut rflags = e.flags;
+    if e.dead() {
+        rflags |= RTNH_F_DEAD;
+    }
     if e.dev.as_ref().is_some_and(|d| !d.carrier_ok()) && e.rtype == RouteType::Unicast {
         rflags |= RTNH_F_LINKDOWN;
     }

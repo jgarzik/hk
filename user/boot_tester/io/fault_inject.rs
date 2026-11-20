@@ -4,13 +4,18 @@
 //! allocation fail in turn until it completes without reaching one: every
 //! ENOMEM path of the call runs. Each run must return (no panic, no hang)
 //! and leave no descriptor behind. Skipped where the kernel has no
-//! fail-nth (a Linux build without fault injection).
+//! fail-nth (a Linux build without fault injection). failslab's
+//! ignore-gfp-wait is N meanwhile (`Reach`), so GFP_KERNEL allocations
+//! fail too (Linux's default skips them).
 //!
 //! - FAULT_INJECT_<CALL>: one line per syscall, with the paths it ran
 //! - FAULT_INJECT_XATTR: setxattr/getxattr value buffers fail with
 //!   ENOMEM (Linux kvmalloc), no panic
 //! - FAULT_INJECT_CGROUP_MKDIR: after each failed mkdir of a cgroup the
 //!   name is still free (nothing half made)
+//! - FAULT_INJECT_KNOBS: the debugfs knobs (failslab/ignore-gfp-wait,
+//!   fail_page_alloc/{ignore-gfp-wait,ignore-gfp-highmem,min-order})
+//!   read Linux's defaults and take writes; skipped without them
 
 use crate::helpers::{print, print_num, println, skip};
 use hk_syscall::{
@@ -24,6 +29,7 @@ use hk_syscall::{
 const MAX_NTH: u32 = 400;
 
 pub fn run_tests() {
+    knobs();
     let path = b"/proc/self/fail-nth\0";
     let fd = sys_open(path.as_ptr(), O_RDWR, 0);
     if fd < 0 {
@@ -31,6 +37,7 @@ pub fn run_tests() {
         return;
     }
     let fd = fd as i32;
+    let reach = Reach::new(false);
     let calls: [(&[u8], fn() -> i64, fn(i64)); 10] = [
         (b"SOCKETPAIR", socketpair, close_pair),
         (b"SOCKET_INET", || sys_socket(2, 1, 0), close_one),
@@ -49,6 +56,7 @@ pub fn run_tests() {
     run(fd, b"FORK", fork, |_| {});
     cgroup_mkdir(fd);
     set(fd, 0);
+    drop(reach);
     sys_close(fd as u64);
 }
 
@@ -278,4 +286,141 @@ fn xattr() -> i64 {
     let g = hk_syscall::sys_getxattr(p.as_ptr(), b"user.t\0".as_ptr(), b.as_mut_ptr(), 64);
     sys_unlink(p.as_ptr());
     if r < 0 { r } else { g.min(0) }
+}
+
+/// FAULT_INJECT_KNOBS: Linux's defaults (Y, Y, Y, 1), a bool written
+/// as "N" and "on" read back as N and Y, min-order written in hex read
+/// back in decimal (debugfs_create_bool / debugfs_create_u32); each
+/// restored
+fn knobs() {
+    const N: &[u8] = b"FAULT_INJECT_KNOBS";
+    let mut st = hk_syscall::Stat::default();
+    let mounted = hk_syscall::sys_stat(KNOBS[0].as_ptr(), &mut st) < 0
+        && sys_mount(
+            b"debugfs\0".as_ptr(),
+            DEBUGFS.as_ptr(),
+            b"debugfs\0".as_ptr(),
+            0,
+            0,
+        ) == 0;
+    let hm = b"/sys/kernel/debug/fail_page_alloc/ignore-gfp-highmem\0";
+    let files: [(&[u8], &[u8]); 4] = [
+        (KNOBS[0], b"Y\n"),
+        (KNOBS[1], b"Y\n"),
+        (hm, b"Y\n"),
+        (KNOBS[2], b"1\n"),
+    ];
+    let mut why: Option<(&[u8], i64)> = None;
+    for (i, (p, want)) in files.iter().enumerate() {
+        let (b, n) = knob(p, b"");
+        if n < 0 {
+            if mounted {
+                sys_umount2(DEBUGFS.as_ptr(), 0);
+            }
+            // A host kernel may lack CONFIG_FAILSLAB / FAIL_PAGE_ALLOC;
+            // hk always has them
+            if crate::helpers::host_mode() {
+                return skip(N, b"no fault-injection debugfs knobs");
+            }
+            why = Some((b"knob missing", i as i64));
+            break;
+        }
+        if &b[..n as usize] != *want && why.is_none() {
+            why = Some((b"default", i as i64));
+        }
+    }
+    let steps: [(&[u8], &[u8], &[u8]); 3] = [
+        (KNOBS[1], b"N", b"N\n"),
+        (KNOBS[1], b"on", b"Y\n"),
+        (KNOBS[2], b"0x2\n", b"2\n"),
+    ];
+    for (i, (p, w, want)) in steps.iter().enumerate() {
+        let (old, n) = knob(p, w);
+        let (b, m) = knob(p, &old[..n.max(0) as usize]);
+        if &b[..m.max(0) as usize] != *want && why.is_none() {
+            why = Some((b"written", i as i64));
+        }
+    }
+    if mounted {
+        sys_umount2(DEBUGFS.as_ptr(), 0);
+    }
+    match why {
+        Some((w, v)) => crate::harness::fail_why(N, w, v),
+        None => crate::harness::pass(N),
+    }
+}
+
+/// The debugfs knob files `Reach` sets
+const KNOBS: [&[u8]; 3] = [
+    b"/sys/kernel/debug/failslab/ignore-gfp-wait\0",
+    b"/sys/kernel/debug/fail_page_alloc/ignore-gfp-wait\0",
+    b"/sys/kernel/debug/fail_page_alloc/min-order\0",
+];
+const DEBUGFS: &[u8] = b"/sys/kernel/debug\0";
+
+/// What fail-nth reaches, widened for a test (Linux's knobs by default
+/// skip allocations that may sleep, and single pages): failslab's
+/// ignore-gfp-wait N and, with `pages`, fail_page_alloc's ignore-gfp-wait
+/// N and min-order 0, as Documentation/fault-injection's fail-nth
+/// example sets them. debugfs is mounted at /sys/kernel/debug if it is
+/// not. Dropping it restores the knobs (and unmounts what it mounted);
+/// a kernel without them is left as it is.
+pub struct Reach {
+    saved: [([u8; 16], i64); 3],
+    mounted: bool,
+}
+
+impl Reach {
+    pub fn new(pages: bool) -> Self {
+        let mut st = hk_syscall::Stat::default();
+        let mounted = hk_syscall::sys_stat(KNOBS[0].as_ptr(), &mut st) < 0
+            && sys_mount(
+                b"debugfs\0".as_ptr(),
+                DEBUGFS.as_ptr(),
+                b"debugfs\0".as_ptr(),
+                0,
+                0,
+            ) == 0;
+        let mut r = Self {
+            saved: [([0; 16], -1); 3],
+            mounted,
+        };
+        let want: [&[u8]; 3] = [b"N", b"N", b"0"];
+        let n = if pages { 3 } else { 1 };
+        for i in 0..n {
+            r.saved[i] = knob(KNOBS[i], want[i]);
+        }
+        r
+    }
+}
+
+impl Drop for Reach {
+    fn drop(&mut self) {
+        for (i, (b, n)) in self.saved.iter().enumerate() {
+            if *n > 0 {
+                knob(KNOBS[i], &b[..*n as usize]);
+            }
+        }
+        if self.mounted {
+            sys_umount2(DEBUGFS.as_ptr(), 0);
+        }
+    }
+}
+
+/// Knob `path`'s old value and its length (-1 if it cannot be read),
+/// `set` written to it (if not empty)
+fn knob(path: &[u8], set: &[u8]) -> ([u8; 16], i64) {
+    let mut b = [0u8; 16];
+    let fd = sys_open(path.as_ptr(), O_RDWR, 0);
+    if fd < 0 {
+        return (b, -1);
+    }
+    let fd = fd as i32;
+    let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64);
+    if !set.is_empty() {
+        sys_lseek(fd, 0, 0);
+        sys_write(fd as u64, set.as_ptr(), set.len() as u64);
+    }
+    sys_close(fd as u64);
+    (b, n)
 }

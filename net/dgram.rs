@@ -1,4 +1,4 @@
-//! Datagram receive queue shared by UDP, ping and raw sockets (Linux
+//! Datagram receive queue shared by ping and raw sockets (Linux
 //! net/core/datagram.c + the sk_receive_queue/sk_rmem_alloc parts of
 //! sock.c)
 //!
@@ -211,8 +211,9 @@ pub fn sock_cmsgs(sk: &Sock, m: &mut RecvMsg<'_>, stamp: i64, drops: u32) {
     }
 }
 
-/// Linux datagram_poll: sends are synchronous, so always writable
-pub fn poll(sk: &Sock, rxq: &RxQueue) -> u16 {
+/// Linux datagram_poll (`readable`: the receive queue is not empty):
+/// sends are synchronous, so always writable
+pub fn poll(sk: &Sock, readable: bool) -> u16 {
     let mut mask = 0;
     if sk.err_pending() {
         mask |= POLLERR;
@@ -224,7 +225,7 @@ pub fn poll(sk: &Sock, rxq: &RxQueue) -> u16 {
     if sh == SHUTDOWN_MASK {
         mask |= POLLHUP;
     }
-    if rxq.readable() {
+    if readable {
         mask |= POLLIN | POLLRDNORM;
     }
     mask | POLLOUT | POLLWRNORM | POLLWRBAND

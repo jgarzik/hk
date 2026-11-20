@@ -102,6 +102,11 @@ pub enum OptOut {
     /// Copied only whole: a shorter buffer is ERANGE with the length
     /// needed written back (Linux SO_PEERGROUPS)
     Whole(Vec<u8>),
+    /// A reserved descriptor's number, the file installed there only
+    /// once the number is copied out; on a fault the descriptor is
+    /// released and the file dropped (Linux SO_PEERPIDFD: fd_install,
+    /// or put_unused_fd + fput)
+    Fd(crate::task::fdtable::UnusedFd, crate::fs::FileRef),
 }
 
 /// Protocol operations of a socket (Linux proto_ops + the parts of
@@ -144,6 +149,41 @@ pub trait ProtoOps: Send + Sync {
     fn getsockopt(&self, _level: i32, _opt: i32) -> Option<Result<OptOut, KernelError>> {
         None
     }
+    /// getsockopt with the caller's buffer `v` (its length, read as
+    /// input by options such as PACKET_HDRLEN; Linux passes optval to
+    /// getsockopt). Default: `getsockopt`.
+    fn getsockopt_in(
+        &self,
+        level: i32,
+        opt: i32,
+        _v: OptIn,
+    ) -> Option<Result<OptOut, KernelError>> {
+        self.getsockopt(level, opt)
+    }
+    /// mmap of the socket file (Linux proto_ops->mmap; sock_no_mmap's
+    /// ENODEV by default); its pages are inserted by `map_page`
+    fn mmap(&self) -> Result<(), KernelError> {
+        Err(KernelError::NoDevice)
+    }
+    /// May a mapping start at byte `off` (Linux: vm_pgoff checked by
+    /// proto_ops->mmap)? Default: any offset.
+    fn mmap_offset(&self, _off: u64) -> Result<(), KernelError> {
+        Ok(())
+    }
+    /// A mapping of `len` bytes is about to be linked (`FileOps::mmap_hold`)
+    fn mmap_hold(&self, _len: u64) -> Result<Option<crate::mm::vma::VmHold>, KernelError> {
+        Ok(None)
+    }
+    /// Page `idx` of a mapping (`FileOps::map_page`)
+    ///
+    /// # Safety
+    /// As `FileOps::map_page`: the caller maps the page with the
+    /// reference taken here and drops it with the mapping; the
+    /// implementor returns a RAM frame that stays allocated while the
+    /// reference is held and holds only what user space may access.
+    unsafe fn map_page(&self, _idx: u64) -> Option<u64> {
+        None
+    }
     /// `flags` includes MSG_DONTWAIT for non-blocking files
     fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError>;
     fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError>;
@@ -160,6 +200,16 @@ pub trait ProtoOps: Send + Sync {
     /// protocols send it; AF_UNIX datagram/seqpacket sockets do not)
     fn sigpipe(&self) -> bool {
         true
+    }
+    /// SO_PEEK_OFF write (Linux proto_ops.set_peek_off); None: the
+    /// protocol has none, and SO_PEEK_OFF is EOPNOTSUPP both ways
+    fn set_peek_off(&self, _val: i32) -> Option<Result<(), KernelError>> {
+        None
+    }
+    /// The protocol has a `set_peek_off` (Linux: proto_ops.set_peek_off
+    /// is not NULL), so getsockopt(SO_PEEK_OFF) reads `Sock.peek_off`
+    fn has_set_peek_off(&self) -> bool {
+        false
     }
 }
 
@@ -208,6 +258,10 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelE
         Some(&crate::fs::pseudo::SOCKFS.sb()?),
         &NULL_INODE_OPS,
     ))?;
+    // The file's owner, shared with the socket for SIGURG (Linux
+    // sk_send_sigurg reaches it through sk->sk_socket->file)
+    let fown = try_arc(crate::io::fasync::FOwner::default())?;
+    sock.sk().fown.call_once(|| fown.clone());
     inode.set_private(try_arc(SockInode(sock))?);
     // On sockfs (Linux sock_alloc_file: alloc_file_pseudo, dname
     // "socket:[ino]")
@@ -216,7 +270,9 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelE
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    File::new(dentry, Some(mnt), flags, &SOCK_FOPS).alloc()
+    let f = File::new(dentry, Some(mnt), flags, &SOCK_FOPS).alloc()?;
+    f.f_owner.call_once(|| fown);
+    Ok(f)
 }
 
 /// Create a protocol socket (Linux __sock_create)
@@ -347,6 +403,44 @@ impl FileOps for SockFile {
         Ok(())
     }
 
+    /// Linux sock_mmap: the protocol's mmap
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
+        sock_of(file).ok_or(KernelError::NotSocket)?.mmap()
+    }
+
+    fn mmap_offset(&self, file: &File, off: u64) -> Result<(), KernelError> {
+        sock_of(file)
+            .ok_or(KernelError::NotSocket)?
+            .mmap_offset(off)
+    }
+
+    fn mmap_hold(
+        &self,
+        file: &File,
+        len: u64,
+    ) -> Result<Option<crate::mm::vma::VmHold>, KernelError> {
+        match sock_of(file) {
+            Some(s) => s.mmap_hold(len),
+            None => Ok(None),
+        }
+    }
+
+    fn maps_driver_pages(&self, file: &File) -> bool {
+        sock_of(file).is_some_and(|s| s.mmap().is_ok())
+    }
+
+    // SAFETY: the protocol's `map_page` has the same contract
+    unsafe fn map_page(
+        &self,
+        file: &File,
+        _off: u64,
+        idx: u64,
+    ) -> Option<Result<u64, KernelError>> {
+        let s = sock_of(file)?;
+        // SAFETY: the caller's obligations are passed on unchanged
+        unsafe { s.map_page(idx) }.map(Ok)
+    }
+
     /// Linux sock_fasync: the socket's list; an allocation failure is
     /// not reported (Linux ignores fasync_helper's result)
     fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
@@ -366,6 +460,8 @@ const FIOSETOWN: u32 = 0x8901;
 const SIOCSPGRP: u32 = 0x8902;
 const FIOGETOWN: u32 = 0x8903;
 const SIOCGPGRP: u32 = 0x8904;
+/// Linux SIOCATMARK: at the out-of-band mark
+pub const SIOCATMARK: u32 = 0x8905;
 
 /// Linux sock_ioctl: owner commands, then the protocol, then the
 /// interface ioctls of the socket's namespace
@@ -432,6 +528,8 @@ pub const SO_RXQ_OVFL: i32 = 40;
 pub const SO_PEEK_OFF: i32 = 42;
 pub const SO_COOKIE: i32 = 57;
 pub const SO_PEERGROUPS: i32 = 59;
+pub const SO_PASSPIDFD: i32 = 76;
+pub const SO_PEERPIDFD: i32 = 77;
 pub const SO_BINDTOIFINDEX: i32 = 62;
 pub const SO_RCVTIMEO_NEW: i32 = 66;
 pub const SO_SNDTIMEO_NEW: i32 = 67;
@@ -452,6 +550,16 @@ fn bool_opt(opt: i32) -> Option<u32> {
         SO_PASSSEC => sf::PASSSEC,
         _ => return None,
     })
+}
+
+/// An option only AF_UNIX takes (Linux sk_is_unix): EOPNOTSUPP on
+/// others
+fn unix_only(family: u16) -> Result<(), KernelError> {
+    if family == AF_UNIX {
+        Ok(())
+    } else {
+        Err(KernelError::OperationNotSupported)
+    }
 }
 
 fn cap(c: u32) -> bool {
@@ -521,8 +629,16 @@ pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), Kerne
             sk.mark.store(val as u32, Ordering::Release);
         }
         SO_BINDTOIFINDEX => bind_ifindex(sk, val)?,
-        // Datagram peek offsets are not implemented (BUGS.md)
-        SO_PEEK_OFF => return Err(KernelError::OperationNotSupported),
+        SO_PASSPIDFD => {
+            unix_only(sk.family)?;
+            sk.set_flag(sf::PASSPIDFD, val != 0);
+        }
+        // Linux sock_setsockopt: the protocol's set_peek_off
+        SO_PEEK_OFF => {
+            return s
+                .set_peek_off(val)
+                .unwrap_or(Err(KernelError::OperationNotSupported));
+        }
         o => {
             let f = bool_opt(o).ok_or(KernelError::NoProtocolOption)?;
             sk.set_flag(f, val != 0);
@@ -619,6 +735,13 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_RCVLOWAT => int(sk.rcvlowat()),
         SO_SNDLOWAT => int(1),
         SO_BINDTOIFINDEX => int(sk.bound_dev_if() as i32),
+        SO_PASSPIDFD => {
+            unix_only(sk.family)?;
+            int(i32::from(sk.flag(sf::PASSPIDFD)))
+        }
+        // Linux sock_getsockopt: only with a set_peek_off
+        SO_PEEK_OFF if s.has_set_peek_off() => int(sk.peek_off.load(Ordering::Relaxed)),
+        SO_PEEK_OFF => Err(KernelError::OperationNotSupported),
         SO_COOKIE => Ok(OptOut::Bytes(
             sk.ino.load(Ordering::Acquire).to_ne_bytes().to_vec(),
         )),
@@ -633,7 +756,7 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.sndtimeo()))),
         SO_PEERCRED => Ok(OptOut::Bytes(peercred_bytes(None))),
         // Only AF_UNIX (and Linux's Bluetooth) has peer credentials
-        SO_PEERGROUPS => Err(KernelError::NoData),
+        SO_PEERGROUPS | SO_PEERPIDFD => Err(KernelError::NoData),
         SO_BINDTODEVICE => {
             let i = sk.bound_dev_if();
             let mut b = Vec::new();
@@ -670,6 +793,11 @@ pub fn put_opt(
     len: i32,
 ) -> Result<(), KernelError> {
     let b = match out {
+        OptOut::Fd(fd, file) => {
+            put_opt(OptOut::Int(fd.fd()), val, lenp, len)?;
+            fd.install(file);
+            return Ok(());
+        }
         OptOut::Int(v) => v.to_ne_bytes().to_vec(),
         OptOut::Bytes(b) => b,
         OptOut::Whole(b) if b.len() > len as usize => {
@@ -694,5 +822,21 @@ pub fn shut_bits(how: i32) -> Result<u8, KernelError> {
         SHUT_WR => Ok(SEND_SHUTDOWN),
         SHUT_RDWR => Ok(RCV_SHUTDOWN | SEND_SHUTDOWN),
         _ => Err(KernelError::InvalidArgument),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux sk_setsockopt / sk_getsockopt SO_PASSPIDFD: AF_UNIX only
+    #[test]
+    fn passpidfd_unix_only() {
+        assert_eq!(unix_only(AF_UNIX), Ok(()));
+        assert_eq!(unix_only(AF_INET), Err(KernelError::OperationNotSupported));
+        assert_eq!(
+            unix_only(AF_NETLINK),
+            Err(KernelError::OperationNotSupported)
+        );
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! SOCK_STREAM (`stream.rs`), SOCK_DGRAM and SOCK_SEQPACKET
 //! (`dgram.rs`; SOCK_RAW is an alias of SOCK_DGRAM like Linux), with
-//! ancillary data in `scm.rs`.
+//! ancillary data in `scm.rs` and the collector of unreachable
+//! in-flight sockets in `gc.rs`.
 //!
 //! Addresses: a filesystem name creates an S_IFSOCK inode (VFS mknod:
 //! DAC on the parent, umask; an existing name is EADDRINUSE) and is
@@ -40,6 +41,12 @@
 //!   queue to a dead socket); a leaf (`UnixCb.fp` aside): a message's
 //!   `Arc` is made before it, a reader takes a reference under it and
 //!   copies after, and taken messages are freed after it.
+//! - `oob` (spin leaf under `rq`): a stream's pending out-of-band skb
+//!   (Linux u->oob_skb), changed under `st` and `rq`.
+//! - `gc::UNIX_GC` (spin, Linux unix_gc_lock): the in-flight graph and
+//!   each socket's `vertex`, `listener`, `nr_unix_fds`; under `st` and
+//!   `UnixCb.fp` when a message is queued, above `rq` (the collector
+//!   takes dead sockets' queues under it). See `gc.rs`.
 //! - `UnixTable` buckets (per netns) and `BSD` buckets (global):
 //!   `crate::sync::spin::Mutex` per bucket (Linux unx.table.locks,
 //!   bsd_socket_locks), sockets linked intrusively and held weakly;
@@ -61,6 +68,7 @@
 //!   messages and their files are always dropped with no lock held.
 
 pub mod dgram;
+pub mod gc;
 pub mod scm;
 pub mod stream;
 
@@ -82,8 +90,8 @@ use crate::net::msg::{RecvMsg, SendMsg};
 use crate::net::skb::{SkBuff, SkbCb, SkbOwned, SkbOwnedQueue};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
-    AF_UNIX, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SO_PEERGROUPS, SOCK_DGRAM,
-    SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
+    AF_UNIX, OptIn, OptOut, ProtoOps, SIOCATMARK, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SO_PEERGROUPS,
+    SO_PEERPIDFD, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
 };
 use crate::net::{NetNamespace, NetRef};
 use crate::sync::Mutex as SMutex;
@@ -104,6 +112,9 @@ pub const SOCKADDR_UN_LEN: usize = 110;
 pub const ESTABLISHED: u8 = 1;
 pub const CLOSE: u8 = 7;
 pub const LISTEN: u8 = 10;
+
+/// Open the bound socket inode (Linux SIOCUNIXFILE, SIOCPROTOPRIVATE)
+const SIOCUNIXFILE: u32 = 0x89E0;
 
 /// Buffer charge per message beyond its bytes (Linux skb truesize
 /// overhead: struct sk_buff + skb_shared_info), so tiny messages cannot
@@ -179,6 +190,9 @@ pub struct UnixCb {
     /// Bytes already read (stream; Linux UNIXCB.consumed): written
     /// under `iolock`
     consumed: AtomicUsize,
+    /// A zero-length datagram was peeked: a peek at offset 0 passes it
+    /// from now on (Linux skb->peeked)
+    peeked: AtomicBool,
     /// A listener's pending connection (Linux: the embryo is skb->sk)
     pub embryo: Option<Arc<UnixSock>>,
 }
@@ -197,6 +211,7 @@ fn unix_skb(from: &Arc<UnixSock>, data: Vec<u8>) -> Result<SkBuff, KernelError> 
         creds: None,
         fp: Mutex::new(None),
         consumed: AtomicUsize::new(0),
+        peeked: AtomicBool::new(false),
         embryo: None,
     })?;
     let mut skb = SkBuff::from_vec(data);
@@ -229,7 +244,7 @@ pub fn unix_len(skb: &SkBuff) -> usize {
 /// yet), unless the sender gave SCM_CREDENTIALS
 fn add_creds(skb: &mut SkBuff, me: &UnixSock, other: &UnixSock) {
     let cb = ucb_mut(skb);
-    if cb.creds.is_none() && (me.passcred() || other.passcred() || !other.has_file()) {
+    if cb.creds.is_none() && (me.may_passcred() || other.may_passcred() || !other.has_file()) {
         cb.creds = Some(Creds::current());
     }
 }
@@ -269,6 +284,11 @@ pub struct UnixSock {
     /// Unread bytes queued (Linux unix_sock.inq_len), changed under
     /// `rq`'s lock
     inq_len: AtomicUsize,
+    /// The queued out-of-band skb of a stream (Linux u->oob_skb):
+    /// changed under `st` and `rq`'s lock (a leaf beneath them), read
+    /// under it alone by poll and SIOCATMARK; the skb it replaces or
+    /// clears is dropped after the locks
+    oob: Mutex<Option<Arc<SkBuff>>>,
     addr: RwLock<Option<Arc<UnixAddr>>>,
     /// The socket inode a filesystem name binds, with its mount (Linux
     /// unix_sock.path: a bound socket keeps the filesystem busy for
@@ -296,6 +316,12 @@ pub struct UnixSock {
     /// Queue length limit (Linux sk_max_ack_backlog)
     backlog: AtomicU32,
     peercred: Mutex<Option<PeerCred>>,
+    /// Our in-flight vertex (Linux u->vertex), the listener of an
+    /// embryo not yet accepted (u->listener), files of unix sockets
+    /// queued to us (scm_stat.nr_unix_fds): `gc::UNIX_GC`'s
+    vertex: gc::GcCell<Option<Arc<gc::Vertex>>>,
+    listener: gc::GcCell<Option<Arc<UnixSock>>>,
+    nr_unix_fds: gc::GcCell<usize>,
     /// Link on our namespace table's bucket (Linux sk_node)
     node: Link,
     /// Link on a `BSD` bucket while bound to a path (Linux sk_bind_node)
@@ -529,6 +555,7 @@ impl UnixSock {
             state: AtomicU8::new(CLOSE),
             rq: SkbOwnedQueue::new(),
             inq_len: AtomicUsize::new(0),
+            oob: Mutex::new(None),
             addr: RwLock::new(None),
             path: Mutex::new(None),
             iolock: SMutex::new(()),
@@ -540,6 +567,9 @@ impl UnixSock {
             dead: AtomicBool::new(false),
             backlog: AtomicU32::new(qlen),
             peercred: Mutex::new(None),
+            vertex: gc::GcCell::new(None),
+            listener: gc::GcCell::new(None),
+            nr_unix_fds: gc::GcCell::new(0),
             node: Link::new(),
             bind_node: Link::new(),
             hash: AtomicU32::new(0),
@@ -581,6 +611,12 @@ impl UnixSock {
 
     fn passcred(&self) -> bool {
         self.sk.flag(sf::PASSCRED)
+    }
+
+    /// Credentials travel with messages (Linux unix_may_passcred:
+    /// SO_PASSCRED or SO_PASSPIDFD)
+    fn may_passcred(&self) -> bool {
+        self.sk.flag(sf::PASSCRED) || self.sk.flag(sf::PASSPIDFD)
     }
 
     /// Has a socket file (an embryo gets one when accepted)
@@ -744,7 +780,7 @@ impl UnixSock {
     /// Autobind first when credentials are passed (Linux
     /// unix_may_passcred && !u->addr)
     fn passcred_autobind(&self) -> Result<(), KernelError> {
-        if self.passcred() && self.addr().is_none() {
+        if self.may_passcred() && self.addr().is_none() {
             self.autobind()?;
         }
         Ok(())
@@ -762,20 +798,36 @@ impl UnixSock {
         // The path taken under the state lock as Linux (off its bucket
         // now, so no lookup reads it), put last (unix_release_sock's
         // path_put)
-        let (state, peer, path) = {
+        // The out-of-band skb is let go under `st` and `rq`, the only
+        // way `oob` changes (Linux clears u->oob_skb just after
+        // unix_state_unlock, the socket dead, so no queue_oob sets it);
+        // our reference is dropped with no lock held
+        let (state, peer, path, oob) = {
             let mut st = self.st.lock();
             self.dead.store(true, Ordering::Release);
             self.sk.or_shutdown(SHUTDOWN_MASK);
             let path = self.path.lock().take();
             let state = self.state();
             self.set_state(CLOSE);
-            (state, st.take(), path)
+            let oob = {
+                let _q = self.rq.lock();
+                self.oob.lock().take()
+            };
+            (state, st.take(), path, oob)
         };
+        drop(oob);
         self.sk.state_change();
         self.peer_wait.wake_all();
         if let Some(p) = peer {
             if self.connected_type() {
-                let unread = !self.rq.is_empty();
+                // A read out-of-band skb is not unread data
+                let unread = {
+                    let q = self.rq.lock();
+                    match q.front() {
+                        Some(h) if unix_len(&h) == 0 => q.next(&h).is_some(),
+                        h => h.is_some(),
+                    }
+                };
                 {
                     let _g = p.st.lock();
                     p.sk.or_shutdown(SHUTDOWN_MASK);
@@ -799,6 +851,7 @@ impl UnixSock {
         drop(q);
         self.relay_wake();
         drop(path);
+        gc::schedule(None);
     }
 
     /// Take the whole receive queue off; the caller frees it unlocked
@@ -870,6 +923,66 @@ impl UnixSock {
             b.extend_from_slice(&ns.from_kgid_munged(k).to_ne_bytes());
         }
         Ok(OptOut::Whole(b))
+    }
+
+    /// `skb` is the out-of-band skb (Linux skb == u->oob_skb)
+    fn is_oob(&self, skb: &SkBuff) -> bool {
+        self.oob
+            .lock()
+            .as_deref()
+            .is_some_and(|o| core::ptr::eq(o, skb))
+    }
+
+    /// An out-of-band byte is pending (Linux READ_ONCE(u->oob_skb))
+    fn has_oob(&self) -> bool {
+        self.oob.lock().is_some()
+    }
+
+    /// SIOCATMARK (Linux unix_ioctl, streams only): the next byte is
+    /// the out-of-band byte, or the head is a read one followed by it
+    /// or by nothing out of band
+    fn atmark(&self) -> Result<bool, KernelError> {
+        if self.sk.stype != SOCK_STREAM {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let _io = self.iolock.lock();
+        let q = self.rq.lock();
+        let Some(skb) = q.front() else {
+            return Ok(false);
+        };
+        let oob = self.oob.lock().clone();
+        let next = q.next(&skb);
+        drop(q);
+        let is = |x: Option<&Arc<SkBuff>>| match (x, &oob) {
+            (Some(x), Some(o)) => Arc::ptr_eq(x, o),
+            _ => false,
+        };
+        Ok(is(Some(&skb)) || (unix_len(&skb) == 0 && (oob.is_none() || is(next.as_ref()))))
+    }
+
+    /// SO_PEERPIDFD (Linux sk_getsockopt): a pidfd (O_CLOEXEC) for the
+    /// peer's process, ENODATA without peer credentials
+    fn peerpidfd_opt(&self) -> Result<OptOut, KernelError> {
+        let pid = self.peercred.lock().as_ref().and_then(|c| c.pid.clone());
+        let pid = pid.ok_or(KernelError::NoData)?;
+        let (fd, f) = crate::task::pidfd::pidfd_prepare(pid)?;
+        Ok(OptOut::Fd(fd, f))
+    }
+
+    /// SIOCUNIXFILE (Linux unix_open_file): an O_PATH descriptor
+    /// (O_CLOEXEC) of the socket inode a filesystem name bound;
+    /// CAP_NET_ADMIN, ENOENT when unbound or abstract
+    fn open_file(&self) -> Result<i32, KernelError> {
+        if !crate::task::capable(crate::task::CAP_NET_ADMIN) {
+            return Err(KernelError::NotPermitted);
+        }
+        if self.addr().is_none() {
+            return Err(KernelError::NotFound);
+        }
+        let p = self.path.lock().clone();
+        let p = p.ok_or(KernelError::NotFound)?;
+        let f = crate::fs::open::file_open_root(&p, crate::fs::flags::O_PATH)?;
+        crate::net::syscall::fd_install(f, true)
     }
 
     /// Linux unix_inq_len: EINVAL on a listener; a stream's unread
@@ -1008,6 +1121,8 @@ impl ProtoOps for UnixSock {
         let v = match cmd {
             SIOCOUTQ => self.wmem.load(Ordering::Acquire),
             SIOCINQ => self.inq_len()?,
+            SIOCATMARK => usize::from(self.atmark()?),
+            SIOCUNIXFILE => return self.open_file().map(i64::from),
             _ => return Err(KernelError::NotTty),
         };
         crate::uaccess::put_user::<i32>(arg, v as i32).map_err(|_| KernelError::BadAddress)?;
@@ -1064,6 +1179,7 @@ impl ProtoOps for UnixSock {
         match opt {
             SO_PEERCRED => Some(Ok(self.peercred_opt())),
             SO_PEERGROUPS => Some(self.peergroups_opt()),
+            SO_PEERPIDFD => Some(self.peerpidfd_opt()),
             _ => None,
         }
     }
@@ -1104,6 +1220,17 @@ impl ProtoOps for UnixSock {
         a.set_state(ESTABLISHED);
         b.set_state(ESTABLISHED);
         Ok(())
+    }
+
+    /// Linux sk_set_peek_off (unix_stream_ops, unix_dgram_ops,
+    /// unix_seqpacket_ops)
+    fn set_peek_off(&self, val: i32) -> Option<Result<(), KernelError>> {
+        self.sk.set_peek_off(val);
+        Some(Ok(()))
+    }
+
+    fn has_set_peek_off(&self) -> bool {
+        true
     }
 
     /// Only stream sockets raise SIGPIPE (Linux unix_stream_sendmsg;
@@ -1185,7 +1312,7 @@ fn hex5(out: &mut [u8], n: u32) {
 /// charge its files as in flight
 fn queue(to: &UnixSock, skb: Arc<SkBuff>) {
     if let Some(f) = ucb(&skb).fp.lock().as_mut() {
-        f.queued();
+        f.queued(&to.arc());
     }
     let len = unix_len(&skb);
     let mut q = to.rq.lock();
@@ -1193,12 +1320,39 @@ fn queue(to: &UnixSock, skb: Arc<SkBuff>) {
     to.inq_len.fetch_add(len, Ordering::AcqRel);
 }
 
+/// Queue the out-of-band skb on `to` (Linux queue_oob, the caller
+/// holding `to.st`): it replaces the pending one, which stays queued
+/// as an ordinary byte; the old reference is returned for the caller
+/// to drop after the lock
+fn queue_oob(to: &UnixSock, skb: Arc<SkBuff>) -> Option<Arc<SkBuff>> {
+    if let Some(f) = ucb(&skb).fp.lock().as_mut() {
+        f.queued(&to.arc());
+    }
+    let mut q = to.rq.lock();
+    let old = to.oob.lock().replace(skb.clone());
+    to.inq_len.fetch_add(1, Ordering::AcqRel);
+    q.push_back(skb);
+    old
+}
+
 /// Shutdown bits test helper
 fn rcv_shut(s: &UnixSock) -> bool {
     s.sk.shutdown() & RCV_SHUTDOWN != 0
 }
 
+/// The receive queue's last skb, as an identity only: never
+/// dereferenced, and holding no reference (Linux queue->prev)
+fn tail(q: &OwnedList<SkbOwned>) -> Option<*const SkBuff> {
+    q.last().map(core::ptr::from_ref)
+}
+
+/// The receive queue's last skb is `last` (Linux skb_peek_tail ==
+/// last); `last` is compared, never dereferenced
+fn tail_is(s: &UnixSock, last: Option<*const SkBuff>) -> bool {
+    tail(&s.rq.lock()) == last
+}
+
 /// Common receive tail: credentials and files into control messages
 fn scm_recv(s: &UnixSock, m: &mut RecvMsg<'_>, creds: Option<Creds>, fds: Option<FpList>) {
-    scm::put(m, s.passcred(), creds, fds);
+    scm::put(m, s.passcred(), s.sk.flag(sf::PASSPIDFD), creds, fds);
 }

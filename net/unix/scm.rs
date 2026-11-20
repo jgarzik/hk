@@ -8,12 +8,10 @@
 //!
 //! Files in flight are charged to the sending user (its ucounts'
 //! `UnixInflight`, Linux user->unix_inflight) from the moment they are
-//! queued until they are
-//! received or their message is dropped. Attaching more while the
-//! user's count exceeds RLIMIT_NOFILE is ETOOMANYREFS (Linux
-//! too_many_unix_fds). There is no garbage collector for unreachable
-//! cycles of in-flight sockets (BUGS.md); this cap bounds what such
-//! cycles can pin per user.
+//! queued until they are received or their message is dropped, and the
+//! unix sockets among them are edges of the collector's graph
+//! (`gc.rs`) for as long. Attaching more while the user's count
+//! exceeds RLIMIT_NOFILE is ETOOMANYREFS (Linux too_many_unix_fds).
 //!
 //! Receive side: `put` emits SCM_CREDENTIALS and installs SCM_RIGHTS
 //! files in the receiver's table (MSG_CMSG_CLOEXEC honored); files that
@@ -26,13 +24,19 @@
 //!
 //! ## Locking
 //!
-//! The in-flight count is an atomic of the sender's ucounts: charging
-//! (under the receiver's `st`) takes no lock and allocates nothing.
+//! The in-flight count is an atomic of the sender's ucounts, changed
+//! under `gc::UNIX_GC` with the edges (under the receiver's `st` when
+//! queued); nothing is allocated there: a message's vertices and edges
+//! are made when it is attached (`prepare`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::FileRef;
+use crate::util::kalloc::try_arc;
+use crate::util::list::OwnedList;
+
+use super::gc::{self, Edge, VEntry, Vertex};
 use crate::net::msg::{MSG_CMSG_CLOEXEC, RecvMsg, cmsgs};
 use crate::net::socket::SOL_SOCKET;
 use crate::task::ucount::{Ucount, UcountsRef};
@@ -40,6 +44,8 @@ use crate::util::error::KernelError;
 
 pub const SCM_RIGHTS: i32 = 1;
 pub const SCM_CREDENTIALS: i32 = 2;
+/// A pidfd of the sender (Linux SCM_PIDFD)
+pub const SCM_PIDFD: i32 = 4;
 /// Most files in one message (Linux SCM_MAX_FD)
 pub const SCM_MAX_FD: usize = 253;
 /// struct cmsghdr
@@ -104,27 +110,29 @@ impl Creds {
 
 /// Files of one message (Linux struct scm_fp_list)
 pub struct FpList {
-    files: Vec<FileRef>,
+    /// The files in order; a unix socket's is held by its edge while
+    /// the message is prepared (None here)
+    pub(super) files: Vec<Option<FileRef>>,
     /// Sending user, charged while queued (Linux fpl->user)
-    user: UcountsRef,
-    inflight: bool,
+    pub(super) user: UcountsRef,
+    pub(super) inflight: bool,
+    /// Unix sockets among the files (Linux count_unix)
+    pub(super) count_unix: usize,
+    /// Freed by the collector (Linux fpl->dead)
+    pub(super) dead: bool,
+    /// One per unix socket, in order (Linux fpl->edges)
+    pub(super) edges: Vec<Arc<Edge>>,
+    /// Spare vertices, one per edge (Linux fpl->vertices)
+    pub(super) vertices: OwnedList<VEntry>,
 }
 
-/// Ceiling on a user's in-flight files whatever its RLIMIT_NOFILE
-/// (Linux UNIX_INFLIGHT_SANE_USER). Linux only uses it to trigger the
-/// garbage collector; without one, files pinned by unreachable cycles
-/// stay charged, so a fixed ceiling (not the user-raisable soft limit)
-/// is what bounds them.
-const INFLIGHT_MAX: u64 = (SCM_MAX_FD * 8) as u64;
-
 /// Linux too_many_unix_fds: the sender's in-flight count is over its
-/// RLIMIT_NOFILE (and over `INFLIGHT_MAX` here) and it lacks
-/// CAP_SYS_RESOURCE and CAP_SYS_ADMIN
+/// RLIMIT_NOFILE and it lacks CAP_SYS_RESOURCE and CAP_SYS_ADMIN
 pub fn too_many_fds() -> bool {
     let n = crate::task::current_cred()
         .ucounts
         .get(Ucount::UnixInflight);
-    let lim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE).min(INFLIGHT_MAX);
+    let lim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
     n > lim
         && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
         && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
@@ -139,45 +147,106 @@ impl FpList {
         self.files.is_empty()
     }
 
-    /// Charge to the sender: the message was queued (Linux
-    /// unix_add_edges)
-    pub fn queued(&mut self) {
-        if !self.inflight {
-            self.user.inc(Ucount::UnixInflight, self.files.len() as u64);
-            self.inflight = true;
-        }
-    }
-
-    /// Received or dropped (Linux unix_del_edges)
-    fn uncharge(&mut self) {
-        if self.inflight {
-            self.user.dec(Ucount::UnixInflight, self.files.len() as u64);
-            self.inflight = false;
-        }
-    }
-
-    /// Copy for MSG_PEEK (Linux scm_fp_dup: not in flight itself)
-    pub fn dup(&self) -> Self {
+    fn new(user: UcountsRef) -> Self {
         Self {
-            files: self.files.clone(),
-            user: self.user.clone(),
+            files: Vec::new(),
+            user,
             inflight: false,
+            count_unix: 0,
+            dead: false,
+            edges: Vec::new(),
+            vertices: OwnedList::new(),
         }
     }
 
-    /// Take the files out (received): no longer in flight
+    /// Attached to a message (Linux unix_prepare_fpl): a spare vertex
+    /// and an edge (holding the file) per unix socket, then a
+    /// collection if the sender has too many files in flight
+    pub fn prepare(&mut self) -> Result<(), KernelError> {
+        if self.count_unix == 0 {
+            return Ok(());
+        }
+        for _ in 0..self.count_unix {
+            self.vertices.push_back(try_arc(Vertex::default())?);
+        }
+        self.edges
+            .try_reserve_exact(self.count_unix)
+            .map_err(|_| KernelError::OutOfMemory)?;
+        for slot in self.files.iter_mut() {
+            let Some(u) = slot.as_ref().and_then(gc::unix_get_socket) else {
+                continue;
+            };
+            let f = slot.take().expect("checked");
+            self.edges.push(try_arc(Edge::new(u, f))?);
+        }
+        gc::schedule(Some(&self.user));
+        Ok(())
+    }
+
+    /// The message was queued on `receiver` (Linux unix_add_edges):
+    /// charged to the sender, its sockets' edges in the graph
+    pub fn queued(&mut self, receiver: &Arc<super::UnixSock>) {
+        if !self.inflight {
+            gc::add_edges(self, receiver);
+        }
+    }
+
+    /// Received or dropped (Linux unix_del_edges, from
+    /// unix_destroy_fpl or scm_stat_del)
+    pub fn detach(&mut self) {
+        if self.inflight {
+            gc::del_edges(self);
+        }
+    }
+
+    /// The files in order, those held by edges included (each a new
+    /// reference)
+    fn all_files(&self) -> Vec<FileRef> {
+        let mut edges = self.edges.iter();
+        self.files
+            .iter()
+            .filter_map(|f| match f {
+                Some(f) => Some(f.clone()),
+                None => edges.next().map(|e| e.file.clone()),
+            })
+            .collect()
+    }
+
+    /// Copy for MSG_PEEK (Linux scm_fp_dup: not in flight itself),
+    /// telling a running collection (unix_peek_fpl)
+    pub fn dup(&self) -> Self {
+        let mut d = Self::new(self.user.clone());
+        d.files = self.all_files().into_iter().map(Some).collect();
+        d.count_unix = self.count_unix;
+        gc::peek_fpl(&d);
+        d
+    }
+
+    /// Take the files out (received): no longer in flight; the edges'
+    /// references come back to their places
     fn take(mut self) -> Vec<FileRef> {
-        self.uncharge();
+        self.detach();
+        let mut edges = core::mem::take(&mut self.edges).into_iter();
         core::mem::take(&mut self.files)
+            .into_iter()
+            .filter_map(|f| match f {
+                Some(f) => Some(f),
+                None => edges.next().map(|e| match Arc::try_unwrap(e) {
+                    Ok(e) => e.file,
+                    Err(e) => e.file.clone(),
+                }),
+            })
+            .collect()
     }
 }
 
-/// Dropped unreceived: uncharged; its files' references go with it
-/// (`fput`: a socket among them is released later, not under the lock
-/// of the queue that held the message)
+/// Dropped unreceived (Linux unix_destroy_fpl): out of the graph and
+/// uncharged; its files' references go with it (`fput`: a socket among
+/// them is released later, not under the lock of the queue that held
+/// the message)
 impl Drop for FpList {
     fn drop(&mut self) {
-        self.uncharge();
+        self.detach();
     }
 }
 
@@ -218,11 +287,9 @@ impl Scm {
         if n == 0 {
             return Ok(());
         }
-        let fpl = self.fds.get_or_insert_with(|| FpList {
-            files: Vec::new(),
-            user: crate::task::current_cred().ucounts,
-            inflight: false,
-        });
+        let fpl = self
+            .fds
+            .get_or_insert_with(|| FpList::new(crate::task::current_cred().ucounts));
         if n > SCM_MAX_FD || fpl.files.len() + n > SCM_MAX_FD {
             return Err(KernelError::InvalidArgument);
         }
@@ -235,7 +302,10 @@ impl Scm {
             if crate::io::io_uring::is_uring(&f) {
                 return Err(KernelError::InvalidArgument);
             }
-            fpl.files.push(f);
+            if gc::unix_get_socket(&f).is_some() {
+                fpl.count_unix += 1;
+            }
+            fpl.files.push(Some(f));
         }
         Ok(())
     }
@@ -282,11 +352,18 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
 }
 
 /// Deliver received ancillary data (Linux scm_recv_unix): credentials
-/// when the receiver set SO_PASSCRED, then the files. Without control
-/// space everything is truncated (MSG_CTRUNC) and the files closed.
-pub fn put(m: &mut RecvMsg<'_>, passcred: bool, creds: Option<Creds>, fds: Option<FpList>) {
+/// when the receiver set SO_PASSCRED, then the files, then with
+/// SO_PASSPIDFD a pidfd of the sender. Without control space
+/// everything is truncated (MSG_CTRUNC) and the files closed.
+pub fn put(
+    m: &mut RecvMsg<'_>,
+    passcred: bool,
+    passpidfd: bool,
+    creds: Option<Creds>,
+    fds: Option<FpList>,
+) {
     if m.cmsg.capacity() == 0 {
-        if passcred || fds.is_some() {
+        if passcred || passpidfd || fds.is_some() {
             m.cmsg.trunc = true;
         }
         drop(fds);
@@ -299,6 +376,28 @@ pub fn put(m: &mut RecvMsg<'_>, passcred: bool, creds: Option<Creds>, fds: Optio
     if let Some(f) = fds {
         put_fds(m, f);
     }
+    if passpidfd {
+        put_pidfd(m, creds.as_ref());
+    }
+}
+
+/// Linux scm_pidfd_recv: SCM_PIDFD, a pidfd (O_CLOEXEC) for the
+/// sender's process, or the error making it gave; MSG_CTRUNC without
+/// room for it; nothing for a message without a sender pid
+fn put_pidfd(m: &mut RecvMsg<'_>, creds: Option<&Creds>) {
+    if m.cmsg.room() < CMSG_HDR + 4 {
+        m.cmsg.trunc = true;
+        return;
+    }
+    let Some(pid) = creds.and_then(|c| c.pid.clone()) else {
+        return;
+    };
+    let fd = m
+        .cmsg
+        .reserve_fds(1)
+        .and_then(|()| crate::task::pidfd::pidfd_prepare(pid))
+        .map_or_else(|e| e.to_errno_neg(), |(fd, f)| m.cmsg.defer_install(fd, f));
+    m.cmsg.put(SOL_SOCKET, SCM_PIDFD, &fd.to_ne_bytes());
 }
 
 /// Install as many files as fit (Linux scm_detach_fds); the rest are
@@ -314,10 +413,19 @@ fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     let files = fpl.take();
     let count = files.len();
     let mut fds = Vec::new();
-    for f in files.iter().take(max) {
-        match crate::net::syscall::fd_install(f.clone(), cloexec) {
-            Ok(fd) => fds.extend_from_slice(&fd.to_ne_bytes()),
-            Err(_) => break,
+    let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
+    let want = count.min(max);
+    if fds.try_reserve(want * 4).is_ok() && m.cmsg.reserve_fds(want).is_ok() {
+        // Linux receive_fd: reserved, its number copied out, then
+        // installed (here once the control data is copied out)
+        for f in files.iter().take(want) {
+            match crate::fs::io::get_unused_fd_flags(fl) {
+                Ok(fd) => {
+                    let n = m.cmsg.defer_install(fd, f.clone());
+                    fds.extend_from_slice(&n.to_ne_bytes());
+                }
+                Err(_) => break,
+            }
         }
     }
     let n = fds.len() / 4;

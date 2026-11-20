@@ -73,6 +73,12 @@ pub struct NetNamespace {
     /// IPv4 routing tables
     pub fib: Fib,
 
+    /// Generation of path MTU exceptions (Linux net->fnhe_genid): one
+    /// learned under an older generation counts as reset. Bumped by a
+    /// write to net.ipv4.route.flush (`route::fnhe_genid_bump`), read by
+    /// route lookups; a lock-free counter, like Linux's atomic_t
+    pub fnhe_genid: AtomicU32,
+
     /// netlink sockets bound in this namespace
     pub nl: NlNet,
 
@@ -84,6 +90,10 @@ pub struct NetNamespace {
 
     /// /proc/sys/net values (`net::sysctl`)
     pub sysctl: crate::net::sysctl::NetSysctl,
+
+    /// Its sysctl registration, held by its /proc/sys/net inodes
+    /// (Linux net->sysctls' headers)
+    pub sysctls: Arc<crate::net::sysctl::SysctlSet>,
 
     /// IPv4 reassembly queues
     pub frags: crate::net::inet::frag::FragTable,
@@ -106,6 +116,9 @@ pub struct NetNamespace {
     /// SNMP / Linux MIB counters (Linux net->mib); shared with the TCP
     /// control blocks, which count without the namespace at hand
     pub mib: Arc<crate::net::mib::NetMib>,
+
+    /// TCP state its control blocks share (`tcp::netns`)
+    pub tcp_net: Arc<crate::net::tcp::netns::TcpNet>,
 
     /// Loopback device for this namespace
     loopback: RwLock<Option<Arc<NetDevice>>>,
@@ -175,7 +188,24 @@ impl NetNamespace {
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
         let nodes = super::tree::Nodes::new()?;
         let common = super::NsCommon::new(super::inum::Inum::alloc()?);
-        let ns = try_arc(Self::fresh(common, user_ns.clone())?)?;
+        let ns = Self::fresh(common, user_ns.clone())?;
+        // Linux tcp_sk_init: init_net's default congestion control
+        let ca = crate::net::INIT_NET_NS
+            .sysctl
+            .tcp_ca
+            .load(Ordering::Relaxed);
+        ns.sysctl.tcp_ca.store(ca, Ordering::Relaxed);
+        // ... and its tcp_rmem / tcp_wmem
+        let init = &crate::net::INIT_NET_NS.sysctl;
+        for (d, s) in [
+            (&ns.sysctl.tcp_rmem, &init.tcp_rmem),
+            (&ns.sysctl.tcp_wmem, &init.tcp_wmem),
+        ] {
+            for (d, s) in d.iter().zip(s) {
+                d.store(s.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+        let ns = try_arc(ns)?;
         Ok(Self::attach(ns, lo, nodes))
     }
 
@@ -202,10 +232,12 @@ impl NetNamespace {
             devices: RcuList::new(),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new()?,
+            fnhe_genid: AtomicU32::new(0),
             nl: Default::default(),
             tcp: Default::default(),
             port_range: PortRange::default(),
             sysctl: Default::default(),
+            sysctls: try_arc(Default::default())?,
             frags: Default::default(),
             icmp: Default::default(),
             ping: Default::default(),
@@ -218,6 +250,7 @@ impl NetNamespace {
                     | u64::from(crate::random::get_random_u32()),
             ],
             mib: crate::net::mib::NetMib::new()?,
+            tcp_net: try_arc(Default::default())?,
             loopback: RwLock::new(None),
             active: AtomicUsize::new(0),
             cleanup_next: AtomicPtr::new(null_mut()),
@@ -356,7 +389,9 @@ impl NetDeviceOps for LoopbackOps {
     /// Linux loopback_xmit: the frame comes straight back as received,
     /// through this CPU's backlog (never processed synchronously, so the
     /// transmit path never re-enters the receive path)
-    fn xmit(&self, skb: alloc::boxed::Box<crate::net::skb::SkBuff>) -> Result<(), KernelError> {
+    fn xmit(&self, mut skb: alloc::boxed::Box<crate::net::skb::SkBuff>) -> Result<(), KernelError> {
+        // Linux loopback_xmit: skb_orphan (a TX ring frame completes)
+        skb.orphan();
         let len = skb.len();
         let dev = skb.dev.clone().ok_or(KernelError::NoDevice)?;
         if crate::net::dev::netif_rx(skb) {
@@ -474,6 +509,8 @@ fn cleanup_net() {
     });
     drop(l);
     for net in &nets {
+        // Linux the sysctl pernet exits: unregister_net_sysctl_table
+        net.sysctls.start_unregistering();
         crate::net::rtnl::netns_exit(net);
         // Linux ipv4_frags_exit_net
         crate::net::inet::frag::net_exit(net);
@@ -502,6 +539,28 @@ pub fn for_each_net(mut f: impl FnMut(&Arc<NetNamespace>)) {
     for net in l.iter().filter_map(Weak::upgrade) {
         f(&net);
     }
+}
+
+/// The network namespace of the task the caller numbers `pid` (Linux
+/// get_net_ns_by_pid): ESRCH if there is none, or it is exiting
+pub fn get_net_ns_by_pid(pid: u32) -> Result<NetRef, KernelError> {
+    let t =
+        crate::task::tasklist::find_task_by_vpid(u64::from(pid)).ok_or(KernelError::NoProcess)?;
+    let np = super::get_task_ns(&t).ok_or(KernelError::NoProcess)?;
+    Ok(np.net_ns.clone())
+}
+
+/// The network namespace namespace file `fd` holds (Linux
+/// get_net_ns_by_fd): EBADF for a bad fd, EINVAL for any other file
+pub fn get_net_ns_by_fd(fd: u32) -> Result<NetRef, KernelError> {
+    use crate::fs::pseudo::nsfs;
+    let file = crate::fs::io::fget(fd.cast_signed())?;
+    if nsfs::proc_ns_file(&file)
+        && let Some(super::NsRef::Net(n)) = file.get_inode().and_then(|i| nsfs::get_proc_ns(&i))
+    {
+        return Ok(n);
+    }
+    Err(KernelError::InvalidArgument)
 }
 
 /// Get the init network namespace

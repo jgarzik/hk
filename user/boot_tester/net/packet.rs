@@ -2,8 +2,10 @@
 //! naming, SOCK_RAW/SOCK_DGRAM receive over lo with packet types
 //! (OUTGOING then HOST), frame sends both ways, MSG_TRUNC, the bounded
 //! receive queue with PACKET_STATISTICS, classic BPF filters with
-//! PACKET_AUXDATA, memberships, /proc/net/packet, and a DHCP exchange
-//! on eth0 without an IP address (what busybox udhcpc does).
+//! PACKET_AUXDATA, memberships, /proc/net/packet, ENETDOWN when the
+//! bound device goes down (PACKET_NETDEV_DOWN, in a new network
+//! namespace), and a DHCP exchange on eth0 without an IP address (what
+//! busybox udhcpc does).
 
 use hk_syscall::{
     AF_INET, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, sys_bind, sys_exit, sys_fork, sys_getpeername,
@@ -11,36 +13,37 @@ use hk_syscall::{
     sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
 };
 
-use crate::harness::T;
-use crate::helpers::{println, skip};
+use crate::harness::{T, fail_num, pass};
+use crate::helpers::{host_mode, loopback_up, println, skip};
 use crate::net::nl::{Nl, addr as nl_addr, msleep, net_setup_eth0};
 use crate::net::sk::*;
 
-const AF_PACKET: i32 = 17;
-const SOL_PACKET: i32 = 263;
+pub const AF_PACKET: i32 = 17;
+pub const SOL_PACKET: i32 = 263;
 const PACKET_ADD_MEMBERSHIP: i32 = 1;
 const PACKET_DROP_MEMBERSHIP: i32 = 2;
-const PACKET_STATISTICS: i32 = 6;
-const PACKET_AUXDATA: i32 = 8;
+pub const PACKET_STATISTICS: i32 = 6;
+pub const PACKET_AUXDATA: i32 = 8;
 const PACKET_MR_PROMISC: u16 = 1;
 const SO_ATTACH_FILTER: i32 = 26;
 const SO_DETACH_FILTER: i32 = 27;
 const SO_LOCK_FILTER: i32 = 44;
 
-const ETH_P_ALL: u16 = 0x0003;
-const ETH_P_IP: u16 = 0x0800;
+pub const ETH_P_ALL: u16 = 0x0003;
+pub const ETH_P_IP: u16 = 0x0800;
 /// IEEE local experimental EtherType: only our test frames use it
-const ETH_P_TEST: u16 = 0x88b5;
+pub const ETH_P_TEST: u16 = 0x88b5;
 
-const PACKET_HOST: u8 = 0;
+pub const PACKET_HOST: u8 = 0;
 const PACKET_BROADCAST: u8 = 1;
-const PACKET_OUTGOING: u8 = 4;
+pub const PACKET_OUTGOING: u8 = 4;
 const ARPHRD_LOOPBACK: u16 = 772;
 const ARPHRD_ETHER: u16 = 1;
 
-const ENXIO: i64 = -6;
+pub const ENXIO: i64 = -6;
 const ENOENT: i64 = -2;
-const ENODEV: i64 = -19;
+pub const ENODEV: i64 = -19;
+pub const ENETDOWN: i64 = -100;
 
 pub fn run_tests() {
     println(b"=== AF_PACKET Tests ===");
@@ -51,12 +54,14 @@ pub fn run_tests() {
     test_lo_all(lo);
     test_lo_dgram(lo);
     test_send(lo);
+    test_tx_protocol(lo);
     test_trunc(lo);
     test_peek(lo);
     test_rcvbuf(lo);
     test_filter(lo);
     test_opts(lo);
     test_proc();
+    test_netdev_down();
     match net_setup_eth0() {
         Ok(eth) => {
             test_eth_errors(eth as i32);
@@ -69,17 +74,17 @@ pub fn run_tests() {
 
 /// struct sockaddr_ll
 #[derive(Clone, Copy, Default)]
-struct Sll {
-    protocol: u16,
-    ifindex: i32,
-    hatype: u16,
-    pkttype: u8,
-    halen: u8,
-    addr: [u8; 8],
+pub struct Sll {
+    pub protocol: u16,
+    pub ifindex: i32,
+    pub hatype: u16,
+    pub pkttype: u8,
+    pub halen: u8,
+    pub addr: [u8; 8],
 }
 
 impl Sll {
-    fn new(protocol: u16, ifindex: i32) -> Self {
+    pub fn new(protocol: u16, ifindex: i32) -> Self {
         Self {
             protocol,
             ifindex,
@@ -87,7 +92,7 @@ impl Sll {
         }
     }
 
-    fn bytes(&self) -> [u8; 20] {
+    pub fn bytes(&self) -> [u8; 20] {
         let mut b = [0u8; 20];
         b[0..2].copy_from_slice(&(AF_PACKET as u16).to_ne_bytes());
         b[2..4].copy_from_slice(&self.protocol.to_be_bytes());
@@ -99,7 +104,7 @@ impl Sll {
         b
     }
 
-    fn parse(b: &[u8; 20]) -> Self {
+    pub fn parse(b: &[u8; 20]) -> Self {
         let mut addr = [0u8; 8];
         addr.copy_from_slice(&b[12..20]);
         Self {
@@ -113,23 +118,23 @@ impl Sll {
     }
 }
 
-fn psock(ty: i32, proto: u16) -> i32 {
+pub fn psock(ty: i32, proto: u16) -> i32 {
     sys_socket(AF_PACKET, ty, proto.to_be() as i32) as i32
 }
 
-fn pbind(fd: i32, proto: u16, ifindex: i32) -> i64 {
+pub fn pbind(fd: i32, proto: u16, ifindex: i32) -> i64 {
     let a = Sll::new(proto, ifindex).bytes();
     sys_bind(fd, a.as_ptr(), 20)
 }
 
 /// A socket bound to `proto` on `ifindex`
-fn bound(ty: i32, proto: u16, ifindex: i32) -> i32 {
+pub fn bound(ty: i32, proto: u16, ifindex: i32) -> i32 {
     let fd = psock(ty, proto);
     pbind(fd, proto, ifindex);
     fd
 }
 
-fn sendto_ll(fd: i32, data: &[u8], a: &Sll, alen: u32) -> i64 {
+pub fn sendto_ll(fd: i32, data: &[u8], a: &Sll, alen: u32) -> i64 {
     let b = a.bytes();
     sys_sendto(fd, data.as_ptr(), data.len(), 0, b.as_ptr(), alen)
 }
@@ -154,7 +159,7 @@ pub fn ifindex(name: &[u8]) -> i32 {
 }
 
 /// Receive one frame within `ms`: (length, source address)
-fn recv_ll(fd: i32, buf: &mut [u8], ms: i32, flags: i32) -> (i64, Sll) {
+pub fn recv_ll(fd: i32, buf: &mut [u8], ms: i32, flags: i32) -> (i64, Sll) {
     let (r, _) = poll1(fd, 1, ms);
     if r != 1 {
         return (EAGAIN, Sll::default());
@@ -173,7 +178,7 @@ fn recv_ll(fd: i32, buf: &mut [u8], ms: i32, flags: i32) -> (i64, Sll) {
 }
 
 /// The next frame within `ms` for which `pred(frame, sll)` holds
-fn find(
+pub fn find(
     fd: i32,
     buf: &mut [u8],
     ms: u64,
@@ -191,11 +196,103 @@ fn find(
 
 /// A test frame: zero (lo's) destination and source, ETH_P_TEST, `tag`
 /// then zero padding to `len`
-fn test_frame(out: &mut [u8], tag: u8, len: usize) -> &[u8] {
+pub fn test_frame(out: &mut [u8], tag: u8, len: usize) -> &[u8] {
     out[..len].fill(0);
     out[12..14].copy_from_slice(&ETH_P_TEST.to_be_bytes());
     out[14] = tag;
     &out[..len]
+}
+
+/// lo up or down (SIOCSIFFLAGS)
+fn set_lo(up: bool) -> i64 {
+    const SIOCGIFFLAGS: u64 = 0x8913;
+    const SIOCSIFFLAGS: u64 = 0x8914;
+    let mut ifr = [0u8; 40];
+    ifr[..2].copy_from_slice(b"lo");
+    let fd = udp();
+    let mut r = sys_ioctl(fd, SIOCGIFFLAGS, ifr.as_mut_ptr() as u64);
+    if r == 0 {
+        let f = u16::from_ne_bytes([ifr[16], ifr[17]]);
+        let f = if up { f | 1 } else { f & !1 };
+        ifr[16..18].copy_from_slice(&f.to_ne_bytes());
+        r = sys_ioctl(fd, SIOCSIFFLAGS, ifr.as_mut_ptr() as u64);
+    }
+    close(fd);
+    r
+}
+
+/// A socket bound to a device that goes down gets ENETDOWN (Linux
+/// packet_notifier NETDEV_DOWN: sk_err, sk_error_report, the hook
+/// unregistered), in a new namespace whose lo can go down
+fn test_netdev_down() {
+    let pid = sys_fork();
+    if pid == 0 {
+        if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        loopback_up();
+        netdev_down(ifindex(b"lo"));
+        sys_exit(0);
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    let code = (st >> 8) & 0xff;
+    if st & 0x7f == 0 && code == 0 {
+        pass(b"PACKET_NETDEV_DOWN_NETNS");
+    } else if code == 2 && host_mode() {
+        skip(
+            b"PACKET_NETDEV_DOWN_NETNS",
+            b"unshare(CLONE_NEWNET) not permitted",
+        );
+    } else {
+        fail_num(b"PACKET_NETDEV_DOWN_NETNS:FAIL status=", st as i64);
+    }
+}
+
+/// POLLERR and ENETDOWN once (then EAGAIN) after lo goes down, none
+/// for a socket with no protocol; frames again once lo is up (the hook
+/// back: Linux NETDEV_UP); a blocked receive woken with ENETDOWN
+fn netdev_down(lo: i32) {
+    let mut t = T::new(b"PACKET_NETDEV_DOWN");
+    let fd = bound(SOCK_RAW, ETH_P_TEST, lo);
+    let idle = bound(SOCK_RAW, 0, lo);
+    t.eq(b"down", set_lo(false), 0);
+    let (_, rev) = poll1(fd, 1, 0);
+    t.ok(b"POLLERR", rev & hk_syscall::POLLERR != 0, rev as i64);
+    let mut buf = [0u8; 128];
+    t.eq(b"recv", recv(fd, &mut buf, MSG_DONTWAIT), ENETDOWN);
+    t.eq(b"recv again", recv(fd, &mut buf, MSG_DONTWAIT), EAGAIN);
+    t.eq(
+        b"no protocol",
+        getint(idle, SOL_SOCKET, SO_ERROR).1 as i64,
+        0,
+    );
+    t.eq(b"up", set_lo(true), 0);
+    let tx = psock(SOCK_RAW, 0);
+    let mut f = [0u8; 64];
+    let frame = test_frame(&mut f, 0x5a, 60);
+    t.eq(
+        b"send",
+        sendto_ll(tx, frame, &Sll::new(ETH_P_TEST, lo), 20),
+        60,
+    );
+    let ours = |f: &[u8], _: &Sll| f.len() == 60 && f[14] == 0x5a;
+    t.ok(b"rehooked", find(fd, &mut buf, 2000, &ours).is_some(), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        msleep(200);
+        sys_exit(if set_lo(false) == 0 { 0 } else { 1 });
+    }
+    let tv: [i64; 2] = [5, 0];
+    sys_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv.as_ptr() as *const u8, 16);
+    t.eq(b"blocked recv", recv(fd, &mut buf, 0), ENETDOWN);
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.eq(b"downer", st as i64, 0);
+    close(tx);
+    close(idle);
+    close(fd);
+    t.done();
 }
 
 /// Creation: EPERM without CAP_NET_RAW, ESOCKTNOSUPPORT for stream
@@ -543,7 +640,7 @@ fn test_rcvbuf(lo: i32) {
 }
 
 /// struct sock_fprog for `insns` (code, jt, jf, k)
-fn fprog(insns: &[(u16, u8, u8, u32)], out: &mut [u8; 128]) -> [u8; 16] {
+pub fn fprog(insns: &[(u16, u8, u8, u32)], out: &mut [u8; 128]) -> [u8; 16] {
     for (i, &(code, jt, jf, k)) in insns.iter().enumerate() {
         let o = i * 8;
         out[o..o + 2].copy_from_slice(&code.to_ne_bytes());
@@ -793,4 +890,57 @@ fn test_dhcp(eth: i32) {
     close(all);
     close(rx);
     t.done();
+}
+
+/// Transmitted frames carry the sender's protocol (Linux skb->protocol
+/// from packet_snd: the bound protocol, else the frame's EtherType for
+/// SOCK_RAW with ETH_P_ALL), seen by an ETH_P_ALL socket on the
+/// outgoing copy; the received copy has the frame's (eth_type_trans)
+fn test_tx_protocol(lo: i32) {
+    let mut t = T::new(b"PACKET_TX_PROTOCOL");
+    let all = bound(SOCK_RAW, ETH_P_ALL, lo);
+    let tx = bound(SOCK_RAW, ETH_P_TEST, lo);
+    let mut f = [0u8; 64];
+    test_frame(&mut f, 0x5c, 60);
+    // An EtherType other than the socket's protocol
+    frame_retype(&mut f, 0x88b6);
+    t.eq(b"send", send(tx, &f[..60], 0), 60);
+    let mut buf = [0u8; 128];
+    let ours = |b: &[u8], _: &Sll| b.len() == 60 && b[14] == 0x5c && b[12..14] == [0x88, 0xb6];
+    let out = find(all, &mut buf, 3000, &ours);
+    t.ok(
+        b"outgoing first",
+        out.is_some_and(|(_, a)| a.pkttype == PACKET_OUTGOING),
+        0,
+    );
+    t.eq(
+        b"outgoing protocol",
+        out.map_or(0, |(_, a)| a.protocol) as i64,
+        ETH_P_TEST as i64,
+    );
+    let inc = find(all, &mut buf, 3000, &ours);
+    t.eq(
+        b"incoming protocol",
+        inc.map_or(0, |(_, a)| a.protocol) as i64,
+        0x88b6,
+    );
+    let any = psock(SOCK_RAW, 0);
+    let tagged = test_frame(&mut f, 0x5d, 60);
+    sendto_ll(any, tagged, &Sll::new(ETH_P_ALL, lo), 20);
+    let mine = |b: &[u8], _: &Sll| b.len() == 60 && b[14] == 0x5d;
+    let out = find(all, &mut buf, 3000, &mine);
+    t.eq(
+        b"ETH_P_ALL: the frame's",
+        out.map_or(0, |(_, a)| a.protocol) as i64,
+        ETH_P_TEST as i64,
+    );
+    close(any);
+    close(tx);
+    close(all);
+    t.done();
+}
+
+/// Set a test frame's EtherType
+fn frame_retype(f: &mut [u8], ty: u16) {
+    f[12..14].copy_from_slice(&ty.to_be_bytes());
 }

@@ -39,7 +39,7 @@ fn fits<T>(count: usize) -> Result<usize, KernelError> {
 /// An allocation is about to be made: ENOMEM if fault injection picked
 /// it (`mm::fault_inject`)
 fn inject() -> Result<(), KernelError> {
-    if crate::mm::fault_inject::should_fail() {
+    if crate::mm::fault_inject::should_failslab() {
         return Err(KernelError::OutOfMemory);
     }
     Ok(())
@@ -71,6 +71,17 @@ pub fn try_vec_with<T>(n: usize, f: impl FnMut() -> T) -> Result<Vec<T>, KernelE
         .map_err(|_| KernelError::OutOfMemory)?;
     x.resize_with(n, f);
     Ok(x)
+}
+
+/// Room in `v` for `extra` more items (exactly), or ENOMEM if that is
+/// over [`MAX_KMALLOC`] or the heap cannot provide it (`v` unchanged)
+pub fn try_reserve<T>(v: &mut Vec<T>, extra: usize) -> Result<(), KernelError> {
+    fits::<T>(v.len().checked_add(extra).ok_or(KernelError::OutOfMemory)?)?;
+    if extra > 0 && core::mem::size_of::<T>() > 0 {
+        inject()?;
+    }
+    v.try_reserve_exact(extra)
+        .map_err(|_| KernelError::OutOfMemory)
 }
 
 /// A copy of `s`, or ENOMEM. For buffers made from a packet on a

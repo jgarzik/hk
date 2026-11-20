@@ -249,8 +249,8 @@ fn out_rsts() -> i64 {
 fn slab_time_wait() {
     const N: i64 = 2000;
     const BASE: u16 = 20000;
-    // Linux sizes tcp_max_tw_buckets from RAM (about 1024 here); past
-    // it a closing socket skips TIME_WAIT. hk has no such limit.
+    // tcp_max_tw_buckets is sized from RAM (about 1024 here); past it a
+    // closing socket skips TIME_WAIT
     let mut buf = [0u8; 32];
     if read_file(MAX_TW, &mut buf) > 0 {
         write_file(MAX_TW, b"65536\n");

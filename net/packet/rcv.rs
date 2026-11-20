@@ -15,7 +15,7 @@ use crate::util::rculist::RcuList;
 use super::{ETH_P_802_2, ETH_P_802_3, ETH_P_ALL, PacketSock, SLL_LEN, Sll, pf};
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use crate::net::dev::Tap;
-use crate::net::ethernet::{ETH_ALEN, ETH_HLEN, PktType};
+use crate::net::ethernet::{ETH_HLEN, PktType};
 use crate::net::filter::Ctx;
 use crate::net::msg::{MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, RecvMsg};
 use crate::net::sock::Sock;
@@ -26,9 +26,40 @@ use crate::util::error::KernelError;
 pub const SOL_PACKET: i32 = 263;
 /// PACKET_AUXDATA (option and control message type)
 pub const PACKET_AUXDATA: i32 = 8;
-/// tpacket_auxdata.tp_status bits
-const TP_STATUS_USER: u32 = 0x1;
-const TP_STATUS_CSUM_VALID: u32 = 0x80;
+use super::ring::{TP_STATUS_CSUMNOTREADY, TP_STATUS_USER};
+
+/// A frame's flow hash (Linux skb_get_hash; with `symmetric` the two
+/// directions of a flow hash alike, __skb_get_hash_symmetric): IPv4
+/// addresses, protocol and, unless a fragment, TCP/UDP/SCTP ports;
+/// other frames by EtherType. Keyed by a boot-time random seed, as
+/// Linux's hashrnd (Linux uses siphash over flow_keys)
+pub(super) fn flow_hash(frame: &[u8], symmetric: bool) -> u32 {
+    static SEED: spin::Once<u32> = spin::Once::new();
+    let seed = *SEED.call_once(crate::random::get_random_u32);
+    let ty = eth_proto(frame);
+    let ip = frame.get(ETH_HLEN..).unwrap_or(&[]);
+    if ty != 0x0800 || ip.len() < 20 || ip[0] >> 4 != 4 {
+        return crate::util::jhash::jhash_1word(u32::from(ty), seed);
+    }
+    let mut src = u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]]);
+    let mut dst = u32::from_be_bytes([ip[16], ip[17], ip[18], ip[19]]);
+    let proto = ip[9];
+    let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0;
+    let ihl = usize::from(ip[0] & 0xf) * 4;
+    let (mut sp, mut dp) = match (proto, ip.get(ihl..ihl + 4)) {
+        (6 | 17 | 132, Some(p)) if !frag => (
+            u16::from_be_bytes([p[0], p[1]]),
+            u16::from_be_bytes([p[2], p[3]]),
+        ),
+        _ => (0, 0),
+    };
+    if symmetric && (dst < src || (dst == src && dp < sp)) {
+        core::mem::swap(&mut src, &mut dst);
+        core::mem::swap(&mut sp, &mut dp);
+    }
+    let ports = (u32::from(sp) << 16) | u32::from(dp);
+    crate::util::jhash::jhash_3words(src, dst, ports ^ u32::from(proto), seed)
+}
 
 /// Packet sockets in all namespaces (fast path: no socket, no work)
 static NSOCKS: AtomicUsize = AtomicUsize::new(0);
@@ -42,7 +73,54 @@ pub struct PktCb {
     sll: Sll,
     /// Offset of the network header in the data
     net_off: u16,
-    loopback: bool,
+    /// tp_status checksum bits (`csum_status`)
+    csum: u32,
+    /// SOCK_PACKET: the device's name (sockaddr_pkt.spkt_device)
+    dev_name: [u8; 14],
+}
+
+impl PktCb {
+    /// A SOCK_PACKET frame (Linux packet_rcv_spkt's sockaddr_pkt: the
+    /// device type, name and frame protocol)
+    pub(super) fn spkt(hatype: u16, proto: u16, dev_name: [u8; 14], len: usize) -> Self {
+        Self {
+            origlen: len,
+            sll: Sll {
+                protocol: proto,
+                hatype,
+                ..Sll::default()
+            },
+            dev_name,
+            ..Self::default()
+        }
+    }
+
+    /// A whole copy queued beside a ring frame too small for it (Linux
+    /// tpacket_rcv's copy_skb: its PACKET_SKB_CB zeroed, so recvmsg
+    /// reports no device, no address and origlen 0)
+    pub(super) fn copy(proto: u16, net_off: usize) -> Self {
+        Self {
+            sll: Sll {
+                protocol: proto,
+                ..Sll::default()
+            },
+            net_off: net_off as u16,
+            ..Self::default()
+        }
+    }
+}
+
+/// tp_status checksum bits of a tapped frame (Linux tpacket_rcv and
+/// packet_recvmsg from skb->ip_summed): CHECKSUM_PARTIAL is
+/// TP_STATUS_CSUMNOTREADY, in both directions. TP_STATUS_CSUM_VALID
+/// (CHECKSUM_UNNECESSARY, a device's receive checksum offload) never:
+/// hk's drivers verify no checksums, and lo keeps what was sent.
+pub(super) fn csum_status(t: &Tap<'_>) -> u32 {
+    if t.csum_partial {
+        TP_STATUS_CSUMNOTREADY
+    } else {
+        0
+    }
 }
 
 /// A socket's receive queue, bounded by SO_RCVBUF: the copied frames
@@ -71,12 +149,12 @@ impl PktQueue {
 
     /// Room for another frame (Linux packet_rcv: admit while rmem <
     /// rcvbuf, checked before the copy is made)
-    fn has_room(&self, sk: &Sock) -> bool {
+    pub(super) fn has_room(&self, sk: &Sock) -> bool {
         self.rmem.load(Ordering::Acquire) < sk.rcvbuf() as usize
     }
 
     /// Queue a frame
-    fn enqueue(&self, sk: &Sock, skb: Arc<SkBuff>) {
+    pub(super) fn enqueue(&self, sk: &Sock, skb: Arc<SkBuff>) {
         self.rmem.fetch_add(skb.truesize(), Ordering::AcqRel);
         self.q.lock().push_back(skb);
         sk.data_ready();
@@ -158,32 +236,48 @@ pub fn deliver(
         return Err(KernelError::InvalidArgument);
     };
     let data = skb.data();
-    let n = m.data.put(0, data)?;
+    // Linux packet_rcv_vnet: the header first, EINVAL in a shorter
+    // buffer
+    let vnet = s.vnet_hdr_len();
+    if vnet != 0 {
+        if m.data.len() < vnet {
+            return Err(KernelError::InvalidArgument);
+        }
+        let h = super::vnet::from_frame(cb.csum, data).bytes();
+        m.data.put(0, &h[..vnet])?;
+    }
+    let n = m.data.put(vnet, data)?;
     if n < data.len() {
         m.flags |= MSG_TRUNC;
     }
     if m.want_name {
-        m.name = Some(cb.sll.bytes()[..SLL_LEN].to_vec());
+        m.name = Some(if s.spkt() {
+            // struct sockaddr_pkt: spkt_family is the device type
+            let mut b = alloc::vec![0u8; super::spkt::SPKT_LEN];
+            b[0..2].copy_from_slice(&cb.sll.hatype.to_ne_bytes());
+            b[2..16].copy_from_slice(&cb.dev_name);
+            b[16..18].copy_from_slice(&cb.sll.protocol.to_be_bytes());
+            b
+        } else {
+            cb.sll.bytes()[..SLL_LEN].to_vec()
+        });
     }
     crate::net::dgram::sock_cmsgs(&s.sk, m, skb.tstamp, skb.dropcount);
     if s.flag(pf::AUXDATA) {
         m.cmsg
             .put(SOL_PACKET, PACKET_AUXDATA, &auxdata(&cb, data.len()));
     }
-    Ok(if flags & MSG_TRUNC != 0 {
-        data.len()
-    } else {
-        n
-    })
+    Ok(vnet
+        + if flags & MSG_TRUNC != 0 {
+            data.len()
+        } else {
+            n
+        })
 }
 
 /// struct tpacket_auxdata (20 bytes) of a frame of `snaplen` bytes
 fn auxdata(f: &PktCb, snaplen: usize) -> [u8; 20] {
-    let mut status = TP_STATUS_USER;
-    if f.loopback && f.sll.pkttype != PktType::Outgoing.num() {
-        // Linux loopback marks received packets CHECKSUM_UNNECESSARY
-        status |= TP_STATUS_CSUM_VALID;
-    }
+    let status = TP_STATUS_USER | f.csum;
     let mut b = [0u8; 20];
     b[0..4].copy_from_slice(&status.to_ne_bytes());
     b[4..8].copy_from_slice(&(f.origlen as u32).to_ne_bytes());
@@ -205,6 +299,9 @@ crate::rcu_head!(PacketSock, rcu);
 #[derive(Default)]
 pub struct PacketTable {
     sklist: RcuList<PacketLink>,
+    /// Fanout groups (Linux fanout_list, its entries of this
+    /// namespace; changed under the fanout mutex)
+    pub(super) fanouts: crate::sync::spin::RwLock<Vec<Arc<super::fanout::Fanout>>>,
 }
 
 impl PacketTable {
@@ -253,6 +350,10 @@ impl PacketSock {
     /// ptype_all for ETH_P_ALL, ptype_base otherwise; outgoing frames
     /// only go to ptype_all, never back to their sender)
     fn wants(&self, t: &Tap<'_>, proto: u16) -> bool {
+        // A fanout member's frames come through its group
+        if !self.flag(pf::RUNNING) || self.fanout.lock().is_some() {
+            return false;
+        }
         let (num, ifindex) = self.bound();
         if num == 0 || (ifindex != 0 && ifindex as u32 != t.dev.ifindex()) {
             return false;
@@ -263,8 +364,12 @@ impl PacketSock {
         num == ETH_P_ALL && !self.flag(pf::IGNORE_OUTGOING) && t.owner != self.id()
     }
 
-    /// Queue a copy of a tapped frame (Linux packet_rcv)
-    fn rcv(&self, t: &Tap<'_>, proto: u16) {
+    /// Queue a copy of a tapped frame (Linux packet_rcv), or put it in
+    /// the receive ring (tpacket_rcv)
+    pub(super) fn rcv(&self, t: &Tap<'_>, proto: u16) {
+        if self.spkt() {
+            return self.rcv_spkt(t, proto);
+        }
         let raw = self.sk.stype == SOCK_RAW;
         let data = if raw { t.frame } else { &t.frame[ETH_HLEN..] };
         let mut snap = data.len();
@@ -287,15 +392,10 @@ impl PacketSock {
             }
             snap = snap.min(res as usize);
         }
-        let mut sll = Sll {
-            protocol: proto,
-            ifindex: t.dev.ifindex() as i32,
-            hatype: t.dev.link().dev_type,
-            pkttype: t.pkt_type.num(),
-            halen: ETH_ALEN as u8,
-            addr: [0; 8],
-        };
-        sll.addr[..ETH_ALEN].copy_from_slice(&t.frame[6..12]);
+        if self.flag(pf::TPACKET) {
+            return self.tpacket_rcv(t, proto, data, snap);
+        }
+        let sll = self.rx_sll(t, proto);
         if !self.rxq.has_room(&self.sk) {
             self.sk.drops.fetch_add(1, Ordering::Relaxed);
             self.drops.fetch_add(1, Ordering::Relaxed);
@@ -305,7 +405,8 @@ impl PacketSock {
             origlen: data.len(),
             sll,
             net_off: if raw { ETH_HLEN as u16 } else { 0 },
-            loopback: t.dev.is_loopback(),
+            csum: csum_status(t),
+            dev_name: [0; 14],
         };
         // No memory for the copy: dropped and counted (Linux packet_rcv's
         // failed skb_clone(GFP_ATOMIC) goes to drop_n_acct)
@@ -322,7 +423,7 @@ impl PacketSock {
 /// A queued copy of a tapped frame's `data`, allocated GFP_ATOMIC (a
 /// receive or transmit path, possibly under a socket's lock) and
 /// wrapped in its `Arc` before any queue lock
-fn frame_skb(data: &[u8], cb: PktCb, drops: u32) -> Option<Arc<SkBuff>> {
+pub(super) fn frame_skb(data: &[u8], cb: PktCb, drops: u32) -> Option<Arc<SkBuff>> {
     let mut skb = SkBuff::alloc(0, data.len(), Gfp::ATOMIC)?;
     skb.put_slice(data)?;
     skb.cb = SkbCb::Pkt(cb);
@@ -340,12 +441,15 @@ pub fn tap(t: &Tap<'_>) {
     let Some(net) = t.dev.net() else {
         return;
     };
-    let proto = eth_proto(t.frame);
+    // Linux skb->protocol: eth_type_trans's on receive, the sender's
+    // on a packet socket's transmit
+    let proto = t.protocol.unwrap_or_else(|| eth_proto(t.frame));
     net.packet.for_each(|s| {
         if s.wants(t, proto) {
             s.rcv(t, proto);
         }
     });
+    super::fanout::deliver(&net, t, proto);
 }
 
 /// `/proc/net/packet` (Linux packet_seq_show; socket addresses

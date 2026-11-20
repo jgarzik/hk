@@ -17,6 +17,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
+use crate::time::timer::TimerList;
 use crate::util::error::KernelError;
 
 /// Accounting quantum (Linux PAGE_SIZE: sk_forward_alloc is charged in
@@ -40,10 +41,19 @@ const PCPU_RSV_MIN: i32 = (1 << 20) / QUANTUM as i32;
 static PCPU_RSV: AtomicI32 = AtomicI32::new(PCPU_RSV_MIN);
 /// tcp_mem in quanta; the boot value is the floor tcp_init_mem
 /// allows (128) until `init` sizes it
+#[cfg(not(test))]
 static LIMITS: [AtomicUsize; 3] = [
     AtomicUsize::new(96),
     AtomicUsize::new(128),
     AtomicUsize::new(192),
+];
+/// Host tests run in parallel against this one global count and never
+/// call `init`: limits no test reaches, so none sees another's memory
+#[cfg(test)]
+static LIMITS: [AtomicUsize; 3] = [
+    AtomicUsize::new(1 << 30),
+    AtomicUsize::new(1 << 30),
+    AtomicUsize::new(1 << 30),
 ];
 /// Linux tcp_memory_pressure: past tcp_mem[1], until back under [0];
 /// when it began (ms, never 0), 0 when off
@@ -55,6 +65,17 @@ crate::percpu! {
     /// tcp_orphan_count): a part may go negative, the sum does not
     static ORPHANS: AtomicIsize = AtomicIsize::new(0);
 }
+/// net.ipv4.tcp_max_orphans (Linux sysctl_tcp_max_orphans: half the
+/// ehash entries, set with the tables, `set_max_orphans`)
+static MAX_ORPHANS: AtomicI32 = AtomicI32::new(512);
+/// Linux tcp_orphan_cache: the orphan sum as `ORPHAN_TIMER` last took
+/// it
+static ORPHAN_CACHE: AtomicUsize = AtomicUsize::new(0);
+/// Linux TCP_ORPHAN_TIMER_PERIOD (ns)
+const ORPHAN_PERIOD_NS: u64 = 100_000_000;
+/// Linux tcp_orphan_timer: refreshes `ORPHAN_CACHE` every period, from
+/// boot (`init`) on
+static ORPHAN_TIMER: TimerList = TimerList::new(orphan_update, 0);
 
 /// Quanta covering `bytes` (Linux sk_mem_pages)
 pub fn quanta(bytes: usize) -> usize {
@@ -68,6 +89,31 @@ pub fn init() {
     set_limits([limit / 4 * 3, limit, limit / 4 * 3 * 2]);
 }
 
+/// Start the orphan count's refresh once timers run (Linux tcp_init
+/// arms tcp_orphan_timer from inet_init, an fs initcall, after the
+/// timer bases exist)
+pub fn start() {
+    orphan_timer_arm();
+}
+
+/// Arm `ORPHAN_TIMER` a period from now
+fn orphan_timer_arm() {
+    let at = crate::time::monotonic_ns().saturating_add(ORPHAN_PERIOD_NS);
+    let _ = core::pin::Pin::static_ref(&ORPHAN_TIMER).mod_timer_ns(at);
+}
+
+/// Linux tcp_orphan_update (`ktimers/N`): take the orphan sum, again in
+/// a period
+fn orphan_update(_: &TimerList) {
+    orphan_refresh();
+    orphan_timer_arm();
+}
+
+/// Take the orphan sum into `ORPHAN_CACHE`
+fn orphan_refresh() {
+    ORPHAN_CACHE.store(orphans(), Ordering::Relaxed);
+}
+
 fn set_limits(v: [usize; 3]) {
     for (l, x) in LIMITS.iter().zip(v) {
         l.store(x, Ordering::Relaxed);
@@ -79,7 +125,7 @@ pub fn limit(i: usize) -> usize {
     LIMITS[i].load(Ordering::Relaxed)
 }
 
-fn rsv() -> isize {
+pub fn rsv() -> isize {
     PCPU_RSV.load(Ordering::Relaxed) as isize
 }
 
@@ -155,6 +201,39 @@ pub fn orphans() -> usize {
     n.max(0) as usize
 }
 
+/// Linux tcp_too_many_orphans: the cached orphan count, doubled
+/// `shift` times for a connection that looks dead, past
+/// tcp_max_orphans
+pub fn too_many_orphans(shift: u32) -> bool {
+    let n = ORPHAN_CACHE.load(Ordering::Relaxed) as i64;
+    (n << shift) > i64::from(MAX_ORPHANS.load(Ordering::Relaxed))
+}
+
+/// Linux tcp_check_oom: too many orphans, or a connection with
+/// `wmem` bytes queued past the hard memory limit
+pub fn check_oom(shift: u32, wmem: usize) -> bool {
+    too_many_orphans(shift) || out_of_memory(wmem)
+}
+
+/// Linux tcp_init: tcp_max_orphans is half the ehash entries
+pub fn set_max_orphans(ehash: usize) {
+    let v = (ehash / 2).min(i32::MAX as usize) as i32;
+    MAX_ORPHANS.store(v, Ordering::Relaxed);
+}
+
+/// /proc/sys/net/ipv4/tcp_max_orphans (machine-wide: in the initial
+/// network namespace's tree only, Linux ipv4_table)
+pub fn max_orphans_show() -> Vec<i64> {
+    alloc::vec![i64::from(MAX_ORPHANS.load(Ordering::Relaxed))]
+}
+
+/// tcp_max_orphans write (Linux proc_dointvec: any int)
+pub fn max_orphans_store(v: &[i64]) -> Result<(), KernelError> {
+    crate::sysctl::range(v[0], i64::from(i32::MIN), i64::from(i32::MAX))?;
+    MAX_ORPHANS.store(v[0] as i32, Ordering::Relaxed);
+    Ok(())
+}
+
 /// A connection counted as an orphan (closed by its owner, or a child
 /// its listener let go) until it is destroyed or dropped (Linux
 /// this_cpu_inc(tcp_orphan_count) in __tcp_close and
@@ -206,32 +285,20 @@ impl Drop for Held {
     }
 }
 
-/// A connection with `wmem` bytes of its own queued while the total is
-/// past the hard limit (Linux tcp_out_of_memory: SOCK_MIN_SNDBUF, half
-/// of it in hk's byte counts)
+/// A connection with `wmem` (sk_wmem_queued) of its own queued while
+/// the total is past the hard limit (Linux tcp_out_of_memory)
 pub fn out_of_memory(wmem: usize) -> bool {
-    wmem > crate::net::sock::MIN_SNDBUF as usize / 2 && allocated() > limit(2)
+    wmem > crate::net::sock::MIN_SNDBUF as usize && allocated() > limit(2)
 }
 
-/// /proc/sys/net/ipv4/tcp_mem
+/// /proc/sys/net/ipv4/tcp_mem (machine-wide: in the initial network
+/// namespace's tree only, `sysctl::INIT_CTLS`)
 pub fn sysctl_show() -> Vec<i64> {
     (0..3).map(|i| limit(i) as i64).collect()
 }
 
-/// These sysctls are machine-wide: Linux registers them for the initial
-/// network namespace only. hk's /proc/sys is one tree, so another
-/// namespace sees them, but may not change them (EPERM: CAP_NET_ADMIN
-/// over a container's own namespace is no right over the host's TCP)
-fn init_net_only() -> Result<(), KernelError> {
-    let net = crate::net::current_net_ns();
-    if net.id == crate::net::init_net_ns().id {
-        Ok(())
-    } else {
-        Err(KernelError::NotPermitted)
-    }
-}
-
-/// /proc/sys/net/core/mem_pcpu_rsv
+/// /proc/sys/net/core/mem_pcpu_rsv (machine-wide: in the initial
+/// network namespace's tree only, `sysctl::INIT_CTLS`)
 pub fn rsv_show() -> Vec<i64> {
     alloc::vec![i64::from(PCPU_RSV.load(Ordering::Relaxed))]
 }
@@ -239,7 +306,6 @@ pub fn rsv_show() -> Vec<i64> {
 /// mem_pcpu_rsv write (Linux proc_dointvec_minmax, at least
 /// SK_MEMORY_PCPU_RESERVE)
 pub fn rsv_store(v: &[i64]) -> Result<(), KernelError> {
-    init_net_only()?;
     crate::sysctl::range(v[0], i64::from(PCPU_RSV_MIN), i64::from(i32::MAX))?;
     PCPU_RSV.store(v[0] as i32, Ordering::Relaxed);
     Ok(())
@@ -248,10 +314,29 @@ pub fn rsv_store(v: &[i64]) -> Result<(), KernelError> {
 /// tcp_mem write (Linux proc_doulongvec_minmax without bounds:
 /// negative values are EINVAL)
 pub fn sysctl_store(v: &[i64]) -> Result<(), KernelError> {
-    init_net_only()?;
     if v.iter().any(|&x| x < 0) {
         return Err(KernelError::InvalidArgument);
     }
     set_limits([v[0] as usize, v[1] as usize, v[2] as usize]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// tcp_too_many_orphans reads the cache the timer refreshes (Linux
+    /// tcp_orphan_cache, tcp_orphan_update), never the live sum
+    #[test]
+    fn orphan_cache_from_timer() {
+        orphan_refresh();
+        let cached = ORPHAN_CACHE.load(Ordering::Relaxed);
+        let held: alloc::vec::Vec<Orphan> = (0..3).map(|_| Orphan::new()).collect();
+        let _ = too_many_orphans(0);
+        assert_eq!(ORPHAN_CACHE.load(Ordering::Relaxed), cached);
+        orphan_refresh();
+        assert_eq!(ORPHAN_CACHE.load(Ordering::Relaxed), orphans());
+        assert!(orphans() >= 3);
+        drop(held);
+    }
 }

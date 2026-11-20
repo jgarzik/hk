@@ -125,6 +125,16 @@ pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<FileRef, KernelError> {
     pidfd_file(p, file_flags)
 }
 
+/// A descriptor (O_CLOEXEC) reserved for a new pidfd file of `pid`,
+/// installed by the caller once its number is copied out (Linux
+/// pidfd_prepare; fd_install, or put_unused_fd + fput)
+pub fn pidfd_prepare(
+    pid: Arc<crate::task::pid::Pid>,
+) -> Result<(crate::task::fdtable::UnusedFd, FileRef), KernelError> {
+    let fd = crate::fs::io::get_unused_fd_flags(crate::task::FD_CLOEXEC)?;
+    Ok((fd, pidfd_file(pid, 0)?))
+}
+
 /// A pidfd file for `pid` (no check that it names a task: clone's
 /// child is not listed yet, Linux PIDFD_STALE)
 pub fn pidfd_file(

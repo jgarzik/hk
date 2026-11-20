@@ -2,9 +2,11 @@
 //!
 //! A `Ctl` is one /proc/sys file: a path below /proc/sys, a mode and
 //! show/store functions over a vector of integers (Linux proc_dointvec
-//! family). Values live with their subsystem (network sysctls are per
-//! namespace atomics: the reader's/writer's namespace is used), so this
-//! module holds no state and no locks.
+//! family). Values live with their subsystem, so this module holds no
+//! state and no locks. Network sysctls are per namespace
+//! (`net::sysctl::NetCtl`, Linux net_sysctl_root): a /proc/sys/net file
+//! is an [`Entry`] bound to the namespace its directory was looked up
+//! in (Linux the inode's ctl_table_header, of that net->sysctls set).
 //!
 //! Writes follow Linux semantics: whitespace-separated decimal integers,
 //! fewer values than the vector leaves the rest unchanged, anything
@@ -12,8 +14,11 @@
 //! offset are ignored (sysctl_writes_strict = 1).
 
 use alloc::string::String;
+use alloc::sync::Weak;
 use alloc::vec::Vec;
 
+use crate::net::sysctl::NetCtl;
+use crate::net::{NetNamespace, NetRef};
 use crate::util::error::KernelError;
 
 /// One /proc/sys entry
@@ -38,22 +43,176 @@ pub struct Text {
     pub store: fn(&str) -> Result<(), KernelError>,
 }
 
-/// Current text of `ctl`
-pub fn read(ctl: &Ctl) -> Vec<u8> {
-    match &ctl.text {
-        Some(t) => {
-            let mut s = (t.show)();
-            s.push('\n');
-            s.into_bytes()
+/// What a /proc/sys file acts on (Linux an inode's ctl_table_header and
+/// ctl_table entry): a global entry, or a network namespace's, bound to
+/// the namespace whose tree it was found in by a weak reference (the
+/// file does not keep the namespace: Linux's header outlives it,
+/// unregistering) and that namespace's id
+#[derive(Clone)]
+pub enum Entry {
+    Global(&'static Ctl),
+    Net {
+        ctl: &'static NetCtl,
+        net: Weak<NetNamespace>,
+        id: u64,
+        /// The entry's mode in that namespace (`NetCtl::mode_in`)
+        mode: u16,
+        set: alloc::sync::Arc<crate::net::sysctl::SysctlSet>,
+    },
+}
+
+/// An entry in use (Linux sysctl_head_grab, use_table): a network one
+/// holds its namespace active, so the namespace's teardown waits for it
+/// (Linux start_unregistering waits for the users)
+enum Grab {
+    Global(&'static Ctl),
+    Net(&'static NetCtl, NetRef),
+}
+
+/// What a permission check needs of an entry (Linux sysctl_perm: the
+/// mode, and whether its root is net_sysctl_root, whose
+/// net_ctl_permissions lets CAP_NET_ADMIN act as root)
+#[derive(Clone, Copy)]
+pub struct Perm {
+    pub mode: u16,
+    pub net: bool,
+}
+
+impl Entry {
+    /// A network entry of `net`
+    pub fn net(ctl: &'static NetCtl, net: &alloc::sync::Arc<NetNamespace>) -> Self {
+        Self::Net {
+            ctl,
+            net: alloc::sync::Arc::downgrade(net),
+            id: net.id,
+            mode: ctl.mode_in(net),
+            set: net.sysctls.clone(),
         }
-        None => format(&(ctl.show)()),
+    }
+
+    /// In use, or ENOENT once its namespace is going (Linux
+    /// sysctl_head_grab: -ENOENT while unregistering)
+    fn grab(&self) -> Result<Grab, KernelError> {
+        match self {
+            Self::Global(c) => Ok(Grab::Global(c)),
+            Self::Net { set, .. } if set.unregistering() => Err(KernelError::NotFound),
+            Self::Net { ctl, net, .. } => net
+                .upgrade()
+                .and_then(|n| n.maybe_get())
+                .map(|n| Grab::Net(ctl, n))
+                .ok_or(KernelError::NotFound),
+        }
+    }
+
+    /// Its namespace's teardown started (Linux head->unregistering):
+    /// a flag read, no reference taken
+    pub fn unregistering(&self) -> bool {
+        match self {
+            Self::Global(_) => false,
+            Self::Net { set, .. } => set.unregistering(),
+        }
+    }
+
+    /// Its permission data
+    pub fn perm(&self) -> Perm {
+        match self {
+            Self::Global(c) => Perm {
+                mode: c.mode,
+                net: false,
+            },
+            Self::Net { mode, .. } => Perm {
+                mode: *mode,
+                net: true,
+            },
+        }
+    }
+
+    /// A string sysctl (proc_dostring)
+    pub fn is_text(&self) -> bool {
+        match self {
+            Self::Global(c) => c.text.is_some(),
+            Self::Net { ctl, .. } => ctl.text.is_some(),
+        }
+    }
+
+    /// The id of the network namespace it is bound to
+    pub fn net_id(&self) -> Option<u64> {
+        match self {
+            Self::Global(_) => None,
+            Self::Net { id, .. } => Some(*id),
+        }
     }
 }
 
-/// All tables, mounted under /proc/sys
+impl Grab {
+    fn show(&self) -> Vec<i64> {
+        match self {
+            Self::Global(c) => (c.show)(),
+            Self::Net(c, n) => (c.show)(n),
+        }
+    }
+
+    fn store(&self, v: &[i64]) -> Result<(), KernelError> {
+        match self {
+            Self::Global(c) => (c.store)(v),
+            Self::Net(c, n) => (c.store)(n, v),
+        }
+    }
+
+    /// A string sysctl's value
+    fn text_show(&self) -> Option<String> {
+        match self {
+            Self::Global(c) => c.text.as_ref().map(|t| (t.show)()),
+            Self::Net(c, n) => c.text.as_ref().map(|t| (t.show)(n)),
+        }
+    }
+
+    /// Store a string sysctl's value; None for a numeric one
+    fn text_store(&self, s: &str) -> Option<Result<(), KernelError>> {
+        match self {
+            Self::Global(c) => c.text.as_ref().map(|t| (t.store)(s)),
+            Self::Net(c, n) => c.text.as_ref().map(|t| (t.store)(n, s)),
+        }
+    }
+}
+
+/// The entry is in use from an open on (Linux proc_sys_open:
+/// sysctl_head_grab, ENOENT once unregistering)
+pub fn open(e: &Entry) -> Result<(), KernelError> {
+    e.grab().map(drop)
+}
+
+/// A read (`write` false) or write of `e` by the current task may go
+/// ahead (Linux proc_sys_call_handler, before the handler: ENOENT once
+/// its namespace is going, then sysctl_perm with MAY_READ / MAY_WRITE
+/// on every call, EPERM)
+pub fn call_check(e: &Entry, write: bool) -> Result<(), KernelError> {
+    let _g = e.grab()?;
+    let mask = if write {
+        crate::fs::MAY_WRITE
+    } else {
+        crate::fs::MAY_READ
+    };
+    permission(e.perm(), &crate::task::current_cred(), mask).map_err(|_| KernelError::NotPermitted)
+}
+
+/// Current text of `e` (Linux proc_sys_call_handler: ENOENT once its
+/// namespace is going)
+pub fn read(e: &Entry) -> Result<Vec<u8>, KernelError> {
+    let g = e.grab()?;
+    Ok(match g.text_show() {
+        Some(mut s) => {
+            s.push('\n');
+            s.into_bytes()
+        }
+        None => format(&g.show()),
+    })
+}
+
+/// All global tables, mounted under /proc/sys (the network ones are
+/// per namespace: `net::sysctl::registered`)
 pub fn tables() -> &'static [&'static [Ctl]] {
     static TABLES: &[&[Ctl]] = &[
-        crate::net::sysctl::CTLS,
         crate::mm::frame_alloc::VM_CTLS,
         crate::mm::writeback::WB_CTLS,
         crate::mm::MM_CTLS,
@@ -133,18 +292,22 @@ pub fn parse(buf: &[u8], cur: &[i64]) -> Result<Vec<i64>, KernelError> {
     Ok(out)
 }
 
-/// Write `buf` at file offset `pos` to `ctl`; returns bytes consumed
-pub fn write(ctl: &Ctl, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
+/// Write `buf` at file offset `pos` to `e`; returns bytes consumed
+/// (ENOENT once its namespace is going)
+pub fn write(e: &Entry, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
+    let g = e.grab()?;
     if pos != 0 {
         return Ok(buf.len());
     }
-    if let Some(t) = &ctl.text {
+    if e.is_text() {
         let s = core::str::from_utf8(buf).map_err(|_| KernelError::InvalidArgument)?;
-        (t.store)(s.trim_end_matches('\0').trim())?;
+        let s = s.trim_end_matches('\0').trim();
+        g.text_store(s)
+            .unwrap_or(Err(KernelError::InvalidArgument))?;
         return Ok(buf.len());
     }
-    let v = parse(buf, &(ctl.show)())?;
-    (ctl.store)(&v)?;
+    let v = parse(buf, &g.show())?;
+    g.store(&v)?;
     Ok(buf.len())
 }
 
@@ -152,12 +315,12 @@ pub fn write(ctl: &Ctl, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
 /// or CAP_NET_ADMIN use the owner bits, egid 0 the group bits, others the
 /// rest (no CAP_DAC_OVERRIDE: a read-only sysctl is read-only for root
 /// too). `mask` holds MAY_READ / MAY_WRITE / MAY_EXEC bits.
-pub fn permission(ctl: &Ctl, c: &crate::task::Cred, mask: u32) -> Result<(), KernelError> {
-    let m = u32::from(ctl.mode);
+pub fn permission(p: Perm, c: &crate::task::Cred, mask: u32) -> Result<(), KernelError> {
+    let m = u32::from(p.mode);
     // Linux test_perm: root gets the owner bits; CAP_NET_ADMIN counts
     // as root only for the network namespace's own files
     // (net_ctl_permissions), never for vm/ and the rest
-    let net_admin = ctl.path.starts_with("net/") && c.cap_effective.has(crate::task::CAP_NET_ADMIN);
+    let net_admin = p.net && c.cap_effective.has(crate::task::CAP_NET_ADMIN);
     let bits = if c.euid == 0 || net_admin {
         m >> 6
     } else if c.egid == 0 {

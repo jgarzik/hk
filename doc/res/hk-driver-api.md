@@ -23,7 +23,7 @@ virtio-net 418, virtio-blk 599, virtio-pci 615, the xHCI files
 | 3 | Field-by-field `write_volatile(&raw mut (*d).f)` into DMA memory, with the publish-last barrier placed by hand | e1000 `transmit`/`receive`/`init_rx`/`init_tx`/`TxRing::reclaim`; xHCI `CommandRing::enqueue`/`noop_at`, `EventRing::dequeue`, `TransferRing::raw_put`; `Vring::publish`; virtio-blk `write_hdr`. There are about 75 volatile sites and 25 barriers in hw/net, hw/usb and hw/virtio. `InputContext::slot_mut`/`endpoint_mut`/`control_mut` hand out `&mut` into DMA memory (breaks doc/UNSAFE.md rule 8) | 150 |
 | 4 | Ring index and ownership models, each coded again | head/tail: e1000 `TxRing`/`RxRing` (TDT/RDT); cycle bit three times: `CommandRing`, `EventRing`, `TransferRing`; avail/used: `Vring`. `EventRing` and the e1000 rings have no host tests | 750 |
 | 5 | Carving one coherent block into slots, and free-slot stacks | virtio-net `Pool::cpu`/`dma`, `TxQueue.free`; virtio-blk `VbQueue::hdr_dma`/`status`, `VbQueue.free`; e1000 `alloc_bufs` allocates one coherent block per 2 KiB buffer, so each uses a 4 KiB frame (`DirectDmaOps::alloc_coherent`): 192 frames per device, half of each unused; xHCI `XhciMem::frame` skips the DMA API entirely (phys = bus address) | 90 |
-| 6 | DMA lifetime handled by hand: `DmaCoherent` has no `Drop`, so every remove frees after reset, and error paths leak | e1000 `free_rings`; virtio-net `VirtioNetWrapper::remove`; virtio-blk `stop`; `VirtioDevice::del_vqs` | 70 |
+| 6 | DMA lifetime handled by hand: `DmaCoherent` has no `Drop`, so every remove frees after reset; e1000's rings and virtio-net's pools are `DmaBox` (freed on drop, the driver vouching the device is done), the probes unwinding by hand | virtio-net `virtnet_del_vqs`; virtio-blk `stop`; `VirtioDevice::del_vqs` | 70 |
 | 7 | Interrupt plumbing per transport | virtio-pci `IrqSlot` state machine + `alloc_vectors`/`queue_vector`/`request_msix`/`request_intx`; `hw/pci/msix.rs` `MsixVectors` (its only user); virtio-blk `vectors` + `first_cpu`; INTx-only e1000 and xHCI; the INTx "reap every queue" fallback (`VirtioBlk::vq_interrupt(None)`) | 300 |
 | 8 | The NAPI skeleton, twice | e1000 and virtio-net `NapiPoll::poll`, `rearm`, `mask`, `NetDeviceOps::open`/`stop`, `napi_off` bookkeeping (as `hk-hadl-prep.md` §1 notes) | 2 × 150 |
 | 9 | Probe/remove ceremony | `try_box(MaybeUninit<Wrapper>)`; a wrapper struct implementing `base::Bound` (`as_any`, a stats printk in `shutdown`, an ordered `remove`: unregister, `napi_disable` unless `napi_off`, reset, drop IRQ, `netif_napi_del`, free rings); unwinding written out with `inspect_err`/`match` | 3 × 100 |
@@ -31,17 +31,6 @@ virtio-net 418, virtio-blk 599, virtio-pci 615, the xHCI files
 Patterns 1–9 make up about 430 of e1000's 646 lines and about 300 of
 virtio-net's 418. Chip-specific logic is the remainder: the MAC filter, link
 status, the virtio feature bits.
-
-Bugs these patterns caused (found here, not fixed; they belong in BUGS.md):
-- `e1000_probe` leaks every earlier coherent block when a later
-  `dma_alloc_coherent` or `alloc_bufs` fails. `alloc_bufs` also grows with
-  infallible `Vec::with_capacity`/`push` (doc/STYLE.md).
-- virtio-net `setup_queues` leaks the RX virtqueue and pool when the TX side
-  fails. `VirtioNetDriver::probe` leaks the queues and the NAPI
-  registration when `try_arc` or `request_irq` fails.
-
-These are leaks, not use-after-free: leaked memory the device may still
-write is never reused.
 
 Soundness gap: `DmaBox`'s drop is safe code, yet it is correct only if the
 device has stopped using the memory. Today the driver vouches for that

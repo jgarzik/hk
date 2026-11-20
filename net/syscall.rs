@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::fs::file::File;
 use crate::fs::io::fget;
+use crate::fs::syscall::UIO_MAXIOV;
 use crate::net::msg::{
     self, Dst, Iov, MMsgHdr, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_WAITFORONE, MsgHdr,
     RecvMsg, SendMsg, Src, UserMsgHdr, addr_in, addr_out,
@@ -198,7 +199,11 @@ pub fn sys_getsockopt(
     if len < 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let out = match s.getsockopt(level, opt) {
+    let v = OptIn {
+        ptr: val.addr(),
+        len: len as usize,
+    };
+    let out = match s.getsockopt_in(level, opt, v) {
         Some(r) => r?,
         None if level == SOL_SOCKET => sock_getsockopt(&*s, opt)?,
         None => return Err(KernelError::NoProtocolOption),
@@ -281,14 +286,18 @@ fn recvmsg_one(
     let mut m = RecvMsg::new(Dst::User(h.iov()?), !h.name.is_null(), h.controllen);
     m.flags = flags & MSG_CMSG_CLOEXEC;
     let n = s.recvmsg(&mut m, file_nb(file, flags))?;
+    // The control data first, its files installed once it is out
+    // (Linux put_cmsg and fd_install during sock_recvmsg), then the
+    // address (move_addr_to_user)
+    if !m.cmsg.buf.is_empty() {
+        copy_to_user(h.control.addr(), &m.cmsg.buf)?;
+    }
+    m.cmsg.install_fds();
     let mut namelen = 0;
     if let (Some(a), false) = (&m.name, h.name.is_null()) {
         let k = (h.namelen as usize).min(a.len());
         copy_to_user(h.name.addr(), &a[..k])?;
         namelen = a.len() as u32;
-    }
-    if !m.cmsg.buf.is_empty() {
-        copy_to_user(h.control.addr(), &m.cmsg.buf)?;
     }
     let mut fl = m.flags;
     if m.cmsg.trunc {
@@ -309,7 +318,7 @@ pub fn sys_recvmsg(fd: i32, msg: UserPtr<UserMsgHdr>, flags: i32) -> KernelResul
 pub fn sys_sendmmsg(fd: i32, vec: UserPtr<MMsgHdr>, vlen: u32, flags: i32) -> KernelResult<usize> {
     let (file, s) = sockfd(fd)?;
     let mut n = 0;
-    for i in 0..(vlen as usize).min(msg::UIO_MAXIOV) {
+    for i in 0..(vlen as usize).min(UIO_MAXIOV) {
         let at = MMsgHdr::at(vec, i);
         match sendmsg_one(&file, &*s, MMsgHdr::hdr(at), flags) {
             Ok(k) => {
@@ -337,7 +346,7 @@ pub fn sys_recvmmsg(
     let deadline = mmsg_deadline(timeout)?;
     let mut flags = flags;
     let mut n = 0;
-    for i in 0..(vlen as usize).min(msg::UIO_MAXIOV) {
+    for i in 0..(vlen as usize).min(UIO_MAXIOV) {
         let at = MMsgHdr::at(vec, i);
         match recvmsg_one(&file, &*s, MMsgHdr::hdr(at), flags) {
             Ok(k) => {

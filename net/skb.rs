@@ -55,6 +55,10 @@ pub const NET_SKB_PAD: usize = 64;
 /// Largest buffer: a 64 KB IP datagram plus headroom (loopback MTU)
 pub const MAX_SKB_SIZE: usize = 65536 + 512;
 
+/// Headroom of a transmitted skb: Ethernet (14) + IP (20-60) + TCP
+/// (20-60) headers
+pub const TX_HEADROOM: usize = 14 + 60 + 60;
+
 /// Network buffer - equivalent to Linux sk_buff
 ///
 /// # Invariants
@@ -76,6 +80,10 @@ pub struct SkBuff {
     data: usize,
     /// End of the packet data (moves with put/trim)
     tail: usize,
+    /// Bytes charged to a socket buffer for it (Linux skb->truesize):
+    /// the buffer and the skb itself as allocated; TCP's send skbs
+    /// count their header room, then the payload copied in
+    truesize: usize,
 
     // Protocol information
     /// EtherType (set by eth_type_trans)
@@ -103,16 +111,29 @@ pub struct SkBuff {
     /// as an id, 0 if none): its own outgoing tap skips it (Linux
     /// skb_loop_sk)
     pub owner: usize,
+    /// The transport checksum is left to the device (Linux ip_summed
+    /// CHECKSUM_PARTIAL: a UDP datagram out through lo, whose
+    /// NETIF_F_HW_CSUM Linux uses; hk computes it anyway); seen by the
+    /// packet taps (TP_STATUS_CSUMNOTREADY), kept as lo loops it back
+    pub csum_partial: bool,
+    /// Run when the skb is freed or orphaned (Linux skb->destructor
+    /// with skb->sk: a TX ring frame's completion); not cloned
+    pub destructor: Option<Box<dyn SkbDestructor>>,
     /// Start of the MAC header in the buffer (None until received)
     mac: Option<usize>,
     /// Start of the IP header of a received packet (None until marked)
     nh: Option<usize>,
     /// Arrival time, CLOCK_REALTIME ns (Linux skb->tstamp, a ktime_t;
-    /// 0: not stamped yet, the receiving socket stamps it as it queues)
+    /// 0: not stamped yet, the receiving socket stamps it as it queues);
+    /// of an skb TCP sent, when it last went out, monotonic ns (Linux
+    /// skb_mstamp_ns, the same union)
     pub tstamp: i64,
     /// The receiving socket's drop count when it was queued (Linux
     /// SOCK_SKB_CB(skb)->dropcount, for SO_RXQ_OVFL)
     pub dropcount: u32,
+    /// A zero-length datagram was peeked at an offset (Linux
+    /// skb->peeked, skb_set_peeked): later offset peeks skip it
+    pub peeked: core::sync::atomic::AtomicBool,
     /// Per-layer data of a queued skb (Linux skb->cb)
     pub cb: SkbCb,
 }
@@ -161,6 +182,19 @@ impl SkbCb {
     }
 }
 
+/// What an skb's destructor does is its `Drop` (Linux skb->destructor,
+/// called by kfree_skb and skb_orphan): any context, possibly under the
+/// freeing path's spin locks, so it takes only leaf locks and wakes
+pub trait SkbDestructor: Send + Sync {}
+
+impl SkBuff {
+    /// Run the destructor now and forget the owner's charge (Linux
+    /// skb_orphan, as loopback_xmit before looping a frame back)
+    pub fn orphan(&mut self) {
+        self.destructor = None;
+    }
+}
+
 /// [`SkbCb::Inet`]
 #[derive(Clone, Copy, Default)]
 pub struct InetCb {
@@ -183,6 +217,7 @@ impl SkBuff {
         with_gfp(gfp, || {
             let buf = crate::util::kmem::try_vec(total_size, 0u8).ok()?;
             try_box(Self {
+                truesize: buf.capacity() + core::mem::size_of::<Self>(),
                 buf,
                 data: headroom,
                 tail: headroom,
@@ -195,9 +230,56 @@ impl SkBuff {
     /// Allocate an skb for transmitting `data_len` bytes, with headroom
     /// for every header below them (Ethernet + IP + TCP)
     pub fn alloc_tx(data_len: usize, gfp: Gfp) -> Option<Box<Self>> {
-        // Reserve space for: Ethernet (14) + IP (20-60) + TCP (20-60)
-        let headroom = 14 + 60 + 60;
-        Self::alloc(headroom, data_len, gfp)
+        Self::alloc(TX_HEADROOM, data_len, gfp)
+    }
+
+    /// Room for `n` bytes after the data: short of it, the buffer
+    /// grows under `gfp` so the data could reach a whole number of
+    /// `step` bytes, no more than `max` (as TCP's send path takes page
+    /// frags of Linux's sk_page_frag_refill). None without memory or
+    /// past [`MAX_SKB_SIZE`] (unchanged).
+    pub fn grow(&mut self, n: usize, step: usize, max: usize, gfp: Gfp) -> Option<()> {
+        if self.tailroom() >= n {
+            return Some(());
+        }
+        let need = self.len().checked_add(n)?;
+        let room = MAX_SKB_SIZE.checked_sub(self.data)?;
+        if need > room {
+            return None;
+        }
+        let want = need
+            .div_ceil(step)
+            .saturating_mul(step)
+            .min(max)
+            .min(room)
+            .max(need);
+        let extra = self.data + want - self.buf.len();
+        with_gfp(gfp, || crate::util::kmem::try_reserve(&mut self.buf, extra)).ok()?;
+        self.buf.resize(self.data + want, 0);
+        Some(())
+    }
+
+    /// Give back the buffer around the data beyond `headroom` before it
+    /// once more than `slack` bytes would go: the data move to a buffer
+    /// that fits, allocated under `gfp` (Linux frees the frags
+    /// tcp_trim_head and tcp_fragment leave unused); header marks are
+    /// dropped. False without memory (unchanged).
+    pub fn compact(&mut self, headroom: usize, slack: usize, gfp: Gfp) -> bool {
+        let waste = self.data.saturating_sub(headroom) + self.tailroom();
+        if waste <= slack {
+            return true;
+        }
+        let h = headroom.min(self.data);
+        let Ok(mut v) = with_gfp(gfp, || crate::util::kmem::try_vec(h + self.len(), 0u8)) else {
+            return false;
+        };
+        v[h..].copy_from_slice(self.data());
+        self.tail = h + self.len();
+        self.data = h;
+        self.buf = v;
+        self.mac = None;
+        self.nh = None;
+        true
     }
 
     /// Get current data length
@@ -341,6 +423,8 @@ impl SkBuff {
         self.pkt_type = PktType::Host;
         self.ip_bcast = false;
         self.owner = 0;
+        self.csum_partial = false;
+        self.destructor = None;
         self.mac = None;
         self.nh = None;
         self.tstamp = 0;
@@ -370,10 +454,23 @@ impl SkBuff {
         self.buf.get(self.nh?..self.tail)
     }
 
-    /// Bytes charged to a socket buffer for it (Linux skb->truesize:
-    /// the buffer and the skb itself)
-    pub fn truesize(&self) -> usize {
+    /// Bytes it holds: the buffer and the skb itself (host tests)
+    #[cfg(test)]
+    pub fn mem_size(&self) -> usize {
         self.buf.capacity() + core::mem::size_of::<Self>()
+    }
+
+    /// Bytes charged to a socket buffer for it (Linux skb->truesize)
+    pub fn truesize(&self) -> usize {
+        self.truesize
+    }
+
+    /// Change what it is charged as (Linux skb->truesize written by
+    /// TCP: tcp_stream_alloc_skb, the payload copied in or moved by
+    /// tcp_fragment, skb_shift, tcp_trim_head); only while uncharged,
+    /// or with the charge adjusted alike
+    pub fn set_truesize(&mut self, n: usize) {
+        self.truesize = n;
     }
 
     /// An skb whose data is `v`, taken over without a copy (a netlink
@@ -382,6 +479,7 @@ impl SkBuff {
     pub fn from_vec(v: Vec<u8>) -> Self {
         Self {
             tail: v.len(),
+            truesize: v.capacity() + core::mem::size_of::<Self>(),
             buf: v,
             ..Default::default()
         }
@@ -405,6 +503,7 @@ impl SkBuff {
             buf,
             data: self.data,
             tail: self.tail,
+            truesize: self.truesize,
             protocol: self.protocol,
             ip_protocol: self.ip_protocol,
             dev: self.dev.clone(),
@@ -415,10 +514,13 @@ impl SkBuff {
             ip_ttl: self.ip_ttl,
             ip_tos: self.ip_tos,
             owner: self.owner,
+            csum_partial: self.csum_partial,
+            destructor: None,
             mac: self.mac,
             nh: self.nh,
             tstamp: self.tstamp,
             dropcount: self.dropcount,
+            peeked: core::sync::atomic::AtomicBool::new(false),
             cb: self.cb.dup(),
         })
     }
@@ -438,25 +540,93 @@ crate::rb_adapter!(pub SkbRb, SkBuff, rb);
 /// TCP's out-of-order queue and retransmit queue)
 pub type SkbTree = RbRoot<SkbRb, Box<SkBuff>>;
 
-/// TCP's per-skb state (Linux struct tcp_skb_cb): the sequence space
-/// the skb covers and the header fields it was received with or is to
-/// be sent with
+/// TCP's per-skb state (Linux struct tcp_skb_cb, its fields only): the
+/// sequence space the skb covers, its flags, scoreboard tags, segment
+/// count and the rate sample's delivery state at its transmission. A
+/// segment's header (window, options, SACK blocks) is not kept here:
+/// it is in the skb's data until TCP processes it, or written there
+/// when it is sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpSkbCb {
+    /// The connection's delivered count when it went out, and a
+    /// nonzero us stamp until a SACK counted its delivery (Linux
+    /// tx.delivered, tx.delivered_mstamp; its send time is the skb's
+    /// `tstamp`, Linux skb_mstamp_ns)
+    pub tx_delivered_mstamp: u64,
+    pub tx_delivered: u32,
     pub seq: u32,
     /// `seq` + data length + SYN + FIN
     pub end_seq: u32,
-    pub ack: u32,
+    /// The ACK field of a received segment (Linux ack_seq)
+    pub ack_seq: u32,
+    /// A SYN taking over a TIME_WAIT tuple: the new connection's ISN,
+    /// else 0 (Linux tcp_tw_isn)
+    pub tw_isn: u32,
+    /// A received segment's header length in words (Linux
+    /// tcp_hdr(skb)->doff, which header prediction compares)
+    pub doff: u8,
+    /// Segments a sent skb counts as, and their size when more than
+    /// one (Linux tcp_gso_segs, tcp_gso_size)
+    gso_segs: u16,
+    gso_size: u16,
+    /// TCP header flags (Linux tcp_flags)
     pub flags: u8,
-    pub wnd: u16,
-    /// MSS and window scale options (SYN and SYN-ACK)
-    pub mss: Option<u16>,
-    pub ws: Option<u8>,
-    /// Timestamps option (TSval, TSecr)
-    pub ts: Option<(u32, u32)>,
-    /// The ports of a received segment (its header is pulled)
-    pub sport: u16,
-    pub dport: u16,
+    /// A sent skb's scoreboard tags (Linux sacked: TCPCB_SACKED_ACKED,
+    /// _SACKED_RETRANS, _LOST, _EVER_RETRANS)
+    pub sacked: u8,
+}
+
+impl TcpSkbCb {
+    pub fn has(&self, f: u8) -> bool {
+        self.flags & f != 0
+    }
+
+    /// Linux tcp_skb_pcount
+    pub fn pcount(&self) -> u32 {
+        u32::from(self.gso_segs)
+    }
+
+    /// Linux tcp_skb_pcount_set
+    pub fn set_pcount(&mut self, n: u32) {
+        self.gso_segs = n.min(u32::from(u16::MAX)) as u16;
+    }
+
+    /// Linux tcp_skb_mss's tcp_gso_size
+    pub fn gso_size(&self) -> u32 {
+        u32::from(self.gso_size)
+    }
+
+    pub fn set_gso_size(&mut self, n: u32) {
+        self.gso_size = n.min(u32::from(u16::MAX)) as u16;
+    }
+}
+
+/// Most SACK blocks an option carries (Linux TCP_NUM_SACKS)
+pub const NUM_SACKS: usize = 4;
+
+/// The blocks of a SACK option, [start, end) each, in option order
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sacks {
+    pub n: u8,
+    pub b: [(u32, u32); NUM_SACKS],
+}
+
+impl Sacks {
+    /// The blocks present
+    pub fn blocks(&self) -> &[(u32, u32)] {
+        &self.b[..usize::from(self.n).min(NUM_SACKS)]
+    }
+
+    /// Append a block; false if full
+    pub fn push(&mut self, blk: (u32, u32)) -> bool {
+        let i = usize::from(self.n);
+        if i >= NUM_SACKS {
+            return false;
+        }
+        self.b[i] = blk;
+        self.n += 1;
+        true
+    }
 }
 
 impl SkBuff {
@@ -773,5 +943,15 @@ mod tests {
         assert_eq!(Arc::strong_count(&a), 2);
         drop(q);
         assert_eq!(Arc::strong_count(&a), 1);
+    }
+}
+
+#[cfg(test)]
+mod tcp_cb_tests {
+    /// TCP's per-skb state fits Linux's 48-byte skb->cb, which every
+    /// skb of every protocol carries
+    #[test]
+    fn tcp_cb_fits_linux_cb() {
+        assert!(core::mem::size_of::<super::TcpSkbCb>() <= 48);
     }
 }

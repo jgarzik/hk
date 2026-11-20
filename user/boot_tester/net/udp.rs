@@ -34,6 +34,7 @@ pub fn run_tests() {
     test_shut_rd();
     test_errqueue();
     test_src_spoof();
+    test_peek_off();
 }
 
 /// sendto/recvfrom with the source address
@@ -615,6 +616,60 @@ fn test_src_spoof() {
         t.eq(b"del addr", addr(nl, false, 1, x, 32, 0) as i64, 0);
         t.eq(b"send deleted", send_to(c, b"y", LO, pb, 0), ENETUNREACH);
         close(c);
+    }
+    close(a);
+    close(b);
+    t.done();
+}
+
+const SO_PEEK_OFF: i32 = 42;
+
+/// SO_PEEK_OFF (Linux udp_set_peek_off, __skb_try_recv_from_queue,
+/// skb_consume_udp): off by default (-1); each peek starts at the
+/// offset and moves it past what it returned, whole datagrams before it
+/// are skipped, a read moves it back by what it consumed; -1 turns it
+/// off. A raw socket has none: EOPNOTSUPP both ways.
+fn test_peek_off() {
+    let mut t = T::new(b"UDP_PEEK_OFF");
+    let (a, _) = udp_lo();
+    let (b, pb) = udp_lo();
+    t.eq(b"default", getint(b, SOL_SOCKET, SO_PEEK_OFF).1 as i64, -1);
+    t.eq(b"set", setint(b, SOL_SOCKET, SO_PEEK_OFF, 0), 0);
+    send_to(a, b"abcd", LO, pb, 0);
+    send_to(a, b"efgh", LO, pb, 0);
+    poll1(b, 1, 1000);
+    crate::helpers::msleep(20);
+    let mut buf = [0u8; 2];
+    let mut peek = |want: &[u8], t: &mut T| {
+        buf.fill(0);
+        let n = recv(b, &mut buf, MSG_PEEK | MSG_DONTWAIT);
+        t.ok(want, n == 2 && buf == *want, n);
+    };
+    peek(b"ab", &mut t);
+    peek(b"cd", &mut t);
+    peek(b"ef", &mut t);
+    t.eq(b"advanced", getint(b, SOL_SOCKET, SO_PEEK_OFF).1 as i64, 6);
+    let mut big = [0u8; 8];
+    let n = recv(b, &mut big, MSG_DONTWAIT);
+    t.ok(b"read whole", n == 4 && &big[..4] == b"abcd", n);
+    t.eq(
+        b"moved back",
+        getint(b, SOL_SOCKET, SO_PEEK_OFF).1 as i64,
+        2,
+    );
+    peek(b"gh", &mut t);
+    t.eq(b"off", setint(b, SOL_SOCKET, SO_PEEK_OFF, -1), 0);
+    t.eq(b"read off", getint(b, SOL_SOCKET, SO_PEEK_OFF).1 as i64, -1);
+    peek(b"ef", &mut t);
+    let r = hk_syscall::sys_socket(hk_syscall::AF_INET, hk_syscall::SOCK_RAW, 17) as i32;
+    if r >= 0 {
+        t.eq(
+            b"raw set",
+            setint(r, SOL_SOCKET, SO_PEEK_OFF, 0),
+            EOPNOTSUPP,
+        );
+        t.eq(b"raw get", getint(r, SOL_SOCKET, SO_PEEK_OFF).0, EOPNOTSUPP);
+        close(r);
     }
     close(a);
     close(b);

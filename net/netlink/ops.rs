@@ -218,7 +218,7 @@ impl ProtoOps for NlSock {
             m.cmsg
                 .put(SOL_NETLINK, NETLINK_PKTINFO, &cb.group.to_ne_bytes());
         }
-        scm::put(m, self.sk.flag(sf::PASSCRED), Some(cb.creds), None);
+        scm::put(m, self.sk.flag(sf::PASSCRED), false, Some(cb.creds), None);
         Ok(if flags & MSG_TRUNC != 0 {
             data.len()
         } else {

@@ -1,5 +1,6 @@
-//! AF_PACKET sockets: socket(AF_PACKET, SOCK_RAW | SOCK_DGRAM, proto)
-//! (Linux net/packet/af_packet.c, without the mmap rings and fanout)
+//! AF_PACKET sockets: socket(AF_PACKET, SOCK_RAW | SOCK_DGRAM, proto),
+//! and the obsolete SOCK_PACKET (`spkt`)
+//! (Linux net/packet/af_packet.c; the mmap rings in `ring`)
 //!
 //! Need CAP_NET_RAW (EPERM). A socket bound to a protocol (htons
 //! ETH_P_ALL or an EtherType; from socket() or bind(sockaddr_ll)) and
@@ -26,17 +27,27 @@
 //! sk_for_each_rcu), queueing GFP_ATOMIC copies; the unregister
 //! notifier, which sleeps per socket, takes a snapshot first. A
 //! released socket's list reference goes a grace period later (Linux
-//! SOCK_RCU_FREE), possibly in `rcuc/N`. Per socket:
-//! `bind` is one atomic word, changed only by compare-exchange (bind,
-//! device unregister); `rxq` (an `SkbQueue`, spin leaf: frames are
+//! SOCK_RCU_FREE), possibly in `rcuc/N`. Per socket: `sk_lock`
+//! (sleeping, Linux lock_sock) serializes bind and the ring options;
+//! `bind_lock` (spin, Linux po->bind_lock) guards the binding's
+//! changes and the hook (RUNNING: the device tap delivers to the
+//! socket), taken by bind, the device notifiers and release:
+//! `sk_lock` -> `bind_lock`. The binding is one atomic word, read
+//! lock-free (receive, send, getname); `rxq` (an `SkbQueue`, spin leaf: frames are
 //! copied into skbs GFP_ATOMIC before it, freed after it) and `filter`
 //! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
 //! `mclist` (sleeping `crate::sync::Mutex` leaf; Linux keeps po->mclist
 //! under RTNL) is changed under RTNL, which device promiscuity changes
 //! need: RTNL -> `mclist`.
 
+mod fanout;
 mod opts;
 mod rcv;
+mod ring;
+mod spkt;
+mod tx;
+mod v3;
+mod vnet;
 
 use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
@@ -82,6 +93,22 @@ mod pf {
     pub const IGNORE_OUTGOING: u32 = 1 << 2;
     /// SO_LOCK_FILTER
     pub const FILTER_LOCKED: u32 = 1 << 3;
+    /// The hook is registered: the tap delivers to the socket (Linux
+    /// PACKET_SOCK_RUNNING; changed under `bind_lock`)
+    pub const RUNNING: u32 = 1 << 4;
+    /// A receive ring takes the frames (Linux prot_hook.func is
+    /// tpacket_rcv; changed under `PacketSock.rx`)
+    pub const TPACKET: u32 = 1 << 5;
+    /// PACKET_TX_HAS_OFF (Linux PACKET_SOCK_TX_HAS_OFF)
+    pub const TX_HAS_OFF: u32 = 1 << 6;
+    /// PACKET_LOSS (Linux PACKET_SOCK_TP_LOSS)
+    pub const TP_LOSS: u32 = 1 << 7;
+    /// Short of room, skipped by rollover (Linux PACKET_SOCK_PRESSURE)
+    pub const PRESSURE: u32 = 1 << 8;
+    /// PACKET_QDISC_BYPASS (Linux PACKET_SOCK_QDISC_BYPASS: hk has no
+    /// qdisc, dev_queue_xmit already goes straight to the driver as
+    /// Linux packet_direct_xmit)
+    pub const QDISC_BYPASS: u32 = 1 << 9;
 }
 
 /// A link-layer address (struct sockaddr_ll)
@@ -136,16 +163,56 @@ pub struct PacketSock {
     sk: Sock,
     /// Bound protocol (host order, 0 = none) << 32 | ifindex (0 = all,
     /// -1 = a device that went away): one word, read lock-free
-    /// (receive, send, getname) and changed only by compare-exchange
-    /// from the value the change was decided on (bind, a device's
-    /// unregister), so neither can undo the other (Linux po->bind_lock)
+    /// (receive, send, getname), changed under `bind_lock` (Linux
+    /// po->num, po->ifindex)
     bind: AtomicU64,
+    /// Linux lock_sock: bind and the ring options
+    sk_lock: crate::sync::Mutex<()>,
+    /// Linux po->bind_lock: the binding's changes and RUNNING
+    bind_lock: crate::sync::spin::Mutex<()>,
     flags: AtomicU32,
     rxq: rcv::PktQueue,
     filter: RwLock<Option<Arc<Filter>>>,
-    /// PACKET_STATISTICS since the last read
+    /// PACKET_STATISTICS since the last read (Linux po->stats,
+    /// po->tp_drops)
     packets: AtomicU32,
     drops: AtomicU32,
+    /// tpacket_stats_v3.tp_freeze_q_cnt
+    freeze_q_cnt: AtomicU32,
+    /// Linux po->pg_vec_lock: ring swaps against mmap
+    pg_vec_lock: crate::sync::Mutex<()>,
+    /// The receive ring (Linux po->rx_ring, under the receive queue
+    /// lock)
+    rx: crate::sync::spin::Mutex<ring::RxRing>,
+    /// The transmit ring (Linux po->tx_ring)
+    tx: crate::sync::spin::Mutex<tx::TxRing>,
+    /// TX ring frames sent and not yet freed (Linux tx_ring's
+    /// pending_refcnt, per CPU there: one counter per socket here, hit
+    /// once per frame each way), their completions (Linux
+    /// po->skb_completion's count and wait queue)
+    tx_pending: AtomicU32,
+    tx_done: AtomicU32,
+    tx_wq: crate::sync::waitqueue::WaitQueue,
+    /// Its own `Arc`, weakly (a fanout group's member list holds it)
+    me: spin::Once<alloc::sync::Weak<PacketSock>>,
+    /// Its fanout group (Linux po->fanout; changed under `FANOUT` and
+    /// `bind_lock`) and rollover state (po->rollover)
+    fanout: crate::sync::spin::Mutex<Option<Arc<fanout::Fanout>>>,
+    rollover: crate::sync::spin::Mutex<Option<Arc<fanout::Rollover>>>,
+    /// The V3 ring's retire timer (Linux prb_bdqc.retire_blk_timer)
+    retire: Arc<v3::Retire>,
+    /// User mappings of the rings (Linux po->mapped)
+    mapped: Arc<ring::Mapped>,
+    /// PACKET_VERSION, the ring frame header length (Linux
+    /// po->tp_hdrlen), PACKET_RESERVE, PACKET_TIMESTAMP,
+    /// PACKET_COPY_THRESH
+    tp_version: AtomicU32,
+    tp_hdrlen: AtomicU32,
+    tp_reserve: AtomicU32,
+    tp_tstamp: AtomicU32,
+    copy_thresh: AtomicU32,
+    /// PACKET_VNET_HDR(_SZ): 0, 10 or 12 (Linux po->vnet_hdr_sz)
+    vnet_hdr_sz: AtomicU32,
     /// PACKET_ADD_MEMBERSHIP entries (changed under RTNL)
     mclist: crate::sync::Mutex<Vec<opts::Mreq>>,
     /// Link on its namespace's list (Linux sk_node)
@@ -161,8 +228,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     if !crate::task::capable(crate::task::CAP_NET_RAW) {
         return Err(KernelError::NotPermitted);
     }
-    if stype != SOCK_RAW && stype != SOCK_DGRAM {
-        // SOCK_PACKET (obsolete) is not supported
+    if stype != SOCK_RAW && stype != SOCK_DGRAM && stype != spkt::SOCK_PACKET {
         return Err(KernelError::SocketTypeNotSupported);
     }
     let proto = u16::from_be(protocol as u16);
@@ -170,61 +236,96 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     let s = try_arc(PacketSock {
         sk: Sock::new(net.clone(), AF_PACKET, stype, protocol),
         bind: AtomicU64::new(pack(proto, 0)),
+        sk_lock: crate::sync::Mutex::new(()),
+        bind_lock: crate::sync::spin::Mutex::new(()),
         flags: AtomicU32::new(0),
         rxq: rcv::PktQueue::default(),
         filter: RwLock::new(None),
         packets: AtomicU32::new(0),
         drops: AtomicU32::new(0),
+        freeze_q_cnt: AtomicU32::new(0),
+        pg_vec_lock: crate::sync::Mutex::new(()),
+        rx: crate::sync::spin::Mutex::new(ring::RxRing::default()),
+        tx: crate::sync::spin::Mutex::new(tx::TxRing::default()),
+        tx_pending: AtomicU32::new(0),
+        tx_done: AtomicU32::new(0),
+        tx_wq: crate::sync::waitqueue::WaitQueue::new(),
+        me: spin::Once::new(),
+        fanout: crate::sync::spin::Mutex::new(None),
+        rollover: crate::sync::spin::Mutex::new(None),
+        retire: try_arc(v3::Retire::new())?,
+        mapped: try_arc(ring::Mapped::default())?,
+        tp_version: AtomicU32::new(ring::TPACKET_V1),
+        tp_hdrlen: AtomicU32::new(0),
+        tp_reserve: AtomicU32::new(0),
+        tp_tstamp: AtomicU32::new(0),
+        copy_thresh: AtomicU32::new(0),
+        vnet_hdr_sz: AtomicU32::new(0),
         mclist: crate::sync::Mutex::new(Vec::new()),
         link: crate::util::list::Link::new(),
         rcu: crate::sync::rcu::RcuHead::new(),
     })?;
+    s.retire.attach(&s);
+    s.me.call_once(|| Arc::downgrade(&s));
+    // Linux packet_create: hooked at once when a protocol is given
+    if proto != 0 {
+        let g = s.bind_lock.lock();
+        s.register_hook(&g);
+    }
     net.packet.insert(&s);
     Ok(s)
 }
 
-/// Bound to `dev` (protocol set: Linux PACKET_SOCK_RUNNING)
-fn bound_to(s: &PacketSock, dev: &NetDevice) -> Option<u16> {
-    let (num, ifindex) = s.bound();
-    (ifindex > 0 && ifindex as u32 == dev.ifindex()).then_some(num)
+/// Bound to `dev`
+fn bound_to(s: &PacketSock, dev: &NetDevice) -> bool {
+    let (_, ifindex) = s.bound();
+    ifindex > 0 && ifindex as u32 == dev.ifindex()
+}
+
+/// `dev` came up (Linux packet_notifier NETDEV_UP, RTNL held): a
+/// socket bound to it with a protocol is hooked again
+pub fn netdev_up(net: &crate::net::NetNamespace, dev: &NetDevice) {
+    net.packet.for_each(|s| {
+        let g = s.bind_lock.lock();
+        if bound_to(s, dev) && s.bound().0 != 0 {
+            s.register_hook(&g);
+        }
+    });
 }
 
 /// `dev` went down (Linux packet_notifier NETDEV_DOWN, RTNL held): a
-/// socket receiving on it gets ENETDOWN
+/// socket hooked on it is unhooked and gets ENETDOWN, reported
+/// (sk_error_report: POLLERR, a blocked receive wakes)
 pub fn netdev_down(net: &crate::net::NetNamespace, dev: &NetDevice) {
     net.packet.for_each(|s| {
-        if bound_to(s, dev).is_some_and(|n| n != 0) {
-            s.sk.set_err(KernelError::NetworkDown);
+        let g = s.bind_lock.lock();
+        if bound_to(s, dev) {
+            s.unhook_err(&g);
         }
     });
 }
 
 /// `dev` is unregistered (Linux packet_notifier NETDEV_UNREGISTER):
-/// its memberships go, and a socket bound to it is left bound to no
-/// device (ifindex -1), so it receives nothing and sends fail ENXIO
+/// its memberships go, and a socket bound to it is unhooked (ENETDOWN)
+/// and left bound to no device (ifindex -1), so it receives nothing
+/// and sends fail ENXIO
 pub fn netdev_unregister(
     r: &crate::net::rtnl::RtnlGuard,
     net: &crate::net::NetNamespace,
     dev: &NetDevice,
 ) {
-    // The device is unlisted already (unregister_netdevice): a bind
-    // that still found it stored first and is seen here; one that
-    // missed it moves itself to -1
+    // The device is unlisted already (unregister_netdevice). A bind
+    // holds bind_lock from its lookup through its store, and the
+    // binding is tested under it here: a bind that found the device
+    // is seen, one that missed it failed ENODEV (Linux gets the same
+    // from bind's RCU section and synchronize_net before the notifier)
     for s in net.packet.snapshot() {
         opts::mclist_delete(r, &s, dev);
-        let mut w = s.bind.load(Ordering::Acquire);
-        loop {
-            let (num, ifindex) = unpack(w);
-            if ifindex <= 0 || ifindex as u32 != dev.ifindex() {
-                break;
-            }
-            match s
-                .bind
-                .compare_exchange(w, pack(num, -1), Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(now) => w = now,
-            }
+        let g = s.bind_lock.lock();
+        if bound_to(&s, dev) {
+            s.unhook_err(&g);
+            let (num, _) = s.bound();
+            s.bind.store(pack(num, -1), Ordering::Release);
         }
     }
 }
@@ -238,10 +339,55 @@ fn unpack(w: u64) -> (u16, i32) {
     ((w >> 32) as u16, w as u32 as i32)
 }
 
+/// `PacketSock.bind_lock` held
+type BindGuard<'a> = crate::sync::spin::MutexGuard<'a, ()>;
+
 impl PacketSock {
     /// (protocol, ifindex) bound
     fn bound(&self) -> (u16, i32) {
         unpack(self.bind.load(Ordering::Acquire))
+    }
+
+    /// Hook the socket on the tap (Linux __register_prot_hook)
+    fn register_hook(&self, _g: &BindGuard<'_>) {
+        if !self.flag(pf::RUNNING) {
+            if let Some(f) = self.fanout.lock().clone() {
+                self.fanout_link(&f);
+            }
+            self.set_flag(pf::RUNNING, true);
+        }
+    }
+
+    /// Clear RUNNING, out of the fanout group if in one
+    fn unhook(&self) {
+        if self.flag(pf::RUNNING)
+            && let Some(f) = self.fanout.lock().clone()
+        {
+            self.fanout_unlink(&f);
+        }
+        self.set_flag(pf::RUNNING, false);
+    }
+
+    /// Unhook it (Linux __unregister_prot_hook): with `sync` the lock
+    /// is dropped for a grace period, after which no tap still
+    /// delivers by the old binding (Linux synchronize_net)
+    fn unregister_hook<'a>(&'a self, g: BindGuard<'a>, sync: bool) -> BindGuard<'a> {
+        self.unhook();
+        if !sync {
+            return g;
+        }
+        drop(g);
+        crate::sync::rcu::synchronize();
+        self.bind_lock.lock()
+    }
+
+    /// The device went: unhooked, ENETDOWN reported (Linux
+    /// packet_notifier NETDEV_DOWN / UNREGISTER)
+    fn unhook_err(&self, _g: &BindGuard<'_>) {
+        if self.flag(pf::RUNNING) {
+            self.unhook();
+            self.sk.set_err(KernelError::NetworkDown);
+        }
     }
 
     fn flag(&self, f: u32) -> bool {
@@ -254,6 +400,83 @@ impl PacketSock {
         } else {
             self.flags.fetch_and(!f, Ordering::AcqRel);
         }
+    }
+
+    /// Bind to the device `ifindex` (0: all) and `proto` (0: keep);
+    /// Linux packet_do_bind
+    fn do_bind(&self, ifindex: i32, proto: u16) -> Result<(), KernelError> {
+        self.do_bind_dev(
+            || match ifindex {
+                0 => Ok(None),
+                i => self.dev(i).map(Some).ok_or(KernelError::NoDevice),
+            },
+            proto,
+        )
+    }
+
+    /// Linux packet_do_bind with the device lookup `lookup` (by index,
+    /// or by name for SOCK_PACKET): ENODEV for an unknown device. A
+    /// changed binding unhooks the socket, waits out the taps, then
+    /// hooks it again, or reports ENETDOWN for a down device or one
+    /// unregistered meanwhile ("unlisted": bound to no device, -1)
+    fn do_bind_dev(
+        &self,
+        lookup: impl Fn() -> Result<Option<Arc<NetDevice>>, KernelError>,
+        proto: u16,
+    ) -> Result<(), KernelError> {
+        let _sk = self.sk_lock.lock();
+        let mut g = self.bind_lock.lock();
+        let (cur, cur_if) = self.bound();
+        let proto = if proto != 0 { proto } else { cur };
+        if self.fanout.lock().is_some() {
+            return Err(KernelError::InvalidArgument);
+        }
+        let dev = lookup()?;
+        let new_if = dev.as_ref().map_or(0, |d| d.ifindex() as i32);
+        // Linux compares po->prot_hook.dev, none once unlisted
+        let need_rehook = cur != proto || cur_if.max(0) != new_if;
+        let mut unlisted = false;
+        if need_rehook {
+            if self.flag(pf::RUNNING) {
+                // Linux: po->num 0 keeps packet_notifier from hooking it
+                self.bind.store(pack(0, cur_if), Ordering::Release);
+                g = self.unregister_hook(g, true);
+                unlisted = dev
+                    .as_ref()
+                    .is_some_and(|d| self.dev(d.ifindex() as i32).is_none());
+            }
+            let ifindex = if unlisted { -1 } else { new_if };
+            self.bind.store(pack(proto, ifindex), Ordering::Release);
+        }
+        if proto == 0 || !need_rehook {
+            return Ok(());
+        }
+        if !unlisted && dev.as_ref().is_none_or(|d| d.is_up()) {
+            self.register_hook(&g);
+        } else {
+            self.sk.set_err(KernelError::NetworkDown);
+        }
+        Ok(())
+    }
+
+    /// skb->protocol of a frame sent with protocol `proto` (Linux 6.8
+    /// packet_snd / tpacket_fill_skb: the sockaddr's or the bound
+    /// protocol; packet_parse_headers takes a SOCK_RAW frame's own
+    /// EtherType for 0 or ETH_P_ALL, dev_parse_header_protocol)
+    fn tx_protocol(&self, proto: u16, frame: &[u8]) -> crate::net::ethernet::EtherType {
+        let p = if (proto == 0 || proto == ETH_P_ALL) && self.sk.stype == SOCK_RAW {
+            frame
+                .get(12..14)
+                .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]))
+        } else {
+            proto
+        };
+        crate::net::ethernet::EtherType::from_be(p)
+    }
+
+    /// PACKET_VNET_HDR's header size, 0 without
+    fn vnet_hdr_len(&self) -> usize {
+        self.vnet_hdr_sz.load(Ordering::Acquire) as usize
     }
 
     /// Identity for skipping our own outgoing frames
@@ -348,6 +571,12 @@ fn eth_hard_header(
     Ok(())
 }
 
+/// A frame over the MTU may carry an 802.1Q tag (Linux
+/// packet_extra_vlan_len_allowed, Ethernet devices)
+fn extra_vlan_allowed(frame: &[u8]) -> bool {
+    frame.get(12..14) == Some(&ETH_P_8021Q.to_be_bytes()[..])
+}
+
 /// Largest send (Linux packet_snd: MTU plus the link header for
 /// SOCK_RAW, plus a VLAN tag for tagged frames)
 fn check_len(stype: i32, mtu: usize, data: &[u8]) -> Result<(), KernelError> {
@@ -382,63 +611,49 @@ impl ProtoOps for PacketSock {
 
     fn release(&self) {
         self.sk.net.packet.remove(self);
+        {
+            // Linux packet_release: unhooked, po->num 0
+            let g = self.bind_lock.lock();
+            let _g = self.unregister_hook(g, false);
+            let (_, ifindex) = self.bound();
+            self.bind.store(pack(0, ifindex), Ordering::Release);
+        }
         opts::flush_mclist(self);
+        {
+            // Linux packet_release: the rings go (closing: even mapped)
+            let _sk = self.sk_lock.lock();
+            if self.rx.lock().ring.is_some() {
+                let _ = ring::set_ring(self, &ring::Req::default(), true, false);
+            }
+            if self.tx.lock().ring.is_some() {
+                let _ = ring::set_ring(self, &ring::Req::default(), true, true);
+            }
+        }
+        // Linux fanout_release: the group goes with its last member
+        fanout::release(self);
         self.rxq.clear();
         self.sk.purge_err();
+        // Linux packet_release's sock_put: the last reference
+        self.sk.inuse_end();
     }
 
-    /// Linux packet_bind: a sockaddr_ll; protocol 0 keeps the current
-    /// one; ENODEV for an unknown device; a down device is ENETDOWN on
-    /// the socket (the bind itself succeeds)
+    /// Linux packet_bind: a sockaddr_ll
     fn bind(&self, a: &[u8]) -> Result<(), KernelError> {
+        if self.spkt() {
+            return self.bind_spkt(a);
+        }
         if a.len() < SLL_LEN || u16::from_ne_bytes([a[0], a[1]]) != AF_PACKET {
             return Err(KernelError::InvalidArgument);
         }
         let sll = Sll::parse(a);
-        let dev = if sll.ifindex != 0 {
-            Some(self.dev(sll.ifindex).ok_or(KernelError::NoDevice)?)
-        } else {
-            None
-        };
-        let mut w = self.bind.load(Ordering::Acquire);
-        let (proto, new) = loop {
-            let (cur, cur_if) = unpack(w);
-            let proto = if sll.protocol != 0 { sll.protocol } else { cur };
-            if proto == cur && sll.ifindex == cur_if {
-                return Ok(());
-            }
-            let new = pack(proto, sll.ifindex);
-            match self
-                .bind
-                .compare_exchange(w, new, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break (proto, new),
-                Err(now) => w = now,
-            }
-        };
-        // Look again after storing: a device unregistered meanwhile was
-        // unlisted before its sockets were visited, so either that visit
-        // sees this binding or this lookup misses the device. Then the
-        // socket is bound to none, as Linux packet_do_bind's "unlisted"
-        // (the bind itself succeeds)
-        let mut ifindex = sll.ifindex;
-        if dev.is_some() && self.dev(sll.ifindex).is_none() {
-            let _ = self.bind.compare_exchange(
-                new,
-                pack(proto, -1),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            ifindex = -1;
-        }
-        if proto != 0 && ifindex != -1 && dev.is_some_and(|d| !d.is_up()) {
-            self.sk.set_err(KernelError::NetworkDown);
-        }
-        Ok(())
+        self.do_bind(sll.ifindex, sll.protocol)
     }
 
     /// Linux packet_getname: no peer; the bound device's address
     fn getname(&self, peer: bool) -> Result<Vec<u8>, KernelError> {
+        if self.spkt() {
+            return self.getname_spkt(peer);
+        }
         if peer {
             return Err(KernelError::OperationNotSupported);
         }
@@ -456,8 +671,44 @@ impl ProtoOps for PacketSock {
         Ok(sll.bytes()[..SLL_ADDR_OFF + sll.halen as usize].to_vec())
     }
 
+    /// Linux packet_poll: datagram_poll, and readable while the ring
+    /// has a filled frame
     fn poll(&self) -> u16 {
-        self.rxq.poll(&self.sk)
+        fanout::try_clear_pressure(self);
+        let mut mask = self.rxq.poll(&self.sk);
+        if self.ring_readable() {
+            mask |= crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM;
+        }
+        if tx::tx_writable(self) {
+            mask |= crate::io::poll::POLLOUT | crate::io::poll::POLLWRNORM;
+        }
+        mask
+    }
+
+    /// Linux packet_mmap (SOCK_PACKET: sock_no_mmap)
+    fn mmap(&self) -> Result<(), KernelError> {
+        if self.spkt() {
+            return Err(KernelError::NoDevice);
+        }
+        Ok(())
+    }
+
+    /// Linux packet_mmap: from offset 0 only
+    fn mmap_offset(&self, off: u64) -> Result<(), KernelError> {
+        if off != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    fn mmap_hold(&self, len: u64) -> Result<Option<crate::mm::vma::VmHold>, KernelError> {
+        ring::mmap_hold(self, len)
+    }
+
+    // SAFETY: ring pages, which hold only frames shared with user
+    // space; each handed out with a reference (`PgVec::map_page`)
+    unsafe fn map_page(&self, idx: u64) -> Option<u64> {
+        ring::map_page(self, idx)
     }
 
     /// SIOCINQ: length of the next frame; SIOCOUTQ: nothing is queued
@@ -475,32 +726,80 @@ impl ProtoOps for PacketSock {
         self.rxq.inq()
     }
 
+    /// SOCK_PACKET has no setsockopt/getsockopt (Linux: EOPNOTSUPP
+    /// past SOL_SOCKET)
     fn setsockopt(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<(), KernelError>> {
+        if self.spkt() && level != crate::net::socket::SOL_SOCKET {
+            return Some(Err(KernelError::OperationNotSupported));
+        }
         opts::set(self, level, opt, v)
     }
 
     fn getsockopt(&self, level: i32, opt: i32) -> Option<Result<OptOut, KernelError>> {
-        opts::get(self, level, opt)
+        if self.spkt() && level != crate::net::socket::SOL_SOCKET {
+            return Some(Err(KernelError::OperationNotSupported));
+        }
+        opts::get(self, level, opt, None)
+    }
+
+    fn getsockopt_in(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<OptOut, KernelError>> {
+        if self.spkt() && level != crate::net::socket::SOL_SOCKET {
+            return Some(Err(KernelError::OperationNotSupported));
+        }
+        opts::get(self, level, opt, Some(v))
     }
 
     /// Linux packet_snd
-    fn sendmsg(&self, m: &mut SendMsg<'_>, _flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
+        if self.spkt() {
+            return self.sendmsg_spkt(m);
+        }
+        // Linux packet_sendmsg: a transmit ring sends its frames
+        // (checked again under pg_vec_lock)
+        if self.tx.lock().ring.is_some() {
+            return tx::tpacket_snd(self, m, flags);
+        }
         let Dest { dev, proto, addr } = self.dest(m)?;
         if !dev.is_up() {
             return Err(KernelError::NetworkDown);
         }
-        let len = m.data.len();
+        let total = m.data.len();
+        // Linux packet_snd_vnet_parse: the header first
+        let vnet = self.vnet_hdr_len();
+        let mut hdr = vnet::VnetHdr::default();
+        if vnet != 0 {
+            if total < vnet {
+                return Err(KernelError::InvalidArgument);
+            }
+            // The whole vnet_hdr_sz is consumed, the header from its
+            // first bytes (Linux packet_snd_vnet_parse, then
+            // iov_iter_advance past the rest)
+            hdr = vnet::VnetHdr::parse(&m.data.take(vnet)?[..vnet::VNET_HDR_LEN]);
+            vnet::snd_parse(&mut hdr, total - vnet)?;
+        }
+        let len = total - vnet;
         let mtu = dev.mtu() as usize;
-        if len > mtu + ETH_HLEN + VLAN_HLEN {
+        let gso = hdr.gso_type != 0;
+        if !gso && len > mtu + ETH_HLEN + VLAN_HLEN {
             return Err(KernelError::MessageTooLong);
         }
-        let data = m.data.take(len)?;
-        check_len(self.sk.stype, mtu, &data)?;
+        let mut data = m.data.take_at(vnet, len)?;
+        if gso {
+            if self.sk.stype == SOCK_RAW && data.len() < ETH_HLEN {
+                return Err(KernelError::InvalidArgument);
+            }
+        } else {
+            check_len(self.sk.stype, mtu, &data)?;
+        }
+        if vnet != 0 {
+            vnet::to_frame(&hdr, &mut data)?;
+        }
         let mut skb = self.build(&dev, proto, addr, &data)?;
+        skb.protocol = self.tx_protocol(proto, skb.data());
         skb.dev = Some(dev);
         skb.owner = self.id();
         crate::net::dev::dev_queue_xmit(skb)?;
-        Ok(len)
+        Ok(total)
     }
 
     /// Linux packet_recvmsg
@@ -514,6 +813,7 @@ impl ProtoOps for PacketSock {
             return Err(KernelError::WouldBlock);
         }
         let f = self.rxq.recv(&self.sk, flags)?;
+        fanout::try_clear_pressure(self);
         rcv::deliver(self, m, &f, flags)
     }
 }

@@ -111,7 +111,9 @@ fn ioc(fd: i32, cmd: u64, r: &mut Ifr) -> i64 {
 /// The first Ethernet interface (SIOCGIFNAME over small indices +
 /// SIOCGIFHWADDR family ARPHRD_ETHER)
 fn find_ether(fd: i32) -> Ifr {
-    for idx in 1..32 {
+    // Indexes only grow: a NIC rebound by earlier tests (fail-nth binds)
+    // registers its device under a new one each time, as Linux
+    for idx in 1..4096 {
         let mut r = Ifr([0; 40]);
         r.set_i32(idx);
         if ioc(fd, SIOCGIFNAME, &mut r) != 0 {

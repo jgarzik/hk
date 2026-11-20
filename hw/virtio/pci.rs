@@ -834,14 +834,9 @@ impl crate::base::Bound for VirtioPciDev {
         super::free_index(self.index);
         let _ = self.vdev.reset();
         self.vdev.free_irq();
-        let cmd = self.pci.cfg_read16(PCI_COMMAND);
-        self.pci
-            .cfg_write16(PCI_COMMAND, cmd & !crate::hw::pci::command::BUS_MASTER);
+        self.pci.disable_device();
     }
 }
-
-/// PCI command register offset
-const PCI_COMMAND: u8 = 0x04;
 
 /// Modern devices only (ENODEV for legacy ones, as without
 /// virtio_pci.force_legacy support)

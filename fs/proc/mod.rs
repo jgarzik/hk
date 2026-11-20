@@ -30,6 +30,7 @@ mod array;
 mod mounts;
 mod opts;
 mod proc_net;
+mod proc_sysctl;
 pub mod seq;
 
 use alloc::collections::BTreeMap;
@@ -262,8 +263,17 @@ pub enum ProcfsInodeData {
     PidFile { pid: ProcPid, generator: PidGen },
     /// Per-process symlink (/proc/<pid>/exe, cwd, root)
     PidLink { pid: ProcPid, target: PidLinkKind },
-    /// /proc/sys file (readable, maybe writable)
-    Sysctl { ctl: &'static crate::sysctl::Ctl },
+    /// /proc/sys file (readable, maybe writable); a network one bound
+    /// to the namespace it was found in
+    Sysctl { ctl: crate::sysctl::Entry },
+    /// A /proc/sys/net directory (`proc_sysctl`): its path below
+    /// /proc/sys, and the namespace it is of (None: the root set's
+    /// /proc/sys/net, whose entries are links into the looking-up
+    /// task's namespace)
+    SysctlDir {
+        dir: &'static str,
+        net: Option<proc_sysctl::NetDir>,
+    },
     /// /proc/<pid>/fail-nth: the task's fault-injection countdown
     /// (Linux proc_fail_nth_operations, `mm::fault_inject`)
     FailNth { pid: ProcPid },
@@ -384,6 +394,7 @@ impl ProcfsInodeData {
                 | Self::PidTaskDirectory { .. }
                 | Self::PidNetDirectory { .. }
                 | Self::PidFdinfoDirectory { .. }
+                | Self::SysctlDir { .. }
         )
     }
 }
@@ -542,13 +553,10 @@ impl InodeOps for ProcfsInodeOps {
             inode.set_uid(uid);
             inode.set_gid(gid);
         }
-        let Some(ctl) = sysctl_of(inode) else {
+        let Some(p) = sysctl_perm_of(inode) else {
             return crate::fs::dac::generic_permission(cred, inode, mask);
         };
-        if mask & crate::fs::MAY_EXEC != 0 {
-            return Err(KernelError::PermissionDenied);
-        }
-        crate::sysctl::permission(ctl, cred, mask)
+        sysctl_permission(inode, p, cred, mask)
     }
 
     /// A new per-process inode takes the task's owner (Linux
@@ -570,7 +578,11 @@ impl InodeOps for ProcfsInodeOps {
 pub struct ProcRcu {
     pid: Option<ProcPid>,
     kind: RcuKind,
-    ctl: Option<&'static crate::sysctl::Ctl>,
+    /// A /proc/sys entry's permission data
+    ctl: Option<crate::sysctl::Perm>,
+    /// The id of the network namespace a /proc/sys/net entry is of
+    /// (Linux its header's set: proc_sys_compare)
+    net: Option<u64>,
     /// The superblock's options
     opts: Option<Arc<opts::ProcOpts>>,
 }
@@ -623,7 +635,7 @@ impl ProcRcu {
             D::PidFile { .. } => RcuKind::PidFile,
             D::FdSymlink { .. } => RcuKind::Fd,
             D::FdinfoFile { .. } => RcuKind::FdinfoFile,
-            D::Sysctl { .. } => RcuKind::Sysctl,
+            D::Sysctl { .. } | D::SysctlDir { .. } => RcuKind::Sysctl,
             D::NetFile { .. } => RcuKind::Net,
             D::PidNsDirectory { .. }
             | D::NamespaceFile { .. }
@@ -632,14 +644,16 @@ impl ProcRcu {
             | D::FailNth { .. }
             | D::PidNetDirectory { .. } => RcuKind::Pid,
         };
-        let ctl = match d {
-            D::Sysctl { ctl } => Some(*ctl),
+        let net = match d {
+            D::Sysctl { ctl } => ctl.net_id(),
+            D::SysctlDir { net, .. } => net.as_ref().map(|n| n.id),
             _ => None,
         };
         Self {
             pid: d.pid(),
             kind,
-            ctl,
+            ctl: sysctl_perm(d),
+            net,
             opts,
         }
     }
@@ -727,11 +741,9 @@ fn permission_rcu(inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelErr
             inode.set_gid(gid);
         }
         (RcuKind::Sysctl, _) => {
-            let ctl = r.ctl.ok_or(KernelError::NoChild)?;
-            if mask & crate::fs::MAY_EXEC != 0 {
-                return Err(KernelError::PermissionDenied);
-            }
-            return crate::sysctl::permission(ctl, cred, mask);
+            let p = r.ctl.ok_or(KernelError::NoChild)?;
+            drop(g);
+            return sysctl_permission(inode, p, cred, mask);
         }
         _ => {}
     }
@@ -781,6 +793,11 @@ fn revalidate_ref(inode: &Inode) -> bool {
     // A /proc/<pid>/net file is looked up afresh by every walk, so
     // it follows the task's namespace (Linux proc_net_d_revalidate)
     if with_data(inode, |d| matches!(d, ProcfsInodeData::NetFile { .. })).unwrap_or(false) {
+        return false;
+    }
+    // A /proc/sys/net entry of a namespace that is going is invalid
+    // (Linux proc_sys_revalidate: !unregistering)
+    if with_data(inode, sysctl_unregistering).unwrap_or(false) {
         return false;
     }
     let fd_of = |d: &ProcfsInodeData| match d {
@@ -842,6 +859,7 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         Task(ProcPid),
         Fdinfo(ProcPid),
         Net(ProcPid),
+        Sysctl(&'static str, Option<proc_sysctl::NetDir>),
     }
     let kind = with_data(dir, |d| -> Result<_, KernelError> {
         Ok(match d {
@@ -857,6 +875,7 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
             ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
             ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
             ProcfsInodeData::PidNetDirectory { pid } => Dir::Net(pid.clone()),
+            ProcfsInodeData::SysctlDir { dir, net } => Dir::Sysctl(dir, net.clone()),
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
@@ -928,6 +947,7 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         }
         Dir::Fdinfo(p) => lookup_pid_fdinfo_entry(dir, &p, name),
         Dir::Net(p) => proc_net::lookup(dir, &p, name),
+        Dir::Sysctl(path, net) => proc_sysctl::lookup(dir, path, net.as_ref(), name),
     }
 }
 
@@ -1840,7 +1860,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
         Pid(ProcPid, PidGen),
         File(ContentGenerator),
         Fdinfo(ProcPid, i32),
-        Sysctl(&'static crate::sysctl::Ctl),
+        Sysctl(crate::sysctl::Entry),
         FailNth(ProcPid),
         Net(proc_net::NetGen),
     }
@@ -1851,7 +1871,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
             // A namespace file has no read (Linux ns_file_operations)
             ProcfsInodeData::NamespaceFile { .. } => return Err(KernelError::InvalidArgument),
             ProcfsInodeData::FdinfoFile { pid, fd } => Gen::Fdinfo(pid.clone(), *fd),
-            ProcfsInodeData::Sysctl { ctl } => Gen::Sysctl(ctl),
+            ProcfsInodeData::Sysctl { ctl } => Gen::Sysctl(ctl.clone()),
             ProcfsInodeData::FailNth { pid } => Gen::FailNth(pid.clone()),
             ProcfsInodeData::NetFile { generator, .. } => Gen::Net(*generator),
             ProcfsInodeData::FdSymlink { .. }
@@ -1864,7 +1884,8 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
             | ProcfsInodeData::PidNetDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
+            | ProcfsInodeData::PidFdinfoDirectory { .. }
+            | ProcfsInodeData::SysctlDir { .. } => return Err(KernelError::IsDirectory),
         })
     })
     .ok_or(KernelError::Io)??;
@@ -1882,7 +1903,7 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
         Gen::File(ContentGenerator::Plain(g)) => g(),
         Gen::File(ContentGenerator::Opener(g)) => g(file),
         Gen::Fdinfo(p, fd) => gen_fdinfo_content(&task(&p)?, fd, &opts::pid_ns(&inode)),
-        Gen::Sysctl(ctl) => crate::sysctl::read(ctl),
+        Gen::Sysctl(ctl) => crate::sysctl::read(&ctl)?,
         Gen::FailNth(p) => {
             let n = task(&p)?
                 .fail_nth
@@ -1982,8 +2003,14 @@ impl FileOps for ProcfsFileOps {
             }
             _ => None,
         };
+        // A sysctl of a namespace that is going is not opened (Linux
+        // proc_sys_open: ENOENT)
+        let ctl = sysctl_of(&inode);
+        if let Some(e) = &ctl {
+            crate::sysctl::open(e)?;
+        }
         // A generated file keeps its last generation (seq_file)
-        if inode.mode().is_file() && sysctl_of(&inode).is_none() && fail_nth_of(&inode).is_none() {
+        if inode.mode().is_file() && ctl.is_none() && fail_nth_of(&inode).is_none() {
             let po = try_arc(ProcOpen {
                 mm,
                 mnt,
@@ -2009,14 +2036,15 @@ impl FileOps for ProcfsFileOps {
             return Err(KernelError::OperationNotSupported);
         }
         let pos = at.unwrap_or_else(|| file.get_pos());
-        // A numeric sysctl reads only from offset 0 (Linux
-        // do_proc_dointvec: *ppos on a read is EOF); a text one from
+        // A sysctl read is checked first (Linux proc_sys_call_handler:
+        // sysctl_perm MAY_READ); a numeric one reads only from offset 0
+        // (do_proc_dointvec: *ppos on a read is EOF), a text one from
         // any (proc_dostring)
-        if pos != 0
-            && let Some(inode) = file.get_inode()
-            && sysctl_of(&inode).is_some_and(|c| c.text.is_none())
-        {
-            return Ok(0);
+        if let Some(c) = file.get_inode().and_then(|i| sysctl_of(&i)) {
+            crate::sysctl::call_check(&c, false)?;
+            if pos != 0 && !c.is_text() {
+                return Ok(0);
+            }
         }
         let n = match proc_open(file) {
             Some(po) => seq_read(file, &po, to, pos)?,
@@ -2049,11 +2077,11 @@ impl FileOps for ProcfsFileOps {
             return write_fail_nth(&p.task().ok_or(KernelError::NoProcess)?, from);
         }
         let ctl = sysctl_of(&inode).ok_or(KernelError::Io)?;
-        crate::sysctl::permission(ctl, &crate::task::current_cred(), crate::fs::MAY_WRITE)?;
+        crate::sysctl::call_check(&ctl, true)?;
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
         // Whole or EFAULT (Linux proc_sys_call_handler)
         from.copy_from_full(&mut buf)?;
-        let n = crate::sysctl::write(ctl, &buf, at.unwrap_or_else(|| file.get_pos()))?;
+        let n = crate::sysctl::write(&ctl, &buf, at.unwrap_or_else(|| file.get_pos()))?;
         if at.is_none() {
             file.advance_pos(n as u64);
         }
@@ -2078,6 +2106,7 @@ impl FileOps for ProcfsFileOps {
             Task(ProcPid),
             Fdinfo(ProcPid),
             Net(ProcPid),
+            Sysctl(&'static str, Option<proc_sysctl::NetDir>),
         }
         let kind = with_data(&inode, |d| -> Result<_, KernelError> {
             Ok(match d {
@@ -2088,6 +2117,7 @@ impl FileOps for ProcfsFileOps {
                 ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
                 ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
                 ProcfsInodeData::PidNetDirectory { pid } => Dir::Net(pid.clone()),
+                ProcfsInodeData::SysctlDir { dir, net } => Dir::Sysctl(dir, net.clone()),
                 ProcfsInodeData::File { .. }
                 | ProcfsInodeData::NamespaceFile { .. }
                 | ProcfsInodeData::FdSymlink { .. }
@@ -2106,7 +2136,7 @@ impl FileOps for ProcfsFileOps {
         // A reaped task's directory lists nothing, not even "." (Linux
         // proc_pident_readdir: ENOENT)
         let task = match &kind {
-            Dir::Static(_) => None,
+            Dir::Static(_) | Dir::Sysctl(..) => None,
             Dir::Pid(p) | Dir::Ns(p) | Dir::Fd(p) | Dir::Task(p) | Dir::Fdinfo(p) | Dir::Net(p) => {
                 Some(p.task().ok_or(KernelError::NotFound)?)
             }
@@ -2197,6 +2227,7 @@ impl FileOps for ProcfsFileOps {
                     proc_net::readdir(t, ctx)?;
                 }
             }
+            Dir::Sysctl(path, net) => proc_sysctl::readdir(file, &inode, path, net.as_ref(), ctx)?,
         }
 
         Ok(())
@@ -2583,11 +2614,54 @@ fn gen_meminfo() -> Vec<u8> {
 }
 
 /// The sysctl behind a /proc/sys inode
-fn sysctl_of(inode: &Inode) -> Option<&'static crate::sysctl::Ctl> {
+fn sysctl_of(inode: &Inode) -> Option<crate::sysctl::Entry> {
     with_data(inode, |d| match d {
-        ProcfsInodeData::Sysctl { ctl } => Some(*ctl),
+        ProcfsInodeData::Sysctl { ctl } => Some(ctl.clone()),
         _ => None,
     })?
+}
+
+/// The permission data of a /proc/sys file or /proc/sys/net directory
+/// (Linux sysctl_perm's table mode and root; a directory's entry is
+/// S_IFDIR 0555)
+fn sysctl_perm(d: &ProcfsInodeData) -> Option<crate::sysctl::Perm> {
+    match d {
+        ProcfsInodeData::Sysctl { ctl } => Some(ctl.perm()),
+        ProcfsInodeData::SysctlDir { net, .. } => Some(crate::sysctl::Perm {
+            mode: 0o555,
+            net: net.is_some(),
+        }),
+        _ => None,
+    }
+}
+
+/// [`sysctl_perm`] of `inode`
+fn sysctl_perm_of(inode: &Inode) -> Option<crate::sysctl::Perm> {
+    with_data(inode, sysctl_perm)?
+}
+
+/// Linux proc_sys_permission: a /proc/sys file is never executable,
+/// then sysctl_perm (no capability override of the mode)
+fn sysctl_permission(
+    inode: &Inode,
+    p: crate::sysctl::Perm,
+    cred: &Cred,
+    mask: u32,
+) -> Result<(), KernelError> {
+    if mask & crate::fs::MAY_EXEC != 0 && inode.mode().is_file() {
+        return Err(KernelError::PermissionDenied);
+    }
+    crate::sysctl::permission(p, cred, mask)
+}
+
+/// A /proc/sys/net entry whose namespace's teardown started (Linux
+/// PROC_I(inode)->sysctl->unregistering: a flag read, no reference)
+fn sysctl_unregistering(d: &ProcfsInodeData) -> bool {
+    match d {
+        ProcfsInodeData::Sysctl { ctl } => ctl.unregistering(),
+        ProcfsInodeData::SysctlDir { net: Some(n), .. } => n.unregistering(),
+        _ => false,
+    }
 }
 
 /// A new procfs inode with `data`
@@ -2693,9 +2767,20 @@ fn build_sysvipc(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), Kernel
     )
 }
 
-/// /proc/sys from the sysctl tables
+/// /proc/sys from the global sysctl tables, and the root set's
+/// /proc/sys/net (Linux net_sysctl_init: "net" registered outside any
+/// namespace, its entries links into the reader's, `proc_sysctl`)
 fn build_sys(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), KernelError> {
     let sys = root.dir(sb, "sys")?;
+    sys.file(
+        sb,
+        "net",
+        InodeMode::directory(0o555),
+        ProcfsInodeData::SysctlDir {
+            dir: "net",
+            net: None,
+        },
+    )?;
     for ctl in crate::sysctl::tables().iter().flat_map(|t| t.iter()) {
         let (dirs, name) = ctl.path.rsplit_once('/').unwrap_or(("", ctl.path));
         let mut d = &mut *sys;
@@ -2706,7 +2791,9 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), KernelErro
             sb,
             name,
             InodeMode::regular(ctl.mode),
-            ProcfsInodeData::Sysctl { ctl },
+            ProcfsInodeData::Sysctl {
+                ctl: crate::sysctl::Entry::Global(ctl),
+            },
         )?;
     }
     Ok(())
@@ -2785,9 +2872,23 @@ fn procfs_mount(
 /// proc_misc_dentry_ops, proc_net_dentry_ops: one set here, told apart
 /// by the inode)
 static PROC_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
+    d_compare: Some(proc_sysctl::compare),
     d_revalidate: Some(proc_revalidate),
+    d_delete: Some(proc_d_delete),
     ..crate::fs::dentry::DentryOps::NONE
 };
+
+/// procfs's d_delete at a dentry's last put: a negative one never
+/// stays (Linux: procfs lookups instantiate none, an ENOENT leaves no
+/// dentry), nor a /proc/sys/net entry of a namespace that is going
+/// (Linux proc_sys_delete: the header's unregistering flag, read with
+/// no reference taken)
+fn proc_d_delete(d: &Dentry) -> bool {
+    let Some(inode) = d.get_inode() else {
+        return true;
+    };
+    with_data(&inode, sysctl_unregistering).unwrap_or(false)
+}
 
 /// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that
 /// is gone, or of an fd no longer open, is invalid, and so is a

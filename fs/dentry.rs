@@ -163,7 +163,8 @@ pub struct DentryOps {
     /// The name's hash (Linux d_hash): names `d_compare` matches hash
     /// alike
     pub d_hash: Option<fn(&[u8]) -> u64>,
-    /// The cached name `stored` is `name` (Linux d_compare)
+    /// The cached child named `stored` is the child `name` (Linux
+    /// d_compare)
     pub d_compare: Option<CompareFn>,
     /// A cached dentry in directory `dir`, positive or negative
     /// (`inode` None), is still good for the lookup whose flags are
@@ -176,18 +177,23 @@ pub struct DentryOps {
     /// mode.
     pub d_revalidate: Option<RevalidateFn>,
     /// A dentry no one holds any more is killed, not kept cached (Linux
-    /// d_delete, asked by retain_dentry at the last dput: ramfs's
-    /// always_delete_dentry). Asked only of a negative one: every
-    /// filesystem here with one pins its positive dentries
-    /// (`SuperOps::d_persistent`, Linux d_make_persistent's reference)
+    /// d_delete, asked by retain_dentry at the last dput of any hashed
+    /// dentry: ramfs's always_delete_dentry, proc_sys_delete). A
+    /// filesystem that keeps its positive dentries
+    /// (`SuperOps::d_persistent`, Linux d_make_persistent's reference,
+    /// which keeps them from ever reaching d_delete) answers false for
+    /// a positive one.
     pub d_delete: Option<fn(&Dentry) -> bool>,
     /// Called as the dentry is killed, before its memory's grace period
     /// starts (Linux d_prune): no reference is left or can be taken
     pub d_prune: Option<fn(&Dentry)>,
 }
 
-/// [`DentryOps::d_compare`]: the cached name `stored` is `name`
-pub type CompareFn = fn(stored: &[u8], name: &[u8]) -> bool;
+/// [`DentryOps::d_compare`]: the cached child `dentry`, named `stored`,
+/// is the one a lookup of `name` wants (Linux d_compare(dentry, len,
+/// str, name)). In an RCU walk `dentry` is borrowed with no reference:
+/// as for `d_revalidate`, only what an RCU reader may read of it.
+pub type CompareFn = fn(dentry: &Dentry, stored: &[u8], name: &[u8]) -> bool;
 
 /// [`DentryOps::d_revalidate`]: the directory, the dentry, its inode
 /// as the caller read it (None: negative), the lookup's flags
@@ -298,10 +304,11 @@ fn d_matcher<'a>(parent: &'a Dentry, name: &'a [u8]) -> (u64, impl Fn(&Dentry) -
     })
 }
 
-/// `stored` names the child `name` of `parent` (Linux d_same_name)
-fn d_same_name(parent: &Dentry, stored: &[u8], name: &[u8]) -> bool {
+/// The child `c` of `parent`, named `stored`, is the child `name`
+/// (Linux d_same_name)
+fn d_same_name(parent: &Dentry, c: &Dentry, stored: &[u8], name: &[u8]) -> bool {
     match parent.d_op.and_then(|o| o.d_compare) {
-        Some(cmp) => cmp(stored, name),
+        Some(cmp) => cmp(c, stored, name),
         None => stored == name,
     }
 }
@@ -327,7 +334,7 @@ fn __d_lookup(parent: &Dentry, name: &[u8]) -> Option<DentryRef> {
         let _cl = c.d_lock.read();
         if !core::ptr::eq(c.parent_ptr(), parent)
             || c.d_unhashed()
-            || !c.d_name.read(&g, |s| d_same_name(parent, s, name))
+            || !c.d_name.read(&g, |s| d_same_name(parent, c, s, name))
         {
             return false;
         }
@@ -385,7 +392,7 @@ pub fn __d_lookup_rcu<'g>(
             // sample before the compare
             let hit = c
                 .d_name
-                .read(g, |n| (!c.d_seq.read_retry(s)).then(|| cmp(n, name)));
+                .read(g, |n| (!c.d_seq.read_retry(s)).then(|| cmp(c, n, name)));
             match hit {
                 Some(h) => {
                     seq = s;
@@ -426,7 +433,7 @@ fn d_lookup_locked(parent: &Dentry, _p: &DentryInner, name: &[u8]) -> Option<Den
     let g = crate::sync::rcu::read_lock();
     d_hash(key)
         .lock()
-        .find(|c| is(c) && c.d_name.read(&g, |s| d_same_name(parent, s, name)))
+        .find(|c| is(c) && c.d_name.read(&g, |s| d_same_name(parent, c, s, name)))
 }
 
 crate::percpu! {
@@ -847,7 +854,7 @@ impl Dentry {
         let same = !c.d_unhashed()
             && core::ptr::eq(c.parent_ptr(), self)
             && c.d_name.read(&crate::sync::rcu::read_lock(), |s| {
-                d_same_name(self, s, name)
+                d_same_name(self, &c, s, name)
             })
             && core::ptr::eq(c.d_inode.load(Relaxed), InodeRef::as_ptr(&inode));
         if !same {
@@ -1502,23 +1509,23 @@ unsafe impl RefPtr for DentryRef {
 }
 
 impl Dentry {
-    /// Negative, and its filesystem keeps no unused one (Linux
-    /// retain_dentry false: d_op->d_delete)
+    /// Its filesystem keeps no unused copy of it (Linux retain_dentry
+    /// false: d_op->d_delete)
     fn unretained(&self) -> bool {
-        self.is_negative() && self.d_op.and_then(|o| o.d_delete).is_some_and(|f| f(self))
+        self.d_op.and_then(|o| o.d_delete).is_some_and(|f| f(self))
     }
 }
 
 /// The caller is the last holder of `d`, hashed, which its filesystem
 /// keeps no unused copy of (`Dentry::unretained`): it leaves the tree
-/// if it is still unused and negative, decided under its parent's
+/// if it is still unused, decided under its parent's
 /// d_lock and its own (`prune_one`, Linux dput -> lock_for_kill ->
 /// __dentry_kill), the tree's references put after the locks; the
 /// caller's put then kills it. A DentryRef of a hashed dentry is never
 /// put under a d_lock.
 fn d_delete_unused(d: &DentryRef) {
     if let Some(parent) = d.get_parent() {
-        prune_one(&parent, d, true);
+        prune_one(&parent, d, false);
     }
 }
 

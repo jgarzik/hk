@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::rcv::{PACKET_AUXDATA, SOL_PACKET};
-use super::{PacketSock, pf};
+use super::{PacketSock, pf, ring};
 use crate::net::filter::{BPF_MAXINSNS, Filter, Insn};
 use crate::net::rtnl;
 use crate::net::socket::{OptIn, OptOut, SOL_SOCKET};
@@ -15,9 +15,28 @@ use crate::util::error::KernelError;
 
 const PACKET_ADD_MEMBERSHIP: i32 = 1;
 const PACKET_DROP_MEMBERSHIP: i32 = 2;
+const PACKET_RX_RING: i32 = 5;
 const PACKET_STATISTICS: i32 = 6;
+const PACKET_COPY_THRESH: i32 = 7;
 const PACKET_ORIGDEV: i32 = 9;
+const PACKET_VERSION: i32 = 10;
+const PACKET_HDRLEN: i32 = 11;
+const PACKET_RESERVE: i32 = 12;
+const PACKET_TX_RING: i32 = 13;
+const PACKET_LOSS: i32 = 14;
+const PACKET_VNET_HDR: i32 = 15;
+const PACKET_TIMESTAMP: i32 = 17;
+const PACKET_FANOUT: i32 = 18;
+const PACKET_TX_HAS_OFF: i32 = 19;
+const PACKET_QDISC_BYPASS: i32 = 20;
+const PACKET_ROLLOVER_STATS: i32 = 21;
+const PACKET_FANOUT_DATA: i32 = 22;
 const PACKET_IGNORE_OUTGOING: i32 = 23;
+const PACKET_VNET_HDR_SZ: i32 = 24;
+
+/// sizeof(struct tpacket_req), sizeof(struct tpacket_req3)
+const REQ_LEN: usize = 16;
+const REQ3_LEN: usize = 28;
 
 /// packet_mreq.mr_type
 const PACKET_MR_PROMISC: u16 = 1;
@@ -97,9 +116,105 @@ fn set_packet(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
             s.set_flag(pf::IGNORE_OUTGOING, val == 1);
             Ok(())
         }
-        // Rings, fanout, versions, vnet headers: not supported
+        PACKET_RX_RING | PACKET_TX_RING => set_ring(s, v, opt == PACKET_TX_RING),
+        PACKET_COPY_THRESH => {
+            s.copy_thresh.store(int_exact(v)? as u32, Ordering::Release);
+            Ok(())
+        }
+        PACKET_VERSION => {
+            let val = int_exact(v)?;
+            if !(ring::TPACKET_V1 as i32..=ring::TPACKET_V3 as i32).contains(&val) {
+                return Err(KernelError::InvalidArgument);
+            }
+            unless_ring(s, || s.tp_version.store(val as u32, Ordering::Release))
+        }
+        PACKET_RESERVE => {
+            let val = int_exact(v)?;
+            // An unsigned int over INT_MAX
+            if val < 0 {
+                return Err(KernelError::InvalidArgument);
+            }
+            unless_ring(s, || s.tp_reserve.store(val as u32, Ordering::Release))
+        }
+        PACKET_LOSS => {
+            let val = int_exact(v)?;
+            unless_ring(s, || s.set_flag(pf::TP_LOSS, val != 0))
+        }
+        PACKET_VNET_HDR | PACKET_VNET_HDR_SZ => {
+            if s.sk.stype != crate::net::socket::SOCK_RAW {
+                return Err(KernelError::InvalidArgument);
+            }
+            let val = v.int()?;
+            let sz = if opt == PACKET_VNET_HDR_SZ {
+                if val != 0
+                    && val as usize != super::vnet::VNET_HDR_LEN
+                    && val as usize != super::vnet::VNET_HDR_MRG_LEN
+                {
+                    return Err(KernelError::InvalidArgument);
+                }
+                val as u32
+            } else if val != 0 {
+                super::vnet::VNET_HDR_LEN as u32
+            } else {
+                0
+            };
+            unless_ring(s, || s.vnet_hdr_sz.store(sz, Ordering::Release))
+        }
+        PACKET_QDISC_BYPASS => {
+            s.set_flag(pf::QDISC_BYPASS, int_exact(v)? != 0);
+            Ok(())
+        }
+        PACKET_FANOUT => super::fanout::set(s, v),
+        PACKET_FANOUT_DATA => super::fanout::set_data(s, v),
+        PACKET_TIMESTAMP => {
+            s.tp_tstamp.store(int_exact(v)? as u32, Ordering::Release);
+            Ok(())
+        }
+        PACKET_TX_HAS_OFF => {
+            let val = int_exact(v)?;
+            // Linux: ignored (0 returned) while a ring exists
+            let _ = unless_ring(s, || s.set_flag(pf::TX_HAS_OFF, val != 0));
+            Ok(())
+        }
         _ => Err(KernelError::NoProtocolOption),
     }
+}
+
+/// An option that must be exactly an int (Linux: optlen != sizeof(val)
+/// is EINVAL)
+fn int_exact(v: OptIn) -> Result<i32, KernelError> {
+    if v.len != 4 {
+        return Err(KernelError::InvalidArgument);
+    }
+    v.int()
+}
+
+/// Apply `f` under the socket lock unless a ring exists (EBUSY; Linux
+/// lock_sock, rx_ring.pg_vec || tx_ring.pg_vec)
+fn unless_ring(s: &PacketSock, f: impl FnOnce()) -> Result<(), KernelError> {
+    let _sk = s.sk_lock.lock();
+    if s.has_ring() {
+        return Err(KernelError::Busy);
+    }
+    f();
+    Ok(())
+}
+
+/// PACKET_RX_RING / PACKET_TX_RING: a tpacket_req (V1/V2) or
+/// tpacket_req3 (V3), at least that long, else EINVAL (Linux
+/// packet_setsockopt, a fault EINVAL too)
+fn set_ring(s: &PacketSock, v: OptIn, tx: bool) -> Result<(), KernelError> {
+    let _sk = s.sk_lock.lock();
+    let len = if s.version() == ring::TPACKET_V3 {
+        REQ3_LEN
+    } else {
+        REQ_LEN
+    };
+    if v.len < len {
+        return Err(KernelError::InvalidArgument);
+    }
+    let b = v.bytes(len).map_err(|_| KernelError::InvalidArgument)?;
+    ring::set_ring(s, &ring::Req::parse(&b), false, tx)
 }
 
 /// struct packet_mreq (Linux: at least 16 bytes, mr_alen within)
@@ -239,7 +354,7 @@ fn set_filter(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
 
 /// struct sock_fprog { u16 len; struct sock_filter *filter; } (Linux
 /// copy_bpf_fprog_from_user + __get_filter)
-fn read_fprog(v: OptIn, locked: bool) -> Result<Filter, KernelError> {
+pub(super) fn read_fprog(v: OptIn, locked: bool) -> Result<Filter, KernelError> {
     if v.len != FPROG_LEN {
         return Err(KernelError::InvalidArgument);
     }
@@ -262,31 +377,72 @@ fn read_fprog(v: OptIn, locked: bool) -> Result<Filter, KernelError> {
     Filter::new(insns)
 }
 
-/// getsockopt: SOL_PACKET options and SO_LOCK_FILTER
-pub fn get(s: &PacketSock, level: i32, opt: i32) -> Option<Result<OptOut, KernelError>> {
+/// getsockopt: SOL_PACKET options and SO_LOCK_FILTER; `v` the
+/// caller's buffer, when known (PACKET_HDRLEN reads it)
+pub fn get(
+    s: &PacketSock,
+    level: i32,
+    opt: i32,
+    v: Option<OptIn>,
+) -> Option<Result<OptOut, KernelError>> {
     match (level, opt) {
         (SOL_SOCKET, SO_LOCK_FILTER) => Some(Ok(OptOut::Int(i32::from(s.flag(pf::FILTER_LOCKED))))),
         (SOL_SOCKET, _) => None,
-        (SOL_PACKET, _) => Some(get_packet(s, opt)),
+        (SOL_PACKET, _) => Some(get_packet(s, opt, v)),
         _ => Some(Err(KernelError::NoProtocolOption)),
     }
 }
 
-fn get_packet(s: &PacketSock, opt: i32) -> Result<OptOut, KernelError> {
+/// Linux packet_getsockopt
+fn get_packet(s: &PacketSock, opt: i32, v: Option<OptIn>) -> Result<OptOut, KernelError> {
     let flag = |f| Ok(OptOut::Int(i32::from(s.flag(f))));
+    let int = |a: &core::sync::atomic::AtomicU32| Ok(OptOut::Int(a.load(Ordering::Acquire) as i32));
     match opt {
+        PACKET_STATISTICS => Ok(OptOut::Bytes(stats(s))),
         PACKET_AUXDATA => flag(pf::AUXDATA),
         PACKET_ORIGDEV => flag(pf::ORIGDEV),
+        PACKET_COPY_THRESH => int(&s.copy_thresh),
+        PACKET_VERSION => int(&s.tp_version),
+        PACKET_HDRLEN => hdrlen(v),
+        PACKET_RESERVE => int(&s.tp_reserve),
+        PACKET_LOSS => flag(pf::TP_LOSS),
+        PACKET_TIMESTAMP => int(&s.tp_tstamp),
         PACKET_IGNORE_OUTGOING => flag(pf::IGNORE_OUTGOING),
-        // struct tpacket_stats, read and reset; packets include drops
-        PACKET_STATISTICS => {
-            let drops = s.drops.swap(0, Ordering::AcqRel);
-            let packets = s.packets.swap(0, Ordering::AcqRel) + drops;
-            let mut b = Vec::with_capacity(8);
-            b.extend_from_slice(&packets.to_ne_bytes());
-            b.extend_from_slice(&drops.to_ne_bytes());
-            Ok(OptOut::Bytes(b))
-        }
+        PACKET_TX_HAS_OFF => flag(pf::TX_HAS_OFF),
+        PACKET_FANOUT => Ok(super::fanout::get(s)),
+        PACKET_VNET_HDR => Ok(OptOut::Int(i32::from(s.vnet_hdr_len() != 0))),
+        PACKET_VNET_HDR_SZ => int(&s.vnet_hdr_sz),
+        PACKET_QDISC_BYPASS => flag(pf::QDISC_BYPASS),
+        PACKET_ROLLOVER_STATS => super::fanout::rollover_stats(s),
         _ => Err(KernelError::NoProtocolOption),
     }
+}
+
+/// struct tpacket_stats (tpacket_stats_v3 for TPACKET_V3), read and
+/// reset; packets include drops
+fn stats(s: &PacketSock) -> Vec<u8> {
+    let drops = s.drops.swap(0, Ordering::AcqRel);
+    let packets = s.packets.swap(0, Ordering::AcqRel).wrapping_add(drops);
+    let mut b = Vec::with_capacity(12);
+    b.extend_from_slice(&packets.to_ne_bytes());
+    b.extend_from_slice(&drops.to_ne_bytes());
+    if s.version() == ring::TPACKET_V3 {
+        let freeze = s.freeze_q_cnt.swap(0, Ordering::AcqRel);
+        b.extend_from_slice(&freeze.to_ne_bytes());
+    }
+    b
+}
+
+/// PACKET_HDRLEN: the header size of the version in the caller's int
+/// (Linux: a longer buffer counts as an int, a shorter one EINVAL)
+fn hdrlen(v: Option<OptIn>) -> Result<OptOut, KernelError> {
+    let v = v.ok_or(KernelError::InvalidArgument)?;
+    if v.len < 4 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let ver = crate::uaccess::get_user::<i32>(v.ptr).map_err(|_| KernelError::BadAddress)?;
+    if !(0..=ring::TPACKET_V3 as i32).contains(&ver) {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(OptOut::Int(ring::hdr_size(ver as u32) as i32))
 }

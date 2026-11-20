@@ -231,6 +231,8 @@ impl ProtoOps for PingSock {
         self.sk.set_shutdown(SHUTDOWN_MASK);
         self.rxq.clear();
         self.sk.purge_err();
+        // Linux sk_common_release's sock_put: the last reference
+        self.sk.inuse_end();
     }
 
     /// Linux ping_bind
@@ -302,7 +304,7 @@ impl ProtoOps for PingSock {
     }
 
     fn poll(&self) -> u16 {
-        dgram::poll(&self.sk, &self.rxq)
+        dgram::poll(&self.sk, self.rxq.readable())
     }
 
     fn shutdown(&self, how: i32) -> Result<(), KernelError> {

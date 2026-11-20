@@ -194,7 +194,7 @@ fn xhci_probe(
         Ok(x) => try_arc(x)?,
         Err(e) => {
             printkln!("xHCI: Failed to initialize controller: {:?}", e);
-            pci_disable_device(pci_dev);
+            pci_dev.disable_device();
             return Err(KernelError::Io);
         }
     };
@@ -203,7 +203,7 @@ fn xhci_probe(
         Err(e) => {
             printkln!("xHCI: Failed to start controller: {:?}", e);
             xhci.stop();
-            pci_disable_device(pci_dev);
+            pci_dev.disable_device();
             return Err(KernelError::Io);
         }
     };
@@ -214,7 +214,7 @@ fn xhci_probe(
         Err(e) => {
             xhci.stop();
             drop(irq);
-            pci_disable_device(pci_dev);
+            pci_dev.disable_device();
             return Err(e);
         }
     };
@@ -226,12 +226,6 @@ fn xhci_probe(
             usb,
         },
     ))
-}
-
-/// Bus mastering off (Linux pci_disable_device)
-fn pci_disable_device(pci_dev: &PciDevice) {
-    let cmd = pci_dev.cfg_read16(0x04);
-    pci_dev.cfg_write16(0x04, cmd & !crate::hw::pci::command::BUS_MASTER);
 }
 
 /// A bound xHCI: the controller, its interrupt handler and its USB
@@ -260,7 +254,7 @@ impl crate::base::Bound for XhciDeviceHandle {
         self.xhci.stop();
         let irq = self.irq.lock().take();
         drop(irq);
-        pci_disable_device(&self.xhci.pci_dev);
+        self.xhci.pci_dev.disable_device();
         printkln!("xHCI: {} stopped", self.xhci.pci_dev.bus_id());
     }
 

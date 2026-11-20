@@ -489,9 +489,11 @@ static TRACEFS_DOPS: DentryOps = DentryOps {
 };
 
 /// Linux tracefs_d_delete: a dentry with no eventfs data goes at its
-/// last put
-fn tracefs_d_delete(_: &Dentry) -> bool {
-    true
+/// last put; the positive ones are pinned entries (`d_persistent`,
+/// Linux d_make_persistent's reference: they never reach it), so only
+/// a negative one does
+fn tracefs_d_delete(d: &Dentry) -> bool {
+    d.is_negative()
 }
 
 /// Linux tracefs_fill_super: simple_fill_super's root directory (inode

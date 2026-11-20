@@ -16,9 +16,14 @@
 //! goes out, or the delayed ACK timer is armed (`ack.rs`).
 
 use super::cb::{
-    MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN,
-    TcpCb, TcpState, Tmr, after, before, between, flags, wake,
+    Ins, MemKind, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TS_LEN, TcpCb, TcpState,
+    Tmr, after, before, between, flags, skb_mstamp_us, wake,
 };
+use super::cong::AckSample;
+use super::mem;
+use super::output::HLEN;
+use super::recovery::{Rexmit, flag, tag};
+use super::sack::SackState;
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
 use crate::util::error::KernelError;
@@ -79,14 +84,123 @@ impl TcpCb {
             self.syn_seg(out);
             return;
         }
+        let prior_snd_una = self.snd_una;
         self.snd_una = s.ack;
-        // Linux tcp_clean_rtx_queue acknowledges the SYN
+        // Linux tcp_clean_rtx_queue acknowledges the SYN, a packet
+        // delivered (FLAG_SYN_ACKED clears retrans_stamp)
+        self.count_delivered(1);
         self.net_stat(LINUX_MIB_TCPDELIVERED);
         self.syn_unacked = false;
+        self.rtx_stamp = None;
+        if self.packets_out != 0 {
+            // The SYN's data, acknowledged with it or not
+            let mut st = SackState::default();
+            self.clean_rtx_queue(prior_snd_una, prior_snd_una, &mut st);
+        }
+        // Linux tcp_ack of the SYN-ACK: a timed-out SYN left CA_Loss
+        // (tcp_fastretrans_alert), before tcp_finish_connect
+        let mut flg = flag::SND_UNA_ADVANCED | flag::SYN_ACKED;
+        if self.ack_is_dubious(flg) {
+            let mut rexmit = Rexmit::None;
+            self.rcv_tsecr = s.ts.filter(|_| self.ts_ok).map(|(_, e)| e);
+            self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
+        }
         self.established(s, now, out);
+        // Linux tcp_finish_connect: predicted only unscaled
+        if self.snd_wscale == 0 {
+            self.fast_path_on(self.snd_wnd);
+        } else {
+            self.pred_flags = 0;
+        }
+        if self.syn_fastopen || self.syn_data {
+            if self.rcv_fastopen_synack(s, skb, out) {
+                // The SYN's data went unacknowledged: resent at once
+                self.output(now, out);
+                return;
+            }
+        } else {
+            // Linux: the SYN-ACK's data is dropped (only Fast Open
+            // takes it); the ACK covers the SYN alone
+            drop(skb);
+        }
+        if self.opts.defer_accept != 0 || self.live.pingpong.get() {
+            // Linux: "Save one ACK" for the data expected soon: the
+            // ACK owed, quickack mode, the delayed ACK timer at
+            // TCP_DELACK_MAX; the segment consumed
+            self.dack.pending = true;
+            self.enter_quickack();
+            self.dack.at = Some(now + super::ack::DELACK_MAX);
+            return;
+        }
         self.ack_now = true;
-        self.rcv_text(s, skb, now, out);
         self.output(now, out);
+    }
+
+    /// Linux tcp_rcv_fastopen_synack: teach the cookie cache what the
+    /// SYN-ACK says (its MSS, its cookie; a lost SYN; another option
+    /// format to try); data in the SYN it did not acknowledge is marked
+    /// lost and resent (TCPFastOpenActiveFail, true); else acknowledged
+    /// data counts TCPFastOpenActive and the SYN-ACK's own data is
+    /// queued (tcp_fastopen_add_skb)
+    fn rcv_fastopen_synack(&mut self, s: &SegIn, mut skb: Box<SkBuff>, out: &mut Out) -> bool {
+        let data = self.syn_data.then(|| self.rtx_head()).flatten();
+        let mss = s.mss.unwrap_or(0);
+        let mut cookie = s.foc.filter(|c| c.len > 0);
+        let (mut syn_lost, mut try_exp) = (false, 0);
+        if !self.syn_fastopen {
+            // Ignore an unsolicited cookie
+            cookie = None;
+        } else if self.stats.total_retrans != 0 {
+            syn_lost = cookie.is_none() && data.is_some();
+        } else if cookie.is_none() && !self.syn_data {
+            try_exp = if self.syn_fastopen_exp { 2 } else { 1 };
+        }
+        out.fo_cache = Some(super::cb::FoCache {
+            mss,
+            cookie,
+            syn_lost,
+            try_exp,
+        });
+        if let Some(head) = data {
+            let seqs: alloc::vec::Vec<u32> = self
+                .rtx
+                .iter()
+                .map(|x| x.tcp().seq)
+                .filter(|&q| !before(q, head))
+                .collect();
+            for q in seqs {
+                self.mark_skb_lost(q);
+            }
+            self.xmit_retransmit_queue(out);
+            self.net_stat(LINUX_MIB_TCPFASTOPENACTIVEFAIL);
+            return true;
+        }
+        self.syn_data_acked = self.syn_data;
+        if self.syn_data_acked {
+            self.net_stat(LINUX_MIB_TCPFASTOPENACTIVE);
+            // SYN-data is counted as two packets in tcp_ack
+            if self.delivered > 1 {
+                self.delivered -= 1;
+            }
+        }
+        let len = skb.len();
+        if len != 0 {
+            skb.dev = None;
+            let c = skb.tcp_mut();
+            c.seq = self.rcv_nxt;
+            c.end_seq = self.rcv_nxt.wrapping_add(len as u32);
+            c.flags &= !flags::SYN;
+            // sk_forced_mem_schedule, skb_set_owner_r
+            let ts = skb.truesize();
+            self.mem_force(ts);
+            self.rcvq_truesize += ts;
+            self.stats.bytes_received = len as u64;
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(len as u32);
+            self.rcv_bytes += len;
+            self.rcvq.push_back(skb);
+            out.wake |= wake::DATA;
+        }
+        false
     }
 
     /// A SYN-ACK's echo must lie between our SYN's TSval and now (Linux
@@ -104,26 +218,49 @@ impl TcpCb {
     /// The handshake completed with `s`
     fn established(&mut self, s: &SegIn, now: u64, out: &mut Out) {
         self.set_state(TcpState::Established);
+        // The handshake's timeouts are over (Linux tcp_finish_connect,
+        // tcp_rcv_state_process SYN_RECV: icsk_retransmits = 0)
+        self.live.retransmits.set(0);
         // Linux tcp_create_openreq_child: the request became a socket
         self.tcp_stat_if(self.passive, TCP_MIB_PASSIVEOPENS);
         self.snd_wnd = self.seg_wnd(s);
-        self.max_wnd = self.max_wnd.max(self.snd_wnd);
+        if self.passive {
+            // Linux tcp_create_openreq_child: max_window from the ACK,
+            // then tcp_v4_syn_recv_sock's tcp_sync_mss
+            self.max_wnd = self.snd_wnd;
+            self.update_mss();
+        } else {
+            self.max_wnd = self.max_wnd.max(self.snd_wnd);
+        }
         self.snd_wl1 = s.seq;
-        self.snd_wl2 = s.ack;
-        if let Some(r) = self.ts_rtt(s) {
-            self.rtt_sample(r);
-        } else if let Some((seq, t)) = self.rtt_seq
-            && !before(s.ack, seq)
-        {
-            self.rtt_sample(now.saturating_sub(t));
-        } else if self.syn_rtx {
+        // The handshake's RTT (Linux tcp_ack of the SYN-ACK,
+        // tcp_synack_rtt_meas): our SYN's or SYN-ACK's unless it was
+        // resent (Karn), else the timestamp echo; none: RFC 6298 5.7's
+        // 3 s (tcp_init_metrics)
+        let rtt = if self.syn_rtx {
+            -1
+        } else {
+            self.tcp_mstamp.saturating_sub(self.syn_mstamp) as i64
+        };
+        let mut st = SackState::default();
+        (st.seq_rtt_us, st.ca_rtt_us) = (rtt, rtt);
+        self.ack_update_rtt(s, flag::SYN_ACKED, &mut st);
+        if self.srtt_us == 0 {
             self.set_rto_fallback();
         }
-        self.rtt_seq = None;
         self.live.backoff.set(0);
         self.rtx_stamp = None;
         self.live.tmr.set(None);
         self.rcv_tstamp = now;
+        if self.tfo {
+            // Linux tcp_rcv_synrecv_state_fastopen: set up at creation;
+            // the request goes (reqsk_fastopen_remove), the RTO follows
+            // what the child sent meanwhile (tcp_rearm_rto)
+            self.tfo = false;
+            self.rearm_rto(now);
+        } else {
+            self.init_transfer();
+        }
         self.arm_keepalive(now);
         out.established = true;
         out.wake |= wake::STATE | wake::EST;
@@ -183,19 +320,136 @@ impl TcpCb {
         }
     }
 
-    /// RTT from the timestamp echo of a segment acknowledging new data
-    /// (RFC 7323 4; valid for retransmitted data too)
+    /// RTT in us from the timestamp echo of a segment acknowledging new
+    /// data (RFC 7323 4; Linux tcp_rtt_tsopt_us: ms in us, at least 1)
     fn ts_rtt(&self, s: &SegIn) -> Option<u64> {
         let (_, e) = s.ts?;
         if !self.ts_ok || e == 0 {
             return None;
         }
         let d = self.tsval().wrapping_sub(e) as i32;
-        (d >= 0).then_some(d as u64)
+        (d >= 0).then_some((d as u64 * 1000).max(1))
+    }
+
+    /// Header length the fast path predicts (Linux tcp_header_len)
+    fn tcp_header_len(&self) -> u32 {
+        HLEN as u32 + self.opt_len()
+    }
+
+    /// Linux __tcp_fast_path_on: predict segments with our header
+    /// length, ACK alone and the window field `wnd`
+    pub(super) fn fast_path_on(&mut self, wnd: u32) {
+        self.pred_flags = ((self.tcp_header_len() / 4) << 28) | (u32::from(flags::ACK) << 16) | wnd;
+    }
+
+    /// Linux tcp_fast_path_check: back on with nothing out of order, an
+    /// open window and sk_rmem_alloc below sk_rcvbuf (hk has no urgent
+    /// data)
+    fn fast_path_check(&mut self) {
+        if self.ooo.is_empty() && self.rcv_wnd() != 0 && self.rmem_alloc() < self.rcvbuf as usize {
+            self.fast_path_on(self.snd_wnd >> self.snd_wscale);
+        }
+    }
+
+    /// Linux tcp_rcv_established's header prediction: in ESTABLISHED a
+    /// segment with the predicted header word (`pred_flags`), at
+    /// RCV.NXT, acknowledging nothing unsent, with a timestamp not older
+    /// than TS.Recent when one is expected, skips validation. A pure ACK
+    /// is processed as a fast ACK (TCPHPAcks if it advances SND.UNA,
+    /// else TCPPureAcks); data that fits the memory already held goes
+    /// straight to the receive queue (TCPHPHits), the ACK taken only if
+    /// it moved. Handed back for the slow path otherwise
+    fn rcv_established_fast(
+        &mut self,
+        s: &SegIn,
+        skb: Box<SkBuff>,
+        now: u64,
+        out: &mut Out,
+    ) -> Option<Box<SkBuff>> {
+        let word = (u32::from(skb.tcp().doff) << 28)
+            | (u32::from(s.flags & !flags::PSH) << 16)
+            | u32::from(s.wnd);
+        if self.pred_flags == 0
+            || word != self.pred_flags
+            || s.seq != self.rcv_nxt
+            || after(s.ack, self.snd_max)
+        {
+            return Some(skb);
+        }
+        let ts = self.tcp_header_len() == HLEN as u32 + TS_LEN;
+        if ts {
+            // tcp_parse_aligned_timestamp, then "If PAWS failed, check
+            // it more carefully in slow path"
+            let Some((v, _)) = s.ts else {
+                return Some(skb);
+            };
+            if (v.wrapping_sub(self.ts_recent) as i32) < 0 {
+                return Some(skb);
+            }
+        }
+        let len = skb.len();
+        self.rcv_tsecr = s.ts.filter(|_| self.ts_ok).map(|(_, e)| e);
+        if len == 0 {
+            if ts && self.rcv_nxt == self.rcv_wup {
+                self.store_ts_recent(s);
+            }
+            self.rcv_ack(s, now, 0, out);
+            self.data_snd_check(now, out);
+            // "update last ts ecr directly instead of calling
+            // tcp_rcv_rtt_measure_ts()"
+            self.rcv_rtt_note_tsecr();
+            return None;
+        }
+        // Linux: truesize past sk_forward_alloc takes the slow path's
+        // steps 5 on; the window is not checked ("Predicted packet is in
+        // window by definition")
+        let truesize = skb.truesize();
+        if !self.rmem_fits(truesize) {
+            return Some(skb);
+        }
+        if ts && self.rcv_nxt == self.rcv_wup {
+            self.store_ts_recent(s);
+        }
+        self.rcv_rtt_measure_ts(len as u32);
+        self.net_stat(LINUX_MIB_TCPHPHITS);
+        let mut skb = skb;
+        skb.dev = None;
+        skb.tcp_mut().end_seq = s.seq.wrapping_add(len as u32);
+        self.stats.bytes_received += len as u64;
+        self.rcv_queue(skb);
+        self.data_recv(len as u32, truesize as u32, now);
+        if s.ack != self.snd_una {
+            self.rcv_ack(s, now, flag::DATA, out);
+        } else {
+            // tcp_update_wl
+            self.snd_wl1 = s.seq;
+        }
+        self.output(now, out);
+        out.wake |= wake::DATA;
+        self.mem_settle();
+        None
+    }
+
+    /// Linux tcp_store_ts_recent: the timestamp of a predicted segment
+    fn store_ts_recent(&mut self, s: &SegIn) {
+        if let Some((v, _)) = s.ts {
+            self.ts_recent = v;
+            self.ts_stamp = self.clock;
+        }
     }
 
     /// Synchronized states and SYN_RECEIVED
     fn rcv_synced(&mut self, s: &SegIn, skb: Box<SkBuff>, now: u64, out: &mut Out) {
+        let skb = if self.state == TcpState::Established {
+            match self.rcv_established_fast(s, skb, now, out) {
+                Some(skb) => skb,
+                None => return,
+            }
+        } else {
+            skb
+        };
+        // A request, or a Fast Open child (Linux tcp_rcv_state_process
+        // runs tcp_check_req with fastopen for it too)
         let req = self.passive && self.state == TcpState::SynReceived;
         if req
             && s.has(flags::SYN)
@@ -217,23 +471,13 @@ impl TcpCb {
                 self.syn_challenge(out);
                 return;
             }
-            if self.state != TcpState::TimeWait
-                && s.has(flags::ACK)
-                && s.seq_len() == 0
-                && before(s.seq, self.rcv_nxt)
-            {
+            if s.has(flags::ACK) && s.seq_len() == 0 && before(s.seq, self.rcv_nxt) {
                 // An old pure ACK is just dropped (Linux
-                // tcp_disordered_ack_check TCP_RFC7323_PAWS_ACK; a
-                // TIME_WAIT socket rejects it as any other,
-                // tcp_timewait_state_process)
+                // tcp_disordered_ack_check TCP_RFC7323_PAWS_ACK)
                 self.net_stat(LINUX_MIB_PAWS_OLD_ACK);
                 return;
             }
-            self.net_stat(if self.state == TcpState::TimeWait {
-                LINUX_MIB_PAWS_TW_REJECTED
-            } else {
-                LINUX_MIB_PAWSESTABREJECTED
-            });
+            self.net_stat(LINUX_MIB_PAWSESTABREJECTED);
             if !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDPAWS) {
                 self.send_ack(out); // dupack
             }
@@ -257,7 +501,21 @@ impl TcpCb {
         }
         if s.has(flags::RST) {
             if s.seq != self.rcv_nxt {
+                // Linux tcp_validate_incoming: an out-of-order RST before
+                // any data on an active Fast Open connection
+                if self.syn_fastopen
+                    && self.stats.data_segs_in == 0
+                    && self.state == TcpState::Established
+                {
+                    out.tfo_disable = true;
+                }
                 self.challenge_ack(out); // RFC 5961 3.2
+            } else if req && self.tfo {
+                // Linux tcp_check_req embryonic_reset for Fast Open:
+                // reqsk_fastopen_remove(reset), then tcp_reset
+                self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
+                self.tfo_reset = true;
+                self.on_reset(out);
             } else if req {
                 // Linux tcp_check_req: the request dies (embryonic_reset)
                 self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
@@ -282,13 +540,17 @@ impl TcpCb {
         if s.has(flags::SYN) && !cross {
             if req {
                 // A new SYN in window: reset, drop the request (Linux
-                // tcp_check_req embryonic_reset)
+                // tcp_check_req embryonic_reset); a Fast Open child
+                // only answers it ("try not to reset the local
+                // connection")
                 self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
                 if let Some(r) = super::output::reset_for(s) {
                     self.reset_seg(r, out);
                 }
-                self.net_stat(LINUX_MIB_EMBRYONICRSTS);
-                self.set_closed(out);
+                if !self.tfo {
+                    self.net_stat(LINUX_MIB_EMBRYONICRSTS);
+                    self.set_closed(out);
+                }
             } else {
                 self.syn_challenge(out); // RFC 5961 4.2
             }
@@ -310,6 +572,16 @@ impl TcpCb {
                 return;
             }
             if req && !self.req_full {
+                // Linux tcp_check_req: "While TCP_DEFER_ACCEPT is
+                // active, drop bare ACK" (the request remembers it was
+                // acked, its TSval noted first)
+                let defer = u32::from(self.opts.defer_accept);
+                if self.live.retransmits.get() < defer && s.end_seq == self.irs.wrapping_add(1) {
+                    self.update_ts_recent(s);
+                    self.req_acked = true;
+                    self.net_stat(LINUX_MIB_TCPDEFERACCEPTDROP);
+                    return;
+                }
                 // tcp_check_req accepted it: the listener makes the
                 // child, then the child processes it (state unchanged)
                 out.req_ack = Some(skb);
@@ -319,11 +591,20 @@ impl TcpCb {
             // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
             self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
             self.snd_una = s.ack;
+            if !self.passive {
+                // Simultaneous open: our SYN is on the retransmit queue,
+                // acked in tcp_ack (tcp_clean_rtx_queue, TCPDelivered)
+                self.count_delivered(1);
+                self.net_stat(LINUX_MIB_TCPDELIVERED);
+            }
             self.syn_unacked = false;
+            // SYN-ACK delivery, which tcp_ack does not track
+            self.count_delivered(1);
             self.established(s, now, out);
             // Linux tcp_rcv_state_process scales the completing
             // segment's window, a SYN-ACK's too
             self.snd_wnd = u32::from(s.wnd) << self.snd_wscale;
+            self.fast_path_on(self.snd_wnd >> self.snd_wscale);
             if cross {
                 // Its SYN is old: a duplicate, ACKed at once (Linux
                 // tcp_data_queue: a retransmit, DelayedACKLost)
@@ -331,11 +612,15 @@ impl TcpCb {
                 self.enter_quickack();
                 self.ack_now = true;
             }
-        } else if !self.rcv_ack(s, now, out) {
+        } else if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
             return;
         }
-        if !self.after_ack(now, out) {
+        if !self.after_ack(s, now, out) {
             return;
+        }
+        if self.state == TcpState::Established && !out.established {
+            // Linux tcp_rcv_established, after tcp_ack
+            self.rcv_rtt_measure_ts(s.seq_len());
         }
         self.rcv_text(s, skb, now, out);
         self.output(now, out);
@@ -357,8 +642,7 @@ impl TcpCb {
 
     /// Linux tcp_oow_rate_limited: data segments are never limited
     /// (they are not part of an ACK loop), pure ones and SYNs are; a
-    /// skipped ACK counts in `mib` (TIME_WAIT's own entry in that
-    /// state)
+    /// skipped ACK counts in `mib`
     fn oow_limited(&mut self, s: &SegIn, mib: usize) -> bool {
         if s.data_len() != 0 && !s.has(flags::SYN) {
             return false;
@@ -366,19 +650,22 @@ impl TcpCb {
         if !self.oow_recent() {
             return false;
         }
-        self.net_stat(if self.state == TcpState::TimeWait {
-            LINUX_MIB_TCPACKSKIPPEDTIMEWAIT
-        } else {
-            mib
-        });
+        self.net_stat(mib);
         true
     }
 
-    /// RFC 5961 challenge ACK, rate limited per connection (Linux
-    /// tcp_send_challenge_ack)
+    /// RFC 5961 challenge ACK, rate limited per connection, then by
+    /// the namespace's per-second budget (Linux tcp_send_challenge_ack)
     fn challenge_ack(&mut self, out: &mut Out) {
         if self.oow_recent() {
             self.net_stat(LINUX_MIB_TCPACKSKIPPEDCHALLENGE);
+            return;
+        }
+        if self
+            .net
+            .as_ref()
+            .is_some_and(|n| !n.challenge_ok(self.clock))
+        {
             return;
         }
         self.net_stat(LINUX_MIB_TCPCHALLENGEACK);
@@ -398,16 +685,25 @@ impl TcpCb {
     /// tcp_send_dupack: duplicated data means our ACK was lost, so stop
     /// delaying ACKs for a while)
     fn dupack(&mut self, s: &SegIn, out: &mut Out) {
-        if s.data_len() != 0 && before(s.seq, self.rcv_nxt) {
+        if s.seq_len() != 0 && before(s.seq, self.rcv_nxt) {
             self.net_stat(LINUX_MIB_DELAYEDACKLOST);
             self.enter_quickack();
+            let end = s.seq.wrapping_add(s.seq_len());
+            let end = if after(end, self.rcv_nxt) {
+                self.rcv_nxt
+            } else {
+                end
+            };
+            self.dsack_set(s.seq, end);
         }
         self.send_ack(out);
     }
 
-    /// State changes once our FIN is acknowledged; false if the segment
-    /// is consumed
-    fn after_ack(&mut self, now: u64, out: &mut Out) -> bool {
+    /// State changes once our FIN is acknowledged by `s`; false if the
+    /// segment is consumed (Linux tcp_rcv_state_process: an orphan
+    /// reaching FIN_WAIT_2 may go to a timewait entry at once, unless
+    /// the segment brings data, which resets it as for a closed reader)
+    fn after_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
         if !self.fin_acked() {
             return true;
         }
@@ -415,12 +711,29 @@ impl TcpCb {
             TcpState::FinWait1 => {
                 self.set_state(TcpState::FinWait2);
                 self.live.tmr.set(None);
-                self.arm_fw2(now);
                 out.wake |= wake::STATE;
-                true
+                let fin = s.has(flags::FIN);
+                let end = s.end_seq.wrapping_sub(u32::from(fin));
+                if !self.orphan {
+                    return true;
+                }
+                if self.opts.linger2 < 0 {
+                    // Linux tcp_done, TCPAbortOnData; the segment is
+                    // answered with a reset (tcp_v4_do_rcv)
+                    if let Some(r) = super::output::reset_for(s) {
+                        self.reset_seg(r, out);
+                    }
+                    self.set_closed(out);
+                    self.net_stat(LINUX_MIB_TCPABORTONDATA);
+                    return false;
+                }
+                if s.seq != s.end_seq && after(end, self.rcv_nxt) {
+                    return true;
+                }
+                !self.orphan_fw2(now, fin, out)
             }
             TcpState::Closing => {
-                self.time_wait(now, out);
+                self.time_wait(out);
                 false
             }
             TcpState::LastAck => {
@@ -434,7 +747,7 @@ impl TcpCb {
     /// RST accepted (Linux tcp_reset): the error a user sees
     fn on_reset(&mut self, out: &mut Out) {
         let err = match self.state {
-            TcpState::SynReceived => KernelError::ConnectionRefused,
+            TcpState::SynSent => KernelError::ConnectionRefused,
             TcpState::CloseWait => KernelError::BrokenPipe,
             _ => KernelError::ConnectionReset,
         };
@@ -444,8 +757,14 @@ impl TcpCb {
     /// The ACK field (RFC 9293 3.10.7.4 fifth check, RFC 5961 5.2: the
     /// acceptable range below SND.UNA is min(max window, bytes acked) as
     /// in Linux tcp_ack); false if the segment must be dropped. An old
-    /// ACK (below SND.UNA) updates neither TS.Recent nor the window.
-    fn rcv_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
+    /// ACK (below SND.UNA) updates TS.Recent but not the window.
+    /// Then Linux tcp_ack: the window, the retransmit queue
+    /// (tcp_clean_rtx_queue), loss recovery for a dubious ACK
+    /// (tcp_fastretrans_alert), the timers, the congestion window
+    /// (tcp_cong_control) and the retransmissions it allows
+    /// (tcp_xmit_recovery).
+    /// `fl`: flags the caller knows (SLOWPATH off the fast path, DATA)
+    fn rcv_ack(&mut self, s: &SegIn, now: u64, fl: u32, out: &mut Out) -> bool {
         let ack = s.ack;
         let span = self
             .max_wnd
@@ -454,111 +773,338 @@ impl TcpCb {
             self.challenge_ack(out);
             return false;
         }
-        if before(ack, self.snd_una) {
+        let prior_snd_una = self.snd_una;
+        self.rcv_tsecr = s.ts.filter(|_| self.ts_ok).map(|(_, e)| e);
+        let blocks = if self.is_sack() { s.sack.blocks() } else { &[] };
+        let mut st = SackState::default();
+        let mut rexmit = Rexmit::None;
+        if before(ack, prior_snd_una) {
+            // Linux old_ack: it may carry new data, so TS.Recent first,
+            // before SACK processing can trigger a retransmission; its
+            // SACK blocks may still tell something
+            self.update_ts_recent(s);
+            if !blocks.is_empty() {
+                let prior_delivered = self.delivered;
+                let mut flg = self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
+                self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
+                self.newly_delivered(prior_delivered);
+                self.xmit_recovery(rexmit, out);
+            }
             return true;
         }
-        // Linux tcp_ack's slow path (hk has no header prediction, so
-        // never TCPHPAcks)
-        self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
-        self.update_ts_recent(s);
+        let mut flg = fl;
+        if after(ack, prior_snd_una) {
+            flg |= flag::SND_UNA_ADVANCED;
+            self.live.retransmits.set(0);
+        }
+        let prior_fack = if self.is_reno() {
+            self.snd_una
+        } else {
+            self.highest_sack_seq()
+        };
+        let prior_packets = self.packets_out;
+        let (prior_delivered, prior_lost) = (self.delivered, self.lost);
+        // FLAG_UPDATE_TS_RECENT comes with the slow path
+        if fl & flag::SLOWPATH != 0 {
+            self.update_ts_recent(s);
+        }
+        if flg & (flag::SLOWPATH | flag::SND_UNA_ADVANCED) == flag::SND_UNA_ADVANCED {
+            // Linux: "Window is constant, pure forward advance"
+            self.snd_wl1 = s.seq;
+            flg |= flag::WIN_UPDATE;
+            self.net_stat(LINUX_MIB_TCPHPACKS);
+        } else {
+            if s.seq_len() != 0 {
+                flg |= flag::DATA;
+            } else {
+                self.net_stat(LINUX_MIB_TCPPUREACKS);
+            }
+            flg |= self.ack_update_window(s, out);
+            if !blocks.is_empty() {
+                flg |= self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
+            }
+        }
+        if st.sack_delivered != 0 {
+            self.count_delivered(st.sack_delivered);
+        }
+        // Something worked: the soft error log goes (Linux tcp_ack)
+        self.soft_err = None;
         self.live.probes.set(0);
         self.rcv_tstamp = now;
-        let old_wnd = self.snd_wnd;
-        let wnd = self.seg_wnd(s);
-        if after(ack, self.snd_una) {
-            self.ack_new(s, now, out);
-        } else if ack == self.snd_una
-            && s.data_len() == 0
-            && !s.has(flags::FIN)
-            && wnd == old_wnd
-            && self.snd_una != self.snd_max
-        {
-            let flight = self.snd_max.wrapping_sub(self.snd_una);
-            if self.cong.on_dupack(flight, self.snd_max) {
-                // Linux tcp_enter_recovery (Reno: no SACK) and the fast
-                // retransmit of tcp_xmit_retransmit_queue
-                self.net_stat(LINUX_MIB_TCPRENORECOVERY);
-                self.fast_retransmit(out);
-            }
-        }
-        // Window update (SND.WL1/WL2 rule)
-        if before(self.snd_wl1, s.seq) || (self.snd_wl1 == s.seq && !before(ack, self.snd_wl2)) {
-            self.snd_wnd = wnd;
-            self.snd_wl1 = s.seq;
-            self.snd_wl2 = ack;
-            self.max_wnd = self.max_wnd.max(self.snd_wnd);
-            if old_wnd == 0
-                && self.snd_wnd > 0
-                && self.live.tmr.get().is_some_and(|t| t.0 == Tmr::Probe)
-            {
-                self.live.tmr.set(None);
-                self.live.backoff.set(0);
+        let acked = ack.wrapping_sub(prior_snd_una);
+        if acked != 0 {
+            self.stats.bytes_acked += u64::from(acked);
+            self.snd_una = ack;
+            if self.syn_unacked {
+                // Linux tcp_clean_rtx_queue: the SYN skb, FLAG_SYN_ACKED
+                self.syn_unacked = false;
                 self.rtx_stamp = None;
-                out.wake |= wake::SPACE;
+                flg |= flag::SYN_ACKED | flag::SET_XMIT_TIMER;
             }
+            if before(self.snd_nxt, ack) {
+                self.snd_nxt = ack;
+            }
+            out.wake |= wake::SPACE;
         }
+        if prior_packets == 0 {
+            // Linux no_queue: a D-SACK may undo a reduction
+            if flg & flag::DSACKING_ACK != 0 {
+                self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
+                self.newly_delivered(prior_delivered);
+            }
+            if flg & flag::SET_XMIT_TIMER != 0 {
+                self.set_xmit_timer(now);
+            }
+            self.process_tlp_ack(ack, flg);
+            self.mem_settle();
+            return true;
+        }
+        flg |= self.clean_rtx_queue(prior_snd_una, prior_fack, &mut st);
+        self.ack_update_rtt(s, flg, &mut st);
+        self.ca_acked(&st);
+        self.mem_settle();
+        self.check_space();
+        self.rack_update_reo_wnd(st.prior_delivered);
+        self.process_tlp_ack(ack, flg);
+        if self.ack_is_dubious(flg) {
+            let num_dupack =
+                u32::from(flg & (flag::SND_UNA_ADVANCED | flag::NOT_DUP | flag::DSACKING_ACK) == 0);
+            self.fastretrans_alert(prior_snd_una, num_dupack, &mut flg, &mut rexmit);
+        }
+        if flg & flag::SET_XMIT_TIMER != 0 {
+            self.set_xmit_timer(now);
+        }
+        let delivered = self.newly_delivered(prior_delivered);
+        let lost = self.lost.wrapping_sub(prior_lost);
+        self.cong_control(ack, delivered, lost, flg);
+        self.xmit_recovery(rexmit, out);
         true
     }
 
-    /// `s` acknowledges new data (Linux tcp_clean_rtx_queue)
-    fn ack_new(&mut self, s: &SegIn, now: u64, out: &mut Out) {
-        let ack = s.ack;
-        let acked = ack.wrapping_sub(self.snd_una);
-        // Data bytes covered (not the FIN)
-        self.clean_rtx(ack);
-        self.stats.bytes_acked += u64::from(acked);
-        self.snd_una = ack;
-        self.syn_unacked = false;
-        self.mem_settle();
-        if before(self.snd_nxt, ack) {
-            self.snd_nxt = ack;
-        }
-        let timed = self.rtt_seq.filter(|&(seq, _)| !before(ack, seq));
-        if let Some(r) = self.ts_rtt(s) {
-            self.rtt_sample(r);
-        } else if let Some((_, t)) = timed {
-            self.rtt_sample(now.saturating_sub(t));
-        }
-        if timed.is_some() {
-            self.rtt_seq = None;
-        }
-        self.rtx_stamp = None;
-        if self.cong.on_ack(acked, ack) {
-            // NewReno partial ACK: the next hole, still in recovery
-            self.fast_retransmit(out);
-        }
-        if self.snd_una == self.snd_max {
-            self.live.tmr.set(None);
-        } else {
-            self.arm_rtx(now);
-        }
-        out.wake |= wake::SPACE;
+    /// Linux tcp_newly_delivered: the packets this ACK delivered
+    fn newly_delivered(&self, prior: u32) -> u32 {
+        let d = self.delivered.wrapping_sub(prior);
+        self.net_add(LINUX_MIB_TCPDELIVERED, u64::from(d));
+        d
     }
 
-    /// The retransmit queue after an ACK of `ack` (Linux
-    /// tcp_clean_rtx_queue): skbs wholly acknowledged go, a partly
-    /// acknowledged head loses its acknowledged bytes (tcp_trim_head)
-    fn clean_rtx(&mut self, ack: u32) {
-        let mut delivered = 0;
-        while self
+    /// The window of an acceptable ACK, taken when Linux
+    /// tcp_may_update_window allows (tcp_ack_update_window: SND.WL1
+    /// follows; a changed window with data waiting may restart an idle
+    /// window); one opening a zero window stops the probes (Linux
+    /// tcp_ack_probe). Returns FLAG_WIN_UPDATE if taken
+    fn ack_update_window(&mut self, s: &SegIn, out: &mut Out) -> u32 {
+        if !self.may_update_window(s) {
+            return 0;
+        }
+        self.snd_wl1 = s.seq;
+        let nwin = self.seg_wnd(s);
+        if self.snd_wnd == nwin {
+            return flag::WIN_UPDATE;
+        }
+        let old_wnd = self.snd_wnd;
+        self.snd_wnd = nwin;
+        // Linux: "the only place, where fast path is recovered for
+        // sending TCP"
+        self.pred_flags = 0;
+        self.fast_path_check();
+        if self.send_head() {
+            self.slow_start_after_idle_check(self.clock);
+        }
+        if nwin > self.max_wnd {
+            // Linux tcp_ack_update_window: tcp_sync_mss
+            self.max_wnd = nwin;
+            self.update_mss();
+        }
+        if old_wnd == 0 && nwin > 0 && self.live.tmr.get().is_some_and(|t| t.0 == Tmr::Probe) {
+            // Linux tcp_ack_probe
+            self.live.tmr.set(None);
+            self.live.backoff.set(0);
+            self.probes_tstamp = None;
+            out.wake |= wake::SPACE;
+        }
+        flag::WIN_UPDATE
+    }
+
+    /// Linux tcp_ack_update_rtt: the RTT of the packets acked or SACKed
+    /// (none if retransmitted data was acked: Karn), else of the
+    /// timestamp echo, feeds the congestion sample (rs->rtt_us), the
+    /// minimum RTT and the RTO estimator; a valid sample ends the backoff
+    fn ack_update_rtt(&mut self, s: &SegIn, flg: u32, st: &mut SackState) {
+        if st.seq_rtt_us < 0
+            && flg & flag::ACKED != 0
+            && let Some(r) = self.ts_rtt(s)
+        {
+            st.seq_rtt_us = r as i64;
+            st.ca_rtt_us = st.seq_rtt_us;
+        }
+        if st.seq_rtt_us < 0 {
+            return;
+        }
+        self.update_rtt_min(st.ca_rtt_us.max(0) as u64, flg);
+        self.rtt_estimator(st.seq_rtt_us);
+        self.set_rto();
+        self.live.backoff.set(0);
+    }
+
+    /// The algorithm's accounting of the ACK (Linux tcp_clean_rtx_queue
+    /// calling icsk_ca_ops->pkts_acked): the packets it acknowledged,
+    /// its RTT (us, -1 if none), the bytes delivered over that round
+    /// trip
+    fn ca_acked(&mut self, st: &SackState) {
+        let rtt_us = st.ca_rtt_us.clamp(-1, i64::from(i32::MAX)) as i32;
+        let dlv = st
+            .prior_delivered
+            .map_or(0, |p| self.delivered.wrapping_sub(p));
+        let s = AckSample {
+            pkts_acked: st.pkts_acked,
+            rtt_us,
+            in_flight: self.live.mss.get().saturating_mul(dlv),
+        };
+        self.ca_pkts_acked(&s);
+    }
+
+    /// Linux tcp_clean_rtx_queue: skbs wholly acknowledged leave the
+    /// retransmit queue, their tags and packets with them; an skb of
+    /// several segments loses the acknowledged ones (tcp_tso_acked).
+    /// Returns the ACK's FLAG_* bits.
+    fn clean_rtx_queue(&mut self, prior_snd_una: u32, prior_fack: u32, st: &mut SackState) -> u32 {
+        let mut flg = 0;
+        let mut reord = self.snd_max;
+        let mut pkts_acked = 0;
+        let (mut first_ackt, mut last_ackt) = (None, 0);
+        let prior_sacked = self.sacked_out;
+        let mut fully_acked = true;
+        while let Some(f) = self.rtx.first() {
+            let (t, tx) = (f.tcp(), skb_mstamp_us(f));
+            let acked_pcount;
+            let mut fully = true;
+            // Where the skb starts once its acked head is trimmed
+            let mut at = t.seq;
+            if after(t.end_seq, self.snd_una) {
+                if t.pcount() == 1 || !after(self.snd_una, t.seq) {
+                    break;
+                }
+                acked_pcount = self.rtx_trim_head(t.seq, self.snd_una.wrapping_sub(t.seq) as usize);
+                if acked_pcount == 0 {
+                    break;
+                }
+                at = self.snd_una;
+                fully = false;
+            } else {
+                acked_pcount = t.pcount();
+            }
+            if t.sacked & tag::RETRANS != 0 {
+                if t.sacked & tag::SACKED_RETRANS != 0 {
+                    self.retrans_out = self.retrans_out.saturating_sub(acked_pcount);
+                }
+                flg |= flag::RETRANS_DATA_ACKED;
+            } else if t.sacked & tag::SACKED_ACKED == 0 {
+                last_ackt = tx;
+                first_ackt.get_or_insert(tx);
+                if before(t.seq, reord) {
+                    reord = t.seq;
+                }
+                if !after(t.end_seq, self.high_seq) {
+                    flg |= flag::ORIG_SACK_ACKED;
+                }
+            }
+            if t.sacked & tag::SACKED_ACKED != 0 {
+                self.sacked_out = self.sacked_out.saturating_sub(acked_pcount);
+            } else if !self.is_reno() {
+                self.count_delivered(acked_pcount);
+                if !self.spurious_retrans(t.sacked, tx) {
+                    self.rack_advance(t.sacked, t.end_seq, tx);
+                }
+            }
+            if t.sacked & tag::LOST != 0 {
+                self.lost_out = self.lost_out.saturating_sub(acked_pcount);
+            }
+            self.packets_out = self.packets_out.saturating_sub(acked_pcount);
+            pkts_acked += acked_pcount;
+            // Linux tcp_rate_skb_delivered: the skb as trimmed
+            self.rate_skb_delivered(st, at);
+            flg |= flag::DATA_ACKED;
+            fully_acked = fully;
+            if !fully {
+                break;
+            }
+            if self.rtx_hint == Some(t.seq) {
+                self.rtx_hint = None;
+            }
+            if let Some(skb) = self.rtx.pop_first() {
+                self.wmem_free(skb);
+            }
+            if self.highest_sack == Some(t.seq) {
+                // Linux tcp_highest_sack_replace
+                self.highest_sack = self.rtx_head();
+            }
+        }
+        if self
             .rtx
             .first()
-            .is_some_and(|f| !after(f.tcp().end_seq, ack))
+            .is_some_and(|h| h.tcp().sacked & tag::SACKED_ACKED != 0)
         {
-            drop(self.rtx.pop_first());
-            delivered += 1;
+            flg |= flag::SACK_RENEGING;
         }
-        // Linux tcp_newly_delivered (every skb is one segment: hk cuts
-        // them at the MSS)
-        self.net_add(LINUX_MIB_TCPDELIVERED, delivered);
-        let mut c = self.rtx.cursor_front_mut();
-        let _ = c.with_current_mut(|h| {
-            if before(h.tcp().seq, ack) {
-                let n = (ack.wrapping_sub(h.tcp().seq) as usize).min(h.len());
-                let _ = h.pull(n);
-                h.tcp_mut().seq = ack;
+        st.pkts_acked = pkts_acked;
+        // The RTTs: of the oldest and newest never retransmitted data
+        // acked (Karn), of the newest SACKed
+        let now = self.tcp_mstamp;
+        let delta = |t: u64| now.saturating_sub(t) as i64;
+        (st.seq_rtt_us, st.ca_rtt_us) = (-1, -1);
+        if let Some(first) = first_ackt
+            && flg & flag::RETRANS_DATA_ACKED == 0
+        {
+            st.seq_rtt_us = delta(first);
+            st.ca_rtt_us = delta(last_ackt);
+            // A lone runt packet over the round trip, nothing SACKed:
+            // conservatively a delayed ACK
+            if pkts_acked == 1
+                && fully_acked
+                && prior_sacked == 0
+                && self.snd_una.wrapping_sub(prior_snd_una) < self.live.mss.get()
+                && st.prior_delivered.map(|p| p.wrapping_add(1)) == Some(self.delivered)
+                && flg & (flag::CA_ALERT | flag::SYN_ACKED) == 0
+            {
+                flg |= flag::ACK_MAYBE_DELAYED;
             }
-        });
+        }
+        let mut sack_rtt_us = -1;
+        if let (Some(first), Some(last)) = (st.first_sackt, st.last_sackt) {
+            sack_rtt_us = delta(first);
+            st.ca_rtt_us = delta(last);
+        }
+        if st.seq_rtt_us < 0 {
+            st.seq_rtt_us = sack_rtt_us;
+        }
+        if flg & flag::ACKED != 0 {
+            flg |= flag::SET_XMIT_TIMER;
+            if self.is_reno() {
+                self.remove_reno_sacks(pkts_acked);
+                // A cumulative ACK cannot tell which copy arrived
+                if flg & flag::RETRANS_DATA_ACKED != 0 {
+                    flg &= !flag::ORIG_SACK_ACKED;
+                }
+            } else if before(reord, prior_fack) {
+                // A never retransmitted hole filled: reordering
+                self.check_sack_reordering(reord, false);
+            }
+        } else if let Some(first) = st.first_sackt
+            && self.rtx.first().is_some_and(|h| first < skb_mstamp_us(h))
+        {
+            // The SACK round trip is from data sent before the head was
+            // last (re)sent: rearm (else the RTO keeps stretching)
+            flg |= flag::SET_XMIT_TIMER;
+        }
+        flg
+    }
+
+    /// Linux tcp_skb_spurious_retrans: a retransmitted skb whose echo
+    /// predates its (last) transmission at `sent` us
+    fn spurious_retrans(&self, sacked: u8, sent: u64) -> bool {
+        let ts = ((sent / 1000) as u32).wrapping_add(self.ts_off);
+        sacked & tag::RETRANS != 0 && self.rcv_tsecr.is_some_and(|e| e != 0 && before(e, ts))
     }
 
     /// Segment text and FIN (Linux tcp_data_queue / tcp_fin): `skb`'s
@@ -567,6 +1113,10 @@ impl TcpCb {
         let mut seq = s.seq.wrapping_add(u32::from(s.has(flags::SYN)));
         let mut len = skb.len();
         let mut fin = s.has(flags::FIN);
+        if len != 0 || fin {
+            // Linux tcp_data_queue: a D-SACK is for this segment only
+            self.dsack.on = false;
+        }
         if before(seq, self.rcv_nxt) {
             // Old bytes: acknowledge again, keep only what is new
             let skip = self.rcv_nxt.wrapping_sub(seq) as usize;
@@ -576,12 +1126,13 @@ impl TcpCb {
                     self.net_stat(LINUX_MIB_DELAYEDACKLOST);
                     self.enter_quickack();
                 }
+                let end = seq.wrapping_add(len as u32 + u32::from(fin));
+                self.dsack_set(seq, end);
                 self.ack_now = true;
-                if fin && self.state == TcpState::TimeWait {
-                    self.live.wait_at.set(Some(now + TIMEWAIT_LEN));
-                }
                 return;
             }
+            // Partly old (Linux tcp_data_queue: D-SACK its head)
+            self.dsack_set(seq, self.rcv_nxt);
             self.ack_now = true;
             let _ = skb.pull(skip);
             len -= skip;
@@ -613,11 +1164,6 @@ impl TcpCb {
         } else {
             0
         };
-        let room = if seq == self.rcv_nxt {
-            room.min(self.hard_room())
-        } else {
-            room
-        };
         if len > room {
             let _ = skb.trim(len - room);
             len = room;
@@ -625,17 +1171,15 @@ impl TcpCb {
             self.ack_now = true;
         }
         if len != 0 && self.rcv_shut && self.state != TcpState::Established {
-            // Data for a closed reader (Linux: abort on data in FIN_WAIT)
+            // Data for a closed reader (Linux: abort on data in FIN_WAIT;
+            // with a FIN on a Fast Open connection, pause Fast Open)
+            out.tfo_disable |= self.syn_fastopen && s.has(flags::FIN);
             self.net_stat(LINUX_MIB_TCPABORTONDATA);
             self.abort(out);
             out.err = Some(KernelError::ConnectionReset);
             return;
         }
-        if len != 0 && seq != self.rcv_nxt {
-            // Linux tcp_data_queue_ofo, before its memory check
-            self.net_stat(LINUX_MIB_TCPOFOQUEUE);
-        }
-        if len != 0 && !self.rmem_ok(seq, len, out) {
+        if len != 0 && !self.rmem_ok(seq, skb.truesize(), out) {
             // Dropped whole, FIN too; it comes again
             return;
         }
@@ -654,55 +1198,26 @@ impl TcpCb {
         }
         if self.ooo_fin == Some(self.rcv_nxt) && self.ooo.is_empty() {
             self.ooo_fin = None;
-            self.rcv_fin(now, out);
+            self.rcv_fin(out);
         }
     }
 
-    /// In-order bytes the receive queue may still take: twice the
-    /// window space, i.e. SO_RCVBUF (the window is half of it, as in
-    /// Linux). A scaled window rounds up to its unit and never shrinks
-    /// (Linux tcp_select_window), so a peer trickling bytes can creep
-    /// the right edge past the window space; Linux bounds that with its
-    /// memory accounting (tcp_try_rmem_schedule drops), hk with this.
-    fn hard_room(&self) -> usize {
-        let hard = 2 * self.full_space() as usize;
-        hard.saturating_sub(self.rcv_bytes)
-    }
-
-    /// Memory for `len` bytes at `seq` (Linux tcp_try_rmem_schedule in
-    /// tcp_data_queue / tcp_data_queue_ofo): out-of-order skbs beyond
-    /// `seq` are pruned to make room. Failing that, out-of-order data is
-    /// dropped; in-order data is still taken into an empty receive queue
-    /// (sk_forced_mem_schedule, so the reader can always progress), else
-    /// dropped with an immediate zero-window ACK (ICSK_ACK_NOMEM). The
-    /// reader is woken either way.
-    fn rmem_ok(&mut self, seq: u32, len: usize, out: &mut Out) -> bool {
+    /// Memory for an skb of truesize `size` at `seq` (Linux
+    /// tcp_data_queue / tcp_data_queue_ofo around
+    /// tcp_try_rmem_schedule). Out-of-order data that does not fit is
+    /// dropped (TCPOFODrop); in-order data is still taken into an empty
+    /// receive queue (sk_forced_mem_schedule, so the reader can always
+    /// progress), else dropped (TCPRcvQDrop), with an immediate
+    /// zero-window ACK (ICSK_ACK_NOMEM) either way. The reader is woken
+    /// when it fails.
+    fn rmem_ok(&mut self, seq: u32, size: usize, out: &mut Out) -> bool {
         let in_order = seq == self.rcv_nxt;
-        let size = if in_order { len } else { len + OOO_OVERHEAD };
-        // Linux tcp_prune_queue (when anything is held) and
-        // tcp_prune_ofo_queue
-        let held = self.rcv_bytes != 0 || !self.ooo.is_empty();
-        let mut first = true;
-        let ok = loop {
-            if self.mem_schedule(size, MemKind::Recv) {
-                break true;
+        if self.try_rmem_schedule(seq, size) {
+            if !in_order {
+                self.net_stat(LINUX_MIB_TCPOFOQUEUE);
             }
-            if first {
-                first = false;
-                self.net_stat_if(held, LINUX_MIB_PRUNECALLED);
-            }
-            if !self.ooo.prune_after(seq) {
-                break false;
-            }
-            // Each pass that freed some (Linux tcp_prune_ofo_queue)
-            self.net_stat(LINUX_MIB_OFOPRUNED);
-        };
-        if ok {
             return true;
         }
-        // No RcvPruned: Linux counts it only when the receive buffer
-        // limit (tcp_can_ingest) still fails, a check hk lacks
-        self.mem_settle();
         out.wake |= wake::DATA;
         if !in_order {
             self.net_stat(LINUX_MIB_TCPOFODROP);
@@ -710,10 +1225,97 @@ impl TcpCb {
         }
         self.ack_nomem = true;
         self.ack_now = true;
-        if self.rcv_bytes != 0 {
+        if !self.rcvq.is_empty() {
             self.net_stat(LINUX_MIB_TCPRCVQDROP);
+            return false;
         }
-        self.rcv_bytes == 0
+        self.mem_force(size);
+        true
+    }
+
+    /// Linux tcp_try_rmem_schedule: past the receive buffer or the
+    /// memory limits, prune; still short of memory, drop out-of-order
+    /// skbs beyond `seq` until it is granted
+    fn try_rmem_schedule(&mut self, seq: u32, size: usize) -> bool {
+        if self.rmem_alloc() <= self.rcvbuf as usize && self.mem_schedule(size, MemKind::Recv) {
+            return true;
+        }
+        if !self.prune_queue(seq) {
+            return false;
+        }
+        while !self.mem_schedule(size, MemKind::Recv) {
+            if !self.prune_ofo_queue(seq) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Linux tcp_prune_queue: get within the receive buffer again;
+    /// false (RcvPruned) when even pruning the out-of-order queue
+    /// beyond `seq` leaves it over, after collapsing the queues into
+    /// fewer skbs (tcp_collapse_ofo_queue, tcp_collapse) did not.
+    fn prune_queue(&mut self, seq: u32) -> bool {
+        self.net_stat(LINUX_MIB_PRUNECALLED);
+        let over = |c: &Self| c.rmem_alloc() > c.rcvbuf as usize;
+        if self.rmem_alloc() >= self.rcvbuf as usize {
+            self.clamp_window();
+        } else if mem::under_pressure() {
+            self.adjust_rcv_ssthresh();
+        }
+        if !over(self) {
+            return true;
+        }
+        // Linux's order: tcp_collapse_ofo_queue, then tcp_collapse of the
+        // receive queue, the memory reclaimed (sk_mem_reclaim) and checked
+        // again, before the destructive pruning below
+        self.collapse_ofo();
+        if !self.rcvq.is_empty() {
+            self.collapse_rcvq();
+        }
+        self.mem_settle();
+        if !over(self) {
+            return true;
+        }
+        self.prune_ofo_queue(seq);
+        if !over(self) {
+            return true;
+        }
+        self.net_stat(LINUX_MIB_RCVPRUNED);
+        // "Massive buffer overcommit": header prediction off
+        self.pred_flags = 0;
+        false
+    }
+
+    /// Linux tcp_prune_ofo_queue: drop out-of-order skbs from the
+    /// highest sequence down, stopping at one `seq` would follow, at
+    /// least 1/8 of the receive buffer each pass until the socket is
+    /// within it and not under memory pressure; true if any went
+    fn prune_ofo_queue(&mut self, seq: u32) -> bool {
+        if self.ooo.is_empty() {
+            return false;
+        }
+        let goal0 = i64::from(self.rcvbuf >> 3);
+        let mut goal = goal0;
+        let mut pruned = false;
+        while let Some(ts) = self.ooo.prune_after(seq) {
+            pruned = true;
+            goal -= ts as i64;
+            if self.ooo.is_empty() || goal <= 0 {
+                if self.rmem_alloc() <= self.rcvbuf as usize && !mem::under_pressure() {
+                    break;
+                }
+                goal = goal0;
+            }
+        }
+        if pruned {
+            self.net_stat(LINUX_MIB_OFOPRUNED);
+            // The blocks are stale now
+            if self.is_sack() {
+                self.sack_reset();
+            }
+        }
+        pruned
     }
 
     /// An accepted skb (its payload at `skb.tcp.seq`): in order to the
@@ -724,49 +1326,190 @@ impl TcpCb {
     /// device reference is dropped (TCP has no further use for it).
     fn queue_data(&mut self, mut skb: Box<SkBuff>, now: u64, out: &mut Out) {
         let len = skb.len();
+        let truesize = skb.truesize() as u32;
         self.stats.bytes_received += len as u64;
         skb.dev = None;
         if skb.tcp().seq != self.rcv_nxt {
-            self.ooo.insert(skb);
+            let (seq, end) = (skb.tcp().seq, skb.tcp().seq.wrapping_add(len as u32));
+            let first = self.ooo.is_empty();
+            let d = self.dsack_on().then_some(&mut self.dsack);
+            let (ins, sets) = self.ooo.insert(skb, d);
+            self.net_add(LINUX_MIB_TCPDSACKOFOSENT, sets);
+            if self.is_sack() {
+                if first {
+                    // Linux tcp_data_queue_ofo: the first one, one block
+                    self.selective_acks.n = 1;
+                    self.selective_acks.b[0] = (seq, end);
+                } else {
+                    self.sack_new_ofo_skb(seq, end);
+                }
+            }
             let m = core::mem::take(&mut self.ooo.merged);
             self.net_add(LINUX_MIB_TCPOFOMERGE, m);
+            if ins == Ins::Queued {
+                // Linux tcp_data_queue_ofo: an skb kept grows the window
+                self.grow_window(len as u32, truesize, true);
+            }
+            // Linux tcp_data_queue_ofo: "Disable header prediction"
+            self.pred_flags = 0;
             self.ack_now = true;
             self.mem_settle();
             return;
         }
         let had_ooo = !self.ooo.is_empty();
         self.rcv_queue(skb);
-        while let Some(d) = self.ooo.take(self.rcv_nxt) {
-            self.rcv_queue(d);
+        // Linux tcp_ofo_queue: bytes below RCV.NXT as it starts are
+        // D-SACKed
+        let high = self.rcv_nxt;
+        loop {
+            let d = self.dsack_on().then_some(&mut self.dsack);
+            let (next, sets) = self.ooo.take(self.rcv_nxt, high, d);
+            self.net_add(LINUX_MIB_TCPDSACKOLDSENT, sets);
+            let Some(next) = next else {
+                break;
+            };
+            self.rcv_queue(next);
         }
-        self.data_recv(len as u32, now);
+        if self.selective_acks.n != 0 {
+            self.sack_remove();
+        }
+        self.data_recv(len as u32, truesize, now);
         if had_ooo {
             self.ack_now = true;
         }
+        self.fast_path_check();
         out.wake |= wake::DATA;
         self.mem_settle();
     }
 
-    /// Append an in-order skb starting at RCV.NXT (Linux tcp_queue_rcv)
+    /// Append an in-order skb starting at RCV.NXT (Linux tcp_queue_rcv,
+    /// and tcp_ofo_queue's move): into the tail's room when it fits
+    /// (tcp_try_coalesce), else queued
     fn rcv_queue(&mut self, skb: Box<SkBuff>) {
         let n = skb.len();
         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
         self.rcv_bytes += n;
+        if let Some(mut tail) = self.rcvq.pop_back() {
+            let eaten = try_coalesce(&mut tail, &skb);
+            self.rcvq.push_back(tail);
+            if eaten {
+                // skb_try_coalesce's tailroom case: no truesize moves
+                // (delta 0), the skb is freed uncharged
+                self.net_stat(LINUX_MIB_TCPRCVCOALESCE);
+                return;
+            }
+        }
+        self.rcvq_truesize += skb.truesize();
         self.rcvq.push_back(skb);
     }
 
     /// The peer's FIN is in sequence (RFC 9293 eighth check)
-    fn rcv_fin(&mut self, now: u64, out: &mut Out) {
+    fn rcv_fin(&mut self, out: &mut Out) {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+        // Linux tcp_fin: nothing beyond the FIN is held
+        if self.is_sack() {
+            self.sack_reset();
+        }
         self.ack_now = true;
         out.shut |= RCV_SHUTDOWN;
         out.wake |= wake::STATE | wake::FIN;
         match self.state {
             TcpState::Established => self.set_state(TcpState::CloseWait),
-            TcpState::FinWait1 if self.fin_acked() => self.time_wait(now, out),
+            TcpState::FinWait1 if self.fin_acked() => self.time_wait(out),
             TcpState::FinWait1 => self.set_state(TcpState::Closing),
-            TcpState::FinWait2 => self.time_wait(now, out),
+            TcpState::FinWait2 => self.time_wait(out),
             _ => {}
         }
+    }
+}
+
+/// Linux tcp_try_coalesce: `from` continues `to` and its payload fits
+/// in `to`'s tailroom (skb_try_coalesce's linear case; hk skbs have no
+/// page frags to steal): copied there, `to` takes its end, ACK and flags
+fn try_coalesce(to: &mut SkBuff, from: &SkBuff) -> bool {
+    let (t, f) = (to.tcp(), from.tcp());
+    if f.seq != t.end_seq || from.len() > to.tailroom() {
+        return false;
+    }
+    if to.put_slice(from.data()).is_none() {
+        return false;
+    }
+    let c = to.tcp_mut();
+    c.end_seq = f.end_seq;
+    c.ack_seq = f.ack_seq;
+    c.flags |= f.flags;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mm::page_alloc::Gfp;
+
+    /// A partially acknowledged skb of two segments is trimmed, then
+    /// sampled as trimmed (Linux tcp_clean_rtx_queue: tcp_tso_acked,
+    /// then tcp_rate_skb_delivered on the same skb)
+    #[test]
+    fn partial_ack_rate_sample() {
+        let mut cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
+        let seq = 1000;
+        let mut skb = SkBuff::alloc_tx(2000, Gfp::KERNEL).unwrap();
+        skb.put_slice(&[0; 2000]).unwrap();
+        let t = skb.tcp_mut();
+        t.seq = seq;
+        t.end_seq = seq + 2000;
+        t.set_pcount(2);
+        t.set_gso_size(1000);
+        t.tx_delivered = 5;
+        t.tx_delivered_mstamp = 1;
+        skb.tstamp = 1000;
+        cb.rtx
+            .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
+        cb.packets_out = 2;
+        cb.snd_max = seq + 2000;
+        cb.snd_nxt = cb.snd_max;
+        cb.snd_una = seq + 1000;
+        let mut st = SackState::default();
+        cb.clean_rtx_queue(seq, seq, &mut st);
+        assert_eq!(cb.rtx_head(), Some(seq + 1000));
+        assert_eq!(cb.packets_out, 1);
+        assert_eq!(st.prior_delivered, Some(5));
+    }
+
+    /// An in-order skb `len` bytes at `seq` with `room` bytes of tailroom
+    fn rx_skb(seq: u32, len: usize, room: usize) -> Box<SkBuff> {
+        let mut skb = SkBuff::alloc_tx(len + room, Gfp::KERNEL).unwrap();
+        skb.put_slice(&alloc::vec![seq as u8; len]).unwrap();
+        let t = skb.tcp_mut();
+        t.seq = seq;
+        t.end_seq = seq + len as u32;
+        skb
+    }
+
+    /// In-order data goes into the receive queue's tail when it fits
+    /// there (Linux tcp_queue_rcv -> tcp_try_coalesce, TCPRcvCoalesce),
+    /// else as an skb of its own; the reader sees the bytes in order
+    #[test]
+    fn rcv_queue_coalesces() {
+        let mut cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
+        let mib = crate::net::mib::NetMib::new().unwrap();
+        cb.mib = Some(mib.clone());
+        cb.rcv_nxt = 100;
+        cb.copied_seq = 100;
+        cb.rcv_queue(rx_skb(100, 10, 30));
+        cb.rcv_queue(rx_skb(110, 20, 0));
+        assert_eq!(cb.rcvq.iter().count(), 1);
+        assert_eq!(mib.net.fold(LINUX_MIB_TCPRCVCOALESCE), 1);
+        // No room left: queued apart
+        cb.rcv_queue(rx_skb(130, 20, 0));
+        assert_eq!(cb.rcvq.iter().count(), 2);
+        assert_eq!(cb.rcv_nxt, 150);
+        assert_eq!(cb.rcvq.back().unwrap().tcp().seq, 130);
+        let mut out = Out::default();
+        let mut buf = [0u8; 64];
+        assert_eq!(cb.recv(&mut buf, 0, true, &mut out), 50);
+        assert!(buf[..10].iter().all(|&b| b == 100));
+        assert!(buf[10..30].iter().all(|&b| b == 110));
+        assert!(buf[30..50].iter().all(|&b| b == 130));
     }
 }

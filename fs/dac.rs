@@ -501,7 +501,7 @@ macro_rules! protected_ctl {
     ($path:literal, $k:ident, $max:literal) => {
         crate::sysctl::Ctl {
             path: $path,
-            mode: 0o600,
+            mode: 0o644,
             show: || alloc::vec![i64::from(knob(&$k))],
             store: |v| {
                 crate::sysctl::range(v[0], 0, $max)?;
@@ -513,7 +513,8 @@ macro_rules! protected_ctl {
     };
 }
 
-/// /proc/sys/fs/protected_* (mode 0600, as Linux)
+/// /proc/sys/fs/protected_* (mode 0644: Linux made them world readable,
+/// c7031c144043)
 pub static PROTECTED_CTLS: &[crate::sysctl::Ctl] = &[
     protected_ctl!("fs/protected_symlinks", PROTECTED_SYMLINKS, 1),
     protected_ctl!("fs/protected_hardlinks", PROTECTED_HARDLINKS, 1),

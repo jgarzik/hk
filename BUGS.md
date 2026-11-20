@@ -11,6 +11,22 @@ infallible, so each one is investigated, not written off.
   -95 (EOPNOTSUPP) on Ubuntu 26.04's 7.0 kernel
   (`LINUX_RELEASE=resolute ./tools/linux-boot-tester.sh`); passes on 6.8
   and hk. Likely the boot's poll queues or the 7.0 IOPOLL rules.
+- **AF_UNIX GC leaks `mixed_lowpoint` on the reference kernel**
+  (`user/boot_tester/net/unix_gc.rs`): Ubuntu's 6.8 kernel carries the
+  graph collector (4090fa373f0e, v6.10) without 4a4263dfeaba
+  ("af_unix: Unify scc_index when finalising SCC in
+  __unix_walk_scc()"), so a component with two back edges is never
+  freed there; hk has the fix. The test skips that one check on the
+  host; drop the skip once the reference kernels carry the fix.
+- **Stale per-CPU `tcp_tw_isn` on the reference kernel**
+  (`user/boot_tester/net/tcp_listen.rs`): Ubuntu's 6.8 kernel keeps the
+  TIME_WAIT-derived ISN per CPU (41eecbd712b7, v6.10) without
+  1bbf0ced1d9d ("tcp: fix stale per-CPU tcp_tw_isn leak enabling ISN
+  prediction"): a value left by a dropped SYN makes a later SYN look
+  like a TIME_WAIT takeover, so it gets that predictable ISN and never
+  a SYN cookie. hk keeps the ISN with the segment, as current Linux.
+  TCP_SYNCOOKIE and TCP_TW_ISN's ISN check skip on the host; drop the
+  skips once the reference kernels carry the fix.
 - **ICMP reply counted as echo reply:** Linux icmp_reply leaves
   fl4_icmp_type 0 and the ICMP control socket is SOCK_RAW, so
   __ip_make_skb's icmp_out_count counts every reply (timestamp replies
@@ -88,65 +104,90 @@ Planned fix:
 
 **Location**: `net/`
 
-Listed because real traffic reaches them: TCP has no SACK (never
-advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
-receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
-tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
-SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf; no rcv_ssthresh,
-so memory pressure does not clamp windows), no orphan count limit
-(tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
-RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
-limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
+Listed because real traffic reaches them: TCP has no delivery rate sampling (Linux
+tcp_rate.c; only the rate sample's prior_delivered, for RACK's
+reordering window), RACK checks every skb of the retransmit queue
+(Linux walks tsorted_sent_queue in send order and stops early), no
+SACK compression
+(Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
+after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
+TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
+(/sys/module/tcp_cubic/parameters: Linux's defaults are constants).
+Fast Open lacks the route metric RTAX_FASTOPEN_NO_COOKIE (hk routes
+carry no metrics), TCP_INFO's tcpi_fastopen_client_fail, and a
+connecting socket's SYN data is bounded by one segment (Linux sends up
+to the path MTU less the option space even past a small cached MSS). A
+request's SYN-ACK retries
+are not cut while old requests clog the SYN queue (reqsk_timer_handler
+lowers max_syn_ack_retries when qlen * 2 exceeds max(8, backlog) and
+young requests are few: hk keeps no young count), and a connecting
+socket saves the handshake's last ACK for TCP_DEFER_ACCEPT or pingpong
+mode but not for sk_write_pending (tcp_rcv_synsent_state_process: a
+writer waiting for the connection).
 
-UDP has the port hash only (Linux udp_table.hash), not the second
-hash by address and port (hash2) Linux looks up in when a slot is
-long, and so walks a whole slot per datagram. Its lookup scores the
-whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
-a group's pick at once (with no connected members), before scoring
-the rest of the hash2 chain.
+UDP has no hash4 (Linux udp_table.hash4: connected sockets by
+four-tuple, looked up before hash2), and its compute_score lacks the
+sk_incoming_cpu point (hk does not track a socket's receiving CPU).
 
-A TIME_WAIT event other than a takeover SYN (a segment, the 2MSL
-timer) rebuilds a full control block from the entry (`TwCb::cb`),
-whose lockless fields (`Live`) it allocates GFP_ATOMIC per event: a
-flood of segments to TIME_WAIT tuples allocates per segment, and an
-allocation failure drops the segment or ends the entry early. Linux
-tcp_timewait_state_process works on the tw itself.
-
-A socket on RCU lists (ping, raw, UDP, packet, netlink) leaves "sockets: used" a grace
-period after its close: the chain's `Arc` is released by
-`RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
-drops the count at sk_free (the last reference, at unhash) and defers
-only the memory (SOCK_RCU_FREE).
-No SYN cookies (a full listener drops SYNs). Echo and timestamp
-replies skip the ICMP rate limits (Linux icmp_reply applies them when
-icmp_ratemask names the reply type, which the default does not).
+skbs are linear (no paged frags, skb_shinfo frags): TCP's SACK
+shifting (`sack.rs` shift, Linux tcp_shift_skb_data / skb_shift moving
+page references) copies the bytes into the previous skb, growing its
+buffer (it gives up without memory), retransmit collapsing copies
+too, a send skb's buffer grows by reallocation a page at a time as
+data are appended (Linux adds page frags), tcp_fragment, tcp_trim_head
+and shifting copy what an skb keeps into a buffer that fits it (one
+left oversized when that GFP_ATOMIC allocation fails, until freed),
+and every retransmission or transmit clone copies the payload (Linux
+skb_clone shares it). No GSO/TSO: one segment per transmission, a
+retransmission resends one MSS (`tcp_retransmit_skb`'s segs is 1;
+Linux sends a multi-segment skb as one GSO packet), and pcount above 1
+only arises when the MSS shrinks under queued skbs.
+An skb holds no reference to its socket (Linux skb->sk with
+sk_wmem_alloc, released by sock_wfree): a closed socket's sent frames
+still queued on a device do not delay its __sk_free, so "sockets:
+used" drops while they are in flight.
+A listener's requests are full child sockets in SYN_RECEIVED on its
+SYN queue (`TcpSock::child`), not Linux request socks (struct
+request_sock in ehash as TCP_NEW_SYN_RECV, inet_reqsk_alloc,
+reqsk_timer_handler): each costs a socket, and the request paths
+mirror tcp_check_req on the child's control block.
+TCP coalesces in-order data into the receive queue's tail only when
+it fits the tail's room (skbs are linear: Linux skb_try_coalesce also
+steals page frags, so it nearly always merges), and never into the
+out-of-order queue (tcp_data_queue_ofo's tcp_ooo_try_coalesce with
+the skb before or ooo_last_skb). Header prediction compares a
+segment's flags without ECE and CWR (hk's header parse drops them;
+Linux's pred_flags word includes them).
+tcp_metrics keeps only Fast Open's cookie cache (`net/tcp/metrics.rs`):
+no per-destination RTT, cwnd and reordering, no TCP_METRICS genetlink
+family, no tcp_metrics timeout refresh from route metrics: new
+connections start from defaults (tcp_init_metrics), and no peer is
+proven for tcp_conn_request's last quarter of tcp_max_syn_backlog
+without SYN cookies (tcp_peer_is_proven), so it drops every new
+request there.
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. UDP
-memory is not accounted (Linux udp_memory_allocated, udp_mem): a
-socket is bounded by SO_RCVBUF only, and /proc/net/sockstat's UDP mem
-is 0. No tcp_can_ingest: a segment is not refused for taking
-receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
-MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
-prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
-ACK counts TCPPureAcks, where Linux's fast path skips it), receive
-coalescing and collapse, undo and F-RTO (TCP*Undo, TCPSpuriousRTOs),
-the CA_Loss state (TCPLossFailures), RcvPruned (no tcp_can_ingest),
-SACK/DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding and
+IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
+socket has one receive queue (`net/udp/rxq.rs`), not Linux's
+per-node producer lists (udp_prod_queue) feeding sk_receive_queue
+and a reader_queue spliced from it.
+MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: MD5/AO,
+forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
-UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
-SO_PEEK_OFF is EOPNOTSUPP.
-NIC removal: e1000 leaves the function's bus mastering and memory
-space on (no pci_disable_device) and its BAR mapped (no iounmap); an
-unregistered `NetDevice` lives on while queued skbs reference it
-(no netdev_wait_allrefs; it is down and driverless).
-FIB: removing every route through a device (`net/inet/fib.rs`,
-`remove_first` per route) restarts from the list head each time, under
-the table's leaf lock; Linux fib_table_flush is one walk. Path MTU
-exceptions (`route::NhExceptions`) have no generation id (Linux
-fnhe_genid), so they are not flushed when a device goes down.
+UDP sends are not charged to SO_SNDBUF (Linux sk_wmem_alloc through
+sock_alloc_send_skb, which blocks or fails a send past it; corked
+data included), and SIOCOUTQ is 0. UDP_SEGMENT is segmented in
+software at send (Linux hands a GSO skb to the device); UDP_GRO is
+stored only (no GRO: no coalesced receive, no UDP_GRO cmsg); UDP_ENCAP
+takes 0 and L2TP only (UDP_ENCAP_ESPINUDP needs XFRM, which hk lacks).
+SO_NO_CHECK does not turn off the UDP send checksum (Linux udp_send_skb
+sends CHECKSUM_NONE with a zero check field): `udp::UdpSock::xmit`
+always computes it.
+A device MTU change leaves path MTU exceptions (`route::NhExceptions`)
+as they are (Linux NETDEV_CHANGEMTU fib_sync_mtu lowers them with it and
+raises those equal to the old MTU).
 
 ## Memory management gaps
 
@@ -287,18 +328,31 @@ without it).
 
 **Location**: `net/packet/`
 
-Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), the mmap rings
-(PACKET_RX_RING/TX_RING, PACKET_VERSION), PACKET_FANOUT,
-PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
-(ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
+Not implemented: SO_ATTACH_BPF, SO_GET_FILTER, and
 socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
-every socket). A bound socket is not told (ENETDOWN) when its device
-goes down later, only when it binds to a down device. Memberships only
-count promiscuity/allmulti users (the drivers have no promiscuous or
-multicast filtering; set_promisc is a no-op on e1000 and virtio-net,
-which has no control queue: QEMU then delivers all frames).
-PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
-lo (hk has no checksum offload states).
+every socket). Memberships only count promiscuity/allmulti users (the
+drivers have no promiscuous or multicast filtering; set_promisc is a
+no-op on e1000 and virtio-net, which has no control queue: QEMU then
+delivers all frames).
+Checksum state (TP_STATUS_CSUMNOTREADY, PACKET_VNET_HDR's NEEDS_CSUM):
+UDP and TCP segments over lo are CHECKSUM_PARTIAL
+(`SkBuff::csum_partial`), but a corked UDP datagram is too (Linux
+__ip_append_data leaves MSG_MORE sends CHECKSUM_NONE).
+The TPACKET_V3 retire timeout without tp_retire_blk_tov is always
+8 ms: hk keeps no ethtool link speed (Linux prb_calc_retire_blk_tmo
+derives it from the block size on links of 1 Gb/s and up, e.g. e1000,
+r8169). tp_rxhash (TP_FT_REQ_FILL_RXHASH) is a jhash of the flow, not
+Linux's siphash flow-dissector hash.
+Fanout: PACKET_FANOUT_FLAG_DEFRAG is kept but IPv4 fragments are not
+reassembled before hashing (Linux ip_check_defrag); PACKET_FANOUT_EBPF
+groups take no program (hk has no bpf(2): PACKET_FANOUT_DATA is EBADF
+or EINVAL, frames go to member 0); the flow hash is a jhash of the
+IPv4 5-tuple, not Linux's siphash flow dissector.
+PACKET_VNET_HDR: no GSO, so a send whose virtio_net_hdr asks for
+segmentation (longer than gso_size) is EINVAL where Linux segments it,
+and a NEEDS_CSUM checksum is completed in software before transmit
+where Linux leaves it CHECKSUM_PARTIAL on lo (the bytes on the wire
+differ from Linux lo, not from a device without offload).
 
 ## fanotify gaps
 
@@ -390,23 +444,9 @@ or FLAG_LOG.
 
 **Location**: `net/unix/`
 
-No garbage collector for in-flight sockets: a socket whose only
-references are messages queued on sockets that are themselves only
-reachable that way (e.g. a socket's own descriptor sent to itself, then
-closed) stays allocated with its queue. Linux collects such cycles
-(net/unix/garbage.c). hk bounds them instead: files in flight are
-charged to the sending user and further SCM_RIGHTS sends fail with
-ETOOMANYREFS once the count exceeds RLIMIT_NOFILE (Linux's
-too_many_unix_fds rule), so a user can pin at most about RLIMIT_NOFILE
-files (plus the queues of those sockets, each bounded by SO_SNDBUF and
-max_dgram_qlen). Unlike Linux the count is also capped at 2024 (Linux's
-UNIX_INFLIGHT_SANE_USER), so raising RLIMIT_NOFILE does not raise what
-can be pinned.
-
-Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
-out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
-SO_PEERPIDFD, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC, SIOCUNIXFILE,
-SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
+Not implemented: SO_INQ / SCM_INQ, SO_PASSRIGHTS and SO_RIGHTS_NOTRUNC
+(newer than the v6.8 reference kernels), SO_PEERSEC (ENOPROTOOPT, as on
+Linux without an LSM).
 
 ## File permission (DAC) gaps
 
@@ -650,8 +690,15 @@ Routing rules are Linux's three IPv4 defaults, fixed: RTM_NEWRULE and
 RTM_DELRULE are EOPNOTSUPP, lookups walk tables local then main and never
 default (no rule engine), and rule dumps of other families are
 EAFNOSUPPORT (Linux lists the IPv6 and multicast-routing defaults).
-RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
-return 0 without moving the device (Linux: moved, or an error).
+RTM_NEWLINK/RTM_SETLINK apply MTU and flags only; the rest is refused
+with the errno Linux gives a device or driver lacking it, never ignored:
+moving a device to another namespace (IFLA_NET_NS_PID/FD; EOPNOTSUPP, lo
+EINVAL as Linux), MAC address, carrier, master, VF, proto_down, XDP and
+per-family (IFLA_AF_SPEC) settings are EOPNOTSUPP. Group, alias,
+broadcast address, txqlen, GSO/GRO limits, operstate and link mode, which
+Linux always applies, are EOPNOTSUPP unless equal to the device's fixed
+value; IFLA_TARGET_NETNSID / IFLA_LINK_NETNSID are EINVAL (no namespace
+ids).
 
 ## io_uring gaps
 
@@ -719,6 +766,28 @@ but inode numbers do not wrap at 2^32 (Linux shmem_reserve_inode).
 F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
+
+## Fault injection and debugfs gaps
+
+**Location**: `mm/fault_inject.rs`, `fs/debugfs.rs`
+
+- Only fail-nth injects: fault_create_debugfs_attr's generic files
+  (probability, interval, times, space, verbose, verbose_ratelimit_*,
+  task-filter with /proc/<pid>/make-it-fail, stacktrace-depth and the
+  require/reject address filters) and the failslab= / fail_page_alloc=
+  boot parameters are missing, as are failslab's cache-filter (and
+  /sys/kernel/slab/<cache>/failslab) and the other fault types
+  (fail_futex, fail_usercopy, fail_make_request, fail_io_timeout,
+  fail_function).
+- The heap's page refills (`mm::slab` `KernelPages`, `mm::vmalloc`
+  `alloc`) pass `Gfp::NOFAIL`, so fail_page_alloc never fails a
+  kmalloc's slab refill as in Linux: the heap also serves infallible
+  allocations, whose failure panics (failslab covers its fallible
+  ones).
+- debugfs has no removal (debugfs_remove), no debugfs= boot option
+  (debugfs_allow) or lockdown check, no automount points and only the
+  bool and u32 file helpers; a u32 file formats its value on every read
+  (Linux simple_attr keeps it per open for a continued read).
 
 ## tracefs gaps
 
@@ -900,19 +969,6 @@ QEMU's xHCI hides all of them.
   bus or ttyUSB0 tty device, no baud rate or modem control requests,
   the bulk IN endpoint is never read.
 
-## Driver probe failure leaks
-
-**Location**: `hw/net/e1000.rs` (`e1000_probe`, `alloc_bufs`),
-`hw/net/virtio_net.rs` (`setup_queues`, `probe`)
-
-A probe that fails part-way does not undo what it set up (Linux
-devm_*, or the probe's goto unwind): e1000's descriptor rings and
-buffers (`DmaCoherent`, freed by hand only at remove) and its register
-mapping leak when a later allocation fails; virtio-net's virtqueues
-and buffer pools leak when the second queue or a pool fails. Owners
-freeing on drop (`DmaBox`) would unwind them; doc/res/hk-driver-api.md
-proposes the design.
-
 ## No DMA for 32-bit devices with RAM above 4GB
 
 **Location**: `hw/dma.rs`, `mm/frame_alloc.rs`,
@@ -1016,6 +1072,11 @@ its no-writeback skip, before it relies on sync.
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
   fixed at probe.
+- `VirtioDevice::reset` (`hw/virtio/pci.rs`) spins a bounded number
+  of status reads and fails, where Linux vp_reset sleeps (msleep(1))
+  until the status reads 0 (vp_modern_set_status, then the wait): a
+  reset that does not complete makes `del_vqs` leak the rings, and
+  virtio-net's remove (`virtnet_del_vqs`) its buffer pools too.
 - virtio-pci remove leaves the BAR mappings (common, notify, ISR,
   device config): `IoMem` windows are copyable and never unmapped, so
   each transport rebind leaks the ioremap space of one device (Linux
@@ -1044,10 +1105,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **Copied helpers** (J, or as touched): `current_time` in cgroupfs,
   perm, procfs and ramfs, `current_time_secs` in ipc msg/sem/shm;
   user-timespec readers each validating (futex `read_user_timeout`,
-  poll `read_ts`, mqueue, posix_timer...; Linux get_timespec64);
-  iovec structs (`fs/iov.rs` `IoVec`, `net/msg.rs` `IoVec`/`Iov`) and
-  importers beside `import_iovec` (`net/msg.rs` `Iov::import`,
-  process_vm `remote_iovecs`); Timespec
+  poll `read_ts`, mqueue, posix_timer...; Linux get_timespec64); Timespec
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
@@ -1062,13 +1120,10 @@ Designs that grew one commit at a time. Tag = roadmap phase
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
   as old as its first.
-  /proc/sys is one static tree: the sysctls Linux registers for the
-  initial network namespace only (net/ipv4/tcp_mem,
-  net/core/mem_pcpu_rsv) appear in every
-  namespace. /proc/sys/net values act on the namespace of the task
-  reading or writing, not the one the file was opened in (Linux binds
-  the file to the opener's namespace): an fd passed across namespaces
-  reads and writes the other one's values.
+  `fs/proc/mod.rs` `proc_d_delete` keeps the dentries of a dead task
+  cached at their last put (Linux pid_delete_dentry, the d_delete of
+  pid_dentry_operations: proc_inode_is_dead); they go only when
+  `proc_revalidate` or the shrinker finds them.
 - **Stale comments** (as touched): "for now"/TODO markers.
 
 ## Review gaps, by phase
@@ -1136,19 +1191,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
     prints the children that missed it and their wait statuses (0:
     SIGUSR2 came first, 2: the wait failed).
 
-13. **TCP_MEM_PRESSURE flake** (hk x86, once in four local `check`
-    runs, in a gate): `TCP_MEM_PRESSURE:FAIL pair status got 1024`: a
-    pair's reader got less than 128 KiB before its 20 s receive
-    timeout (`user/boot_tester/net/tcp_mem.rs` `pair`, exit 4) with
-    every tcp_mem limit at 4 pages. The receive side forces the charge
-    for an empty queue and drops into a non-empty one with a zero
-    window ACK (`TcpCb::rmem_ok`, Linux tcp_data_queue), the send side
-    keeps its tcp_wmem[0] floor (`wmem_schedule`), as Linux; what
-    restarts a stalled sender (the window update when the reader
-    drains, the probe or retransmit timer and its backoff) is not
-    ruled out. A stalled pair now prints its byte count, the last recv
-    result, /proc/net/tcp and the TcpExt and Tcp counters.
-
 14. **FD_ALLOC_SCALE flake on Linux** (`check-linux`, under host load):
     `FD_ALLOC_SCALE:FAIL 5`: the batch of dup()s at ~33000 descriptors
     took 4x or more the batch at ~2000 on the reference Linux; uncached
@@ -1160,13 +1202,15 @@ Tag = roadmap phase (doc/ROADMAP.md).
 16. **MEM_SLAB_TIME_WAIT near its bound** (hk x86): 2000 TIME_WAIT
     entries grow Slab by 1800-2092 kB against a 2000 kB bound
     (`user/boot_tester/mm/memcore.rs` `slab_time_wait`), failing about
-    one x86 boot in three; arm64 measures about 1570 kB. The test's
-    comment puts an entry at about 600 bytes, and `TimeWait` plus its
-    ehash `Eh` are 392 + 104 bytes (host build, before Arc headers and
-    slab rounding), yet the growth stays near 900 bytes an entry after
-    3 s of settling, so it is not deferred frees. Find what else each
-    entry allocates (`net/tcp/timewait.rs` `TimeWait::new`, its timer,
-    bhash owner and ehash entries) before touching the bound.
+    one x86 boot in three; arm64 measures about 1570 kB (both measured
+    with `Arc<TimeWait>` in kmalloc-512). The test's comment puts an
+    entry at about 600 bytes; an `Arc<TimeWait>` is now 312 bytes from
+    its own cache (`mm/slab.rs` `TW_CACHE`, no rounding) and its ehash
+    `Arc<Eh>` 120 in kmalloc-128 (host build), yet the growth stayed
+    near 900 bytes an entry after 3 s of settling, so it is not
+    deferred frees. Find what else each entry allocates
+    (`net/tcp/timewait.rs` `TimeWait::new`, its timer, bhash owner and
+    ehash entries) before touching the bound.
 
 ## DRM dumb buffers are the boot framebuffer only
 

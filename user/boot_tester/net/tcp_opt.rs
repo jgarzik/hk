@@ -2,18 +2,21 @@
 //! window scaling and timestamps (checked through TCP_INFO), 4 MB
 //! through the slirp echo peer, IPPROTO_TCP option round-trips,
 //! TCP_MAXSEG on a connection, TCP_CORK/MSG_MORE delivery, keepalive
-//! against a dead peer (a blackhole route), /proc/net/tcp lines and the
-//! TCP sysctls.
+//! against a dead peer (a blackhole route), /proc/net/tcp lines, the
+//! TCP sysctls, and SACK (TCPI_OPT_SACK, tcp_sack / tcp_dsack per
+//! namespace).
 
 use hk_syscall::{
-    SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_listen, sys_setsockopt, sys_shutdown,
+    CLONE_NEWNET, SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_listen, sys_setsockopt,
+    sys_shutdown, sys_unshare,
 };
 
 use crate::harness::T;
+use crate::net::netlink::drop_caps;
 use crate::net::nl::{self, Nl, Req};
 use crate::net::sk::*;
 use crate::net::tcp_xfer::{accept, listener, recv_pat, send_pat, set_timeo, wait_child};
-use crate::proc::sysctl::read_file;
+use crate::proc::sysctl::{read_file, reads, write_file};
 
 const MB: usize = 1024 * 1024;
 /// slirp guestfwd echo service (tools/qemu-net.sh)
@@ -35,15 +38,21 @@ const TCP_FASTOPEN: i32 = 23;
 const TCP_NOTSENT_LOWAT: i32 = 25;
 const MSG_MORE: i32 = 0x8000;
 const ENOENT: i64 = -2;
+const EPERM: i64 = -1;
 const ETIMEDOUT: i64 = -110;
 /// tcpi_options bits
 const TCPI_OPT_TIMESTAMPS: u8 = 1;
+const TCPI_OPT_SACK: u8 = 2;
 const TCPI_OPT_WSCALE: u8 = 4;
+const EINVAL: i64 = -22;
+const TCP_SACK: &[u8] = b"/proc/sys/net/ipv4/tcp_sack\0";
+const TCP_DSACK: &[u8] = b"/proc/sys/net/ipv4/tcp_dsack\0";
 
 pub fn run_tests() {
     crate::helpers::println(b"=== TCP Option Tests ===");
     test_opts();
     test_congestion();
+    test_congestion_allowed();
     test_lo_4mb_info();
     test_maxseg_conn();
     test_cork_more();
@@ -52,6 +61,70 @@ pub fn run_tests() {
     test_echo_4mb();
     test_keepalive_dead_peer();
     test_listen_opts();
+    test_sack();
+}
+
+/// Whether TCPI_OPT_SACK is set on each end of a new loopback
+/// connection (client, server); None if it could not be made
+fn lo_sack_bits() -> Option<(bool, bool)> {
+    let (l, p) = listener(1);
+    let c = tcp();
+    set_timeo(c, 10_000);
+    if connect(c, LO, p) != 0 {
+        close(c);
+        close(l);
+        return None;
+    }
+    let s = accept(l);
+    let bits = (
+        tcp_info(c).options & TCPI_OPT_SACK != 0,
+        tcp_info(s).options & TCPI_OPT_SACK != 0,
+    );
+    close(s);
+    close(c);
+    close(l);
+    Some(bits)
+}
+
+/// SACK is negotiated over lo by default (TCP_INFO TCPI_OPT_SACK);
+/// net.ipv4.tcp_sack and tcp_dsack are per namespace (1 in a new one),
+/// u8 values (Linux proc_dou8vec_minmax); tcp_sack=0 in a namespace
+/// leaves its connections without SACK and the initial namespace's on
+fn test_sack() {
+    let mut t = T::new(b"TCP_SACK");
+    t.ok(b"lo negotiates", lo_sack_bits() == Some((true, true)), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        crate::helpers::loopback_up();
+        if !reads(TCP_SACK, b"1\n") || !reads(TCP_DSACK, b"1\n") {
+            sys_exit(10);
+        }
+        if write_file(TCP_SACK, b"0") != 1 || !reads(TCP_SACK, b"0\n") {
+            sys_exit(11);
+        }
+        if lo_sack_bits() != Some((false, false)) {
+            sys_exit(12);
+        }
+        if write_file(TCP_SACK, b"256") != EINVAL || !reads(TCP_SACK, b"0\n") {
+            sys_exit(13);
+        }
+        if write_file(TCP_DSACK, b"0") != 1 || !reads(TCP_DSACK, b"0\n") {
+            sys_exit(14);
+        }
+        sys_exit(0);
+    }
+    let st = wait_child(pid);
+    if st == 2 << 8 && crate::helpers::host_mode() {
+        crate::helpers::skip(b"TCP_SACK", b"unshare(CLONE_NEWNET) not permitted");
+        return;
+    }
+    t.eq(b"netns child", st as i64, 0);
+    t.ok(b"init tcp_sack", reads(TCP_SACK, b"1\n"), 0);
+    t.ok(b"init tcp_dsack", reads(TCP_DSACK, b"1\n"), 0);
+    t.done();
 }
 
 /// The fields of struct tcp_info the tests read
@@ -171,32 +244,110 @@ fn test_opts() {
     t.done();
 }
 
-/// TCP_CONGESTION: "reno" is always there; unknown names are ENOENT
-fn test_congestion() {
-    let mut t = T::new(b"TCP_CONGESTION");
-    let fd = tcp();
+/// TCP_CONGESTION of `fd` as its NUL-padded 16 bytes
+fn get_ca(fd: i32) -> (i64, [u8; 16], u32) {
     let mut b = [0xffu8; 16];
     let mut len = 16u32;
     let r = sys_getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, b.as_mut_ptr(), &mut len);
+    (r, b, len)
+}
+
+fn set_ca(fd: i32, name: &[u8]) -> i64 {
+    sys_setsockopt(
+        fd,
+        IPPROTO_TCP,
+        TCP_CONGESTION,
+        name.as_ptr(),
+        name.len() as u32,
+    )
+}
+
+/// TCP_CONGESTION: a new socket has the default, cubic; reno and cubic
+/// are selectable; unknown names are ENOENT
+fn test_congestion() {
+    let mut t = T::new(b"TCP_CONGESTION");
+    let fd = tcp();
+    let (r, b, len) = get_ca(fd);
     t.eq(b"get", r, 0);
     t.eq(b"len", len as i64, 16);
-    t.ok(b"has a name", b[0].is_ascii_lowercase(), b[0] as i64);
-    let set = |name: &[u8]| {
-        sys_setsockopt(
-            fd,
-            IPPROTO_TCP,
-            TCP_CONGESTION,
-            name.as_ptr(),
-            name.len() as u32,
-        )
-    };
-    t.eq(b"reno", set(b"reno"), 0);
-    let mut b = [0xffu8; 16];
-    let mut len = 16u32;
-    sys_getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, b.as_mut_ptr(), &mut len);
-    t.ok(b"reno back", &b[..5] == b"reno\0", 0);
-    t.eq(b"unknown", set(b"nosuchcc"), ENOENT);
+    t.ok(b"cubic default", &b[..6] == b"cubic\0", b[0] as i64);
+    t.eq(b"reno", set_ca(fd, b"reno"), 0);
+    t.ok(b"reno back", &get_ca(fd).1[..5] == b"reno\0", 0);
+    t.eq(b"cubic", set_ca(fd, b"cubic"), 0);
+    t.ok(b"cubic back", &get_ca(fd).1[..6] == b"cubic\0", 0);
+    t.eq(b"unknown", set_ca(fd, b"nosuchcc"), ENOENT);
     close(fd);
+    t.done();
+}
+
+const ALLOWED: &[u8] = b"/proc/sys/net/ipv4/tcp_allowed_congestion_control\0";
+const CA_DEFAULT: &[u8] = b"/proc/sys/net/ipv4/tcp_congestion_control\0";
+
+/// A child namespace's tcp_congestion_control takes only an allowed
+/// algorithm (Linux tcp_set_default_congestion_control: EPERM): the
+/// child's exit status, 2 if unshare was refused
+fn ca_default_child() -> i32 {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        if write_file(CA_DEFAULT, b"cubic") != EPERM {
+            sys_exit(3);
+        }
+        if write_file(CA_DEFAULT, b"reno") != 4 || !reads(CA_DEFAULT, b"reno\n") {
+            sys_exit(4);
+        }
+        sys_exit(0);
+    }
+    wait_child(pid)
+}
+
+/// tcp_allowed_congestion_control: a restricted algorithm needs
+/// CAP_NET_ADMIN (Linux tcp_set_congestion_control), the current one
+/// does not, and only the initial namespace may make it a default;
+/// unknown names are ENOENT
+fn test_congestion_allowed() {
+    let mut t = T::new(b"TCP_CONGESTION_ALLOWED");
+    t.eq(b"restrict", write_file(ALLOWED, b"reno"), 4);
+    let mut b = [0u8; 64];
+    let n = read_file(ALLOWED, &mut b);
+    t.ok(b"reno only", n == 5 && &b[..5] == b"reno\n", n);
+    t.ok(b"unknown", write_file(ALLOWED, b"reno nosuchcc") < 0, 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        let fd = tcp();
+        if !drop_caps() {
+            sys_exit(1);
+        }
+        if set_ca(fd, b"reno") != 0 {
+            sys_exit(2);
+        }
+        if set_ca(fd, b"cubic") != EPERM {
+            sys_exit(3);
+        }
+        if set_ca(fd, b"reno") != 0 {
+            sys_exit(4);
+        }
+        sys_exit(0);
+    }
+    t.eq(b"unprivileged", wait_child(pid) as i64, 0);
+    let st = ca_default_child();
+    if st == 2 << 8 && crate::helpers::host_mode() {
+        crate::helpers::skip(
+            b"TCP_CONGESTION_ALLOWED netns",
+            b"unshare(CLONE_NEWNET) not permitted",
+        );
+    } else {
+        t.eq(b"netns default", st as i64, 0);
+    }
+    // Privileged: restricted ones too
+    let fd = tcp();
+    t.eq(b"cap_net_admin", set_ca(fd, b"cubic"), 0);
+    close(fd);
+    t.eq(b"restore", write_file(ALLOWED, b"reno cubic"), 10);
+    let n = read_file(ALLOWED, &mut b);
+    t.ok(b"restored", n == 11 && &b[..11] == b"reno cubic\n", n);
     t.done();
 }
 
@@ -398,27 +549,22 @@ fn test_proc_net_tcp() {
 fn test_sysctls() {
     let mut t = T::new(b"TCP_SYSCTLS");
     let mut b = [0u8; 128];
-    let n = read_file(
-        b"/proc/sys/net/ipv4/tcp_available_congestion_control\0",
-        &mut b,
-    );
-    t.ok(
-        b"available has reno",
-        n > 0 && has_line(&b[..n as usize], &[b"reno"]),
-        n,
-    );
-    let n = read_file(b"/proc/sys/net/ipv4/tcp_congestion_control\0", &mut b);
-    t.ok(
-        b"default",
-        n > 1 && b[0].is_ascii_lowercase() && b[n as usize - 1] == b'\n',
-        n,
-    );
     for (path, want) in [
-        (&b"/proc/sys/net/ipv4/tcp_window_scaling\0"[..], &b"1\n"[..]),
+        (
+            &b"/proc/sys/net/ipv4/tcp_available_congestion_control\0"[..],
+            &b"reno cubic\n"[..],
+        ),
+        (ALLOWED, b"reno cubic\n"),
+        (b"/proc/sys/net/ipv4/tcp_congestion_control\0", b"cubic\n"),
+        (b"/proc/sys/net/ipv4/tcp_window_scaling\0", b"1\n"),
         (b"/proc/sys/net/ipv4/tcp_timestamps\0", b"1\n"),
         (b"/proc/sys/net/ipv4/tcp_keepalive_time\0", b"7200\n"),
         (b"/proc/sys/net/ipv4/tcp_keepalive_intvl\0", b"75\n"),
         (b"/proc/sys/net/ipv4/tcp_keepalive_probes\0", b"9\n"),
+        (b"/proc/sys/net/ipv4/tcp_frto\0", b"2\n"),
+        (b"/proc/sys/net/ipv4/tcp_min_rtt_wlen\0", b"300\n"),
+        (b"/proc/sys/net/ipv4/tcp_slow_start_after_idle\0", b"1\n"),
+        (b"/proc/sys/net/ipv4/tcp_orphan_retries\0", b"0\n"),
     ] {
         let n = read_file(path, &mut b);
         t.ok(
