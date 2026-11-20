@@ -8,6 +8,10 @@
 //! falling from 10 to 2 minutes as the table nears its threshold, 0
 //! past it).
 //!
+//! The collector looks at the entries a locked lookup passes on its
+//! way down the tree (Linux lookup()'s gc_stack, at most PEER_MAX_GC),
+//! as Linux.
+//!
 //! Locking: `InetPeerBase.tree` (spin, thread only: softnet's
 //! reassembly) is a leaf; the node and the peer are allocated
 //! GFP_ATOMIC before it is taken. Deviation: Linux looks up under a
@@ -58,23 +62,46 @@ fn threshold() -> usize {
     (pages * 4096 / (100 * 64)).clamp(4096, 65536 + 128)
 }
 
-/// Linux inet_peer_gc's time to live with `total` entries
+/// Linux inet_peer_gc's time to live with `total` entries, in its
+/// integer order: (maxttl - minttl) / HZ * total / threshold * HZ
 fn ttl(total: usize, thresh: usize) -> u64 {
     if total >= thresh {
         return 0;
     }
-    MAXTTL - (MAXTTL - MINTTL) * total as u64 / thresh as u64
+    MAXTTL - (MAXTTL - MINTTL) / 1000 * total as u64 / thresh as u64 * 1000
+}
+
+/// The collector's candidates: the entries a locked lookup passed
+/// (Linux lookup()'s gc_stack)
+struct GcStack {
+    keys: [u32; PEER_MAX_GC],
+    n: usize,
+}
+
+impl GcStack {
+    fn push(&mut self, k: u32) {
+        if self.n < PEER_MAX_GC {
+            self.keys[self.n] = k;
+            self.n += 1;
+        }
+    }
 }
 
 impl InetPeerBase {
     /// The peer of `addr`, made if there is none (Linux inet_getpeer
     /// with a reference); None without memory
     pub fn get(&self, addr: Ipv4Addr) -> Option<Arc<InetPeer>> {
-        let now = crate::net::neigh::now_ms();
+        self.get_at(addr, crate::net::neigh::now_ms(), threshold())
+    }
+
+    /// [`get`](Self::get) at `now` (ms) with collector threshold
+    /// `thresh`
+    fn get_at(&self, addr: Ipv4Addr, now: u64, thresh: usize) -> Option<Arc<InetPeer>> {
         if let Some(p) = self.tree.lock().get(&addr.0) {
             p.dtime.store(now, Relaxed);
             return Some(p.clone());
         }
+        // Linux allocates under the lock, GFP_ATOMIC; hk before it
         let node = RbTreeNodeReservation::new_gfp(Gfp::ATOMIC).ok()?;
         let p = try_arc_gfp(
             InetPeer {
@@ -85,34 +112,50 @@ impl InetPeerBase {
         )
         .ok()?;
         let mut t = self.tree.lock();
-        if let Some(old) = t.get(&addr.0) {
-            return Some(old.clone());
-        }
-        drop(t.insert(node.into_node(addr.0, p.clone())));
-        let gone = Self::gc(&mut t, addr.0, now);
+        let mut gc = GcStack {
+            keys: [0; PEER_MAX_GC],
+            n: 0,
+        };
+        let found = t
+            .get_mut_visiting(&addr.0, |k, _| gc.push(*k))
+            .map(|o| o.clone());
+        let p = match found {
+            Some(o) => {
+                o.dtime.store(now, Relaxed);
+                o
+            }
+            None => {
+                drop(t.insert(node.into_node(addr.0, p.clone())));
+                p
+            }
+        };
+        let gone = Self::gc(&mut t, &gc, now, thresh);
         drop(t);
         drop(gone);
         Some(p)
     }
 
-    /// Collect the unreferenced, expired peers among the
-    /// `PEER_MAX_GC` after `key` (Linux inet_peer_gc over the lookup
-    /// path's candidates); the removed nodes come back to free after
-    /// the unlock
+    /// Linux inet_peer_gc: of the candidates, those unreferenced and
+    /// unused for the time to live leave; their nodes come back to free
+    /// after the unlock
     fn gc(
         t: &mut RbTree<u32, Arc<InetPeer>>,
-        key: u32,
+        gc: &GcStack,
         now: u64,
+        thresh: usize,
     ) -> [Option<PeerNode>; PEER_MAX_GC] {
-        let ttl = ttl(t.len(), threshold());
+        let ttl = ttl(t.len(), thresh);
+        let dead = |k: &u32| {
+            t.get(k).is_some_and(|p| {
+                let age = now.saturating_sub(p.dtime.load(Relaxed));
+                age >= ttl && Arc::strong_count(p) == 1
+            })
+        };
         let mut keys = [0u32; PEER_MAX_GC];
         let mut n = 0;
-        for (k, p) in t.range_from(&key).take(PEER_MAX_GC) {
-            let age = now.saturating_sub(p.dtime.load(Relaxed));
-            if *k != key && age >= ttl && Arc::strong_count(p) == 1 {
-                keys[n] = *k;
-                n += 1;
-            }
+        for k in gc.keys[..gc.n].iter().filter(|k| dead(k)) {
+            keys[n] = *k;
+            n += 1;
         }
         core::array::from_fn(|i| if i < n { t.remove_node(&keys[i]) } else { None })
     }
@@ -123,7 +166,23 @@ type PeerNode = crate::util::rbtree::RbTreeNode<u32, Arc<InetPeer>>;
 
 #[cfg(test)]
 mod tests {
-    use super::ttl;
+    use super::*;
+
+    /// A source spraying ascending addresses, every old peer expired:
+    /// the collector keeps the table near its threshold (Linux
+    /// inet_getpeer gathers its candidates on the lookup path, both
+    /// sides of the key)
+    #[test]
+    fn ascending_keys_stay_bounded() {
+        let b = InetPeerBase::default();
+        let thresh = 64;
+        for i in 0..20_000u32 {
+            let now = u64::from(i) * MAXTTL;
+            drop(b.get_at(Ipv4Addr(i), now, thresh));
+        }
+        let n = b.tree.lock().len();
+        assert!(n <= 2 * thresh, "{n} peers");
+    }
 
     #[test]
     fn ttl_falls_with_load() {
