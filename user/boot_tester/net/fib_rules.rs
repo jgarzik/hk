@@ -152,6 +152,7 @@ const FRA_UID_RANGE: u16 = 20;
 const RTA_SRC: u16 = 2;
 const RTA_TABLE: u16 = 15;
 const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
+const RTM_F_FIB_MATCH: u32 = 0x2000;
 const FR_ACT_GOTO: u8 = 2;
 const FR_ACT_BLACKHOLE: u8 = 6;
 const FR_ACT_UNREACHABLE: u8 = 7;
@@ -323,6 +324,22 @@ fn rule_engine(name: &'static [u8]) -> bool {
         b"get from",
         route_get(&mut nl, [10, 30, 0, 5], Some(ip)),
         100,
+    );
+    // fibmatch looks up the same flow, source included
+    t.eq(
+        b"fibmatch from",
+        route_get_flags(
+            &mut nl,
+            [10, 30, 0, 5],
+            Some(ip),
+            RTM_F_FIB_MATCH | RTM_F_LOOKUP_TABLE,
+        ),
+        100,
+    );
+    t.eq(
+        b"fibmatch main",
+        route_get_flags(&mut nl, [10, 30, 0, 5], Some(ip), RTM_F_FIB_MATCH),
+        254,
     );
     t.eq(
         b"get not from",

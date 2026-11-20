@@ -156,7 +156,11 @@ const RTA_PREFSRC: u16 = 7;
 const RTA_MULTIPATH: u16 = 9;
 const RTA_CACHEINFO: u16 = 12;
 const RTA_TABLE: u16 = 15;
+const RTA_MARK: u16 = 16;
 const RTA_UID: u16 = 25;
+const RTA_IP_PROTO: u16 = 27;
+const RTA_SPORT: u16 = 28;
+const RTA_DPORT: u16 = 29;
 const RTA_NH_ID: u16 = 30;
 const RTA_MAX: u16 = 31;
 const RTM_F_CLONED: u32 = 0x200;
@@ -1578,6 +1582,19 @@ pub fn fill_route(
     seq: u32,
     pid: u32,
 ) -> Result<(), KernelError> {
+    fill_route_tb(nb, e, e.table, ty, flags, seq, pid)
+}
+
+/// [`fill_route`] reporting table `tb` (Linux fib_rt_info tb_id)
+fn fill_route_tb(
+    nb: &mut NlBuf<'_>,
+    e: &FibEntry,
+    tb: u32,
+    ty: u16,
+    flags: u16,
+    seq: u32,
+    pid: u32,
+) -> Result<(), KernelError> {
     let mut rflags = e.flags;
     if e.dead() {
         rflags |= RTNH_F_DEAD;
@@ -1585,11 +1602,7 @@ pub fn fill_route(
     if e.dev.as_ref().is_some_and(|d| !d.carrier_ok()) && e.rtype == RouteType::Unicast {
         rflags |= RTNH_F_LINKDOWN;
     }
-    let table8 = if e.table < 256 {
-        e.table as u8
-    } else {
-        RT_TABLE_COMPAT
-    };
+    let table8 = u8::try_from(tb).unwrap_or(RT_TABLE_COMPAT);
     let mut h = [0u8; RTMSG_LEN];
     h[0] = AF_INET;
     h[1] = e.dst_len;
@@ -1600,7 +1613,7 @@ pub fn fill_route(
     h[7] = e.rtype as u8;
     h[8..12].copy_from_slice(&rflags.to_ne_bytes());
     let m = nb.msg_put(ty, flags, seq, pid, &h)?;
-    match route_attrs(nb, e) {
+    match route_attrs(nb, e, tb) {
         Ok(()) => {
             nb.msg_end(m);
             Ok(())
@@ -1613,8 +1626,8 @@ pub fn fill_route(
 }
 
 /// A route's attributes (fib_dump_info's nla_puts)
-fn route_attrs(nb: &mut NlBuf<'_>, e: &FibEntry) -> Result<(), KernelError> {
-    nb.put_u32(RTA_TABLE, e.table)?;
+fn route_attrs(nb: &mut NlBuf<'_>, e: &FibEntry, tb: u32) -> Result<(), KernelError> {
+    nb.put_u32(RTA_TABLE, tb)?;
     if e.dst_len != 0 {
         nb.put(RTA_DST, &e.dst.to_be_bytes())?;
     }
@@ -1650,6 +1663,45 @@ pub fn notify_route(net: &NetNamespace, e: &FibEntry, ty: u16, nl: NlInfo) {
     }
 }
 
+/// The flow of a route get request (Linux inet_rtm_getroute's fl4):
+/// mark, uid (the caller's unless given), protocol (UDP unless given;
+/// only TCP, UDP, ICMP) and ports
+fn getroute_key(a: &Attrs<'_>, ext: &ExtAck) -> Result<route::OutKey, KernelError> {
+    const IPPROTO_ICMP: u8 = 1;
+    const IPPROTO_TCP: u8 = 6;
+    const IPPROTO_UDP: u8 = 17;
+    let proto = a.u8(RTA_IP_PROTO)?.unwrap_or(IPPROTO_UDP);
+    if !matches!(proto, IPPROTO_TCP | IPPROTO_UDP | IPPROTO_ICMP) {
+        // Linux rtm_getroute_parse_ip_proto
+        ext.msg("Unsupported ip proto");
+        return Err(KernelError::OperationNotSupported);
+    }
+    let port = |t| -> Result<u16, KernelError> {
+        Ok(a.min(t, 2)?.map_or(0, |p| u16::from_be_bytes([p[0], p[1]])))
+    };
+    Ok(route::OutKey {
+        mark: a.u32(RTA_MARK)?.unwrap_or(0),
+        uid: match a.u32(RTA_UID)? {
+            Some(u) => u,
+            None => crate::task::percpu::current_cred().uid,
+        },
+        proto,
+        sport: port(RTA_SPORT)?,
+        dport: port(RTA_DPORT)?,
+        anysrc: false,
+    })
+}
+
+/// The table a route get reports: the one looked up only with
+/// RTM_F_LOOKUP_TABLE, else main (Linux inet_rtm_getroute)
+fn lookup_table(flags: u32, hit: u32) -> u32 {
+    if flags & RTM_F_LOOKUP_TABLE != 0 {
+        hit
+    } else {
+        RT_TABLE_MAIN
+    }
+}
+
 /// RTM_GETROUTE for one destination ("ip route get"; Linux
 /// inet_rtm_getroute, output routes only)
 fn getroute(sk: &NlSock, h: &Hdr, p: &[u8], ext: &ExtAck) -> Result<Done, KernelError> {
@@ -1662,32 +1714,39 @@ fn getroute(sk: &NlSock, h: &Hdr, p: &[u8], ext: &ExtAck) -> Result<Done, Kernel
     let dst = a.in_addr(RTA_DST)?.unwrap_or_default();
     let src = a.in_addr(RTA_SRC)?.unwrap_or_default();
     let oif = a.u32(RTA_OIF)?.unwrap_or(0);
+    let k = getroute_key(&a, ext)?;
     let net = sk.net();
     if rtm.flags & RTM_F_FIB_MATCH != 0 {
+        // The flow the output lookup sees (Linux the same fl4)
         let key = FlowKey {
             daddr: dst,
+            saddr: src,
             oif,
+            iif: route::LOOPBACK_IFINDEX,
+            mark: k.mark,
+            uid: k.uid,
+            proto: k.proto,
+            sport: k.sport,
+            dport: k.dport,
             ..Default::default()
         };
         let e = net.fib.lookup(&key)?;
-        let m = route_msg(&e, RTM_NEWROUTE, h.seq, sk.portid()).ok_or(KernelError::OutOfMemory)?;
-        reply(sk, m);
+        let tb = lookup_table(rtm.flags, e.table);
+        let mut v = nlmsg_new(ROUTE_NLMSG_SIZE)?;
+        let mut nb = NlBuf::new(&mut v, ROUTE_NLMSG_SIZE);
+        fill_route_tb(&mut nb, &e, tb, RTM_NEWROUTE, 0, h.seq, sk.portid())?;
+        reply(sk, v);
         return Ok(Done::Ok);
     }
-    let rt = route::output(net, dst, src, oif)?;
-    // The table looked up only on request, else main (Linux)
-    let table = if rtm.flags & RTM_F_LOOKUP_TABLE != 0 {
-        rt.table
-    } else {
-        RT_TABLE_MAIN
-    };
-    reply(sk, fill_rt(&rt, table, src, h.seq, sk.portid()));
+    let rt = route::output_key(net, dst, src, oif, &k)?;
+    let table = lookup_table(rtm.flags, rt.table);
+    reply(sk, fill_rt(&rt, table, src, k.uid, h.seq, sk.portid()));
     Ok(Done::Ok)
 }
 
-/// RTM_NEWROUTE answer for an output route, reporting `table` (Linux
-/// rt_fill_info)
-fn fill_rt(rt: &route::Rtable, table: u32, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
+/// RTM_NEWROUTE answer for an output route, reporting `table` and the
+/// flow's `uid` (Linux rt_fill_info)
+fn fill_rt(rt: &route::Rtable, table: u32, src: Ipv4Addr, uid: u32, seq: u32, pid: u32) -> Vec<u8> {
     let mut m = Msg::new(RTM_NEWROUTE, 0, seq, pid);
     let mut hd = [0u8; RTMSG_LEN];
     hd[0] = AF_INET;
@@ -1709,7 +1768,6 @@ fn fill_rt(rt: &route::Rtable, table: u32, src: Ipv4Addr, seq: u32, pid: u32) ->
     if let Some(g) = rt.gateway {
         m.attr(RTA_GATEWAY, &g.to_be_bytes());
     }
-    let uid = crate::task::percpu::current_cred().uid;
     m.u32(RTA_UID, uid).attr(RTA_CACHEINFO, &[0u8; 32]);
     m.finish()
 }
