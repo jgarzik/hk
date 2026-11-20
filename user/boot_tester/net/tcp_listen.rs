@@ -25,7 +25,8 @@
 //! - TCP_FASTOPEN_SERVER: with tcp_fastopen 3 and TCP_FASTOPEN on the
 //!   listener a cookie request gets a cookie; a SYN with that cookie and
 //!   data is accepted at once, its data readable and acknowledged by the
-//!   SYN-ACK, the child sending before the handshake completes; a wrong
+//!   SYN-ACK, the child sending before the handshake completes, its
+//!   send buffer tuned at creation as a plain child's is; a wrong
 //!   cookie gets the SYN only acknowledged and the right cookie
 //!   (TCPFastOpenCookieReqd, TCPFastOpenPassive, TCPFastOpenPassiveFail;
 //!   Linux tcp_try_fastopen)
@@ -404,6 +405,8 @@ fn test_fastopen_server() {
     );
     let a = accept_in(l, 1000);
     t.ok(b"accept", a >= 0, i64::from(a));
+    // Its send buffer as tcp_init_transfer tuned it at creation
+    let tfo_snd = getint(a, SOL_SOCKET, SO_SNDBUF).1;
     let mut b = [0u8; 8];
     t.eq(b"recv", recv(a, &mut b, MSG_DONTWAIT), 5);
     t.ok(b"bytes", &b[..5] == b"hello", 0);
@@ -431,6 +434,14 @@ fn test_fastopen_server() {
         0,
     );
     peer.send_full(P3, pl, Y + 1, 0, RST, &[], &[]);
+    // A plain child's buffer, tuned as its handshake completes, is the
+    // Fast Open child's (same MSS and window)
+    if handshake(&mut t, &peer, pl, Y + 100).is_some() {
+        let c = accept_in(l, 1000);
+        let snd = getint(c, SOL_SOCKET, SO_SNDBUF).1;
+        t.ok(b"tuned sndbuf", snd == tfo_snd, i64::from(tfo_snd));
+        abort(c);
+    }
     let after = names.map(tcpext);
     for (i, n) in names.iter().enumerate() {
         t.ok(n, after[i] == before[i] + 1, after[i] - before[i]);

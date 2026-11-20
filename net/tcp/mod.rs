@@ -1251,7 +1251,9 @@ impl TcpSock {
             return fail();
         };
         let mut b = c.lock.bh_lock();
-        let Some(g) = b.get() else {
+        // The child's buffers read as its own (sync_caps): what its
+        // creation tunes is stored from them (put_caps)
+        let Some(g) = c.bh_get(&mut b) else {
             return fail();
         };
         let mut out = Out::default();
@@ -1428,7 +1430,9 @@ impl TcpSock {
             return;
         };
         let mut b = c.lock.bh_lock();
-        let Some(g) = b.get() else {
+        // The child's buffers read as its own (sync_caps): what its
+        // creation tunes is stored from them (put_caps)
+        let Some(g) = c.bh_get(&mut b) else {
             return;
         };
         let mut cb = self.child_cb(&c, opts, caps);
@@ -1483,7 +1487,9 @@ impl TcpSock {
             o.iss = isn;
         }
         let mut b = c.lock.bh_lock();
-        let Some(g) = b.get() else {
+        // The child's buffers read as its own (sync_caps): what its
+        // creation tunes is stored from them (put_caps)
+        let Some(g) = c.bh_get(&mut b) else {
             return;
         };
         let mut cb = self.child_cb(&c, opts, caps);
