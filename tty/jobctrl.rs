@@ -339,7 +339,7 @@ pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelE
             Ok(())
         };
     }
-    if crate::task::percpu::pgrp_orphaned(&pg) {
+    if crate::task::pgrp::pgrp_orphaned(&pg) {
         return Err(KernelError::Io);
     }
     kill_pgrp_pid(&pg, sig);

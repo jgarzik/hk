@@ -610,7 +610,7 @@ pub fn stop_applies(sig: Signal) -> bool {
     }
     let me = crate::task::percpu::current();
     let pg = me.pgrp.get(&crate::sync::rcu::read_lock());
-    pg.is_none_or(|pg| !crate::task::percpu::pgrp_orphaned(&pg))
+    pg.is_none_or(|pg| !crate::task::pgrp::pgrp_orphaned(&pg))
 }
 
 /// New thread `child` of `parent`'s group joins its group stop, in

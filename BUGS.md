@@ -1057,10 +1057,6 @@ Designs that grew one commit at a time. Tag = roadmap phase
   references (`Task.pgrp`/`session`) held by every thread, not
   once per process (Linux signal->pids); one global CHILD_EXIT_WQ wakes every waiting parent on every
   exit.
-- **`task/percpu.rs` is the largest file** (before C): scheduler core,
-  do_clone, exit, wait, credential setters, several sleep APIs. Split
-  like Linux (sched/core, fork, exit, cred). Other giant functions:
-  copy_process, sys_prctl, sys_semctl, do_mmap, exec_file.
 - **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move

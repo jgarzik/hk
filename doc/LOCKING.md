@@ -2012,7 +2012,7 @@ pub struct Zone {
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
 **Location:** `mm/mod.rs` (`Mm`, `MmRef`), `mm/memory.rs`
-(`exit_mmap`), `task/exit.rs` (`exit_current`), `task/percpu.rs`
+(`exit_mmap`), `task/exit.rs` (`exit_current`), `task/exec.rs`
 (`exec_replace_image`), `task/fork.rs` (`do_clone`)
 
 - `Mm.users` (`AtomicUsize`, Linux mm_users) counts the tasks running in

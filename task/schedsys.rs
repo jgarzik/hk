@@ -96,7 +96,7 @@ fn prio_tasks(which: i32, who: u64) -> KernelResult<alloc::vec::Vec<TaskRef>> {
         PRIO_PGRP => {
             let pgid = super::pid::from_vnr_or(who, super::percpu::current_pgid())
                 .ok_or(KernelError::NoProcess)?;
-            super::percpu::pgrp_tasks(pgid)
+            super::pgrp::pgrp_tasks(pgid)
         }
         _ => return Err(KernelError::InvalidArgument),
     })
@@ -646,7 +646,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
             // (Linux walks the group under tasklist_lock and never sees
             // it); ESRCH if none was left
             let mut found = false;
-            for t in &super::percpu::pgrp_tasks(pgid) {
+            for t in &super::pgrp::pgrp_tasks(pgid) {
                 if super::tasklist::TASKLIST.read().view(t).is_none() {
                     continue;
                 }
@@ -711,7 +711,7 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> KernelResult<i64> {
             let pgid = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
                 .ok_or(KernelError::NoProcess)?;
 
-            let tasks = super::percpu::pgrp_tasks(pgid);
+            let tasks = super::pgrp::pgrp_tasks(pgid);
             if tasks.is_empty() {
                 return Err(KernelError::NoProcess);
             }

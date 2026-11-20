@@ -11,8 +11,9 @@ use alloc::vec::Vec;
 
 use crate::arch::{FrameAlloc, PageFlags, PageTable, phys_to_virt};
 
-use super::percpu;
+use super::percpu::{self, current};
 use super::tasklist::{TASKLIST, TaskRef, task_ref};
+use crate::arch::{CurrentArch, UserModeOps};
 use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 use crate::task::{Task, TaskState};
@@ -1294,7 +1295,7 @@ where
     drop(path);
 
     // Switch to the new address space and jump to user mode
-    percpu::exec_replace_image(mm, entry_point, user_sp, ident, guard);
+    exec_replace_image(mm, entry_point, user_sp, ident, guard);
 }
 
 /// sys_execve - execute a program
@@ -1596,4 +1597,73 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     }
     drop(table);
     gone
+}
+
+/// Replace current task's address space and jump to new entry point
+///
+/// This is used by execve to replace the current process image (Linux
+/// exec_mmap): the task switches to `mm` first, then drops its user
+/// reference on the old address space. That tears it down only if
+/// nothing else uses it -- a vfork parent or other CLONE_VM threads keep
+/// it alive. The function never returns.
+///
+/// # Arguments
+/// * `mm` - The new address space (its top-level table is loaded)
+/// * `entry_point` - The entry point address in the new program
+/// * `user_sp` - The initial user stack pointer
+pub fn exec_replace_image(
+    mm: crate::mm::MmRef,
+    entry_point: u64,
+    user_sp: u64,
+    ident: crate::task::exec::ExecIdentity,
+    guard: crate::signal::CredGuard,
+) -> ! {
+    let me = current();
+    let new = mm.arc().clone();
+
+    // The new mm, name and dumpability together (Linux exec_mmap, then
+    // __set_task_comm and set_dumpable), under cred_guard_mutex and
+    // exec_update_lock
+    let old = guard.exec_update(|| {
+        let mut table = TASKLIST.write();
+        let task = table.view_mut(&me);
+        let mut task = task.expect("exec: current task not in the task table");
+        task.pgd = new.pgd();
+        new.set_dumpable(ident.dumpable);
+        // A new execution domain (Linux de_thread): SIGCHLD; a secure
+        // exec is not signalled at its parent's death (begin_new_exec)
+        task.exit_signal = crate::signal::ExitSignal::SIGCHLD;
+        if ident.secure {
+            task.pdeath_signal = None;
+        }
+        // The mm and name change as one under task_lock (Linux
+        // exec_mmap, __set_task_comm): a reader sees both or neither
+        let mut a = task.task.task_lock();
+        a.set_comm(ident.name);
+        a.set_mm(Some(mm))
+    });
+
+    // The new image starts with no user GS base (Linux start_thread:
+    // load_gs_index(0), gsbase 0)
+    current().gsbase.store(0, Ordering::Relaxed);
+    crate::arch::write_user_gsbase(0);
+
+    // Leave the old tables before releasing them: their frames may be
+    // reused at once by another CPU
+    crate::mm::tlb::switch_mm(Some(&new));
+    drop(new);
+    drop(old);
+    drop(guard);
+
+    // Get kernel stack for syscall/interrupt return
+    let kstack_top = {
+        let table = TASKLIST.read();
+        table.view(&me).map_or(0, |t| t.task.kstack_top)
+    };
+
+    // Jump to user mode at the new entry point
+    // This function never returns
+    unsafe {
+        CurrentArch::jump_to_user(entry_point, user_sp, kstack_top);
+    }
 }
