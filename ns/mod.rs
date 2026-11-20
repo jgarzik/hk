@@ -571,7 +571,7 @@ pub fn fork_nsproxy(
 ) -> KernelResult<Arc<NsProxy>> {
     let ns_flags = flags & CLONE_NS_FLAGS;
     // CLONE_NEWNS with a shared fs struct was refused before any work
-    // (`percpu::clone_flags_ok`, Linux copy_process); the child's own
+    // (`fork::clone_flags_ok`, Linux copy_process); the child's own
     // copy follows its new mounts
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);

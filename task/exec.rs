@@ -1246,7 +1246,7 @@ where
 
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked
-    percpu::signal_vfork_done();
+    crate::task::fork::signal_vfork_done();
 
     // Initialize brk for the new process
     // Calculate page-aligned start_brk (end of loaded segments, rounded up)

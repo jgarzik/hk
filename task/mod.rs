@@ -18,6 +18,7 @@ pub mod fair;
 pub mod fdbits;
 pub use fdbits::FdTable;
 pub mod fdtable;
+pub mod fork;
 pub mod id;
 pub mod kthread;
 pub mod loadavg;
@@ -696,7 +697,7 @@ pub mod pf {
     pub const NO_SETAFFINITY: u32 = 0x0400_0000;
 }
 
-/// An io thread's function and its argument (`percpu::create_io_thread`)
+/// An io thread's function and its argument (`fork::create_io_thread`)
 pub type IoThreadFn = (
     fn(Arc<dyn core::any::Any + Send + Sync>),
     Arc<dyn core::any::Any + Send + Sync>,

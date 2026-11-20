@@ -6,7 +6,7 @@
 //! (fsync, statx, openat, ...), a link chain, or a request a drain held
 //! back is queued on its submitter's io-wq and run to its end, blocking,
 //! by a worker (Linux io_queue_iowq -> io_wq_enqueue). Workers are io
-//! threads of the submitter's process (`task::percpu::create_io_thread`,
+//! threads of the submitter's process (`task::fork::create_io_thread`,
 //! Linux create_io_thread): they share its mm, descriptors and fs
 //! context. Each request runs with the credentials its submitter had
 //! when it was queued (`task::override_creds`, Linux io_prep_async_work's
@@ -272,7 +272,7 @@ impl IoWq {
         .and_then(|worker| try_arc(WorkerArg { wq, i, worker }))
         .and_then(|a| {
             let a: Arc<dyn core::any::Any + Send + Sync> = a;
-            crate::task::percpu::create_io_thread(worker, a)
+            crate::task::fork::create_io_thread(worker, a)
         });
         if started.is_ok() {
             self.retries.store(0, Ordering::Relaxed);

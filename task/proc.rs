@@ -98,7 +98,7 @@ pub fn sys_clone(
         0
     };
 
-    clone(super::percpu::CloneConfig {
+    clone(super::fork::CloneConfig {
         flags: flags & !0xff, // Remove signal bits from flags
         child_stack,
         parent_tidptr: parent_tidptr.addr(),
@@ -107,7 +107,7 @@ pub fn sys_clone(
         pidfd_ptr,
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
-        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid: super::fork::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
         io_thread: None,
     })
@@ -115,9 +115,9 @@ pub fn sys_clone(
 
 /// Create the task described by `config` (do_clone with the global
 /// frame allocator): the child's tid
-fn clone(config: super::percpu::CloneConfig) -> KernelResult<i64> {
+fn clone(config: super::fork::CloneConfig) -> KernelResult<i64> {
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    Ok(super::percpu::do_clone(config, &mut frame_alloc)? as i64)
+    Ok(super::fork::do_clone(config, &mut frame_alloc)? as i64)
 }
 
 /// sys_fork - create a new process (classic fork)
@@ -131,7 +131,7 @@ fn clone(config: super::percpu::CloneConfig) -> KernelResult<i64> {
 /// * < 0: Error code
 pub fn sys_fork() -> KernelResult<i64> {
     // fork() is clone() with no CLONE_* flags and child_stack = 0 (inherit parent stack)
-    clone(super::percpu::CloneConfig {
+    clone(super::fork::CloneConfig {
         flags: 0,       // No sharing flags = fork semantics
         child_stack: 0, // 0 = inherit parent's stack pointer
         parent_tidptr: 0,
@@ -140,7 +140,7 @@ pub fn sys_fork() -> KernelResult<i64> {
         pidfd_ptr: 0,
         exit_signal: crate::signal::ExitSignal::SIGCHLD, // fork sends SIGCHLD on exit
         cgroup_fd: -1,
-        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid: super::fork::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
         io_thread: None,
     })
@@ -169,7 +169,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
 
     // vfork() = clone(CLONE_VM | CLONE_VFORK, parent_stack)
     // Child shares address space and parent blocks until child exec()s or _exit()s
-    clone(super::percpu::CloneConfig {
+    clone(super::fork::CloneConfig {
         flags: CLONE_VM | CLONE_VFORK,
         child_stack: super::percpu::current_pt_regs().sp(), // the parent's (CLONE_VM needs one)
         parent_tidptr: 0,
@@ -178,7 +178,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
         pidfd_ptr: 0,
         exit_signal: crate::signal::ExitSignal::SIGCHLD, // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
-        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid: super::fork::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
         io_thread: None,
     })
@@ -610,7 +610,7 @@ const CSIGNAL: u64 = 0x000000ff;
 /// * 0: Child returns 0
 /// * < 0: Error code
 pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
-    use super::percpu::CloneConfig;
+    use super::fork::CloneConfig;
 
     use crate::uaccess::copy_struct_from_user;
 
