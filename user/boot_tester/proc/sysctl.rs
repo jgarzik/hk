@@ -27,6 +27,7 @@ pub fn run_tests() {
     test_proc_net_udp();
     test_netns_bind();
     test_netns_init_only();
+    test_netns_global();
     test_perm_call();
     test_unregister_timeout();
 }
@@ -432,6 +433,42 @@ fn test_netns_init_only() {
             return 15;
         }
         sys_close(f as u64);
+        0
+    });
+}
+
+/// The congestion control lists are global: read-only outside the
+/// initial namespace (Linux ipv4_net_table_dup clears the write bits of
+/// entries without per-net data); a new namespace's default comes from
+/// init_net (tcp_sk_init) and is its own
+fn test_netns_global() {
+    const ALLOWED: &[u8] = b"/proc/sys/net/ipv4/tcp_allowed_congestion_control\0";
+    const CA: &[u8] = b"/proc/sys/net/ipv4/tcp_congestion_control\0";
+    in_child(b"SYSCTL_NETNS_GLOBAL", || {
+        let w = sys_open(ALLOWED.as_ptr(), O_WRONLY, 0);
+        if w < 0 {
+            return 10;
+        }
+        sys_close(w as u64);
+        let init = sys_open(b"/proc/self/ns/net\0".as_ptr(), O_RDONLY, 0);
+        if init < 0 {
+            return 11;
+        }
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            return 2;
+        }
+        if sys_open(ALLOWED.as_ptr(), O_WRONLY, 0) >= 0 {
+            return 12;
+        }
+        if !reads(ALLOWED, b"reno cubic\n") || !reads(CA, b"cubic\n") {
+            return 13;
+        }
+        if write_file(CA, b"reno") != 4 || !reads(CA, b"reno\n") {
+            return 14;
+        }
+        if sys_setns(init as i32, CLONE_NEWNET as i32) != 0 || !reads(CA, b"cubic\n") {
+            return 15;
+        }
         0
     });
 }

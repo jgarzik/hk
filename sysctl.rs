@@ -55,6 +55,8 @@ pub enum Entry {
         ctl: &'static NetCtl,
         net: Weak<NetNamespace>,
         id: u64,
+        /// The entry's mode in that namespace (`NetCtl::mode_in`)
+        mode: u16,
         set: alloc::sync::Arc<crate::net::sysctl::SysctlSet>,
     },
 }
@@ -83,6 +85,7 @@ impl Entry {
             ctl,
             net: alloc::sync::Arc::downgrade(net),
             id: net.id,
+            mode: ctl.mode_in(net),
             set: net.sysctls.clone(),
         }
     }
@@ -117,8 +120,8 @@ impl Entry {
                 mode: c.mode,
                 net: false,
             },
-            Self::Net { ctl, .. } => Perm {
-                mode: ctl.mode,
+            Self::Net { mode, .. } => Perm {
+                mode: *mode,
                 net: true,
             },
         }

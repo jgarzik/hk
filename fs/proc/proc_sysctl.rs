@@ -143,7 +143,7 @@ fn make_inode(
         Child::File(ctl) => create_file_inode(
             parent,
             ino,
-            InodeMode::regular(ctl.mode),
+            InodeMode::regular(ctl.mode_in(net)),
             ProcfsInodeData::Sysctl {
                 ctl: Entry::net(ctl, net.passive()),
             },

@@ -177,6 +177,10 @@ pub struct NetCtl {
     pub path: &'static str,
     /// File mode bits (0644, 0444)
     pub mode: u16,
+    /// Its data is global, not the namespace's (Linux an
+    /// ipv4_net_table entry without a data pointer): read-only outside
+    /// the initial namespace ([`NetCtl::mode_in`])
+    pub global: bool,
     /// Current value in a namespace
     pub show: fn(&NetNamespace) -> Vec<i64>,
     /// Validate and store a value (as `sysctl::Ctl::store`)
@@ -189,6 +193,18 @@ pub struct NetCtl {
 pub struct NetText {
     pub show: fn(&NetNamespace) -> String,
     pub store: fn(&NetNamespace, &str) -> Result<(), KernelError>,
+}
+
+impl NetCtl {
+    /// Its mode in `net` (Linux ipv4_net_table_dup: an entry without
+    /// per-net data loses its write bits outside init_net)
+    pub fn mode_in(&self, net: &NetNamespace) -> u16 {
+        if self.global && !is_init(net) {
+            self.mode & !0o222
+        } else {
+            self.mode
+        }
+    }
 }
 
 /// `net` is the initial namespace (Linux net_eq(net, &init_net))
@@ -359,6 +375,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/ping_group_range",
         mode: 0o644,
+        global: false,
         show: ping_group_show,
         store: ping_group_store,
         text: None,
@@ -366,6 +383,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/ip_local_port_range",
         mode: 0o644,
+        global: false,
         show: port_range_show,
         store: port_range_store,
         text: None,
@@ -373,6 +391,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/icmp_echo_ignore_all",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.icmp_echo_ignore_all),
         store: |n, v| set_bool(n, |s| &s.icmp_echo_ignore_all, v),
         text: None,
@@ -380,6 +399,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/icmp_echo_ignore_broadcasts",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.icmp_echo_ignore_bcast),
         store: |n, v| set_bool(n, |s| &s.icmp_echo_ignore_bcast, v),
         text: None,
@@ -387,6 +407,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/icmp_ratelimit",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.icmp_ratelimit),
         store: |n, v| set_int(n, |s| &s.icmp_ratelimit, v, 0, INT_MAX),
         text: None,
@@ -394,6 +415,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/icmp_ratemask",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.icmp_ratemask),
         store: |n, v| set_int(n, |s| &s.icmp_ratemask, v, INT_MIN, INT_MAX),
         text: None,
@@ -401,6 +423,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/icmp_msgs_per_sec",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.icmp_msgs_per_sec),
         store: |n, v| set_int(n, |s| &s.icmp_msgs_per_sec, v, 0, INT_MAX),
         text: None,
@@ -408,6 +431,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/icmp_msgs_burst",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.icmp_msgs_burst),
         store: |n, v| set_int(n, |s| &s.icmp_msgs_burst, v, 0, INT_MAX),
         text: None,
@@ -415,6 +439,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_syn_retries",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_syn_retries),
         store: |n, v| {
             range(v[0], 1, MAX_SYNCNT)?;
@@ -428,6 +453,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_synack_retries",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_synack_retries),
         store: |n, v| set_u8(n, |s| &s.tcp_synack_retries, v),
         text: None,
@@ -435,6 +461,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_retries2",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_retries2),
         store: |n, v| set_u8(n, |s| &s.tcp_retries2, v),
         text: None,
@@ -442,6 +469,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_fin_timeout",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.tcp_fin_timeout),
         store: |n, v| set_int(n, |s| &s.tcp_fin_timeout, v, 1, INT_MAX / 1000),
         text: None,
@@ -449,6 +477,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_window_scaling",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_window_scaling),
         store: |n, v| set_u8(n, |s| &s.tcp_window_scaling, v),
         text: None,
@@ -456,6 +485,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_timestamps",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_timestamps),
         store: |n, v| set_u8(n, |s| &s.tcp_timestamps, v),
         text: None,
@@ -463,6 +493,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_sack",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_sack),
         store: |n, v| set_u8(n, |s| &s.tcp_sack, v),
         text: None,
@@ -470,6 +501,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_dsack",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_dsack),
         store: |n, v| set_u8(n, |s| &s.tcp_dsack, v),
         text: None,
@@ -477,6 +509,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_reordering",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.tcp_reordering),
         store: |n, v| {
             let max = n.sysctl.tcp_max_reordering.load(Ordering::Relaxed);
@@ -487,6 +520,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_max_reordering",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.tcp_max_reordering),
         store: |n, v| set_int(n, |s| &s.tcp_max_reordering, v, 1, INT_MAX),
         text: None,
@@ -494,6 +528,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_recovery",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_recovery),
         store: |n, v| set_u8(n, |s| &s.tcp_recovery, v),
         text: None,
@@ -501,6 +536,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_early_retrans",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_early_retrans),
         store: |n, v| {
             range(v[0], 0, 4)?;
@@ -514,6 +550,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_rfc1337",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_rfc1337),
         store: |n, v| set_u8(n, |s| &s.tcp_rfc1337, v),
         text: None,
@@ -521,6 +558,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_rmem",
         mode: 0o644,
+        global: false,
         show: rmem_show,
         store: rmem_store,
         text: None,
@@ -528,6 +566,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_keepalive_time",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.tcp_keepalive_time),
         store: |n, v| set_int(n, |s| &s.tcp_keepalive_time, v, 1, INT_MAX / 1000),
         text: None,
@@ -535,6 +574,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_keepalive_intvl",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.tcp_keepalive_intvl),
         store: |n, v| set_int(n, |s| &s.tcp_keepalive_intvl, v, 1, INT_MAX / 1000),
         text: None,
@@ -542,6 +582,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_keepalive_probes",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_keepalive_probes),
         store: |n, v| set_u8(n, |s| &s.tcp_keepalive_probes, v),
         text: None,
@@ -549,6 +590,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_frto",
         mode: 0o644,
+        global: false,
         show: |n| get_u8(n, |s| &s.tcp_frto),
         store: |n, v| set_u8(n, |s| &s.tcp_frto, v),
         text: None,
@@ -556,6 +598,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_congestion_control",
         mode: 0o644,
+        global: false,
         show: no_ints,
         store: ro,
         text: Some(NetText {
@@ -566,6 +609,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_available_congestion_control",
         mode: 0o444,
+        global: true,
         show: no_ints,
         store: ro,
         text: Some(NetText {
@@ -573,10 +617,12 @@ pub static CTLS: &[NetCtl] = &[
             store: ro_text,
         }),
     },
-    // Linux ipv4_net_table, its data global (tcp_cong_list's flags)
+    // Linux ipv4_net_table, its data global (tcp_cong_list's flags):
+    // read-only outside init_net
     NetCtl {
         path: "net/ipv4/tcp_allowed_congestion_control",
         mode: 0o644,
+        global: true,
         show: no_ints,
         store: ro,
         text: Some(NetText {
@@ -589,6 +635,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/route/flush",
         mode: 0o200,
+        global: false,
         show: no_ints,
         store: ro,
         text: Some(NetText {
@@ -599,6 +646,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/ip_forward",
         mode: 0o444,
+        global: false,
         show: |_| vec![0],
         store: ro,
         text: None,
@@ -606,6 +654,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/ipfrag_high_thresh",
         mode: 0o644,
+        global: false,
         show: |n| frag_show(n, true),
         store: |n, v| frag_store(n, true, v),
         text: None,
@@ -613,6 +662,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/ipfrag_low_thresh",
         mode: 0o644,
+        global: false,
         show: |n| frag_show(n, false),
         store: |n, v| frag_store(n, false, v),
         text: None,
@@ -620,6 +670,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/ipfrag_time",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.frag_time),
         store: |n, v| set_int(n, |s| &s.frag_time, v, 1, INT_MAX),
         text: None,
@@ -627,6 +678,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/core/somaxconn",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.somaxconn),
         store: |n, v| set_int(n, |s| &s.somaxconn, v, 0, INT_MAX),
         text: None,
@@ -634,6 +686,7 @@ pub static CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/unix/max_dgram_qlen",
         mode: 0o644,
+        global: false,
         show: |n| get_i32(n, |s| &s.unix_max_dgram_qlen),
         store: |n, v| set_int(n, |s| &s.unix_max_dgram_qlen, v, INT_MIN, INT_MAX),
         text: None,
@@ -646,6 +699,7 @@ pub static INIT_CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/ipv4/tcp_mem",
         mode: 0o644,
+        global: false,
         show: |_| crate::net::tcp::mem::sysctl_show(),
         store: |_, v| crate::net::tcp::mem::sysctl_store(v),
         text: None,
@@ -653,6 +707,7 @@ pub static INIT_CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/core/netdev_unregister_timeout_secs",
         mode: 0o644,
+        global: false,
         show: |_| {
             let s = crate::net::rtnl::UNREGISTER_TIMEOUT_SECS.load(Ordering::Relaxed);
             vec![i64::from(s)]
@@ -667,6 +722,7 @@ pub static INIT_CTLS: &[NetCtl] = &[
     NetCtl {
         path: "net/core/mem_pcpu_rsv",
         mode: 0o644,
+        global: false,
         show: |_| crate::net::tcp::mem::rsv_show(),
         store: |_, v| crate::net::tcp::mem::rsv_store(v),
         text: None,
