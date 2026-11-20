@@ -314,9 +314,8 @@ drivers have no promiscuous or multicast filtering; set_promisc is a
 no-op on e1000 and virtio-net, which has no control queue: QEMU then
 delivers all frames).
 Checksum state (TP_STATUS_CSUMNOTREADY, PACKET_VNET_HDR's NEEDS_CSUM):
-only UDP over lo is CHECKSUM_PARTIAL (`SkBuff::csum_partial`); TCP
-segments over lo are not marked (Linux tcp_v4_send_check makes them
-CHECKSUM_PARTIAL), nor is a corked UDP datagram exempt (Linux
+UDP and TCP segments over lo are CHECKSUM_PARTIAL
+(`SkBuff::csum_partial`), but a corked UDP datagram is too (Linux
 __ip_append_data leaves MSG_MORE sends CHECKSUM_NONE).
 The TPACKET_V3 retire timeout without tp_retire_blk_tov is always
 8 ms: hk keeps no ethtool link speed (Linux prb_calc_retire_blk_tmo

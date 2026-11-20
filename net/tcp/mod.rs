@@ -367,6 +367,12 @@ fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) 
     let Ok(rt) = route::output(net, t.raddr, t.laddr, oif) else {
         return false;
     };
+    let mut skb = skb;
+    // Linux validate_xmit_skb: a device without checksum offload gets
+    // the checksum done (skb_checksum_help); lo keeps it partial
+    if !rt.dev.is_loopback() {
+        skb.csum_partial = false;
+    }
     let _ = ipv4::ip_send_rt(net, &rt, skb, IPPROTO_TCP, p);
     true
 }
@@ -375,6 +381,8 @@ fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) 
 /// with ip_queue_xmit), each header put on its payload skb
 pub(super) fn send_segs(net: &NetNamespace, t: &Tuple, out: &mut Out, p: IpParams, oif: u32) {
     while let Some(mut skb) = out.segs.pop_front() {
+        // Linux tcp_v4_send_check: CHECKSUM_PARTIAL (hk sums it anyway)
+        skb.csum_partial = true;
         if output::finish_hdr(&mut skb, t).is_some() && !send(net, t, skb, p, oif) {
             // Linux __ip_queue_xmit's no_route
             net.mib.ip.inc(crate::net::mib::IPSTATS_MIB_OUTNOROUTES);

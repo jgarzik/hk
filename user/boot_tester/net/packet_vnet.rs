@@ -331,6 +331,30 @@ fn test_csum(lo: i32) {
             6,
         );
     }
+    // TCP data over lo: tcp_v4_send_check's CHECKSUM_PARTIAL
+    let l = tcp();
+    bind(l, LO, 0);
+    hk_syscall::sys_listen(l, 1);
+    let c = tcp();
+    t.eq(b"connect", connect(c, LO, crate::net::sk::port(l)), 0);
+    t.eq(b"tcp send", send(c, b"tcpcs", 0), 5);
+    let is_tcp = |f: &[u8]| {
+        f.len() >= 59 && f[12..14] == ETH_P_IP.to_be_bytes() && f[23] == 6 && f.ends_with(b"tcpcs")
+    };
+    let out = aux_status(all, &is_tcp);
+    t.ok(
+        b"tcp outgoing notready",
+        out.is_some_and(|s| s & 8 != 0),
+        out.unwrap_or(0) as i64,
+    );
+    let inc = aux_status(all, &is_tcp);
+    t.ok(
+        b"tcp incoming notready",
+        inc.is_some_and(|s| s & 8 != 0),
+        inc.unwrap_or(0) as i64,
+    );
+    close(c);
+    close(l);
     let tx = psock(SOCK_RAW, 0);
     let mut f = [0u8; 64];
     let fr = test_frame(&mut f, 0xd1, 60);
