@@ -3125,3 +3125,26 @@ fn full_flight_is_cwnd_limited() {
     assert_eq!(q.a.packets_out, 1);
     assert!(q.a.cong.cwnd_limited());
 }
+
+/// An old ACK (below SND.UNA, no SACK blocks) still updates TS.Recent,
+/// though not the window (Linux tcp_ack old_ack: tcp_replace_ts_recent
+/// before the SACK check)
+#[test]
+fn old_ack_updates_ts_recent() {
+    let mut p = Pair::new(1000);
+    p.send_a(&pattern(5000));
+    p.run();
+    let wnd = p.a.snd_wnd;
+    let tsv = p.a.ts_recent.wrapping_add(7);
+    let old = SegIn {
+        seq: p.a.rcv_nxt,
+        ack: p.a.snd_una.wrapping_sub(500),
+        flags: flags::ACK,
+        wnd: 0,
+        ts: Some((tsv, 0)),
+        ..Default::default()
+    };
+    p.a.feed(&old, p.now, &mut Out::default());
+    assert_eq!(p.a.ts_recent, tsv);
+    assert_eq!(p.a.snd_wnd, wnd);
+}

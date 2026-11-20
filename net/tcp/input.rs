@@ -459,7 +459,7 @@ impl TcpCb {
     /// The ACK field (RFC 9293 3.10.7.4 fifth check, RFC 5961 5.2: the
     /// acceptable range below SND.UNA is min(max window, bytes acked) as
     /// in Linux tcp_ack); false if the segment must be dropped. An old
-    /// ACK (below SND.UNA) updates neither TS.Recent nor the window.
+    /// ACK (below SND.UNA) updates TS.Recent but not the window.
     /// Then Linux tcp_ack: the window, the retransmit queue
     /// (tcp_clean_rtx_queue), loss recovery for a dubious ACK
     /// (tcp_fastretrans_alert), the timers, the congestion window
@@ -480,9 +480,11 @@ impl TcpCb {
         let mut st = SackState::default();
         let mut rexmit = Rexmit::None;
         if before(ack, prior_snd_una) {
-            // Linux old_ack: its SACK blocks may still tell something
+            // Linux old_ack: it may carry new data, so TS.Recent first,
+            // before SACK processing can trigger a retransmission; its
+            // SACK blocks may still tell something
+            self.update_ts_recent(s);
             if !blocks.is_empty() {
-                self.update_ts_recent(s);
                 let prior_delivered = self.delivered;
                 let mut flg = self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
                 self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
