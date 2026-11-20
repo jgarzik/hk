@@ -230,6 +230,8 @@ impl ProtoOps for RawSock {
         self.sk.set_shutdown(SHUTDOWN_MASK);
         self.rxq.clear();
         self.sk.purge_err();
+        // Linux sk_common_release's sock_put: the last reference
+        self.sk.inuse_end();
     }
 
     /// Linux raw_bind: an address only (local, multicast or broadcast)

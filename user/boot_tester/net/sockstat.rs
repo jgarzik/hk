@@ -9,8 +9,15 @@
 //!   listener, its connection and the accepted one in TCP inuse; the
 //!   side that closes first ends in TIME_WAIT (tw); closing everything
 //!   brings the counts back
+//! - SOCKSTAT_USED_CLOSE: bound UDP, raw, bound ping, packet, TCP
+//!   listener and unbound TCP sockets leave "sockets: used" as close()
+//!   returns (Linux __sk_free at the last sk_refcnt, before the
+//!   RCU-deferred free of SOCK_RCU_FREE sockets), not a grace period
+//!   later
 
-use hk_syscall::{AF_INET, CLONE_NEWNET, SOCK_RAW, sys_exit, sys_fork, sys_socket, sys_unshare};
+use hk_syscall::{
+    AF_INET, CLONE_NEWNET, SOCK_DGRAM, SOCK_RAW, sys_exit, sys_fork, sys_socket, sys_unshare,
+};
 
 use crate::harness::{T, fail_num, pass};
 use crate::helpers::{host_mode, loopback_up, msleep, println, read_file, skip};
@@ -90,6 +97,7 @@ pub fn run_tests() {
         loopback_up();
         format();
         counts();
+        used_close();
         sys_exit(0);
     }
     let st = wait_child(pid);
@@ -169,9 +177,9 @@ fn counts() {
         1,
     );
     close(u);
-    // Counts drop when the socket is freed, which may come after close
-    // returns (Linux __sk_free on the last reference)
-    let s = settle(|s| used(s) == base).unwrap_or_else(Stat::empty);
+    // Counts drop as close returns (Linux __sk_free on the last
+    // reference; only the memory waits for a grace period)
+    let s = Stat::read().unwrap_or_else(Stat::empty);
     t.eq(b"udp closed", s.val(b"UDP:", b"inuse"), 0);
     t.eq(b"udp closed used", used(&s) - base, 0);
 
@@ -189,9 +197,11 @@ fn counts() {
         Stat::read().map_or(-1, |s| s.val(b"RAW:", b"inuse")),
         0,
     );
-    // Freed after a grace period (Linux SOCK_RCU_FREE)
-    let s = settle(|s| used(s) == base).unwrap_or_else(Stat::empty);
-    t.eq(b"raw closed used", used(&s) - base, 0);
+    t.eq(
+        b"raw closed used",
+        Stat::read().map_or(-1, |s| used(&s) - base),
+        0,
+    );
 
     // TCP: listener, connection, accepted; the client closes first
     let (l, p) = listener(1);
@@ -213,5 +223,50 @@ fn counts() {
     close(l);
     let s = settle(|s| s.val(b"TCP:", b"inuse") == 0).unwrap_or_else(Stat::empty);
     t.eq(b"tcp closed", s.val(b"TCP:", b"inuse"), 0);
+    t.done();
+}
+
+const AF_PACKET: i32 = 17;
+const PING_RANGE: &[u8] = b"/proc/sys/net/ipv4/ping_group_range\0";
+/// Sockets of each kind
+const EACH: usize = 4;
+
+/// Open sockets of every RCU-listed kind, then close them: "sockets:
+/// used" is back at once
+fn used_close() {
+    let mut t = T::new(b"SOCKSTAT_USED_CLOSE");
+    let used = || Stat::read().map_or(-1, |s| s.val(b"sockets:", b"used"));
+    let base = used();
+    let ping = crate::proc::sysctl::write_file(PING_RANGE, b"0 2147483647") > 0;
+    let mut fds = [-1i32; 6 * EACH];
+    let mut n = 0;
+    let mut add = |fd: i32, what: &[u8], t: &mut T| {
+        t.ok(what, fd >= 0, i64::from(fd));
+        fds[n] = fd;
+        n += 1;
+    };
+    for _ in 0..EACH {
+        let (u, _) = udp_lo();
+        add(u, b"udp", &mut t);
+        add(
+            sys_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) as i32,
+            b"raw",
+            &mut t,
+        );
+        let p = sys_socket(AF_PACKET, SOCK_RAW, i32::from(0x0003u16.to_be()));
+        add(p as i32, b"packet", &mut t);
+        add(listener(1).0, b"listener", &mut t);
+        add(tcp(), b"tcp", &mut t);
+        if ping {
+            let p = sys_socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) as i32;
+            t.eq(b"ping bind", bind(p, LO, 0), 0);
+            add(p, b"ping", &mut t);
+        }
+    }
+    t.eq(b"open", used() - base, n as i64);
+    for &fd in &fds[..n] {
+        close(fd);
+    }
+    t.eq(b"closed", used() - base, 0);
     t.done();
 }

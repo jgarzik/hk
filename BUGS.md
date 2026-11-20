@@ -113,11 +113,6 @@ branch); a takeover SYN's connection gets a fresh ISN, not the
 entry's SND.NXT + 65537 (Linux TCP_SKB_CB tcp_tw_isn); and there is
 no tcp_max_tw_buckets (inet_twsk_alloc's limit, TCPTimeWaitOverflow).
 
-A socket on RCU lists (ping, raw, UDP, packet, netlink) leaves "sockets: used" a grace
-period after its close: the chain's `Arc` is released by
-`RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
-drops the count at sk_free (the last reference, at unhash) and defers
-only the memory (SOCK_RCU_FREE).
 No SYN cookies (a full listener drops SYNs).
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).

@@ -388,6 +388,8 @@ impl ProtoOps for PacketSock {
         opts::flush_mclist(self);
         self.rxq.clear();
         self.sk.purge_err();
+        // Linux packet_release's sock_put: the last reference
+        self.sk.inuse_end();
     }
 
     /// Linux packet_bind: a sockaddr_ll; protocol 0 keeps the current

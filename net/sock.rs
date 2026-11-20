@@ -18,9 +18,7 @@
 //! or not).
 
 use alloc::boxed::Box;
-use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::io::fasync::{FasyncList, POLL_ERR, POLL_IN, POLL_OUT, kill_fasync};
 use crate::io::poll::{
@@ -166,16 +164,22 @@ pub struct Sock {
     pub fasync: FasyncList,
     /// `wqf` bits
     wq_flags: AtomicU32,
-    /// Counted in its namespace's INUSE_ALL (`inuse_start`)
-    inuse: AtomicBool,
+    /// In its namespace's INUSE_ALL: `INUSE_*` (`inuse_start`,
+    /// `inuse_end`)
+    inuse: AtomicU8,
 }
 
+/// `Sock.inuse`: not counted yet, counted, counted no more (for good)
+const INUSE_NOT_YET: u8 = 0;
+const INUSE_COUNTED: u8 = 1;
+const INUSE_ENDED: u8 = 2;
+
 impl Drop for Sock {
-    /// Linux __sk_free's sock_inuse_add
+    /// A socket whose protocol never called `inuse_end` (one Linux
+    /// frees from an RCU callback, as netlink, or one never released)
+    /// leaves the count here
     fn drop(&mut self) {
-        if *self.inuse.get_mut() {
-            self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, false);
-        }
+        self.inuse_end();
     }
 }
 
@@ -191,8 +195,29 @@ impl Sock {
     /// Counted from now on, once (Linux sk_alloc, or sk_clone_lock for
     /// a TCP child, which Linux makes only when its handshake completes)
     pub fn inuse_start(&self) {
-        if !self.inuse.swap(true, Ordering::Relaxed) {
+        if self
+            .inuse
+            .compare_exchange(
+                INUSE_NOT_YET,
+                INUSE_COUNTED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, true);
+        }
+    }
+
+    /// Its last reference went (Linux __sk_free's sock_inuse_add, run
+    /// at sk_free before the memory's RCU-deferred release with
+    /// SOCK_RCU_FREE): out of the count, once, never counted again. hk's
+    /// table references are released a grace period after unhashing,
+    /// so the protocols call this where Linux drops the last
+    /// sk_refcnt (datagram release, TCP destroy of an orphan)
+    pub fn inuse_end(&self) {
+        if self.inuse.swap(INUSE_ENDED, Ordering::Relaxed) == INUSE_COUNTED {
+            self.net.mib.inuse_add(crate::net::mib::INUSE_ALL, false);
         }
     }
 
@@ -223,7 +248,7 @@ impl Sock {
             errmem: AtomicUsize::new(0),
             fasync: FasyncList::new(),
             wq_flags: AtomicU32::new(0),
-            inuse: AtomicBool::new(false),
+            inuse: AtomicU8::new(INUSE_NOT_YET),
         }
     }
 

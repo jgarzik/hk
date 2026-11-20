@@ -508,6 +508,12 @@ impl TcpSock {
             }
         }
         self.sync_timers(g);
+        // Linux inet_csk_destroy_sock of an orphan (tcp_done, tcp_close
+        // in TCP_CLOSE, tcp_time_wait): with its timers stopped, its
+        // last reference goes (sk_free)
+        if g.cb.orphan && g.cb.state == TcpState::Closed {
+            self.sk.inuse_end();
+        }
         ready
     }
 
