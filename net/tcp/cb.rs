@@ -419,6 +419,10 @@ pub struct Live {
     pub(super) rto: SoleCell<u64>,
     /// Consecutive timeouts / probes (exponential backoff)
     pub(super) backoff: SoleCell<u32>,
+    /// Retransmission timeouts since SND.UNA last moved (Linux
+    /// icsk_retransmits): what tcp_write_timeout counts; a shrunk-window
+    /// probe is not one
+    pub(super) retransmits: SoleCell<u32>,
     /// Zero-window or keepalive probes without an answer
     pub(super) probes: SoleCell<u32>,
     /// Send MSS: payload per segment (min(peer's MSS option, path MTU -

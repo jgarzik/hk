@@ -653,6 +653,63 @@ fn shrunk_window_retransmits_probe_head() {
     assert!(p.now - quiet > 2 * RTO_MAX);
 }
 
+/// After shrunk-window probing past tcp_retries2, the peer reopens its
+/// window acking only the probed head: the rest of the lost flight goes
+/// out at once, and the probes never count as retransmission timeouts,
+/// so the next ordinary RTO does not time the connection out (Linux:
+/// tcp_enter_loss marks the flight lost; icsk_retransmits stays 0 in
+/// the shrunk-window branch)
+#[test]
+fn shrunk_window_reopen_resends_rest() {
+    let mut p = Pair::new(1000);
+    p.filter = |_, to_b, s, _| {
+        if to_b && !s.data.is_empty() {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    };
+    assert_eq!(p.send_a(&pattern(3000)), 3000);
+    p.run();
+    let una = p.a.snd_una;
+    let ack = |p: &Pair, ack: u32, wnd: u16| SegIn {
+        seq: p.a.rcv_nxt,
+        ack,
+        flags: flags::ACK,
+        wnd,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    let now = p.now;
+    p.a.feed(&ack(&p, una, 0), now, &mut out);
+    for _ in 0..(cfg().retries2 + 5) {
+        let t = p.a.next_timer().expect("armed");
+        p.now = t;
+        let mut out = Out::default();
+        p.a.on_timer(t, &mut out);
+        let mut out = Out::default();
+        p.a.feed(&ack(&p, una, 0), t, &mut out);
+    }
+    // The window opens, the head acked: the rest goes out now
+    let head = una.wrapping_add(1000);
+    let mut out = Out::default();
+    let now = p.now;
+    p.a.feed(&ack(&p, head, 60_000), now, &mut out);
+    assert!(
+        wire(&out)
+            .iter()
+            .any(|s| s.seq == head && !s.data.is_empty()),
+        "rest of the flight resent at once"
+    );
+    // The next ordinary timeout retransmits; no ETIMEDOUT
+    let t = p.a.next_timer().expect("armed");
+    p.now = t;
+    let mut out = Out::default();
+    p.a.on_timer(t, &mut out);
+    assert_eq!(p.a.state, TcpState::Established);
+    assert_eq!(out.err, None);
+}
+
 #[test]
 fn window_edge_never_moves_left() {
     let mut p = Pair::with_cap(1000, 8000);

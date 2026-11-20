@@ -104,7 +104,8 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let synced = cb.state.synced();
     b.u8(cb.state.linux());
     b.u8(cb.ca_state());
-    b.u8(cb.live.backoff.get().min(255) as u8);
+    // tcpi_retransmits, tcpi_probes, tcpi_backoff
+    b.u8(cb.live.retransmits.get().min(255) as u8);
     b.u8(cb.live.probes.get().min(255) as u8);
     b.u8(cb.live.backoff.get().min(255) as u8);
     let mut opt = 0;
@@ -230,7 +231,8 @@ pub(super) struct ProcView {
     /// keepalive / FIN_WAIT2 timer; and its deadline (ms)
     pub tr: u8,
     pub when: u64,
-    pub backoff: u32,
+    /// Linux icsk_retransmits (the retrnsmt column)
+    pub retransmits: u32,
     pub probes: u32,
     pub rto: u64,
     pub ato: u64,
@@ -263,7 +265,7 @@ impl ProcView {
         Self {
             tr,
             when,
-            backoff: l.backoff.get(),
+            retransmits: l.retransmits.get(),
             probes: l.probes.get(),
             rto: l.rto_cur(),
             ato: l.ato.get(),
@@ -308,7 +310,7 @@ fn sock_line(m: &mut SeqBuf, i: usize, s: &super::TcpSock, now: u64) {
         rxq,
         v.tr,
         ticks(when),
-        v.backoff,
+        v.retransmits,
         uid,
         v.probes,
         ino,

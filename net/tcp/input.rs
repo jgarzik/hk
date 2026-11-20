@@ -104,6 +104,9 @@ impl TcpCb {
     /// The handshake completed with `s`
     fn established(&mut self, s: &SegIn, now: u64, out: &mut Out) {
         self.set_state(TcpState::Established);
+        // The handshake's timeouts are over (Linux tcp_finish_connect,
+        // tcp_rcv_state_process SYN_RECV: icsk_retransmits = 0)
+        self.live.retransmits.set(0);
         // Linux tcp_create_openreq_child: the request became a socket
         self.tcp_stat_if(self.passive, TCP_MIB_PASSIVEOPENS);
         self.snd_wnd = self.seg_wnd(s);
@@ -493,6 +496,8 @@ impl TcpCb {
         self.clean_rtx(ack);
         self.stats.bytes_acked += u64::from(acked);
         self.snd_una = ack;
+        // Linux tcp_ack: FLAG_SND_UNA_ADVANCED
+        self.live.retransmits.set(0);
         self.syn_unacked = false;
         self.mem_settle();
         if before(self.snd_nxt, ack) {

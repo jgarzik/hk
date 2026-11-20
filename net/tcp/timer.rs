@@ -179,11 +179,11 @@ impl TcpCb {
         }
         // Linux tcp_write_timeout: reset while the RTO is short or the
         // retries are not used up
-        let reset = self.rto_cur() < RTO_MAX || !self.gave_up(self.live.backoff.get(), now);
+        let reset = self.rto_cur() < RTO_MAX || !self.gave_up(self.live.retransmits.get(), now);
         if !handshake && self.out_of_resources(now, reset, out) {
             return;
         }
-        if self.gave_up(self.live.backoff.get(), now) {
+        if self.gave_up(self.live.retransmits.get(), now) {
             self.timed_out(out);
             return;
         }
@@ -199,6 +199,8 @@ impl TcpCb {
         self.cong.on_rto(flight);
         self.rtt_seq = None;
         self.live.backoff.set(self.live.backoff.get() + 1);
+        // Linux tcp_update_rto_stats
+        self.live.retransmits.set(self.live.retransmits.get() + 1);
         self.stats.rto_count = self.stats.rto_count.wrapping_add(1);
         if handshake {
             self.syn_rtx = true;
@@ -233,9 +235,11 @@ impl TcpCb {
             self.timed_out(out);
             return;
         }
-        // Linux tcp_enter_loss, then tcp_retransmit_skb of the head
+        // Linux tcp_enter_loss (the flight is lost: resent from SND.UNA
+        // once the window allows), then tcp_retransmit_skb of the head
         let flight = self.snd_max.wrapping_sub(self.snd_una);
         self.cong.on_rto(flight);
+        self.snd_nxt = self.snd_una;
         self.retransmit_head(out);
         self.live.backoff.set(self.live.backoff.get() + 1);
         self.arm_rtx(now);
