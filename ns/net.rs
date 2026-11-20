@@ -518,6 +518,28 @@ pub fn for_each_net(mut f: impl FnMut(&Arc<NetNamespace>)) {
     }
 }
 
+/// The network namespace of the task the caller numbers `pid` (Linux
+/// get_net_ns_by_pid): ESRCH if there is none, or it is exiting
+pub fn get_net_ns_by_pid(pid: u32) -> Result<NetRef, KernelError> {
+    let t =
+        crate::task::tasklist::find_task_by_vpid(u64::from(pid)).ok_or(KernelError::NoProcess)?;
+    let np = super::get_task_ns(&t).ok_or(KernelError::NoProcess)?;
+    Ok(np.net_ns.clone())
+}
+
+/// The network namespace namespace file `fd` holds (Linux
+/// get_net_ns_by_fd): EBADF for a bad fd, EINVAL for any other file
+pub fn get_net_ns_by_fd(fd: u32) -> Result<NetRef, KernelError> {
+    use crate::fs::pseudo::nsfs;
+    let file = crate::fs::io::fget(fd.cast_signed())?;
+    if nsfs::proc_ns_file(&file)
+        && let Some(super::NsRef::Net(n)) = file.get_inode().and_then(|i| nsfs::get_proc_ns(&i))
+    {
+        return Ok(n);
+    }
+    Err(KernelError::InvalidArgument)
+}
+
 /// Get the init network namespace
 pub fn init_net_ns() -> NetRef {
     INIT_NET_NS.clone()

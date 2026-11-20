@@ -645,8 +645,15 @@ Routing rules are Linux's three IPv4 defaults, fixed: RTM_NEWRULE and
 RTM_DELRULE are EOPNOTSUPP, lookups walk tables local then main and never
 default (no rule engine), and rule dumps of other families are
 EAFNOSUPPORT (Linux lists the IPv6 and multicast-routing defaults).
-RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
-return 0 without moving the device (Linux: moved, or an error).
+RTM_NEWLINK/RTM_SETLINK apply MTU and flags only; the rest is refused
+with the errno Linux gives a device or driver lacking it, never ignored:
+moving a device to another namespace (IFLA_NET_NS_PID/FD; EOPNOTSUPP, lo
+EINVAL as Linux), MAC address, carrier, master, VF, proto_down, XDP and
+per-family (IFLA_AF_SPEC) settings are EOPNOTSUPP. Group, alias,
+broadcast address, txqlen, GSO/GRO limits, operstate and link mode, which
+Linux always applies, are EOPNOTSUPP unless equal to the device's fixed
+value; IFLA_TARGET_NETNSID / IFLA_LINK_NETNSID are EINVAL (no namespace
+ids).
 
 ## io_uring gaps
 

@@ -14,6 +14,7 @@ pub mod netlink;
 pub mod nl;
 pub mod packet;
 pub mod raw;
+pub mod rtnl_link;
 pub mod sk;
 pub mod snmp;
 pub mod sockcore;
