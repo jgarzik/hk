@@ -153,6 +153,8 @@ fn try_connect(
         *nst = Some(me.clone());
         newsk.set_state(ESTABLISHED);
     }
+    // Its in-flight edges count as the listener's until accepted
+    super::gc::set_listener(newsk, other);
     *newsk.peercred.lock() = Some(cred);
     // The server side passes credentials if the listener does
     let pass = other.sk.flag(sf::PASSCRED);
@@ -201,6 +203,7 @@ pub fn accept(s: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, KernelError
             let e = ucb(&skb).embryo.clone();
             drop(skb);
             let e = e.ok_or(KernelError::InvalidArgument)?;
+            super::gc::update_edges(&e);
             // A connector may wait for backlog room
             s.peer_wait.wake_all();
             return Ok(e);
@@ -282,6 +285,9 @@ fn send_skb(
         if too_many_fds() {
             return Err(KernelError::TooManyRefs);
         }
+        // Linux unix_attach_fds: unix_prepare_fpl
+        let mut f = f;
+        f.prepare()?;
         *ucb_mut(&mut skb).fp.get_mut() = Some(f);
     }
     add_creds(&mut skb, s, other);
@@ -631,7 +637,11 @@ fn consume(s: &UnixSock, skb: &Arc<SkBuff>, chunk: usize, g: &mut Got) -> bool {
     let cb = ucb(skb);
     cb.consumed.fetch_add(chunk, Ordering::AcqRel);
     s.sk.peek_offset_bwd(chunk as i32);
-    let fds = cb.fp.lock().take();
+    // Linux scm_stat_del + unix_detach_fds
+    let mut fds = cb.fp.lock().take();
+    if let Some(f) = fds.as_mut() {
+        f.detach();
+    }
     if fds.is_some() {
         g.fds = fds;
     }

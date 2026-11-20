@@ -1249,6 +1249,13 @@ impl FileRef {
     }
 }
 
+/// The references to `f`'s file, `f` included (Linux file_count): a
+/// snapshot, exact only while nothing can take or put one (the AF_UNIX
+/// collector, under unix_gc_lock)
+pub fn file_count(f: &FileRef) -> usize {
+    f.count().load(Ordering::Acquire)
+}
+
 /// A file whose last reference went, owned by its release (`release`)
 ///
 /// # Invariants

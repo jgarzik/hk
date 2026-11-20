@@ -336,6 +336,7 @@ pub fn run_all_tests() {
     net::unix::run_tests();
     net::unix_opt::run_tests();
     net::unix_oob::run_tests();
+    net::unix_gc::run_tests();
     net::udp::run_tests();
     net::udp_hash::run_tests();
     net::udp_mem::run_tests();

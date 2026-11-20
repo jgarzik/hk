@@ -156,6 +156,9 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
         if too_many_fds() {
             return Err(KernelError::TooManyRefs);
         }
+        // Linux unix_attach_fds: unix_prepare_fpl
+        let mut f = f;
+        f.prepare()?;
         *ucb_mut(&mut skb).fp.get_mut() = Some(f);
     }
     let mut other = match &m.addr {
@@ -334,7 +337,12 @@ fn take(s: &UnixSock, flags: i32) -> Option<Rx> {
     let fds = if peek {
         peek_fds(&skb)
     } else {
-        ucb(&skb).fp.lock().take()
+        // Linux scm_stat_del at the dequeue
+        let mut f = ucb(&skb).fp.lock().take();
+        if let Some(f) = f.as_mut() {
+            f.detach();
+        }
+        f
     };
     Some(Rx {
         creds: ucb(&skb).creds.clone(),

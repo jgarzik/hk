@@ -2,7 +2,8 @@
 //!
 //! SOCK_STREAM (`stream.rs`), SOCK_DGRAM and SOCK_SEQPACKET
 //! (`dgram.rs`; SOCK_RAW is an alias of SOCK_DGRAM like Linux), with
-//! ancillary data in `scm.rs`.
+//! ancillary data in `scm.rs` and the collector of unreachable
+//! in-flight sockets in `gc.rs`.
 //!
 //! Addresses: a filesystem name creates an S_IFSOCK inode (VFS mknod:
 //! DAC on the parent, umask; an existing name is EADDRINUSE) and is
@@ -42,6 +43,10 @@
 //!   copies after, and taken messages are freed after it.
 //! - `oob` (spin leaf under `rq`): a stream's pending out-of-band skb
 //!   (Linux u->oob_skb), changed under `st` and `rq`.
+//! - `gc::UNIX_GC` (spin, Linux unix_gc_lock): the in-flight graph and
+//!   each socket's `vertex`, `listener`, `nr_unix_fds`; under `st` and
+//!   `UnixCb.fp` when a message is queued, above `rq` (the collector
+//!   takes dead sockets' queues under it). See `gc.rs`.
 //! - `UnixTable` buckets (per netns) and `BSD` buckets (global):
 //!   `crate::sync::spin::Mutex` per bucket (Linux unx.table.locks,
 //!   bsd_socket_locks), sockets linked intrusively and held weakly;
@@ -63,6 +68,7 @@
 //!   messages and their files are always dropped with no lock held.
 
 pub mod dgram;
+pub mod gc;
 pub mod scm;
 pub mod stream;
 
@@ -307,6 +313,12 @@ pub struct UnixSock {
     /// Queue length limit (Linux sk_max_ack_backlog)
     backlog: AtomicU32,
     peercred: Mutex<Option<PeerCred>>,
+    /// Our in-flight vertex (Linux u->vertex), the listener of an
+    /// embryo not yet accepted (u->listener), files of unix sockets
+    /// queued to us (scm_stat.nr_unix_fds): `gc::UNIX_GC`'s
+    vertex: gc::GcCell<Option<Arc<gc::Vertex>>>,
+    listener: gc::GcCell<Option<Arc<UnixSock>>>,
+    nr_unix_fds: gc::GcCell<usize>,
     /// Link on our namespace table's bucket (Linux sk_node)
     node: Link,
     /// Link on a `BSD` bucket while bound to a path (Linux sk_bind_node)
@@ -552,6 +564,9 @@ impl UnixSock {
             dead: AtomicBool::new(false),
             backlog: AtomicU32::new(qlen),
             peercred: Mutex::new(None),
+            vertex: gc::GcCell::new(None),
+            listener: gc::GcCell::new(None),
+            nr_unix_fds: gc::GcCell::new(0),
             node: Link::new(),
             bind_node: Link::new(),
             hash: AtomicU32::new(0),
@@ -820,6 +835,7 @@ impl UnixSock {
         drop(q);
         self.relay_wake();
         drop(path);
+        gc::schedule(None);
     }
 
     /// Take the whole receive queue off; the caller frees it unlocked
@@ -1253,7 +1269,7 @@ fn hex5(out: &mut [u8], n: u32) {
 /// charge its files as in flight
 fn queue(to: &UnixSock, skb: Arc<SkBuff>) {
     if let Some(f) = ucb(&skb).fp.lock().as_mut() {
-        f.queued();
+        f.queued(&to.arc());
     }
     let len = unix_len(&skb);
     let mut q = to.rq.lock();
@@ -1267,7 +1283,7 @@ fn queue(to: &UnixSock, skb: Arc<SkBuff>) {
 /// to drop after the lock
 fn queue_oob(to: &UnixSock, skb: Arc<SkBuff>) -> Option<Arc<SkBuff>> {
     if let Some(f) = ucb(&skb).fp.lock().as_mut() {
-        f.queued();
+        f.queued(&to.arc());
     }
     let mut q = to.rq.lock();
     let old = to.oob.lock().replace(skb.clone());
