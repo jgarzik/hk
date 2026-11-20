@@ -108,6 +108,9 @@ pub struct SkBuff {
     /// NETIF_F_HW_CSUM Linux uses; hk computes it anyway); seen by the
     /// packet taps (TP_STATUS_CSUMNOTREADY), kept as lo loops it back
     pub csum_partial: bool,
+    /// Run when the skb is freed or orphaned (Linux skb->destructor
+    /// with skb->sk: a TX ring frame's completion); not cloned
+    pub destructor: Option<Box<dyn SkbDestructor>>,
     /// Start of the MAC header in the buffer (None until received)
     mac: Option<usize>,
     /// Start of the IP header of a received packet (None until marked)
@@ -168,6 +171,19 @@ impl SkbCb {
             Self::Frag(f) => Self::Frag(*f),
             Self::Tcp(t) => Self::Tcp(*t),
         }
+    }
+}
+
+/// What an skb's destructor does is its `Drop` (Linux skb->destructor,
+/// called by kfree_skb and skb_orphan): any context, possibly under the
+/// freeing path's spin locks, so it takes only leaf locks and wakes
+pub trait SkbDestructor: Send + Sync {}
+
+impl SkBuff {
+    /// Run the destructor now and forget the owner's charge (Linux
+    /// skb_orphan, as loopback_xmit before looping a frame back)
+    pub fn orphan(&mut self) {
+        self.destructor = None;
     }
 }
 
@@ -352,6 +368,7 @@ impl SkBuff {
         self.ip_bcast = false;
         self.owner = 0;
         self.csum_partial = false;
+        self.destructor = None;
         self.mac = None;
         self.nh = None;
         self.tstamp = 0;
@@ -427,6 +444,7 @@ impl SkBuff {
             ip_tos: self.ip_tos,
             owner: self.owner,
             csum_partial: self.csum_partial,
+            destructor: None,
             mac: self.mac,
             nh: self.nh,
             tstamp: self.tstamp,

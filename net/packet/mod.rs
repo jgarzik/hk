@@ -186,6 +186,13 @@ pub struct PacketSock {
     rx: crate::sync::spin::Mutex<ring::RxRing>,
     /// The transmit ring (Linux po->tx_ring)
     tx: crate::sync::spin::Mutex<tx::TxRing>,
+    /// TX ring frames sent and not yet freed (Linux tx_ring's
+    /// pending_refcnt, per CPU there: one counter per socket here, hit
+    /// once per frame each way), their completions (Linux
+    /// po->skb_completion's count and wait queue)
+    tx_pending: AtomicU32,
+    tx_done: AtomicU32,
+    tx_wq: crate::sync::waitqueue::WaitQueue,
     /// Its own `Arc`, weakly (a fanout group's member list holds it)
     me: spin::Once<alloc::sync::Weak<PacketSock>>,
     /// Its fanout group (Linux po->fanout; changed under `FANOUT` and
@@ -240,6 +247,9 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         pg_vec_lock: crate::sync::Mutex::new(()),
         rx: crate::sync::spin::Mutex::new(ring::RxRing::default()),
         tx: crate::sync::spin::Mutex::new(tx::TxRing::default()),
+        tx_pending: AtomicU32::new(0),
+        tx_done: AtomicU32::new(0),
+        tx_wq: crate::sync::waitqueue::WaitQueue::new(),
         me: spin::Once::new(),
         fanout: crate::sync::spin::Mutex::new(None),
         rollover: crate::sync::spin::Mutex::new(None),
@@ -725,14 +735,14 @@ impl ProtoOps for PacketSock {
     }
 
     /// Linux packet_snd
-    fn sendmsg(&self, m: &mut SendMsg<'_>, _flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if self.spkt() {
             return self.sendmsg_spkt(m);
         }
         // Linux packet_sendmsg: a transmit ring sends its frames
         // (checked again under pg_vec_lock)
         if self.tx.lock().ring.is_some() {
-            return tx::tpacket_snd(self, m);
+            return tx::tpacket_snd(self, m, flags);
         }
         let Dest { dev, proto, addr } = self.dest(m)?;
         if !dev.is_up() {

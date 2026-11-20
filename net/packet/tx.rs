@@ -16,7 +16,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
 use crate::net::ethernet::ETH_HLEN;
-use crate::net::msg::SendMsg;
+use crate::net::msg::{MSG_DONTWAIT, SendMsg};
 use crate::net::skb::SkBuff;
 use crate::net::socket::{SOCK_DGRAM, SOCK_RAW};
 use crate::util::error::KernelError;
@@ -150,7 +150,7 @@ impl PacketSock {
 
 /// Linux tpacket_snd: send the frames marked TP_STATUS_SEND_REQUEST
 /// from the head on; the bytes sent, or the first error
-pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>) -> Result<usize, KernelError> {
+pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     let _pg = s.pg_vec_lock.lock();
     // The lockless check in sendmsg, confirmed under pg_vec_lock
     let ring = s.tx.lock().ring.clone().ok_or(KernelError::Busy)?;
@@ -166,31 +166,72 @@ pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>) -> Result<usize, KernelError
     if s.vnet_hdr_len() == 0 {
         size_max = size_max.min(d.dev.mtu() as usize + reserve + VLAN_HLEN);
     }
+    let need_wait = flags & MSG_DONTWAIT == 0;
     let mut len_sum: usize = 0;
-    // Each frame is copied and sent before the next: none is still in
-    // flight when the walk ends (Linux waits for pending frames when
-    // blocking; here there are none)
-    while let Some(head) = s.tx_current(&ring, TP_STATUS_SEND_REQUEST) {
+    // Linux skb != NULL: this pass built an skb
+    let mut skb_made = false;
+    s.tx_done.store(0, Ordering::Release);
+    loop {
+        let Some(head) = s.tx_current(&ring, TP_STATUS_SEND_REQUEST) else {
+            if need_wait && skb_made {
+                // Linux wait_for_completion_interruptible_timeout on
+                // po->skb_completion
+                let timeo = s.sk.snd_timeo(false);
+                let consume = || {
+                    s.tx_done
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |d| d.checked_sub(1))
+                        .is_ok()
+                };
+                match crate::net::sock::wait_on(&s.tx_wq, timeo, consume) {
+                    Ok(_) => {}
+                    Err(KernelError::WouldBlock) => return Err(KernelError::TimedOut),
+                    Err(_) => return Err(KernelError::RestartSys),
+                }
+            }
+            // Check for more frames while some are still in flight
+            if need_wait && s.tx_pending.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            break;
+        };
         let f = ring.frame(head);
+        skb_made = false;
         let r = s
             .parse_header(&f, frame_size, size_max)
             .and_then(|(tp_len, off)| {
                 if tp_len > i32::MAX as usize - len_sum {
                     return Ok(None);
                 }
+                skb_made = true;
                 s.tx_skb(&d, &f, off, tp_len).map(Some)
             });
         match r {
-            Ok(Some((skb, tp_len))) => {
+            Ok(Some((mut skb, tp_len))) => {
+                let done = crate::util::kalloc::try_box(TxDone {
+                    sk: s.me.get().and_then(alloc::sync::Weak::upgrade),
+                    ring: ring.clone(),
+                    frame: head,
+                });
+                // Linux tpacket_snd's failed uarg allocation: what was
+                // sent so far, else ENOMEM; the frame stays requested
+                let Ok(done) = done else {
+                    return if len_sum > 0 {
+                        Ok(len_sum)
+                    } else {
+                        Err(KernelError::OutOfMemory)
+                    };
+                };
+                skb.destructor = Some(done);
                 f.set_status(version, TP_STATUS_SENDING);
-                // The copy is sent: the frame is free again (Linux: at
-                // the skb's completion, tpacket_ubuf_complete)
+                s.tx_pending.fetch_add(1, Ordering::AcqRel);
                 if let Err(e) = crate::net::dev::dev_queue_xmit(skb) {
-                    // Linux: an skb already freed puts the frame back
-                    f.set_status(version, TP_STATUS_SEND_REQUEST);
-                    return Err(e);
+                    // The skb went already: its frame is available;
+                    // Linux puts it back as requested and reports
+                    if f.status(version) == u64::from(TP_STATUS_AVAILABLE) {
+                        f.set_status(version, TP_STATUS_SEND_REQUEST);
+                        return Err(e);
+                    }
                 }
-                f.set_status(version, TP_STATUS_AVAILABLE);
                 s.tx_increment_head(&ring);
                 len_sum += tp_len;
             }
@@ -207,6 +248,41 @@ pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>) -> Result<usize, KernelError
         }
     }
     Ok(len_sum)
+}
+
+/// A sent frame's completion, run when its skb is freed or orphaned
+/// (Linux tpacket_destruct_skb, 6.8): the frame available again, the
+/// pending count down, a blocked sender woken once none is pending.
+/// Nothing is written once the ring was replaced.
+struct TxDone {
+    sk: Option<Arc<PacketSock>>,
+    ring: Arc<PgRing>,
+    frame: u32,
+}
+
+impl crate::net::skb::SkbDestructor for TxDone {}
+
+impl Drop for TxDone {
+    fn drop(&mut self) {
+        let Some(s) = &self.sk else { return };
+        if !s
+            .tx
+            .lock()
+            .ring
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &self.ring))
+        {
+            return;
+        }
+        let left = s.tx_pending.fetch_sub(1, Ordering::AcqRel) - 1;
+        self.ring
+            .frame(self.frame)
+            .set_status(s.version(), TP_STATUS_AVAILABLE);
+        if left == 0 {
+            s.tx_done.fetch_add(1, Ordering::AcqRel);
+            s.tx_wq.wake_all();
+        }
+    }
 }
 
 /// Linux packet_poll: writable when the head frame is available

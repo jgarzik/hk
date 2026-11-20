@@ -512,7 +512,10 @@ impl PacketSock {
 /// (Linux packet_set_ring: EBUSY while mapped or when a ring exists;
 /// the socket unhooked across the swap)
 pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<(), KernelError> {
-    if !closing && s.mapped.get() != 0 {
+    // Linux: busy while mapped or while TX frames are in flight
+    // (packet_read_pending)
+    let pending = || tx && s.tx_pending.load(Ordering::Acquire) != 0;
+    if !closing && (s.mapped.get() != 0 || pending()) {
         return Err(KernelError::Busy);
     }
     let version = s.version();
@@ -568,7 +571,7 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
     let mut r = Ok(());
     let old = {
         let _pg = s.pg_vec_lock.lock();
-        if closing || s.mapped.get() == 0 {
+        if (closing || s.mapped.get() == 0) && !(!closing && pending()) {
             if tx {
                 let mut t = s.tx.lock();
                 let old = t.ring.take();

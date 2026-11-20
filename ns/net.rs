@@ -375,7 +375,9 @@ impl NetDeviceOps for LoopbackOps {
     /// Linux loopback_xmit: the frame comes straight back as received,
     /// through this CPU's backlog (never processed synchronously, so the
     /// transmit path never re-enters the receive path)
-    fn xmit(&self, skb: alloc::boxed::Box<crate::net::skb::SkBuff>) -> Result<(), KernelError> {
+    fn xmit(&self, mut skb: alloc::boxed::Box<crate::net::skb::SkBuff>) -> Result<(), KernelError> {
+        // Linux loopback_xmit: skb_orphan (a TX ring frame completes)
+        skb.orphan();
         let len = skb.len();
         let dev = skb.dev.clone().ok_or(KernelError::NoDevice)?;
         if crate::net::dev::netif_rx(skb) {

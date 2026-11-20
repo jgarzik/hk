@@ -318,10 +318,6 @@ only UDP over lo is CHECKSUM_PARTIAL (`SkBuff::csum_partial`); TCP
 segments over lo are not marked (Linux tcp_v4_send_check makes them
 CHECKSUM_PARTIAL), nor is a corked UDP datagram exempt (Linux
 __ip_append_data leaves MSG_MORE sends CHECKSUM_NONE).
-The TX ring copies each frame into an skb and makes it
-TP_STATUS_AVAILABLE once queued; Linux sends the ring pages themselves
-(zero copy) and frees the frame at the skb's completion
-(tpacket_ubuf_complete), a blocking send waiting for pending frames.
 The TPACKET_V3 retire timeout without tp_retire_blk_tov is always
 8 ms: hk keeps no ethtool link speed (Linux prb_calc_retire_blk_tmo
 derives it from the block size on links of 1 Gb/s and up, e.g. e1000,
