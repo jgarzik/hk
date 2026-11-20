@@ -52,3 +52,59 @@ fn synrecv_ack_covers_data() {
     assert!(b.rtx.first().is_none());
     assert!(b.live.tmr.get().is_none());
 }
+
+/// A child shut down in SYN_RECEIVED goes to FIN_WAIT_1 with its
+/// request (Linux fastopen_rsk); the ACK of its SYN-ACK there releases
+/// it (tcp_rcv_state_process FIN_WAIT1: tcp_rcv_synrecv_state_fastopen),
+/// so its timeouts follow the connection's rules from then on
+#[test]
+fn fin_wait1_ack_releases_request() {
+    let data = b"fast open data";
+    let (_, syn, mut b) = tfo_child(data);
+    b.live.retransmits.set(1);
+    let mut out = Out::default();
+    assert!(b.shutdown_wr(10, &mut out));
+    assert_eq!(b.state, TcpState::FinWait1);
+    assert!(b.tfo);
+    let rcv = 1001 + data.len() as u32;
+    // An ACK not past the SYN-ACK is old (Linux tcp_ack's old_ack: not
+    // acceptable, challenged): the request stays
+    let mut old = synack_ack(&syn, &b, rcv, 0);
+    old.ack = 5000;
+    let mut out = Out::default();
+    b.feed(&old, 15, &mut out);
+    assert!(b.tfo);
+    // The SYN-ACK acked, not the FIN
+    let mut out = Out::default();
+    b.feed(&synack_ack(&syn, &b, rcv, 0), 20, &mut out);
+    assert_eq!(b.state, TcpState::FinWait1);
+    assert!(!b.tfo);
+    assert_eq!(b.snd_una, 5001);
+    assert_eq!(b.live.retransmits.get(), 0);
+    assert!(b.rtx_stamp.is_none());
+    // The FIN acked
+    let mut out = Out::default();
+    b.feed(&synack_ack(&syn, &b, rcv, 1), 30, &mut out);
+    assert_eq!(b.state, TcpState::FinWait2);
+}
+
+/// A retransmitted SYN reaching a child in FIN_WAIT_1 still holding its
+/// request resends the SYN-ACK (Linux tcp_check_req runs for
+/// fastopen_rsk in FIN_WAIT1 too)
+#[test]
+fn fin_wait1_request_resends_synack() {
+    let data = b"fast open data";
+    let (_, syn, mut b) = tfo_child(data);
+    let mut out = Out::default();
+    b.shutdown_wr(10, &mut out);
+    let mut s = seg_in(&syn);
+    s.data = data;
+    let mut out = Out::default();
+    b.feed(&s, 20, &mut out);
+    let w = wire(&out);
+    assert!(
+        w.iter()
+            .any(|x| x.has(flags::SYN) && x.has(flags::ACK) && x.seq == 5000)
+    );
+    assert_eq!(b.state, TcpState::FinWait1);
+}

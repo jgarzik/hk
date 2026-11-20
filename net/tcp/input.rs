@@ -22,7 +22,7 @@ use super::cb::{
 use super::cong::AckSample;
 use super::mem;
 use super::output::HLEN;
-use super::recovery::{Rexmit, flag, tag};
+use super::recovery::{CaState, Rexmit, flag, tag};
 use super::sack::SackState;
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
@@ -257,17 +257,29 @@ impl TcpCb {
         self.live.tmr.set(None);
         self.rcv_tstamp = now;
         if self.tfo {
-            // Linux tcp_rcv_synrecv_state_fastopen: set up at creation;
-            // the request goes (reqsk_fastopen_remove), the RTO follows
-            // what the child sent meanwhile (tcp_rearm_rto)
-            self.tfo = false;
-            self.rearm_rto(now);
+            // Set up at creation
+            self.synrecv_fastopen(now);
         } else {
             self.init_transfer();
         }
         self.arm_keepalive(now);
         out.established = true;
         out.wake |= wake::STATE | wake::EST;
+    }
+
+    /// A Fast Open child's SYN-ACK was acknowledged, in SYN_RECEIVED or
+    /// FIN_WAIT_1 (Linux tcp_rcv_synrecv_state_fastopen): a SYN-ACK
+    /// timeout's loss state is undone if nothing is in flight, the
+    /// timeouts are over, the request goes (reqsk_fastopen_remove) and
+    /// the RTO follows what the child sent meanwhile (tcp_rearm_rto)
+    fn synrecv_fastopen(&mut self, now: u64) {
+        if self.ca_state == CaState::Loss && self.packets_out == 0 {
+            self.try_undo_recovery();
+        }
+        self.rtx_stamp = None;
+        self.live.retransmits.set(0);
+        self.tfo = false;
+        self.rearm_rto(now);
     }
 
     /// Linux tcp_sequence: the segment overlaps [RCV.NXT, RCV.NXT+WND]
@@ -452,9 +464,11 @@ impl TcpCb {
         } else {
             skb
         };
-        // A request, or a Fast Open child (Linux tcp_rcv_state_process
-        // runs tcp_check_req with fastopen for it too)
-        let req = self.passive && self.state == TcpState::SynReceived;
+        // A request, or a Fast Open child still holding its request, in
+        // SYN_RECEIVED or closed to FIN_WAIT_1 (Linux
+        // tcp_rcv_state_process runs tcp_check_req with fastopen for it
+        // too)
+        let req = self.passive && (self.state == TcpState::SynReceived || self.tfo);
         if req
             && s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)
@@ -626,8 +640,26 @@ impl TcpCb {
                 self.enter_quickack();
                 self.ack_now = true;
             }
-        } else if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
-            return;
+        } else {
+            if self.tfo {
+                // A Fast Open child closed in SYN_RECEIVED: its SND.UNA
+                // is past its SYN-ACK (Linux tcp_create_openreq_child),
+                // so an ACK not past it is old (tcp_ack's old_ack, not
+                // acceptable: challenged)
+                if !after(s.ack, self.iss) {
+                    self.challenge_ack(out);
+                    return;
+                }
+                self.snd_una = self.iss.wrapping_add(1);
+                self.syn_unacked = false;
+            }
+            if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
+                return;
+            }
+            if self.tfo {
+                // Linux tcp_rcv_state_process FIN_WAIT1 with fastopen_rsk
+                self.synrecv_fastopen(now);
+            }
         }
         if !self.after_ack(s, now, out) {
             return;

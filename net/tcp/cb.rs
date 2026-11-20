@@ -1045,7 +1045,8 @@ pub struct TcpCb {
     /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
     /// processed as tcp_child_process does
     pub(super) req_full: bool,
-    /// A listener's Fast Open child still in SYN_RECEIVED (Linux
+    /// A listener's Fast Open child whose SYN-ACK is not acknowledged
+    /// yet, in SYN_RECEIVED or closed to FIN_WAIT_1 (Linux
     /// tp->fastopen_rsk): already accepted, it may send and receive
     pub tfo: bool,
     /// The Fast Open child left SYN_RECEIVED by a valid RST (Linux

@@ -183,8 +183,8 @@ struct Inner {
     bound: bool,
     /// The listener of a child still in SYN_RECEIVED
     parent: Option<Weak<TcpSock>>,
-    /// The listener whose Fast Open queue counts this child while it is
-    /// in SYN_RECEIVED (Linux fastopen_rsk->rsk_listener)
+    /// The listener whose Fast Open queue counts this child while it
+    /// holds its request (Linux fastopen_rsk->rsk_listener)
     tfo_parent: Option<Weak<TcpSock>>,
     /// The deadline (ms) each of `TcpSock.timers` was last armed for
     armed: [Option<u64>; 3],
@@ -254,8 +254,8 @@ struct Snap {
     /// Linux snd_una / snd_nxt (the ICMP error sequence check)
     snd_una: AtomicU32,
     snd_max: AtomicU32,
-    /// A Fast Open child in SYN_RECEIVED (Linux tp->fastopen_rsk, which
-    /// tcp_poll reads)
+    /// A Fast Open child holding its request (Linux tp->fastopen_rsk,
+    /// which tcp_poll reads)
     tfo: AtomicBool,
     /// TCP_FASTOPEN_CONNECT deferred the SYN (Linux DEFER_CONNECT,
     /// which tcp_poll reads)
@@ -628,9 +628,9 @@ impl TcpSock {
         if out.done {
             self.fastopen_ofo_check(g);
         }
-        if g.tfo_parent.is_some() && !(g.cb.tfo && g.cb.state == TcpState::SynReceived) {
-            // Linux reqsk_fastopen_remove: the handshake completed or the
-            // child died
+        if g.tfo_parent.is_some() && !(g.cb.tfo && g.cb.state != TcpState::Closed) {
+            // Linux reqsk_fastopen_remove: the SYN-ACK was acknowledged
+            // (in SYN_RECEIVED or FIN_WAIT_1) or the child died
             if let Some(p) = g.tfo_parent.take().and_then(|w| w.upgrade()) {
                 if let Some(q) = p.queue.lock().as_mut() {
                     q.tfo_qlen = q.tfo_qlen.saturating_sub(1);

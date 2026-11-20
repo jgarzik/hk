@@ -505,7 +505,7 @@ impl TcpCb {
     }
 
     /// Linux tcp_try_undo_recovery
-    fn try_undo_recovery(&mut self) -> bool {
+    pub(super) fn try_undo_recovery(&mut self) -> bool {
         if self.may_undo() {
             self.undo_cwnd_reduction(false);
             self.net_stat(if self.ca_state == CaState::Loss {
