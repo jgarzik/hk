@@ -317,15 +317,20 @@ pub struct TimeWait {
     /// is never armed again (Linux timer_shutdown in
     /// inet_twsk_deschedule_put); set under `inner`
     killed: AtomicBool,
-    /// Counted in its namespace's TIME_WAIT entries (`start`, until
-    /// `unhash`)
-    started: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
     rcu_puts: RcuPuts,
     me: Weak<TimeWait>,
 }
 
 crate::rcu_puts!(TimeWait, rcu_puts);
+
+impl Drop for TimeWait {
+    /// No longer counted in its namespace (Linux tw_refcount's
+    /// decrement, inet_twsk_kill: once per entry)
+    fn drop(&mut self) {
+        self.net.tcp_net.tw_sub();
+    }
+}
 
 impl TimeWait {
     /// Entry for `cb` (already in TIME_WAIT); register with [`start`]
@@ -338,7 +343,14 @@ impl TimeWait {
         oif: u32,
         cb: TwCb,
     ) -> Result<Arc<Self>, KernelError> {
-        try_arc_cyclic(|me| Self {
+        // Linux inet_twsk_alloc: none past tcp_max_tw_buckets; counted
+        // from here to its drop (`Drop`)
+        let tn = Arc::clone(&net.tcp_net);
+        if tn.tw_full() {
+            return Err(KernelError::NoBufferSpace);
+        }
+        tn.tw_add();
+        let r = try_arc_cyclic(|me| Self {
             tuple,
             bind,
             net,
@@ -350,10 +362,13 @@ impl TimeWait {
             bind_link: Link::new(),
             by_bind,
             killed: AtomicBool::new(false),
-            started: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             me: me.clone(),
-        })
+        });
+        if r.is_err() {
+            tn.tw_sub();
+        }
+        r
     }
 
     /// Its ehash entry, before it replaces its socket there
@@ -361,13 +376,9 @@ impl TimeWait {
         *self.eh.lock() = Some(eh);
     }
 
-    /// Leave the tables (once: the entry is taken), no longer counted
-    /// (Linux inet_twsk_kill)
+    /// Leave the tables (once: the entry is taken)
     fn unhash(self: &Arc<Self>) {
         let eh = self.eh.lock().take();
-        if eh.is_some() && self.started.swap(false, Ordering::Relaxed) {
-            self.net.tcp_net.tw_sub();
-        }
         self.net.tcp.tw_unhash(self, eh);
     }
 
@@ -386,11 +397,8 @@ impl TimeWait {
         self.inner.lock().0.substate()
     }
 
-    /// Arm the 2MSL timer; counted in its namespace until it ends
-    /// (Linux __inet_twsk_schedule)
+    /// Arm the 2MSL timer
     pub fn start(&self) {
-        self.started.store(true, Ordering::Relaxed);
-        self.net.tcp_net.tw_add();
         let mut g = self.inner.lock();
         self.sync(&mut g, false);
     }

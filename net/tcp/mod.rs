@@ -622,12 +622,8 @@ impl TcpSock {
         bind.listen = false;
         // GFP_ATOMIC under the socket lock (Linux inet_twsk_alloc: none
         // past tcp_max_tw_buckets)
-        let full = self.sk.net.tcp_net.tw_full();
         let twcb = TwCb::from_cb(&g.cb);
         let tw = with_gfp(Gfp::ATOMIC, || {
-            if full {
-                return Err(KernelError::NoBufferSpace);
-            }
             TimeWait::new(
                 Arc::clone(self.sk.net.passive()),
                 t,
