@@ -106,7 +106,10 @@ snd_cwnd_used) and no tcp_slow_start_after_idle sysctl (always on), a
 timeout stamps `rtx_stamp` one RTO back (the head's send, for the
 retry and user timeouts) where Linux's retrans_stamp is the first
 retransmission, so the timestamp echo never undoes a timeout
-(tcp_packet_delayed; F-RTO still does), no CUBIC module parameters
+(tcp_packet_delayed; F-RTO still does), a SYN or SYN-ACK timeout
+halves ssthresh and sets cwnd 1 without entering CA_Loss (Linux
+tcp_enter_loss; so tcp_init_transfer's cwnd of 1 after more than one
+SYN retransmission, keyed on undo_marker, never applies), no CUBIC module parameters
 (/sys/module/tcp_cubic/parameters: Linux's defaults are constants), no
 receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
 tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
