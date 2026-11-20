@@ -113,6 +113,10 @@ branch); a takeover SYN's connection gets a fresh ISN, not the
 entry's SND.NXT + 65537 (Linux TCP_SKB_CB tcp_tw_isn); and there is
 no tcp_max_tw_buckets (inet_twsk_alloc's limit, TCPTimeWaitOverflow).
 
+An skb holds no reference to its socket (Linux skb->sk with
+sk_wmem_alloc, released by sock_wfree): a closed socket's sent frames
+still queued on a device do not delay its __sk_free, so "sockets:
+used" drops while they are in flight.
 No SYN cookies (a full listener drops SYNs).
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
