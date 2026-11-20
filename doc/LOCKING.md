@@ -1342,7 +1342,7 @@ serializes wakers (3.1), the siglock of its handler table owns its signal state
 | `Task.real_parent` | `RcuPtr<Task>` | The real parent, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
 | `Task.ptrace` | `AtomicU32` | Ptrace flags (Linux task->ptrace): written under TASKLIST's write lock (a `TaskViewMut`: attach, seize, resume, unlink, CLONE_PTRACE), read with a Relaxed load anywhere (Linux's racy reads under siglock: sig_ignored, the stop prepare's PT_SEIZED, a group kill); a decision that must hold reads it under TASKLIST (ptrace_stop, wait, the tracer's checks) |
 | `Task.ptracer` | `RcuPtr<Task>` | The tracer while traced, no reference: written under TASKLIST's write lock, read under it or an RCU read guard (Relations) |
-| `Task.pgrp`, `Task.session` | `RcuLockedArc<Pid, GlobalTaskTable>` | Group and session links: written under TASKLIST's write lock (old reference `put_rcu`), read under it or an RCU read guard |
+| `SignalStruct.pgrp`, `SignalStruct.session` | `RcuLockedArc<Pid, GlobalTaskTable>` | A process's group and session links (Linux signal->pids[PIDTYPE_PGID, PIDTYPE_SID]), one per process: written under TASKLIST's write lock (old reference `put_rcu`), read under it or an RCU read guard (reached through `Task::cpu_group`, set once and never cleared) |
 | `Task.thread_pid` | `RcuLockedArc<Pid, GlobalTaskTable>` | Its struct pid (Linux task->thread_pid): set before the task is listed, exchanged by de_thread (`take_leadership`, Linux exchange_tids) and cleared at release (`unhash`, Linux detach_pid PIDTYPE_PID; de_thread's removed threads after their numbers are released) under TASKLIST's write lock, the replaced reference dropped a grace period later; read under TASKLIST or an RCU read guard (`Task::pid_nr_ns`, Linux task_pid_nr_ns: 0 once released). A release pins it for proc_flush_pid (Linux release_task's get_pid) |
 
 **Pids** (`task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
@@ -1546,9 +1546,9 @@ so a reader on a removed leader stands on allocated memory (the
 them (`TaskInner.pids_linked`), like Linux: linked when inserted
 (fork), by the new leader at exec's `take_leadership`, and after a
 change; unlinked at `remove` (release or reap; a zombie leader stays,
-as in Linux). Every thread holds a reference to its group's and
-session's `Pid` (`Task.pgrp`/`session`, `RcuLockedArc`s owned by
-TASKLIST, Linux signal->pids), so a `Pid` outlives its group even
+as in Linux). Each process holds one reference to its group's and
+session's `Pid` (`SignalStruct.pgrp`/`session`, `RcuLockedArc`s owned
+by TASKLIST, Linux signal->pids), so a `Pid` outlives its group even
 after its own task is gone. They are the only record (Linux has no
 copies): a task's group and session are read through them, under an
 RCU read guard with no lock for the caller's own (`current_pgid`,
@@ -1565,13 +1565,13 @@ on it keeps it; the `Pid` drop then runs in `rcuc/N` (PIDMAP_LOCK
 taken there, a leaf). A released leader's links (and its group's
 `leader_pid`) are cleared so (`detach_group_pids`, Linux
 __unhash_process with group_dead), after its numbers are given back.
-setpgid and setsid change every thread of the process in one write
-section (`change_pids`, walking the leader's `threads` list: nothing
-is allocated); fork copies the creator's under the same
-write lock that inserts the child. The old group and session `Pid`
-are handed back too and dropped after TASKLIST (Linux ksys_setsid's
-pids[] and free_pids; each thread's own old reference goes through
-`put_rcu` in the section); a group's `Pid` is looked up by number
+setpgid and setsid replace the process's pair in one write section
+(`change_pids`: nothing is allocated); a new process copies its
+creator's under the same write lock that lists it
+(`install_fork_signal` -> `inherit_pids`, then `attach_pids`). The
+old group and session `Pid` are handed back too and dropped after
+TASKLIST (Linux ksys_setsid's pids[] and free_pids; the link's own old
+reference goes through `put_rcu` in the section); a group's `Pid` is looked up by number
 (`find_pgrp`, under RCU) before TASKLIST is taken. Group 0, where
 init starts, is `INIT_STRUCT_PID` (Linux init_struct_pid, never
 hashed). kill(-pgrp), kill(0), tty ISIG, F_SETOWN and PRIO_PGRP /
@@ -1811,7 +1811,7 @@ from `Task.se`.
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
 | `sighand->siglock` | Signal state, handlers | `SigHand.siglock` with the per-task state it owns (`Task.sig`), `SignalStruct.jobctl` (group stop state) and `SignalStruct.shared` (owned too), `SignalStruct.ignored_timers`, the action table (the siglock's own data; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
-| RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, the task list, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `Task.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHListBare`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
+| RCU (`real_parent`, `parent` (ptrace_parent), `signal->pids[]`, pid hash, `pid->tasks[PIDTYPE_PID]`, `pid->tasks[PIDTYPE_PGID/SID]`, the task list, task and pid lifetime) | Lockless parent, tracer, group and session reads; task lookup by pid | `Task.real_parent`, `Task.ptracer` (`RcuPtr`), `SignalStruct.pgrp`/`session` (`RcuLockedArc`), the pid hash chains (`find_pid_ns`), `Pid.task` (`RcuPtr`), `Pid.pgrp`/`session` (`RcuHListBare`), the list's task reference through `kfree_rcu`, a dropped `Pid` link and the hash's reference through `put_rcu` |
 | RCU (`cred`, put_cred_rcu) | Credentials | `Task.cred` (`TaskCred`): lock-free for the task, an RCU read guard for others, the old set through `put_rcu` |
 
 Remaining differences: the `task_struct` fields Linux leaves to the

@@ -976,15 +976,6 @@ pub struct Task {
     /// ([`Task::tracer_locked`]) or an RCU read guard
     /// ([`Task::tracer`]), written under its write lock
     ptracer: crate::sync::rcu::RcuPtr<Task>,
-    /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
-    /// PIDTYPE_SID]): the same in every thread of the group, the only
-    /// record of its group and session; none for kernel threads and
-    /// once its released leader's group is gone. Replaced under
-    /// TASKLIST's write lock, the old reference dropped a
-    /// grace period later (Linux free_pid -> delayed_put_pid); read
-    /// under its read lock or an RCU read guard
-    pub pgrp: crate::sync::rcu::RcuLockedArc<pid::Pid, tasklist::GlobalTaskTable>,
-    pub session: crate::sync::rcu::RcuLockedArc<pid::Pid, tasklist::GlobalTaskTable>,
     /// Releases the task list's reference a grace period after it is
     /// unlisted (type invariant)
     rcu: crate::sync::rcu::RcuHead,
@@ -1017,7 +1008,8 @@ crate::rcu_head!(Task, rcu);
 
 /// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner {
-    /// A group leader on its `Task.pgrp`'s and `session`'s lists
+    /// A group leader on its group's `SignalStruct.pgrp`'s and
+    /// `session`'s lists
     pids_linked: bool,
     /// The user namespace of its credentials (Linux
     /// real_cred->user_ns; hk keeps the namespace itself in the
@@ -1711,8 +1703,6 @@ impl Task {
             session_link: crate::util::rcuhlist::HNode::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
             ptracer: crate::sync::rcu::RcuPtr::null(),
-            pgrp: crate::sync::rcu::RcuLockedArc::none(),
-            session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::new(ids.thread_pid),
@@ -1787,8 +1777,6 @@ impl Task {
             session_link: crate::util::rcuhlist::HNode::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
             ptracer: crate::sync::rcu::RcuPtr::null(),
-            pgrp: crate::sync::rcu::RcuLockedArc::none(),
-            session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::none(),
@@ -1927,13 +1915,29 @@ impl Task {
     /// Its process group (root number), 0 for none (Linux
     /// pid_nr(task_pgrp)), under `g`
     pub fn pgid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
-        self.pgrp.read(g).map_or(0, |p| Pid::from(p.nr()))
+        self.pgrp_rcu(g).map_or(0, |p| Pid::from(p.nr()))
     }
 
     /// Its session (root number), 0 for none (Linux
     /// pid_nr(task_session)), under `g`
     pub fn sid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
-        self.session.read(g).map_or(0, |p| Pid::from(p.nr()))
+        self.session_rcu(g).map_or(0, |p| Pid::from(p.nr()))
+    }
+
+    /// Its process group (Linux task_pgrp: signal->pids[PIDTYPE_PGID]),
+    /// under `g`; none for a kernel thread and once its group is
+    /// released
+    pub fn pgrp_rcu<'g>(&'g self, g: &'g crate::sync::rcu::RcuReadGuard) -> Option<&'g pid::Pid> {
+        self.cpu_group()?.pgrp.read(g)
+    }
+
+    /// Its session (Linux task_session: signal->pids[PIDTYPE_SID]),
+    /// under `g`; likewise
+    pub fn session_rcu<'g>(
+        &'g self,
+        g: &'g crate::sync::rcu::RcuReadGuard,
+    ) -> Option<&'g pid::Pid> {
+        self.cpu_group()?.session.read(g)
     }
 
     /// Its pid namespace, a counted reference (Linux

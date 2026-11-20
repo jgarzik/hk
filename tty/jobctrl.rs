@@ -64,10 +64,10 @@ impl Ctty {
 /// task_session); None for a kernel thread
 fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
     let me = crate::task::percpu::current();
-    let t = table.view(&me)?;
+    let s = table.view(&me)?.signal()?;
     Some((
-        t.task.pgrp.get_protected(table)?,
-        t.task.session.get_protected(table)?,
+        s.pgrp.get_protected(table)?,
+        s.session.get_protected(table)?,
     ))
 }
 

@@ -150,8 +150,12 @@ pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
 pub fn vpid_pgrp_vnr(nr: u64, session: bool) -> Option<u32> {
     let g = crate::sync::rcu::read_lock();
     let t = vpid_task(nr, &g)?;
-    let p = if session { &t.session } else { &t.pgrp };
-    match p.read(&g) {
+    let p = if session {
+        t.session_rcu(&g)
+    } else {
+        t.pgrp_rcu(&g)
+    };
+    match p {
         Some(p) => Some(p.nr_ns(crate::task::pid::current_pid_ns())),
         None if t.has_flag(crate::task::pf::KTHREAD) => Some(0),
         None => None,

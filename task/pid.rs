@@ -76,8 +76,9 @@ pub struct Pid {
     /// leaves it, and freed a grace period after that, as
     /// `Pid.task`'s target), changed under TASKLIST's write lock and
     /// walked under it or an RCU read guard ([`Pid::pgrp_task`], Linux
-    /// pid_task(pid, PIDTYPE_PGID)). Every thread of a member holds a
-    /// reference to this `Pid` (`Task.pgrp`), so it outlives its group.
+    /// pid_task(pid, PIDTYPE_PGID)). Every member process holds a
+    /// reference to this `Pid` (`SignalStruct.pgrp`), so it outlives
+    /// its group.
     pub(crate) pgrp: RcuHListBare<PgrpLink, GlobalTaskTable>,
     /// The session whose id this is, likewise (Linux
     /// pid->tasks[PIDTYPE_SID]; links `Task.session_link`)
@@ -100,8 +101,8 @@ pub struct Pid {
     /// unhashed (`release_numbers`); under PIDMAP_LOCK
     hash_ref: AtomicBool,
     /// References dropped a grace period late (Linux delayed_put_pid):
-    /// a task's group or session link, read by RCU readers of
-    /// `Task.pgrp`/`session`, and the hash's own once it is unhashed,
+    /// a process's group or session link, read by RCU readers of
+    /// `SignalStruct.pgrp`/`session`, and the hash's own once it is unhashed,
     /// read by RCU walkers of the hash (`put_rcu`); several may go in
     /// one. Its drop may so run in `rcuc/N`, preemption off
     /// (`release_numbers`: spin leaves only).

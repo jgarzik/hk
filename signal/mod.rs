@@ -984,8 +984,14 @@ use crate::task::tasklist::{TASKLIST, TaskRef};
 /// Initialize signal state for new task `t`
 ///
 /// Called when creating the init process at boot (failure cannot be
-/// reported). Also initializes the SignalStruct (which contains rlimits).
-pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
+/// reported). Also initializes the SignalStruct (which contains
+/// rlimits), in process group and session `pids` (Linux
+/// init_signals.pids: init_struct_pid).
+pub fn init_task_signal(
+    t: &Task,
+    sighand: Arc<SigHand>,
+    pids: [Option<Arc<crate::task::pid::Pid>>; 2],
+) {
     // Built before TASKLIST is taken, with init's limits (init_rlimits)
     let s = SignalStruct::alloc_nofail();
     // The global init (Linux init_signals: SIGNAL_UNKILLABLE)
@@ -1008,11 +1014,17 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
         // Named before anyone can lock it
         t.sighand.replace(Some(sighand), &mut table).defer_put();
     }
-    if let Some(task) = table.view_mut(t) {
-        task.task.set_cpu_group(&s);
-    }
     let pid = table.view(t).and_then(|v| v.thread_pid());
     s.set_leader_pid(&mut table, pid);
+    if table.view(t).is_some() {
+        let [pg, ses] = pids;
+        // The group had none (new: nothing to retire)
+        s.pgrp.replace(pg, &mut table).defer_put();
+        s.session.replace(ses, &mut table).defer_put();
+        t.set_cpu_group(&s);
+        // Its leader joins their lists (Linux attach_pid)
+        table.attach_pids(t);
+    }
 }
 
 /// Task `t`'s signal handlers, read under RCU (Linux
@@ -1329,12 +1341,16 @@ pub fn install_fork_signal(
         // Not named before (the child is new): nothing to retire
         child.sighand.replace(Some(f.sighand), table).defer_put();
     }
-    // A new process: the child leads it, with its parent's controlling
-    // tty (Linux copy_process, under tasklist_lock)
+    // A new process: the child leads it, in its parent's process group
+    // and session and with its parent's controlling tty (Linux
+    // copy_process, under tasklist_lock)
+    let me = crate::task::percpu::current();
     if !f.share_signal {
         let pid = table.view(child).and_then(|c| c.thread_pid());
         f.signal.set_leader_pid(table, pid);
-        let me = crate::task::percpu::current();
+        if table.view(&me).is_some() {
+            table.inherit_pids(&f.signal, &me);
+        }
         if let Some(ps) = table.view(&me).and_then(|p| p.signal().cloned()) {
             // One ctty lock at a time: it is a leaf
             let tty = ps.ctty.lock().tty();
@@ -1343,6 +1359,9 @@ pub fn install_fork_signal(
     }
     if table.view(child).is_some() {
         child.set_cpu_group(&f.signal);
+        // A new leader joins its group's and session's lists (Linux
+        // copy_process: attach_pid PIDTYPE_PGID, PIDTYPE_SID)
+        table.attach_pids(child);
     }
 }
 
@@ -2731,6 +2750,23 @@ pub struct SignalStruct {
         crate::task::pid::Pid,
         crate::task::tasklist::GlobalTaskTable,
     >,
+    /// The group's process group and session (Linux
+    /// signal->pids[PIDTYPE_PGID, PIDTYPE_SID]), the only record of
+    /// either: set under TASKLIST's write lock when the group's first
+    /// task is attached (fork inherits its creator's, the global init
+    /// gets the boot ones), replaced there by setpgid and setsid, and
+    /// cleared there when the group is released (its leader's `remove`,
+    /// Linux __unhash_process detach_pid(PIDTYPE_PGID, PIDTYPE_SID));
+    /// the replaced reference dropped a grace period later (Linux
+    /// free_pid -> delayed_put_pid); read under TASKLIST or RCU
+    pub pgrp: crate::sync::rcu::RcuLockedArc<
+        crate::task::pid::Pid,
+        crate::task::tasklist::GlobalTaskTable,
+    >,
+    pub session: crate::sync::rcu::RcuLockedArc<
+        crate::task::pid::Pid,
+        crate::task::tasklist::GlobalTaskTable,
+    >,
     /// Threads not yet exiting (Linux signal->live): +1 at each
     /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
     /// takes it to 0 is the group's last (group_dead)
@@ -2952,6 +2988,8 @@ impl SignalStruct {
             posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
             itimers: itimers,
             leader_pid: crate::sync::rcu::RcuLockedArc::none(),
+            pgrp: crate::sync::rcu::RcuLockedArc::none(),
+            session: crate::sync::rcu::RcuLockedArc::none(),
             live: AtomicU32::new(1),
             dead_times: [const { AtomicU64::new(0) }; 3],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],

@@ -225,12 +225,12 @@ macro_rules! relation_reads {
 
             /// Its process group
             pub fn pgrp(&self) -> Option<&'a crate::task::pid::Pid> {
-                self.task.pgrp.protected(self.table)
+                self.task.cpu_group()?.pgrp.protected(self.table)
             }
 
             /// Its session
             pub fn session(&self) -> Option<&'a crate::task::pid::Pid> {
-                self.task.session.protected(self.table)
+                self.task.cpu_group()?.session.protected(self.table)
             }
 
             /// Its process group (root number), 0 for none (Linux
@@ -545,7 +545,6 @@ impl GlobalTaskTable {
             p.set_task(Some(&task), self);
         }
         TASKS.push_back(task.clone());
-        self.attach_pids(&task);
     }
 
     /// Process `pid`'s thread list (Linux signal->thread_head, read under
@@ -707,9 +706,9 @@ impl GlobalTaskTable {
     fn detach_group_pids(&mut self, t: &Task) {
         if let Some(s) = t.cpu_group() {
             s.leader_pid.replace(None, self).defer_put();
+            s.pgrp.replace(None, self).defer_put();
+            s.session.replace(None, self).defer_put();
         }
-        t.pgrp.replace(None, self).defer_put();
-        t.session.replace(None, self).defer_put();
     }
 
     /// Removed task `t` names no struct pid (Linux detach_pid
@@ -722,10 +721,11 @@ impl GlobalTaskTable {
     /// back (Linux free_pid)
     pub(super) fn release_pids(&self, t: &Task) {
         if t.inner().access(self).is_some() {
+            let s = t.cpu_group();
             let pids = [
                 t.thread_pid.protected(self),
-                t.pgrp.protected(self),
-                t.session.protected(self),
+                s.and_then(|s| s.pgrp.protected(self)),
+                s.and_then(|s| s.session.protected(self)),
             ];
             for p in pids.into_iter().flatten() {
                 self.release_unused(p);
@@ -760,32 +760,40 @@ impl GlobalTaskTable {
         self.pgrp(pg).flat_map(move |l| self.threads(l.task.pid))
     }
 
-    /// A new task joins its creator's process group and session (Linux
-    /// copy_process: under the write lock, so the creator's concurrent
-    /// setpgid or setsid is not missed); the creator is in this list,
-    /// the child not yet
-    pub fn inherit_pids(&mut self, child: &Task, parent: &Task) {
-        if parent.inner().access(self).is_none() {
+    /// A new process `s` joins its creator's process group and session
+    /// (Linux copy_process init_task_pid: under the write lock, so the
+    /// creator's concurrent setpgid or setsid is not missed)
+    pub fn inherit_pids(&mut self, s: &crate::signal::SignalStruct, parent: &Task) {
+        let Some(ps) = parent.cpu_group() else {
             return;
-        }
-        let (pg, s) = (
-            parent.pgrp.get_protected(self),
-            parent.session.get_protected(self),
-        );
-        // The child had none (not listed yet: nothing to retire)
-        child.pgrp.replace(pg, self).defer_put();
-        child.session.replace(s, self).defer_put();
+        };
+        let (pg, ses) = (ps.pgrp.get_protected(self), ps.session.get_protected(self));
+        // The group had none (new: nothing to retire)
+        s.pgrp.replace(pg, self).defer_put();
+        s.session.replace(ses, self).defer_put();
+    }
+
+    /// The process group and session of `t`'s group, counted
+    fn group_pids(
+        &self,
+        t: &Task,
+    ) -> (
+        Option<Arc<crate::task::pid::Pid>>,
+        Option<Arc<crate::task::pid::Pid>>,
+    ) {
+        t.cpu_group().map_or((None, None), |s| {
+            (s.pgrp.get_protected(self), s.session.get_protected(self))
+        })
     }
 
     /// Put group leader `t` on its process group's and session's lists
     /// (Linux attach_pid PIDTYPE_PGID, PIDTYPE_SID)
-    pub(super) fn attach_pids(&mut self, t: &Task) {
+    pub(crate) fn attach_pids(&mut self, t: &Task) {
         let ti = self.inner_mut_of(t);
         if ti.pids_linked || !ti.leader {
             return;
         }
-        let (Some(pg), Some(s)) = (t.pgrp.get_protected(self), t.session.get_protected(self))
-        else {
+        let (Some(pg), Some(s)) = self.group_pids(t) else {
             return;
         };
         self.inner_mut_of(t).pids_linked = true;
@@ -807,7 +815,7 @@ impl GlobalTaskTable {
         if !core::mem::take(&mut ti.pids_linked) {
             return;
         }
-        if let (Some(pg), Some(s)) = (t.pgrp.get_protected(self), t.session.get_protected(self)) {
+        if let (Some(pg), Some(s)) = self.group_pids(t) {
             // RCU readers may stand on it: the task outlives them by its
             // own rule (Linux hlist_del_rcu; freed a grace period after
             // it leaves the task list)
@@ -825,13 +833,13 @@ impl GlobalTaskTable {
         }
     }
 
-    /// Move process `pid` (every thread; its leader on the lists) to
-    /// group `pg` and, if given, session `s` (Linux change_pid); the
+    /// Move process `pid` (its leader on the lists) to group `pg` and,
+    /// if given, session `s` (Linux change_pid on signal->pids); the
     /// group and session it left come back, for the caller to drop
     /// after TASKLIST (Linux ksys_setsid's pids[] and free_pids).
-    /// Nothing is allocated: the threads are walked on the leader's
-    /// list; each thread's old reference is dropped a grace period
-    /// later (`put_rcu`: an RCU reader may still be on it).
+    /// Nothing is allocated; the replaced references are dropped a
+    /// grace period later (`put_rcu`: an RCU reader may still be on
+    /// them).
     #[must_use]
     pub(super) fn change_pids(
         &mut self,
@@ -842,26 +850,16 @@ impl GlobalTaskTable {
         let Some(l) = self.task(pid) else {
             return [None, None];
         };
-        let before = l.pgrp.get_protected(self);
-        let before_s = l.session.get_protected(self);
+        let Some(sig) = l.cpu_group().cloned() else {
+            return [None, None];
+        };
+        let (before, before_s) = self.group_pids(&l);
         self.detach_pids(&l);
-        let mut cur = self.first_thread(pid);
-        while let Some(t) = cur {
-            debug_assert!(
-                t.pgrp.as_ptr() == Self::pid_ptr(&before),
-                "threads share a group"
-            );
-            // RCU readers of the old link may still hold it: dropped a
-            // grace period later (Linux free_pid -> delayed_put_pid)
-            t.pgrp.replace(Some(pg.clone()), self).defer_put();
-            if let Some(s) = s {
-                debug_assert!(
-                    t.session.as_ptr() == Self::pid_ptr(&before_s),
-                    "threads share a session"
-                );
-                t.session.replace(Some(s.clone()), self).defer_put();
-            }
-            cur = self.next_thread(pid, &t);
+        // RCU readers of the old link may still hold it: dropped a
+        // grace period later (Linux free_pid -> delayed_put_pid)
+        sig.pgrp.replace(Some(pg.clone()), self).defer_put();
+        if let Some(s) = s {
+            sig.session.replace(Some(s.clone()), self).defer_put();
         }
         self.attach_pids(&l);
         // The group or session it left may be gone (setpgid, setsid)
@@ -869,11 +867,6 @@ impl GlobalTaskTable {
             self.release_unused(p);
         }
         [before, before_s]
-    }
-
-    /// The `Pid` a reference names, for identity checks
-    fn pid_ptr(p: &Option<Arc<crate::task::pid::Pid>>) -> *const crate::task::pid::Pid {
-        p.as_ref().map_or(core::ptr::null(), Arc::as_ptr)
     }
 
     /// Number of tasks, zombies included

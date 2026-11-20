@@ -1053,10 +1053,9 @@ Designs that grew one commit at a time. Tag = roadmap phase
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
-- **Process-wide state per thread** (C): the group and session `Pid`
-  references (`Task.pgrp`/`session`) held by every thread, not
-  once per process (Linux signal->pids); one global CHILD_EXIT_WQ wakes every waiting parent on every
-  exit.
+- **One global child-exit wait queue** (C): CHILD_EXIT_WQ wakes every
+  waiting parent on every exit (Linux signal->wait_chldexit, woken by
+  __wake_up_parent).
 - **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move

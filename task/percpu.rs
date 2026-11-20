@@ -1010,9 +1010,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
     // Add to global table, as the root namespace's child reaper
     {
         let mut table = TASKLIST.write();
-        // Not listed yet: nothing to retire
-        task.pgrp.replace(pgrp, &mut table).defer_put();
-        task.session.replace(session, &mut table).defer_put();
         table.insert(task.clone());
         crate::task::pidns::attach_init(&mut table, &task);
     }
@@ -1051,7 +1048,11 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, KernelError> 
     crate::ns::init_task_ns(&task, crate::ns::INIT_NSPROXY.clone());
 
     // Initialize signal handlers for the init task
-    crate::signal::init_task_signal(&task, arc_nofail(crate::signal::SigHand::new()));
+    crate::signal::init_task_signal(
+        &task,
+        arc_nofail(crate::signal::SigHand::new()),
+        [pgrp, session],
+    );
 
     printkln!("USER_TASK_CREATED: pid={} tid={}", pid, tid);
     Ok(task)
@@ -2145,8 +2146,7 @@ pub fn current_pgid_vnr() -> u32 {
     let me = current();
     let g = crate::sync::rcu::read_lock();
     me.task
-        .pgrp
-        .read(&g)
+        .pgrp_rcu(&g)
         .map_or(0, |p| p.nr_ns(me.task.pid_ns()))
 }
 
@@ -2163,8 +2163,7 @@ pub fn current_sid_vnr() -> u32 {
     let me = current();
     let g = crate::sync::rcu::read_lock();
     me.task
-        .session
-        .read(&g)
+        .session_rcu(&g)
         .map_or(0, |p| p.nr_ns(me.task.pid_ns()))
 }
 

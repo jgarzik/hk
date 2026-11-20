@@ -270,8 +270,8 @@ fn dup_task_struct(me: &Cur, config: &CloneConfig) -> KernelResult<TaskRef> {
         comm: me.comm(),
         mempolicy: me.task_lock().mempolicy(),
     };
-    // pgrp/session are set from the creator's under TASKLIST
-    // (`inherit_pids`); pdeath_signal is never inherited; untraced until
+    // A new process's pgrp/session are set from the creator's under
+    // TASKLIST (`install_fork_signal`); pdeath_signal is never inherited; untraced until
     // listed: CLONE_PTRACE links it in the write section that lists it
     let inner = crate::task::TaskInner {
         // Linux copy_process: a thread -1, a CLONE_PARENT child the
@@ -644,7 +644,6 @@ fn copy_process<FA: FrameAlloc<PhysAddr = u64>>(
             // current), listed
             child_task.set_parent(Some(&*me), &mut table);
         }
-        table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         new_pid.attached();
         // Its handlers and group state, in the section that lists it
