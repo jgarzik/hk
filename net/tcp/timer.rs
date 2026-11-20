@@ -409,7 +409,7 @@ impl TcpCb {
         if self.soft_err.is_some() {
             shift += 1;
         }
-        if !super::mem::check_oom(shift, self.sndq_len(), now) {
+        if !super::mem::check_oom(shift, self.wmem_queued, now) {
             return false;
         }
         let reset = reset

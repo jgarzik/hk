@@ -796,10 +796,12 @@ pub struct TcpCb {
     pub(super) rtx: SkbTree,
     /// End of the data queued (Linux write_seq; the FIN is after it)
     pub(super) write_seq: u32,
-    /// Linux sk_sndbuf: the send buffer, of which hk's byte counts
-    /// (payload, no truesize) fill half (`snd_cap`); the socket's
-    /// SO_SNDBUF, grown by tcp_sndbuf_expand
+    /// Linux sk_sndbuf: the send buffer, in skb truesize (the socket's
+    /// SO_SNDBUF, grown by tcp_sndbuf_expand)
     pub sndbuf: u32,
+    /// Truesize of the write and retransmit queues' skbs (Linux
+    /// sk_wmem_queued)
+    pub(super) wmem_queued: usize,
     /// The user closed the sending side: a FIN follows the queued data
     pub(super) fin_queued: bool,
     /// End of the last segment shorter than the MSS (Nagle, Minshall)
@@ -1047,6 +1049,7 @@ impl TcpCb {
             rtx: Default::default(),
             write_seq: Default::default(),
             sndbuf: 128 * 1024,
+            wmem_queued: 0,
             fin_queued: Default::default(),
             snd_sml: Default::default(),
             irs: Default::default(),
@@ -1316,7 +1319,7 @@ impl TcpCb {
         max: usize,
         mut fill: impl FnMut(&mut [u8]) -> Result<usize, KernelError>,
     ) -> Result<usize, KernelError> {
-        let n = self.wmem_schedule(max.min(self.snd_space()));
+        let n = max;
         let (mut done, mut err, mut short) = (0, None, false);
         while done < n {
             let Some(mut skb) = self.wq_tail() else {
@@ -1337,7 +1340,9 @@ impl TcpCb {
             skb.tcp_mut().end_seq = skb.tcp().end_seq.wrapping_add(got as u32);
             self.write_seq = self.write_seq.wrapping_add(got as u32);
             done += got;
-            if !skb.is_empty() {
+            if skb.is_empty() {
+                self.wmem_free(skb);
+            } else {
                 self.wq.push_back(skb);
             }
             if got < k {
@@ -1357,14 +1362,20 @@ impl TcpCb {
     }
 
     /// The skb new data goes into: the write queue's tail while it has
-    /// room, else a new one of one MSS (Linux tcp_write_queue_tail /
-    /// tcp_stream_alloc_skb); None without memory
+    /// room, else, with the buffer not full (Linux tcp_sendmsg_locked's
+    /// sk_stream_memory_free before a new segment), a new one of one
+    /// MSS charged its truesize (tcp_stream_alloc_skb: forced into
+    /// empty queues, else sk_wmem_schedule); None without room or
+    /// memory
     fn wq_tail(&mut self) -> Option<Box<SkBuff>> {
         if let Some(t) = self.wq.pop_back() {
             if t.tailroom() > 0 {
                 return Some(t);
             }
             self.wq.push_back(t);
+        }
+        if !self.memory_free() {
+            return None;
         }
         let Some(mut skb) = SkBuff::alloc_tx(self.live.mss.get() as usize, Gfp::KERNEL) else {
             // Linux tcp_stream_alloc_skb: enter_memory_pressure,
@@ -1375,6 +1386,13 @@ impl TcpCb {
             self.moderate_sndbuf();
             return None;
         };
+        let ts = skb.truesize();
+        if self.wq.is_empty() && self.rtx.is_empty() {
+            self.mem_force(ts);
+        } else if !self.mem_schedule(ts, MemKind::Send) {
+            return None;
+        }
+        self.wmem_queued += ts;
         let t = skb.tcp_mut();
         t.seq = self.write_seq;
         t.end_seq = self.write_seq;
@@ -1395,36 +1413,23 @@ impl TcpCb {
         .unwrap_or(0)
     }
 
-    /// How much of `n` bytes may be queued (Linux tcp_wmem_schedule):
-    /// all if memory allows; else, so a sender with little queued still
-    /// progresses, its tcp_wmem[0] floor is charged regardless and what
-    /// the held quanta cover is taken; 0: wait for memory
-    fn wmem_schedule(&mut self, n: usize) -> usize {
-        if n == 0 || self.mem_schedule(n, MemKind::Send) {
-            return n;
-        }
-        let left = self.wmem_min().saturating_sub(self.sndq_len());
-        if left > 0 {
-            self.mem_force(left.min(n));
-        }
-        n.min((self.held.get() * mem::QUANTUM).saturating_sub(self.mem_used()))
+    /// An skb leaves the send queues for good (Linux
+    /// tcp_wmem_free_skb: sk_wmem_queued less its truesize)
+    pub(super) fn wmem_free(&mut self, skb: Box<SkBuff>) {
+        self.wmem_queued = self.wmem_queued.saturating_sub(skb.truesize());
     }
 
-    /// Room in the send queue (none while TCP_NOTSENT_LOWAT unsent
-    /// bytes wait, Linux sk_stream_memory_free)
-    pub fn snd_space(&self) -> usize {
+    /// Linux tcp_stream_memory_free with `wake` (1 for writability): the
+    /// unsent bytes, doubled when waking, below TCP_NOTSENT_LOWAT
+    fn notsent_ok(&self, wake: u32) -> bool {
         let lowat = self.opts.notsent_lowat as usize;
-        if lowat != 0 && self.unsent() >= lowat {
-            return 0;
-        }
-        self.snd_cap().saturating_sub(self.sndq_len())
+        lowat == 0 || (self.unsent() << wake) < lowat
     }
 
-    /// Send bytes the buffer holds: half of SO_SNDBUF, the other half
-    /// the overhead hk's byte counts leave out (Linux compares
-    /// sk_wmem_queued, in truesize, with sk_sndbuf)
-    pub fn snd_cap(&self) -> usize {
-        self.sndbuf as usize / 2
+    /// Linux sk_stream_memory_free: the queues' truesize below
+    /// SO_SNDBUF, and the unsent bytes below TCP_NOTSENT_LOWAT
+    pub fn memory_free(&self) -> bool {
+        self.wmem_queued < self.sndbuf as usize && self.notsent_ok(0)
     }
 
     /// Data bytes queued for sending, sent or not (SIOCOUTQ: Linux
@@ -1451,13 +1456,14 @@ impl TcpCb {
         }
     }
 
-    /// Linux sk_stream_is_writeable: free space is at least half of what
-    /// is queued, and fewer unsent bytes than TCP_NOTSENT_LOWAT
+    /// Linux sk_stream_is_writeable: free space (sk_stream_wspace) at
+    /// least half of what is queued (sk_stream_min_wspace), and the
+    /// buffer not full with half TCP_NOTSENT_LOWAT unsent at most
+    /// (__sk_stream_memory_free with wake)
     pub fn writable(&self) -> bool {
-        let q = self.sndq_len();
-        let free = self.snd_cap().saturating_sub(q);
-        let lowat = self.opts.notsent_lowat;
-        free > 0 && free * 2 >= q && (lowat == 0 || self.unsent() < lowat as usize)
+        let q = self.wmem_queued;
+        let free = (self.sndbuf as usize).saturating_sub(q);
+        free >= q >> 1 && q < self.sndbuf as usize && self.notsent_ok(1)
     }
 
     /// Bytes readable
@@ -1633,7 +1639,7 @@ impl TcpCb {
             return;
         }
         // Too many orphans or past the memory limit, it goes now
-        if self.state != TcpState::Closed && mem::check_oom(0, self.sndq_len(), now) {
+        if self.state != TcpState::Closed && mem::check_oom(0, self.wmem_queued, now) {
             self.send_reset(out);
             self.set_closed(out);
             self.net_stat(LINUX_MIB_TCPABORTONMEMORY);
@@ -1709,6 +1715,7 @@ impl TcpCb {
     fn purge_wq(&mut self) {
         self.wq = SkbHead::new();
         self.rtx = SkbTree::new();
+        self.wmem_queued = 0;
         // Linux tcp_write_queue_purge + tcp_clear_all_retrans_hints
         self.packets_out = 0;
         self.rtx_hint = None;
@@ -1972,10 +1979,9 @@ impl TcpCb {
 
     // --- memory ------------------------------------------------------------
 
-    /// Bytes in the queues (Linux sk_wmem_queued + sk_rmem_alloc; the
-    /// send side in hk's byte counts)
+    /// Truesize in the queues (Linux sk_wmem_queued + sk_rmem_alloc)
     fn mem_used(&self) -> usize {
-        self.sndq_len() + self.rmem_alloc()
+        self.wmem_queued + self.rmem_alloc()
     }
 
     /// Cover `size` more bytes before queueing them (Linux
@@ -2020,7 +2026,7 @@ impl TcpCb {
         if allocated <= mem::limit(2) {
             let floor = match kind {
                 MemKind::Recv => self.rmem_alloc() < self.cfg.rmem_min as usize,
-                MemKind::Send => self.sndq_len() < self.wmem_min(),
+                MemKind::Send => self.wmem_queued < self.cfg.wmem_min as usize,
             };
             if floor {
                 return true;
@@ -2034,15 +2040,7 @@ impl TcpCb {
             return false;
         }
         self.moderate_sndbuf();
-        self.sndq_len() + size >= self.snd_cap()
-    }
-
-    /// tcp_wmem[0] in hk's send byte counts, which leave out truesize
-    /// overhead (half, as SO_SNDBUF): what a connection may queue
-    /// whatever the memory (tcp_wmem_schedule) and below the hard
-    /// limit (__sk_mem_raise_allocated)
-    fn wmem_min(&self) -> usize {
-        self.cfg.wmem_min as usize / 2
+        self.wmem_queued + size >= self.sndbuf as usize
     }
 
     /// Charge `size` more bytes without a limit (Linux

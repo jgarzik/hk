@@ -303,17 +303,17 @@ fn sndbuf_expand() {
     assert_eq!(p.a.sndbuf, 16_384);
 }
 
-/// Linux sk_stream_moderate_sndbuf: half of what is queued (Linux's
-/// sk_wmem_queued, twice hk's send bytes), at least SOCK_MIN_SNDBUF;
-/// a set SO_SNDBUF stays
+/// Linux sk_stream_moderate_sndbuf: half of what is queued
+/// (sk_wmem_queued), at least SOCK_MIN_SNDBUF; a set SO_SNDBUF stays
 #[test]
 fn sndbuf_moderate() {
     let mut p = snd_pair(0);
     p.filter = drop_all;
     let sent = p.send_a(&pattern(30_000));
     assert_eq!(sent, 30_000);
+    let q = p.a.wmem_queued;
     p.a.moderate_sndbuf();
-    assert_eq!(p.a.sndbuf, 30_000);
+    assert_eq!(p.a.sndbuf as usize, q / 2);
     let mut p = snd_pair(0);
     p.a.moderate_sndbuf();
     assert_eq!(p.a.sndbuf, crate::net::sock::MIN_SNDBUF);
@@ -465,4 +465,49 @@ fn backlog_counts_in_space() {
     assert_eq!(p.b.space(), free - p.b.win_from_space(1 << 15));
     p.b.live.backlog_len.store(1 << 16, Ordering::Relaxed);
     assert_eq!(p.b.window_now(), 0);
+}
+
+/// The send queues' truesize (Linux sk_wmem_queued)
+fn queued_truesize(c: &TcpCb) -> usize {
+    c.wq.iter().map(|s| s.truesize()).sum::<usize>()
+        + c.rtx.iter().map(|s| s.truesize()).sum::<usize>()
+}
+
+/// Send memory is skb truesize against all of SO_SNDBUF (Linux
+/// sk_wmem_queued, sk_stream_memory_free): charged as skbs are queued
+/// or split, released as they are acknowledged or merged, through
+/// losses, SACK and retransmission; the buffer takes payload up to it
+#[test]
+fn send_memory_is_truesize() {
+    let mut p = Pair::with_cap(1000, 1 << 20);
+    p.a.sndbuf = 64 * 1024;
+    p.filter = drop_all;
+    let n = p.send_a(&pattern(200_000));
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+    // Up to one skb past the buffer, payload short of it
+    let skb = p.a.wq.iter().next().map(|s| s.truesize()).unwrap();
+    assert!(p.a.wmem_queued >= 64 * 1024 && p.a.wmem_queued < 64 * 1024 + skb);
+    assert!(n < 64 * 1024 && n > 32 * 1024, "{n}");
+    assert!(!p.a.memory_free());
+    assert!(!p.a.writable());
+    let mut p = Pair::with_cap(1000, 1 << 20);
+    p.filter = lossy;
+    let data = pattern(300_000);
+    let mut sent = 0;
+    for _ in 0..20_000 {
+        if sent < data.len() {
+            sent += p.send_a(&data[sent..]);
+        }
+        p.run();
+        assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+        p.read_b(1 << 20);
+        if sent == data.len() && p.a.snd_una == p.a.snd_max {
+            break;
+        }
+        if p.wire.is_empty() {
+            p.tick();
+        }
+    }
+    assert_eq!(p.a.snd_una, p.a.snd_max);
+    assert_eq!(p.a.wmem_queued, 0);
 }

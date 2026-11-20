@@ -103,9 +103,7 @@ SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
-(/sys/module/tcp_cubic/parameters: Linux's defaults are constants), the
-send side counts payload bytes against half of SO_SNDBUF (Linux:
-skb truesize, sk_wmem_queued, against all of it), and TCP_DEFER_ACCEPT /
+(/sys/module/tcp_cubic/parameters: Linux's defaults are constants), and TCP_DEFER_ACCEPT /
 TCP_FASTOPEN are stored only.
 
 UDP has no hash4 (Linux udp_table.hash4: connected sockets by

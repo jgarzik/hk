@@ -589,6 +589,7 @@ impl TcpCb {
         if self.highest_sack == Some(skb) {
             self.advance_highest_sack(prev);
         }
+        self.wmem_free(s);
         self.net_stat(LINUX_MIB_SACKMERGED);
         Some(true)
     }

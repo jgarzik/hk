@@ -266,11 +266,10 @@ impl Drop for Held {
     }
 }
 
-/// A connection with `wmem` bytes of its own queued while the total is
-/// past the hard limit (Linux tcp_out_of_memory: SOCK_MIN_SNDBUF, half
-/// of it in hk's byte counts)
+/// A connection with `wmem` (sk_wmem_queued) of its own queued while
+/// the total is past the hard limit (Linux tcp_out_of_memory)
 pub fn out_of_memory(wmem: usize) -> bool {
-    wmem > crate::net::sock::MIN_SNDBUF as usize / 2 && allocated() > limit(2)
+    wmem > crate::net::sock::MIN_SNDBUF as usize && allocated() > limit(2)
 }
 
 /// /proc/sys/net/ipv4/tcp_mem (machine-wide: in the initial network

@@ -440,13 +440,12 @@ impl TcpCb {
 
     /// Linux sk_stream_moderate_sndbuf (memory refused a sender): the
     /// buffer shrinks to half what is queued, at least SOCK_MIN_SNDBUF,
-    /// unless SO_SNDBUF was set (hk's send byte counts are half of
-    /// Linux's truesize, sk_wmem_queued)
+    /// unless SO_SNDBUF was set
     pub(super) fn moderate_sndbuf(&mut self) {
         if self.userlocks & SNDBUF_LOCK != 0 {
             return;
         }
-        let queued = (2 * self.sndq_len()).min(u32::MAX as usize) as u32;
+        let queued = self.wmem_queued.min(u32::MAX as usize) as u32;
         let val = self.sndbuf.min(queued >> 1);
         self.sndbuf = val.max(crate::net::sock::MIN_SNDBUF);
     }

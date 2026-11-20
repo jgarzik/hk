@@ -743,7 +743,9 @@ impl TcpCb {
             if self.rtx_hint == Some(t.seq) {
                 self.rtx_hint = None;
             }
-            drop(self.rtx.pop_first());
+            if let Some(skb) = self.rtx.pop_first() {
+                self.wmem_free(skb);
+            }
             if self.highest_sack == Some(t.seq) {
                 // Linux tcp_highest_sack_replace
                 self.highest_sack = self.rtx_head();

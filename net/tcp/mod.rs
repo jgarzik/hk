@@ -1987,7 +1987,7 @@ fn send_some(
     } else if n > 0 {
         g.cb.output(now_ms(), &mut out);
     }
-    let no_mem = n == 0 && g.cb.snd_space() > 0;
+    let no_mem = n == 0 && g.cb.memory_free();
     s.finish(g, &mut out);
     Ok((n, no_mem))
 }

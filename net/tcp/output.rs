@@ -386,15 +386,15 @@ impl TcpCb {
     /// them, or on an skb of its own once the data is gone (Linux
     /// tcp_send_fin). False without memory.
     fn send_new(&mut self, n: u32, fl: u8, out: &mut Out) -> bool {
-        let mut skb = match self.wq.pop_front() {
-            Some(s) => s,
+        let (mut skb, new) = match self.wq.pop_front() {
+            Some(s) => (s, false),
             None => {
                 let Some(mut s) = SkBuff::alloc_tx(0, out.gfp) else {
                     return false;
                 };
                 s.tcp_mut().seq = self.write_seq;
                 s.tcp_mut().end_seq = self.write_seq;
-                s
+                (s, true)
             }
         };
         if skb.len() > n as usize {
@@ -402,6 +402,8 @@ impl TcpCb {
                 self.wq.push_front(skb);
                 return false;
             };
+            // Linux tcp_fragment: sk_wmem_queued_add(buff->truesize)
+            self.wmem_queued += rest.truesize();
             self.wq.push_front(rest);
         }
         if !self.transmit(&skb, skb.tcp().seq, fl, out) {
@@ -422,6 +424,10 @@ impl TcpCb {
         // Linux __tcp_transmit_skb: skb_mstamp_ns
         skb.tstamp = self.tcp_clock_cache as i64;
         self.packets_out += 1;
+        if new {
+            // Linux tcp_send_fin's own skb, charged as it is queued
+            self.wmem_queued += skb.truesize();
+        }
         self.rtx
             .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
         true
@@ -473,6 +479,7 @@ impl TcpCb {
         if diff != 0 && !before(self.snd_max, rest.tcp().end_seq) {
             self.adjust_pcount(tags, diff);
         }
+        self.wmem_queued += rest.truesize();
         self.rtx
             .insert_by(rest, |a, b| before(a.tcp().seq, b.tcp().seq));
         true
@@ -537,6 +544,7 @@ impl TcpCb {
             self.rtx_hint = Some(seq);
         }
         self.adjust_pcount(nt.sacked, nt.pcount() as i32);
+        self.wmem_free(next);
         true
     }
 
