@@ -286,11 +286,9 @@ fn bound_to(s: &PacketSock, dev: &NetDevice) -> bool {
 /// socket bound to it with a protocol is hooked again
 pub fn netdev_up(net: &crate::net::NetNamespace, dev: &NetDevice) {
     net.packet.for_each(|s| {
-        if bound_to(s, dev) {
-            let g = s.bind_lock.lock();
-            if s.bound().0 != 0 {
-                s.register_hook(&g);
-            }
+        let g = s.bind_lock.lock();
+        if bound_to(s, dev) && s.bound().0 != 0 {
+            s.register_hook(&g);
         }
     });
 }
@@ -300,8 +298,8 @@ pub fn netdev_up(net: &crate::net::NetNamespace, dev: &NetDevice) {
 /// (sk_error_report: POLLERR, a blocked receive wakes)
 pub fn netdev_down(net: &crate::net::NetNamespace, dev: &NetDevice) {
     net.packet.for_each(|s| {
+        let g = s.bind_lock.lock();
         if bound_to(s, dev) {
-            let g = s.bind_lock.lock();
             s.unhook_err(&g);
         }
     });
@@ -316,13 +314,15 @@ pub fn netdev_unregister(
     net: &crate::net::NetNamespace,
     dev: &NetDevice,
 ) {
-    // The device is unlisted already (unregister_netdevice): a bind
-    // that found it stored its binding under bind_lock before this
-    // visit, one that missed it failed ENODEV
+    // The device is unlisted already (unregister_netdevice). A bind
+    // holds bind_lock from its lookup through its store, and the
+    // binding is tested under it here: a bind that found the device
+    // is seen, one that missed it failed ENODEV (Linux gets the same
+    // from bind's RCU section and synchronize_net before the notifier)
     for s in net.packet.snapshot() {
         opts::mclist_delete(r, &s, dev);
+        let g = s.bind_lock.lock();
         if bound_to(&s, dev) {
-            let g = s.bind_lock.lock();
             s.unhook_err(&g);
             let (num, _) = s.bound();
             s.bind.store(pack(num, -1), Ordering::Release);
