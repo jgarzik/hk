@@ -551,3 +551,25 @@ fn linger2() {
     assert_eq!(p.a.state, TcpState::Closed);
     assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONLINGER), 1);
 }
+
+/// An orphan reaching FIN_WAIT_2 from its backlog, the socket owned,
+/// keeps its socket on the keepalive timer for all of tcp_fin_time
+/// (Linux tcp_rcv_state_process's sock_owned_by_user), which then
+/// resets it, nothing being left past TIME_WAIT's length
+#[test]
+fn owned_orphan_fin_wait2_keeps_socket() {
+    let mut p = Pair::new(1460);
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.a.owned = true;
+    p.run();
+    assert_eq!(p.a.state, TcpState::FinWait2);
+    assert!(!p.a_out.timewait);
+    assert_eq!(p.a.live.wait_at.get(), Some(p.now + 60_000));
+    let t = p.now;
+    assert!(p.until(|p| p.a.state == TcpState::Closed, 10));
+    assert_eq!(p.now - t, 60_000);
+    assert!(!p.a_out.timewait);
+    assert!(p.log.iter().any(|l| l.1 && l.2.has(flags::RST)));
+}

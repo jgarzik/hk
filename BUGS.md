@@ -112,10 +112,7 @@ sk_incoming_cpu point (hk does not track a socket's receiving CPU).
 
 TIME_WAIT (`net/tcp/timewait.rs`): a takeover SYN's connection gets
 a fresh ISN, not the entry's SND.NXT + 65537 (Linux TCP_SKB_CB
-tcp_tw_isn). An orphan reaching FIN_WAIT_2 from its
-backlog goes to a timewait entry where Linux, the socket owned, arms
-the keepalive timer instead (tcp_rcv_state_process's
-sock_owned_by_user: the control block does not know).
+tcp_tw_isn).
 
 skbs are linear (no paged frags, skb_shinfo frags): TCP's SACK
 shifting (`sack.rs` shift, Linux tcp_shift_skb_data / skb_shift moving

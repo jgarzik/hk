@@ -998,6 +998,9 @@ pub struct TcpCb {
     /// The timeout of the timewait entry it is handed to (ms; Linux
     /// tcp_time_wait's timeo)
     pub(super) tw_timeo: u64,
+    /// Input runs from the backlog, the socket owned (Linux
+    /// sock_owned_by_user in tcp_rcv_state_process)
+    pub owned: bool,
     /// An ACK must go out now (pure ACK if no data segment carries it)
     pub(super) ack_now: bool,
     /// In-order data was dropped for memory: the next ACK offers a zero
@@ -1135,6 +1138,7 @@ impl TcpCb {
             orphan: Default::default(),
             soft_err: Default::default(),
             tw_timeo: TIMEWAIT_LEN,
+            owned: false,
             ack_now: Default::default(),
             ack_nomem: Default::default(),
             last_oow: Default::default(),
@@ -1803,14 +1807,14 @@ impl TcpCb {
     /// An orphan in FIN_WAIT_2 (Linux __tcp_close; tcp_rcv_state_process
     /// FIN_WAIT1 with `fin` the segment's): with tcp_fin_time past
     /// TIME_WAIT's length the keepalive timer waits out the excess
-    /// first, and with a FIN arriving (which must not be lost) all of
-    /// it; else a timewait entry in the FIN_WAIT2 substate takes over
-    /// (true)
+    /// first, and with a FIN arriving (which must not be lost) or the
+    /// socket owned (input from its backlog) all of it; else a timewait
+    /// entry in the FIN_WAIT2 substate takes over (true)
     pub(super) fn orphan_fw2(&mut self, now: u64, fin: bool, out: &mut Out) -> bool {
         let tmo = self.fin_time();
         if tmo > TIMEWAIT_LEN {
             self.live.wait_at.set(Some(now + tmo - TIMEWAIT_LEN));
-        } else if fin {
+        } else if fin || self.owned {
             self.live.wait_at.set(Some(now + tmo));
         } else {
             self.fw2_time_wait(tmo, out);

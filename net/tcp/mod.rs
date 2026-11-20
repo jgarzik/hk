@@ -1450,7 +1450,10 @@ impl SockHooks<Inner> for TcpSock {
             return;
         };
         let mut out = Out::default();
+        // Linux sock_owned_by_user, as tcp_rcv_state_process sees it
+        g.cb.owned = true;
         self.do_rcv(g, skb, t, now_ms(), &mut out);
+        g.cb.owned = false;
         self.finish(g, &mut out);
     }
 
