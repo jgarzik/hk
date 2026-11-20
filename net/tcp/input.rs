@@ -988,6 +988,9 @@ impl TcpCb {
         if !over(self) {
             return true;
         }
+        // Linux's order: tcp_collapse_ofo_queue (`collapse_ofo`), then
+        // tcp_collapse of the receive queue (`collapse_rcvq`), checked
+        // again, before the destructive pruning below (not done yet)
         self.prune_ofo_queue(seq);
         if !over(self) {
             return true;
