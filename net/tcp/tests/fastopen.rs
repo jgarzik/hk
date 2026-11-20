@@ -108,3 +108,25 @@ fn fin_wait1_request_resends_synack() {
     );
     assert_eq!(b.state, TcpState::FinWait1);
 }
+
+/// An ACK beyond SND.MAX to a child holding its request in FIN_WAIT_1
+/// is not acceptable (Linux tcp_ack: after(ack, snd_nxt)) and changes
+/// nothing: tcp_rcv_state_process sends a challenge ACK, the request
+/// and the SYN-ACK's retransmission state stay
+#[test]
+fn fin_wait1_ack_beyond_snd_max() {
+    let data = b"fast open data";
+    let (_, syn, mut b) = tfo_child(data);
+    let mut out = Out::default();
+    b.shutdown_wr(10, &mut out);
+    let rcv = 1001 + data.len() as u32;
+    let bad = synack_ack(&syn, &b, rcv, 100);
+    let mut out = Out::default();
+    b.feed(&bad, 20, &mut out);
+    assert_eq!(b.state, TcpState::FinWait1);
+    assert!(b.tfo && b.syn_unacked);
+    assert_eq!(b.snd_una, 5000);
+    let w = wire(&out);
+    assert_eq!(w.len(), 1);
+    assert!(w[0].flags == flags::ACK && w[0].seq == b.snd_max && w[0].ack == rcv);
+}

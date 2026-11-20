@@ -644,9 +644,11 @@ impl TcpCb {
             if self.tfo {
                 // A Fast Open child closed in SYN_RECEIVED: its SND.UNA
                 // is past its SYN-ACK (Linux tcp_create_openreq_child),
-                // so an ACK not past it is old (tcp_ack's old_ack, not
-                // acceptable: challenged)
-                if !after(s.ack, self.iss) {
+                // so an ACK not past it is old (tcp_ack's old_ack); one
+                // beyond SND.MAX acknowledges unsent data. Neither is
+                // acceptable (challenged), and both are refused before
+                // SND.UNA moves
+                if !after(s.ack, self.iss) || after(s.ack, self.snd_max) {
                     self.challenge_ack(out);
                     return;
                 }
