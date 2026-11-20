@@ -677,11 +677,13 @@ const IFLA_REJECT: [u16; 7] = [
 ];
 
 /// The parts of Linux ifla_policy the link requests rely on beyond the
-/// typed reads: rejected attributes, the txqlen range
+/// typed reads: rejected attributes, the alias length, the txqlen range
 fn ifla_validate(a: &Attrs<'_>) -> Result<(), KernelError> {
     if IFLA_REJECT.iter().any(|&t| a.has(t)) {
         return Err(KernelError::InvalidArgument);
     }
+    // NLA_BINARY, len IFALIASZ - 1
+    a.max(IFLA_IFALIAS, IFALIASZ - 1)?;
     // NLA_POLICY_FULL_RANGE(NLA_U32, 0..INT_MAX)
     if a.u32(IFLA_TXQLEN)?.is_some_and(|q| q > i32::MAX as u32) {
         return Err(KernelError::Range);

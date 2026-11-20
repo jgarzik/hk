@@ -4,7 +4,8 @@
 //! - RTNL_LINK_SETTINGS: IFLA_GROUP is kept and a group-wide
 //!   RTM_NEWLINK (no index, no name) changes its members
 //!   (rtnl_group_changelink); IFLA_IFALIAS is kept and an empty one
-//!   clears it, one of IFALIASZ bytes is EINVAL (dev_set_alias);
+//!   clears it, one of IFALIASZ - 1 bytes is kept, one of IFALIASZ
+//!   bytes fails ifla_policy (ERANGE);
 //!   IFLA_TXQLEN is kept (dev_change_tx_queue_len); IFLA_BROADCAST is
 //!   copied; GSO/GRO limits are kept up to the device's TSO limits and
 //!   GRO_MAX_SIZE, beyond them EINVAL ("too big ...", validate_linkmsg)
@@ -22,6 +23,7 @@ const IFLA_GSO_MAX_SEGS: u16 = 40;
 const IFLA_GSO_MAX_SIZE: u16 = 41;
 const IFLA_GRO_MAX_SIZE: u16 = 58;
 const EINVAL: i64 = -22;
+const ERANGE: i64 = -34;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== RTNL Link Settings Tests ===");
@@ -109,7 +111,19 @@ fn settings(name: &'static [u8]) -> bool {
         set(&mut nl, &|r| {
             r.attr(IFLA_IFALIAS, &[b'a'; 256]);
         }),
-        EINVAL,
+        ERANGE,
+    );
+    t.eq(
+        b"alias max",
+        set(&mut nl, &|r| {
+            r.attr(IFLA_IFALIAS, &[b'a'; 255]);
+        }),
+        0,
+    );
+    t.eq(
+        b"alias max kept",
+        get_attr(&mut nl, IFLA_IFALIAS, &mut b),
+        256,
     );
     // Transmit queue length
     t.eq(
