@@ -1333,15 +1333,16 @@ fn rcv_shut(s: &UnixSock) -> bool {
     s.sk.shutdown() & RCV_SHUTDOWN != 0
 }
 
+/// The receive queue's last skb, as an identity only: never
+/// dereferenced, and holding no reference (Linux queue->prev)
+fn tail(q: &OwnedList<SkbOwned>) -> Option<*const SkBuff> {
+    q.last().map(core::ptr::from_ref)
+}
+
 /// The receive queue's last skb is `last` (Linux skb_peek_tail ==
-/// last)
-fn tail_is(s: &UnixSock, last: Option<&SkBuff>) -> bool {
-    let q = s.rq.lock();
-    match (q.last(), last) {
-        (None, None) => true,
-        (Some(t), Some(l)) => core::ptr::eq(t, l),
-        _ => false,
-    }
+/// last); `last` is compared, never dereferenced
+fn tail_is(s: &UnixSock, last: Option<*const SkBuff>) -> bool {
+    tail(&s.rq.lock()) == last
 }
 
 /// Common receive tail: credentials and files into control messages

@@ -895,12 +895,6 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         self.list.list.front().map(|p| unsafe { P::clone_raw(p) })
     }
 
-    /// A new reference to the last entry (Linux skb_peek_tail + skb_get)
-    pub fn back(&self) -> Option<P> {
-        // SAFETY: as in `front`
-        self.list.list.back().map(|p| unsafe { P::clone_raw(p) })
-    }
-
     /// A new reference to the entry after `item`; None if `item` is the
     /// last or not on this list
     /// The entry after `item`, borrowed for as long as the list is (None

@@ -295,16 +295,16 @@ struct Rx {
 /// for MSG_PEEK a reference to the message at the peek offset `off`
 /// (-1: the head), whole messages before it skipped (a zero-length
 /// one once it was peeked); `off` becomes the offset into it. `last`
-/// is the queue's tail as scanned, which a wait for more must see
-/// change (Linux `*last = queue->prev`).
+/// is the queue's tail as scanned, an identity holding no reference,
+/// which a wait for more must see change (Linux `*last = queue->prev`).
 fn try_recv(
     s: &UnixSock,
     peek: bool,
     off: &mut i32,
-    last: &mut Option<Arc<SkBuff>>,
+    last: &mut Option<*const SkBuff>,
 ) -> Option<Arc<SkBuff>> {
     let mut q = s.rq.lock();
-    *last = q.back();
+    *last = super::tail(&q);
     if !peek {
         let skb = q.pop_front()?;
         s.inq_len.fetch_sub(unix_len(&skb), Ordering::AcqRel);
@@ -336,7 +336,7 @@ fn try_recv(
 /// a dequeue makes room for blocked or polling senders. The caller
 /// holds `iolock`, so only it takes the files. With none, `last` is the
 /// tail a wait for more starts from.
-fn take(s: &UnixSock, flags: i32, last: &mut Option<Arc<SkBuff>>) -> Option<Rx> {
+fn take(s: &UnixSock, flags: i32, last: &mut Option<*const SkBuff>) -> Option<Rx> {
     let peek = flags & MSG_PEEK != 0;
     let mut off = s.sk.peek_offset(flags);
     let skb = try_recv(s, peek, &mut off, last)?;
@@ -399,7 +399,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
         // after `last` (a peek past every queued byte finds the queue
         // non-empty, yet has nothing to read)
         match s.sk.wait(timeo, || {
-            !super::tail_is(s, last.as_deref())
+            !super::tail_is(s, last)
                 || s.sk.has_err()
                 || rcv_shut(s)
                 || (seqpacket && s.state() != ESTABLISHED)

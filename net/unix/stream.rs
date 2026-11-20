@@ -366,7 +366,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
         // Linux unix_stream_data_wait: until an skb is queued after
         // `last`, an error, receive shutdown or release
         match s.sk.wait_data(timeo, || {
-            !super::tail_is(s, last.as_deref())
+            !super::tail_is(s, last.as_deref().map(core::ptr::from_ref))
                 || s.sk.has_err()
                 || super::rcv_shut(s)
                 || s.is_dead()
