@@ -366,7 +366,10 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
         // Linux unix_stream_data_wait: until an skb is queued after
         // `last`, an error, receive shutdown or release
         match s.sk.wait_data(timeo, || {
-            !tail_is(s, last.as_deref()) || s.sk.has_err() || super::rcv_shut(s) || s.is_dead()
+            !super::tail_is(s, last.as_deref())
+                || s.sk.has_err()
+                || super::rcv_shut(s)
+                || s.is_dead()
         }) {
             Ok(t) => timeo = t,
             Err(KernelError::WouldBlock) => timeo = 0,
@@ -382,17 +385,6 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
     match err {
         Some(e) if copied == 0 => Err(e),
         _ => Ok(copied),
-    }
-}
-
-/// The receive queue's last skb is `last` (Linux skb_peek_tail ==
-/// last)
-fn tail_is(s: &UnixSock, last: Option<&SkBuff>) -> bool {
-    let q = s.rq.lock();
-    match (q.last(), last) {
-        (None, None) => true,
-        (Some(t), Some(l)) => core::ptr::eq(t, l),
-        _ => false,
     }
 }
 

@@ -294,9 +294,17 @@ struct Rx {
 /// Linux __skb_try_recv_from_queue: the head message taken off, or
 /// for MSG_PEEK a reference to the message at the peek offset `off`
 /// (-1: the head), whole messages before it skipped (a zero-length
-/// one once it was peeked); `off` becomes the offset into it
-fn try_recv(s: &UnixSock, peek: bool, off: &mut i32) -> Option<Arc<SkBuff>> {
+/// one once it was peeked); `off` becomes the offset into it. `last`
+/// is the queue's tail as scanned, which a wait for more must see
+/// change (Linux `*last = queue->prev`).
+fn try_recv(
+    s: &UnixSock,
+    peek: bool,
+    off: &mut i32,
+    last: &mut Option<Arc<SkBuff>>,
+) -> Option<Arc<SkBuff>> {
     let mut q = s.rq.lock();
+    *last = q.back();
     if !peek {
         let skb = q.pop_front()?;
         s.inq_len.fetch_sub(unix_len(&skb), Ordering::AcqRel);
@@ -326,11 +334,12 @@ fn try_recv(s: &UnixSock, peek: bool, off: &mut i32) -> Option<Arc<SkBuff>> {
 
 /// Take (or reference, with MSG_PEEK) the message at the peek offset;
 /// a dequeue makes room for blocked or polling senders. The caller
-/// holds `iolock`, so only it takes the files.
-fn take(s: &UnixSock, flags: i32) -> Option<Rx> {
+/// holds `iolock`, so only it takes the files. With none, `last` is the
+/// tail a wait for more starts from.
+fn take(s: &UnixSock, flags: i32, last: &mut Option<Arc<SkBuff>>) -> Option<Rx> {
     let peek = flags & MSG_PEEK != 0;
     let mut off = s.sk.peek_offset(flags);
-    let skb = try_recv(s, peek, &mut off)?;
+    let skb = try_recv(s, peek, &mut off, last)?;
     if !peek {
         s.relay_wake();
     }
@@ -362,13 +371,14 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
     }
     let seqpacket = s.sk.stype == SOCK_SEQPACKET;
     let mut timeo = s.sk.rcv_timeo(flags & MSG_DONTWAIT != 0);
+    let mut last = None;
     loop {
         if let Some(e) = s.sk.take_err() {
             return Err(e);
         }
         {
             let _io = s.iolock.lock();
-            if let Some(rx) = take(s, flags) {
+            if let Some(rx) = take(s, flags, &mut last) {
                 return deliver(s, m, flags, rx);
             }
         }
@@ -385,8 +395,11 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
         if seqpacket && s.state() != ESTABLISHED && s.state() != LISTEN {
             return Err(KernelError::NotConnected);
         }
+        // Linux __skb_wait_for_more_packets: until an skb is queued
+        // after `last` (a peek past every queued byte finds the queue
+        // non-empty, yet has nothing to read)
         match s.sk.wait(timeo, || {
-            !s.rq.is_empty()
+            !super::tail_is(s, last.as_deref())
                 || s.sk.has_err()
                 || rcv_shut(s)
                 || (seqpacket && s.state() != ESTABLISHED)

@@ -1333,6 +1333,17 @@ fn rcv_shut(s: &UnixSock) -> bool {
     s.sk.shutdown() & RCV_SHUTDOWN != 0
 }
 
+/// The receive queue's last skb is `last` (Linux skb_peek_tail ==
+/// last)
+fn tail_is(s: &UnixSock, last: Option<&SkBuff>) -> bool {
+    let q = s.rq.lock();
+    match (q.last(), last) {
+        (None, None) => true,
+        (Some(t), Some(l)) => core::ptr::eq(t, l),
+        _ => false,
+    }
+}
+
 /// Common receive tail: credentials and files into control messages
 fn scm_recv(s: &UnixSock, m: &mut RecvMsg<'_>, creds: Option<Creds>, fds: Option<FpList>) {
     scm::put(m, s.passcred(), s.sk.flag(sf::PASSPIDFD), creds, fds);

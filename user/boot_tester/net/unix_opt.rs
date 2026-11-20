@@ -8,7 +8,7 @@ use hk_syscall::{
 };
 use hk_syscall::{
     O_RDONLY, SOCK_DGRAM, SOCK_STREAM, sys_exit, sys_fcntl, sys_fork, sys_getpid, sys_open,
-    sys_pidfd_send_signal, sys_pipe, sys_read, sys_wait4, sys_write,
+    sys_pidfd_send_signal, sys_pipe, sys_read, sys_setsockopt, sys_wait4, sys_write,
 };
 
 use crate::harness::T;
@@ -105,6 +105,19 @@ fn test_peek_off(ty: i32) {
         recv(b, &mut buf, MSG_PEEK | MSG_DONTWAIT),
         EAGAIN,
     );
+    if ty != SOCK_STREAM {
+        // A blocking peek there waits for a new message, not spinning
+        // on the queued one (Linux __skb_wait_for_more_packets)
+        let tv: [i64; 2] = [0, 50_000];
+        sys_setsockopt(b, SOL_SOCKET, SO_RCVTIMEO, tv.as_ptr() as *const u8, 16);
+        t.eq(
+            b"blocking peek past end",
+            recv(b, &mut buf, MSG_PEEK),
+            EAGAIN,
+        );
+        let zero: [i64; 2] = [0, 0];
+        sys_setsockopt(b, SOL_SOCKET, SO_RCVTIMEO, zero.as_ptr() as *const u8, 16);
+    }
     t.ok(b"read after", recveq(b, 8, 0, b"cc"), 0);
     close(a);
     close(b);
