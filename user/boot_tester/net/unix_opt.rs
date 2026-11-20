@@ -1,7 +1,11 @@
 //! AF_UNIX options (hk and Linux): SO_PEEK_OFF on stream, datagram and
 //! seqpacket sockets (Linux selftests af_unix/so_peek_off.c);
-//! SO_PASSPIDFD / SCM_PIDFD and SO_PEERPIDFD (af_unix/scm_pidfd.c).
+//! SO_PASSPIDFD / SCM_PIDFD and SO_PEERPIDFD (af_unix/scm_pidfd.c);
+//! SIOCUNIXFILE.
 
+use hk_syscall::{
+    AF_UNIX, O_PATH, Stat, sys_bind, sys_fstat, sys_ioctl, sys_socket, sys_stat, sys_unlink,
+};
 use hk_syscall::{
     O_RDONLY, SOCK_DGRAM, SOCK_STREAM, sys_exit, sys_fcntl, sys_fork, sys_getpid, sys_open,
     sys_pidfd_send_signal, sys_pipe, sys_read, sys_wait4, sys_write,
@@ -17,6 +21,8 @@ const SO_PASSPIDFD: i32 = 76;
 const SO_PEERPIDFD: i32 = 77;
 const SCM_PIDFD: i32 = 4;
 const F_GETFD: i32 = 1;
+const F_GETFL: i32 = 3;
+const SIOCUNIXFILE: u64 = 0x89E0;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== AF_UNIX option Tests ===");
@@ -25,6 +31,7 @@ pub fn run_tests() {
     }
     test_pidfd();
     test_pidfd_child();
+    test_unixfile();
 }
 
 /// Receive into a `len`-byte buffer: exactly the bytes `want`
@@ -228,5 +235,54 @@ fn test_pidfd_child() {
     for f in [a, b, p[0], p[1]] {
         close(f);
     }
+    t.done();
+}
+
+/// A sockaddr_un for a filesystem name (length to pass)
+fn sun(p: &[u8]) -> ([u8; 110], u32) {
+    let mut b = [0u8; 110];
+    b[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+    b[2..2 + p.len()].copy_from_slice(p);
+    (b, (2 + p.len() + 1) as u32)
+}
+
+/// SIOCUNIXFILE: an O_PATH, O_CLOEXEC descriptor of the socket inode
+/// a filesystem name bound; ENOENT unbound or abstract
+fn test_unixfile() {
+    let mut t = T::new(b"UNIX_SIOCUNIXFILE");
+    let path = b"/tmp/ux_unixfile\0";
+    sys_unlink(path.as_ptr());
+    let s = sys_socket(AF_UNIX, SOCK_STREAM, 0) as i32;
+    t.eq(b"unbound", sys_ioctl(s, SIOCUNIXFILE, 0), -2);
+    let (a, len) = sun(&path[..path.len() - 1]);
+    t.eq(b"bind", sys_bind(s, a.as_ptr(), len), 0);
+    let fd = sys_ioctl(s, SIOCUNIXFILE, 0);
+    t.ok(b"open", fd >= 0, fd);
+    if fd >= 0 {
+        let fd = fd as i32;
+        let fl = sys_fcntl(fd, F_GETFL, 0);
+        t.ok(b"O_PATH", fl >= 0 && fl as u32 & O_PATH != 0, fl);
+        t.eq(b"FD_CLOEXEC", sys_fcntl(fd, F_GETFD, 0) & 1, 1);
+        let mut st = Stat::default();
+        let mut st2 = Stat::default();
+        t.eq(b"fstat", sys_fstat(fd, &mut st), 0);
+        sys_stat(path.as_ptr(), &mut st2);
+        t.ok(
+            b"socket inode",
+            st.st_mode & 0o170000 == 0o140000 && st.st_ino == st2.st_ino,
+            st.st_mode as i64,
+        );
+        close(fd);
+    }
+    // An abstract name has no inode
+    let d = sys_socket(AF_UNIX, SOCK_DGRAM, 0) as i32;
+    let mut b = [0u8; 110];
+    b[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+    b[3..8].copy_from_slice(b"uxuf!");
+    sys_bind(d, b.as_ptr(), 8);
+    t.eq(b"abstract", sys_ioctl(d, SIOCUNIXFILE, 0), -2);
+    close(d);
+    close(s);
+    sys_unlink(path.as_ptr());
     t.done();
 }

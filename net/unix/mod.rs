@@ -113,6 +113,9 @@ pub const ESTABLISHED: u8 = 1;
 pub const CLOSE: u8 = 7;
 pub const LISTEN: u8 = 10;
 
+/// Open the bound socket inode (Linux SIOCUNIXFILE, SIOCPROTOPRIVATE)
+const SIOCUNIXFILE: u32 = 0x89E0;
+
 /// Buffer charge per message beyond its bytes (Linux skb truesize
 /// overhead: struct sk_buff + skb_shared_info), so tiny messages cannot
 /// pin unbounded memory
@@ -959,6 +962,22 @@ impl UnixSock {
         Ok(OptOut::Int(crate::net::syscall::fd_install(f, true)?))
     }
 
+    /// SIOCUNIXFILE (Linux unix_open_file): an O_PATH descriptor
+    /// (O_CLOEXEC) of the socket inode a filesystem name bound;
+    /// CAP_NET_ADMIN, ENOENT when unbound or abstract
+    fn open_file(&self) -> Result<i32, KernelError> {
+        if !crate::task::capable(crate::task::CAP_NET_ADMIN) {
+            return Err(KernelError::NotPermitted);
+        }
+        if self.addr().is_none() {
+            return Err(KernelError::NotFound);
+        }
+        let p = self.path.lock().clone();
+        let p = p.ok_or(KernelError::NotFound)?;
+        let f = crate::fs::open::file_open_root(&p, crate::fs::flags::O_PATH)?;
+        crate::net::syscall::fd_install(f, true)
+    }
+
     /// Linux unix_inq_len: EINVAL on a listener; a stream's unread
     /// bytes, a seqpacket's queued bytes, a datagram socket's first
     /// message
@@ -1096,6 +1115,7 @@ impl ProtoOps for UnixSock {
             SIOCOUTQ => self.wmem.load(Ordering::Acquire),
             SIOCINQ => self.inq_len()?,
             SIOCATMARK => usize::from(self.atmark()?),
+            SIOCUNIXFILE => return self.open_file().map(i64::from),
             _ => return Err(KernelError::NotTty),
         };
         crate::uaccess::put_user::<i32>(arg, v as i32).map_err(|_| KernelError::BadAddress)?;
