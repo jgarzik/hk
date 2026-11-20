@@ -415,6 +415,7 @@ pub fn run_all_tests() {
     net::fib_flush::run_tests();
     net::rtnl_ack::run_tests();
     net::rtnl_link::run_tests();
+    net::rtnl_link_set::run_tests();
     net::fib_rules::run_tests();
     net::netdev_ioctl::run_tests();
     net::netdev::run_tests();

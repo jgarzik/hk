@@ -71,10 +71,10 @@ fn operstate_name(s: u8) -> &'static str {
 /// An attribute: its name and its value, from the interface
 type NAttr = (&'static [u8], fn(&NetDevice) -> Result<String, KernelError>);
 
-const ATTRS: [NAttr; 14] = [
+const ATTRS: [NAttr; 16] = [
     (b"address", |n| Ok(format!("{}\n", mac_str(&n.mac())))),
     (b"broadcast", |n| {
-        Ok(format!("{}\n", mac_str(&n.link().broadcast)))
+        Ok(format!("{}\n", mac_str(&n.broadcast())))
     }),
     (b"addr_len", |_| Ok(String::from("6\n"))),
     // NET_ADDR_PERM: the device's own address
@@ -84,7 +84,12 @@ const ATTRS: [NAttr; 14] = [
     (b"iflink", |n| Ok(format!("{}\n", n.ifindex()))),
     (b"flags", |n| Ok(format!("{:#x}\n", n.get_flags()))),
     (b"mtu", |n| Ok(format!("{}\n", n.mtu()))),
-    (b"tx_queue_len", |n| Ok(format!("{}\n", n.link().txqlen))),
+    (b"tx_queue_len", |n| Ok(format!("{}\n", n.txqlen()))),
+    (b"netdev_group", |n| Ok(format!("{}\n", n.group()))),
+    // Linux ifalias_show: the alias, or nothing when unset
+    (b"ifalias", |n| {
+        Ok(n.ifalias().map_or(String::new(), |a| format!("{}\n", a)))
+    }),
     (b"operstate", |n| {
         Ok(format!("{}\n", operstate_name(n.operstate())))
     }),

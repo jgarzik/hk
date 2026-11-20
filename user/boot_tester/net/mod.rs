@@ -23,6 +23,7 @@ pub mod packet_vnet;
 pub mod raw;
 pub mod rtnl_ack;
 pub mod rtnl_link;
+pub mod rtnl_link_set;
 pub mod sk;
 pub mod snmp;
 pub mod sockcore;

@@ -129,8 +129,7 @@ const XDP_FLAGS_MASK: u32 = 0x1f;
 /// IF_OPER_* the device module has no use for
 const IF_OPER_TESTING: u8 = 4;
 const IF_OPER_DORMANT: u8 = 5;
-/// Linux INIT_NETDEV_GROUP, IFALIASZ, ETH_ALEN
-const INIT_NETDEV_GROUP: u32 = 0;
+/// Linux IFALIASZ, ETH_ALEN
 const IFALIASZ: usize = 256;
 const ETH_ALEN: usize = 6;
 
@@ -794,12 +793,9 @@ fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<D
         let Some(group) = a.u32(IFLA_GROUP)?.filter(|_| !specified) else {
             return Err(KernelError::NoDevice);
         };
-        // Linux rtnl_group_changelink: every device is in the default
-        // group (0)
-        if group == INIT_NETDEV_GROUP {
-            for dev in net.devices() {
-                do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl, ext)?;
-            }
+        // Linux rtnl_group_changelink: each device of the group
+        for dev in net.devices().iter().filter(|d| d.group() == group) {
+            do_setlink(&r, net, dev, tgt.as_deref(), &ifm, &a, nl, ext)?;
         }
         return Ok(Done::Ok);
     }
@@ -808,11 +804,39 @@ fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<D
 }
 
 /// Linux validate_linkmsg: hardware addresses at least the device's
-/// length (6: hk links are Ethernet-like), IFLA_AF_SPEC of known
-/// families (AF_INET, AF_INET6; Linux rtnl_af_lookup, EAFNOSUPPORT)
-fn validate_linkmsg(a: &Attrs<'_>) -> Result<(), KernelError> {
+/// length (6: hk links are Ethernet-like), GSO/GRO limits within the
+/// device's TSO limits and GRO_MAX_SIZE, IFLA_AF_SPEC of known families
+/// (AF_INET, AF_INET6; Linux rtnl_af_lookup, EAFNOSUPPORT)
+fn validate_linkmsg(dev: &NetDevice, a: &Attrs<'_>, ext: &ExtAck) -> Result<(), KernelError> {
+    use crate::net::device::gso;
     for t in [IFLA_ADDRESS, IFLA_BROADCAST] {
         if a.get(t).is_some_and(|b| b.len() < ETH_ALEN) {
+            return Err(KernelError::InvalidArgument);
+        }
+    }
+    let (tso_size, tso_segs) = dev.tso_max();
+    let limits = [
+        (IFLA_GSO_MAX_SIZE, tso_size, "too big gso_max_size"),
+        (
+            IFLA_GSO_MAX_SEGS,
+            tso_segs.min(gso::GSO_MAX_SEGS),
+            "too big gso_max_segs",
+        ),
+        (IFLA_GRO_MAX_SIZE, gso::GRO_MAX_SIZE, "too big gro_max_size"),
+        (
+            IFLA_GSO_IPV4_MAX_SIZE,
+            tso_size,
+            "too big gso_ipv4_max_size",
+        ),
+        (
+            IFLA_GRO_IPV4_MAX_SIZE,
+            gso::GRO_MAX_SIZE,
+            "too big gro_ipv4_max_size",
+        ),
+    ];
+    for (t, max, msg) in limits {
+        if a.u32(t)?.is_some_and(|v| v > max) {
+            ext.msg(msg);
             return Err(KernelError::InvalidArgument);
         }
     }
@@ -878,7 +902,7 @@ fn do_setlink(
     ext: &ExtAck,
 ) -> Result<(), KernelError> {
     use KernelError::{InvalidArgument, OperationNotSupported};
-    validate_linkmsg(a)?;
+    validate_linkmsg(dev, a, ext)?;
     if let Some(t) = tgt
         && !dev.net_is(t)
     {
@@ -899,9 +923,12 @@ fn do_setlink(
         // INT_MAX it is negative and dev_set_mtu refuses it
         rtnl::dev_set_mtu(r, net, dev, mtu.cast_signed(), nl)?;
     }
-    // Devices stay in the default group
-    if a.u32(IFLA_GROUP)?.is_some_and(|g| g != INIT_NETDEV_GROUP) {
-        return Err(OperationNotSupported);
+    // Changes Linux announces once at the end (DO_SETLINK_NOTIFY ->
+    // netdev_state_change)
+    let mut notify = false;
+    if let Some(g) = a.u32(IFLA_GROUP)? {
+        dev.set_group(r, g);
+        notify = true;
     }
     if ifm.index.cast_signed() > 0
         && let Some(n) = a.str(IFLA_IFNAME, IFNAMSIZ)?
@@ -911,19 +938,16 @@ fn do_setlink(
         // Renaming is not supported
         return Err(OperationNotSupported);
     }
-    // No aliases: only clearing (an empty one) is a no-op
     if let Some(al) = a.get(IFLA_IFALIAS) {
-        if al.len() >= IFALIASZ {
-            return Err(InvalidArgument);
-        }
-        if !al.is_empty() {
-            return Err(OperationNotSupported);
-        }
+        dev_set_alias(r, dev, al)?;
+        notify = true;
     }
-    if a.get(IFLA_BROADCAST)
-        .is_some_and(|b| b[..ETH_ALEN] != dev.link().broadcast)
-    {
-        return Err(OperationNotSupported);
+    if let Some(b) = a.get(IFLA_BROADCAST) {
+        // Length checked by validate_linkmsg; NETDEV_CHANGEADDR
+        let mut bc = [0u8; ETH_ALEN];
+        bc.copy_from_slice(b.get(..ETH_ALEN).ok_or(InvalidArgument)?);
+        dev.store_broadcast(&bc);
+        notify_link(net, dev, nl);
     }
     if ifm.flags != 0 || ifm.change != 0 {
         let mut f = ifm.flags;
@@ -946,21 +970,26 @@ fn do_setlink(
     if a.u8(IFLA_CARRIER)?.is_some() {
         return Err(OperationNotSupported);
     }
-    if a.u32(IFLA_TXQLEN)?.is_some_and(|q| q != dev.link().txqlen) {
-        return Err(OperationNotSupported);
+    if let Some(q) = a.u32(IFLA_TXQLEN)? {
+        // Linux dev_change_tx_queue_len: NETDEV_CHANGE_TX_QUEUE_LEN
+        if q != dev.txqlen() {
+            dev.store_txqlen(q);
+            notify_link(net, dev, nl);
+        }
     }
-    // No GSO/GRO limits to set
-    if [
-        IFLA_GSO_MAX_SIZE,
-        IFLA_GSO_MAX_SEGS,
-        IFLA_GRO_MAX_SIZE,
-        IFLA_GSO_IPV4_MAX_SIZE,
-        IFLA_GRO_IPV4_MAX_SIZE,
-    ]
-    .iter()
-    .any(|&t| a.has(t))
     {
-        return Err(OperationNotSupported);
+        use crate::net::device::gso;
+        for (t, i) in [
+            (IFLA_GSO_MAX_SIZE, gso::GSO_MAX_SIZE_I),
+            (IFLA_GSO_MAX_SEGS, gso::GSO_MAX_SEGS_I),
+            (IFLA_GRO_MAX_SIZE, gso::GRO_MAX_SIZE_I),
+            (IFLA_GSO_IPV4_MAX_SIZE, gso::GSO_IPV4_MAX_SIZE_I),
+            (IFLA_GRO_IPV4_MAX_SIZE, gso::GRO_IPV4_MAX_SIZE_I),
+        ] {
+            if let Some(v) = a.u32(t)? {
+                dev.store_gso(i, v);
+            }
+        }
     }
     // Operational state and link mode follow the carrier only
     if let Some(t) = a.u8(IFLA_OPERSTATE)? {
@@ -1003,6 +1032,29 @@ fn do_setlink(
     if let Some(b) = a.get(IFLA_XDP) {
         setlink_xdp(b)?;
     }
+    if notify {
+        notify_link(net, dev, nl);
+    }
+    Ok(())
+}
+
+/// Linux dev_set_alias: EINVAL at IFALIASZ bytes or more, an empty one
+/// clears it
+fn dev_set_alias(r: &RtnlGuard, dev: &NetDevice, al: &[u8]) -> Result<(), KernelError> {
+    let _ = r;
+    if al.len() >= IFALIASZ {
+        return Err(KernelError::InvalidArgument);
+    }
+    // Up to a NUL (Linux strscpy of the payload)
+    let n = al.iter().position(|&c| c == 0).unwrap_or(al.len());
+    let s = core::str::from_utf8(&al[..n]).map_err(|_| KernelError::InvalidArgument)?;
+    let new = if s.is_empty() {
+        None
+    } else {
+        // Bounded by IFALIASZ
+        Some(Arc::<str>::from(s))
+    };
+    drop(dev.swap_ifalias(new));
     Ok(())
 }
 
@@ -1038,6 +1090,7 @@ fn setlink_xdp(b: &[u8]) -> Result<(), KernelError> {
 
 /// RTM_NEWLINK message for `dev` (Linux rtnl_fill_ifinfo subset)
 pub fn fill_link(dev: &NetDevice, ty: u16, flags: u16, seq: u32, pid: u32, change: u32) -> Vec<u8> {
+    use crate::net::device::gso;
     let mut m = Msg::new(ty, flags, seq, pid);
     let mut h = [0u8; IFINFOMSG_LEN];
     h[0] = AF_UNSPEC;
@@ -1049,24 +1102,34 @@ pub fn fill_link(dev: &NetDevice, ty: u16, flags: u16, seq: u32, pid: u32, chang
     let promisc = u32::from(dev.admin_flags() & dflags::IFF_PROMISC != 0);
     m.put(&h)
         .str(IFLA_IFNAME, dev.name())
-        .u32(IFLA_TXQLEN, dev.link().txqlen)
+        .u32(IFLA_TXQLEN, dev.txqlen())
         .u8(IFLA_OPERSTATE, dev.operstate())
         .u8(IFLA_LINKMODE, 0)
         .u32(IFLA_MTU, dev.mtu())
         .u32(IFLA_MIN_MTU, min_mtu)
         .u32(IFLA_MAX_MTU, max_mtu)
-        .u32(IFLA_GROUP, 0)
+        .u32(IFLA_GROUP, dev.group())
         .u32(IFLA_PROMISCUITY, promisc)
         .u32(IFLA_NUM_TX_QUEUES, 1)
+        .u32(IFLA_GSO_MAX_SEGS, dev.gso(gso::GSO_MAX_SEGS_I))
+        .u32(IFLA_GSO_MAX_SIZE, dev.gso(gso::GSO_MAX_SIZE_I))
+        .u32(IFLA_GRO_MAX_SIZE, dev.gso(gso::GRO_MAX_SIZE_I))
+        .u32(IFLA_GSO_IPV4_MAX_SIZE, dev.gso(gso::GSO_IPV4_MAX_SIZE_I))
+        .u32(IFLA_GRO_IPV4_MAX_SIZE, dev.gso(gso::GRO_IPV4_MAX_SIZE_I))
+        .u32(IFLA_TSO_MAX_SIZE, dev.tso_max().0)
+        .u32(IFLA_TSO_MAX_SEGS, dev.tso_max().1)
         .u32(IFLA_NUM_RX_QUEUES, 1)
         .u8(IFLA_CARRIER, u8::from(dev.carrier_ok()))
         .str(IFLA_QDISC, "noqueue")
         .u32(IFLA_CARRIER_CHANGES, dev.carrier_changes())
         .u8(IFLA_PROTO_DOWN, 0)
         .attr(IFLA_ADDRESS, &dev.mac())
-        .attr(IFLA_BROADCAST, &dev.link().broadcast)
+        .attr(IFLA_BROADCAST, &dev.broadcast())
         .attr(IFLA_STATS64, &stats64(dev))
         .attr(IFLA_STATS, &stats32(dev));
+    if let Some(al) = dev.ifalias() {
+        m.str(IFLA_IFALIAS, &al);
+    }
     m.finish()
 }
 

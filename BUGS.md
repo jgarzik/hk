@@ -577,7 +577,8 @@ hub6, where Linux moves the port (uart_change_port).
   config is 256 bytes even for PCIe functions (no extended space).
 - cpu: no cpuN/topology, cache/ or online files and no MODALIAS
   (CONFIG_GENERIC_CPU_AUTOPROBE); node: no meminfo/numastat/vmstat.
-- net: no queues/, phys_port_*, speed/duplex, ifalias or gro files;
+- net: no queues/, phys_port_*, speed/duplex or gro files; ifalias
+  is read-only (Linux ifalias_store under rtnl_trylock);
   interfaces cannot be renamed or moved between namespaces, so no
   "move" uevents.
 - /sys/module lists built-in modules with drivers only; no parameters
@@ -724,15 +725,19 @@ other families are EAFNOSUPPORT (Linux lists the IPv6 and IPv4/IPv6
 multicast-routing defaults; hk registers no rules for them). Rule
 changes take RTNL (current Linux: RTNL only for the first custom rule,
 ops->lock after). No FIB notifier chain (call_fib_rule_notifiers).
-RTM_NEWLINK/RTM_SETLINK apply MTU and flags only; the rest is refused
-with the errno Linux gives a device or driver lacking it, never ignored:
-moving a device to another namespace (IFLA_NET_NS_PID/FD; EOPNOTSUPP, lo
-EINVAL as Linux), MAC address, carrier, master, VF, proto_down, XDP and
-per-family (IFLA_AF_SPEC) settings are EOPNOTSUPP. Group, alias,
-broadcast address, txqlen, GSO/GRO limits, operstate and link mode, which
-Linux always applies, are EOPNOTSUPP unless equal to the device's fixed
-value; IFLA_TARGET_NETNSID / IFLA_LINK_NETNSID are EINVAL (no namespace
-ids).
+RTM_NEWLINK/RTM_SETLINK apply MTU, flags, group, alias, broadcast
+address, txqlen and GSO/GRO limits; the rest is refused with the errno
+Linux gives a device or driver lacking it, never ignored: moving a
+device to another namespace (IFLA_NET_NS_PID/FD; EOPNOTSUPP, lo EINVAL
+as Linux), renaming (EOPNOTSUPP: kernfs has no rename, Linux
+kernfs_rename_ns/device_rename and the "move" uevent, and device names
+are immutable), MAC address, carrier, master, VF, proto_down, XDP and
+per-family (IFLA_AF_SPEC) settings are EOPNOTSUPP. Operational state
+and link mode are EOPNOTSUPP unless the request leaves them as they are
+(hk derives operstate from the carrier: no stored dev->operstate,
+linkwatch rfc2863_policy or IF_LINK_MODE_DORMANT). GSO/GRO limits are
+kept and reported but bound nothing (no GSO/GRO). IFLA_TARGET_NETNSID /
+IFLA_LINK_NETNSID are EINVAL (no namespace ids).
 
 ## io_uring gaps
 
