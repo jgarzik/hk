@@ -528,6 +528,9 @@ pub struct IpParams {
     /// Confirm the next hop's neighbour as it goes out (Linux
     /// skb_set_dst_pending_confirm: MSG_CONFIRM, TCP's forward progress)
     pub confirm: bool,
+    /// Route from a source address that is not local (Linux
+    /// FLOWI_FLAG_ANYSRC of inet_sk_flowi_flags)
+    pub anysrc: bool,
 }
 
 impl Default for IpParams {
@@ -539,6 +542,7 @@ impl Default for IpParams {
             id: None,
             icmp_type: None,
             confirm: false,
+            anysrc: false,
         }
     }
 }

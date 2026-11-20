@@ -287,7 +287,7 @@ impl UdpSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)
+        let rt = route::output_flow(&self.sk.net, daddr, saddr, oif, self.inet.anysrc())
             .inspect_err(|e| self.sk.net.mib.route_err(e))?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);

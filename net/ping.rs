@@ -161,7 +161,7 @@ impl PingSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)
+        let rt = route::output_flow(&self.sk.net, daddr, saddr, oif, self.inet.anysrc())
             .inspect_err(|e| self.sk.net.mib.route_err(e))?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
@@ -212,7 +212,7 @@ fn check_bind_addr(sk: &Sock, inet: &Inet, a: &[u8]) -> Result<(Ipv4Addr, u16), 
     match sk.net.fib.addr_type(addr) {
         RouteType::Multicast | RouteType::Broadcast => Err(KernelError::AddressNotAvailable),
         RouteType::Local => Ok((addr, port)),
-        _ if inet.flag(af_inet::ipf::FREEBIND) => Ok((addr, port)),
+        _ if inet.nonlocal_bind() => Ok((addr, port)),
         _ => Err(KernelError::AddressNotAvailable),
     }
 }

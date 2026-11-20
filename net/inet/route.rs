@@ -106,7 +106,19 @@ pub fn output(
     saddr: Ipv4Addr,
     oif: u32,
 ) -> Result<Rtable, KernelError> {
-    let mut rt = output_fib(net, daddr, saddr, oif)?;
+    output_flow(net, daddr, saddr, oif, false)
+}
+
+/// As [`output`]; `anysrc` lets `saddr` be an address that is not local
+/// (Linux FLOWI_FLAG_ANYSRC: IP_TRANSPARENT, IP_HDRINCL)
+pub fn output_flow(
+    net: &NetNamespace,
+    daddr: Ipv4Addr,
+    saddr: Ipv4Addr,
+    oif: u32,
+    anysrc: bool,
+) -> Result<Rtable, KernelError> {
+    let mut rt = output_fib(net, daddr, saddr, oif, anysrc)?;
     // Linux __mkroute_output: find_exception on the nexthop, then
     // rt_bind_exception
     let genid = fnhe_genid(net);
@@ -126,14 +138,22 @@ fn output_fib(
     mut daddr: Ipv4Addr,
     mut saddr: Ipv4Addr,
     oif: u32,
+    anysrc: bool,
 ) -> Result<Rtable, KernelError> {
     let lo = || net.loopback().ok_or(KernelError::NetworkUnreachable);
     if !saddr.is_unspecified() {
-        let dev = src_dev(net, saddr)?;
+        if saddr.is_multicast() || saddr.is_broadcast() {
+            return Err(KernelError::InvalidArgument);
+        }
         // Multicast / limited broadcast without oif leave through the
         // source address's device
         if oif == 0 && (daddr.is_multicast() || daddr.is_broadcast()) {
-            return make(dev, daddr, saddr, None, 0);
+            return make(src_dev(net, saddr)?, daddr, saddr, None, 0);
+        }
+        // Linux ip_route_output_key_hash_rcu: a source not ours only
+        // with FLOWI_FLAG_ANYSRC
+        if !anysrc {
+            src_dev(net, saddr)?;
         }
     }
     let mut odev = None;

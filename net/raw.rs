@@ -149,7 +149,7 @@ impl RawSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)?;
+        let rt = route::output_flow(&self.sk.net, daddr, saddr, oif, self.inet.anysrc())?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
         }
@@ -265,7 +265,7 @@ impl ProtoOps for RawSock {
                 ty,
                 RouteType::Local | RouteType::Multicast | RouteType::Broadcast
             )
-            || self.inet.flag(ipf::FREEBIND);
+            || self.inet.nonlocal_bind();
         if !ok {
             return Err(KernelError::AddressNotAvailable);
         }

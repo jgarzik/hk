@@ -45,6 +45,7 @@ pub const IP_RECVERR: i32 = 11;
 pub const IP_RECVTTL: i32 = 12;
 pub const IP_RECVTOS: i32 = 13;
 pub const IP_MTU: i32 = 14;
+pub const IP_TRANSPARENT: i32 = 19;
 pub const IP_FREEBIND: i32 = 15;
 pub const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
 pub const IP_MULTICAST_TTL: i32 = 33;
@@ -111,6 +112,7 @@ pub mod ipf {
     pub const BIND_NO_PORT: u32 = 1 << 5;
     pub const MC_LOOP: u32 = 1 << 6;
     pub const HDRINCL: u32 = 1 << 7;
+    pub const TRANSPARENT: u32 = 1 << 8;
 }
 
 impl Default for Inet {
@@ -172,6 +174,19 @@ impl Inet {
         self.pmtudisc.load(Ordering::Acquire)
     }
 
+    /// It may bind an address that is not local (Linux
+    /// inet_can_nonlocal_bind: IP_FREEBIND or IP_TRANSPARENT)
+    pub fn nonlocal_bind(&self) -> bool {
+        self.flag(ipf::FREEBIND) || self.flag(ipf::TRANSPARENT)
+    }
+
+    /// Its routes may use a source address that is not local (Linux
+    /// inet_sk_flowi_flags: FLOWI_FLAG_ANYSRC for IP_TRANSPARENT or
+    /// IP_HDRINCL)
+    pub fn anysrc(&self) -> bool {
+        self.flag(ipf::TRANSPARENT) || self.flag(ipf::HDRINCL)
+    }
+
     /// IP parameters of the next packet (Linux ip_select_ident_segs:
     /// a connected socket numbers its packets from its own counter)
     pub fn params(&self) -> IpParams {
@@ -183,6 +198,7 @@ impl Inet {
             id: connected.then(|| self.id.fetch_add(1, Ordering::Relaxed)),
             icmp_type: None,
             confirm: false,
+            anysrc: self.anysrc(),
         }
     }
 
@@ -212,6 +228,18 @@ impl Inet {
             return Ok(());
         }
         match opt {
+            // Linux do_ip_setsockopt: turning it on needs CAP_NET_RAW or
+            // CAP_NET_ADMIN
+            IP_TRANSPARENT => {
+                let on = v.int_or_byte()? != 0;
+                if on
+                    && !crate::task::capable(crate::task::CAP_NET_RAW)
+                    && !crate::task::capable(crate::task::CAP_NET_ADMIN)
+                {
+                    return Err(KernelError::NotPermitted);
+                }
+                self.set_flag(ipf::TRANSPARENT, on);
+            }
             // Linux do_ip_setsockopt: raw sockets only
             IP_HDRINCL if sk.stype != SOCK_RAW => return Err(KernelError::NoProtocolOption),
             IP_HDRINCL => self.set_hdrincl(v.int_or_byte()? != 0),
@@ -265,6 +293,7 @@ impl Inet {
             IP_MULTICAST_TTL => i32::from(self.mc_ttl.load(Ordering::Acquire)),
             IP_MULTICAST_LOOP => i32::from(self.flag(ipf::MC_LOOP)),
             IP_HDRINCL => i32::from(self.flag(ipf::HDRINCL)),
+            IP_TRANSPARENT => i32::from(self.flag(ipf::TRANSPARENT)),
             _ => return Err(KernelError::NoProtocolOption),
         };
         Ok(OptOut::Int(v))
@@ -363,7 +392,7 @@ const PROT_SOCK: u16 = 1024;
 
 /// bind() address/port checks shared by UDP and TCP (Linux
 /// __inet_bind): AF_UNSPEC only with INADDR_ANY; EADDRNOTAVAIL for an
-/// address that is not local (unless IP_FREEBIND); EACCES for a
+/// address that is not local (unless IP_FREEBIND or IP_TRANSPARENT); EACCES for a
 /// privileged port. Returns (address, port, address type).
 pub fn bind_check(
     sk: &Sock,
@@ -388,7 +417,7 @@ pub fn bind_check(
             ty,
             RouteType::Local | RouteType::Multicast | RouteType::Broadcast
         )
-        || inet.flag(ipf::FREEBIND);
+        || inet.nonlocal_bind();
     if !ok {
         return Err(KernelError::AddressNotAvailable);
     }

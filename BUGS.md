@@ -179,8 +179,11 @@ change sends no RTM_NEWNETCONF (hk has no netconf messages). Of the
 neighbour sysctls (`net/core/neigh_sysctl.rs`) anycast_delay,
 interval_probe_time_ms and gc_interval are kept only.
 IP: no IP options on output (received options are
-validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. A UDP
+validated and skipped; source-routed packets are dropped).
+IP_TRANSPARENT binds and sends from foreign addresses, but nothing
+steers foreign traffic to a transparent socket (no netfilter TPROXY;
+TCP resets of a transparent socket's connections are not sent
+IP_REPLY_ARG_NOSRCCHECK). A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
 and a reader_queue spliced from it.
