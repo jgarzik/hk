@@ -470,6 +470,31 @@ fn backlog_counts_in_space() {
     assert_eq!(p.b.window_now(), 0);
 }
 
+/// Without window scaling, free space at least half the buffer's but
+/// below the MSS estimate keeps the window offered: Linux v6.8
+/// __tcp_select_window's `window` is an int, so `window <= free_space -
+/// mss` compares signed and a negative difference never rounds the
+/// window down to 0
+#[test]
+fn small_buffer_keeps_window() {
+    use core::sync::atomic::Ordering;
+    let mut p = Pair::new(1460);
+    p.b.rcv_wscale = 0;
+    p.b.dack.rcv_mss = 1460;
+    // A buffer holding a window of 2000 bytes
+    p.b.rcvbuf = (2000 << 8) / u32::from(p.b.scaling_ratio);
+    let full = i64::from(p.b.full_space());
+    assert!(full > 1460 && full < 2 * 1460);
+    // Free space in [full / 2, mss)
+    let back = p.b.space_from_win(700) as usize;
+    p.b.live.backlog_len.store(back, Ordering::Relaxed);
+    let free = p.b.space();
+    assert!(free >= full / 2 && free < 1460);
+    p.b.rcv_wup = p.b.rcv_nxt;
+    p.b.rcv_adv = p.b.rcv_nxt.wrapping_add(500);
+    assert_eq!(p.b.window_now(), 500);
+}
+
 /// Send memory is skb truesize against all of SO_SNDBUF (Linux
 /// sk_wmem_queued, sk_stream_memory_free): charged as skbs are queued
 /// or split, released as they are acknowledged or merged, through
@@ -732,6 +757,38 @@ fn linger2() {
     assert!(wire(&out).iter().any(|s| s.has(flags::RST)));
     assert_eq!(p.a.state, TcpState::Closed);
     assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONLINGER), 1);
+}
+
+/// An orphan whose FIN is acknowledged by a segment bringing data or a
+/// FIN beyond RCV.NXT is done at once (Linux tcp_rcv_state_process
+/// FIN_WAIT1: tcp_done, TCPAbortOnData, the segment answered with a
+/// RST; an active Fast Open connection's FIN pauses Fast Open), not
+/// left in FIN_WAIT_2 without a timer
+#[test]
+fn orphan_fin_acked_with_ooo_fin() {
+    let (mut p, m) = mib_pair_buf(1460, 1 << 20, 0);
+    p.a.syn_fastopen = true;
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::FinWait1);
+    let seg = SegIn {
+        seq: p.a.rcv_nxt.wrapping_add(10),
+        ack: p.a.snd_max,
+        flags: flags::ACK | flags::FIN,
+        wnd: 1000,
+        ts: Some((p.b.tsval(), p.a.tsval())),
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    p.a.feed(&seg, p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::Closed);
+    assert!(out.done && out.tfo_disable);
+    assert!(
+        wire(&out)
+            .iter()
+            .any(|s| s.has(flags::RST) && s.seq == seg.ack)
+    );
+    assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONDATA), 1);
 }
 
 /// An orphan reaching FIN_WAIT_2 from its backlog, the socket owned,

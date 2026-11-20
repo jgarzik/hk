@@ -28,7 +28,45 @@ pub fn run_tests() {
     test_proto_unreach();
     test_peek();
     test_frag_overlap();
+    test_frag_dist();
     test_frag_expire();
+    test_proc();
+}
+
+fn has(h: &[u8], n: &[u8]) -> bool {
+    h.windows(n.len()).any(|w| w == n)
+}
+
+/// /proc/net/raw (Linux raw_seq_show): a line per socket, the protocol
+/// as its local port, CLOSE (07) until connected, then ESTABLISHED
+fn test_proc() {
+    let mut t = T::new(b"RAW_PROC");
+    let fd = raw(253);
+    t.eq(b"bind", bind(fd, LO, 0), 0);
+    let mut buf = [0u8; 4096];
+    let n = crate::proc::sysctl::read_file(b"/proc/net/raw\0", &mut buf);
+    t.ok(b"read", n > 0, n);
+    let text = &buf[..n.max(0) as usize];
+    t.ok(
+        b"header",
+        text.starts_with(
+            b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+        ),
+        0,
+    );
+    t.ok(b"bound", has(text, b": 0100007F:00FD 00000000:0000 07 "), 0);
+    t.eq(b"connect", connect(fd, LO, 0), 0);
+    let n = crate::proc::sysctl::read_file(b"/proc/net/raw\0", &mut buf);
+    let text = &buf[..n.max(0) as usize];
+    t.ok(
+        b"connected",
+        has(text, b": 0100007F:00FD 0100007F:0000 01 "),
+        0,
+    );
+    close(fd);
+    let n = crate::proc::sysctl::read_file(b"/proc/net/raw\0", &mut buf);
+    t.ok(b"gone", !has(&buf[..n.max(0) as usize], b":00FD "), 0);
+    t.done();
 }
 
 /// MSG_PEEK leaves the packet (IP header included) queued; a short
@@ -314,6 +352,42 @@ fn test_frag_overlap() {
     // The queue is gone: the missing piece no longer completes it
     frag(fd, 0x1003, 16, false, &d[16..]);
     t.eq(b"killed", recv(u, &mut buf, MSG_DONTWAIT), EAGAIN);
+    close(fd);
+    close(u);
+    t.done();
+}
+
+/// ipfrag_max_dist (Linux ip_frag_too_far): a datagram whose source
+/// sent more than 64 other fragments between two of its own starts
+/// over, so it never completes; with the check off (0) it does
+fn test_frag_dist() {
+    const DIST: &[u8] = b"/proc/sys/net/ipv4/ipfrag_max_dist\0";
+    let mut t = T::new(b"RAW_FRAG_DIST");
+    t.ok(b"default", crate::proc::sysctl::reads(DIST, b"64\n"), 0);
+    let (u, pu) = udp_lo();
+    let fd = raw(IPPROTO_RAW);
+    let mut d = [0u8; 24];
+    d[0..2].copy_from_slice(&1111u16.to_be_bytes());
+    d[2..4].copy_from_slice(&pu.to_be_bytes());
+    d[4..6].copy_from_slice(&24u16.to_be_bytes());
+    d[8..24].copy_from_slice(b"0123456789abcdef");
+    let mut buf = [0u8; 32];
+    let gap = |base: u16| {
+        for i in 0..70u16 {
+            frag(fd, base + i, 0, true, &d[..16]);
+        }
+    };
+    frag(fd, 0x2001, 0, true, &d[..16]);
+    gap(0x2100);
+    frag(fd, 0x2001, 16, false, &d[16..]);
+    t.eq(b"too far", recv(u, &mut buf, MSG_DONTWAIT), EAGAIN);
+    t.eq(b"off", crate::proc::sysctl::write_file(DIST, b"0"), 1);
+    frag(fd, 0x2002, 0, true, &d[..16]);
+    gap(0x2200);
+    frag(fd, 0x2002, 16, false, &d[16..]);
+    t.eq(b"unchecked", recv(u, &mut buf, MSG_DONTWAIT), 16);
+    t.eq(b"restore", crate::proc::sysctl::write_file(DIST, b"64"), 2);
+    t.eq(b"neg", crate::proc::sysctl::write_file(DIST, b"-1"), EINVAL);
     close(fd);
     close(u);
     t.done();

@@ -146,6 +146,8 @@ fn netdev_unregister_notify(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetD
     // (Linux fib_netdev_event -> fib_disable_ip -> arp_ifdown)
     ifaddr::inetdev_destroy(rtnl, net, dev);
     crate::net::packet::netdev_unregister(rtnl, net, dev);
+    // Rules naming it detach (Linux fib_rules_event's detach_rules)
+    net.fib.rules.detach(dev);
 }
 
 /// References an unregistered device keeps once every holder let it
@@ -272,6 +274,9 @@ pub fn netns_exit(net: &Arc<crate::net::NetNamespace>) {
     for dev in devs {
         unregister_netdevice(&r, &dev);
     }
+    // Device-less proxy entries go with their namespace (Linux keeps
+    // them until the table is cleared: a leak)
+    crate::net::arp::arp_tbl().phash.net_exit(net.id);
     drop(r);
 }
 

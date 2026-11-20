@@ -116,6 +116,9 @@ struct Frags {
     complete: bool,
     /// Input device of the latest fragment (Linux qp->iif)
     iif: u32,
+    /// Its source's fragment count when its latest fragment came
+    /// (Linux qp->rid)
+    rid: u32,
 }
 
 impl Frags {
@@ -230,6 +233,9 @@ fn assemble(f: &Frags, last: &Meta) -> Option<Box<SkBuff>> {
     s.dev = last.dev.clone();
     s.pkt_type = last.pkt_type;
     s.ip_bcast = last.ip_bcast;
+    // The head's parsed options stay (Linux ip_frag_reasm keeps
+    // IPCB(head)->opt)
+    s.ip_opt = first.ip_opt;
     Some(s)
 }
 
@@ -248,6 +254,8 @@ pub struct FragQueue {
     /// Its namespace (Linux q->fqdir->net)
     net: Weak<NetNamespace>,
     st: Mutex<Frags>,
+    /// Its source's peer, with ipfrag_max_dist set (Linux qp->peer)
+    peer: Option<Arc<crate::net::inet::peer::InetPeer>>,
     /// Link on its hash bucket (Linux q->node)
     link: NullsLink,
     /// Expiry (Linux q->timer, ip_expire)
@@ -351,6 +359,14 @@ impl FragTable {
             ip.inc(IPSTATS_MIB_REASMFAILS);
             return Defrag::Pending;
         }
+        if self.too_far(net, &q, &mut st) && !self.reinit(net, &q, &mut st) {
+            // Linux ip_frag_queue: the timer already fired
+            let dead = self.kill(&q, &mut st);
+            drop(st);
+            drop(dead);
+            ip.inc(IPSTATS_MIB_REASMFAILS);
+            return Defrag::Pending;
+        }
         let before = st.mem;
         st.iif = meta.dev.as_ref().map_or(0, |d| d.ifindex());
         let r = st.insert(skb, ihl, off, more);
@@ -381,6 +397,48 @@ impl FragTable {
         }
     }
 
+    /// More than ipfrag_max_dist fragments came from the source since
+    /// this queue's last one (Linux ip_frag_too_far, ReasmFails then)
+    fn too_far(&self, net: &NetNamespace, q: &FragQueue, st: &mut Frags) -> bool {
+        let max = net.sysctl.frag_max_dist.load(Ordering::Relaxed);
+        let Some(peer) = q.peer.as_ref().filter(|_| max > 0) else {
+            return false;
+        };
+        let start = st.rid;
+        let end = peer.rid.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        st.rid = end;
+        let far = !st.tree.is_empty() && end.wrapping_sub(start) > max as u32;
+        if far {
+            net.mib.ip.inc(IPSTATS_MIB_REASMFAILS);
+        }
+        far
+    }
+
+    /// Start `q` over: its fragments dropped, a full timeout again;
+    /// false if its timer already fired (Linux ip_frag_reinit:
+    /// mod_timer_pending)
+    fn reinit(&self, net: &NetNamespace, q: &Arc<FragQueue>, st: &mut Frags) -> bool {
+        if !q.timer.pending() {
+            return false;
+        }
+        let secs = net.sysctl.frag_time.load(Ordering::Relaxed).max(1) as u64;
+        let at = crate::net::neigh::now_ms().saturating_add(secs * 1000);
+        q.timer.reset(q, at.saturating_mul(1_000_000));
+        self.mem.fetch_sub(st.mem, Ordering::Relaxed);
+        let rid = st.rid;
+        let old = core::mem::replace(
+            st,
+            Frags {
+                rid,
+                ..Default::default()
+            },
+        );
+        // Freed under the queue's lock, as Linux's
+        // inet_frag_queue_flush; no allocation
+        drop(old);
+        true
+    }
+
     /// The queue for `key`, made if there is none and memory allows
     /// (Linux inet_frag_find: lookup under RCU, then inet_frag_create's
     /// GFP_ATOMIC allocation and an insert that keeps a racing one)
@@ -398,12 +456,19 @@ impl FragTable {
                 return Some(q.arc());
             }
         }
+        // Linux ip4_frag_init: the source's peer, with max_dist set
+        let peer = if net.sysctl.frag_max_dist.load(Ordering::Relaxed) > 0 {
+            net.peers.get(key.saddr)
+        } else {
+            None
+        };
         let q = try_arc_gfp(
             FragQueue {
                 key: *key,
                 bkt,
                 net: Arc::downgrade(net),
                 st: Mutex::new(Frags::default()),
+                peer,
                 link: NullsLink::new(),
                 timer: ArcTimer::new(ip_expire),
                 rcu: RcuPuts::new(),
@@ -644,6 +709,20 @@ mod tests {
         // Largest offset with a payload overflowing 16 bits
         let mut q = Frags::default();
         assert_eq!(ins(&mut q, 65528, 64, 1, false), Ins::Kill);
+    }
+
+    /// The head fragment's parsed options survive, whichever fragment
+    /// completed the datagram
+    #[test]
+    fn head_options_kept() {
+        let mut q = Frags::default();
+        assert_eq!(ins(&mut q, 8, 8, 2, false), Ins::More);
+        let mut head = frag(&HDR, 8, 1);
+        head.ip_opt.rr = 20;
+        head.ip_opt.optlen = 8;
+        assert_eq!(q.insert(head, 20, 0, true), Ins::Done);
+        let s = assemble(&q, &meta()).unwrap();
+        assert_eq!((s.ip_opt.rr, s.ip_opt.optlen), (20, 8));
     }
 
     /// Each fragment is charged its skb's truesize

@@ -3,7 +3,7 @@
 //!
 //! Requests are dispatched by message type and family: links (any
 //! family), IPv4 addresses and routes (AF_INET), the ARP neighbour
-//! table (RTM_{NEW,DEL,GET}NEIGH) and the IPv4 rule dump. AF_INET6
+//! table (RTM_{NEW,DEL,GET}NEIGH, `neigh_nl`) and the IPv4 rule dump. AF_INET6
 //! requests get empty dumps (no IPv6 addresses/routes exist yet; rule
 //! dumps are EAFNOSUPPORT) and EAFNOSUPPORT for changes. NEW/DEL/SET
 //! need CAP_NET_ADMIN.
@@ -16,7 +16,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::attr::{
-    Attrs, Hdr, Msg, NLMSG_HDRLEN, NlBuf, align, attr_size, header, msg_size, nlmsg_new,
+    Attrs, Hdr, Msg, NLA_HDRLEN, NLMSG_HDRLEN, NlBuf, align, attr_size, header, msg_size, nlmsg_new,
 };
 use super::*;
 use crate::net::NetNamespace;
@@ -25,13 +25,12 @@ use crate::net::inet::fib::{
     self, FibConfig, FibEntry, FlowKey, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, RT_TABLE_MAIN,
     RTNH_F_DEAD, RTNH_F_LINKDOWN, RouteType,
 };
-use crate::net::inet::fib_rules::{self, FibRule};
 use crate::net::inet::ifaddr::{
     self, IFA_F_PERMANENT, IFNAMSIZ, INFINITY_LIFE_TIME, IfaLabel, InIfaddr,
 };
 use crate::net::inet::route;
 use crate::net::ipv4::Ipv4Addr;
-use crate::net::neigh::{self, NeighInfo, nud};
+use crate::net::neigh_nl::{self, NeighFilter};
 use crate::net::rtnl::{self, RtnlGuard};
 use crate::ns::NetRef;
 use crate::util::kmem::KVec;
@@ -48,10 +47,9 @@ pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
-pub const RTM_NEWNEIGH: u16 = 28;
-pub const RTM_DELNEIGH: u16 = 29;
+pub use crate::net::neigh_nl::{RTM_DELNEIGH, RTM_NEWNEIGH};
 pub const RTM_GETNEIGH: u16 = 30;
-pub const RTM_NEWRULE: u16 = 32;
+pub use crate::net::fib_rules::{RTM_DELRULE, RTM_NEWRULE};
 pub const RTM_GETRULE: u16 = 34;
 const RTM_MAX: u16 = 123;
 
@@ -131,8 +129,7 @@ const XDP_FLAGS_MASK: u32 = 0x1f;
 /// IF_OPER_* the device module has no use for
 const IF_OPER_TESTING: u8 = 4;
 const IF_OPER_DORMANT: u8 = 5;
-/// Linux INIT_NETDEV_GROUP, IFALIASZ, ETH_ALEN
-const INIT_NETDEV_GROUP: u32 = 0;
+/// Linux IFALIASZ, ETH_ALEN
 const IFALIASZ: usize = 256;
 const ETH_ALEN: usize = 6;
 
@@ -144,6 +141,7 @@ const IFA_BROADCAST: u16 = 4;
 const IFA_CACHEINFO: u16 = 6;
 const IFA_FLAGS: u16 = 8;
 const IFA_RT_PRIORITY: u16 = 9;
+const IFA_TARGET_NETNSID: u16 = 10;
 const IFA_PROTO: u16 = 11;
 const IFA_MAX: u16 = 11;
 
@@ -158,44 +156,22 @@ const RTA_PREFSRC: u16 = 7;
 const RTA_MULTIPATH: u16 = 9;
 const RTA_CACHEINFO: u16 = 12;
 const RTA_TABLE: u16 = 15;
+const RTA_MARK: u16 = 16;
 const RTA_UID: u16 = 25;
+const RTA_IP_PROTO: u16 = 27;
+const RTA_SPORT: u16 = 28;
+const RTA_DPORT: u16 = 29;
 const RTA_NH_ID: u16 = 30;
 const RTA_MAX: u16 = 31;
 const RTM_F_CLONED: u32 = 0x200;
+const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 const RTM_F_FIB_MATCH: u32 = 0x2000;
 const RT_TABLE_COMPAT: u8 = 252;
-
-// FRA_*
-const FRA_PRIORITY: u16 = 6;
-const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
-const FRA_TABLE: u16 = 15;
-const FRA_PROTOCOL: u16 = 21;
-
-// NDA_*
-const NDA_DST: u16 = 1;
-const NDA_LLADDR: u16 = 2;
-const NDA_CACHEINFO: u16 = 3;
-const NDA_PROBES: u16 = 4;
-const NDA_MAX: u16 = 16;
 
 /// Family header sizes
 const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
 const RTMSG_LEN: usize = 12;
-const NDMSG_LEN: usize = 12;
-const FIB_RULE_HDR_LEN: usize = 12;
-/// Longest hardware address (Linux MAX_ADDR_LEN)
-const MAX_ADDR_LEN: usize = 32;
-/// An RTM_NEWNEIGH message (Linux nlmsg_new(neigh_nlmsg_size()): DST,
-/// LLADDR, CACHEINFO, PROBES, FLAGS_EXT, PROTOCOL)
-const NEIGH_NLMSG_SIZE: usize = msg_size(
-    align(NDMSG_LEN)
-        + 2 * attr_size(MAX_ADDR_LEN)
-        + attr_size(16)
-        + attr_size(4)
-        + attr_size(4)
-        + attr_size(1),
-);
 
 /// Largest dump datagram
 pub const DUMP_SIZE: usize = 8192;
@@ -214,7 +190,7 @@ enum Done {
 
 /// Process a buffer of requests sent to the kernel (Linux
 /// netlink_rcv_skb + rtnetlink_rcv_msg)
-pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool) {
+pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool, _creds: &Creds) {
     while data.len() >= NLMSG_HDRLEN {
         let h = Hdr::parse(data).unwrap();
         let len = h.len as usize;
@@ -222,26 +198,37 @@ pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool) {
             return;
         }
         let msg = &data[..len];
+        let ext = ExtAck::default();
         let res = if h.flags & NLM_F_REQUEST == 0 || h.ty < NLMSG_MIN_TYPE {
             Ok(Done::Ok)
         } else {
-            rcv_msg(sk, &h, &msg[NLMSG_HDRLEN..], explicit)
+            rcv_msg(sk, &h, &msg[NLMSG_HDRLEN..], explicit, &ext)
         };
         match res {
             Ok(Done::Dump) => {}
-            Ok(Done::Ok) if h.flags & NLM_F_ACK != 0 => ack(sk, &h, msg, 0),
+            Ok(Done::Ok) if h.flags & NLM_F_ACK != 0 => ack(sk, &h, msg, 0, &ext),
             Ok(Done::Ok) => {}
-            Err(e) => ack(sk, &h, msg, -e.errno()),
+            Err(e) => ack(sk, &h, msg, -e.errno(), &ext),
         }
         data = &data[align(len).min(data.len())..];
     }
 }
 
 /// Queue an NLMSG_ERROR (err 0 = ACK) for request `msg` (Linux
-/// netlink_ack): errors echo the whole request unless NETLINK_CAP_ACK
-fn ack(sk: &NlSock, h: &Hdr, msg: &[u8], err: i32) {
+/// netlink_ack): errors echo the whole request unless NETLINK_CAP_ACK;
+/// with NETLINK_EXT_ACK the handler's message and, for an error, the
+/// offending attribute's offset follow (netlink_ack_tlv_fill)
+fn ack(sk: &NlSock, h: &Hdr, msg: &[u8], err: i32, ext: &ExtAck) {
     let echo = err != 0 && !sk.has_flag(sflags::CAP_ACK);
-    match ack_msg(h.seq, sk.portid(), msg, err, echo) {
+    let tlv = if sk.has_flag(sflags::EXT_ACK) {
+        AckTlv {
+            msg: ext.get_msg(),
+            offs: ext.offs(msg).filter(|_| err != 0),
+        }
+    } else {
+        AckTlv::default()
+    };
+    match ack_msg(h.seq, sk.portid(), msg, err, echo, &tlv) {
         Some(m) => reply(sk, m),
         // Linux netlink_ack: no memory for even the capped ACK reports
         // ENOBUFS on the socket
@@ -260,34 +247,80 @@ fn nlmsg_hdr(len: usize, ty: u16, flags: u16, seq: u32, pid: u32) -> [u8; NLMSG_
     b
 }
 
+/// The extended ACK attributes of an NLMSG_ERROR (Linux
+/// netlink_ack_tlv_len / netlink_ack_tlv_fill)
+#[derive(Default)]
+struct AckTlv {
+    /// NLMSGERR_ATTR_MSG
+    msg: Option<&'static str>,
+    /// NLMSGERR_ATTR_OFFS (errors only)
+    offs: Option<u32>,
+}
+
+impl AckTlv {
+    fn len(&self) -> usize {
+        self.msg.map_or(0, |m| attr_size(m.len() + 1)) + self.offs.map_or(0, |_| attr_size(4))
+    }
+
+    /// Append them to `m` (room reserved by the caller)
+    fn fill(&self, m: &mut KVec<u8>) -> Option<()> {
+        if let Some(s) = self.msg {
+            tlv_put(m, NLMSGERR_ATTR_MSG, &[s.as_bytes(), &[0]])?;
+        }
+        if let Some(o) = self.offs {
+            tlv_put(m, NLMSGERR_ATTR_OFFS, &[&o.to_ne_bytes()])?;
+        }
+        Some(())
+    }
+}
+
+/// One attribute whose payload is `parts`, padded to 4
+fn tlv_put(m: &mut KVec<u8>, ty: u16, parts: &[&[u8]]) -> Option<()> {
+    let n: usize = parts.iter().map(|p| p.len()).sum();
+    let len = u16::try_from(NLA_HDRLEN + n).ok()?;
+    m.try_extend_from_slice(&len.to_ne_bytes()).ok()?;
+    m.try_extend_from_slice(&ty.to_ne_bytes()).ok()?;
+    for p in parts {
+        m.try_extend_from_slice(p).ok()?;
+    }
+    m.try_resize(align(m.len()), 0).ok()
+}
+
 /// The NLMSG_ERROR for request `msg`: the error, then the whole request
 /// when `echo` and the message fits a fallible allocation; else the
 /// error and the request header with NLM_F_CAPPED (Linux netlink_ack
-/// falls back rather than fail). The capped form is a fixed 36 bytes,
-/// built on the stack and copied out fallibly: None if even that fails.
-fn ack_msg(seq: u32, pid: u32, msg: &[u8], err: i32, echo: bool) -> Option<Vec<u8>> {
-    if echo && let Some(m) = echo_msg(seq, pid, msg, err) {
+/// fails instead: hk falls back to the small form); the extended ACK
+/// attributes `tlv` last, with NLM_F_ACK_TLVS. None if no memory.
+fn ack_msg(seq: u32, pid: u32, msg: &[u8], err: i32, echo: bool, tlv: &AckTlv) -> Option<Vec<u8>> {
+    if echo && let Some(m) = err_msg(seq, pid, msg, err, false, tlv) {
         return Some(m);
     }
-    const LEN: usize = NLMSG_HDRLEN + 4 + NLMSG_HDRLEN;
-    let mut b = [0u8; LEN];
-    b[..NLMSG_HDRLEN].copy_from_slice(&nlmsg_hdr(LEN, NLMSG_ERROR, NLM_F_CAPPED, seq, pid));
-    b[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].copy_from_slice(&err.to_ne_bytes());
-    b[NLMSG_HDRLEN + 4..].copy_from_slice(&msg[..NLMSG_HDRLEN]);
-    let mut m = KVec::try_with_capacity(LEN).ok()?;
-    m.try_extend_from_slice(&b).ok()?;
-    Some(m.into_vec())
+    err_msg(seq, pid, &msg[..NLMSG_HDRLEN], err, true, tlv)
 }
 
-/// The echoing NLMSG_ERROR, allocated fallibly in one exact piece
-fn echo_msg(seq: u32, pid: u32, msg: &[u8], err: i32) -> Option<Vec<u8>> {
-    let len = NLMSG_HDRLEN + 4 + align(msg.len());
+/// An NLMSG_ERROR carrying `req` (the whole request, or its header:
+/// NLM_F_CAPPED), allocated fallibly in one exact piece
+fn err_msg(
+    seq: u32,
+    pid: u32,
+    req: &[u8],
+    err: i32,
+    capped: bool,
+    tlv: &AckTlv,
+) -> Option<Vec<u8>> {
+    let body = NLMSG_HDRLEN + 4 + align(req.len());
+    let len = body + tlv.len();
+    let mut flags = if capped { NLM_F_CAPPED } else { 0 };
+    if tlv.len() != 0 {
+        flags |= NLM_F_ACK_TLVS;
+    }
     let mut m = KVec::try_with_capacity(len).ok()?;
-    m.try_extend_from_slice(&nlmsg_hdr(len, NLMSG_ERROR, 0, seq, pid))
+    m.try_extend_from_slice(&nlmsg_hdr(len, NLMSG_ERROR, flags, seq, pid))
         .ok()?;
     m.try_extend_from_slice(&err.to_ne_bytes()).ok()?;
-    m.try_extend_from_slice(msg).ok()?;
-    m.try_resize(len, 0).ok()?;
+    m.try_extend_from_slice(req).ok()?;
+    m.try_resize(body, 0).ok()?;
+    tlv.fill(&mut m)?;
     Some(m.into_vec())
 }
 
@@ -296,7 +329,13 @@ fn reply(sk: &NlSock, data: Vec<u8>) {
 }
 
 /// One request: permission, then dump or do
-fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8], explicit: bool) -> Result<Done, KernelError> {
+fn rcv_msg(
+    sk: &Arc<NlSock>,
+    h: &Hdr,
+    p: &[u8],
+    explicit: bool,
+    ext: &ExtAck,
+) -> Result<Done, KernelError> {
     if h.ty > RTM_MAX {
         return Err(KernelError::OperationNotSupported);
     }
@@ -323,21 +362,42 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8], explicit: bool) -> Result<Done, 
     let nl = NlInfo {
         portid: sk.portid(),
         seq: h.seq,
+        report: h.flags & NLM_F_ECHO != 0,
     };
     match h.ty {
-        RTM_NEWNEIGH => newneigh(sk, h, p),
-        RTM_DELNEIGH => delneigh(sk, p),
-        RTM_GETNEIGH => getneigh(sk, h, p),
-        RTM_NEWLINK => newlink(sk, h, p, nl),
-        RTM_SETLINK => setlink(sk, p, nl),
-        RTM_GETLINK => getlink(sk, h, p),
+        RTM_NEWNEIGH | RTM_DELNEIGH => {
+            // Configuration changes: under RTNL from the device lookup
+            // on (Linux neigh_add / neigh_delete are locked doits)
+            let _r = rtnl::lock();
+            match h.ty {
+                RTM_NEWNEIGH => neigh_nl::newneigh(sk, h.flags, p, ext)?,
+                _ => neigh_nl::delneigh(sk, p, ext)?,
+            }
+            Ok(Done::Ok)
+        }
+        RTM_GETNEIGH => {
+            reply(sk, neigh_nl::getneigh(sk, h.seq, p, ext)?);
+            Ok(Done::Ok)
+        }
+        RTM_NEWRULE | RTM_DELRULE => {
+            let r = rtnl::lock();
+            let net = sk.net();
+            match h.ty {
+                RTM_NEWRULE => crate::net::fib_rules::newrule(&r, net, h.flags, p, nl, ext)?,
+                _ => crate::net::fib_rules::delrule(&r, net, p, nl, ext)?,
+            }
+            Ok(Done::Ok)
+        }
+        RTM_NEWLINK => newlink(sk, h, p, nl, ext),
+        RTM_SETLINK => setlink(sk, p, nl, ext),
+        RTM_GETLINK => getlink(sk, h, p, ext),
         RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE | RTM_GETROUTE => match family {
             AF_INET => match h.ty {
-                RTM_NEWADDR => newaddr(sk, h, p, nl),
-                RTM_DELADDR => deladdr(sk, p, nl),
-                RTM_NEWROUTE => newroute(sk, h, p, nl),
-                RTM_DELROUTE => delroute(sk, h, p, nl),
-                _ => getroute(sk, h, p),
+                RTM_NEWADDR => newaddr(sk, h, p, nl, ext),
+                RTM_DELADDR => deladdr(sk, p, nl, ext),
+                RTM_NEWROUTE => newroute(sk, h, p, nl, ext),
+                RTM_DELROUTE => delroute(sk, h, p, nl, ext),
+                _ => getroute(sk, h, p, ext),
             },
             AF_INET6 => Err(KernelError::AddressFamilyNotSupported),
             _ => Err(KernelError::OperationNotSupported),
@@ -353,13 +413,20 @@ enum DumpKind {
     Addr(u32),
     /// Routes (of one table if non-zero)
     Route(u32),
-    Neigh,
+    /// Neighbours or proxy entries
+    Neigh(NeighFilter),
     /// IPv4 routing rules
     Rule,
     /// Nothing (other families, RTM_F_CLONED)
     Empty,
-    /// Request rejected by strict checking: DONE carries the error
-    Bad(KernelError),
+    /// Request rejected by strict checking: DONE carries the error and
+    /// its extended ACK message
+    Bad(KernelError, Option<&'static str>),
+}
+
+/// A dump request refused: `e`, with message `m`
+fn bad(e: KernelError, m: &'static str) -> DumpKind {
+    DumpKind::Bad(e, Some(m))
 }
 
 /// A resumable rtnetlink dump: `pos` counts the objects already sent;
@@ -379,15 +446,12 @@ impl RtDump {
         let mut flags = NLM_F_MULTI;
         let inet = family != AF_INET6;
         let kind = match h.ty {
-            RTM_GETLINK if strict => match link_dump_check(p) {
-                Ok(()) => DumpKind::Link,
-                Err(e) => DumpKind::Bad(e),
-            },
+            RTM_GETLINK if strict => link_dump_check(p),
             RTM_GETLINK => DumpKind::Link,
             RTM_GETADDR if inet => addr_dump_kind(sk.net(), p, strict, &mut flags),
             RTM_GETROUTE if inet => route_dump_kind(p, strict, &mut flags),
-            RTM_GETNEIGH if inet => DumpKind::Neigh,
-            RTM_GETRULE => rule_dump_kind(p, family, strict),
+            RTM_GETNEIGH if inet => neigh_dump_kind(p, strict, &mut flags),
+            RTM_GETRULE => rule_dump_kind(sk.net(), p, strict),
             _ => DumpKind::Empty,
         };
         Self {
@@ -440,7 +504,7 @@ impl DumpCb for RtDump {
         let net = sk.net();
         let (f, seq, pid) = (self.flags, self.seq, self.pid);
         match self.kind {
-            DumpKind::Bad(e) => Err(e),
+            DumpKind::Bad(e, _) => Err(e),
             DumpKind::Empty => Ok(true),
             DumpKind::Link => {
                 let devs = net.devices();
@@ -472,26 +536,56 @@ impl DumpCb for RtDump {
                     fill_route(nb, e, RTM_NEWROUTE, f, seq, pid)
                 })
             }
-            DumpKind::Neigh => {
+            DumpKind::Neigh(nf) if nf.proxy => {
+                // Linux pneigh_dump_table: the chains walked under RCU
+                let g = crate::sync::rcu::read_lock();
+                let ns = neigh_nl::dump_pneighs(&g, net, nf);
+                let mut nb = NlBuf::new(buf, DUMP_SIZE);
+                self.take_nl(&mut nb, ns, |nb, n| {
+                    neigh_nl::fill_pneigh(nb, n, RTM_NEWNEIGH, f, seq, pid)
+                })
+            }
+            DumpKind::Neigh(nf) => {
                 // Linux neigh_dump_table: the buckets walked under RCU,
                 // each entry of the namespace filled as it is reached
                 let g = crate::sync::rcu::read_lock();
-                let now = neigh::now_ms();
-                let ns = crate::net::arp::arp_tbl()
-                    .iter_rcu(&g)
-                    .filter(|n| n.dev.net_is(net));
+                let now = crate::net::neigh::now_ms();
+                let ns = neigh_nl::dump_neighs(&g, net, nf);
                 let mut nb = NlBuf::new(buf, DUMP_SIZE);
                 self.take_nl(&mut nb, ns, |nb, n| {
-                    fill_neigh(nb, &n.info(now), RTM_NEWNEIGH, f, seq, pid)
+                    neigh_nl::fill_neigh(nb, &n.info(now), RTM_NEWNEIGH, f, seq, pid)
                 })
             }
             DumpKind::Rule => {
+                // Linux dump_rules: the list walked under RCU
+                let g = crate::sync::rcu::read_lock();
+                let rules = &net.fib.rules;
                 let mut nb = NlBuf::new(buf, DUMP_SIZE);
-                self.take_nl(&mut nb, fib_rules::RULES.iter(), |nb, r| {
-                    fill_rule(nb, r, RTM_NEWRULE, f, seq, pid)
+                self.take_nl(&mut nb, rules.iter(&g), |nb, r| {
+                    crate::net::fib_rules::fill_rule(nb, rules, &g, r, RTM_NEWRULE, f, seq, pid)
                 })
             }
         }
+    }
+
+    fn ext_msg(&self) -> Option<&'static str> {
+        match self.kind {
+            DumpKind::Bad(_, m) => m,
+            _ => None,
+        }
+    }
+}
+
+/// Neighbour dump request (Linux neigh_dump_info): its filter, or the
+/// strict check's error
+fn neigh_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
+    let ext = ExtAck::default();
+    match neigh_nl::dump_req(p, strict, &ext) {
+        Ok(nf) => {
+            *flags |= nf.nlflags();
+            DumpKind::Neigh(nf)
+        }
+        Err(e) => DumpKind::Bad(e, ext.get_msg()),
     }
 }
 
@@ -499,58 +593,12 @@ impl DumpCb for RtDump {
 // Rules
 // ============================================================================
 
-/// Rule dump request (Linux fib_nl_dumprule): AF_UNSPEC lists every
-/// family's rules, which here are IPv4's; a family without rules is
-/// EAFNOSUPPORT. Strict: a zeroed fib_rule_hdr but the family, no
-/// attributes (fib_valid_dumprule_req).
-fn rule_dump_kind(p: &[u8], family: u8, strict: bool) -> DumpKind {
-    if strict && (p.len() != FIB_RULE_HDR_LEN || p[1..].iter().any(|&b| b != 0)) {
-        return DumpKind::Bad(KernelError::InvalidArgument);
+/// Rule dump request (Linux fib_nl_dumprule)
+fn rule_dump_kind(net: &NetNamespace, p: &[u8], strict: bool) -> DumpKind {
+    match crate::net::fib_rules::dump_req(net, p, strict) {
+        Ok(()) => DumpKind::Rule,
+        Err((e, m)) => DumpKind::Bad(e, m),
     }
-    match family {
-        AF_UNSPEC | AF_INET => DumpKind::Rule,
-        _ => DumpKind::Bad(KernelError::AddressFamilyNotSupported),
-    }
-}
-
-/// An RTM_NEWRULE message for `r` in `nb` (Linux fib_nl_fill_rule and
-/// fib4_rule_fill): EMSGSIZE, nothing left behind, if it does not fit
-fn fill_rule(
-    nb: &mut NlBuf<'_>,
-    r: &FibRule,
-    ty: u16,
-    flags: u16,
-    seq: u32,
-    pid: u32,
-) -> Result<(), KernelError> {
-    // struct fib_rule_hdr: family, dst_len, src_len, tos, table, res1,
-    // res2, action, flags
-    let mut h = [0u8; FIB_RULE_HDR_LEN];
-    h[0] = AF_INET;
-    h[4] = u8::try_from(r.table).unwrap_or(RT_TABLE_COMPAT);
-    h[7] = r.action;
-    let m = nb.msg_put(ty, flags, seq, pid, &h)?;
-    match rule_attrs(nb, r) {
-        Ok(()) => {
-            nb.msg_end(m);
-            Ok(())
-        }
-        Err(err) => {
-            nb.msg_cancel(m);
-            Err(err)
-        }
-    }
-}
-
-/// A rule's attributes, in Linux's order
-fn rule_attrs(nb: &mut NlBuf<'_>, r: &FibRule) -> Result<(), KernelError> {
-    nb.put_u32(FRA_TABLE, r.table)?;
-    nb.put(FRA_SUPPRESS_PREFIXLEN, &r.suppress_prefixlen.to_ne_bytes())?;
-    nb.put(FRA_PROTOCOL, &[r.proto])?;
-    if r.pref != 0 {
-        nb.put_u32(FRA_PRIORITY, r.pref)?;
-    }
-    Ok(())
 }
 
 // ============================================================================
@@ -558,14 +606,19 @@ fn rule_attrs(nb: &mut NlBuf<'_>, r: &FibRule) -> Result<(), KernelError> {
 // ============================================================================
 
 /// Strict link dump header (Linux rtnl_valid_dump_ifinfo_req)
-fn link_dump_check(p: &[u8]) -> Result<(), KernelError> {
-    if p.len() < IFINFOMSG_LEN {
-        return Err(KernelError::InvalidArgument);
+fn link_dump_check(p: &[u8]) -> DumpKind {
+    use KernelError::InvalidArgument as E;
+    let Some(h) = p.get(..IFINFOMSG_LEN) else {
+        return bad(E, "Invalid header for link dump");
+    };
+    // __ifi_pad, ifi_type, ifi_flags, ifi_change
+    if h[1..4].iter().chain(&h[8..16]).any(|&b| b != 0) {
+        return bad(E, "Invalid values in header for link dump request");
     }
-    if p[1..IFINFOMSG_LEN].iter().any(|&b| b != 0) {
-        return Err(KernelError::InvalidArgument);
+    if h[4..8].iter().any(|&b| b != 0) {
+        return bad(E, "Filter by device index not supported for link dumps");
     }
-    Ok(())
+    DumpKind::Link
 }
 
 /// struct ifinfomsg fields
@@ -608,9 +661,9 @@ fn link_dev(
 }
 
 /// RTM_GETLINK for one device
-fn getlink(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
+fn getlink(sk: &NlSock, h: &Hdr, p: &[u8], ext: &ExtAck) -> Result<Done, KernelError> {
     let ifm = ifinfo(p)?;
-    let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
+    let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?.ext(ext);
     let dev = link_dev(sk.net(), &ifm, &a)?.ok_or(KernelError::NoDevice)?;
     reply(sk, fill_link(&dev, RTM_NEWLINK, 0, h.seq, sk.portid(), 0));
     Ok(Done::Ok)
@@ -628,10 +681,21 @@ const IFLA_REJECT: [u16; 7] = [
 ];
 
 /// The parts of Linux ifla_policy the link requests rely on beyond the
-/// typed reads: rejected attributes, the txqlen range
+/// typed reads: rejected attributes, the alias length, the GSO size
+/// minimum, the txqlen range
 fn ifla_validate(a: &Attrs<'_>) -> Result<(), KernelError> {
     if IFLA_REJECT.iter().any(|&t| a.has(t)) {
         return Err(KernelError::InvalidArgument);
+    }
+    // NLA_BINARY, len IFALIASZ - 1
+    a.max(IFLA_IFALIAS, IFALIASZ - 1)?;
+    // NLA_POLICY_MIN(NLA_U32, MAX_TCP_HEADER + 1): a smaller GSO size
+    // underflows the socket's GSO limit
+    let min = crate::net::tcp::buf::MAX_TCP_HEADER + 1;
+    for t in [IFLA_GSO_MAX_SIZE, IFLA_GSO_IPV4_MAX_SIZE] {
+        if a.u32(t)?.is_some_and(|v| v < min) {
+            return Err(KernelError::Range);
+        }
     }
     // NLA_POLICY_FULL_RANGE(NLA_U32, 0..INT_MAX)
     if a.u32(IFLA_TXQLEN)?.is_some_and(|q| q > i32::MAX as u32) {
@@ -642,12 +706,13 @@ fn ifla_validate(a: &Attrs<'_>) -> Result<(), KernelError> {
 
 /// At most one of the attributes naming a namespace (Linux
 /// rtnl_ensure_unique_netns)
-fn ensure_unique_netns(a: &Attrs<'_>) -> Result<(), KernelError> {
+fn ensure_unique_netns(a: &Attrs<'_>, ext: &ExtAck) -> Result<(), KernelError> {
     let n = [IFLA_NET_NS_PID, IFLA_NET_NS_FD, IFLA_TARGET_NETNSID]
         .iter()
         .filter(|&&t| a.has(t))
         .count();
     if n > 1 {
+        ext.msg("multiple netns identifying attributes specified");
         return Err(KernelError::InvalidArgument);
     }
     Ok(())
@@ -673,34 +738,35 @@ fn link_get_net(a: &Attrs<'_>) -> Result<Option<NetRef>, KernelError> {
 }
 
 /// RTM_SETLINK (Linux rtnl_setlink)
-fn setlink(sk: &NlSock, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
+fn setlink(sk: &NlSock, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<Done, KernelError> {
     let ifm = ifinfo(p)?;
-    let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
+    let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?.ext(ext);
     ifla_validate(&a)?;
-    ensure_unique_netns(&a)?;
+    ensure_unique_netns(&a, ext)?;
     let tgt = link_get_net(&a)?;
     let net = sk.net();
     // The lookup under RTNL too: an unregistered device is never found
     let r = rtnl::lock();
     let dev = link_dev(net, &ifm, &a)?.ok_or(KernelError::NoDevice)?;
-    do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl)?;
+    do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl, ext)?;
     Ok(Done::Ok)
 }
 
 /// RTM_NEWLINK (Linux rtnl_newlink): no link kinds are registered, so
 /// it only changes existing devices (rtnl_changelink) or a group
-fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
+fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<Done, KernelError> {
     let ifm = ifinfo(p)?;
-    let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
+    let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?.ext(ext);
     ifla_validate(&a)?;
-    ensure_unique_netns(&a)?;
+    ensure_unique_netns(&a, ext)?;
     let linkinfo = match a.get(IFLA_LINKINFO) {
-        Some(b) => Some(Attrs::parse(b, IFLA_INFO_MAX)?),
+        Some(b) => Some(Attrs::parse(b, IFLA_INFO_MAX)?.ext(ext)),
         None => None,
     };
     let tgt = link_get_net(&a)?;
     if a.has(IFLA_LINK_NETNSID) {
         // No namespace ids (Linux get_net_ns_by_id failing)
+        ext.msg("Unknown network namespace id");
         return Err(KernelError::InvalidArgument);
     }
     let net = sk.net();
@@ -712,6 +778,7 @@ fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
         _ => net,
     };
     if ifm.index.cast_signed() < 0 {
+        ext.msg("ifindex can't be negative");
         return Err(KernelError::InvalidArgument);
     }
     let specified = ifm.index != 0 || a.has(IFLA_IFNAME) || a.has(IFLA_ALT_IFNAME);
@@ -735,19 +802,16 @@ fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
         {
             return Err(KernelError::OperationNotSupported);
         }
-        do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl)?;
+        do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl, ext)?;
         return Ok(Done::Ok);
     }
     if !create {
         let Some(group) = a.u32(IFLA_GROUP)?.filter(|_| !specified) else {
             return Err(KernelError::NoDevice);
         };
-        // Linux rtnl_group_changelink: every device is in the default
-        // group (0)
-        if group == INIT_NETDEV_GROUP {
-            for dev in net.devices() {
-                do_setlink(&r, net, &dev, tgt.as_deref(), &ifm, &a, nl)?;
-            }
+        // Linux rtnl_group_changelink: each device of the group
+        for dev in net.devices().iter().filter(|d| d.group() == group) {
+            do_setlink(&r, net, dev, tgt.as_deref(), &ifm, &a, nl, ext)?;
         }
         return Ok(Done::Ok);
     }
@@ -756,11 +820,39 @@ fn newlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
 }
 
 /// Linux validate_linkmsg: hardware addresses at least the device's
-/// length (6: hk links are Ethernet-like), IFLA_AF_SPEC of known
-/// families (AF_INET, AF_INET6; Linux rtnl_af_lookup, EAFNOSUPPORT)
-fn validate_linkmsg(a: &Attrs<'_>) -> Result<(), KernelError> {
+/// length (6: hk links are Ethernet-like), GSO/GRO limits within the
+/// device's TSO limits and GRO_MAX_SIZE, IFLA_AF_SPEC of known families
+/// (AF_INET, AF_INET6; Linux rtnl_af_lookup, EAFNOSUPPORT)
+fn validate_linkmsg(dev: &NetDevice, a: &Attrs<'_>, ext: &ExtAck) -> Result<(), KernelError> {
+    use crate::net::device::gso;
     for t in [IFLA_ADDRESS, IFLA_BROADCAST] {
         if a.get(t).is_some_and(|b| b.len() < ETH_ALEN) {
+            return Err(KernelError::InvalidArgument);
+        }
+    }
+    let (tso_size, tso_segs) = dev.tso_max();
+    let limits = [
+        (IFLA_GSO_MAX_SIZE, tso_size, "too big gso_max_size"),
+        (
+            IFLA_GSO_MAX_SEGS,
+            tso_segs.min(gso::GSO_MAX_SEGS),
+            "too big gso_max_segs",
+        ),
+        (IFLA_GRO_MAX_SIZE, gso::GRO_MAX_SIZE, "too big gro_max_size"),
+        (
+            IFLA_GSO_IPV4_MAX_SIZE,
+            tso_size,
+            "too big gso_ipv4_max_size",
+        ),
+        (
+            IFLA_GRO_IPV4_MAX_SIZE,
+            gso::GRO_MAX_SIZE,
+            "too big gro_ipv4_max_size",
+        ),
+    ];
+    for (t, max, msg) in limits {
+        if a.u32(t)?.is_some_and(|v| v > max) {
+            ext.msg(msg);
             return Err(KernelError::InvalidArgument);
         }
     }
@@ -823,9 +915,10 @@ fn do_setlink(
     ifm: &IfInfo,
     a: &Attrs<'_>,
     nl: NlInfo,
+    ext: &ExtAck,
 ) -> Result<(), KernelError> {
     use KernelError::{InvalidArgument, OperationNotSupported};
-    validate_linkmsg(a)?;
+    validate_linkmsg(dev, a, ext)?;
     if let Some(t) = tgt
         && !dev.net_is(t)
     {
@@ -846,9 +939,12 @@ fn do_setlink(
         // INT_MAX it is negative and dev_set_mtu refuses it
         rtnl::dev_set_mtu(r, net, dev, mtu.cast_signed(), nl)?;
     }
-    // Devices stay in the default group
-    if a.u32(IFLA_GROUP)?.is_some_and(|g| g != INIT_NETDEV_GROUP) {
-        return Err(OperationNotSupported);
+    // Changes Linux announces once at the end (DO_SETLINK_NOTIFY ->
+    // netdev_state_change)
+    let mut notify = false;
+    if let Some(g) = a.u32(IFLA_GROUP)? {
+        dev.set_group(r, g);
+        notify = true;
     }
     if ifm.index.cast_signed() > 0
         && let Some(n) = a.str(IFLA_IFNAME, IFNAMSIZ)?
@@ -858,19 +954,16 @@ fn do_setlink(
         // Renaming is not supported
         return Err(OperationNotSupported);
     }
-    // No aliases: only clearing (an empty one) is a no-op
     if let Some(al) = a.get(IFLA_IFALIAS) {
-        if al.len() >= IFALIASZ {
-            return Err(InvalidArgument);
-        }
-        if !al.is_empty() {
-            return Err(OperationNotSupported);
-        }
+        dev_set_alias(r, dev, al)?;
+        notify = true;
     }
-    if a.get(IFLA_BROADCAST)
-        .is_some_and(|b| b[..ETH_ALEN] != dev.link().broadcast)
-    {
-        return Err(OperationNotSupported);
+    if let Some(b) = a.get(IFLA_BROADCAST) {
+        // Length checked by validate_linkmsg; NETDEV_CHANGEADDR
+        let mut bc = [0u8; ETH_ALEN];
+        bc.copy_from_slice(b.get(..ETH_ALEN).ok_or(InvalidArgument)?);
+        dev.store_broadcast(&bc);
+        notify_link(net, dev, nl);
     }
     if ifm.flags != 0 || ifm.change != 0 {
         let mut f = ifm.flags;
@@ -893,21 +986,26 @@ fn do_setlink(
     if a.u8(IFLA_CARRIER)?.is_some() {
         return Err(OperationNotSupported);
     }
-    if a.u32(IFLA_TXQLEN)?.is_some_and(|q| q != dev.link().txqlen) {
-        return Err(OperationNotSupported);
+    if let Some(q) = a.u32(IFLA_TXQLEN)? {
+        // Linux dev_change_tx_queue_len: NETDEV_CHANGE_TX_QUEUE_LEN
+        if q != dev.txqlen() {
+            dev.store_txqlen(q);
+            notify_link(net, dev, nl);
+        }
     }
-    // No GSO/GRO limits to set
-    if [
-        IFLA_GSO_MAX_SIZE,
-        IFLA_GSO_MAX_SEGS,
-        IFLA_GRO_MAX_SIZE,
-        IFLA_GSO_IPV4_MAX_SIZE,
-        IFLA_GRO_IPV4_MAX_SIZE,
-    ]
-    .iter()
-    .any(|&t| a.has(t))
     {
-        return Err(OperationNotSupported);
+        use crate::net::device::gso;
+        for (t, i) in [
+            (IFLA_GSO_MAX_SIZE, gso::GSO_MAX_SIZE_I),
+            (IFLA_GSO_MAX_SEGS, gso::GSO_MAX_SEGS_I),
+            (IFLA_GRO_MAX_SIZE, gso::GRO_MAX_SIZE_I),
+            (IFLA_GSO_IPV4_MAX_SIZE, gso::GSO_IPV4_MAX_SIZE_I),
+            (IFLA_GRO_IPV4_MAX_SIZE, gso::GRO_IPV4_MAX_SIZE_I),
+        ] {
+            if let Some(v) = a.u32(t)? {
+                gso_set(dev, i, v);
+            }
+        }
     }
     // Operational state and link mode follow the carrier only
     if let Some(t) = a.u8(IFLA_OPERSTATE)? {
@@ -942,13 +1040,51 @@ fn do_setlink(
     if a.get(IFLA_AF_SPEC).is_some_and(|b| !b.is_empty()) {
         return Err(OperationNotSupported);
     }
-    // No device supports proto_down
+    // No device supports proto_down (Linux do_set_proto_down)
     if a.has(IFLA_PROTO_DOWN) || a.has(IFLA_PROTO_DOWN_REASON) {
+        ext.msg("Protodown not supported by device");
         return Err(OperationNotSupported);
     }
     if let Some(b) = a.get(IFLA_XDP) {
         setlink_xdp(b)?;
     }
+    if notify {
+        notify_link(net, dev, nl);
+    }
+    Ok(())
+}
+
+/// Set GSO/GRO limit `i`: a GSO or GRO size within the legacy limit
+/// is the IPv4 one too (Linux netif_set_gso_max_size,
+/// netif_set_gro_max_size)
+fn gso_set(dev: &NetDevice, i: usize, v: u32) {
+    use crate::net::device::gso;
+    dev.store_gso(i, v);
+    let v4 = match i {
+        gso::GSO_MAX_SIZE_I if v <= gso::GSO_LEGACY_MAX_SIZE => gso::GSO_IPV4_MAX_SIZE_I,
+        gso::GRO_MAX_SIZE_I if v <= gso::GRO_LEGACY_MAX_SIZE => gso::GRO_IPV4_MAX_SIZE_I,
+        _ => return,
+    };
+    dev.store_gso(v4, v);
+}
+
+/// Linux dev_set_alias: EINVAL at IFALIASZ bytes or more, an empty one
+/// clears it
+fn dev_set_alias(r: &RtnlGuard, dev: &NetDevice, al: &[u8]) -> Result<(), KernelError> {
+    let _ = r;
+    if al.len() >= IFALIASZ {
+        return Err(KernelError::InvalidArgument);
+    }
+    // Up to a NUL (Linux strscpy of the payload)
+    let n = al.iter().position(|&c| c == 0).unwrap_or(al.len());
+    let s = core::str::from_utf8(&al[..n]).map_err(|_| KernelError::InvalidArgument)?;
+    let new = if s.is_empty() {
+        None
+    } else {
+        // Bounded by IFALIASZ
+        Some(Arc::<str>::from(s))
+    };
+    drop(dev.swap_ifalias(new));
     Ok(())
 }
 
@@ -984,6 +1120,7 @@ fn setlink_xdp(b: &[u8]) -> Result<(), KernelError> {
 
 /// RTM_NEWLINK message for `dev` (Linux rtnl_fill_ifinfo subset)
 pub fn fill_link(dev: &NetDevice, ty: u16, flags: u16, seq: u32, pid: u32, change: u32) -> Vec<u8> {
+    use crate::net::device::gso;
     let mut m = Msg::new(ty, flags, seq, pid);
     let mut h = [0u8; IFINFOMSG_LEN];
     h[0] = AF_UNSPEC;
@@ -995,24 +1132,34 @@ pub fn fill_link(dev: &NetDevice, ty: u16, flags: u16, seq: u32, pid: u32, chang
     let promisc = u32::from(dev.admin_flags() & dflags::IFF_PROMISC != 0);
     m.put(&h)
         .str(IFLA_IFNAME, dev.name())
-        .u32(IFLA_TXQLEN, dev.link().txqlen)
+        .u32(IFLA_TXQLEN, dev.txqlen())
         .u8(IFLA_OPERSTATE, dev.operstate())
         .u8(IFLA_LINKMODE, 0)
         .u32(IFLA_MTU, dev.mtu())
         .u32(IFLA_MIN_MTU, min_mtu)
         .u32(IFLA_MAX_MTU, max_mtu)
-        .u32(IFLA_GROUP, 0)
+        .u32(IFLA_GROUP, dev.group())
         .u32(IFLA_PROMISCUITY, promisc)
         .u32(IFLA_NUM_TX_QUEUES, 1)
+        .u32(IFLA_GSO_MAX_SEGS, dev.gso(gso::GSO_MAX_SEGS_I))
+        .u32(IFLA_GSO_MAX_SIZE, dev.gso(gso::GSO_MAX_SIZE_I))
+        .u32(IFLA_GRO_MAX_SIZE, dev.gso(gso::GRO_MAX_SIZE_I))
+        .u32(IFLA_GSO_IPV4_MAX_SIZE, dev.gso(gso::GSO_IPV4_MAX_SIZE_I))
+        .u32(IFLA_GRO_IPV4_MAX_SIZE, dev.gso(gso::GRO_IPV4_MAX_SIZE_I))
+        .u32(IFLA_TSO_MAX_SIZE, dev.tso_max().0)
+        .u32(IFLA_TSO_MAX_SEGS, dev.tso_max().1)
         .u32(IFLA_NUM_RX_QUEUES, 1)
         .u8(IFLA_CARRIER, u8::from(dev.carrier_ok()))
         .str(IFLA_QDISC, "noqueue")
         .u32(IFLA_CARRIER_CHANGES, dev.carrier_changes())
         .u8(IFLA_PROTO_DOWN, 0)
         .attr(IFLA_ADDRESS, &dev.mac())
-        .attr(IFLA_BROADCAST, &dev.link().broadcast)
+        .attr(IFLA_BROADCAST, &dev.broadcast())
         .attr(IFLA_STATS64, &stats64(dev))
         .attr(IFLA_STATS, &stats32(dev));
+    if let Some(al) = dev.ifalias() {
+        m.str(IFLA_IFALIAS, &al);
+    }
     m.finish()
 }
 
@@ -1044,22 +1191,26 @@ fn stats32(dev: &NetDevice) -> Vec<u8> {
         .collect()
 }
 
-/// Announce a link change to RTNLGRP_LINK
+/// Announce a link change to RTNLGRP_LINK (Linux __dev_notify_flags'
+/// rtmsg_ifinfo: never echoed)
 pub fn notify_link(net: &NetNamespace, dev: &NetDevice, nl: NlInfo) {
     let data = fill_link(dev, RTM_NEWLINK, 0, nl.seq, nl.portid, 0);
-    notify(net, data, RTNLGRP_LINK);
+    rtnl_notify(net, data, RTNLGRP_LINK, NlInfo::default());
 }
 
 /// RTM_DELLINK for an unregistered device (Linux
 /// unregister_netdevice_many_notify's rtmsg_ifinfo, change ~0)
 pub fn notify_dellink(net: &NetNamespace, dev: &NetDevice) {
     let data = fill_link(dev, RTM_DELLINK, 0, 0, 0, !0);
-    notify(net, data, RTNLGRP_LINK);
+    rtnl_notify(net, data, RTNLGRP_LINK, NlInfo::default());
 }
 
-fn notify(net: &NetNamespace, data: Vec<u8>, group: u32) {
+/// Send a notification to `group`, and back to the requester when it
+/// asked (NLM_F_ECHO; Linux rtnl_notify -> nlmsg_notify)
+fn rtnl_notify(net: &NetNamespace, data: Vec<u8>, group: u32, nl: NlInfo) {
     // Linux rtnl_notify(GFP_KERNEL): no lock held here
-    broadcast(net, NETLINK_ROUTE, kernel_skb(data, group), 0, Gfp::KERNEL);
+    let skb = kernel_skb(data, group);
+    notify(net, NETLINK_ROUTE, skb, nl.portid, nl.report, Gfp::KERNEL);
 }
 
 // ============================================================================
@@ -1088,21 +1239,33 @@ fn ifaddrmsg(p: &[u8]) -> Result<IfAddrMsg, KernelError> {
 
 /// Address dump filter (Linux inet_valid_dump_ifaddr_req when strict)
 fn addr_dump_kind(net: &NetNamespace, p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
+    use KernelError::InvalidArgument as E;
     if !strict {
         return DumpKind::Addr(0);
     }
-    let ifm = match ifaddrmsg(p) {
-        Ok(m) => m,
-        Err(e) => return DumpKind::Bad(e),
+    let Ok(ifm) = ifaddrmsg(p) else {
+        return bad(E, "ipv4: Invalid header for address dump request");
     };
     if ifm.prefixlen != 0 || ifm.flags != 0 || ifm.scope != 0 {
-        return DumpKind::Bad(KernelError::InvalidArgument);
+        return bad(E, "ipv4: Invalid values in header for address dump request");
     }
     if ifm.index != 0 {
         *flags |= NLM_F_DUMP_FILTERED;
-        if net.dev_get_by_index(ifm.index).is_none() {
-            return DumpKind::Bad(KernelError::NoDevice);
+    }
+    match Attrs::parse(&p[IFADDRMSG_LEN..], IFA_MAX) {
+        Err(e) => return DumpKind::Bad(e, None),
+        // No namespace ids: none is valid (Linux
+        // rtnl_get_net_ns_capable failing)
+        Ok(a) if a.has(IFA_TARGET_NETNSID) => {
+            return bad(E, "ipv4: Invalid target network namespace id");
         }
+        Ok(a) if (1..=IFA_MAX).any(|t| a.has(t)) => {
+            return bad(E, "ipv4: Unsupported attribute in dump request");
+        }
+        Ok(_) => {}
+    }
+    if ifm.index != 0 && net.dev_get_by_index(ifm.index).is_none() {
+        return DumpKind::Bad(KernelError::NoDevice, None);
     }
     DumpKind::Addr(ifm.index)
 }
@@ -1183,51 +1346,86 @@ pub fn notify_addr(net: &NetNamespace, dev: &NetDevice, ifa: &InIfaddr, ty: u16,
     };
     let mut nb = NlBuf::new(&mut v, ADDR_NLMSG_SIZE);
     if fill_addr(&mut nb, dev, ifa, ty, 0, nl.seq, nl.portid).is_ok() {
-        notify(net, v, RTNLGRP_IPV4_IFADDR);
+        rtnl_notify(net, v, RTNLGRP_IPV4_IFADDR, nl);
     }
 }
 
-/// RTM_NEWADDR (Linux inet_rtm_newaddr)
-fn newaddr(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
+/// The attributes of an address request, read as Linux's
+/// ifa_ipv4_policy validates them: every one before any other check
+struct IfaAttrs<'a> {
+    local: Option<Ipv4Addr>,
+    address: Option<Ipv4Addr>,
+    broadcast: Option<Ipv4Addr>,
+    label: Option<&'a str>,
+    flags: Option<u32>,
+    /// IFA_CACHEINFO's (preferred, valid) lifetimes
+    cacheinfo: Option<(u32, u32)>,
+    rt_priority: Option<u32>,
+    proto: Option<u8>,
+}
+
+fn ifa_attrs<'a>(a: &Attrs<'a>) -> Result<IfaAttrs<'a>, KernelError> {
+    let cacheinfo = a.min(IFA_CACHEINFO, 16)?.map(|ci| {
+        let w = |o: usize| u32::from_ne_bytes([ci[o], ci[o + 1], ci[o + 2], ci[o + 3]]);
+        (w(0), w(4))
+    });
+    Ok(IfaAttrs {
+        address: a.in_addr(IFA_ADDRESS)?,
+        local: a.in_addr(IFA_LOCAL)?,
+        label: a.str(IFA_LABEL, IFNAMSIZ)?,
+        broadcast: a.in_addr(IFA_BROADCAST)?,
+        cacheinfo,
+        flags: a.u32(IFA_FLAGS)?,
+        rt_priority: a.u32(IFA_RT_PRIORITY)?,
+        proto: a.u8(IFA_PROTO)?,
+    })
+}
+
+/// RTM_NEWADDR (Linux inet_rtm_newaddr, inet_validate_rtm)
+fn newaddr(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<Done, KernelError> {
     let ifm = ifaddrmsg(p)?;
-    let a = Attrs::parse(&p[IFADDRMSG_LEN..], IFA_MAX)?;
+    let a = Attrs::parse(&p[IFADDRMSG_LEN..], IFA_MAX)?.ext(ext);
+    let at = ifa_attrs(&a)?;
     if ifm.prefixlen > 32 {
+        ext.msg("ipv4: Invalid prefix length");
         return Err(KernelError::InvalidArgument);
     }
-    let local = a.in_addr(IFA_LOCAL)?.ok_or(KernelError::InvalidArgument)?;
-    if let Some(ci) = a.get(IFA_CACHEINFO) {
-        if ci.len() < 16 {
-            return Err(KernelError::InvalidArgument);
-        }
-        let w = |o: usize| u32::from_ne_bytes([ci[o], ci[o + 1], ci[o + 2], ci[o + 3]]);
-        let (prefered, valid) = (w(0), w(4));
-        if valid == 0 || prefered > valid {
-            return Err(KernelError::InvalidArgument);
-        }
+    let Some(local) = at.local else {
+        ext.msg("ipv4: Local address is not supplied");
+        return Err(KernelError::InvalidArgument);
+    };
+    if let Some((prefered, valid)) = at.cacheinfo
+        && (valid == 0 || prefered > valid)
+    {
+        ext.msg("ipv4: address lifetime invalid");
+        return Err(KernelError::InvalidArgument);
     }
     if local.is_unspecified() {
         return Ok(Done::Ok);
     }
     let net = sk.net();
     let r = rtnl::lock();
-    let dev = net
-        .dev_get_by_index(ifm.index)
-        .ok_or(KernelError::NoDevice)?;
+    let Some(dev) = net.dev_get_by_index(ifm.index) else {
+        ext.msg("ipv4: Device not found");
+        return Err(KernelError::NoDevice);
+    };
+    ifaddr::devconf_setall(&dev);
     let mut ifa = InIfaddr::new(local, ifm.prefixlen, dev.name());
-    ifa.address = a.in_addr(IFA_ADDRESS)?.unwrap_or(local);
-    ifa.set_flags(a.u32(IFA_FLAGS)?.unwrap_or(u32::from(ifm.flags)) | IFA_F_PERMANENT);
+    ifa.address = at.address.unwrap_or(local);
+    ifa.set_flags(at.flags.unwrap_or(u32::from(ifm.flags)) | IFA_F_PERMANENT);
     ifa.scope = ifm.scope;
-    if let Some(b) = a.in_addr(IFA_BROADCAST)? {
+    if let Some(b) = at.broadcast {
         ifa.broadcast = b;
     }
-    if let Some(l) = a.str(IFA_LABEL, IFNAMSIZ)? {
+    if let Some(l) = at.label {
         ifa.label = IfaLabel::new(l);
     }
-    ifa.set_rt_priority(a.u32(IFA_RT_PRIORITY)?.unwrap_or(0));
-    ifa.set_proto(a.u8(IFA_PROTO)?.unwrap_or(0));
+    ifa.set_rt_priority(at.rt_priority.unwrap_or(0));
+    ifa.set_proto(at.proto.unwrap_or(0));
     if ifaddr::find_matching_ifa(&dev, &ifa).is_none() {
-        ifaddr::inet_insert_ifa(&r, net, &dev, ifa, nl)?;
+        ifaddr::inet_insert_ifa(&r, net, &dev, ifa, nl, Some(ext))?;
     } else if h.flags & NLM_F_EXCL != 0 || h.flags & NLM_F_REPLACE == 0 {
+        ext.msg("ipv4: Address already assigned");
         return Err(KernelError::AlreadyExists);
     } else {
         ifaddr::inet_replace_ifa(&r, net, &dev, &ifa, nl);
@@ -1236,23 +1434,26 @@ fn newaddr(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
 }
 
 /// RTM_DELADDR (Linux inet_rtm_deladdr)
-fn deladdr(sk: &NlSock, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
+fn deladdr(sk: &NlSock, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<Done, KernelError> {
     let ifm = ifaddrmsg(p)?;
-    let a = Attrs::parse(&p[IFADDRMSG_LEN..], IFA_MAX)?;
-    let local = a.in_addr(IFA_LOCAL)?;
-    let label = a.str(IFA_LABEL, IFNAMSIZ)?;
-    let address = a.in_addr(IFA_ADDRESS)?;
+    let a = Attrs::parse(&p[IFADDRMSG_LEN..], IFA_MAX)?.ext(ext);
+    let at = ifa_attrs(&a)?;
+    let (local, label, address) = (at.local, at.label, at.address);
     let net = sk.net();
     let r = rtnl::lock();
-    let dev = net
-        .dev_get_by_index(ifm.index)
-        .ok_or(KernelError::NoDevice)?;
+    let Some(dev) = net.dev_get_by_index(ifm.index) else {
+        ext.msg("ipv4: Device not found");
+        return Err(KernelError::NoDevice);
+    };
     let victim = dev.in_dev().ifa_list.find(|x| {
         local.is_none_or(|l| l == x.local)
             && label.is_none_or(|l| l == x.label.as_str())
             && address.is_none_or(|ad| ifm.prefixlen == x.prefixlen && x.matches(ad))
     });
-    let ifa = victim.ok_or(KernelError::AddressNotAvailable)?;
+    let Some(ifa) = victim else {
+        ext.msg("ipv4: Address not found");
+        return Err(KernelError::AddressNotAvailable);
+    };
     ifaddr::inet_del_ifa(&r, net, &dev, &ifa, nl);
     Ok(Done::Ok)
 }
@@ -1288,16 +1489,10 @@ fn rtmsg(p: &[u8]) -> Result<RtMsg, KernelError> {
 }
 
 /// Request -> fib config (Linux rtm_to_fib_config)
-fn fib_config(h: &Hdr, p: &[u8], nl: NlInfo) -> Result<FibConfig, KernelError> {
+fn fib_config(h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<FibConfig, KernelError> {
     let rtm = rtmsg(p)?;
-    let a = Attrs::parse(&p[RTMSG_LEN..], RTA_MAX)?;
-    if rtm.rtype > fib::RTN_MAX {
-        return Err(KernelError::InvalidArgument);
-    }
-    if a.has(RTA_MULTIPATH) || a.has(RTA_NH_ID) {
-        return Err(KernelError::OperationNotSupported);
-    }
-    Ok(FibConfig {
+    let a = Attrs::parse(&p[RTMSG_LEN..], RTA_MAX)?.ext(ext);
+    let cfg = FibConfig {
         table: a.u32(RTA_TABLE)?.unwrap_or(u32::from(rtm.table)),
         dst: a.in_addr(RTA_DST)?.unwrap_or_default(),
         dst_len: rtm.dst_len,
@@ -1312,24 +1507,41 @@ fn fib_config(h: &Hdr, p: &[u8], nl: NlInfo) -> Result<FibConfig, KernelError> {
         flags: rtm.flags & 0xff,
         nlflags: h.flags,
         nl,
-    })
+    };
+    if rtm.rtype > fib::RTN_MAX {
+        ext.msg("Invalid route type");
+        return Err(KernelError::InvalidArgument);
+    }
+    if cfg.dst_len > 32 {
+        ext.msg("Invalid prefix length");
+        return Err(KernelError::InvalidArgument);
+    }
+    if cfg.dst.0 & !ifaddr::inet_make_mask(cfg.dst_len).0 != 0 {
+        ext.msg("Invalid prefix for given prefix length");
+        return Err(KernelError::InvalidArgument);
+    }
+    if a.has(RTA_MULTIPATH) || a.has(RTA_NH_ID) {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Ok(cfg)
 }
 
-fn newroute(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
-    let cfg = fib_config(h, p, nl)?;
+fn newroute(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<Done, KernelError> {
+    let cfg = fib_config(h, p, nl, ext)?;
     let r = rtnl::lock();
     fib::fib_table_insert(&r, sk.net(), &cfg)?;
     Ok(Done::Ok)
 }
 
-fn delroute(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
-    let cfg = fib_config(h, p, nl)?;
+fn delroute(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<Done, KernelError> {
+    let cfg = fib_config(h, p, nl, ext)?;
     let r = rtnl::lock();
     fib::fib_table_delete(&r, sk.net(), &cfg)?;
     Ok(Done::Ok)
 }
 
-/// Route dump filter (strict: table, RTM_F_CLONED = empty cache dump)
+/// Route dump filter (strict: table, RTM_F_CLONED = empty cache dump;
+/// Linux ip_valid_fib_dump_req)
 fn route_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
     if !strict {
         return DumpKind::Route(0);
@@ -1352,7 +1564,7 @@ fn route_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
             DumpKind::Route(t)
         }
         Ok(k) => k,
-        Err(e) => DumpKind::Bad(e),
+        Err(e) => DumpKind::Bad(e, None),
     }
 }
 
@@ -1370,6 +1582,19 @@ pub fn fill_route(
     seq: u32,
     pid: u32,
 ) -> Result<(), KernelError> {
+    fill_route_tb(nb, e, e.table, ty, flags, seq, pid)
+}
+
+/// [`fill_route`] reporting table `tb` (Linux fib_rt_info tb_id)
+fn fill_route_tb(
+    nb: &mut NlBuf<'_>,
+    e: &FibEntry,
+    tb: u32,
+    ty: u16,
+    flags: u16,
+    seq: u32,
+    pid: u32,
+) -> Result<(), KernelError> {
     let mut rflags = e.flags;
     if e.dead() {
         rflags |= RTNH_F_DEAD;
@@ -1377,11 +1602,7 @@ pub fn fill_route(
     if e.dev.as_ref().is_some_and(|d| !d.carrier_ok()) && e.rtype == RouteType::Unicast {
         rflags |= RTNH_F_LINKDOWN;
     }
-    let table8 = if e.table < 256 {
-        e.table as u8
-    } else {
-        RT_TABLE_COMPAT
-    };
+    let table8 = u8::try_from(tb).unwrap_or(RT_TABLE_COMPAT);
     let mut h = [0u8; RTMSG_LEN];
     h[0] = AF_INET;
     h[1] = e.dst_len;
@@ -1392,7 +1613,7 @@ pub fn fill_route(
     h[7] = e.rtype as u8;
     h[8..12].copy_from_slice(&rflags.to_ne_bytes());
     let m = nb.msg_put(ty, flags, seq, pid, &h)?;
-    match route_attrs(nb, e) {
+    match route_attrs(nb, e, tb) {
         Ok(()) => {
             nb.msg_end(m);
             Ok(())
@@ -1405,8 +1626,8 @@ pub fn fill_route(
 }
 
 /// A route's attributes (fib_dump_info's nla_puts)
-fn route_attrs(nb: &mut NlBuf<'_>, e: &FibEntry) -> Result<(), KernelError> {
-    nb.put_u32(RTA_TABLE, e.table)?;
+fn route_attrs(nb: &mut NlBuf<'_>, e: &FibEntry, tb: u32) -> Result<(), KernelError> {
+    nb.put_u32(RTA_TABLE, tb)?;
     if e.dst_len != 0 {
         nb.put(RTA_DST, &e.dst.to_be_bytes())?;
     }
@@ -1438,15 +1659,54 @@ fn route_msg(e: &FibEntry, ty: u16, seq: u32, pid: u32) -> Option<Vec<u8>> {
 /// dropped if no memory)
 pub fn notify_route(net: &NetNamespace, e: &FibEntry, ty: u16, nl: NlInfo) {
     if let Some(v) = route_msg(e, ty, nl.seq, nl.portid) {
-        notify(net, v, RTNLGRP_IPV4_ROUTE);
+        rtnl_notify(net, v, RTNLGRP_IPV4_ROUTE, nl);
+    }
+}
+
+/// The flow of a route get request (Linux inet_rtm_getroute's fl4):
+/// mark, uid (the caller's unless given), protocol (UDP unless given;
+/// only TCP, UDP, ICMP) and ports
+fn getroute_key(a: &Attrs<'_>, ext: &ExtAck) -> Result<route::OutKey, KernelError> {
+    const IPPROTO_ICMP: u8 = 1;
+    const IPPROTO_TCP: u8 = 6;
+    const IPPROTO_UDP: u8 = 17;
+    let proto = a.u8(RTA_IP_PROTO)?.unwrap_or(IPPROTO_UDP);
+    if !matches!(proto, IPPROTO_TCP | IPPROTO_UDP | IPPROTO_ICMP) {
+        // Linux rtm_getroute_parse_ip_proto
+        ext.msg("Unsupported ip proto");
+        return Err(KernelError::OperationNotSupported);
+    }
+    let port = |t| -> Result<u16, KernelError> {
+        Ok(a.min(t, 2)?.map_or(0, |p| u16::from_be_bytes([p[0], p[1]])))
+    };
+    Ok(route::OutKey {
+        mark: a.u32(RTA_MARK)?.unwrap_or(0),
+        uid: match a.u32(RTA_UID)? {
+            Some(u) => u,
+            None => crate::task::percpu::current_cred().uid,
+        },
+        proto,
+        sport: port(RTA_SPORT)?,
+        dport: port(RTA_DPORT)?,
+        anysrc: false,
+    })
+}
+
+/// The table a route get reports: the one looked up only with
+/// RTM_F_LOOKUP_TABLE, else main (Linux inet_rtm_getroute)
+fn lookup_table(flags: u32, hit: u32) -> u32 {
+    if flags & RTM_F_LOOKUP_TABLE != 0 {
+        hit
+    } else {
+        RT_TABLE_MAIN
     }
 }
 
 /// RTM_GETROUTE for one destination ("ip route get"; Linux
 /// inet_rtm_getroute, output routes only)
-fn getroute(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
+fn getroute(sk: &NlSock, h: &Hdr, p: &[u8], ext: &ExtAck) -> Result<Done, KernelError> {
     let rtm = rtmsg(p)?;
-    let a = Attrs::parse(&p[RTMSG_LEN..], RTA_MAX)?;
+    let a = Attrs::parse(&p[RTMSG_LEN..], RTA_MAX)?.ext(ext);
     if a.u32(RTA_IIF)?.unwrap_or(0) != 0 {
         // Input route simulation
         return Err(KernelError::OperationNotSupported);
@@ -1454,36 +1714,45 @@ fn getroute(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     let dst = a.in_addr(RTA_DST)?.unwrap_or_default();
     let src = a.in_addr(RTA_SRC)?.unwrap_or_default();
     let oif = a.u32(RTA_OIF)?.unwrap_or(0);
+    let k = getroute_key(&a, ext)?;
     let net = sk.net();
     if rtm.flags & RTM_F_FIB_MATCH != 0 {
+        // The flow the output lookup sees (Linux the same fl4)
         let key = FlowKey {
             daddr: dst,
+            saddr: src,
             oif,
+            iif: route::LOOPBACK_IFINDEX,
+            mark: k.mark,
+            uid: k.uid,
+            proto: k.proto,
+            sport: k.sport,
+            dport: k.dport,
             ..Default::default()
         };
         let e = net.fib.lookup(&key)?;
-        let m = route_msg(&e, RTM_NEWROUTE, h.seq, sk.portid()).ok_or(KernelError::OutOfMemory)?;
-        reply(sk, m);
+        let tb = lookup_table(rtm.flags, e.table);
+        let mut v = nlmsg_new(ROUTE_NLMSG_SIZE)?;
+        let mut nb = NlBuf::new(&mut v, ROUTE_NLMSG_SIZE);
+        fill_route_tb(&mut nb, &e, tb, RTM_NEWROUTE, 0, h.seq, sk.portid())?;
+        reply(sk, v);
         return Ok(Done::Ok);
     }
-    let rt = route::output(net, dst, src, oif)?;
-    reply(sk, fill_rt(&rt, src, h.seq, sk.portid()));
+    let rt = route::output_key(net, dst, src, oif, &k)?;
+    let table = lookup_table(rtm.flags, rt.table);
+    reply(sk, fill_rt(&rt, table, src, k.uid, h.seq, sk.portid()));
     Ok(Done::Ok)
 }
 
-/// RTM_NEWROUTE answer for an output route (Linux rt_fill_info)
-fn fill_rt(rt: &route::Rtable, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
-    let table = if rt.table != 0 {
-        rt.table
-    } else {
-        RT_TABLE_MAIN
-    };
+/// RTM_NEWROUTE answer for an output route, reporting `table` and the
+/// flow's `uid` (Linux rt_fill_info)
+fn fill_rt(rt: &route::Rtable, table: u32, src: Ipv4Addr, uid: u32, seq: u32, pid: u32) -> Vec<u8> {
     let mut m = Msg::new(RTM_NEWROUTE, 0, seq, pid);
     let mut hd = [0u8; RTMSG_LEN];
     hd[0] = AF_INET;
     hd[1] = 32;
     hd[2] = if src.is_unspecified() { 0 } else { 32 };
-    hd[4] = table as u8;
+    hd[4] = u8::try_from(table).unwrap_or(RT_TABLE_COMPAT);
     hd[7] = rt.rtype as u8;
     hd[8..12].copy_from_slice(&RTM_F_CLONED.to_ne_bytes());
     m.put(&hd)
@@ -1499,145 +1768,8 @@ fn fill_rt(rt: &route::Rtable, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
     if let Some(g) = rt.gateway {
         m.attr(RTA_GATEWAY, &g.to_be_bytes());
     }
-    let uid = crate::task::percpu::current_cred().uid;
     m.u32(RTA_UID, uid).attr(RTA_CACHEINFO, &[0u8; 32]);
     m.finish()
-}
-
-// ============================================================================
-// Neighbours
-// ============================================================================
-
-/// RTM_NEWNEIGH message for a neighbour (Linux neigh_fill_info)
-/// One neighbour as a message in `nb` (Linux neigh_fill_info):
-/// EMSGSIZE, nothing left behind, if it does not fit
-fn fill_neigh(
-    nb: &mut NlBuf<'_>,
-    e: &NeighInfo,
-    ty: u16,
-    flags: u16,
-    seq: u32,
-    pid: u32,
-) -> Result<(), KernelError> {
-    let mut h = [0u8; NDMSG_LEN];
-    h[0] = AF_INET;
-    h[4..8].copy_from_slice(&e.ifindex.to_ne_bytes());
-    h[8..10].copy_from_slice(&u16::from(e.state).to_ne_bytes());
-    h[11] = RouteType::Unicast as u8;
-    let m = nb.msg_put(ty, flags, seq, pid, &h)?;
-    match neigh_attrs(nb, e) {
-        Ok(()) => {
-            nb.msg_end(m);
-            Ok(())
-        }
-        Err(err) => {
-            nb.msg_cancel(m);
-            Err(err)
-        }
-    }
-}
-
-/// A neighbour's attributes (neigh_fill_info's nla_puts)
-fn neigh_attrs(nb: &mut NlBuf<'_>, e: &NeighInfo) -> Result<(), KernelError> {
-    nb.put(NDA_DST, &e.key[..4])?;
-    if e.state & nud::VALID != 0 {
-        nb.put(NDA_LLADDR, &e.ha)?;
-    }
-    // struct nda_cacheinfo: ages in clock_t
-    let mut ci = [0u8; 16];
-    ci[0..4].copy_from_slice(&(crate::time::ms_to_clock_t(e.confirmed) as u32).to_ne_bytes());
-    ci[4..8].copy_from_slice(&(crate::time::ms_to_clock_t(e.used) as u32).to_ne_bytes());
-    ci[8..12].copy_from_slice(&(crate::time::ms_to_clock_t(e.updated) as u32).to_ne_bytes());
-    nb.put_u32(NDA_PROBES, e.probes)?;
-    nb.put(NDA_CACHEINFO, &ci)
-}
-
-/// struct ndmsg fields and the request's attributes
-struct NdReq<'a> {
-    family: u8,
-    ifindex: u32,
-    state: u8,
-    attrs: Attrs<'a>,
-}
-
-fn ndmsg(p: &[u8]) -> Result<NdReq<'_>, KernelError> {
-    if p.len() < NDMSG_LEN {
-        return Err(KernelError::InvalidArgument);
-    }
-    Ok(NdReq {
-        family: p[0],
-        ifindex: u32::from_ne_bytes([p[4], p[5], p[6], p[7]]),
-        state: u16::from_ne_bytes([p[8], p[9]]) as u8,
-        attrs: Attrs::parse(&p[NDMSG_LEN..], NDA_MAX)?,
-    })
-}
-
-/// Device and key of a neighbour request (Linux neigh_add/neigh_delete
-/// checks, in their order): EINVAL without NDA_DST or a device,
-/// ENODEV for an unknown device, EAFNOSUPPORT for other families
-fn nd_target(
-    net: &NetNamespace,
-    r: &NdReq<'_>,
-) -> Result<(Arc<NetDevice>, neigh::Key), KernelError> {
-    let dst = r.attrs.get(NDA_DST).ok_or(KernelError::InvalidArgument)?;
-    let dev = match r.ifindex {
-        0 => None,
-        i => Some(net.dev_get_by_index(i).ok_or(KernelError::NoDevice)?),
-    };
-    if r.family != AF_INET {
-        return Err(KernelError::AddressFamilyNotSupported);
-    }
-    if dst.len() < 4 {
-        return Err(KernelError::InvalidArgument);
-    }
-    let dev = dev.ok_or(KernelError::InvalidArgument)?;
-    let a = Ipv4Addr::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]);
-    Ok((dev, neigh::key4(a)))
-}
-
-/// RTM_NEWNEIGH ("ip neigh add/replace/change"; Linux neigh_add)
-fn newneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
-    let r = ndmsg(p)?;
-    // Configuration change: under RTNL from the device lookup on (Linux
-    // neigh_add is a locked doit)
-    let _r = rtnl::lock();
-    let (dev, key) = nd_target(sk.net(), &r)?;
-    let ll = match r.attrs.get(NDA_LLADDR) {
-        Some(a) if a.len() < 6 => return Err(KernelError::InvalidArgument),
-        Some(a) => Some([a[0], a[1], a[2], a[3], a[4], a[5]]),
-        None => None,
-    };
-    crate::net::arp::arp_tbl().admin_add(&dev, &key, ll, r.state, h.flags)?;
-    Ok(Done::Ok)
-}
-
-/// RTM_DELNEIGH (Linux neigh_delete): ENOENT if absent
-fn delneigh(sk: &NlSock, p: &[u8]) -> Result<Done, KernelError> {
-    let r = ndmsg(p)?;
-    let (dev, key) = nd_target(sk.net(), &r)?;
-    let _r = rtnl::lock();
-    crate::net::arp::arp_tbl().admin_del(&dev, &key)?;
-    Ok(Done::Ok)
-}
-
-/// RTM_GETNEIGH for one entry (Linux neigh_get): ENOENT if absent
-fn getneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
-    let r = ndmsg(p)?;
-    let (dev, key) = nd_target(sk.net(), &r)?;
-    let e = crate::net::arp::arp_tbl()
-        .info(&dev, &key)
-        .ok_or(KernelError::NotFound)?;
-    let mut v = nlmsg_new(NEIGH_NLMSG_SIZE)?;
-    fill_neigh(
-        &mut NlBuf::new(&mut v, NEIGH_NLMSG_SIZE),
-        &e,
-        RTM_NEWNEIGH,
-        0,
-        h.seq,
-        sk.portid(),
-    )?;
-    reply(sk, v);
-    Ok(Done::Ok)
 }
 
 #[cfg(test)]
@@ -1659,7 +1791,7 @@ mod tests {
     #[test]
     fn ack_echoes() {
         let r = req(21);
-        let m = ack_msg(7, 9, &r, -22, true).unwrap();
+        let m = ack_msg(7, 9, &r, -22, true, &AckTlv::default()).unwrap();
         assert_eq!(m.len(), 16 + 4 + 24);
         assert_eq!(u32_at(&m, 0) as usize, m.len());
         assert_eq!(u16::from_ne_bytes([m[6], m[7]]), 0);
@@ -1672,7 +1804,7 @@ mod tests {
     #[test]
     fn ack_capped() {
         let r = req(40);
-        let m = ack_msg(1, 2, &r, 0, false).unwrap();
+        let m = ack_msg(1, 2, &r, 0, false, &AckTlv::default()).unwrap();
         assert_eq!(m.len(), 36);
         assert_eq!(u32_at(&m, 0), 36);
         assert_eq!(u16::from_ne_bytes([m[4], m[5]]), NLMSG_ERROR);
@@ -1686,9 +1818,50 @@ mod tests {
     #[test]
     fn ack_echo_too_big() {
         let r = req(MAX_KMALLOC - 8);
-        let m = ack_msg(1, 2, &r, -22, true).unwrap();
+        let m = ack_msg(1, 2, &r, -22, true, &AckTlv::default()).unwrap();
         assert_eq!(m.len(), 36);
         assert_eq!(u16::from_ne_bytes([m[6], m[7]]), NLM_F_CAPPED);
         assert_eq!(u32_at(&m, 16) as i32, -22);
+    }
+
+    /// Extended ACK attributes follow the (padded) request: the message
+    /// NUL-terminated, the offset as a u32, and NLM_F_ACK_TLVS is set
+    #[test]
+    fn ack_tlvs() {
+        let r = req(21);
+        let tlv = AckTlv {
+            msg: Some("abc"),
+            offs: Some(24),
+        };
+        let m = ack_msg(3, 4, &r, -34, true, &tlv).unwrap();
+        assert_eq!(m.len(), 16 + 4 + 24 + 8 + 8);
+        assert_eq!(u32_at(&m, 0) as usize, m.len());
+        assert_eq!(u16::from_ne_bytes([m[6], m[7]]), NLM_F_ACK_TLVS);
+        let a = Attrs::parse(&m[44..], 2).unwrap();
+        assert_eq!(a.get(NLMSGERR_ATTR_MSG), Some(&b"abc\0"[..]));
+        assert_eq!(a.u32(NLMSGERR_ATTR_OFFS).unwrap(), Some(24));
+        // Capped: the request header only
+        let m = ack_msg(3, 4, &r, -34, false, &tlv).unwrap();
+        assert_eq!(m.len(), 36 + 16);
+        assert_eq!(
+            u16::from_ne_bytes([m[6], m[7]]),
+            NLM_F_CAPPED | NLM_F_ACK_TLVS
+        );
+    }
+
+    /// An attribute offset is reported only inside the request's
+    /// payload (Linux nlmsg_check_in_payload)
+    #[test]
+    fn ext_offs() {
+        let r = req(40);
+        let ext = ExtAck::default();
+        assert_eq!(ext.offs(&r), None);
+        ext.bad_attr(&r[28..32]);
+        assert_eq!(ext.offs(&r), Some(24));
+        ext.bad_attr(&r[2..4]);
+        assert_eq!(ext.offs(&r), None);
+        let other = req(40);
+        ext.bad_attr(&other[28..32]);
+        assert_eq!(ext.offs(&r), None);
     }
 }

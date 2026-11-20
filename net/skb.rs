@@ -116,6 +116,12 @@ pub struct SkBuff {
     /// NETIF_F_HW_CSUM Linux uses; hk computes it anyway); seen by the
     /// packet taps (TP_STATUS_CSUMNOTREADY), kept as lo loops it back
     pub csum_partial: bool,
+    /// The sender saw forward progress: the next hop's neighbour entry
+    /// is confirmed as the packet goes out (Linux dst_pending_confirm,
+    /// skb_set_dst_pending_confirm; sock_confirm_neigh)
+    pub dst_pending_confirm: bool,
+    /// The received IP header's compiled options (Linux IPCB(skb)->opt)
+    pub ip_opt: crate::net::inet::options::OptMeta,
     /// Run when the skb is freed or orphaned (Linux skb->destructor
     /// with skb->sk: a TX ring frame's completion); not cloned
     pub destructor: Option<Box<dyn SkbDestructor>>,
@@ -159,6 +165,9 @@ pub enum SkbCb {
     /// A TCP segment: the sequence space it covers and its header
     /// fields (Linux TCP_SKB_CB)
     Tcp(TcpSkbCb),
+    /// A request waiting on a neighbour table's proxy queue (Linux
+    /// NEIGH_CB)
+    Neigh(crate::net::neigh::NeighCb),
     /// An AF_UNIX message (Linux UNIXCB and the skb's sock_wfree
     /// destructor); boxed, so every skb stays small (skbs are passed by
     /// value down the receive path)
@@ -178,6 +187,7 @@ impl SkbCb {
             Self::Nl(n) => Self::Nl(n.clone()),
             Self::Frag(f) => Self::Frag(*f),
             Self::Tcp(t) => Self::Tcp(*t),
+            Self::Neigh(n) => Self::Neigh(*n),
         }
     }
 }
@@ -424,6 +434,8 @@ impl SkBuff {
         self.ip_bcast = false;
         self.owner = 0;
         self.csum_partial = false;
+        self.dst_pending_confirm = false;
+        self.ip_opt = Default::default();
         self.destructor = None;
         self.mac = None;
         self.nh = None;
@@ -515,6 +527,8 @@ impl SkBuff {
             ip_tos: self.ip_tos,
             owner: self.owner,
             csum_partial: self.csum_partial,
+            dst_pending_confirm: self.dst_pending_confirm,
+            ip_opt: self.ip_opt,
             destructor: None,
             mac: self.mac,
             nh: self.nh,

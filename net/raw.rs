@@ -41,7 +41,7 @@ use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IP_HLEN_MIN, IPPROTO_ICMP, Ipv4Addr, ip_checksum, pmtu};
 use crate::net::mib::IPSTATS_MIB_OUTDISCARDS;
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, RecvMsg, SendMsg};
+use crate::net::msg::{MSG_CONFIRM, MSG_ERRQUEUE, MSG_OOB, MSG_PROBE, RecvMsg, SendMsg};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -149,7 +149,12 @@ impl RawSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)?;
+        // Linux raw_sendmsg's flowi4_init_output: the socket's
+        // protocol, no ports
+        let proto = u8::try_from(self.sk.protocol).unwrap_or(0);
+        let mut k = self.sk.out_key(proto, 0, 0);
+        k.anysrc = self.inet.anysrc();
+        let rt = route::output_key(&self.sk.net, daddr, saddr, oif, &k)?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
         }
@@ -159,9 +164,23 @@ impl RawSock {
     /// IP_HDRINCL send (Linux raw_send_hdrinc): at most the device MTU,
     /// a sane header length; source (if 0), total length, id (if 0)
     /// and checksum filled in
-    fn send_hdrinc(&self, rt: &route::Rtable, data: &[u8]) -> Result<(), KernelError> {
+    fn send_hdrinc(
+        &self,
+        rt: &route::Rtable,
+        data: &[u8],
+        confirm: bool,
+    ) -> Result<(), KernelError> {
+        let mtu = self.hdrinc_size(rt, data.len())?;
+        // Linux raw_send_hdrinc's error path past the size checks
+        self.xmit_hdrinc(rt, data, mtu, confirm)
+            .inspect_err(|_| self.sk.net.mib.ip.inc(IPSTATS_MIB_OUTDISCARDS))
+    }
+
+    /// raw_send_hdrinc's size checks of a `len`-byte packet (a probe
+    /// stops after them): the device MTU it may fill
+    fn hdrinc_size(&self, rt: &route::Rtable, len: usize) -> Result<usize, KernelError> {
         let mtu = rt.dev.mtu() as usize;
-        if data.len() > mtu {
+        if len > mtu {
             let e = KernelError::MessageTooLong;
             af_inet::ip_local_error(
                 &self.sk,
@@ -173,17 +192,21 @@ impl RawSock {
             );
             return Err(e);
         }
-        if data.len() < IP_HLEN_MIN {
+        if len < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
         }
-        // Linux raw_send_hdrinc's error path past the size checks
-        self.xmit_hdrinc(rt, data, mtu)
-            .inspect_err(|_| self.sk.net.mib.ip.inc(IPSTATS_MIB_OUTDISCARDS))
+        Ok(mtu)
     }
 
     /// The header of an IP_HDRINCL packet completed, then out along
     /// `rt` (without __ip_local_out, so not in OutRequests, as Linux)
-    fn xmit_hdrinc(&self, rt: &route::Rtable, data: &[u8], mtu: usize) -> Result<(), KernelError> {
+    fn xmit_hdrinc(
+        &self,
+        rt: &route::Rtable,
+        data: &[u8],
+        mtu: usize,
+        confirm: bool,
+    ) -> Result<(), KernelError> {
         let ihl = ((data[0] & 0x0f) as usize) * 4;
         if ihl > data.len() || ihl < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
@@ -191,6 +214,7 @@ impl RawSock {
         let mut skb =
             SkBuff::alloc_tx(data.len(), Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;
+        skb.dst_pending_confirm = confirm;
         let h = skb.data_mut();
         if h[12..16] == [0; 4] {
             h[12..16].copy_from_slice(&rt.saddr.to_be_bytes());
@@ -246,7 +270,7 @@ impl ProtoOps for RawSock {
                 ty,
                 RouteType::Local | RouteType::Multicast | RouteType::Broadcast
             )
-            || self.inet.flag(ipf::FREEBIND);
+            || self.inet.nonlocal_bind();
         if !ok {
             return Err(KernelError::AddressNotAvailable);
         }
@@ -371,7 +395,7 @@ impl ProtoOps for RawSock {
             return Err(KernelError::OperationNotSupported);
         }
         let daddr = self.dest(m)?;
-        let c = udp::tx_cmsgs(&m.control)?;
+        let c = udp::tx_cmsgs(&self.sk.net, &m.control)?;
         let a = self.inet.get();
         let oif = if c.oif != 0 {
             c.oif
@@ -383,13 +407,44 @@ impl ProtoOps for RawSock {
         } else {
             c.saddr
         };
-        let rt = self.route(daddr, saddr, oif)?;
+        // Linux raw_sendmsg: options (an IP_RETOPTS control message or
+        // the socket's IP_OPTIONS, even set empty) with IP_HDRINCL are
+        // EINVAL, as raw headers are not mangled; a source route goes
+        // to its first hop
+        let hdrincl = self.inet.flag(ipf::HDRINCL);
+        if hdrincl && (c.opt.is_some() || self.inet.options().is_some()) {
+            return Err(KernelError::InvalidArgument);
+        }
+        let opt = c.opt(&self.inet, daddr);
+        let hop = ipv4::TxOpt::first_hop(&opt, daddr);
+        let rt = self.route(hop, saddr, oif)?;
+        // Linux raw_sendmsg's do_confirm: fl4.daddr, the first hop
+        if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {
+            route::confirm_neigh(&rt, hop);
+            if len == 0 {
+                return Ok(0);
+            }
+        }
+        if hdrincl {
+            // Linux raw_send_hdrinc: a probe returns after the size
+            // checks
+            if flags & MSG_PROBE != 0 {
+                return self.hdrinc_size(&rt, len).map(|_| len);
+            }
+            let data = m.data.take(len)?;
+            if let Some(e) = self.sk.take_err() {
+                return Err(e);
+            }
+            let confirm = flags & MSG_CONFIRM != 0;
+            return self.send_hdrinc(&rt, &data, confirm).map(|()| len);
+        }
+        // Linux ip_append_data: a probe sends nothing
+        if flags & MSG_PROBE != 0 {
+            return Ok(len);
+        }
         let data = m.data.take(len)?;
         if let Some(e) = self.sk.take_err() {
             return Err(e);
-        }
-        if self.inet.flag(ipf::HDRINCL) {
-            return self.send_hdrinc(&rt, &data).map(|()| len);
         }
         // Linux ip_append_data's error path, then ip_send_skb's
         let discard = |e| {
@@ -407,6 +462,8 @@ impl ProtoOps for RawSock {
         let mut p = self.inet.params();
         p.tos = c.tos.unwrap_or(p.tos);
         p.ttl = c.ttl.unwrap_or(p.ttl);
+        p.confirm = flags & MSG_CONFIRM != 0;
+        p.opt = opt;
         match ipv4::ip_send_rt(&self.sk.net, &rt, skb, self.num as u8, p) {
             Err(KernelError::MessageTooLong) => {
                 let e = KernelError::MessageTooLong;
@@ -472,6 +529,54 @@ static RAW_TABLE: RawTable = RawTable {
 fn slot(net: &NetNamespace, proto: u16) -> &'static RcuHList<RawNode, RawLocked> {
     let h = (net.hash_mix ^ u32::from(proto)).wrapping_mul(0x61C8_8647) >> (32 - RAW_HTABLE_LOG);
     &RAW_TABLE.hash[h as usize]
+}
+
+/// `/proc/net/raw` of `net` (Linux raw_seq_show / raw_sock_seq_show):
+/// its sockets by chain, the protocol as the local port, addresses as
+/// raw network-order hex, state ESTABLISHED (1) when connected, else
+/// CLOSE (7); the pointer column 0 (kptr_restrict); generated under
+/// RCU into a buffer that never grows
+pub fn proc_net_raw(net: &NetNamespace) -> Vec<u8> {
+    use core::fmt::Write;
+    crate::fs::proc::seq::generate(|m| {
+        let _ = writeln!(
+            m,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
+        );
+        let raw = |a: Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
+        let g = crate::sync::rcu::read_lock();
+        for (i, head) in RAW_TABLE.hash.iter().enumerate() {
+            for s in head.iter(&g).filter(|s| s.sk.net.id == net.id) {
+                let a = s.inet.get();
+                let st = if s.connected.load(Ordering::Acquire) {
+                    1
+                } else {
+                    7
+                };
+                let _ = writeln!(
+                    m,
+                    "{:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {}",
+                    i,
+                    raw(a.rcv_saddr),
+                    s.num,
+                    raw(a.daddr),
+                    0,
+                    st,
+                    0,
+                    s.rxq.rmem(),
+                    0,
+                    0,
+                    0,
+                    s.sk.cred.euid,
+                    0,
+                    s.sk.ino.load(Ordering::Relaxed),
+                    2,
+                    0,
+                    s.sk.drops.load(Ordering::Relaxed)
+                );
+            }
+        }
+    })
 }
 
 /// Linux raw_hash_sk

@@ -56,7 +56,9 @@ use crate::net::inet::port::{BindInfo, Flow};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
 use crate::net::mib::*;
-use crate::net::msg::{MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, RecvMsg, SendMsg, cmsgs};
+use crate::net::msg::{
+    MSG_CONFIRM, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_PROBE, RecvMsg, SendMsg, cmsgs,
+};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -111,7 +113,13 @@ struct Cork {
     /// Bytes appended, the UDP header counted (Linux up->len)
     len: usize,
     data: Vec<u8>,
+    /// MSG_CONFIRM of the send that corked it (Linux __ip_append_data
+    /// marks the queue's first skb)
+    confirm: bool,
+    /// Its options (Linux cork->opt, ip_setup_cork)
+    opt: Option<ipv4::TxOpt>,
 }
+
 /// A UDP socket
 pub struct UdpSock {
     sk: Sock,
@@ -280,8 +288,14 @@ impl UdpSock {
         daddr: Ipv4Addr,
         saddr: Ipv4Addr,
         oif: u32,
+        dport: u16,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)
+        // Linux ip_route_connect / udp_sendmsg's flowi4_init_output
+        let mut k = self
+            .sk
+            .out_key(IPPROTO_UDP as u8, self.inet.get().sport, dport);
+        k.anysrc = self.inet.anysrc();
+        let rt = route::output_key(&self.sk.net, daddr, saddr, oif, &k)
             .inspect_err(|e| self.sk.net.mib.route_err(e))?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
@@ -330,7 +344,8 @@ impl UdpSock {
             m.name = Some(af_inet::sin_bytes(skb.saddr.unwrap_or_default(), cb.sport));
         }
         dgram::sock_cmsgs(&self.sk, m, skb.tstamp, skb.dropcount);
-        self.inet.recv_cmsgs(&mut m.cmsg, &cb.info);
+        self.inet
+            .recv_cmsgs(&self.sk.net, &mut m.cmsg, &cb.info, Some(skb));
         Ok(if flags & crate::net::msg::MSG_TRUNC != 0 {
             ulen
         } else {
@@ -476,6 +491,8 @@ impl UdpSock {
         let mut p = self.inet.params();
         p.tos = c.tos;
         p.ttl = c.ttl.unwrap_or(p.ttl);
+        p.confirm = c.confirm;
+        p.opt = c.opt;
         let sport = self.inet.get().sport;
         self.send_out(&c.rt, sport, c.dport, &c.data, p, c.gso)
     }
@@ -608,16 +625,27 @@ fn send_err(e: KernelError, recverr: bool) -> Option<KernelError> {
 }
 
 /// Per-message IP parameters from sendmsg control data (Linux
-/// ip_cmsg_send: IP_PKTINFO, IP_TTL, IP_TOS)
+/// ip_cmsg_send: IP_RETOPTS, IP_PKTINFO, IP_TTL, IP_TOS)
 #[derive(Default)]
 pub struct TxCmsg {
     pub oif: u32,
     pub saddr: Ipv4Addr,
     pub ttl: Option<u8>,
     pub tos: Option<u8>,
+    /// IP_RETOPTS: options for this datagram (Linux ipc->opt)
+    pub opt: Option<crate::net::inet::options::IpOptions>,
 }
 
-pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
+impl TxCmsg {
+    /// The datagram's options to `daddr`: the message's, else the
+    /// socket's (Linux udp_sendmsg / raw_sendmsg: ipc.opt, else a copy
+    /// of inet_opt)
+    pub fn opt(&self, inet: &Inet, daddr: Ipv4Addr) -> Option<ipv4::TxOpt> {
+        ipv4::TxOpt::of(self.opt.or_else(|| inet.options()), daddr)
+    }
+}
+
+pub fn tx_cmsgs(net: &crate::net::NetNamespace, c: &[u8]) -> Result<TxCmsg, KernelError> {
     let mut t = TxCmsg::default();
     for r in cmsgs(c) {
         let (level, ty, d) = r?;
@@ -641,6 +669,11 @@ pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
             }
         };
         match ty {
+            // Linux ip_cmsg_send: at most 40 bytes of it
+            af_inet::IP_RETOPTS => {
+                let n = d.len().min(crate::net::inet::options::MAX_OPTLEN);
+                t.opt = Some(af_inet::options_get(net, &d[..n])?);
+            }
             IP_PKTINFO => {
                 if d.len() != 12 {
                     return Err(KernelError::InvalidArgument);
@@ -736,7 +769,7 @@ impl ProtoOps for UdpSock {
         let _g = self.op.lock();
         self.autobind_locked()?;
         let cur = self.inet.get();
-        let rt = self.route(daddr, cur.saddr, self.sk.bound_dev_if())?;
+        let rt = self.route(daddr, cur.saddr, self.sk.bound_dev_if(), dport)?;
         // Linux __ip4_datagram_connect: addresses before the rehash
         let mut s = self.inet.addr.lock();
         s.daddr = rt.daddr;
@@ -848,6 +881,12 @@ impl ProtoOps for UdpSock {
         if self.pending.load(Ordering::Relaxed) {
             let mut g = self.op.lock();
             if g.is_some() {
+                // Linux ip_append_data: a probe appends nothing (and
+                // pushes the cork unless more is to come)
+                if flags & MSG_PROBE != 0 {
+                    self.append(&mut g, &[], 0, corkreq)?;
+                    return Ok(len);
+                }
                 // Linux do_append_data: any ip_append_data error (a
                 // fault copying the data included) drops the cork
                 let data = match m.data.take(len) {
@@ -866,7 +905,7 @@ impl ProtoOps for UdpSock {
         }
         let (daddr, dport, _connected) = self.dest(m)?;
         let gso = self.cmsg_gso(&m.control)?;
-        let c = tx_cmsgs(&m.control)?;
+        let c = tx_cmsgs(&self.sk.net, &m.control)?;
         let data = m.data.take(len)?;
         let a: InetAddr = self.inet.get();
         let oif = if c.oif != 0 {
@@ -879,7 +918,18 @@ impl ProtoOps for UdpSock {
         } else {
             c.saddr
         };
-        let rt = self.route(daddr, saddr, oif)?;
+        // Linux udp_sendmsg: a source route goes to its first hop
+        let opt = c.opt(&self.inet, daddr);
+        let hop = ipv4::TxOpt::first_hop(&opt, daddr);
+        let rt = self.route(hop, saddr, oif, dport)?;
+        // Linux udp_sendmsg's do_confirm; then ip_make_skb or
+        // ip_append_data send nothing for a probe
+        if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {
+            route::confirm_neigh(&rt, hop);
+        }
+        if flags & MSG_PROBE != 0 {
+            return Ok(len);
+        }
         // Linux sock_alloc_send_pskb, for the datagram's first skb (a
         // corked one's later appends allocate with no error check,
         // __ip_append_data with transhdrlen 0): a pending error first
@@ -890,6 +940,8 @@ impl ProtoOps for UdpSock {
             let mut p = self.inet.params();
             p.tos = c.tos.unwrap_or(p.tos);
             p.ttl = c.ttl.unwrap_or(p.ttl);
+            p.confirm = flags & MSG_CONFIRM != 0;
+            p.opt = opt;
             self.send_out(&rt, a.sport, dport, &data, p, gso)?;
             return Ok(len);
         }
@@ -911,6 +963,8 @@ impl ProtoOps for UdpSock {
             gso,
             len: 0,
             data: Vec::new(),
+            confirm: flags & MSG_CONFIRM != 0,
+            opt,
         });
         self.pending.store(true, Ordering::Relaxed);
         self.append(&mut g, &data, len + UDP_HLEN, corkreq)?;

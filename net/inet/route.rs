@@ -54,19 +54,93 @@ impl Rtable {
     }
 }
 
+/// Forward progress towards `daddr` along `rt`: confirm the next
+/// hop's neighbour entry, never making one (Linux ipv4_confirm_neigh,
+/// dst_confirm_neigh); nothing for a local, broadcast or multicast
+/// route without a gateway
+pub fn confirm_neigh(rt: &Rtable, daddr: Ipv4Addr) {
+    let key = match rt.gateway {
+        Some(gw) => gw,
+        None if matches!(
+            rt.rtype,
+            RouteType::Local | RouteType::Broadcast | RouteType::Multicast
+        ) =>
+        {
+            return;
+        }
+        None => daddr,
+    };
+    crate::net::arp::arp_tbl().confirm_key(&rt.dev, &crate::net::neigh::key4(key));
+}
+
+/// The output device of `net`'s forwarding route for `daddr` (Linux
+/// ip_route_input_slow's fib_lookup with forwarding on: an RTN_UNICAST
+/// result's FIB_RES_DEV); None for a martian destination or a route of
+/// another type
+pub fn input_fwd(net: &NetNamespace, daddr: Ipv4Addr) -> Option<Arc<NetDevice>> {
+    if zeronet(daddr) || daddr.is_broadcast() || daddr.is_multicast() || daddr.is_loopback() {
+        return None;
+    }
+    let key = FlowKey {
+        daddr,
+        oif: 0,
+        scope: crate::net::inet::ifaddr::RT_SCOPE_UNIVERSE,
+        ..Default::default()
+    };
+    let e = net.fib.lookup(&key).ok()?;
+    if e.rtype != RouteType::Unicast {
+        return None;
+    }
+    e.dev.clone()
+}
+
+/// lo's index (Linux LOOPBACK_IFINDEX): the input interface of an
+/// output lookup
+pub const LOOPBACK_IFINDEX: u32 = 1;
+
 fn zeronet(a: Ipv4Addr) -> bool {
     (a.0 >> 24) == 0
 }
 
-/// Route a locally generated packet to `daddr` from `saddr` (0 = pick
-/// one) through `oif` (0 = any); the MTU reflects a learned path MTU
+/// What an output lookup knows of its sender besides the addresses
+/// (Linux flowi4_init_output's mark, uid, proto and ports): a socket's
+/// SO_MARK and owner, its protocol and ports; zeros for packets of no
+/// socket (Linux sock_net_uid(net, NULL): the namespace's root, 0 here)
+#[derive(Clone, Copy, Default)]
+pub struct OutKey {
+    pub mark: u32,
+    pub uid: u32,
+    pub proto: u8,
+    pub sport: u16,
+    pub dport: u16,
+    /// `saddr` may be an address that is not local (Linux
+    /// FLOWI_FLAG_ANYSRC: IP_TRANSPARENT, IP_HDRINCL)
+    pub anysrc: bool,
+}
+
+/// Route a locally generated packet of no socket (`output_key` with
+/// zero mark, uid and ports)
 pub fn output(
     net: &NetNamespace,
     daddr: Ipv4Addr,
     saddr: Ipv4Addr,
     oif: u32,
 ) -> Result<Rtable, KernelError> {
-    let mut rt = output_fib(net, daddr, saddr, oif)?;
+    output_key(net, daddr, saddr, oif, &OutKey::default())
+}
+
+/// Route a locally generated packet to `daddr` from `saddr` (0 = pick
+/// one) through `oif` (0 = any), the rules seeing `k` (Linux
+/// ip_route_output_key_hash with the flow flowi4_init_output built);
+/// the MTU reflects a learned path MTU
+pub fn output_key(
+    net: &NetNamespace,
+    daddr: Ipv4Addr,
+    saddr: Ipv4Addr,
+    oif: u32,
+    k: &OutKey,
+) -> Result<Rtable, KernelError> {
+    let mut rt = output_fib(net, daddr, saddr, oif, k)?;
     // Linux __mkroute_output: find_exception on the nexthop, then
     // rt_bind_exception
     let genid = fnhe_genid(net);
@@ -86,14 +160,22 @@ fn output_fib(
     mut daddr: Ipv4Addr,
     mut saddr: Ipv4Addr,
     oif: u32,
+    k: &OutKey,
 ) -> Result<Rtable, KernelError> {
     let lo = || net.loopback().ok_or(KernelError::NetworkUnreachable);
     if !saddr.is_unspecified() {
-        let dev = src_dev(net, saddr)?;
+        if saddr.is_multicast() || saddr.is_broadcast() {
+            return Err(KernelError::InvalidArgument);
+        }
         // Multicast / limited broadcast without oif leave through the
         // source address's device
         if oif == 0 && (daddr.is_multicast() || daddr.is_broadcast()) {
-            return make(dev, daddr, saddr, None, 0);
+            return make(src_dev(net, saddr)?, daddr, saddr, None, 0);
+        }
+        // Linux ip_route_output_key_hash_rcu: a source not ours only
+        // with FLOWI_FLAG_ANYSRC
+        if !k.anysrc {
+            src_dev(net, saddr)?;
         }
     }
     let mut odev = None;
@@ -120,7 +202,14 @@ fn output_fib(
     }
     let key = FlowKey {
         daddr,
+        saddr,
         oif,
+        iif: LOOPBACK_IFINDEX,
+        mark: k.mark,
+        uid: k.uid,
+        proto: k.proto,
+        sport: k.sport,
+        dport: k.dport,
         ..Default::default()
     };
     let res = match net.fib.lookup(&key) {

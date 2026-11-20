@@ -175,7 +175,7 @@ fn selftest_thread(_arg: usize) {
                 let ifa = InIfaddr::new(extra, 24, lo.name());
                 check(
                     "netns_lo_addr",
-                    inet_insert_ifa(&r, &net, &lo, ifa, NlInfo::default()).is_ok(),
+                    inet_insert_ifa(&r, &net, &lo, ifa, NlInfo::default(), None).is_ok(),
                     0,
                 );
             }

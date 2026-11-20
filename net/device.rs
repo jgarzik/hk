@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::RwLock;
 
@@ -49,6 +49,29 @@ pub mod operstate {
     pub const IF_OPER_UNKNOWN: u8 = 0;
     pub const IF_OPER_DOWN: u8 = 2;
     pub const IF_OPER_UP: u8 = 6;
+}
+
+/// GSO/GRO limits (Linux include/linux/netdevice.h): indexes of
+/// `NetDevice::gso` and the bounds
+pub mod gso {
+    pub const GSO_MAX_SIZE_I: usize = 0;
+    pub const GSO_MAX_SEGS_I: usize = 1;
+    pub const GRO_MAX_SIZE_I: usize = 2;
+    pub const GSO_IPV4_MAX_SIZE_I: usize = 3;
+    pub const GRO_IPV4_MAX_SIZE_I: usize = 4;
+    pub const N: usize = 5;
+    pub const GSO_LEGACY_MAX_SIZE: u32 = 65536;
+    pub const GSO_MAX_SEGS: u32 = 65535;
+    pub const GSO_MAX_SIZE: u32 = 8 * GSO_MAX_SEGS;
+    pub const GRO_LEGACY_MAX_SIZE: u32 = 65536;
+    pub const GRO_MAX_SIZE: u32 = 8 * 65535;
+    pub const TSO_LEGACY_MAX_SIZE: u32 = 65536;
+    pub const TSO_MAX_SEGS: u32 = 65535;
+}
+
+/// A 6-byte address as the low bytes of a word
+fn mac_word(m: &[u8; 6]) -> u64 {
+    u64::from_le_bytes([m[0], m[1], m[2], m[3], m[4], m[5], 0, 0])
 }
 
 /// Link-layer types (Linux ARPHRD_*)
@@ -190,7 +213,8 @@ pub struct LinkInfo {
     pub flags: u32,
     /// Hardware broadcast address
     pub broadcast: [u8; 6],
-    /// Transmit queue length (reported only; there is no qdisc)
+    /// Initial transmit queue length (`NetDevice::txqlen` holds the
+    /// current one)
     pub txqlen: u32,
     /// Smallest MTU accepted
     pub min_mtu: u32,
@@ -277,6 +301,27 @@ pub struct NetDevice {
     /// Number of carrier transitions (IFLA_CARRIER_CHANGES)
     carrier_changes: AtomicU32,
 
+    /// Device group (IFLA_GROUP; Linux dev->group): set under RTNL,
+    /// read without it
+    group: AtomicU32,
+
+    /// Transmit queue length (IFLA_TXQLEN; Linux tx_queue_len): set
+    /// under RTNL, read without it
+    txqlen: AtomicU32,
+
+    /// Hardware broadcast address in the low 6 bytes (IFLA_BROADCAST;
+    /// Linux dev->broadcast): set under RTNL, read per received frame
+    broadcast: AtomicU64,
+
+    /// Alias (IFLA_IFALIAS; Linux dev->ifalias, RCU): replaced whole
+    /// under RTNL, a leaf lock for readers; empty when unset
+    ifalias: RwLock<Option<Arc<str>>>,
+
+    /// GSO/GRO limits (Linux gso_max_size, gso_max_segs,
+    /// gro_max_size, gso_ipv4_max_size, gro_ipv4_max_size): set under
+    /// RTNL, read without it
+    gso: [AtomicU32; gso::N],
+
     /// Promiscuity and allmulti users (AF_PACKET memberships; Linux
     /// dev->promiscuity / allmulti); changed under RTNL
     promiscuity: AtomicU32,
@@ -305,6 +350,7 @@ impl NetDevice {
         let mtu = ops.mtu();
         let max_mtu = ops.max_mtu();
         let flags = link.flags;
+        let (txqlen, bcast) = (link.txqlen, mac_word(&link.broadcast));
         Self {
             name,
             ifindex: AtomicU32::new(0),
@@ -320,6 +366,17 @@ impl NetDevice {
             carrier: AtomicBool::new(true),
             running: AtomicBool::new(false),
             carrier_changes: AtomicU32::new(0),
+            group: AtomicU32::new(0),
+            txqlen: AtomicU32::new(txqlen),
+            broadcast: AtomicU64::new(bcast),
+            ifalias: RwLock::new(None),
+            gso: [
+                AtomicU32::new(gso::GSO_LEGACY_MAX_SIZE),
+                AtomicU32::new(gso::GSO_MAX_SEGS),
+                AtomicU32::new(gso::GRO_LEGACY_MAX_SIZE),
+                AtomicU32::new(gso::GSO_LEGACY_MAX_SIZE),
+                AtomicU32::new(gso::GRO_LEGACY_MAX_SIZE),
+            ],
             promiscuity: AtomicU32::new(0),
             allmulti: AtomicU32::new(0),
             parent: spin::Once::new(),
@@ -385,6 +442,67 @@ impl NetDevice {
     /// Number of carrier transitions
     pub fn carrier_changes(&self) -> u32 {
         self.carrier_changes.load(Ordering::Relaxed)
+    }
+
+    /// Device group (IFLA_GROUP)
+    pub fn group(&self) -> u32 {
+        self.group.load(Ordering::Relaxed)
+    }
+
+    /// Set the group (Linux netif_set_group; RTNL held)
+    pub fn set_group(&self, _rtnl: &crate::net::rtnl::RtnlGuard, g: u32) {
+        self.group.store(g, Ordering::Relaxed);
+    }
+
+    /// Transmit queue length (reported only; there is no qdisc)
+    pub fn txqlen(&self) -> u32 {
+        self.txqlen.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn store_txqlen(&self, q: u32) {
+        self.txqlen.store(q, Ordering::Relaxed);
+    }
+
+    /// Hardware broadcast address
+    pub fn broadcast(&self) -> [u8; 6] {
+        let b = self.broadcast.load(Ordering::Relaxed).to_le_bytes();
+        [b[0], b[1], b[2], b[3], b[4], b[5]]
+    }
+
+    /// Set the broadcast address (RTNL held)
+    pub(crate) fn store_broadcast(&self, b: &[u8; 6]) {
+        self.broadcast.store(mac_word(b), Ordering::Relaxed);
+    }
+
+    /// The alias, if set
+    pub fn ifalias(&self) -> Option<Arc<str>> {
+        self.ifalias.read().clone()
+    }
+
+    /// Replace the alias (RTNL held); the old one is dropped after the
+    /// unlock
+    pub(crate) fn swap_ifalias(&self, a: Option<Arc<str>>) -> Option<Arc<str>> {
+        core::mem::replace(&mut *self.ifalias.write(), a)
+    }
+
+    /// GSO/GRO limit `i` (`gso::*` index)
+    pub fn gso(&self, i: usize) -> u32 {
+        self.gso[i].load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn store_gso(&self, i: usize, v: u32) {
+        self.gso[i].store(v, Ordering::Relaxed);
+    }
+
+    /// Largest TSO frame and segments the device takes (Linux
+    /// tso_max_size, tso_max_segs: lo GSO_MAX_SIZE, others the legacy
+    /// default)
+    pub fn tso_max(&self) -> (u32, u32) {
+        if self.link.dev_type == ARPHRD_LOOPBACK {
+            (gso::GSO_MAX_SIZE, gso::TSO_MAX_SEGS)
+        } else {
+            (gso::TSO_LEGACY_MAX_SIZE, gso::TSO_MAX_SEGS)
+        }
     }
 
     /// Get interface name

@@ -22,7 +22,7 @@ use super::cb::{
 use super::cong::AckSample;
 use super::mem;
 use super::output::HLEN;
-use super::recovery::{Rexmit, flag, tag};
+use super::recovery::{CaState, Rexmit, flag, tag};
 use super::sack::SackState;
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
@@ -171,7 +171,7 @@ impl TcpCb {
             for q in seqs {
                 self.mark_skb_lost(q);
             }
-            self.xmit_retransmit_queue(out);
+            self.non_congestion_loss_retransmit(out);
             self.net_stat(LINUX_MIB_TCPFASTOPENACTIVEFAIL);
             return true;
         }
@@ -236,15 +236,19 @@ impl TcpCb {
         // The handshake's RTT (Linux tcp_ack of the SYN-ACK,
         // tcp_synack_rtt_meas): our SYN's or SYN-ACK's unless it was
         // resent (Karn), else the timestamp echo; none: RFC 6298 5.7's
-        // 3 s (tcp_init_metrics)
-        let rtt = if self.syn_rtx {
-            -1
-        } else {
-            self.tcp_mstamp.saturating_sub(self.syn_mstamp) as i64
-        };
-        let mut st = SackState::default();
-        (st.seq_rtt_us, st.ca_rtt_us) = (rtt, rtt);
-        self.ack_update_rtt(s, flag::SYN_ACKED, &mut st);
+        // 3 s (tcp_init_metrics). A child measures only without an
+        // estimate yet (tcp_rcv_state_process: a Fast Open child's
+        // tcp_ack may have sampled the data it sent)
+        if !self.passive || self.srtt_us == 0 {
+            let rtt = if self.syn_rtx {
+                -1
+            } else {
+                self.tcp_mstamp.saturating_sub(self.syn_mstamp) as i64
+            };
+            let mut st = SackState::default();
+            (st.seq_rtt_us, st.ca_rtt_us) = (rtt, rtt);
+            self.ack_update_rtt(s, flag::SYN_ACKED, &mut st);
+        }
         if self.srtt_us == 0 {
             self.set_rto_fallback();
         }
@@ -253,17 +257,29 @@ impl TcpCb {
         self.live.tmr.set(None);
         self.rcv_tstamp = now;
         if self.tfo {
-            // Linux tcp_rcv_synrecv_state_fastopen: set up at creation;
-            // the request goes (reqsk_fastopen_remove), the RTO follows
-            // what the child sent meanwhile (tcp_rearm_rto)
-            self.tfo = false;
-            self.rearm_rto(now);
+            // Set up at creation
+            self.synrecv_fastopen(now);
         } else {
             self.init_transfer();
         }
         self.arm_keepalive(now);
         out.established = true;
         out.wake |= wake::STATE | wake::EST;
+    }
+
+    /// A Fast Open child's SYN-ACK was acknowledged, in SYN_RECEIVED or
+    /// FIN_WAIT_1 (Linux tcp_rcv_synrecv_state_fastopen): a SYN-ACK
+    /// timeout's loss state is undone if nothing is in flight, the
+    /// timeouts are over, the request goes (reqsk_fastopen_remove) and
+    /// the RTO follows what the child sent meanwhile (tcp_rearm_rto)
+    fn synrecv_fastopen(&mut self, now: u64) {
+        if self.ca_state == CaState::Loss && self.packets_out == 0 {
+            self.try_undo_recovery();
+        }
+        self.rtx_stamp = None;
+        self.live.retransmits.set(0);
+        self.tfo = false;
+        self.rearm_rto(now);
     }
 
     /// Linux tcp_sequence: the segment overlaps [RCV.NXT, RCV.NXT+WND]
@@ -448,9 +464,11 @@ impl TcpCb {
         } else {
             skb
         };
-        // A request, or a Fast Open child (Linux tcp_rcv_state_process
-        // runs tcp_check_req with fastopen for it too)
-        let req = self.passive && self.state == TcpState::SynReceived;
+        // A request, or a Fast Open child still holding its request, in
+        // SYN_RECEIVED or closed to FIN_WAIT_1 (Linux
+        // tcp_rcv_state_process runs tcp_check_req with fastopen for it
+        // too)
+        let req = self.passive && (self.state == TcpState::SynReceived || self.tfo);
         if req
             && s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)
@@ -587,17 +605,27 @@ impl TcpCb {
                 out.req_ack = Some(skb);
                 return;
             }
-            self.update_ts_recent(s);
-            // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
-            self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
-            self.snd_una = s.ack;
-            if !self.passive {
+            if self.passive {
+                // Linux tcp_create_openreq_child: the child's SND.UNA is
+                // past its SYN-ACK; tcp_rcv_state_process then runs
+                // tcp_ack(FLAG_SLOWPATH), which cleans what a Fast Open
+                // child sent meanwhile from the retransmit queue
+                self.snd_una = self.iss.wrapping_add(1);
+                self.syn_unacked = false;
+                if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
+                    return;
+                }
+            } else {
+                self.update_ts_recent(s);
+                // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
+                self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
+                self.snd_una = s.ack;
                 // Simultaneous open: our SYN is on the retransmit queue,
                 // acked in tcp_ack (tcp_clean_rtx_queue, TCPDelivered)
                 self.count_delivered(1);
                 self.net_stat(LINUX_MIB_TCPDELIVERED);
+                self.syn_unacked = false;
             }
-            self.syn_unacked = false;
             // SYN-ACK delivery, which tcp_ack does not track
             self.count_delivered(1);
             self.established(s, now, out);
@@ -612,8 +640,28 @@ impl TcpCb {
                 self.enter_quickack();
                 self.ack_now = true;
             }
-        } else if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
-            return;
+        } else {
+            if self.tfo {
+                // A Fast Open child closed in SYN_RECEIVED: its SND.UNA
+                // is past its SYN-ACK (Linux tcp_create_openreq_child),
+                // so an ACK not past it is old (tcp_ack's old_ack); one
+                // beyond SND.MAX acknowledges unsent data. Neither is
+                // acceptable (challenged), and both are refused before
+                // SND.UNA moves
+                if !after(s.ack, self.iss) || after(s.ack, self.snd_max) {
+                    self.challenge_ack(out);
+                    return;
+                }
+                self.snd_una = self.iss.wrapping_add(1);
+                self.syn_unacked = false;
+            }
+            if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
+                return;
+            }
+            if self.tfo {
+                // Linux tcp_rcv_state_process FIN_WAIT1 with fastopen_rsk
+                self.synrecv_fastopen(now);
+            }
         }
         if !self.after_ack(s, now, out) {
             return;
@@ -701,8 +749,9 @@ impl TcpCb {
 
     /// State changes once our FIN is acknowledged by `s`; false if the
     /// segment is consumed (Linux tcp_rcv_state_process: an orphan
-    /// reaching FIN_WAIT_2 may go to a timewait entry at once, unless
-    /// the segment brings data, which resets it as for a closed reader)
+    /// reaching FIN_WAIT_2 may go to a timewait entry at once; one with
+    /// TCP_LINGER2 negative, or whose segment brings data or a FIN
+    /// beyond RCV.NXT, is done with a reset)
     fn after_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
         if !self.fin_acked() {
             return true;
@@ -710,6 +759,7 @@ impl TcpCb {
         match self.state {
             TcpState::FinWait1 => {
                 self.set_state(TcpState::FinWait2);
+                self.dst_pending_confirm = true;
                 self.live.tmr.set(None);
                 out.wake |= wake::STATE;
                 let fin = s.has(flags::FIN);
@@ -717,18 +767,19 @@ impl TcpCb {
                 if !self.orphan {
                     return true;
                 }
-                if self.opts.linger2 < 0 {
+                let ooo = s.seq != s.end_seq && after(end, self.rcv_nxt);
+                if self.opts.linger2 < 0 || ooo {
                     // Linux tcp_done, TCPAbortOnData; the segment is
-                    // answered with a reset (tcp_v4_do_rcv)
+                    // answered with a reset (tcp_v4_do_rcv). An out of
+                    // order FIN after close() on an active Fast Open
+                    // connection pauses Fast Open
+                    out.tfo_disable |= self.opts.linger2 >= 0 && self.syn_fastopen && fin;
                     if let Some(r) = super::output::reset_for(s) {
                         self.reset_seg(r, out);
                     }
                     self.set_closed(out);
                     self.net_stat(LINUX_MIB_TCPABORTONDATA);
                     return false;
-                }
-                if s.seq != s.end_seq && after(end, self.rcv_nxt) {
-                    return true;
                 }
                 !self.orphan_fw2(now, fin, out)
             }
@@ -873,6 +924,10 @@ impl TcpCb {
         }
         if flg & flag::SET_XMIT_TIMER != 0 {
             self.set_xmit_timer(now);
+        }
+        if flg & flag::FORWARD_PROGRESS != 0 || flg & flag::NOT_DUP == 0 {
+            // Linux sk_dst_confirm
+            self.dst_pending_confirm = true;
         }
         let delivered = self.newly_delivered(prior_delivered);
         let lost = self.lost.wrapping_sub(prior_lost);

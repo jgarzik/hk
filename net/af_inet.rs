@@ -39,12 +39,16 @@ pub const SOL_IP: i32 = 0;
 pub const IP_TOS: i32 = 1;
 pub const IP_TTL: i32 = 2;
 pub const IP_HDRINCL: i32 = 3;
+pub const IP_OPTIONS: i32 = 4;
+pub const IP_RECVOPTS: i32 = 6;
+pub const IP_RETOPTS: i32 = 7;
 pub const IP_PKTINFO: i32 = 8;
 pub const IP_MTU_DISCOVER: i32 = 10;
 pub const IP_RECVERR: i32 = 11;
 pub const IP_RECVTTL: i32 = 12;
 pub const IP_RECVTOS: i32 = 13;
 pub const IP_MTU: i32 = 14;
+pub const IP_TRANSPARENT: i32 = 19;
 pub const IP_FREEBIND: i32 = 15;
 pub const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
 pub const IP_MULTICAST_TTL: i32 = 33;
@@ -99,6 +103,9 @@ pub struct Inet {
     mc_ttl: AtomicU8,
     /// IP id counter of a connected socket (Linux inet_id)
     id: AtomicU16,
+    /// IP_OPTIONS (Linux inet->inet_opt, RCU): copied out per packet
+    /// under this leaf lock
+    opt: Mutex<Option<crate::net::inet::options::IpOptions>>,
 }
 
 /// `Inet.flags` bits
@@ -111,6 +118,9 @@ pub mod ipf {
     pub const BIND_NO_PORT: u32 = 1 << 5;
     pub const MC_LOOP: u32 = 1 << 6;
     pub const HDRINCL: u32 = 1 << 7;
+    pub const TRANSPARENT: u32 = 1 << 8;
+    pub const RECVOPTS: u32 = 1 << 9;
+    pub const RETOPTS: u32 = 1 << 10;
 }
 
 impl Default for Inet {
@@ -123,6 +133,7 @@ impl Default for Inet {
             pmtudisc: AtomicU8::new(crate::net::ipv4::pmtu::WANT),
             mc_ttl: AtomicU8::new(1),
             id: AtomicU16::new(crate::random::get_random_u32() as u16),
+            opt: Mutex::new(None),
         }
     }
 }
@@ -172,6 +183,24 @@ impl Inet {
         self.pmtudisc.load(Ordering::Acquire)
     }
 
+    /// It may bind an address that is not local (Linux
+    /// inet_can_nonlocal_bind: IP_FREEBIND or IP_TRANSPARENT)
+    pub fn nonlocal_bind(&self) -> bool {
+        self.flag(ipf::FREEBIND) || self.flag(ipf::TRANSPARENT)
+    }
+
+    /// Its routes may use a source address that is not local (Linux
+    /// inet_sk_flowi_flags: FLOWI_FLAG_ANYSRC for IP_TRANSPARENT or
+    /// IP_HDRINCL)
+    pub fn anysrc(&self) -> bool {
+        self.flag(ipf::TRANSPARENT) || self.flag(ipf::HDRINCL)
+    }
+
+    /// Its IP_OPTIONS (Linux inet_opt)
+    pub fn options(&self) -> Option<crate::net::inet::options::IpOptions> {
+        *self.opt.lock()
+    }
+
     /// IP parameters of the next packet (Linux ip_select_ident_segs:
     /// a connected socket numbers its packets from its own counter)
     pub fn params(&self) -> IpParams {
@@ -182,6 +211,11 @@ impl Inet {
             pmtudisc: self.pmtudisc(),
             id: connected.then(|| self.id.fetch_add(1, Ordering::Relaxed)),
             icmp_type: None,
+            confirm: false,
+            anysrc: self.anysrc(),
+            opt: None,
+            mark: 0,
+            uid: 0,
         }
     }
 
@@ -204,6 +238,8 @@ impl Inet {
             IP_FREEBIND => Some(ipf::FREEBIND),
             IP_BIND_ADDRESS_NO_PORT => Some(ipf::BIND_NO_PORT),
             IP_MULTICAST_LOOP => Some(ipf::MC_LOOP),
+            IP_RECVOPTS => Some(ipf::RECVOPTS),
+            IP_RETOPTS => Some(ipf::RETOPTS),
             _ => None,
         };
         if let Some(f) = bool_flag {
@@ -211,6 +247,27 @@ impl Inet {
             return Ok(());
         }
         match opt {
+            // Linux do_ip_setsockopt: at most 40 bytes, ip_options_get
+            IP_OPTIONS => {
+                if v.len > crate::net::inet::options::MAX_OPTLEN {
+                    return Err(KernelError::InvalidArgument);
+                }
+                let user = v.bytes(crate::net::inet::options::MAX_OPTLEN)?;
+                let o = options_get(&sk.net, &user)?;
+                *self.opt.lock() = Some(o);
+            }
+            // Linux do_ip_setsockopt: turning it on needs CAP_NET_RAW or
+            // CAP_NET_ADMIN
+            IP_TRANSPARENT => {
+                let on = v.int_or_byte()? != 0;
+                if on
+                    && !crate::task::capable(crate::task::CAP_NET_RAW)
+                    && !crate::task::capable(crate::task::CAP_NET_ADMIN)
+                {
+                    return Err(KernelError::NotPermitted);
+                }
+                self.set_flag(ipf::TRANSPARENT, on);
+            }
             // Linux do_ip_setsockopt: raw sockets only
             IP_HDRINCL if sk.stype != SOCK_RAW => return Err(KernelError::NoProtocolOption),
             IP_HDRINCL => self.set_hdrincl(v.int_or_byte()? != 0),
@@ -264,14 +321,34 @@ impl Inet {
             IP_MULTICAST_TTL => i32::from(self.mc_ttl.load(Ordering::Acquire)),
             IP_MULTICAST_LOOP => i32::from(self.flag(ipf::MC_LOOP)),
             IP_HDRINCL => i32::from(self.flag(ipf::HDRINCL)),
+            IP_TRANSPARENT => i32::from(self.flag(ipf::TRANSPARENT)),
+            IP_RECVOPTS => i32::from(self.flag(ipf::RECVOPTS)),
+            IP_RETOPTS => i32::from(self.flag(ipf::RETOPTS)),
+            // Linux: the options as given (ip_options_undo), cut to the
+            // buffer
+            IP_OPTIONS => {
+                let Some(mut o) = self.options().filter(|o| o.m.optlen != 0) else {
+                    return Ok(OptOut::Bytes(Vec::new()));
+                };
+                crate::net::inet::options::undo(&mut o);
+                return Ok(OptOut::Bytes(o.bytes().to_vec()));
+            }
             _ => return Err(KernelError::NoProtocolOption),
         };
         Ok(OptOut::Int(v))
     }
 
     /// Receive control messages for a datagram (Linux
-    /// ip_cmsg_recv_offset): IP_PKTINFO, IP_TTL, IP_TOS
-    pub fn recv_cmsgs(&self, c: &mut Cmsg, info: &RxInfo) {
+    /// ip_cmsg_recv_offset): IP_PKTINFO, IP_TTL, IP_TOS, then the
+    /// received options as they came (IP_RECVOPTS) and as a reply
+    /// would carry them (IP_RETOPTS) when `skb` is the datagram
+    pub fn recv_cmsgs(
+        &self,
+        net: &crate::net::NetNamespace,
+        c: &mut Cmsg,
+        info: &RxInfo,
+        skb: Option<&crate::net::skb::SkBuff>,
+    ) {
         if self.flag(ipf::PKTINFO) {
             let mut b = [0u8; 12];
             b[..4].copy_from_slice(&info.ifindex.to_ne_bytes());
@@ -284,6 +361,29 @@ impl Inet {
         }
         if self.flag(ipf::RECVTOS) {
             c.put(SOL_IP, IP_TOS, &[info.tos]);
+        }
+        let Some(skb) = skb.filter(|s| s.ip_opt.optlen != 0) else {
+            return;
+        };
+        let Some(h) = skb.network_packet() else {
+            return;
+        };
+        let n = usize::from(skb.ip_opt.optlen);
+        if self.flag(ipf::RECVOPTS) {
+            // Linux ip_cmsg_recv_opts
+            let hl = crate::net::ipv4::IP_HLEN_MIN;
+            c.put(SOL_IP, IP_RECVOPTS, &h[hl..hl + n]);
+        }
+        if self.flag(ipf::RETOPTS) {
+            // Linux ip_cmsg_recv_retopts
+            let at = |a| net.fib.addr_type(a);
+            match crate::net::inet::options::echo(h, &skb.ip_opt, &at) {
+                Ok(mut o) => {
+                    crate::net::inet::options::undo(&mut o);
+                    c.put(SOL_IP, IP_RETOPTS, o.bytes());
+                }
+                Err(_) => c.trunc = true,
+            }
         }
     }
 }
@@ -357,12 +457,23 @@ pub fn sin_parse(a: &[u8], unspec_ok: bool) -> Result<(Ipv4Addr, u16), KernelErr
     Ok((addr, port))
 }
 
+/// A sender's options from `user` bytes in `net` (Linux
+/// ip_options_get; CAP_NET_RAW asked only where needed)
+pub fn options_get(
+    net: &crate::net::NetNamespace,
+    user: &[u8],
+) -> Result<crate::net::inet::options::IpOptions, KernelError> {
+    let at = |a| net.fib.addr_type(a);
+    let cap = || crate::task::capable(crate::task::CAP_NET_RAW);
+    crate::net::inet::options::get(user, &cap, &at)
+}
+
 /// Ports below this need CAP_NET_BIND_SERVICE (ip_unprivileged_port_start)
 const PROT_SOCK: u16 = 1024;
 
 /// bind() address/port checks shared by UDP and TCP (Linux
 /// __inet_bind): AF_UNSPEC only with INADDR_ANY; EADDRNOTAVAIL for an
-/// address that is not local (unless IP_FREEBIND); EACCES for a
+/// address that is not local (unless IP_FREEBIND or IP_TRANSPARENT); EACCES for a
 /// privileged port. Returns (address, port, address type).
 pub fn bind_check(
     sk: &Sock,
@@ -387,7 +498,7 @@ pub fn bind_check(
             ty,
             RouteType::Local | RouteType::Multicast | RouteType::Broadcast
         )
-        || inet.flag(ipf::FREEBIND);
+        || inet.nonlocal_bind();
     if !ok {
         return Err(KernelError::AddressNotAvailable);
     }
@@ -493,7 +604,7 @@ pub fn ip_recv_error(
     if e.origin == crate::net::sock::EE_ORIGIN_ICMP {
         ee[16..32].copy_from_slice(&sin_bytes(e.offender, 0)[..16]);
         if let Some(rx) = &e.rx {
-            inet.recv_cmsgs(&mut m.cmsg, rx);
+            inet.recv_cmsgs(&sk.net, &mut m.cmsg, rx, None);
         }
     }
     m.cmsg.put(SOL_IP, IP_RECVERR, &ee);

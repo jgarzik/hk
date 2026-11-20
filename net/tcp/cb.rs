@@ -1045,7 +1045,8 @@ pub struct TcpCb {
     /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
     /// processed as tcp_child_process does
     pub(super) req_full: bool,
-    /// A listener's Fast Open child still in SYN_RECEIVED (Linux
+    /// A listener's Fast Open child whose SYN-ACK is not acknowledged
+    /// yet, in SYN_RECEIVED or closed to FIN_WAIT_1 (Linux
     /// tp->fastopen_rsk): already accepted, it may send and receive
     pub tfo: bool,
     /// The Fast Open child left SYN_RECEIVED by a valid RST (Linux
@@ -1158,6 +1159,10 @@ pub struct TcpCb {
     /// Last ICMP error (Linux sk_err_soft), reported if the connection
     /// times out; an acceptable ACK clears it
     pub soft_err: Option<KernelError>,
+    /// The peer showed forward progress: the next segment out confirms
+    /// the next hop's neighbour, which clears it (Linux
+    /// sk_dst_pending_confirm, sk_dst_confirm)
+    pub dst_pending_confirm: bool,
     /// The timeout of the timewait entry it is handed to (ms; Linux
     /// tcp_time_wait's timeo)
     pub(super) tw_timeo: u64,
@@ -1312,6 +1317,7 @@ impl TcpCb {
             dack: Default::default(),
             orphan: Default::default(),
             soft_err: Default::default(),
+            dst_pending_confirm: false,
             tw_timeo: TIMEWAIT_LEN,
             owned: false,
             ack_now: Default::default(),
@@ -1487,6 +1493,8 @@ impl TcpCb {
         self.tfo = true;
         self.req_full = true;
         self.init_transfer();
+        // Linux keeps rcv_wnd, a length: the edge moves with RCV.NXT
+        let wnd = self.rcv_wnd_adv();
         let len = data.len();
         if len != 0 {
             data.dev = None;
@@ -1505,6 +1513,7 @@ impl TcpCb {
             out.wake |= wake::DATA;
         }
         self.rcv_wup = self.rcv_nxt;
+        self.rcv_adv = self.rcv_nxt.wrapping_add(wnd);
         self.synack_send(now, out);
     }
 
@@ -2284,14 +2293,15 @@ impl TcpCb {
         if self.rcv_wscale != 0 {
             return ((free + unit - 1) & !(unit - 1)) as u32;
         }
-        let window = self.rcv_wnd_adv();
-        // Linux compares the u32 window with the int free - mss
-        if window <= (free - mss) as i32 as u32 || i64::from(window) > free {
+        // Linux's window is an int: free - mss, negative while free is
+        // below the MSS estimate, compares signed
+        let window = i64::from(self.rcv_wnd_adv() as i32);
+        if window <= free - mss || window > free {
             (free - free % mss) as u32
-        } else if mss == full && free > i64::from(window) + (full >> 1) {
+        } else if mss == full && free > window + (full >> 1) {
             free as u32
         } else {
-            window
+            window as u32
         }
     }
 

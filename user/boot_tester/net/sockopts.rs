@@ -24,7 +24,61 @@ pub fn run_tests() {
     test_timeo();
     test_bindtodevice();
     test_ip_opts();
+    test_transparent();
     test_tcp_opts();
+}
+
+const IP_FREEBIND: i32 = 15;
+const IP_TRANSPARENT: i32 = 19;
+/// Not an address of ours
+const FOREIGN: [u8; 4] = [10, 99, 99, 1];
+
+/// IP_TRANSPARENT (Linux): turning it on needs CAP_NET_RAW or
+/// CAP_NET_ADMIN; it allows binding an address that is not ours (as
+/// IP_FREEBIND) and, unlike IP_FREEBIND, sending from it
+/// (FLOWI_FLAG_ANYSRC: without it the route is ENETUNREACH)
+fn test_transparent() {
+    let mut t = T::new(b"SOCKOPT_TRANSPARENT");
+    let u = udp();
+    t.eq(b"default", getint(u, SOL_IP, IP_TRANSPARENT).1 as i64, 0);
+    t.eq(b"foreign bind", bind(u, FOREIGN, 0), EADDRNOTAVAIL);
+    t.eq(b"set", setint(u, SOL_IP, IP_TRANSPARENT, 1), 0);
+    t.eq(b"get", getint(u, SOL_IP, IP_TRANSPARENT).1 as i64, 1);
+    t.eq(b"bind", bind(u, FOREIGN, 0), 0);
+    let (r, rp) = udp_lo();
+    t.eq(b"send", send_to(u, b"tp", LO, rp, 0), 2);
+    let mut buf = [0u8; 8];
+    let mut got = (-1, [0u8; 4], 0u16);
+    for _ in 0..20 {
+        got = recv_from(r, &mut buf, MSG_DONTWAIT);
+        if got.0 >= 0 {
+            break;
+        }
+        crate::net::nl::msleep(10);
+    }
+    t.ok(b"from foreign", got.0 == 2 && got.1 == FOREIGN, got.0);
+    close(u);
+    // IP_FREEBIND binds it, but its route needs the source to be ours
+    let f = udp();
+    t.eq(b"freebind", setint(f, SOL_IP, IP_FREEBIND, 1), 0);
+    t.eq(b"freebind bind", bind(f, FOREIGN, 0), 0);
+    t.eq(b"freebind send", send_to(f, b"x", LO, rp, 0), ENETUNREACH);
+    close(f);
+    close(r);
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(65534, 65534, 65534) != 0 {
+            sys_exit(90);
+        }
+        let u = udp();
+        let on = setint(u, SOL_IP, IP_TRANSPARENT, 1);
+        let off = setint(u, SOL_IP, IP_TRANSPARENT, 0);
+        sys_exit(if on == EPERM && off == 0 { 0 } else { 1 });
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.eq(b"unprivileged", st as i64, 0);
+    t.done();
 }
 
 const TCP_NODELAY: i32 = 1;

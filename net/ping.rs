@@ -39,7 +39,7 @@ use crate::net::icmp::{IcmpErr, icmp_type};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IPPROTO_ICMP, Ipv4Addr, ip_checksum};
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, MSG_TRUNC, RecvMsg, SendMsg};
+use crate::net::msg::{MSG_CONFIRM, MSG_ERRQUEUE, MSG_OOB, MSG_PROBE, MSG_TRUNC, RecvMsg, SendMsg};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -161,7 +161,12 @@ impl PingSock {
         saddr: Ipv4Addr,
         oif: u32,
     ) -> Result<route::Rtable, KernelError> {
-        let rt = route::output(&self.sk.net, daddr, saddr, oif)
+        // Linux ping_v4_sendmsg's flowi4_init_output: the socket's
+        // protocol, no ports
+        let proto = u8::try_from(self.sk.protocol).unwrap_or(0);
+        let mut k = self.sk.out_key(proto, 0, 0);
+        k.anysrc = self.inet.anysrc();
+        let rt = route::output_key(&self.sk.net, daddr, saddr, oif, &k)
             .inspect_err(|e| self.sk.net.mib.route_err(e))?;
         if rt.rtype == RouteType::Broadcast && !self.sk.flag(sf::BROADCAST) {
             return Err(KernelError::PermissionDenied);
@@ -212,7 +217,7 @@ fn check_bind_addr(sk: &Sock, inet: &Inet, a: &[u8]) -> Result<(Ipv4Addr, u16), 
     match sk.net.fib.addr_type(addr) {
         RouteType::Multicast | RouteType::Broadcast => Err(KernelError::AddressNotAvailable),
         RouteType::Local => Ok((addr, port)),
-        _ if inet.flag(af_inet::ipf::FREEBIND) => Ok((addr, port)),
+        _ if inet.nonlocal_bind() => Ok((addr, port)),
         _ => Err(KernelError::AddressNotAvailable),
     }
 }
@@ -349,7 +354,7 @@ impl ProtoOps for PingSock {
             return Err(KernelError::InvalidArgument);
         }
         let daddr = self.dest(m)?;
-        let c = udp::tx_cmsgs(&m.control)?;
+        let c = udp::tx_cmsgs(&self.sk.net, &m.control)?;
         let a = self.inet.get();
         let oif = if c.oif != 0 {
             c.oif
@@ -361,7 +366,18 @@ impl ProtoOps for PingSock {
         } else {
             c.saddr
         };
-        let rt = self.route(daddr, saddr, oif)?;
+        // Linux ping_v4_sendmsg: a source route goes to its first hop
+        let opt = c.opt(&self.inet, daddr);
+        let hop = ipv4::TxOpt::first_hop(&opt, daddr);
+        let rt = self.route(hop, saddr, oif)?;
+        // Linux ping_v4_sendmsg's do_confirm (len is never 0); then
+        // ip_append_data sends nothing for a probe
+        if flags & MSG_PROBE != 0 {
+            if flags & MSG_CONFIRM != 0 {
+                route::confirm_neigh(&rt, hop);
+            }
+            return Ok(len);
+        }
         if let Some(e) = self.sk.take_err() {
             return Err(e);
         }
@@ -374,6 +390,8 @@ impl ProtoOps for PingSock {
         let mut p = self.inet.params();
         p.tos = c.tos.unwrap_or(p.tos);
         p.ttl = c.ttl.unwrap_or(p.ttl);
+        p.confirm = flags & MSG_CONFIRM != 0;
+        p.opt = opt;
         match ipv4::ip_send_rt(&self.sk.net, &rt, skb, IPPROTO_ICMP, p) {
             Err(KernelError::MessageTooLong) => {
                 let e = KernelError::MessageTooLong;
@@ -444,6 +462,59 @@ static PING_TABLE: PingTable = PingTable {
 pub struct PingNet {
     /// Last identifier handed out
     rover: AtomicU16,
+}
+
+/// `/proc/net/icmp` of `net` (Linux ping_v4_seq_show /
+/// ping_v4_format_sock): its bound ping sockets by chain, the echo
+/// identifier as the local port, addresses as raw network-order hex,
+/// state ESTABLISHED (1) when connected, else CLOSE (7), lines padded
+/// to 127 columns; the pointer column 0 (kptr_restrict); generated
+/// under RCU into a buffer that never grows
+pub fn proc_net_icmp(net: &NetNamespace) -> Vec<u8> {
+    use core::fmt::Write;
+    crate::fs::proc::seq::generate(|m| {
+        m.setwidth(127);
+        let _ = write!(
+            m,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
+        );
+        m.pad('\n');
+        let raw = |a: crate::net::Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
+        let g = crate::sync::rcu::read_lock();
+        for (i, head) in PING_TABLE.hash.iter().enumerate() {
+            for s in head.iter(&g).filter(|s| s.sk.net.id == net.id) {
+                let a = s.inet.get();
+                let st = if s.connected.load(Ordering::Acquire) {
+                    1
+                } else {
+                    7
+                };
+                m.setwidth(127);
+                let _ = write!(
+                    m,
+                    "{:5}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {}",
+                    i,
+                    raw(a.rcv_saddr),
+                    a.sport,
+                    raw(a.daddr),
+                    a.dport,
+                    st,
+                    0,
+                    s.rxq.rmem(),
+                    0,
+                    0,
+                    0,
+                    s.sk.cred.euid,
+                    0,
+                    s.sk.ino.load(Ordering::Relaxed),
+                    2,
+                    0,
+                    s.sk.drops.load(Ordering::Relaxed)
+                );
+                m.pad('\n');
+            }
+        }
+    })
 }
 
 /// Linux ping_hashslot: the identifier plus the namespace's random mix

@@ -11,6 +11,7 @@ phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |
 |---|-------|----------|
+| 0 | NW — network sweep close-out | bugs first: the network sweep's open items |
 | 1 | Y — tty and console core | prerequisite of devpts (2) and VT (5) |
 | 2 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
 | 3 | I — Debian networking | DEB_NET |
@@ -31,6 +32,17 @@ typed register vocabulary, Ethernet engine, chip descriptions, signed
 driver packages and loader, native escape modules). Only its
 preparatory items are in the phases above (M4, D's firmware
 loading); HADL itself waits for the owner's go-ahead.
+
+## 0. NW — network sweep close-out
+
+The rest of the network sweep, paused unstarted: classic socket
+filters on every socket (SO_ATTACH_FILTER / SO_GET_FILTER beyond
+AF_PACKET: tcp_filter, UDP, raw, ping, unix, netlink); the
+rtnetlink and IP items left in BUGS.md (link rename and netns moves,
+operstate/linkmode, address lifetimes, promote_secondaries,
+`ip route get iif`, multipath and nexthop objects, IP options on
+TCP, mq_notify SIGEV_THREAD); then an audit of the network parsers
+added by the sweep (lengths, panics, copy-outs, per-user limits).
 
 ## 1. Y — tty and console core
 

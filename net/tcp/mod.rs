@@ -183,8 +183,8 @@ struct Inner {
     bound: bool,
     /// The listener of a child still in SYN_RECEIVED
     parent: Option<Weak<TcpSock>>,
-    /// The listener whose Fast Open queue counts this child while it is
-    /// in SYN_RECEIVED (Linux fastopen_rsk->rsk_listener)
+    /// The listener whose Fast Open queue counts this child while it
+    /// holds its request (Linux fastopen_rsk->rsk_listener)
     tfo_parent: Option<Weak<TcpSock>>,
     /// The deadline (ms) each of `TcpSock.timers` was last armed for
     armed: [Option<u64>; 3],
@@ -254,8 +254,8 @@ struct Snap {
     /// Linux snd_una / snd_nxt (the ICMP error sequence check)
     snd_una: AtomicU32,
     snd_max: AtomicU32,
-    /// A Fast Open child in SYN_RECEIVED (Linux tp->fastopen_rsk, which
-    /// tcp_poll reads)
+    /// A Fast Open child holding its request (Linux tp->fastopen_rsk,
+    /// which tcp_poll reads)
     tfo: AtomicBool,
     /// TCP_FASTOPEN_CONNECT deferred the SYN (Linux DEFER_CONNECT,
     /// which tcp_poll reads)
@@ -436,7 +436,17 @@ pub(super) fn xmit(net: &NetNamespace, t: &Tuple, seg: &Seg, p: IpParams, oif: u
 /// Route and send `skb` (its TCP header on) to `t` (route each time;
 /// no cached dst); false without a route
 fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) -> bool {
-    let Ok(rt) = route::output(net, t.raddr, t.laddr, oif) else {
+    // Linux ip_route_connect's flow (tcp_v4_connect), the socket's
+    // mark and owner with the connection's ports
+    let k = route::OutKey {
+        mark: p.mark,
+        uid: p.uid,
+        proto: IPPROTO_TCP,
+        sport: t.lport,
+        dport: t.rport,
+        anysrc: p.anysrc,
+    };
+    let Ok(rt) = route::output_key(net, t.raddr, t.laddr, oif, &k) else {
         return false;
     };
     let mut skb = skb;
@@ -450,12 +460,28 @@ fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) 
 }
 
 /// Transmit `out`'s segments to `t` in order (Linux tcp_transmit_skb
-/// with ip_queue_xmit), each header put on its payload skb
-pub(super) fn send_segs(net: &NetNamespace, t: &Tuple, out: &mut Out, p: IpParams, oif: u32) {
+/// with ip_queue_xmit), each header put on its payload skb; each
+/// carries the socket's pending neighbour confirmation, cleared once a
+/// segment is routed with it (Linux skb_set_dst_pending_confirm from
+/// sk_dst_pending_confirm, cleared by sock_confirm_neigh)
+pub(super) fn send_segs(
+    net: &NetNamespace,
+    t: &Tuple,
+    out: &mut Out,
+    mut p: IpParams,
+    oif: u32,
+    confirm: &mut bool,
+) {
     while let Some(mut skb) = out.segs.pop_front() {
         // Linux tcp_v4_send_check: CHECKSUM_PARTIAL (hk sums it anyway)
         skb.csum_partial = true;
-        if output::finish_hdr(&mut skb, t).is_some() && !send(net, t, skb, p, oif) {
+        p.confirm = *confirm;
+        if output::finish_hdr(&mut skb, t).is_none() {
+            continue;
+        }
+        if send(net, t, skb, p, oif) {
+            *confirm = false;
+        } else {
             // Linux __ip_queue_xmit's no_route
             net.mib.ip.inc(crate::net::mib::IPSTATS_MIB_OUTNOROUTES);
         }
@@ -628,9 +654,9 @@ impl TcpSock {
         if out.done {
             self.fastopen_ofo_check(g);
         }
-        if g.tfo_parent.is_some() && !(g.cb.tfo && g.cb.state == TcpState::SynReceived) {
-            // Linux reqsk_fastopen_remove: the handshake completed or the
-            // child died
+        if g.tfo_parent.is_some() && !(g.cb.tfo && g.cb.state != TcpState::Closed) {
+            // Linux reqsk_fastopen_remove: the SYN-ACK was acknowledged
+            // (in SYN_RECEIVED or FIN_WAIT_1) or the child died
             if let Some(p) = g.tfo_parent.take().and_then(|w| w.upgrade()) {
                 if let Some(q) = p.queue.lock().as_mut() {
                     q.tfo_qlen = q.tfo_qlen.saturating_sub(1);
@@ -783,7 +809,7 @@ impl TcpSock {
     /// sk_shutdown under the socket lock): publish the shutdown bits and
     /// the error (reported with the wakeups), then transmit to `t`.
     /// Returns the wakeups still to make.
-    fn emit(&self, out: &mut Out, t: Option<Tuple>) -> u8 {
+    fn emit(&self, out: &mut Out, t: Option<Tuple>, confirm: &mut bool) -> u8 {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
@@ -791,7 +817,10 @@ impl TcpSock {
             self.sk.store_err(e as u32);
         }
         if let Some(t) = t {
-            send_segs(&self.sk.net, &t, out, self.inet.params(), self.oif());
+            let mut p = self.inet.params();
+            let k = self.sk.out_key(0, 0, 0);
+            (p.mark, p.uid) = (k.mark, k.uid);
+            send_segs(&self.sk.net, &t, out, p, self.oif(), confirm);
         }
         if out.err.is_some() {
             out.wake | cb::wake::ERR
@@ -807,7 +836,7 @@ impl TcpSock {
         let t = g.tuple.or_else(|| self.cur_tuple());
         self.put_caps(g);
         let ready = self.post(g, out);
-        let w = self.emit(out, t);
+        let w = self.emit(out, t, &mut g.cb.dst_pending_confirm);
         if g.cb.state == TcpState::Listen {
             *self.listen_opts.lock() = g.cb.opts;
         }
@@ -1144,8 +1173,12 @@ impl TcpSock {
         if want_cookie {
             return self.cookie_synack(s, t, &opts, caps, now);
         }
-        let (tfo, foc) = self.try_fastopen(s, &t, &opts);
-        if tfo && self.fastopen_child(s, skb, t, opts, caps, foc, now) {
+        let (tfo, alt, foc) = self.try_fastopen(s, &t, &opts);
+        // The child's SYN-ACK carries the primary key's cookie only
+        // when a backup key matched; without a child the plain
+        // request's carries it whatever key matched
+        let child_foc = foc.filter(|_| alt);
+        if tfo && self.fastopen_child(s, skb, t, opts, caps, child_foc, now) {
             return;
         }
         self.child(s, t, opts, caps, now, isn, foc);
@@ -1157,8 +1190,10 @@ impl TcpSock {
     /// (TCPFastOpenCookieReqd); a valid cookie (or none needed,
     /// TFO_SERVER_COOKIE_NOT_REQD) makes a Fast Open child (true); an
     /// invalid one TCPFastOpenPassiveFail and the valid cookie. Returns
-    /// that and the cookie the SYN-ACK carries
-    fn try_fastopen(&self, s: &SegIn, t: &Tuple, opts: &cb::Opts) -> (bool, Option<cb::Foc>) {
+    /// that, whether a backup key matched (TCPFastOpenPassiveAltKey),
+    /// and the primary key's cookie (Linux valid_foc), which the
+    /// SYN-ACK carries unless a child made with the primary key answers
+    fn try_fastopen(&self, s: &SegIn, t: &Tuple, opts: &cb::Opts) -> (bool, bool, Option<cb::Foc>) {
         let net = &self.sk.net;
         if s.foc.is_some_and(|f| f.len == 0) {
             net.mib.net.inc(LINUX_MIB_TCPFASTOPENCOOKIEREQD);
@@ -1166,15 +1201,15 @@ impl TcpSock {
         let tfo = net.sysctl.tcp_fastopen.load(Ordering::Relaxed);
         let syn_data = s.data_len() != 0;
         if tfo & TFO_SERVER_ENABLE == 0 || !(syn_data || s.foc.is_some()) || !self.fastopen_room() {
-            return (false, None);
+            return (false, false, None);
         }
         // tcp_fastopen_no_cookie (hk has no RTAX_FASTOPEN_NO_COOKIE
         // route metric)
         if tfo & TFO_SERVER_COOKIE_NOT_REQD != 0 || opts.tfo_no_cookie {
-            return (true, None);
+            return (true, false, None);
         }
         let Some(f) = s.foc else {
-            return (false, None);
+            return (false, false, None);
         };
         // The listener's keys, else its namespace's (tcp_fastopen_get_ctx)
         let ctx = (*self.fastopen_ctx.lock()).or_else(|| net.tcp.fastopen_ctx());
@@ -1183,17 +1218,17 @@ impl TcpSock {
             ..fastopen::cookie(&c.key[0], t)
         });
         if f.len == 0 {
-            return (false, valid);
+            return (false, false, valid);
         }
         match ctx.map_or(0, |c| c.check(t, &f)) {
-            1 => (true, None),
+            1 => (true, false, valid),
             2 => {
                 net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEALTKEY);
-                (true, valid)
+                (true, true, valid)
             }
             _ => {
                 net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
-                (false, valid)
+                (false, false, valid)
             }
         }
     }
@@ -1251,7 +1286,9 @@ impl TcpSock {
             return fail();
         };
         let mut b = c.lock.bh_lock();
-        let Some(g) = b.get() else {
+        // The child's buffers read as its own (sync_caps): what its
+        // creation tunes is stored from them (put_caps)
+        let Some(g) = c.bh_get(&mut b) else {
             return fail();
         };
         let mut out = Out::default();
@@ -1363,7 +1400,8 @@ impl TcpSock {
     /// tcp_syncookies, after a recent SYN queue overflow, a valid cookie
     /// whose timestamp names only enabled options makes the child
     /// (`cookie_child`). Handed back when the listener answers the
-    /// segment itself (no cookie: RST); consumed when a child was made
+    /// segment itself (no cookie, or one naming options turned off:
+    /// RST); consumed when a child was made
     /// or the accept queue is full (dropped)
     fn cookie_check(&self, s: &SegIn, skb: Box<SkBuff>, t: Tuple, now: u64) -> Option<Box<SkBuff>> {
         let net = &self.sk.net;
@@ -1392,7 +1430,12 @@ impl TcpSock {
             tsoff = if c.ts == 1 { ts_off(&t) } else { 0 };
             ts = Some((v, e.wrapping_sub(tsoff)));
         }
-        let r = syncookies::timestamp_decode(ts, &c)?;
+        // Options turned off since: the listener answers (Linux
+        // cookie_tcp_check fails, cookie_v4_check returns the listener,
+        // whose tcp_rcv_state_process resets the ACK)
+        let Some(r) = syncookies::timestamp_decode(ts, &c) else {
+            return Some(skb);
+        };
         // tcp_v4_syn_recv_sock: a full accept queue drops it
         if self.acceptq_full() {
             self.listen_overflow();
@@ -1422,7 +1465,9 @@ impl TcpSock {
             return;
         };
         let mut b = c.lock.bh_lock();
-        let Some(g) = b.get() else {
+        // The child's buffers read as its own (sync_caps): what its
+        // creation tunes is stored from them (put_caps)
+        let Some(g) = c.bh_get(&mut b) else {
             return;
         };
         let mut cb = self.child_cb(&c, opts, caps);
@@ -1477,7 +1522,9 @@ impl TcpSock {
             o.iss = isn;
         }
         let mut b = c.lock.bh_lock();
-        let Some(g) = b.get() else {
+        // The child's buffers read as its own (sync_caps): what its
+        // creation tunes is stored from them (put_caps)
+        let Some(g) = c.bh_get(&mut b) else {
             return;
         };
         let mut cb = self.child_cb(&c, opts, caps);
@@ -1613,7 +1660,9 @@ impl TcpSock {
                 return Err(KernelError::AlreadyConnected);
             }
             let a = self.inet.get();
-            let rt = route::output(&self.sk.net, daddr, a.saddr, self.oif())
+            let mut k = self.sk.out_key(IPPROTO_TCP, a.sport, dport);
+            k.anysrc = self.inet.anysrc();
+            let rt = route::output_key(&self.sk.net, daddr, a.saddr, self.oif(), &k)
                 .inspect_err(|e| self.sk.net.mib.route_err(e))?;
             if matches!(rt.rtype, RouteType::Broadcast | RouteType::Multicast) {
                 return Err(KernelError::NetworkUnreachable);
@@ -1656,7 +1705,6 @@ impl TcpSock {
             c.syn_retries = self.syncnt(&g.cb.opts);
             let mut cb = TcpCb::new(c, Arc::clone(&self.live));
             cb.mib = Some(Arc::clone(&self.sk.net.mib));
-            cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
             cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
             cb.opts = g.cb.opts;
             (cb.rcvbuf, cb.sndbuf, cb.userlocks) = (g.cb.rcvbuf, g.cb.sndbuf, g.cb.userlocks);

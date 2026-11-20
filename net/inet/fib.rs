@@ -2,9 +2,10 @@
 //! fib_semantics.c, fib_trie.c semantics)
 //!
 //! Per network namespace: routing tables by id (local = 255, main = 254;
-//! others are created on demand). Lookups consult local then main (the
-//! Linux default rules without a rule engine), longest prefix first, and
-//! within a prefix the first entry whose TOS, scope and output device fit.
+//! others are created on demand). Lookups walk the routing rules
+//! (`fib_rules`, Linux __fib_lookup), each table longest prefix first,
+//! and within a prefix the first entry whose TOS, scope and output
+//! device fit.
 //! Route types follow Linux: unicast, local, broadcast, and the error
 //! types unreachable (EHOSTUNREACH), prohibit (EACCES), blackhole (EINVAL).
 //!
@@ -209,11 +210,22 @@ impl FibEntry {
 #[derive(Clone, Copy, Default)]
 pub struct FlowKey {
     pub daddr: Ipv4Addr,
+    /// Source (0: any), for rules' source prefixes
+    pub saddr: Ipv4Addr,
     /// Output interface constraint (0 = any)
     pub oif: u32,
+    /// Input interface (output lookups: lo, Linux LOOPBACK_IFINDEX)
+    pub iif: u32,
     /// Smallest acceptable route scope
     pub scope: u8,
     pub tos: u8,
+    /// Firewall mark, user id, IP protocol and ports (Linux
+    /// flowi4_mark, flowi4_uid, flowi4_proto, fl4_sport/dport)
+    pub mark: u32,
+    pub uid: u32,
+    pub proto: u8,
+    pub sport: u16,
+    pub dport: u16,
 }
 
 /// One routing table (Linux struct fib_table)
@@ -331,11 +343,14 @@ impl FibTable {
     }
 }
 
-/// Per-namespace IPv4 FIB (Linux netns_ipv4's fib_table_hash)
+/// Per-namespace IPv4 FIB (Linux netns_ipv4's fib_table_hash and
+/// rules_ops)
 pub struct Fib {
     /// Tables by descending id: local, main, then those created on
     /// demand; never removed while the namespace lives
     tables: RcuList<TableLink>,
+    /// The routing rules (Linux net->ipv4.rules_ops)
+    pub rules: crate::net::fib_rules::FibRules,
 }
 
 impl Fib {
@@ -343,7 +358,19 @@ impl Fib {
         let tables = RcuList::new();
         tables.push_back(FibTable::new(RT_TABLE_LOCAL)?);
         tables.push_back(FibTable::new(RT_TABLE_MAIN)?);
-        Ok(Self { tables })
+        let rules = crate::net::inet::fib_rules::fib4_rules_init()?;
+        Ok(Self { tables, rules })
+    }
+
+    /// Table `id` exists (Linux fib_get_table != NULL)
+    pub fn has_table(&self, id: u32) -> bool {
+        let g = crate::sync::rcu::read_lock();
+        self.get_table(&g, id).is_some()
+    }
+
+    /// Table `id`, created if missing (Linux fib_new_table), RTNL held
+    pub fn new_table_rtnl(&self, _rtnl: &RtnlGuard, id: u32) -> Result<(), KernelError> {
+        self.new_table(id).map(drop)
     }
 
     /// Table `id`, while `g` is held (Linux fib_get_table)
@@ -384,16 +411,26 @@ impl Fib {
         }
     }
 
-    /// Full lookup: local, then main (Linux default rules); ENETUNREACH
-    /// when nothing matches. The route is referenced, nothing copied.
+    /// Full lookup through the rules (Linux fib_lookup ->
+    /// __fib_lookup -> fib_rules_lookup with fib4_rule_action and
+    /// fib4_rule_suppress); ENETUNREACH when no rule decides. The route
+    /// is referenced, nothing copied.
     pub fn lookup(&self, key: &FlowKey) -> Result<Arc<FibEntry>, KernelError> {
-        let g = crate::sync::rcu::read_lock();
-        for table in [RT_TABLE_LOCAL, RT_TABLE_MAIN] {
-            if let Some(e) = self.lookup_table(&g, table, key)? {
-                return Ok(e.get());
-            }
-        }
-        Err(KernelError::NetworkUnreachable)
+        use crate::net::inet::fib_rules as r4;
+        let r = self.rules.lookup(
+            &r4::rule_flow(key),
+            |r| r4::fib4_rule_match(r, key),
+            |r| {
+                let table = r4::fib4_rule_action(r)?;
+                let g = crate::sync::rcu::read_lock();
+                Ok(self.lookup_table(&g, table, key)?.map(RcuRef::get))
+            },
+            |r, e| r4::fib4_rule_suppress(r, e.dst_len, e.dev.as_deref()),
+        );
+        r.map_err(|e| match e {
+            KernelError::NoProcess => KernelError::NetworkUnreachable,
+            e => e,
+        })
     }
 
     /// Linux inet_addr_type: classify `addr` by the local table
@@ -621,7 +658,8 @@ fn fib_check_nh_gw(
         daddr: gw,
         oif: cfg.oif,
         scope: cfg.scope.saturating_add(1).max(RT_SCOPE_LINK),
-        tos: 0,
+        iif: crate::net::inet::route::LOOPBACK_IFINDEX,
+        ..Default::default()
     };
     let res = net.fib.lookup(&key)?;
     if res.rtype != RouteType::Unicast && res.rtype != RouteType::Local {

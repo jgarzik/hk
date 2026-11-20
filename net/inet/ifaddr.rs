@@ -36,8 +36,8 @@ use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::fib::{self, RouteType};
 use crate::net::ipv4::Ipv4Addr;
-use crate::net::netlink::NlInfo;
 use crate::net::netlink::rtnetlink;
+use crate::net::netlink::{ExtAck, NlInfo};
 use crate::net::rtnl::RtnlGuard;
 use crate::sync::rcu::{RcuHead, RcuReadGuard};
 use crate::util::error::KernelError;
@@ -235,14 +235,71 @@ pub fn inet_mask_len(mask: Ipv4Addr) -> Option<u8> {
 }
 
 /// A device's IPv4 state (Linux struct in_device)
-#[derive(Default)]
 pub struct InDevice {
     /// Addresses: primaries (by scope) then secondaries (Linux
     /// ifa_list); read under RCU, changed under RTNL
     pub ifa_list: RcuList<IfaList>,
+    /// Configuration (Linux in_dev->cnf): net/ipv4/conf/<dev>
+    pub cnf: crate::net::inet::devconf::DevConf,
+    /// ARP parameters (Linux in_dev->arp_parms): net/ipv4/neigh/<dev>
+    pub arp_parms: crate::net::neigh::NeighParms,
+    /// The registration of its net/ipv4/{conf,neigh}/<name> directories
+    /// (Linux cnf.sysctl, arp_parms->sysctl_table): set and taken
+    /// under RTNL, read by /proc lookups (spin leaf)
+    sysctl: crate::sync::spin::Mutex<Option<Arc<crate::net::sysctl::DevSysctl>>>,
+}
+
+impl Default for InDevice {
+    fn default() -> Self {
+        Self {
+            ifa_list: RcuList::new(),
+            cnf: crate::net::inet::devconf::DevConf::dflt(),
+            arp_parms: crate::net::neigh::NeighParms::arp_default(),
+            sysctl: crate::sync::spin::Mutex::new(None),
+        }
+    }
 }
 
 impl InDevice {
+    /// Registration of `dev` (this device) in `net` (Linux
+    /// inetdev_init): the namespace's default configuration, state
+    /// bits included, ARP's default parameters without theirs
+    /// (neigh_parms_alloc), and
+    /// its sysctl directories (devinet_sysctl_register)
+    pub fn init(&self, net: &crate::net::NetNamespace, name: &str) {
+        self.cnf.copy_from(&net.devconf_dflt);
+        if let Some(tbl) = crate::net::arp::arp_tbl_get() {
+            self.arp_parms.copy_from(&tbl.parms);
+        }
+        self.sysctl_register(name);
+    }
+
+    /// Register its net/ipv4/{conf,neigh}/`name` directories (Linux
+    /// devinet_sysctl_register: neigh_sysctl_register and
+    /// __devinet_sysctl_register), replacing any registration; without
+    /// memory it has none (Linux fails the device's registration)
+    pub fn sysctl_register(&self, name: &str) {
+        use crate::net::sysctl::DevSysctl;
+        let reg = crate::util::kalloc::try_arc(DevSysctl::new(alloc::string::String::from(name)));
+        let old = core::mem::replace(&mut *self.sysctl.lock(), reg.ok());
+        if let Some(o) = old {
+            o.start_unregistering();
+        }
+    }
+
+    /// Take its directories back (Linux devinet_sysctl_unregister):
+    /// their lookups and open files are ENOENT from now on
+    pub fn sysctl_unregister(&self) {
+        if let Some(o) = self.sysctl.lock().take() {
+            o.start_unregistering();
+        }
+    }
+
+    /// Its registration, if any
+    pub fn sysctl_reg(&self) -> Option<Arc<crate::net::sysctl::DevSysctl>> {
+        self.sysctl.lock().clone()
+    }
+
     /// The addresses, while `g` is held (Linux in_dev_for_each_ifa_rcu)
     pub fn addrs<'a>(&'a self, g: &'a RcuReadGuard) -> RcuIter<'a, IfaList> {
         self.ifa_list.iter(g)
@@ -327,7 +384,9 @@ pub fn ip_dev_find(net: &NetNamespace, addr: Ipv4Addr) -> Option<Arc<NetDevice>>
 // ============================================================================
 
 /// Insert `ifa` on `dev` (Linux __inet_insert_ifa): EEXIST for the same
-/// local address in the same subnet; secondaries are detected here. A
+/// local address in the same subnet, EINVAL for a secondary of another
+/// scope (each with Linux's message for `ext`); secondaries are
+/// detected here. A
 /// primary goes after the last primary of its scope or a wider one,
 /// a secondary last. The RTM_NEWADDR notification precedes the FIB
 /// update like Linux.
@@ -337,6 +396,7 @@ pub fn inet_insert_ifa(
     dev: &Arc<NetDevice>,
     mut ifa: InIfaddr,
     nl: NlInfo,
+    ext: Option<&ExtAck>,
 ) -> Result<(), KernelError> {
     ifa.set_flags(ifa.flags() & !(IFA_F_SECONDARY | IPV6ONLY_FLAGS));
     let mut last_primary: *const InIfaddr = core::ptr::null();
@@ -348,9 +408,11 @@ pub fn inet_insert_ifa(
             }
             if ifa1.same_subnet(&ifa) {
                 if ifa1.local == ifa.local {
+                    ext.inspect(|e| e.msg("ipv4: Address already assigned"));
                     return Err(KernelError::AlreadyExists);
                 }
                 if ifa1.scope != ifa.scope {
+                    ext.inspect(|e| e.msg("ipv4: Invalid scope value"));
                     return Err(KernelError::InvalidArgument);
                 }
                 ifa.set_flags(ifa.flags() | IFA_F_SECONDARY);
@@ -481,14 +543,28 @@ pub fn inet_replace_ifa(
     rtnetlink::notify_addr(net, dev, &x, rtnetlink::RTM_NEWADDR, nl);
 }
 
+/// Every devconf attribute and ARP parameter of `dev` marked as its
+/// own, so "default" no longer reaches them: a device given an address
+/// by the user or lo coming up (Linux ipv4_devconf_setall and
+/// neigh_parms_data_state_setall in rtm_to_ifa, inet_set_ifa and
+/// inetdev_event NETDEV_UP)
+pub fn devconf_setall(dev: &NetDevice) {
+    dev.in_dev().cnf.setall();
+    dev.in_dev().arp_parms.setall();
+}
+
 /// Device came up (Linux inetdev_event/fib_netdev_event NETDEV_UP): `lo`
-/// gets 127.0.0.1/8 if it has no address; every address's routes are
+/// has its settings marked its own (`devconf_setall`) and gets
+/// 127.0.0.1/8 if it has no address; every address's routes are
 /// (re)installed
 pub fn inetdev_up(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    if dev.is_loopback() {
+        devconf_setall(dev);
+    }
     if dev.is_loopback() && !dev.in_dev().has_addrs() {
         let mut ifa = InIfaddr::new(Ipv4Addr::new(127, 0, 0, 1), 8, dev.name());
         ifa.scope = RT_SCOPE_HOST;
-        let _ = inet_insert_ifa(rtnl, net, dev, ifa, NlInfo::default());
+        let _ = inet_insert_ifa(rtnl, net, dev, ifa, NlInfo::default(), None);
     }
     // Each route insert takes RTNL-side locks: a reference per address
     for ifa in dev.in_dev().ifa_list.snapshot() {
@@ -506,10 +582,22 @@ pub fn inetdev_down(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) 
 /// inetdev_destroy, then fib_netdev_event -> fib_disable_ip(force)):
 /// every address is deleted and announced, then every route through it
 pub fn inetdev_destroy(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    // Linux inetdev_destroy -> devinet_sysctl_unregister
+    dev.in_dev().sysctl_unregister();
     while let Some(ifa) = dev.in_dev().ifa_list.find(|_| true) {
         inet_del_ifa(rtnl, net, dev, &ifa, NlInfo::default());
     }
     fib::fib_disable_ip(rtnl, net, dev, true);
+}
+
+/// `dev` was renamed (Linux inetdev_event NETDEV_CHANGENAME, RTNL
+/// held): its sysctl directories move to the new name
+/// (devinet_sysctl_unregister + devinet_sysctl_register); the old
+/// name's lookups and open files are ENOENT
+pub fn inetdev_changename(_rtnl: &RtnlGuard, dev: &NetDevice) {
+    let i = dev.in_dev();
+    i.sysctl_unregister();
+    i.sysctl_register(dev.name());
 }
 
 /// Type of `addr` in the namespace (Linux inet_addr_type)

@@ -59,6 +59,8 @@ pub mod device;
 pub mod devioctl;
 pub mod dgram;
 pub mod ethernet;
+#[path = "core/fib_rules.rs"]
+pub mod fib_rules;
 #[path = "core/filter.rs"]
 pub mod filter;
 pub mod icmp;
@@ -68,9 +70,15 @@ pub mod mib;
 pub mod msg;
 #[path = "core/neigh.rs"]
 pub mod neigh;
+#[path = "core/neigh_nl.rs"]
+pub mod neigh_nl;
+#[path = "core/neigh_sysctl.rs"]
+pub mod neigh_sysctl;
 pub mod netlink;
 pub mod packet;
 pub mod ping;
+#[path = "core/pneigh.rs"]
+pub mod pneigh;
 pub mod proc;
 pub mod raw;
 pub mod rtnl;

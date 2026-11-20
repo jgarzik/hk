@@ -1,8 +1,9 @@
 //! AF_NETLINK sockets (Linux net/netlink/af_netlink.c)
 //!
 //! Protocols are described by `NlProto` (Linux netlink_kernel_cfg):
-//! NETLINK_ROUTE (`rtnetlink.rs`) and NETLINK_KOBJECT_UEVENT (kernel
-//! to user only, `base/uevent.rs`); others are EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
+//! NETLINK_ROUTE (`rtnetlink.rs`) and NETLINK_KOBJECT_UEVENT
+//! (`base/uevent.rs`: events to user space, and a privileged sender's
+//! rebroadcast in its namespace); others are EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
 //! bound explicitly, or autobound on first use to the process's tgid, then
 //! to unique negative values. Multicast groups are a bitmap; kernel
 //! notifications go to every subscribed socket of the namespace.
@@ -109,19 +110,73 @@ pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 /// NLMSG_ERROR flags
 pub const NLM_F_CAPPED: u16 = 0x100;
 pub const NLM_F_ACK_TLVS: u16 = 0x200;
-/// Extended ACK attribute: error message string
+/// Extended ACK attributes (Linux NLMSGERR_ATTR_*): the error message
+/// string, the offset of the invalid attribute in the request
 pub const NLMSGERR_ATTR_MSG: u16 = 1;
+pub const NLMSGERR_ATTR_OFFS: u16 = 2;
 
 /// sizeof(struct sockaddr_nl)
 pub const SOCKADDR_NL_LEN: usize = 12;
 /// Multicast groups of NETLINK_ROUTE (RTNLGRP_MAX)
 pub const RTNL_NGROUPS: u32 = 39;
 
-/// Notification origin: the request's portid and sequence (0 = kernel)
+/// Notification origin (Linux struct nl_info): the request's portid
+/// and sequence (0 = kernel), and whether it asked for the
+/// notification back (NLM_F_ECHO, Linux nlmsg_report(info->nlh))
 #[derive(Clone, Copy, Default, Debug)]
 pub struct NlInfo {
     pub portid: u32,
     pub seq: u32,
+    pub report: bool,
+}
+
+/// What a request's handler reports beside its errno (Linux struct
+/// netlink_ext_ack: _msg, bad_attr), sent back as NLMSGERR_ATTR_MSG
+/// and NLMSGERR_ATTR_OFFS when the socket set NETLINK_EXT_ACK. Lives
+/// on the stack of the request's processing; handlers set it through a
+/// shared reference (Linux NL_SET_ERR_MSG overwrites).
+#[derive(Default)]
+pub struct ExtAck {
+    msg: core::cell::Cell<Option<&'static str>>,
+    /// Address of the offending attribute's header (0: none), turned
+    /// into an offset against the request when the ACK is built
+    bad_attr: core::cell::Cell<usize>,
+}
+
+impl ExtAck {
+    /// Linux NL_SET_ERR_MSG
+    pub fn msg(&self, m: &'static str) {
+        self.msg.set(Some(m));
+    }
+
+    /// Linux NL_SET_BAD_ATTR: `payload` is the attribute's payload in
+    /// the request
+    pub fn bad_attr(&self, payload: &[u8]) {
+        let hdr = (payload.as_ptr() as usize).wrapping_sub(attr::NLA_HDRLEN);
+        self.bad_attr.set(hdr);
+    }
+
+    /// Linux NL_SET_ERR_MSG_ATTR
+    pub fn attr_msg(&self, payload: &[u8], m: &'static str) {
+        self.bad_attr(payload);
+        self.msg(m);
+    }
+
+    /// The message set, if any
+    pub fn get_msg(&self) -> Option<&'static str> {
+        self.msg.get()
+    }
+
+    /// The offending attribute's offset in request `req`, if one was
+    /// set and lies in its payload (Linux nlmsg_check_in_payload)
+    pub fn offs(&self, req: &[u8]) -> Option<u32> {
+        let a = self.bad_attr.get();
+        let off = a.checked_sub(req.as_ptr() as usize)?;
+        if a == 0 || off < attr::NLMSG_HDRLEN || off >= req.len() {
+            return None;
+        }
+        u32::try_from(off).ok()
+    }
 }
 
 /// Destination of a send: (portid, group), and whether the sender named
@@ -172,8 +227,9 @@ pub fn nl_cb(skb: &SkBuff) -> NlCb {
 }
 
 /// Kernel receiver of messages sent to port 0 (`explicit`: the sender
-/// named the destination)
-pub type NlInput = fn(&Arc<NlSock>, &[u8], bool);
+/// named the destination) with the sender's credentials (Linux
+/// NETLINK_CB(skb).creds)
+pub type NlInput = fn(&Arc<NlSock>, &[u8], bool, &Creds);
 
 /// A netlink protocol (Linux netlink_kernel_cfg)
 pub struct NlProto {
@@ -189,7 +245,7 @@ static ROUTE: NlProto = NlProto {
 
 static UEVENT: NlProto = NlProto {
     ngroups: 1,
-    input: None,
+    input: Some(crate::base::uevent::uevent_net_rcv),
 };
 
 /// The protocol of socket(AF_NETLINK, _, `protocol`)
@@ -265,6 +321,12 @@ pub struct NlSock {
 /// `rtnetlink::DUMP_SIZE` bytes); `Ok(true)` when finished
 pub trait DumpCb: Send {
     fn fill(&mut self, sk: &NlSock, buf: &mut Vec<u8>) -> Result<bool, KernelError>;
+
+    /// The message of the error a dump ended with (Linux cb->extack's
+    /// _msg, sent in NLMSG_DONE with NETLINK_EXT_ACK)
+    fn ext_msg(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 struct Dump {
@@ -682,9 +744,7 @@ impl NlSock {
             Err(e) => Some(-e.errno()),
         };
         if let Some(err) = done {
-            let mut m = attr::Msg::new(NLMSG_DONE, NLM_F_MULTI, st.seq, self.portid());
-            m.put(&err.to_ne_bytes());
-            buf.extend_from_slice(&m.finish());
+            buf.extend_from_slice(&self.dump_done(st, err));
             *d = None;
             self.running.store(false, Ordering::Release);
         }
@@ -702,6 +762,20 @@ impl NlSock {
         drop(d);
         self.sk.data_ready();
         true
+    }
+
+    /// The NLMSG_DONE ending dump `st` with `err` (Linux
+    /// netlink_dump_done): with NETLINK_EXT_ACK and an error message,
+    /// NLM_F_ACK_TLVS and NLMSGERR_ATTR_MSG after the error
+    fn dump_done(&self, st: &Dump, err: i32) -> Vec<u8> {
+        let msg = st.cb.ext_msg().filter(|_| self.has_flag(sflags::EXT_ACK));
+        let flags = NLM_F_MULTI | if msg.is_some() { NLM_F_ACK_TLVS } else { 0 };
+        let mut m = attr::Msg::new(NLMSG_DONE, flags, st.seq, self.portid());
+        m.put(&err.to_ne_bytes());
+        if let Some(s) = msg {
+            m.str(NLMSGERR_ATTR_MSG, s);
+        }
+        m.finish()
     }
 
     /// Send `data` to `dst` from this socket with the sender's `creds`
@@ -737,7 +811,7 @@ impl NlSock {
             if group == 0
                 && let Some(input) = self.proto.input
             {
-                input(self, data, explicit);
+                input(self, data, explicit, &creds);
             }
             return Ok(data.len());
         }
@@ -798,6 +872,47 @@ pub fn broadcast(net: &NetNamespace, protocol: i32, skb: SkBuff, exclude: u32, g
     } else {
         let g = crate::sync::rcu::read_lock();
         deliver(list.iter_ref(&g).map(|s| s.item()), skb, exclude, bit, gfp);
+    }
+}
+
+/// Send a notification to `group` and, when `report`, back to port
+/// `portid` (Linux nlmsg_notify): the requester is left out of the
+/// multicast and gets its own copy, queued after it
+pub fn notify(net: &NetNamespace, protocol: i32, skb: SkBuff, portid: u32, report: bool, gfp: Gfp) {
+    if !report {
+        broadcast(net, protocol, skb, 0, gfp);
+        return;
+    }
+    let copy = skb.clone_gfp(gfp);
+    broadcast(net, protocol, skb, portid, gfp);
+    let Some(peer) = NlNet::get(net, protocol, portid) else {
+        return;
+    };
+    match copy {
+        Some(c) => {
+            peer.queue(c);
+        }
+        None => peer.overrun(),
+    }
+}
+
+/// Report `err` on every socket of `protocol` in `net` subscribed to
+/// `group` (Linux netlink_set_err): ENOBUFS spares those with
+/// NETLINK_NO_ENOBUFS
+pub fn set_err(net: &NetNamespace, protocol: i32, group: u32, err: KernelError) {
+    if group == 0 || group > 64 || !(0..MAX_LINKS as i32).contains(&protocol) {
+        return;
+    }
+    let bit = 1u64 << (group - 1);
+    let g = crate::sync::rcu::read_lock();
+    for s in net.nl.mc(protocol).iter_ref(&g).map(|s| s.item()) {
+        if s.groups_all() & bit == 0 {
+            continue;
+        }
+        if err == KernelError::NoBufferSpace && s.has_flag(sflags::NO_ENOBUFS) {
+            continue;
+        }
+        s.sk.set_err(err);
     }
 }
 
@@ -962,4 +1077,68 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     }
     let p = proto(protocol).ok_or(KernelError::ProtocolNotSupported)?;
     Ok(NlSock::new(p, protocol, stype)?)
+}
+
+/// Run `cb` on each request message of `data` (Linux netlink_rcv_skb):
+/// messages without NLM_F_REQUEST and control types are skipped, a
+/// short or truncated one ends the walk; each that fails is answered
+/// with its error, each that asks with an ACK (`ack`)
+pub fn rcv_skb(
+    sk: &NlSock,
+    mut data: &[u8],
+    mut cb: impl FnMut(&attr::Hdr, &[u8]) -> Result<(), KernelError>,
+) {
+    while data.len() >= attr::NLMSG_HDRLEN {
+        let Some(h) = attr::Hdr::parse(data) else {
+            return;
+        };
+        let len = h.len as usize;
+        if len < attr::NLMSG_HDRLEN || data.len() < len {
+            return;
+        }
+        let msg = &data[..len];
+        if h.flags & NLM_F_REQUEST != 0 && h.ty >= NLMSG_MIN_TYPE {
+            match cb(&h, msg) {
+                Err(e) => ack(sk, &h, msg, -e.errno()),
+                Ok(()) if h.flags & NLM_F_ACK != 0 => ack(sk, &h, msg, 0),
+                Ok(()) => {}
+            }
+        }
+        data = &data[attr::align(len).min(data.len())..];
+    }
+}
+
+/// Queue an NLMSG_ERROR (0: an ACK) for request `msg` with header `h`
+/// (Linux netlink_ack without extended ACK attributes): an error
+/// echoes the request unless NETLINK_CAP_ACK; with no memory for even
+/// the capped form the socket gets ENOBUFS
+pub fn ack(sk: &NlSock, h: &attr::Hdr, msg: &[u8], err: i32) {
+    let echo = err != 0 && !sk.has_flag(sflags::CAP_ACK);
+    let len = attr::NLMSG_HDRLEN
+        + 4
+        + if echo {
+            attr::align(msg.len())
+        } else {
+            attr::NLMSG_HDRLEN
+        };
+    let flags = if echo { 0 } else { NLM_F_CAPPED };
+    let mut m = Vec::new();
+    if m.try_reserve_exact(len).is_err() {
+        sk.sk.set_err(KernelError::NoBufferSpace);
+        return;
+    }
+    m.extend_from_slice(&(len as u32).to_ne_bytes());
+    m.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+    m.extend_from_slice(&flags.to_ne_bytes());
+    m.extend_from_slice(&h.seq.to_ne_bytes());
+    m.extend_from_slice(&sk.portid().to_ne_bytes());
+    m.extend_from_slice(&err.to_ne_bytes());
+    let body = if echo {
+        msg
+    } else {
+        &msg[..attr::NLMSG_HDRLEN]
+    };
+    m.extend_from_slice(body);
+    m.resize(len, 0);
+    sk.queue(kernel_skb(m, 0));
 }

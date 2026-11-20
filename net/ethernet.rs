@@ -158,7 +158,7 @@ pub fn eth_type_trans(skb: &mut SkBuff, dev: &NetDevice) -> Option<u16> {
     skb.pkt_type = if dest == dev.mac() {
         PktType::Host
     } else if dest[0] & 0x01 != 0 {
-        if dest == dev.link().broadcast {
+        if dest == dev.broadcast() {
             PktType::Broadcast
         } else {
             PktType::Multicast

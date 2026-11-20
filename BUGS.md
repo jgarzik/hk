@@ -165,11 +165,30 @@ connections start from defaults (tcp_init_metrics), and no peer is
 proven for tcp_conn_request's last quarter of tcp_max_syn_backlog
 without SYN cookies (tcp_peer_is_proven), so it drops every new
 request there.
-Neighbour entries are not confirmed by TCP progress (only ARP), there is
-no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
-IP: no ipfrag_max_dist, no IP options on output (received options are
-validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
+No IP forwarding: net.ipv4.conf.*.forwarding
+(and ip_forward) is kept and propagated as Linux, but packets for other
+hosts are still dropped (no ip_forward / ip_route_input forwarding
+path). Of the net.ipv4.conf.* attributes (`net/inet/devconf.rs`) only
+forwarding, proxy_arp, proxy_arp_pvlan and medium_id act; the rest are
+kept and shown only (rp_filter, accept/send/secure_redirects, accept_source_route,
+accept_local, route_localnet, log_martians, arp_filter / announce /
+ignore / accept / notify / evict_nocarrier, shared_media, bootp_relay,
+tag, src_valid_mark, bc_forwarding, the IGMP knobs,
+drop_*, disable_xfrm / disable_policy, promote_secondaries), and a
+change sends no RTM_NEWNETCONF (hk has no netconf messages). Of the
+neighbour sysctls (`net/core/neigh_sysctl.rs`) anycast_delay,
+interval_probe_time_ms and gc_interval are kept only.
+IP options (`net/inet/options.rs`): UDP, raw and ping sockets send
+IP_OPTIONS / IP_RETOPTS, ICMP replies and errors echo a packet's, but
+TCP keeps IP_OPTIONS without sending them (no icsk_ext_hdr_len in its
+MSS, no echo in SYN-ACKs, resets and accepted children: Linux
+tcp_v4_save_options, ip_send_unicast_reply); a received source route
+with hops left is dropped (no forwarding: ip_options_rcv_srr,
+ip_forward_options), and CIPSO is always refused (no DOI support).
+IP_TRANSPARENT binds and sends from foreign addresses, but nothing
+steers foreign traffic to a transparent socket (no netfilter TPROXY;
+TCP resets of a transparent socket's connections are not sent
+IP_REPLY_ARG_NOSRCCHECK). A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
 and a reader_queue spliced from it.
@@ -558,7 +577,8 @@ hub6, where Linux moves the port (uart_change_port).
   config is 256 bytes even for PCIe functions (no extended space).
 - cpu: no cpuN/topology, cache/ or online files and no MODALIAS
   (CONFIG_GENERIC_CPU_AUTOPROBE); node: no meminfo/numastat/vmstat.
-- net: no queues/, phys_port_*, speed/duplex, ifalias or gro files;
+- net: no queues/, phys_port_*, speed/duplex or gro files; ifalias
+  is read-only (Linux ifalias_store under rtnl_trylock);
   interfaces cannot be renamed or moved between namespaces, so no
   "move" uevents.
 - /sys/module lists built-in modules with drivers only; no parameters
@@ -568,9 +588,6 @@ hub6, where Linux moves the port (uart_change_port).
 
 - `/sys/kernel/uevent_helper` stores a path, but no helper is run per
   event (Linux call_usermodehelper; hk has no usermode helper).
-- NETLINK_KOBJECT_UEVENT has no kernel input: messages a
-  CAP_SYS_ADMIN sender addresses to port 0 are not rebroadcast (Linux
-  uevent_net_rcv, used by container managers).
 - Network namespaces have no owning user namespace, so uevents go to
   every namespace; Linux sends untagged events only into namespaces
   owned by the initial user namespace (uevent_sock_list).
@@ -675,30 +692,52 @@ PTRACE_PEEKUSER/POKEUSER, PTRACE_GETFPREGS/SETFPREGS and
 PTRACE_GETREGSET/SETREGSET are EINVAL (Linux arch_ptrace: gdb reads
 debug registers and FP state through them).
 
+PTRACE_TRACER_SIPID (`user/boot_tester/signal/ptrace_stop.rs`
+`test_tracer_sipid`) hung once in 20 `make check-stress OVERFLOW=1` x86
+boots (no output after PTRACE_SINGLESTEP_TRACE, boot timeout); not
+reproduced, cause unknown.
+
 ## NETLINK_ROUTE / SIOC* subset gaps
 
-**Location**: `net/netlink/rtnetlink.rs`, `net/devioctl.rs`
+**Location**: `net/netlink/rtnetlink.rs`, `net/core/neigh_nl.rs`, `net/devioctl.rs`
 
-No notifications for neighbour state changes (no RTNLGRP_NEIGH); no
-proxy ARP entries, NTF_USE or NDA_PROTOCOL.
+Neighbour entries keep no NTF_* flags: NTF_ROUTER, NTF_EXT_LEARNED,
+NTF_MANAGED and NTF_EXT_VALIDATED of RTM_NEWNEIGH are ignored (Linux
+stores and reports them, and probes managed entries periodically);
+ndm_type is always RTN_UNICAST (Linux arp_constructor types local and
+broadcast keys) and nda_cacheinfo.ndm_refcnt 0.
 Missing, each answered with a Linux errno rather than silently: link
 creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
 (EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),
-NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
 address lifetimes are always infinite, promote_secondaries is off.
-Routing rules are Linux's three IPv4 defaults, fixed: RTM_NEWRULE and
-RTM_DELRULE are EOPNOTSUPP, lookups walk tables local then main and never
-default (no rule engine), and rule dumps of other families are
-EAFNOSUPPORT (Linux lists the IPv6 and multicast-routing defaults).
-RTM_NEWLINK/RTM_SETLINK apply MTU and flags only; the rest is refused
-with the errno Linux gives a device or driver lacking it, never ignored:
-moving a device to another namespace (IFLA_NET_NS_PID/FD; EOPNOTSUPP, lo
-EINVAL as Linux), MAC address, carrier, master, VF, proto_down, XDP and
-per-family (IFLA_AF_SPEC) settings are EOPNOTSUPP. Group, alias,
-broadcast address, txqlen, GSO/GRO limits, operstate and link mode, which
-Linux always applies, are EOPNOTSUPP unless equal to the device's fixed
-value; IFLA_TARGET_NETNSID / IFLA_LINK_NETNSID are EINVAL (no namespace
-ids).
+Attribute policies are checked as attributes are read, not all at
+parse time (Linux nla_parse validates every one first, so with several
+bad attributes another may be named), and extended ACKs never carry
+NLMSGERR_ATTR_POLICY (Linux netlink_policy_dump_write_attr).
+Routing rules (`net/core/fib_rules.rs`): output lookups carry the
+socket's SO_MARK, owner uid, protocol and ports for UDP, TCP connect
+and data, raw and ping sockets, but never the TOS (rules on tos/dscp
+see 0), and TCP segments sent without the socket lock's send path
+(retransmit timers, TIME_WAIT, resets, SYN-ACKs) and ICMP replies carry
+no mark or uid (Linux: the connect-time flow, the skb's mark); `ip
+route get` passes no RTA_MARK/RTA_UID/RTA_IP_PROTO/ports. Rule dumps of
+other families are EAFNOSUPPORT (Linux lists the IPv6 and IPv4/IPv6
+multicast-routing defaults; hk registers no rules for them). Rule
+changes take RTNL (current Linux: RTNL only for the first custom rule,
+ops->lock after). No FIB notifier chain (call_fib_rule_notifiers).
+RTM_NEWLINK/RTM_SETLINK apply MTU, flags, group, alias, broadcast
+address, txqlen and GSO/GRO limits; the rest is refused with the errno
+Linux gives a device or driver lacking it, never ignored: moving a
+device to another namespace (IFLA_NET_NS_PID/FD; EOPNOTSUPP, lo EINVAL
+as Linux), renaming (EOPNOTSUPP: kernfs has no rename, Linux
+kernfs_rename_ns/device_rename and the "move" uevent, and device names
+are immutable), MAC address, carrier, master, VF, proto_down, XDP and
+per-family (IFLA_AF_SPEC) settings are EOPNOTSUPP. Operational state
+and link mode are EOPNOTSUPP unless the request leaves them as they are
+(hk derives operstate from the carrier: no stored dev->operstate,
+linkwatch rfc2863_policy or IF_LINK_MODE_DORMANT). GSO/GRO limits are
+kept and reported but bound nothing (no GSO/GRO). IFLA_TARGET_NETNSID /
+IFLA_LINK_NETNSID are EINVAL (no namespace ids).
 
 ## io_uring gaps
 

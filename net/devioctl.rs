@@ -286,7 +286,7 @@ impl Ctx<'_> {
     }
 
     fn add(&self, ifa: InIfaddr) -> Result<(), KernelError> {
-        ifaddr::inet_insert_ifa(self.r, self.net, self.dev, ifa, NlInfo::default())
+        ifaddr::inet_insert_ifa(self.r, self.net, self.dev, ifa, NlInfo::default(), None)
     }
 
     fn bcast_ok(&self, plen: u8) -> bool {
@@ -324,6 +324,8 @@ impl Ctx<'_> {
         if sin.is_loopback() {
             ifa.scope = RT_SCOPE_HOST;
         }
+        // Linux inet_set_ifa
+        ifaddr::devconf_setall(self.dev);
         self.add(ifa)
     }
 
