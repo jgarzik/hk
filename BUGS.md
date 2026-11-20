@@ -1164,6 +1164,17 @@ Tag = roadmap phase (doc/ROADMAP.md).
     EINTR on the reference Linux; a rerun passed. Find what signal
     interrupts the wait, or retry the wait on EINTR as Linux allows.
 
+16. **MEM_SLAB_TIME_WAIT near its bound** (hk x86): 2000 TIME_WAIT
+    entries grow Slab by 1800-2092 kB against a 2000 kB bound
+    (`user/boot_tester/mm/memcore.rs` `slab_time_wait`), failing about
+    one x86 boot in three; arm64 measures about 1570 kB. The test's
+    comment puts an entry at about 600 bytes, and `TimeWait` plus its
+    ehash `Eh` are 392 + 104 bytes (host build, before Arc headers and
+    slab rounding), yet the growth stays near 900 bytes an entry after
+    3 s of settling, so it is not deferred frees. Find what else each
+    entry allocates (`net/tcp/timewait.rs` `TimeWait::new`, its timer,
+    bhash owner and ehash entries) before touching the bound.
+
 ## DRM dumb buffers are the boot framebuffer only
 
 **Location**: `hw/gfx/simplegfx.rs` (`create_dumb`)
