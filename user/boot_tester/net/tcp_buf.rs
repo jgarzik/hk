@@ -26,6 +26,9 @@
 //!   TIME_WAIT's length) is a timewait entry (sockstat tw, a 05 line
 //!   with the timewait timer in /proc/net/tcp); data from the peer is
 //!   answered with a reset.
+//! - TCP_PEEK_OFF: SO_PEEK_OFF on TCP (Linux 6.10 on: before it,
+//!   EOPNOTSUPP): MSG_PEEK reads from the offset and moves it on, a
+//!   read moves it back.
 
 use hk_syscall::{sys_exit, sys_fork, sys_getsockopt};
 
@@ -49,6 +52,7 @@ pub fn run_tests() {
     test_challenge_limit();
     test_max_tw();
     test_fin_wait2_tw();
+    test_peek_off();
 }
 
 /// A connected pair over lo: (client, server, listener)
@@ -430,5 +434,51 @@ fn test_fin_wait2_tw() {
         sys_exit(fw2_entry());
     }
     t.eq(b"entry", wait_child(child) as i64, 0);
+    t.done();
+}
+
+const SO_PEEK_OFF: i32 = 42;
+
+fn test_peek_off() {
+    let mut t = T::new(b"TCP_PEEK_OFF");
+    let (c, s, l) = pair();
+    if !crate::helpers::linux_at_least(6, 10) {
+        t.eq(b"old", setint(s, SOL_SOCKET, SO_PEEK_OFF, 0), EOPNOTSUPP);
+    } else {
+        t.eq(b"default", getint(s, SOL_SOCKET, SO_PEEK_OFF).1 as i64, -1);
+        t.eq(b"set", setint(s, SOL_SOCKET, SO_PEEK_OFF, 0), 0);
+        send(c, b"abcdefgh", 0);
+        let mut b = [0u8; 8];
+        // Let all eight bytes arrive
+        for _ in 0..100 {
+            if recv(s, &mut b, MSG_PEEK | MSG_DONTWAIT) == 8 {
+                break;
+            }
+            setint(s, SOL_SOCKET, SO_PEEK_OFF, 0);
+            crate::helpers::msleep(10);
+        }
+        setint(s, SOL_SOCKET, SO_PEEK_OFF, 0);
+        let get = |flags: i32, n: usize| {
+            let mut x = [0u8; 8];
+            let r = recv(s, &mut x[..n], flags | MSG_DONTWAIT);
+            (r, x)
+        };
+        let (r, x) = get(MSG_PEEK, 3);
+        t.ok(b"peek abc", r == 3 && &x[..3] == b"abc", r);
+        let (r, x) = get(MSG_PEEK, 3);
+        t.ok(b"peek def", r == 3 && &x[..3] == b"def", r);
+        t.eq(b"offset", getint(s, SOL_SOCKET, SO_PEEK_OFF).1 as i64, 6);
+        let (r, x) = get(0, 2);
+        t.ok(b"read ab", r == 2 && &x[..2] == b"ab", r);
+        t.eq(b"back", getint(s, SOL_SOCKET, SO_PEEK_OFF).1 as i64, 4);
+        let (r, x) = get(MSG_PEEK, 2);
+        t.ok(b"peek gh", r == 2 && &x[..2] == b"gh", r);
+        setint(s, SOL_SOCKET, SO_PEEK_OFF, -1);
+        let (r, x) = get(MSG_PEEK, 2);
+        t.ok(b"off: peek cd", r == 2 && &x[..2] == b"cd", r);
+    }
+    close(c);
+    close(s);
+    close(l);
     t.done();
 }

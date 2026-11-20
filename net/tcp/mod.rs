@@ -1339,6 +1339,8 @@ impl TcpSock {
         out.shut = 0;
         self.sk.clear_shutdown();
         g.connecting = false;
+        // Linux tcp_disconnect
+        self.sk.set_peek_off(-1);
     }
 
     /// tcp_disconnect's rest, after the unlock: the listener's queue
@@ -1709,18 +1711,20 @@ fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, Ke
     r
 }
 
-/// Hand up to `want` readable bytes past the `copied` already peeked
-/// (MSG_PEEK) or taken to user memory at `copied` (MSG_TRUNC: count or
-/// drop them), applying what consuming them sends (window updates)
+/// Hand up to `want` readable bytes past `skip` (MSG_PEEK: the peek
+/// offset and what was peeked already) to user memory at `copied`
+/// (MSG_TRUNC: count or drop them), applying what consuming them sends
+/// (window updates); SO_PEEK_OFF moves past what was peeked, back over
+/// what was taken (Linux tcp_recvmsg_locked: sk_peek_offset_fwd/bwd)
 fn recv_some(
     s: &TcpSock,
     g: &mut Guard<'_>,
     m: &mut RecvMsg<'_>,
     copied: usize,
+    skip: usize,
     flags: i32,
 ) -> Result<usize, KernelError> {
     let peek = flags & MSG_PEEK != 0;
-    let skip = if peek { copied } else { 0 };
     let want = m.data.len() - copied;
     let mut out = Out::default();
     let r = if flags & MSG_TRUNC != 0 {
@@ -1740,6 +1744,14 @@ fn recv_some(
         )
     };
     s.finish(g, &mut out);
+    if let Ok(n) = r {
+        let n = n.min(i32::MAX as usize) as i32;
+        if peek {
+            s.sk.peek_offset_fwd(n);
+        } else {
+            s.sk.peek_offset_bwd(n);
+        }
+    }
     r
 }
 
@@ -1769,14 +1781,17 @@ fn recvmsg_locked(
         (s.sk.rcvlowat().max(0) as usize).min(len)
     }
     .max(1);
+    // MSG_PEEK reads from SO_PEEK_OFF on (Linux sk_peek_offset)
+    let base = s.sk.peek_offset(flags).max(0) as usize;
     let mut copied = 0;
     loop {
-        match recv_some(s, g, m, copied, flags) {
+        let skip = if peek { base + copied } else { 0 };
+        match recv_some(s, g, m, copied, skip, flags) {
             Ok(n) if n > 0 => copied += n,
             // Data, but no room for it (a zero-length read)
-            Ok(_) if g.cb.rcvq_len() > if peek { copied } else { 0 } => break,
+            Ok(_) if g.cb.rcvq_len() > skip => break,
             Ok(_) => {
-                if !recv_wait(s, g, &mut timeo, copied, target, peek)? {
+                if !recv_wait(s, g, &mut timeo, copied, target, skip)? {
                     break;
                 }
             }
@@ -1800,7 +1815,7 @@ fn recv_wait(
     timeo: &mut u64,
     copied: usize,
     target: usize,
-    peek: bool,
+    skip: usize,
 ) -> Result<bool, KernelError> {
     if copied >= target && !g.backlog_pending() {
         return Ok(false);
@@ -1833,10 +1848,9 @@ fn recv_wait(
         g.flush_backlog();
         return Ok(true);
     }
-    let more = if peek { copied } else { 0 };
     let r = g.unlocked(|| {
         dev::netif_rx_flush_local();
-        s.sk.wait_data(*timeo, || s.rx_ready(more))
+        s.sk.wait_data(*timeo, || s.rx_ready(skip))
     });
     match r {
         Ok(t) => *timeo = t,
@@ -2355,6 +2369,16 @@ impl ProtoOps for TcpSock {
 
     fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         tcp_recvmsg(self, m, flags)
+    }
+
+    /// SO_PEEK_OFF (Linux inet_stream_ops: sk_set_peek_off, no lock)
+    fn set_peek_off(&self, val: i32) -> Option<Result<(), KernelError>> {
+        self.sk.set_peek_off(val);
+        Some(Ok(()))
+    }
+
+    fn has_set_peek_off(&self) -> bool {
+        true
     }
 }
 

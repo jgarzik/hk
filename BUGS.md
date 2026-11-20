@@ -159,8 +159,6 @@ takes 0 and L2TP only (UDP_ENCAP_ESPINUDP needs XFRM, which hk lacks).
 SO_NO_CHECK does not turn off the UDP send checksum (Linux udp_send_skb
 sends CHECKSUM_NONE with a zero check field): `udp::UdpSock::xmit`
 always computes it.
-TCP has no SO_PEEK_OFF (EOPNOTSUPP; Linux inet_stream_ops sets
-sk_set_peek_off and tcp_recvmsg peeks at the offset).
 A device MTU change leaves path MTU exceptions (`route::NhExceptions`)
 as they are (Linux NETDEV_CHANGEMTU fib_sync_mtu lowers them with it and
 raises those equal to the old MTU).
