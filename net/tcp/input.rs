@@ -577,9 +577,10 @@ impl TcpCb {
                 && self.snd_wnd > 0
                 && self.live.tmr.get().is_some_and(|t| t.0 == Tmr::Probe)
             {
+                // Linux tcp_ack_probe
                 self.live.tmr.set(None);
                 self.live.backoff.set(0);
-                self.rtx_stamp = None;
+                self.probes_tstamp = None;
                 out.wake |= wake::SPACE;
             }
         }

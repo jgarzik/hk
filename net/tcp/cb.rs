@@ -846,9 +846,13 @@ pub struct TcpCb {
     /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
     /// processed as tcp_child_process does
     pub(super) req_full: bool,
-    /// When the oldest unacknowledged data was (about) first sent, once
-    /// retransmitting or probing (Linux retrans_stamp; TCP_USER_TIMEOUT)
+    /// The first retransmission of the episode, ms (Linux
+    /// retrans_stamp: the retry and user timeouts count from it, the
+    /// timestamp echo is compared with it for undo)
     pub(super) rtx_stamp: Option<u64>,
+    /// The first zero-window probe of a series, ms (Linux
+    /// icsk_probes_tstamp)
+    pub(super) probes_tstamp: Option<u64>,
     /// Last ACK received / last data sent (keepalive, cwnd restart)
     pub(super) rcv_tstamp: u64,
     pub(super) lsndtime: u64,
@@ -1013,6 +1017,7 @@ impl TcpCb {
             passive: Default::default(),
             req_full: Default::default(),
             rtx_stamp: Default::default(),
+            probes_tstamp: None,
             rcv_tstamp: Default::default(),
             lsndtime: Default::default(),
             cong: Cong::new(live.clone()),

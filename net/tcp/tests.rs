@@ -521,9 +521,14 @@ fn rto_backoff_and_give_up() {
     // RTT 0 measured in the handshake: first the tail loss probe after
     // 2 RTT + RTO_MIN (Linux tcp_schedule_loss_probe, a lone packet),
     // the RTO restarting from it; RTO = 200 ms (RTO_MIN), doubling up
-    // to 120 s; retries2 = 15 retransmissions
-    assert_eq!(times.len(), 17);
+    // to 120 s; given up once tcp_retries2's model time, (2^10 - 1) *
+    // 200 ms + 6 * 120 s, passed since the first retransmission (Linux
+    // retransmits_timed_out): 16 retransmissions
+    assert_eq!(times.len(), 18);
     let gaps: Vec<u64> = times.windows(2).map(|w| w[1] - w[0]).collect();
+    let model = 1023 * 200 + 6 * RTO_MAX;
+    let last = times[times.len() - 1] - times[2];
+    assert!(last < model && last + RTO_MAX >= model, "{last}");
     assert_eq!(&gaps[..7], &[200, 200, 400, 800, 1600, 3200, 6400]);
     assert!(gaps.iter().all(|&g| g <= RTO_MAX));
     assert_eq!(*gaps.last().unwrap(), RTO_MAX);
@@ -1998,10 +2003,12 @@ fn user_timeout_bounds_retransmission() {
     p.send_a(b"data");
     p.until(|p| p.a.state == TcpState::Closed, 100);
     assert_eq!(p.a_out.err, Some(KernelError::TimedOut));
-    // Gave up about 5 s after the data first went out, not after 15
+    // Gave up 5 s after the first retransmission (the loss probe at
+    // 200 ms, the RTO at 400 ms; Linux retransmits_timed_out from
+    // retrans_stamp, the timer clamped to it), not after 15
     // retransmissions
     let dt = p.now - t0;
-    assert!((5000..=5300).contains(&dt), "gave up after {} ms", dt);
+    assert_eq!(dt, 5400, "gave up after {} ms", dt);
 }
 
 #[test]
@@ -2836,6 +2843,15 @@ fn frto_pair(ts: u8) -> (Pair, alloc::sync::Arc<crate::net::mib::NetMib>) {
 /// A spurious timeout: b's ACKs for a window are held past the RTO,
 /// then arrive after the resend of the head
 fn spurious_rto(p: &mut Pair) {
+    for s in held_acks(p) {
+        let mut out = Out::default();
+        p.a.feed(&seg_in(&s), p.now, &mut out);
+        p.take(true, out);
+    }
+}
+
+/// `spurious_rto` up to the ACKs it holds back
+fn held_acks(p: &mut Pair) -> Vec<Seg> {
     p.filter = |_, to_b, _, _| if to_b { Fate::Pass } else { Fate::Drop };
     let n = p.log.len();
     p.send_a(&pattern(20 * 988));
@@ -2858,11 +2874,36 @@ fn spurious_rto(p: &mut Pair) {
     assert_eq!(p.a.ca_state, super::recovery::CaState::Loss);
     assert_eq!(p.a.cong.snd_cwnd(), 1);
     p.filter = pass;
-    for s in held {
-        let mut out = Out::default();
-        p.a.feed(&seg_in(&s), p.now, &mut out);
-        p.take(true, out);
-    }
+    held
+}
+
+/// With timestamps the first ACK of the originals echoes a TSval from
+/// before the resend (retrans_stamp): the timeout is undone at once
+/// (Linux tcp_try_undo_loss via tcp_packet_delayed, RFC 3522)
+#[test]
+fn eifel_undoes_spurious_timeout() {
+    use crate::net::mib::*;
+    let (mut p, m) = frto_pair(1);
+    let held = held_acks(&mut p);
+    let mut out = Out::default();
+    p.a.feed(&seg_in(&held[0]), p.now, &mut out);
+    p.take(true, out);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSUNDO), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPSPURIOUSRTOS), 0);
+    assert!(p.a.cong.snd_cwnd() >= 10);
+    assert_eq!(p.a.cong.snd_ssthresh(), super::cong::INFINITE_SSTHRESH);
+}
+
+/// Linux tcp_model_timeout's values (ms)
+#[test]
+fn model_timeout_values() {
+    use super::timer::model_timeout;
+    assert_eq!(model_timeout(2, 1000), 7 * 1000);
+    assert_eq!(model_timeout(9, 200), 1023 * 200);
+    assert_eq!(model_timeout(10, 200), 1023 * 200 + RTO_MAX);
+    assert_eq!(model_timeout(15, 200), 1023 * 200 + 6 * RTO_MAX);
+    // tcp_orphan_retries' 8
+    assert_eq!(model_timeout(8, 200), 511 * 200);
 }
 
 /// F-RTO (RFC 5682): ACKs of never retransmitted data after a timeout
