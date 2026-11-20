@@ -253,6 +253,9 @@ impl PacketSock {
     /// ptype_all for ETH_P_ALL, ptype_base otherwise; outgoing frames
     /// only go to ptype_all, never back to their sender)
     fn wants(&self, t: &Tap<'_>, proto: u16) -> bool {
+        if !self.flag(pf::RUNNING) {
+            return false;
+        }
         let (num, ifindex) = self.bound();
         if num == 0 || (ifindex != 0 && ifindex as u32 != t.dev.ifindex()) {
             return false;

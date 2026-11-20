@@ -86,6 +86,7 @@ pub fn dev_change_flags(
     if want_up && !dev.is_up() {
         dev.open()?;
         ifaddr::inetdev_up(rtnl, net, dev);
+        crate::net::packet::netdev_up(net, dev);
     } else if !want_up && dev.is_up() {
         close(rtnl, net, dev);
     }
