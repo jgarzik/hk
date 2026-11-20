@@ -1021,7 +1021,7 @@ impl TcpCb {
         self.write_seq = self.snd_nxt;
         self.syn_unacked = true;
         self.ts_off = if self.cfg.ts == 1 { o.ts_off } else { 0 };
-        self.cong.set_algo(self.opts.ca);
+        self.assign_cc(self.opts.ca);
         self.set_adv_mss(o.mss);
         self.rtt_seq = Some((self.snd_nxt, now));
         self.rcv_tstamp = now;
@@ -1148,7 +1148,6 @@ impl TcpCb {
         self.live
             .mss
             .set(m.saturating_sub(self.opt_len()).max(MSS_MIN));
-        self.cong.set_mss(self.live.mss.get());
     }
 
     /// The path MTU to the peer changed (ICMP frag needed): shrink the
@@ -1529,6 +1528,7 @@ impl TcpCb {
             self.send_reset(out);
         }
         self.abort(out);
+        self.ca_disconnect();
         if reset {
             out.err = Some(KernelError::ConnectionReset);
         }

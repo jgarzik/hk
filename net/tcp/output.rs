@@ -250,9 +250,7 @@ impl TcpCb {
             if !push.one() {
                 self.schedule_loss_probe(now, false);
             }
-            let flight = self.snd_max.wrapping_sub(self.snd_una);
-            self.cong
-                .on_sent(flight, self.snd_una, self.snd_nxt, limited);
+            self.cwnd_validate(limited);
         } else if self.state.synced() {
             self.ack_snd_check(now, out);
         }
@@ -332,12 +330,14 @@ impl TcpCb {
         if fin {
             fl |= flags::FIN;
         }
+        // Linux tcp_event_data_sent: nothing was in flight
+        let tx_start = self.in_flight() == 0;
         if !self.send_new(n, fl, now, out) {
             return None;
         }
         if !in_flight && now.saturating_sub(self.lsndtime) > self.live.rto.get() {
             // Idle longer than an RTO: restart from the initial window
-            self.cong.restart(now - self.lsndtime, self.live.rto.get());
+            self.cwnd_restart(now - self.lsndtime);
         }
         let next = seq.wrapping_add(n + u32::from(fin));
         if self.rtt_seq.is_none() {
@@ -347,6 +347,9 @@ impl TcpCb {
             self.snd_sml = next;
         }
         if n > 0 {
+            if tx_start {
+                self.ca_event(super::cong::CaEvent::TxStart);
+            }
             self.data_sent(now);
             self.lsndtime = now;
         }

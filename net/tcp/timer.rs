@@ -214,9 +214,9 @@ impl TcpCb {
         }
         if handshake {
             // The SYN or SYN-ACK alone was out: one packet, lost
-            let ss = self.cong.loss_ssthresh(1);
-            self.cong.set_snd_ssthresh(ss);
-            self.cong.set_snd_cwnd(1);
+            let ss = self.ca_ssthresh();
+            self.cong.set_ssthresh(ss);
+            self.cong.set_cwnd(1);
             self.cong.reset_cnt();
         } else {
             self.enter_loss();

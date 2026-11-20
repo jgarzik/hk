@@ -19,6 +19,7 @@ use super::cb::{
     Ins, MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb,
     TcpState, Tmr, after, before, between, flags, wake,
 };
+use super::cong::AckSample;
 use super::recovery::{Rexmit, flag, tag};
 use super::sack::SackState;
 use crate::net::mib::*;
@@ -129,6 +130,7 @@ impl TcpCb {
         self.rtx_stamp = None;
         self.live.tmr.set(None);
         self.rcv_tstamp = now;
+        self.init_transfer();
         self.arm_keepalive(now);
         out.established = true;
         out.wake |= wake::STATE | wake::EST;
@@ -506,6 +508,7 @@ impl TcpCb {
         self.live.probes.set(0);
         self.rcv_tstamp = now;
         let acked = ack.wrapping_sub(prior_snd_una);
+        let mut rtt = None;
         if acked != 0 {
             self.stats.bytes_acked += u64::from(acked);
             self.snd_una = ack;
@@ -518,7 +521,7 @@ impl TcpCb {
             if before(self.snd_nxt, ack) {
                 self.snd_nxt = ack;
             }
-            self.ack_rtt(s, now);
+            rtt = self.ack_rtt(s, now);
             out.wake |= wake::SPACE;
         }
         if prior_packets == 0 {
@@ -535,6 +538,7 @@ impl TcpCb {
             return true;
         }
         flg |= self.clean_rtx_queue(prior_fack, &mut st);
+        self.ca_acked(&st, rtt);
         self.mem_settle();
         self.rack_update_reo_wnd(st.prior_delivered);
         self.process_tlp_ack(ack, flg);
@@ -548,7 +552,7 @@ impl TcpCb {
         }
         let delivered = self.newly_delivered(prior_delivered);
         let lost = self.lost.wrapping_sub(prior_lost);
-        self.cong_control(delivered, lost, flg, acked);
+        self.cong_control(ack, delivered, lost, flg);
         self.xmit_recovery(rexmit, out);
         true
     }
@@ -582,17 +586,34 @@ impl TcpCb {
     }
 
     /// An RTT sample from an ACK of new data: the timestamp echo, else
-    /// the timed segment (Karn)
-    fn ack_rtt(&mut self, s: &SegIn, now: u64) {
+    /// the timed segment (Karn); returns it (ms)
+    fn ack_rtt(&mut self, s: &SegIn, now: u64) -> Option<u64> {
         let timed = self.rtt_seq.filter(|&(seq, _)| !before(s.ack, seq));
-        if let Some(r) = self.ts_rtt(s) {
+        let rtt = self.ts_rtt(s).or(timed.map(|(_, t)| now.saturating_sub(t)));
+        if let Some(r) = rtt {
             self.rtt_sample(r);
-        } else if let Some((_, t)) = timed {
-            self.rtt_sample(now.saturating_sub(t));
         }
         if timed.is_some() {
             self.rtt_seq = None;
         }
+        rtt
+    }
+
+    /// The algorithm's accounting of the ACK (Linux tcp_clean_rtx_queue
+    /// calling icsk_ca_ops->pkts_acked): the packets it acknowledged,
+    /// its RTT (us, -1 if none), the bytes delivered over that round
+    /// trip
+    fn ca_acked(&mut self, st: &SackState, rtt_ms: Option<u64>) {
+        let rtt_us = rtt_ms.map_or(-1, |r| r.saturating_mul(1000).min(i32::MAX as u64) as i32);
+        let dlv = st
+            .prior_delivered
+            .map_or(0, |p| self.delivered.wrapping_sub(p));
+        let s = AckSample {
+            pkts_acked: st.pkts_acked,
+            rtt_us,
+            in_flight: self.live.mss.get().saturating_mul(dlv),
+        };
+        self.ca_pkts_acked(&s);
     }
 
     /// Linux tcp_clean_rtx_queue: skbs wholly acknowledged leave the
@@ -666,6 +687,7 @@ impl TcpCb {
         {
             flg |= flag::SACK_RENEGING;
         }
+        st.pkts_acked = pkts_acked;
         if flg & flag::ACKED != 0 {
             flg |= flag::SET_XMIT_TIMER;
             if self.is_reno() {

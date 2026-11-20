@@ -1261,7 +1261,7 @@ fn fast_retransmit_on_dupacks() {
         }
     }
     p.filter = drop_second;
-    p.a.live.cwnd.set(20_000);
+    p.a.live.cwnd.set(20);
     p.send_a(&pattern(10_000));
     let t = p.now;
     p.run();
@@ -1633,7 +1633,7 @@ fn wscale_opens_large_window() {
     let ack = p.log.iter().rev().find(|l| !l.1).unwrap().2.clone();
     assert_eq!((ack.wnd as u32) << 7, p.a.snd_wnd);
     // ... and more than 64 KB can be in flight
-    p.a.live.cwnd.set(1 << 20);
+    p.a.live.cwnd.set(1000);
     p.filter = drop_all;
     p.send_a(&data[400_000..]);
     assert!(p.a.snd_max.wrapping_sub(p.a.snd_una) > 65535);
@@ -1897,7 +1897,7 @@ fn cork_holds_partial_segments() {
 fn iw10_slow_start_growth() {
     let mut p = Pair::new(1000);
     let mss = p.a.live.mss.get() as usize;
-    assert_eq!(p.a.cong.cwnd() as usize, 10 * mss);
+    assert_eq!(p.a.cong.snd_cwnd(), 10);
     p.filter = drop_all;
     p.log.clear();
     p.send_a(&pattern(100_000));
@@ -1916,12 +1916,11 @@ fn iw10_slow_start_growth() {
     }
     assert!(rounds[1] >= 16, "rounds {:?}", rounds);
     // Congestion avoidance: about one segment per window
-    let mut c = p.a.cong.dup();
-    c.live.ssthresh.set(c.cwnd());
-    let w = c.cwnd();
-    c.on_sent(w, 0, 1, true);
-    c.on_ack(w);
-    assert_eq!(c.cwnd(), w + mss as u32);
+    let c = &mut p.a.cong;
+    c.set_ssthresh(c.snd_cwnd());
+    let w = c.snd_cwnd();
+    c.cong_avoid_ai(w, w);
+    assert_eq!(c.snd_cwnd(), w + 1);
 }
 
 #[test]
@@ -2485,7 +2484,7 @@ fn reno_fast_recovery_as_linux() {
             Fate::Pass
         }
     };
-    p.a.cong.set_snd_cwnd(20);
+    p.a.cong.set_cwnd(20);
     p.send_a(&pattern(10 * 988));
     let t = p.now;
     p.run();
@@ -2513,10 +2512,10 @@ fn reno_fast_recovery_as_linux() {
         ),
         (0, 0, 0, 0)
     );
-    // ssthresh: half the 8 packets out at the third duplicate (the
-    // algorithm's ssthresh); recovery ends at it
-    assert_eq!(p.a.cong.snd_ssthresh(), 4);
-    assert_eq!(p.a.cong.snd_cwnd(), 4);
+    // ssthresh: half the window of 20 at the third duplicate (Linux
+    // tcp_reno_ssthresh); recovery ends at it
+    assert_eq!(p.a.cong.snd_ssthresh(), 10);
+    assert_eq!(p.a.cong.snd_cwnd(), 10);
 }
 
 /// A timeout marks the flight lost and slow-starts from one packet
@@ -2591,7 +2590,7 @@ fn sack_recovers_lost_segments_only() {
         d.store(base + i * mss, Relaxed);
     }
     p.filter = drop_listed;
-    p.a.cong.set_snd_cwnd(20);
+    p.a.cong.set_cwnd(20);
     p.send_a(&pattern(12 * mss as usize));
     let t = p.now;
     p.run();
@@ -2643,7 +2642,7 @@ fn dsack_undoes_spurious_retransmission() {
         }
     }
     p.filter = delay_third;
-    p.a.cong.set_snd_cwnd(20);
+    p.a.cong.set_cwnd(20);
     let data = pattern(10 * 988);
     p.send_a(&data);
     p.run();
@@ -2663,7 +2662,7 @@ fn dsack_undoes_spurious_retransmission() {
 fn reordering_seen_by_timestamps() {
     use crate::net::mib::*;
     let (mut p, m) = sack_pair(1000);
-    p.a.cong.set_snd_cwnd(20);
+    p.a.cong.set_cwnd(20);
     p.send_a(&pattern(8 * 988));
     let segs = take_to_b(&mut p);
     p.now = 100;
@@ -2789,7 +2788,7 @@ fn rack_reordering_timer_marks_loss() {
     p.a.stats.min_rtt = Some(100);
     p.a.srtt8 = 800;
     p.now = 1000;
-    p.a.cong.set_snd_cwnd(20);
+    p.a.cong.set_cwnd(20);
     p.send_a(&pattern(4 * 988));
     let segs = take_to_b(&mut p);
     p.now = 1100;

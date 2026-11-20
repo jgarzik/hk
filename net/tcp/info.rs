@@ -20,8 +20,7 @@ use crate::fs::proc::seq::{self, SeqBuf};
 const OPT_TIMESTAMPS: u8 = 1;
 const OPT_SACK: u8 = 2;
 const OPT_WSCALE: u8 = 4;
-/// Linux TCP_INFINITE_SSTHRESH
-const INFINITE_SSTHRESH: u32 = 0x7fff_ffff;
+use super::cong::INFINITE_SSTHRESH;
 /// sizeof(struct tcp_info)
 pub const INFO_LEN: usize = 280;
 
@@ -123,13 +122,8 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let (srtt, var) = cb.rtt();
     b.u32((srtt * 1000) as u32);
     b.u32((var * 1000) as u32);
-    let ss = cb.cong.ssthresh();
-    b.u32(if ss >= INFINITE_SSTHRESH {
-        INFINITE_SSTHRESH
-    } else {
-        pkts(ss, mss)
-    });
-    b.u32(pkts(cb.cong.cwnd(), mss));
+    b.u32(cb.cong.snd_ssthresh().min(INFINITE_SSTHRESH));
+    b.u32(cb.cong.snd_cwnd());
     b.u32(cb.adv_mss);
     b.u32(cb.reordering);
     b.u32(0); // rcv_rtt
@@ -241,14 +235,13 @@ impl ProcView {
             (None, Some(t)) => (2, t),
             _ => (0, 0),
         };
-        let mss = l.mss.get();
         let ss = l.ssthresh.get();
         let last = if state == TcpState::Listen {
             i64::from(l.fastopen.get())
         } else if ss >= INFINITE_SSTHRESH {
             -1
         } else {
-            i64::from(pkts(ss, mss))
+            i64::from(ss)
         };
         Self {
             tr,
@@ -258,7 +251,7 @@ impl ProcView {
             rto: l.rto_cur(),
             ato: l.ato.get(),
             qp: (l.quick.get() << 1) | u32::from(l.pingpong.get()),
-            cwnd: pkts(l.cwnd.get(), mss),
+            cwnd: l.cwnd.get(),
             last,
         }
     }

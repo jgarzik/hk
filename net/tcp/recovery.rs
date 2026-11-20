@@ -17,7 +17,7 @@
 //! Reductions found spurious (timestamps, D-SACKs) are undone.
 
 use super::cb::{RTO_INIT, RTO_MIN, TcpCb, TcpState, Tmr, after, before};
-use super::cong::INFINITE_SSTHRESH;
+use super::cong::{CaEvent, INFINITE_SSTHRESH};
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
 
@@ -182,13 +182,8 @@ impl TcpCb {
         matches!(self.ca_state, CaState::Cwr | CaState::Recovery)
     }
 
-    /// Linux tcp_set_ca_state
-    pub(super) fn set_ca_state(&mut self, st: CaState) {
-        self.ca_state = st;
-    }
-
     /// Linux tcp_current_ssthresh, packets
-    fn current_ssthresh(&self) -> u32 {
+    pub(super) fn current_ssthresh(&self) -> u32 {
         let ss = self.cong.snd_ssthresh();
         if self.in_cwnd_reduction() {
             ss
@@ -374,11 +369,12 @@ impl TcpCb {
         {
             self.prior_ssthresh = self.current_ssthresh();
             self.prior_cwnd = self.cong.snd_cwnd();
-            let ss = self.cong.loss_ssthresh(self.packets_out);
-            self.cong.set_snd_ssthresh(ss);
+            let ss = self.ca_ssthresh();
+            self.cong.set_ssthresh(ss);
+            self.ca_event(CaEvent::Loss);
             self.init_undo();
         }
-        self.cong.set_snd_cwnd(self.in_flight() + 1);
+        self.cong.set_cwnd(self.in_flight() + 1);
         self.cong.reset_cnt();
         // Many duplicate ACKs, then a timeout: reordering overestimated
         if self.ca_state <= CaState::Disorder && self.sacked_out >= self.cfg.reordering {
@@ -410,7 +406,7 @@ impl TcpCb {
         if self.ca_state != CaState::Loss {
             self.high_seq = self.snd_max;
             let ss = self.current_ssthresh();
-            self.cong.set_snd_ssthresh(ss);
+            self.cong.set_ssthresh(ss);
             self.prior_ssthresh = 0;
             self.undo_marker = None;
             self.set_ca_state(CaState::Loss);
@@ -467,10 +463,10 @@ impl TcpCb {
             self.rtx_hint = None;
         }
         if self.prior_ssthresh != 0 {
-            let c = self.cong.undo_cwnd(self.prior_cwnd);
-            self.cong.set_snd_cwnd(c);
+            let c = self.ca_undo_cwnd();
+            self.cong.set_cwnd(c);
             if self.prior_ssthresh > self.cong.snd_ssthresh() {
-                self.cong.set_snd_ssthresh(self.prior_ssthresh);
+                self.cong.set_ssthresh(self.prior_ssthresh);
             }
         }
         self.undo_marker = None;
@@ -601,8 +597,8 @@ impl TcpCb {
         self.prior_cwnd = self.cong.snd_cwnd();
         self.prr_delivered = 0;
         self.prr_out = 0;
-        let ss = self.cong.loss_ssthresh(self.packets_out);
-        self.cong.set_snd_ssthresh(ss);
+        let ss = self.ca_ssthresh();
+        self.cong.set_ssthresh(ss);
     }
 
     /// Linux tcp_cwnd_reduction (RFC 6937 PRR): spread the reduction
@@ -631,15 +627,16 @@ impl TcpCb {
         // Force a fast retransmit upon entering fast recovery
         sndcnt = sndcnt.max(if self.prr_out != 0 { 0 } else { 1 });
         let c = (i64::from(self.in_flight()) + sndcnt).max(0) as u32;
-        self.cong.set_snd_cwnd(c);
+        self.cong.set_cwnd(c);
     }
 
     /// Linux tcp_end_cwnd_reduction: back to ssthresh (unless undone)
     fn end_cwnd_reduction(&mut self) {
         let ss = self.cong.snd_ssthresh();
         if ss < INFINITE_SSTHRESH && (self.ca_state == CaState::Cwr || self.undo_marker.is_some()) {
-            self.cong.set_snd_cwnd(ss);
+            self.cong.set_cwnd(ss);
         }
+        self.ca_event(CaEvent::CompleteCwr);
     }
 
     /// Linux tcp_try_keep_open
@@ -873,12 +870,12 @@ impl TcpCb {
     }
 
     /// Linux tcp_cong_control (no cong_control op): PRR while reducing,
-    /// else growth (`acked` bytes cumulatively acked)
-    pub(super) fn cong_control(&mut self, acked_sacked: u32, losses: u32, f: u32, acked: u32) {
+    /// else the algorithm's growth for the packets delivered up to `ack`
+    pub(super) fn cong_control(&mut self, ack: u32, acked_sacked: u32, losses: u32, f: u32) {
         if self.in_cwnd_reduction() {
             self.cwnd_reduction(acked_sacked, losses, f);
         } else if self.may_raise_cwnd(f) {
-            self.cong.on_ack(acked);
+            self.cong_avoid(ack, acked_sacked);
         }
     }
 

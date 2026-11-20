@@ -1,48 +1,91 @@
-//! Congestion control (RFC 5681 slow start / congestion avoidance; RFC
-//! 6928 initial window; Linux tcp_cong.c)
+//! Congestion control (Linux tcp_cong.c and its call sites in
+//! tcp_input.c / tcp_output.c)
 //!
-//! Pure arithmetic on byte counts; the control block calls the hooks
-//! and acts on their results. The parts that differ between algorithms
-//! (Linux tcp_congestion_ops: `ssthresh`, `cong_avoid`, `undo_cwnd`)
-//! sit behind [`CongOps`]; the loss recovery around them (Linux
-//! tcp_input.c: the CA states, PRR, undo) is `recovery.rs`, which sees
-//! the window in packets (`snd_cwnd`, `snd_ssthresh`), as Linux. Only Reno is built in (TCP_CONGESTION "reno"; Linux's default
-//! CUBIC is not implemented, so hk's default is "reno").
+//! The window is in packets, as Linux's snd_cwnd / snd_ssthresh /
+//! snd_cwnd_cnt, so an algorithm's arithmetic is Linux's own; the
+//! sender keeps at most cwnd packets in flight (`output.rs`,
+//! tcp_cwnd_test).
 //!
-//! Growth follows Linux: slow start adds the bytes acknowledged (RFC
-//! 3465 byte counting without the L limit, like Linux's packet count),
-//! congestion avoidance adds one MSS per cwnd of acknowledged bytes,
-//! and both only while the sender actually used its window (Linux
-//! tcp_is_cwnd_limited, RFC 7661 spirit): an application-limited sender
-//! does not inflate cwnd. After an idle period longer than the RTO the
-//! window decays towards the initial window (RFC 5681 4.1, Linux
-//! tcp_cwnd_restart).
+//! What differs between algorithms sits behind [`CongOps`] (Linux struct
+//! tcp_congestion_ops). Its hooks take the control block as Linux's take
+//! the socket, and keep per-connection state in [`CaPriv`] (Linux
+//! inet_csk_ca). Linux's split holds: this file is tcp_cong.c (the
+//! registry, the hooks' callers tcp_set_ca_state / tcp_ca_event /
+//! tcp_init_congestion_control..., tcp_slow_start, tcp_cong_avoid_ai,
+//! Reno) and the window bookkeeping of tcp_output.c (tcp_cwnd_validate,
+//! tcp_cwnd_restart); the CA state machine, PRR, undo and F-RTO that
+//! call the hooks are tcp_input.c's, in `recovery.rs`.
+//!
+//! Algorithms are built in (no modules, so no key or reference count).
+//! ECN, TSO and pacing do not exist, so neither do the ECN events, the
+//! in_ack_event, min_tso_segs, sndbuf_expand and cong_control hooks.
 
-use core::fmt;
-
-use super::cb::{Live, before};
+use super::cb::{TcpCb, TcpState, before};
+use super::recovery::CaState;
 use alloc::sync::Arc;
+use core::fmt;
 
 /// Largest name of an algorithm with its NUL (Linux TCP_CA_NAME_MAX)
 pub const NAME_MAX: usize = 16;
-/// Largest congestion window, in bytes (Linux snd_cwnd_clamp, which is
-/// in packets): the largest window a peer can advertise (65535 << 14,
-/// RFC 7323). More could never be sent, and the cap keeps cwnd + a few
-/// MSS far from u32 overflow however long recovery inflates it.
-pub const CWND_CLAMP: u32 = 0xffff << 14;
-/// Linux TCP_INFINITE_SSTHRESH
+/// Initial window in packets (Linux TCP_INIT_CWND)
+pub const INIT_CWND: u32 = 10;
+/// Slow start threshold before any loss (Linux TCP_INFINITE_SSTHRESH)
 pub const INFINITE_SSTHRESH: u32 = 0x7fff_ffff;
 
-/// What differs between congestion algorithms
-pub trait CongOps: Sync {
-    fn name(&self) -> &'static str;
-    /// Slow start threshold after a loss with `flight` bytes out
-    fn ssthresh(&self, c: &Cong, flight: u32) -> u32;
-    /// `acked` new bytes acknowledged outside recovery while cwnd-limited
-    fn cong_avoid(&self, c: &mut Cong, acked: u32);
+/// Linux enum tcp_ca_event (no ECN, so no ECN_NO_CE / ECN_IS_CE)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaEvent {
+    /// First transmit when nothing is in flight
+    TxStart,
+    /// Window restart after idle
+    CwndRestart,
+    /// End of a CWR or Recovery window reduction
+    CompleteCwr,
+    /// Retransmission timeout
+    Loss,
 }
 
-/// RFC 5681 Reno (Linux tcp_reno_*)
+/// What an ACK delivered (Linux struct ack_sample)
+#[derive(Clone, Copy, Debug)]
+pub struct AckSample {
+    /// Packets newly acknowledged
+    pub pkts_acked: u32,
+    /// Round trip of the ACK in us, -1 if none
+    pub rtt_us: i32,
+    /// Bytes delivered over the sample's round trip
+    pub in_flight: u32,
+}
+
+/// A congestion control algorithm (Linux struct tcp_congestion_ops)
+pub trait CongOps: Sync {
+    fn name(&self) -> &'static str;
+    /// TCP_CONG_* flags (Linux tcp_congestion_ops.flags as registered)
+    fn flags(&self) -> u32 {
+        0
+    }
+    /// Set up the private state (connection established, or switched
+    /// to on one)
+    fn init(&self, _tp: &mut TcpCb) {}
+    /// Tear it down
+    fn release(&self, _tp: &mut TcpCb) {}
+    /// Slow start threshold after a loss (required)
+    fn ssthresh(&self, tp: &mut TcpCb) -> u32;
+    /// Grow the window: `acked` packets delivered up to `ack`
+    fn cong_avoid(&self, tp: &mut TcpCb, ack: u32, acked: u32);
+    /// Called before the CA state changes
+    fn set_state(&self, _tp: &mut TcpCb, _new: CaState) {}
+    /// A window event
+    fn cwnd_event(&self, _tp: &mut TcpCb, _ev: CaEvent) {}
+    /// Packet accounting of every ACK
+    fn pkts_acked(&self, _tp: &mut TcpCb, _s: &AckSample) {}
+    /// The window after an undone reduction (required)
+    fn undo_cwnd(&self, tp: &mut TcpCb) -> u32;
+}
+
+/// Linux TCP_CONG_NON_RESTRICTED: unprivileged users may select it
+pub const NON_RESTRICTED: u32 = 1;
+
+/// RFC 5681 Reno (Linux tcp_reno)
 pub struct Reno;
 
 impl CongOps for Reno {
@@ -50,58 +93,101 @@ impl CongOps for Reno {
         "reno"
     }
 
-    fn ssthresh(&self, c: &Cong, flight: u32) -> u32 {
-        (flight / 2).max(2 * c.mss)
+    fn flags(&self) -> u32 {
+        NON_RESTRICTED
     }
 
-    fn cong_avoid(&self, c: &mut Cong, mut acked: u32) {
-        if c.in_slow_start() {
-            acked = c.slow_start(acked);
-            if acked == 0 {
-                return;
-            }
-        }
-        c.avoid_ai(acked);
+    fn ssthresh(&self, tp: &mut TcpCb) -> u32 {
+        reno_ssthresh(tp)
+    }
+
+    fn cong_avoid(&self, tp: &mut TcpCb, ack: u32, acked: u32) {
+        reno_cong_avoid(tp, ack, acked);
+    }
+
+    fn undo_cwnd(&self, tp: &mut TcpCb) -> u32 {
+        reno_undo_cwnd(tp)
     }
 }
 
-/// Built-in algorithms; index 0 is the default
+/// Linux tcp_reno_cong_avoid
+pub fn reno_cong_avoid(tp: &mut TcpCb, _ack: u32, mut acked: u32) {
+    let c = &mut tp.cong;
+    if !c.cwnd_limited() {
+        return;
+    }
+    if c.in_slow_start() {
+        acked = c.slow_start(acked);
+        if acked == 0 {
+            return;
+        }
+    }
+    let w = c.snd_cwnd();
+    c.cong_avoid_ai(w, acked);
+}
+
+/// Linux tcp_reno_ssthresh: half the window, at least 2
+pub fn reno_ssthresh(tp: &mut TcpCb) -> u32 {
+    (tp.cong.snd_cwnd() >> 1).max(2)
+}
+
+/// Linux tcp_reno_undo_cwnd
+pub fn reno_undo_cwnd(tp: &mut TcpCb) -> u32 {
+    tp.cong.snd_cwnd().max(tp.prior_cwnd)
+}
+
+/// Built-in algorithms in registration order (what
+/// tcp_available_congestion_control lists)
 pub static ALGOS: &[&dyn CongOps] = &[&Reno];
 
-/// Index of algorithm `name`
+/// The boot default (Linux CONFIG_DEFAULT_TCP_CONG)
+pub const DEFAULT: usize = 0;
+
+/// Index of algorithm `name` (Linux tcp_ca_find)
 pub fn find(name: &str) -> Option<usize> {
     ALGOS.iter().position(|a| a.name() == name)
 }
 
-/// Names of the built-in algorithms, space separated
+/// Names of the built-in algorithms, space separated (Linux
+/// tcp_get_available_congestion_control)
 pub fn names() -> alloc::string::String {
     let v: alloc::vec::Vec<&str> = ALGOS.iter().map(|a| a.name()).collect();
     v.join(" ")
 }
 
-/// A connection's congestion state; cwnd and ssthresh, which
-/// /proc/net/tcp reads, are in its control block's `cb::Live`
+/// Per-connection private state of the algorithms (Linux icsk_ca_priv:
+/// zeroed whenever an algorithm is assigned). Reno keeps none.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaPriv {}
+
+/// A connection's window and algorithm (Linux tcp_sock's snd_cwnd,
+/// snd_ssthresh, snd_cwnd_cnt, snd_cwnd_clamp, is_cwnd_limited...;
+/// icsk_ca_ops, icsk_ca_priv). The window and threshold, which
+/// /proc/net/tcp reads, are in its control block's `cb::Live`.
 pub struct Cong {
-    pub(super) live: Arc<Live>,
-    mss: u32,
-    /// Bytes acknowledged towards the next congestion avoidance step
-    /// (Linux snd_cwnd_cnt, in bytes)
+    pub(super) live: Arc<super::cb::Live>,
+    /// Linux snd_cwnd_cnt: packets acknowledged towards the next
+    /// congestion avoidance step
     cnt: u32,
-    /// The window was the limit during the last flight (Linux
-    /// is_cwnd_limited / max_packets_out / cwnd_usage_seq)
+    /// Linux snd_cwnd_clamp
+    clamp: u32,
+    /// Linux is_cwnd_limited / max_packets_out / cwnd_usage_seq
     limited: bool,
-    max_flight: u32,
+    max_packets_out: u32,
     usage_seq: u32,
-    /// The algorithm (index into [`ALGOS`])
+    /// The algorithm (Linux icsk_ca_ops: index into [`ALGOS`]), whether
+    /// its init ran (icsk_ca_initialized), its private state
     algo: usize,
+    initialized: bool,
+    pub(super) ca: CaPriv,
 }
 
 impl fmt::Debug for Cong {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cong")
             .field("algo", &self.name())
-            .field("cwnd", &self.live.cwnd.get())
-            .field("ssthresh", &self.live.ssthresh.get())
+            .field("cwnd", &self.snd_cwnd())
+            .field("ssthresh", &self.snd_ssthresh())
             .finish()
     }
 }
@@ -114,42 +200,46 @@ impl Default for Cong {
 }
 
 impl Cong {
-    /// Initial state, its window in `live`
-    pub fn new(live: Arc<Live>) -> Self {
+    /// A new socket's state (Linux tcp_init_sock), its window in `live`
+    pub fn new(live: Arc<super::cb::Live>) -> Self {
         let c = Self {
             live,
-            mss: super::cb::MSS_DEFAULT,
             cnt: 0,
+            clamp: u32::MAX,
             limited: false,
-            max_flight: 0,
+            max_packets_out: 0,
             usage_seq: 0,
-            algo: 0,
+            algo: DEFAULT,
+            initialized: false,
+            ca: CaPriv::default(),
         };
-        c.live.ssthresh.set(u32::MAX);
-        c.live.cwnd.set(c.initial());
+        c.live.ssthresh.set(INFINITE_SSTHRESH);
+        c.live.cwnd.set(INIT_CWND);
         c
     }
 
-    /// Linux tcp_snd_cwnd (bytes here)
-    pub fn cwnd(&self) -> u32 {
+    /// Linux tcp_snd_cwnd (packets)
+    pub fn snd_cwnd(&self) -> u32 {
         self.live.cwnd.get()
     }
 
-    /// Linux snd_ssthresh (bytes here)
-    pub fn ssthresh(&self) -> u32 {
+    /// Linux snd_ssthresh (packets)
+    pub fn snd_ssthresh(&self) -> u32 {
         self.live.ssthresh.get()
     }
 
-    /// The same state on its own cells (tests)
-    #[cfg(test)]
-    pub fn dup(&self) -> Self {
-        let c = Self {
-            live: Arc::default(),
-            ..*self
-        };
-        c.live.cwnd.set(self.cwnd());
-        c.live.ssthresh.set(self.ssthresh());
-        c
+    /// Linux tcp_snd_cwnd_set
+    pub fn set_cwnd(&mut self, v: u32) {
+        self.live.cwnd.set(v.max(1));
+    }
+
+    pub fn set_ssthresh(&mut self, v: u32) {
+        self.live.ssthresh.set(v);
+    }
+
+    /// Linux snd_cwnd_cnt = 0
+    pub fn reset_cnt(&mut self) {
+        self.cnt = 0;
     }
 
     fn ops(&self) -> &'static dyn CongOps {
@@ -164,256 +254,285 @@ impl Cong {
         self.algo
     }
 
-    /// Switch algorithm (TCP_CONGESTION); the window state carries over
-    pub fn set_algo(&mut self, i: usize) {
-        if i < ALGOS.len() {
-            self.algo = i;
-        }
-    }
-
-    /// RFC 6928 initial window: min(10*MSS, max(2*MSS, 14600))
-    pub fn initial(&self) -> u32 {
-        (10 * self.mss).min((2 * self.mss).max(14600))
-    }
-
-    pub fn set_mss(&mut self, mss: u32) {
-        let first = self.live.cwnd.get() == self.initial();
-        self.mss = mss;
-        if first {
-            self.live.cwnd.set(self.initial());
-        }
-    }
-
+    /// Linux tcp_in_slow_start
     pub fn in_slow_start(&self) -> bool {
-        self.live.cwnd.get() < self.live.ssthresh.get()
+        self.snd_cwnd() < self.snd_ssthresh()
     }
 
-    /// Linux tcp_slow_start: grow by `acked` up to ssthresh; returns the
-    /// bytes left for congestion avoidance
+    /// Linux tcp_in_initial_slowstart
+    pub fn in_initial_slowstart(&self) -> bool {
+        self.snd_ssthresh() >= INFINITE_SSTHRESH
+    }
+
+    /// Linux tcp_slow_start: grow by `acked` up to ssthresh; returns
+    /// the packets left for congestion avoidance
     pub fn slow_start(&mut self, acked: u32) -> u32 {
-        let cwnd = self
-            .live
-            .cwnd
-            .get()
-            .saturating_add(acked)
-            .min(self.live.ssthresh.get());
-        let left = acked.saturating_sub(cwnd.saturating_sub(self.live.cwnd.get()));
-        self.set_cwnd(cwnd);
+        let w = self.snd_cwnd();
+        let cwnd = w.saturating_add(acked).min(self.snd_ssthresh());
+        let left = acked - (cwnd - w);
+        self.set_cwnd(cwnd.min(self.clamp));
         left
     }
 
-    /// Linux tcp_cong_avoid_ai: one MSS per cwnd of acknowledged bytes
-    pub fn avoid_ai(&mut self, acked: u32) {
-        self.cnt = self.cnt.saturating_add(acked);
-        let w = self.live.cwnd.get().max(1);
+    /// Linux tcp_cong_avoid_ai: one packet per `w` acknowledged
+    pub fn cong_avoid_ai(&mut self, w: u32, acked: u32) {
+        let w = w.max(1);
+        // Credits accumulated at a higher w are applied gently now
         if self.cnt >= w {
-            let steps = self.cnt / w;
-            self.cnt -= steps * w;
-            self.set_cwnd(
-                self.live
-                    .cwnd
-                    .get()
-                    .saturating_add(steps.saturating_mul(self.mss)),
-            );
+            self.cnt = 0;
+            self.set_cwnd(self.snd_cwnd().saturating_add(1));
         }
-    }
-
-    /// Linux tcp_snd_cwnd_set with the snd_cwnd_clamp bound its callers
-    /// apply: cwnd never passes [`CWND_CLAMP`]
-    fn set_cwnd(&mut self, v: u32) {
-        self.live.cwnd.set(v.min(CWND_CLAMP));
+        self.cnt = self.cnt.saturating_add(acked);
+        if self.cnt >= w {
+            let delta = self.cnt / w;
+            self.cnt -= delta * w;
+            self.set_cwnd(self.snd_cwnd().saturating_add(delta));
+        }
+        self.set_cwnd(self.snd_cwnd().min(self.clamp));
     }
 
     /// Linux tcp_is_cwnd_limited
-    fn cwnd_limited(&self) -> bool {
+    pub fn cwnd_limited(&self) -> bool {
         if self.limited {
             return true;
         }
-        self.in_slow_start() && self.live.cwnd.get() < 2 * self.max_flight
+        self.in_slow_start() && self.snd_cwnd() < 2 * self.max_packets_out
+    }
+}
+
+impl TcpCb {
+    fn ca_ops(&self) -> &'static dyn CongOps {
+        self.cong.ops()
     }
 
-    /// After a transmit pass: `flight` bytes out, `limited` if cwnd
-    /// stopped it (Linux tcp_cwnd_validate); one sample per window
-    pub fn on_sent(&mut self, flight: u32, snd_una: u32, snd_nxt: u32, limited: bool) {
-        if !before(snd_una, self.usage_seq)
-            || limited
-            || (!self.limited && flight > self.max_flight)
-        {
-            self.limited = limited;
-            self.max_flight = flight;
-            self.usage_seq = snd_nxt;
+    /// Linux tcp_assign_congestion_control / the algorithm switch of
+    /// tcp_reinit_congestion_control: its private state zeroed
+    pub(super) fn assign_cc(&mut self, i: usize) {
+        if i < ALGOS.len() {
+            self.cong.algo = i;
+            self.cong.ca = CaPriv::default();
         }
     }
 
-    /// New data acknowledged outside a window reduction (Linux
-    /// tcp_cong_avoid, `acked` bytes): grow while cwnd-limited
-    pub fn on_ack(&mut self, acked: u32) {
-        if self.cwnd_limited() {
-            self.ops().cong_avoid(self, acked);
+    /// Linux tcp_init_congestion_control
+    pub(super) fn init_cc(&mut self) {
+        self.prior_ssthresh = 0;
+        self.ca_ops().init(self);
+        self.cong.initialized = true;
+    }
+
+    /// Linux tcp_cleanup_congestion_control
+    pub(super) fn cleanup_cc(&mut self) {
+        if self.cong.initialized {
+            self.ca_ops().release(self);
+        }
+        self.cong.initialized = false;
+    }
+
+    /// TCP_CONGESTION (Linux tcp_set_congestion_control, then
+    /// tcp_reinit_congestion_control): the same algorithm is no change;
+    /// another one is initialized at once on a connection
+    pub(super) fn set_cc(&mut self, i: usize) {
+        if i == self.cong.algo || i >= ALGOS.len() {
+            return;
+        }
+        self.cleanup_cc();
+        self.assign_cc(i);
+        if !matches!(self.state, TcpState::Closed | TcpState::Listen) {
+            self.init_cc();
         }
     }
 
-    /// Linux tcp_snd_cwnd: the window in packets (at least one)
-    pub fn snd_cwnd(&self) -> u32 {
-        (self.live.cwnd.get() / self.mss.max(1)).max(1)
-    }
-
-    /// Linux tcp_snd_cwnd_set (and snd_cwnd_cnt = 0 where Linux's
-    /// callers reset it): the window to `pkts` packets
-    pub fn set_snd_cwnd(&mut self, pkts: u32) {
-        self.set_cwnd(pkts.saturating_mul(self.mss));
-    }
-
-    /// Linux snd_ssthresh in packets (TCP_INFINITE_SSTHRESH unset)
-    pub fn snd_ssthresh(&self) -> u32 {
-        match self.live.ssthresh.get() {
-            u32::MAX => INFINITE_SSTHRESH,
-            b => b / self.mss.max(1),
-        }
-    }
-
-    pub fn set_snd_ssthresh(&mut self, pkts: u32) {
-        self.live.ssthresh.set(if pkts >= INFINITE_SSTHRESH {
-            u32::MAX
+    /// The handshake completed (Linux tcp_init_transfer): the initial
+    /// window (one packet after more than one SYN retransmission, RFC
+    /// 6298), then the algorithm
+    pub(super) fn init_transfer(&mut self) {
+        if self.stats.total_retrans > 1 && self.undo_marker.is_some() {
+            self.cong.set_cwnd(1);
         } else {
-            pkts.saturating_mul(self.mss)
-        });
+            self.cong.set_cwnd(INIT_CWND);
+        }
+        if !self.cong.initialized {
+            self.init_cc();
+        }
     }
 
-    /// The algorithm's slow start threshold after a loss with
-    /// `in_flight` packets out (Linux icsk_ca_ops->ssthresh), packets
-    pub fn loss_ssthresh(&self, in_flight: u32) -> u32 {
-        let b = self
-            .ops()
-            .ssthresh(self, in_flight.saturating_mul(self.mss));
-        (b / self.mss.max(1)).max(2)
+    /// Linux tcp_disconnect's congestion part: the algorithm released
+    /// and zeroed, the initial window
+    pub(super) fn ca_disconnect(&mut self) {
+        if self.cong.initialized {
+            self.ca_ops().release(self);
+        }
+        self.cong.ca = CaPriv::default();
+        self.cong.initialized = false;
+        self.set_ca_state(CaState::Open);
+        self.cong.set_ssthresh(INFINITE_SSTHRESH);
+        self.cong.set_cwnd(INIT_CWND);
     }
 
-    /// The window to restore on undo (Linux icsk_ca_ops->undo_cwnd,
-    /// tcp_reno_undo_cwnd: max(cwnd, prior_cwnd)), packets
-    pub fn undo_cwnd(&self, prior_cwnd: u32) -> u32 {
-        self.snd_cwnd().max(prior_cwnd)
+    /// Linux tcp_set_ca_state
+    pub(super) fn set_ca_state(&mut self, s: CaState) {
+        self.ca_ops().set_state(self, s);
+        self.ca_state = s;
     }
 
-    /// Linux snd_cwnd_cnt = 0
-    pub fn reset_cnt(&mut self) {
-        self.cnt = 0;
+    /// Linux tcp_ca_event
+    pub(super) fn ca_event(&mut self, ev: CaEvent) {
+        self.ca_ops().cwnd_event(self, ev);
     }
 
-    /// Sending again after `idle` ms with nothing in flight (Linux
+    /// Linux icsk_ca_ops->ssthresh
+    pub(super) fn ca_ssthresh(&mut self) -> u32 {
+        self.ca_ops().ssthresh(self)
+    }
+
+    /// Linux icsk_ca_ops->undo_cwnd
+    pub(super) fn ca_undo_cwnd(&mut self) -> u32 {
+        self.ca_ops().undo_cwnd(self)
+    }
+
+    /// Linux tcp_clean_rtx_queue's icsk_ca_ops->pkts_acked
+    pub(super) fn ca_pkts_acked(&mut self, s: &AckSample) {
+        self.ca_ops().pkts_acked(self, s);
+    }
+
+    /// Linux tcp_cong_avoid
+    pub(super) fn cong_avoid(&mut self, ack: u32, acked: u32) {
+        self.ca_ops().cong_avoid(self, ack, acked);
+    }
+
+    /// After a transmit pass with `limited` if cwnd stopped it (Linux
+    /// tcp_cwnd_validate): one sample per window
+    pub(super) fn cwnd_validate(&mut self, limited: bool) {
+        let out = self.packets_out;
+        let c = &mut self.cong;
+        if !before(self.snd_una, c.usage_seq) || limited || (!c.limited && out > c.max_packets_out)
+        {
+            c.limited = limited;
+            c.max_packets_out = out;
+            c.usage_seq = self.snd_nxt;
+        }
+    }
+
+    /// Sending again after `delta` ms with nothing in flight (Linux
     /// tcp_cwnd_restart): halve per RTO idle, not below the initial
     /// window
-    pub fn restart(&mut self, idle: u64, rto: u64) {
-        let iw = self.initial().min(self.live.cwnd.get());
-        let mut cwnd = self.live.cwnd.get();
-        let mut left = idle as i64 - rto as i64;
-        while left > 0 && cwnd > iw {
+    pub(super) fn cwnd_restart(&mut self, delta: u64) {
+        let rto = self.live.rto.get();
+        let mut cwnd = self.cong.snd_cwnd();
+        let restart = INIT_CWND.min(cwnd);
+        self.ca_event(CaEvent::CwndRestart);
+        let ss = self.current_ssthresh();
+        self.cong.set_ssthresh(ss);
+        let mut left = delta as i64 - rto as i64;
+        while left > 0 && cwnd > restart {
             cwnd >>= 1;
             left -= rto as i64;
         }
-        self.live.cwnd.set(cwnd.max(iw));
-        self.max_flight = 0;
+        self.cong.set_cwnd(cwnd.max(restart));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::cb::Cfg;
     use super::*;
 
-    fn limited(c: &mut Cong) {
-        c.on_sent(c.cwnd(), 0, 1, true);
+    /// An established Reno connection with `n` packets out, cwnd the
+    /// limit
+    fn cb(n: u32) -> TcpCb {
+        let mut tp = TcpCb::new(Cfg::default(), Arc::default());
+        tp.live.mss.set(1000);
+        tp.state = TcpState::Established;
+        tp.assign_cc(0);
+        tp.init_cc();
+        tp.packets_out = n;
+        tp.cwnd_validate(true);
+        tp
     }
 
     #[test]
     fn iw10() {
-        let mut c = Cong::default();
-        c.set_mss(1460);
-        assert_eq!(c.cwnd(), 14600);
-        c.set_mss(1000);
-        assert_eq!(c.cwnd(), 10_000);
-        c.set_mss(536);
-        assert_eq!(c.cwnd(), 5360);
-        let mut c = Cong::default();
-        c.set_mss(9000);
-        assert_eq!(c.cwnd(), 18_000);
+        let tp = cb(0);
+        assert_eq!(tp.cong.snd_cwnd(), 10);
+        assert!(tp.cong.in_initial_slowstart());
     }
 
     #[test]
     fn slow_start_then_avoidance() {
-        let mut c = Cong::default();
-        c.set_mss(1000);
-        assert_eq!(c.cwnd(), 10_000);
-        c.live.ssthresh.set(13_000);
-        limited(&mut c);
-        // Slow start: every acknowledged byte, up to ssthresh
-        c.on_ack(2000);
-        assert_eq!(c.cwnd(), 12_000);
+        let mut tp = cb(10);
+        tp.cong.set_ssthresh(13);
+        // Slow start: every acknowledged packet, up to ssthresh
+        tp.cong_avoid(0, 2);
+        assert_eq!(tp.cong.snd_cwnd(), 12);
         // Crossing ssthresh: the rest counts towards avoidance
-        c.on_ack(2000);
-        assert_eq!(c.cwnd(), 13_000);
-        // Avoidance: one MSS per cwnd acknowledged
+        tp.cong_avoid(0, 2);
+        assert_eq!(tp.cong.snd_cwnd(), 13);
+        assert_eq!(tp.cong.cnt, 1);
+        // Avoidance: one packet per cwnd acknowledged
         for _ in 0..12 {
-            c.on_ack(1000);
+            tp.cong_avoid(0, 1);
         }
-        assert_eq!(c.cwnd(), 14_000);
-        c.on_ack(13_000);
-        assert_eq!(c.cwnd(), 14_000);
-        c.on_ack(1000);
-        assert_eq!(c.cwnd(), 15_000);
+        assert_eq!(tp.cong.snd_cwnd(), 14);
+        for _ in 0..14 {
+            tp.cong_avoid(0, 1);
+        }
+        assert_eq!(tp.cong.snd_cwnd(), 15);
     }
 
     #[test]
     fn app_limited_does_not_grow() {
-        let mut c = Cong::default();
-        c.set_mss(1000);
-        // Only 2000 bytes ever in flight: slow start stops at 2x that
-        c.on_sent(2000, 0, 2000, false);
-        for i in 0..20 {
-            c.on_ack(1000);
+        let mut tp = cb(0);
+        // Only 2 packets ever in flight: slow start stops at 2x that
+        tp.packets_out = 2;
+        tp.cwnd_validate(false);
+        for _ in 0..4 {
+            tp.cong_avoid(0, 1);
         }
-        assert_eq!(c.cwnd(), 10_000);
-        c.on_sent(6000, 2000, 8000, false);
-        for i in 0..20 {
-            c.on_ack(1000);
+        assert_eq!(tp.cong.snd_cwnd(), 10);
+        tp.packets_out = 6;
+        tp.cwnd_validate(false);
+        for _ in 0..6 {
+            tp.cong_avoid(0, 1);
         }
-        assert_eq!(c.cwnd(), 12_000);
+        assert_eq!(tp.cong.snd_cwnd(), 12);
     }
 
     #[test]
-    fn packet_units() {
-        let mut c = Cong::default();
-        c.set_mss(1000);
-        assert_eq!((c.snd_cwnd(), c.snd_ssthresh()), (10, INFINITE_SSTHRESH));
-        c.set_snd_cwnd(7);
-        c.set_snd_ssthresh(5);
-        assert_eq!((c.cwnd(), c.ssthresh()), (7000, 5000));
-        assert_eq!((c.snd_cwnd(), c.snd_ssthresh()), (7, 5));
-        // Reno halves the flight, at least two packets
-        assert_eq!((c.loss_ssthresh(10), c.loss_ssthresh(1)), (5, 2));
-        assert_eq!(c.undo_cwnd(9), 9);
-        // The clamp holds however many packets are asked for
-        c.set_snd_cwnd(u32::MAX);
-        assert_eq!(c.cwnd(), CWND_CLAMP);
+    fn reno_hooks() {
+        let mut tp = cb(10);
+        tp.cong.set_cwnd(9);
+        assert_eq!(tp.ca_ssthresh(), 4);
+        tp.cong.set_cwnd(3);
+        assert_eq!(tp.ca_ssthresh(), 2);
+        tp.prior_cwnd = 7;
+        assert_eq!(tp.ca_undo_cwnd(), 7);
     }
 
     #[test]
     fn restart_after_idle() {
-        let mut c = Cong::default();
-        c.set_mss(1000);
-        c.live.cwnd.set(80_000);
-        c.restart(150, 200);
-        assert_eq!(c.cwnd(), 80_000);
-        c.restart(450, 200);
-        assert_eq!(c.cwnd(), 20_000);
-        c.restart(100_000, 200);
-        assert_eq!(c.cwnd(), 10_000);
+        let mut tp = cb(0);
+        tp.cong.set_cwnd(80);
+        tp.live.rto.set(200);
+        tp.cwnd_restart(150);
+        assert_eq!(tp.cong.snd_cwnd(), 80);
+        assert_eq!(tp.cong.snd_ssthresh(), INFINITE_SSTHRESH);
+        tp.cwnd_restart(450);
+        assert_eq!(tp.cong.snd_cwnd(), 20);
+        tp.cwnd_restart(100_000);
+        assert_eq!(tp.cong.snd_cwnd(), 10);
+        // tcp_current_ssthresh: 3/4 of the old window
+        tp.cong.set_ssthresh(4);
+        tp.cong.set_cwnd(40);
+        tp.cwnd_restart(0);
+        assert_eq!(tp.cong.snd_ssthresh(), 30);
     }
 
     #[test]
     fn registry() {
         assert_eq!(find("reno"), Some(0));
-        assert_eq!(find("cubic"), None);
+        assert_eq!(find("nosuch"), None);
         assert_eq!(names(), "reno");
-        assert_eq!(Cong::default().name(), "reno");
+        assert_eq!(cb(0).cong.name(), "reno");
     }
 }

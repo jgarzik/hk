@@ -388,7 +388,9 @@ impl TcpSock {
         let live = try_arc(cb::Live::default())?;
         let mut cb = TcpCb::new(cfg(&sk.net), live.clone());
         cb.mib = Some(Arc::clone(&sk.net.mib));
+        // Linux tcp_init_sock: tcp_assign_congestion_control
         cb.opts.ca = sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
+        cb.assign_cc(cb.opts.ca);
         let snap = Snap::default();
         snap.store(&cb);
         try_arc_cyclic(|me| Self {
@@ -509,7 +511,9 @@ impl TcpSock {
             // stays until close()
             let keep = !g.cb.orphan && self.inet.get().port_lock;
             // Linux inet_csk_destroy_sock: no longer an orphan
+            // (tcp_v4_destroy_sock: tcp_cleanup_congestion_control)
             g.orphan = None;
+            g.cb.cleanup_cc();
             self.unhash_conn(g);
             if !keep {
                 self.unbind(g);
@@ -2336,7 +2340,7 @@ impl TcpSock {
         let i = cong::find(name).ok_or(KernelError::NotFound)?;
         let mut g = self.lock_sock();
         g.cb.opts.ca = i;
-        g.cb.cong.set_algo(i);
+        g.cb.set_cc(i);
         Ok(())
     }
 

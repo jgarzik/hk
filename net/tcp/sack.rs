@@ -235,6 +235,9 @@ pub(super) struct SackState {
     pub reord: u32,
     /// Packets newly SACKed, or D-SACKed duplicates
     pub sack_delivered: u32,
+    /// Packets cumulatively acknowledged (tcp_clean_rtx_queue's
+    /// pkts_acked)
+    pub pkts_acked: u32,
     pub flag: u32,
     /// Delivered count when the most recently sent s/acked skb went out,
     /// that skb's send time and end (Linux rs->prior_delivered,
