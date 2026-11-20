@@ -177,10 +177,11 @@ impl PgRing {
 
 impl Frame<'_> {
     /// The status word, read once (Linux __packet_get_status: smp_rmb,
-    /// READ_ONCE; V1's is an unsigned long, its high bits compared too)
+    /// READ_ONCE; V1's is an unsigned long returned as int: its low 32
+    /// bits only)
     pub fn status(&self, version: u32) -> u64 {
         if version == TPACKET_V1 {
-            self.r.word64(self.off).load(Ordering::Acquire)
+            u64::from(self.r.word64(self.off).load(Ordering::Acquire) as u32)
         } else {
             let o = if version == TPACKET_V3 { 20 } else { 0 };
             u64::from(self.r.word(self.off + o).load(Ordering::Acquire))
