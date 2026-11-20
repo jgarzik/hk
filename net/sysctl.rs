@@ -43,6 +43,8 @@ pub struct NetSysctl {
     pub tcp_window_scaling: AtomicU8,
     /// 0 off, 1 on with a random offset per address pair, 2 no offset
     pub tcp_timestamps: AtomicU8,
+    /// Nonzero: offer and accept SACK (RFC 2018)
+    pub tcp_sack: AtomicU8,
     /// Nonzero: a TIME_WAIT entry ignores an in-window RST (RFC 1337)
     pub tcp_rfc1337: AtomicU8,
     /// tcp_rmem min / default / max (only max is used: window scale)
@@ -79,6 +81,7 @@ impl Default for NetSysctl {
             tcp_fin_timeout: AtomicI32::new(60),
             tcp_window_scaling: AtomicU8::new(1),
             tcp_timestamps: AtomicU8::new(1),
+            tcp_sack: AtomicU8::new(1),
             tcp_rfc1337: AtomicU8::new(0),
             tcp_rmem: [
                 AtomicI32::new(4096),
@@ -434,6 +437,13 @@ pub static CTLS: &[NetCtl] = &[
         mode: 0o644,
         show: |n| get_u8(n, |s| &s.tcp_timestamps),
         store: |n, v| set_u8(n, |s| &s.tcp_timestamps, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_sack",
+        mode: 0o644,
+        show: |n| get_u8(n, |s| &s.tcp_sack),
+        store: |n, v| set_u8(n, |s| &s.tcp_sack, v),
         text: None,
     },
     NetCtl {

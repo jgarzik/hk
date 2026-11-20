@@ -25,7 +25,7 @@ use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, f
 use crate::mm::page_alloc::Gfp;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::mib::*;
-use crate::net::skb::SkBuff;
+use crate::net::skb::{Sacks, SkBuff};
 
 /// TCP header without options
 pub const HLEN: usize = 20;
@@ -36,7 +36,13 @@ const OPT_EOL: u8 = 0;
 const OPT_NOP: u8 = 1;
 const OPT_MSS: u8 = 2;
 const OPT_WS: u8 = 3;
+const OPT_SACK_PERM: u8 = 4;
+const OPT_SACK: u8 = 5;
 const OPT_TS: u8 = 8;
+/// SACK option bytes: the kind and length (with two NOPs before them,
+/// Linux TCPOLEN_SACK_BASE_ALIGNED), then 8 per block
+pub(super) const SACK_BASE: u32 = 4;
+pub(super) const SACK_PERBLOCK: u32 = 8;
 
 /// How partial segments are pushed (Linux nonagle modes)
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +99,7 @@ impl TcpCb {
             mss: Some(self.adv_mss.min(u32::from(u16::MAX)) as u16),
             ws: self.wscale_ok.then_some(self.rcv_wscale),
             ts,
+            sack_perm: self.sack_ok != 0,
             ..Default::default()
         };
         out.ctl(h)
@@ -615,8 +622,9 @@ pub struct Tuple {
 }
 
 /// The header of `h` from `t.lport` to `t.rport` into `b` (options in
-/// Linux's order and padding, tcp_options_write without SACK: MSS, NOP
-/// NOP TS, NOP WS); its length
+/// Linux's order and padding, tcp_options_write: MSS, NOP NOP TS (SACK
+/// PERM TS when both), NOP NOP SACK_PERM without TS, NOP WS, NOP NOP
+/// SACK and its blocks); its length
 fn put_hdr(h: &Seg, t: &Tuple, b: &mut [u8; HLEN_MAX]) -> usize {
     b[0..2].copy_from_slice(&t.lport.to_be_bytes());
     b[2..4].copy_from_slice(&t.rport.to_be_bytes());
@@ -631,15 +639,38 @@ fn put_hdr(h: &Seg, t: &Tuple, b: &mut [u8; HLEN_MAX]) -> usize {
         b[n + 2..n + 4].copy_from_slice(&m.to_be_bytes());
         n += 4;
     }
+    let mut sack_perm = h.sack_perm;
     if let Some((v, e)) = h.ts {
-        b[n..n + 4].copy_from_slice(&[OPT_NOP, OPT_NOP, OPT_TS, 10]);
+        let lead = if sack_perm {
+            sack_perm = false;
+            [OPT_SACK_PERM, 2]
+        } else {
+            [OPT_NOP, OPT_NOP]
+        };
+        b[n..n + 2].copy_from_slice(&lead);
+        b[n + 2..n + 4].copy_from_slice(&[OPT_TS, 10]);
         b[n + 4..n + 8].copy_from_slice(&v.to_be_bytes());
         b[n + 8..n + 12].copy_from_slice(&e.to_be_bytes());
         n += 12;
     }
+    if sack_perm {
+        b[n..n + 4].copy_from_slice(&[OPT_NOP, OPT_NOP, OPT_SACK_PERM, 2]);
+        n += 4;
+    }
     if let Some(w) = h.ws {
         b[n..n + 4].copy_from_slice(&[OPT_NOP, OPT_WS, 3, w]);
         n += 4;
+    }
+    let blocks = h.sack.blocks();
+    if !blocks.is_empty() {
+        let len = (SACK_BASE - 2 + SACK_PERBLOCK * blocks.len() as u32) as u8;
+        b[n..n + 4].copy_from_slice(&[OPT_NOP, OPT_NOP, OPT_SACK, len]);
+        n += 4;
+        for &(start, end) in blocks {
+            b[n..n + 4].copy_from_slice(&start.to_be_bytes());
+            b[n + 4..n + 8].copy_from_slice(&end.to_be_bytes());
+            n += 8;
+        }
     }
     b[12] = ((n / 4) as u8) << 4;
     n
@@ -697,7 +728,10 @@ pub fn parse(b: &[u8]) -> Option<(Seg, usize)> {
 
 /// The options of a segment (Linux tcp_parse_options: parsing stops at
 /// EOL, a length below 2 or past the header; an MSS of 0 is ignored;
-/// MSS and window scale count only on a SYN; a scale above 14 is 14)
+/// MSS, window scale and SACK-permitted count only on a SYN; a scale
+/// above 14 is 14; a SACK option needs a whole number of blocks, at
+/// most four of them are read). Whether the connection may use them
+/// (the sysctls, what was negotiated) the control block decides.
 fn parse_opts(mut o: &[u8], s: &mut Seg) {
     let syn = s.has(flags::SYN);
     while let Some(&k) = o.first() {
@@ -722,6 +756,20 @@ fn parse_opts(mut o: &[u8], s: &mut Seg) {
                         let v = u32::from_be_bytes([o[2], o[3], o[4], o[5]]);
                         let e = u32::from_be_bytes([o[6], o[7], o[8], o[9]]);
                         s.ts = Some((v, e));
+                    }
+                    (OPT_SACK_PERM, 2) if syn => s.sack_perm = true,
+                    (OPT_SACK, _)
+                        if l >= (SACK_BASE - 2 + SACK_PERBLOCK) as usize
+                            && (l - 2).is_multiple_of(SACK_PERBLOCK as usize) =>
+                    {
+                        s.sack = Sacks::default();
+                        for c in o[2..l].as_chunks::<8>().0 {
+                            let be =
+                                |i: usize| u32::from_be_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
+                            if !s.sack.push((be(0), be(4))) {
+                                break;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -812,6 +860,68 @@ mod tests {
             (s.mss, s.ws, s.ts),
             (Some(1460), Some(7), Some((0x11223344, 0)))
         );
+    }
+
+    /// SACK_PERM rides in the timestamp's NOPs, or has its own word;
+    /// SACK blocks follow NOP NOP (Linux tcp_options_write)
+    #[test]
+    fn sack_options_on_wire() {
+        let t = Tuple::default();
+        let mut seg = Seg {
+            seq: 1,
+            flags: flags::SYN,
+            mss: Some(1460),
+            ws: Some(7),
+            ts: Some((5, 0)),
+            sack_perm: true,
+            ..Default::default()
+        };
+        let skb = build(&seg, &t, Gfp::KERNEL).unwrap();
+        assert_eq!(
+            &skb.data()[20..40],
+            &[
+                2, 4, 5, 0xb4, 4, 2, 8, 10, 0, 0, 0, 5, 0, 0, 0, 0, 1, 3, 3, 7
+            ]
+        );
+        assert!(parse(skb.data()).unwrap().0.sack_perm);
+        seg.ts = None;
+        let skb = build(&seg, &t, Gfp::KERNEL).unwrap();
+        assert_eq!(
+            &skb.data()[20..32],
+            &[2, 4, 5, 0xb4, 1, 1, 4, 2, 1, 3, 3, 7]
+        );
+        assert!(parse(skb.data()).unwrap().0.sack_perm);
+        let mut a = Seg {
+            seq: 9,
+            flags: flags::ACK,
+            ts: Some((1, 2)),
+            ..Default::default()
+        };
+        a.sack.push((100, 200));
+        a.sack.push((300, 400));
+        let skb = build(&a, &t, Gfp::KERNEL).unwrap();
+        let b = skb.data();
+        assert_eq!(b.len(), 20 + 12 + 4 + 16);
+        assert_eq!(&b[32..36], &[1, 1, 5, 18]);
+        let (s, _) = parse(b).unwrap();
+        assert_eq!(s.sack.blocks(), &[(100, 200), (300, 400)]);
+        assert!(!s.sack_perm);
+    }
+
+    #[test]
+    fn sack_option_parsing() {
+        let blk = |v: u32| v.to_be_bytes();
+        let mut o = alloc::vec![1, 1, 5, 10];
+        o.extend_from_slice(&blk(7));
+        o.extend_from_slice(&blk(9));
+        assert_eq!(opts(&o, false).sack.blocks(), &[(7, 9)]);
+        // A length that is not a whole number of blocks is ignored
+        let mut bad = alloc::vec![5, 9];
+        bad.extend_from_slice(&[0; 7]);
+        assert_eq!(opts(&bad, false).sack.n, 0);
+        // SACK_PERM counts only on a SYN
+        assert!(opts(&[4, 2], true).sack_perm);
+        assert!(!opts(&[4, 2], false).sack_perm);
     }
 
     #[test]

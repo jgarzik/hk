@@ -10,7 +10,7 @@ use super::cb::{
 };
 use super::timewait::{TwCb, TwStatus};
 use crate::mm::page_alloc::Gfp;
-use crate::net::skb::SkBuff;
+use crate::net::skb::{Sacks, SkBuff};
 use crate::util::error::KernelError;
 
 /// A segment as the wire sees it: header fields and payload
@@ -23,6 +23,8 @@ struct Seg {
     mss: Option<u16>,
     ws: Option<u8>,
     ts: Option<(u32, u32)>,
+    sack_perm: bool,
+    sack: Sacks,
     data: Vec<u8>,
 }
 
@@ -42,6 +44,8 @@ struct SegIn<'a> {
     mss: Option<u16>,
     ws: Option<u8>,
     ts: Option<(u32, u32)>,
+    sack_perm: bool,
+    sack: Sacks,
     data: &'a [u8],
 }
 
@@ -58,6 +62,8 @@ impl SegIn<'_> {
             mss: self.mss,
             ws: self.ws,
             ts: self.ts,
+            sack_perm: self.sack_perm,
+            sack: self.sack,
             ..Default::default()
         });
         skb.tcp_mut().set_len(self.data.len() as u32);
@@ -107,6 +113,8 @@ fn wire(out: &Out) -> Vec<Seg> {
             mss: skb.tcp().mss,
             ws: skb.tcp().ws,
             ts: skb.tcp().ts,
+            sack_perm: skb.tcp().sack_perm,
+            sack: skb.tcp().sack,
             data: skb.data().to_vec(),
         })
         .collect()
@@ -121,6 +129,8 @@ fn seg_in(s: &Seg) -> SegIn<'_> {
         mss: s.mss,
         ws: s.ws,
         ts: s.ts,
+        sack_perm: s.sack_perm,
+        sack: s.sack,
         data: &s.data,
     }
 }
@@ -2249,4 +2259,25 @@ fn mib_refused() {
     assert_eq!(m.tcp.fold(TCP_MIB_ACTIVEOPENS), 1);
     assert_eq!(m.tcp.fold(TCP_MIB_ATTEMPTFAILS), 1);
     assert_eq!(m.tcp.fold(TCP_MIB_CURRESTAB), 0);
+}
+
+/// SACK is offered on the SYN and SYN-ACK when tcp_sack allows, and
+/// used only when both did (Linux tcp_syn_options, tcp_parse_options)
+#[test]
+fn sack_negotiation() {
+    let p = Pair::new(1460);
+    assert!(p.log[0].2.sack_perm && p.log[1].2.sack_perm);
+    assert!(p.a.sack_ok != 0 && p.b.sack_ok != 0);
+    let off = Cfg {
+        sack: false,
+        ..cfg()
+    };
+    // Off at the passive end: no SACK_PERM on its SYN-ACK
+    let p = Pair::with_cfgs(1460, 64 * 1024, cfg(), off);
+    assert!(p.log[0].2.sack_perm && !p.log[1].2.sack_perm);
+    assert!(p.a.sack_ok == 0 && p.b.sack_ok == 0);
+    // Off at the active end: not offered, so not accepted
+    let p = Pair::with_cfgs(1460, 64 * 1024, off, cfg());
+    assert!(!p.log[0].2.sack_perm && !p.log[1].2.sack_perm);
+    assert!(p.a.sack_ok == 0 && p.b.sack_ok == 0);
 }

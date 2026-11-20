@@ -18,6 +18,7 @@ use crate::fs::proc::seq::{self, SeqBuf};
 
 /// tcpi_options bits
 const OPT_TIMESTAMPS: u8 = 1;
+const OPT_SACK: u8 = 2;
 const OPT_WSCALE: u8 = 4;
 /// Linux TCP_CA_Open / TCP_CA_Recovery / TCP_CA_Loss
 const CA_OPEN: u8 = 0;
@@ -111,6 +112,9 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     let mut opt = 0;
     if cb.ts_ok {
         opt |= OPT_TIMESTAMPS;
+    }
+    if cb.sack_ok != 0 {
+        opt |= OPT_SACK;
     }
     if cb.wscale_ok {
         opt |= OPT_WSCALE;

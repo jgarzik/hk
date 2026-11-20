@@ -23,7 +23,8 @@
 //! the SYN/SYN-ACK; timestamps give RTT samples on every ACK of new data
 //! and PAWS (`input.rs`). The TS clock is the caller's ms clock plus a
 //! per-connection keyed offset (`Open.ts_off`, Linux
-//! secure_tcp_seq_and_ts_off over the four-tuple). SACK is not implemented and never advertised.
+//! secure_tcp_seq_and_ts_off over the four-tuple). SACK (RFC 2018,
+//! RFC 2883 D-SACK) is negotiated likewise (`sack.rs`).
 //! Delayed ACKs live in `ack.rs`, Nagle/cork in `output.rs`, keepalive
 //! and the user timeout in `time/timer.rs`.
 
@@ -112,6 +113,10 @@ impl TcpState {
     }
 }
 
+/// `TcpCb.sack_ok` bits (Linux TCP_SACK_SEEN, TCP_DSACK_SEEN)
+pub const SACK_SEEN: u8 = 1;
+pub const DSACK_SEEN: u8 = 4;
+
 /// Default send MSS when the peer sends no MSS option (RFC 9293 3.7.1)
 pub const MSS_DEFAULT: u32 = 536;
 /// Smallest send MSS (Linux tcp_min_snd_mss)
@@ -166,6 +171,8 @@ pub struct Cfg {
     pub wscale: bool,
     /// tcp_timestamps (0 off, 1 on with offset, 2 on without offset)
     pub ts: u8,
+    /// tcp_sack: offer and accept SACK
+    pub sack: bool,
     /// tcp_rmem[0]: receive bytes a connection may always hold below
     /// the hard memory limit
     pub rmem_min: u32,
@@ -186,6 +193,7 @@ impl Default for Cfg {
             fin_timeout: 60_000,
             wscale: true,
             ts: 1,
+            sack: true,
             rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
             keepidle: 7_200_000,
@@ -657,6 +665,10 @@ pub struct TcpCb {
     pub wscale_ok: bool,
     /// Timestamps negotiated
     pub ts_ok: bool,
+    /// SACK negotiated (Linux rx_opt.sack_ok: `SACK_SEEN`, plus
+    /// `DSACK_SEEN` once the peer sent a D-SACK); before the handshake
+    /// completes, whether we offer or accept it
+    pub sack_ok: u8,
     /// TSval = clock + ts_off
     pub(super) ts_off: u32,
     /// TS.Recent and the clock when it was stored
@@ -781,6 +793,7 @@ impl TcpCb {
             rcv_wscale: Default::default(),
             wscale_ok: Default::default(),
             ts_ok: Default::default(),
+            sack_ok: Default::default(),
             ts_off: Default::default(),
             ts_recent: Default::default(),
             ts_stamp: Default::default(),
@@ -850,6 +863,7 @@ impl TcpCb {
             0
         };
         self.ts_ok = self.cfg.ts != 0;
+        self.sack_ok = if self.cfg.sack { SACK_SEEN } else { 0 };
         self.set_state(TcpState::SynSent);
         if self.syn_seg(out) {
             self.tcp_stat(TCP_MIB_OUTSEGS);
@@ -866,6 +880,11 @@ impl TcpCb {
         self.open(&o, now);
         self.wscale_ok = self.cfg.wscale && syn.ws.is_some();
         self.ts_ok = self.cfg.ts != 0 && syn.ts.is_some();
+        self.sack_ok = if self.cfg.sack && syn.sack_perm {
+            SACK_SEEN
+        } else {
+            0
+        };
         self.syn_rcvd(syn, now);
         self.set_state(TcpState::SynReceived);
         self.passive = true;
@@ -875,8 +894,8 @@ impl TcpCb {
         self.arm_rtx(now);
     }
 
-    /// Record the peer's SYN: IRS, window, options (`wscale_ok` and
-    /// `ts_ok` hold what we offered or accept)
+    /// Record the peer's SYN: IRS, window, options (`wscale_ok`,
+    /// `ts_ok` and `sack_ok` hold what we offered or accept)
     pub(super) fn syn_rcvd(&mut self, s: &SegIn, now: u64) {
         self.irs = s.seq;
         self.rcv_nxt = s.seq.wrapping_add(1);
@@ -907,6 +926,9 @@ impl TcpCb {
                 self.ts_stamp = now;
             }
             _ => self.ts_ok = false,
+        }
+        if !s.sack_perm {
+            self.sack_ok = 0;
         }
         self.update_mss();
         self.dack

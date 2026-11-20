@@ -454,9 +454,42 @@ pub struct TcpSkbCb {
     pub ws: Option<u8>,
     /// Timestamps option (TSval, TSecr)
     pub ts: Option<(u32, u32)>,
+    /// SACK-permitted option (SYN and SYN-ACK)
+    pub sack_perm: bool,
+    /// SACK option blocks, received or to send (Linux keeps the
+    /// option's offset in TCP_SKB_CB(skb)->sacked and reads the header)
+    pub sack: Sacks,
     /// The ports of a received segment (its header is pulled)
     pub sport: u16,
     pub dport: u16,
+}
+
+/// Most SACK blocks an option carries (Linux TCP_NUM_SACKS)
+pub const NUM_SACKS: usize = 4;
+
+/// The blocks of a SACK option, [start, end) each, in option order
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sacks {
+    pub n: u8,
+    pub b: [(u32, u32); NUM_SACKS],
+}
+
+impl Sacks {
+    /// The blocks present
+    pub fn blocks(&self) -> &[(u32, u32)] {
+        &self.b[..usize::from(self.n).min(NUM_SACKS)]
+    }
+
+    /// Append a block; false if full
+    pub fn push(&mut self, blk: (u32, u32)) -> bool {
+        let i = usize::from(self.n);
+        if i >= NUM_SACKS {
+            return false;
+        }
+        self.b[i] = blk;
+        self.n += 1;
+        true
+    }
 }
 
 impl SkBuff {
