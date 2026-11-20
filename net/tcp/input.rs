@@ -356,7 +356,7 @@ impl TcpCb {
         } else if !self.rcv_ack(s, now, out) {
             return;
         }
-        if !self.after_ack(now, out) {
+        if !self.after_ack(s, now, out) {
             return;
         }
         if self.state == TcpState::Established && !out.established {
@@ -440,9 +440,11 @@ impl TcpCb {
         self.send_ack(out);
     }
 
-    /// State changes once our FIN is acknowledged; false if the segment
-    /// is consumed
-    fn after_ack(&mut self, now: u64, out: &mut Out) -> bool {
+    /// State changes once our FIN is acknowledged by `s`; false if the
+    /// segment is consumed (Linux tcp_rcv_state_process: an orphan
+    /// reaching FIN_WAIT_2 may go to a timewait entry at once, unless
+    /// the segment brings data, which resets it as for a closed reader)
+    fn after_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
         if !self.fin_acked() {
             return true;
         }
@@ -450,9 +452,13 @@ impl TcpCb {
             TcpState::FinWait1 => {
                 self.set_state(TcpState::FinWait2);
                 self.live.tmr.set(None);
-                self.arm_fw2(now);
                 out.wake |= wake::STATE;
-                true
+                let fin = s.has(flags::FIN);
+                let end = s.end_seq.wrapping_sub(u32::from(fin));
+                if !self.orphan || (s.seq != s.end_seq && after(end, self.rcv_nxt)) {
+                    return true;
+                }
+                !self.orphan_fw2(now, fin, out)
             }
             TcpState::Closing => {
                 self.time_wait(out);

@@ -396,3 +396,60 @@ fn tw_buckets_limit() {
     net.set_max_tw_buckets(-1).unwrap();
     assert!(!net.tw_full());
 }
+
+/// A timewait entry in the FIN_WAIT2 substate (Linux
+/// tcp_timewait_state_process): a duplicate ACK does nothing, new data
+/// or a SYN resets, an in-window RST ends it, an out-of-window segment
+/// is ACKed, and the peer's FIN makes it a true TIME_WAIT for 2MSL
+#[test]
+fn fin_wait2_timewait_entry() {
+    let mut p = Pair::new(1460);
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    assert!(p.a_out.timewait);
+    let tw0 = TwCb::from_cb(&p.a);
+    assert_eq!(tw0.substate(), TcpState::FinWait2);
+    let (nxt, una) = (tw0.rcv_nxt, p.a.snd_max);
+    let seg = |seq: u32, fl: u8, data: &[u8]| {
+        let mut h = SegIn {
+            seq,
+            ack: una,
+            flags: fl,
+            ..Default::default()
+        }
+        .hdr();
+        h.set_len(data.len() as u32);
+        h
+    };
+    let now = p.now + 10;
+    let mut tw = tw0.clone();
+    assert_eq!(
+        tw.rcv(&seg(nxt, flags::ACK, &[]), now, false, None),
+        TwStatus::Success
+    );
+    assert_eq!(
+        tw.rcv(&seg(nxt, flags::ACK, &[1, 2]), now, false, None),
+        TwStatus::Rst
+    );
+    assert_eq!(
+        tw.rcv(&seg(nxt, flags::SYN, &[]), now, false, None),
+        TwStatus::Rst
+    );
+    assert_eq!(
+        tw.rcv(&seg(nxt, flags::RST, &[]), now, false, None),
+        TwStatus::Kill
+    );
+    let far = nxt.wrapping_add(1 << 30);
+    assert_eq!(
+        tw.rcv(&seg(far, flags::ACK, &[]), now, false, None),
+        TwStatus::Ack
+    );
+    let fin = seg(nxt, flags::ACK | flags::FIN, &[]);
+    assert_eq!(tw.rcv(&fin, now, false, None), TwStatus::Ack);
+    assert_eq!(tw.substate(), TcpState::TimeWait);
+    assert_eq!(tw.rcv_nxt, nxt.wrapping_add(1));
+    assert_eq!(tw.expires(), now + TIMEWAIT_LEN);
+    assert_eq!(tw.ack(now).ack, nxt.wrapping_add(1));
+}

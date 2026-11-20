@@ -22,6 +22,10 @@
 //! - TCP_MAX_TW_BUCKETS: net.ipv4.tcp_max_tw_buckets is positive and
 //!   per namespace; at 0 a connection closing first skips TIME_WAIT
 //!   (inet_twsk_alloc refuses, TCPTimeWaitOverflow).
+//! - TCP_FIN_WAIT2_TW: an orphan's FIN_WAIT_2 (tcp_fin_timeout within
+//!   TIME_WAIT's length) is a timewait entry (sockstat tw, a 05 line
+//!   with the timewait timer in /proc/net/tcp); data from the peer is
+//!   answered with a reset.
 
 use hk_syscall::{sys_exit, sys_fork, sys_getsockopt};
 
@@ -44,6 +48,7 @@ pub fn run_tests() {
     test_max_orphans();
     test_challenge_limit();
     test_max_tw();
+    test_fin_wait2_tw();
 }
 
 /// A connected pair over lo: (client, server, listener)
@@ -338,5 +343,92 @@ fn test_max_tw() {
     }
     t.eq(b"refused", wait_child(child) as i64, 0);
     t.eq(b"init unchanged", sysctl_ints(MAX_TW)[0], max);
+    t.done();
+}
+
+/// The sockstat "TCP: ... tw N" value
+fn sockstat_tw() -> i64 {
+    let mut b = [0u8; 1024];
+    let n = read_file(b"/proc/net/sockstat\0", &mut b).max(0) as usize;
+    let Some(line) = b[..n]
+        .split(|&c| c == b'\n')
+        .find(|l| l.starts_with(b"TCP:"))
+    else {
+        return -1;
+    };
+    let mut w = line.split(|&c| c == b' ');
+    while let Some(x) = w.next() {
+        if x == b"tw" {
+            let v = w.next().unwrap_or(b"");
+            return v.iter().fold(0i64, |a, &c| a * 10 + i64::from(c - b'0'));
+        }
+    }
+    -1
+}
+
+/// In a new namespace: the orphan's FIN_WAIT_2 entry (exit status 0)
+fn fw2_entry() -> u64 {
+    crate::helpers::loopback_up();
+    let (l, p) = listener(4);
+    let c = tcp();
+    if connect(c, LO, p) != 0 {
+        return 1;
+    }
+    let s = accept(l);
+    close(c);
+    let mut seen = false;
+    for _ in 0..100 {
+        if sockstat_tw() == 1 {
+            seen = true;
+            break;
+        }
+        crate::helpers::msleep(10);
+    }
+    if !seen {
+        return 2;
+    }
+    let mut b = [0u8; 4096];
+    let n = read_file(b"/proc/net/tcp\0", &mut b).max(0) as usize;
+    // "sl local rem st tx:rx tr:when": state 05, timer 03
+    let fw2 = b[..n].split(|&c| c == b'\n').any(|l| {
+        let f: [&[u8]; 6] = {
+            let mut it = l.split(|&c| c == b' ').filter(|w| !w.is_empty());
+            [(); 6].map(|_| it.next().unwrap_or(b""))
+        };
+        f[3] == b"05" && f[5].starts_with(b"03:")
+    });
+    if !fw2 {
+        return 3;
+    }
+    // Data after the half-duplex close: reset (TCP_TW_RST). The FIN
+    // already set SOCK_DONE, so recv keeps reading 0 (Linux
+    // tcp_recvmsg_locked); the reset shows as TCP_CLOSE in TCP_INFO.
+    send(s, b"late", MSG_NOSIGNAL);
+    let mut closed = false;
+    for _ in 0..100 {
+        if info_u32(s, 0) & 0xff == 7 {
+            closed = true;
+            break;
+        }
+        crate::helpers::msleep(10);
+    }
+    if !closed {
+        return 4;
+    }
+    close(s);
+    close(l);
+    0
+}
+
+fn test_fin_wait2_tw() {
+    let mut t = T::new(b"TCP_FIN_WAIT2_TW");
+    let child = sys_fork();
+    if child == 0 {
+        if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+            sys_exit(9);
+        }
+        sys_exit(fw2_entry());
+    }
+    t.eq(b"entry", wait_child(child) as i64, 0);
     t.done();
 }

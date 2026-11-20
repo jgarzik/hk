@@ -114,12 +114,13 @@ UDP has no hash4 (Linux udp_table.hash4: connected sockets by
 four-tuple, looked up before hash2), and its compute_score lacks the
 sk_incoming_cpu point (hk does not track a socket's receiving CPU).
 
-TIME_WAIT (`net/tcp/timewait.rs`) lacks two Linux parts: an
-orphan's FIN_WAIT_2 stays a full socket (Linux tcp_close hands it to
-a timewait sock with tw_substate FIN_WAIT2 when tcp_fin_timeout is
-at most TCP_TIMEWAIT_LEN; tcp_timewait_state_process's FIN_WAIT2
-branch); and a takeover SYN's connection gets a fresh ISN, not the
-entry's SND.NXT + 65537 (Linux TCP_SKB_CB tcp_tw_isn).
+TIME_WAIT (`net/tcp/timewait.rs`): a takeover SYN's connection gets
+a fresh ISN, not the entry's SND.NXT + 65537 (Linux TCP_SKB_CB
+tcp_tw_isn). There is no TCP_LINGER2 (tcp_fin_time is
+tcp_fin_timeout's), and an orphan reaching FIN_WAIT_2 from its
+backlog goes to a timewait entry where Linux, the socket owned, arms
+the keepalive timer instead (tcp_rcv_state_process's
+sock_owned_by_user: the control block does not know).
 
 skbs are linear (no paged frags, skb_shinfo frags): TCP's SACK
 shifting (`sack.rs` shift, Linux tcp_shift_skb_data / skb_shift moving

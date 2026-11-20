@@ -1168,15 +1168,33 @@ fn linger_zero_resets() {
 
 #[test]
 fn orphan_fin_wait2_times_out() {
+    // tcp_fin_timeout within TIME_WAIT's length: the ACK of our FIN
+    // hands the orphan to a timewait entry in the FIN_WAIT2 substate
+    // for it (Linux tcp_rcv_state_process -> tcp_time_wait)
     let mut p = Pair::new(1460);
     let mut out = Out::default();
     p.a.close(false, p.now, &mut out);
     p.take(true, out);
     p.run();
     assert_eq!(p.a.state, TcpState::FinWait2);
+    assert!(p.a_out.timewait);
+    let tw = TwCb::from_cb(&p.a);
+    assert_eq!(tw.substate(), TcpState::FinWait2);
+    assert_eq!(tw.expires() - p.a.clock, 60_000);
+    // Past it: the keepalive timer waits out the excess, then a
+    // timewait entry for the excess again (Linux tcp_keepalive_timer)
+    let mut c = cfg();
+    c.fin_timeout = 100_000;
+    let mut p = Pair::with_cfgs(1460, 64 * 1024, c, cfg());
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    assert!(!p.a_out.timewait);
     let t = p.now;
-    p.until(|p| p.a.state == TcpState::Closed, 10);
-    assert_eq!(p.now - t, 60_000);
+    assert!(p.until(|p| p.a_out.timewait, 10));
+    assert_eq!(p.now - t, 40_000);
+    assert_eq!(TwCb::from_cb(&p.a).expires() - p.now, 40_000);
     // Not orphaned (shutdown only): no timeout
     let mut p = Pair::new(1460);
     let mut out = Out::default();

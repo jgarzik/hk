@@ -1,7 +1,10 @@
 //! TIME_WAIT entries (Linux inet_timewait_sock / tcp_timewait_sock,
 //! tcp_minisocks.c, inet_timewait_sock.c)
 //!
-//! When a connection enters TIME_WAIT its socket goes to CLOSED (the
+//! When a connection enters TIME_WAIT, or an orphan FIN_WAIT_2 (the
+//! FIN_WAIT2 substate, Linux tcp_time_wait(sk, TCP_FIN_WAIT2, timeo):
+//! data or a SYN after the half-duplex close is reset, the peer's FIN
+//! makes it TIME_WAIT), its socket goes to CLOSED (the
 //! user may still read queued data) and a `TimeWait` takes its place in
 //! the ehash and as owner of its port: the tuple, the bind rules and a
 //! `TwCb`, the few fields of the connection TIME_WAIT still needs
@@ -29,14 +32,17 @@ use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::Mutex;
 
-use super::cb::{OOW_RATELIMIT, PAWS_WRAP, Seg, SegIn, TIMEWAIT_LEN, TcpCb, after, flags};
+use super::cb::{
+    OOW_RATELIMIT, PAWS_WRAP, Seg, SegIn, TIMEWAIT_LEN, TcpCb, TcpState, after, before, flags,
+};
 use super::output::Tuple;
 use super::timer::now_ms;
 use crate::net::NetNamespace;
 use crate::net::inet::port::BindInfo;
 use crate::net::ipv4::IpParams;
 use crate::net::mib::{
-    LINUX_MIB_PAWS_TW_REJECTED, LINUX_MIB_TCPACKSKIPPEDTIMEWAIT, NetMib, TCP_MIB_OUTSEGS,
+    LINUX_MIB_PAWS_TW_REJECTED, LINUX_MIB_TCPACKSKIPPEDFINWAIT2, LINUX_MIB_TCPACKSKIPPEDTIMEWAIT,
+    NetMib, TCP_MIB_OUTSEGS,
 };
 use crate::net::skb::SkBuff;
 use crate::sync::rcu::RcuPuts;
@@ -53,6 +59,8 @@ const PAWS_MSL: u64 = 60_000;
 /// tcp_timewait_sock: no queues, no congestion or RTT state)
 #[derive(Clone, Debug)]
 pub struct TwCb {
+    /// TIME_WAIT, or an orphan's FIN_WAIT_2 (Linux tw_substate)
+    substate: TcpState,
     /// Linux tw_rcv_nxt
     pub rcv_nxt: u32,
     /// Linux tw_snd_nxt (hk's SND.MAX)
@@ -85,13 +93,34 @@ pub enum TwStatus {
     Syn,
     /// The entry ends (an in-window RST: inet_twsk_deschedule_put)
     Kill,
+    /// Reset the sender and end the entry (TCP_TW_RST: data or a SYN
+    /// after the half-duplex close of a FIN_WAIT2 entry)
+    Rst,
+}
+
+/// Linux tcp_in_window: [seq, end) reaches into [s_win, e_win]
+fn in_window(seq: u32, end: u32, s_win: u32, e_win: u32) -> bool {
+    seq == s_win || (after(end, s_win) && before(seq, e_win)) || (seq == e_win && seq == end)
 }
 
 impl TwCb {
     /// The TIME_WAIT part of `c` (Linux tcp_time_wait's copy into the
-    /// tcp_timewait_sock), its 2MSL running from `c`'s TIME_WAIT entry
+    /// tcp_timewait_sock): in TIME_WAIT for 2MSL, or an orphan's
+    /// FIN_WAIT_2 for what is left of tcp_fin_time, at least 3.5 RTO
     pub fn from_cb(c: &TcpCb) -> Self {
+        let substate = if c.state == TcpState::FinWait2 {
+            TcpState::FinWait2
+        } else {
+            TcpState::TimeWait
+        };
+        let rto = c.live.rto.get();
+        let timeo = if substate == TcpState::TimeWait {
+            TIMEWAIT_LEN
+        } else {
+            c.tw_timeo.max((rto << 2) - (rto >> 1))
+        };
         Self {
+            substate,
             rcv_nxt: c.rcv_nxt,
             snd_nxt: c.snd_max,
             rcv_wnd: c.rcv_wnd(),
@@ -101,8 +130,13 @@ impl TwCb {
             ts_recent: c.ts_recent,
             ts_stamp: c.ts_stamp,
             last_oow: None,
-            at: c.live.wait_at.get().unwrap_or(c.clock + TIMEWAIT_LEN),
+            at: c.clock + timeo,
         }
+    }
+
+    /// Linux tw_substate
+    pub fn substate(&self) -> TcpState {
+        self.substate
     }
 
     /// When 2MSL ends
@@ -126,14 +160,16 @@ impl TwCb {
         !ok && !(rst && age >= PAWS_MSL)
     }
 
-    /// Linux tcp_timewait_state_process for the TIME_WAIT substate (hk
-    /// hands only TIME_WAIT over, never an orphan's FIN_WAIT_2): `s` at
-    /// `now`, `rfc1337` the namespace's tcp_rfc1337
+    /// Linux tcp_timewait_state_process: `s` at `now`, `rfc1337` the
+    /// namespace's tcp_rfc1337
     pub fn rcv(&mut self, s: &SegIn, now: u64, rfc1337: bool, mib: Option<&NetMib>) -> TwStatus {
         // Linux parses the timestamp only when the connection had them
         let ts = s.ts.filter(|_| self.ts_ok).map(|(v, _)| v);
         let rst = s.has(flags::RST);
         let paws = ts.is_some_and(|v| self.paws_reject(v, rst, now));
+        if self.substate == TcpState::FinWait2 {
+            return self.rcv_fw2(s, ts, paws, now, mib);
+        }
         // In window: only a reset or a bare ACK
         if !paws && s.seq == self.rcv_nxt && (s.seq_len() == 0 || rst) {
             if rst {
@@ -170,16 +206,60 @@ impl TwCb {
         if paws || s.has(flags::ACK) {
             self.reschedule(now);
         }
-        if self.oow_limited(s, now, mib) {
+        if self.oow_limited(s, now, mib, LINUX_MIB_TCPACKSKIPPEDTIMEWAIT) {
             TwStatus::Success
         } else {
             TwStatus::Ack
         }
     }
 
+    /// tcp_timewait_state_process's FIN_WAIT2 substate: the checks of
+    /// tcp_rcv_state_process again. Out of window: ACK (rate limited);
+    /// RST: the entry ends; a SYN at or past RCV.NXT, or new data:
+    /// reset; a duplicate: nothing; the FIN: true TIME_WAIT, for 2MSL
+    fn rcv_fw2(
+        &mut self,
+        s: &SegIn,
+        ts: Option<u32>,
+        paws: bool,
+        now: u64,
+        mib: Option<&NetMib>,
+    ) -> TwStatus {
+        let end = s.seq.wrapping_add(s.seq_len());
+        let edge = self.rcv_nxt.wrapping_add(self.rcv_wnd);
+        if paws || !in_window(s.seq, end, self.rcv_nxt, edge) {
+            return if self.oow_limited(s, now, mib, LINUX_MIB_TCPACKSKIPPEDFINWAIT2) {
+                TwStatus::Success
+            } else {
+                TwStatus::Ack
+            };
+        }
+        if s.has(flags::RST) {
+            return TwStatus::Kill;
+        }
+        if s.has(flags::SYN) && !before(s.seq, self.rcv_nxt) {
+            return TwStatus::Rst;
+        }
+        if !s.has(flags::ACK) || !after(end, self.rcv_nxt) || s.seq_len() == 0 {
+            return TwStatus::Success;
+        }
+        if !s.has(flags::FIN) || end != self.rcv_nxt.wrapping_add(1) {
+            return TwStatus::Rst;
+        }
+        self.substate = TcpState::TimeWait;
+        self.rcv_nxt = end;
+        if let Some(v) = ts {
+            self.ts_stamp = now;
+            self.ts_recent = v;
+        }
+        self.reschedule(now);
+        TwStatus::Ack
+    }
+
     /// Linux tcp_oow_rate_limited with tw_last_oow_ack_time: segments
-    /// with sequence space and no SYN are never limited
-    fn oow_limited(&mut self, s: &SegIn, now: u64, mib: Option<&NetMib>) -> bool {
+    /// with sequence space and no SYN are never limited; a skipped ACK
+    /// counts in `skipped`
+    fn oow_limited(&mut self, s: &SegIn, now: u64, mib: Option<&NetMib>, skipped: usize) -> bool {
         if s.seq_len() != 0 && !s.has(flags::SYN) {
             return false;
         }
@@ -188,7 +268,7 @@ impl TwCb {
             && now - t < OOW_RATELIMIT
         {
             if let Some(m) = mib {
-                m.net.inc(LINUX_MIB_TCPACKSKIPPEDTIMEWAIT);
+                m.net.inc(skipped);
             }
             return true;
         }
@@ -301,6 +381,11 @@ impl TimeWait {
         self.inner.lock().0.expires().saturating_sub(now)
     }
 
+    /// TIME_WAIT or FIN_WAIT2 (/proc/net/tcp: Linux tw_substate)
+    pub fn substate(&self) -> TcpState {
+        self.inner.lock().0.substate()
+    }
+
     /// Arm the 2MSL timer; counted in its namespace until it ends
     /// (Linux __inet_twsk_schedule)
     pub fn start(&self) {
@@ -346,6 +431,15 @@ impl TimeWait {
             TwStatus::Syn => return Some(skb),
             TwStatus::Kill => {
                 drop(g);
+                self.kill();
+            }
+            TwStatus::Rst => {
+                drop(g);
+                // Linux do_time_wait's TCP_TW_RST: tcp_v4_send_reset,
+                // inet_twsk_deschedule_put
+                if let Some(r) = super::output::reset_for(&s) {
+                    super::send_reset(&self.net, &self.tuple, &r);
+                }
                 self.kill();
             }
             TwStatus::Ack => {

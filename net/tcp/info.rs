@@ -313,7 +313,7 @@ fn tw_line(i: usize, tw: &super::timewait::TimeWait, now: u64) -> Line {
         t.lport,
         raw(t.raddr),
         t.rport,
-        TcpState::TimeWait.linux(),
+        tw.substate().linux(),
         0,
         0,
         3,

@@ -623,6 +623,7 @@ impl TcpSock {
         // GFP_ATOMIC under the socket lock (Linux inet_twsk_alloc: none
         // past tcp_max_tw_buckets)
         let full = self.sk.net.tcp_net.tw_full();
+        let twcb = TwCb::from_cb(&g.cb);
         let tw = with_gfp(Gfp::ATOMIC, || {
             if full {
                 return Err(KernelError::NoBufferSpace);
@@ -634,7 +635,7 @@ impl TcpSock {
                 self.by_bind.load(Ordering::Relaxed),
                 self.inet.params(),
                 self.oif(),
-                TwCb::from_cb(&g.cb),
+                twcb.clone(),
             )
         });
         // Its ehash entry, GFP_ATOMIC with it
@@ -660,8 +661,13 @@ impl TcpSock {
         g.bound = false;
         // Linux tcp_time_wait -> tcp_done -> inet_csk_destroy_sock
         g.orphan = None;
-        // Linux inet_twsk_schedule: 2MSL is past the "killed" bound
-        self.sk.net.mib.net.inc(LINUX_MIB_TIMEWAITED);
+        // Linux __inet_twsk_schedule: up to 4 s is "killed"
+        let killed = twcb.expires().saturating_sub(g.cb.clock) <= 4000;
+        self.sk.net.mib.net.inc(if killed {
+            LINUX_MIB_TIMEWAITKILLED
+        } else {
+            LINUX_MIB_TIMEWAITED
+        });
         tw.start();
         g.cb.tw_done(out);
     }

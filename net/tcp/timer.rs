@@ -239,9 +239,16 @@ impl TcpCb {
         self.tick(now);
         if self.live.wait_at.get().is_some_and(|t| t <= now) {
             self.live.wait_at.set(None);
-            // Orphan in FIN_WAIT_2 too long (Linux tcp_keepalive_timer)
-            if self.state == TcpState::FinWait2 {
-                self.abort(out);
+            // Orphan in FIN_WAIT_2 (Linux tcp_keepalive_timer): what is
+            // left of tcp_fin_time beyond TIME_WAIT's length in a
+            // timewait entry, else it is over
+            if self.state == TcpState::FinWait2 && self.orphan {
+                let tmo = self.fin_time().saturating_sub(TIMEWAIT_LEN);
+                if tmo > 0 {
+                    self.fw2_time_wait(tmo, out);
+                } else {
+                    self.abort(out);
+                }
             }
             return;
         }

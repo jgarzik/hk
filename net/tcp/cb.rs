@@ -985,6 +985,9 @@ pub struct TcpCb {
     /// Last ICMP error (Linux sk_err_soft), reported if the connection
     /// times out; an acceptable ACK clears it
     pub soft_err: Option<KernelError>,
+    /// The timeout of the timewait entry it is handed to (ms; Linux
+    /// tcp_time_wait's timeo)
+    pub(super) tw_timeo: u64,
     /// An ACK must go out now (pure ACK if no data segment carries it)
     pub(super) ack_now: bool,
     /// In-order data was dropped for memory: the next ACK offers a zero
@@ -1120,6 +1123,7 @@ impl TcpCb {
             dack: Default::default(),
             orphan: Default::default(),
             soft_err: Default::default(),
+            tw_timeo: TIMEWAIT_LEN,
             ack_now: Default::default(),
             ack_nomem: Default::default(),
             last_oow: Default::default(),
@@ -1617,13 +1621,13 @@ impl TcpCb {
             }
             _ => {
                 self.shutdown_wr(now, out);
-                if self.state == TcpState::FinWait2 {
-                    self.arm_fw2(now);
-                }
             }
         }
-        // Linux __tcp_close's adjudge_to_death: too many orphans or
-        // past the memory limit, it goes now
+        // Linux __tcp_close's adjudge_to_death: an orphan's FIN_WAIT_2
+        if self.state == TcpState::FinWait2 && self.orphan_fw2(now, false, out) {
+            return;
+        }
+        // Too many orphans or past the memory limit, it goes now
         if self.state != TcpState::Closed && mem::check_oom(0, self.sndq_len(), now) {
             self.send_reset(out);
             self.set_closed(out);
@@ -1749,8 +1753,46 @@ impl TcpCb {
         self.stop_timers();
         self.purge_wq();
         self.mem_settle();
+        self.tw_timeo = TIMEWAIT_LEN;
         out.timewait = true;
         out.wake |= wake::STATE;
+    }
+
+    /// An orphan's FIN_WAIT_2 goes to a timewait entry in that substate
+    /// for `timeo` ms (Linux tcp_time_wait(sk, TCP_FIN_WAIT2, timeo)),
+    /// the socket then closing as for TIME_WAIT
+    pub(super) fn fw2_time_wait(&mut self, timeo: u64, out: &mut Out) {
+        self.stop_timers();
+        self.purge_wq();
+        self.mem_settle();
+        self.tw_timeo = timeo;
+        out.timewait = true;
+    }
+
+    /// Linux tcp_fin_time: tcp_fin_timeout (no TCP_LINGER2), at least
+    /// 3.5 RTO
+    pub(super) fn fin_time(&self) -> u64 {
+        let rto = self.live.rto.get();
+        self.cfg.fin_timeout.max((rto << 2) - (rto >> 1))
+    }
+
+    /// An orphan in FIN_WAIT_2 (Linux __tcp_close; tcp_rcv_state_process
+    /// FIN_WAIT1 with `fin` the segment's): with tcp_fin_time past
+    /// TIME_WAIT's length the keepalive timer waits out the excess
+    /// first, and with a FIN arriving (which must not be lost) all of
+    /// it; else a timewait entry in the FIN_WAIT2 substate takes over
+    /// (true)
+    pub(super) fn orphan_fw2(&mut self, now: u64, fin: bool, out: &mut Out) -> bool {
+        let tmo = self.fin_time();
+        if tmo > TIMEWAIT_LEN {
+            self.live.wait_at.set(Some(now + tmo - TIMEWAIT_LEN));
+        } else if fin {
+            self.live.wait_at.set(Some(now + tmo));
+        } else {
+            self.fw2_time_wait(tmo, out);
+            return true;
+        }
+        false
     }
 
     /// The socket's side after handing TIME_WAIT over: CLOSED, readable
@@ -1821,13 +1863,6 @@ impl TcpCb {
     pub(super) fn net_stat_if(&self, cond: bool, f: usize) {
         if cond {
             self.net_stat(f);
-        }
-    }
-
-    /// Orphan in FIN_WAIT_2: give up after tcp_fin_timeout
-    pub(super) fn arm_fw2(&mut self, now: u64) {
-        if self.orphan {
-            self.live.wait_at.set(Some(now + self.cfg.fin_timeout));
         }
     }
 
