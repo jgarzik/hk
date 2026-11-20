@@ -264,13 +264,9 @@ impl TcpCb {
                 self.net_stat(m);
             }
         }
-        if handshake {
-            // The SYN or SYN-ACK alone was out: one packet, lost
-            let ss = self.ca_ssthresh();
-            self.cong.set_ssthresh(ss);
-            self.cong.set_cwnd(1);
-            self.cong.reset_cnt();
-        } else {
+        // A request's SYN-ACK timer has no congestion state (Linux
+        // tcp_syn_ack_timeout); a SYN_SENT or SYN_RECV socket's does
+        if !(self.passive && self.state == TcpState::SynReceived) {
             self.enter_loss();
         }
         self.rtt_seq = None;
@@ -284,8 +280,10 @@ impl TcpCb {
             self.syn_rtx = handshake || self.syn_rtx;
             self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             self.syn_rtx(out);
-            // tcp_retransmit_skb of the SYN: the episode's first stamp
+            // tcp_retransmit_skb of the SYN: the episode's first stamp,
+            // one more retransmission towards undo
             self.rtx_stamp.get_or_insert(now);
+            self.undo_retrans = self.undo_retrans.max(0) + 1;
         } else if let Some(head) = self.rtx_head() {
             self.retransmit_skb(head, 1, now, out);
         }

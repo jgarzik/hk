@@ -82,10 +82,21 @@ impl TcpCb {
             self.syn_seg(out);
             return;
         }
+        let prior_snd_una = self.snd_una;
         self.snd_una = s.ack;
-        // Linux tcp_clean_rtx_queue acknowledges the SYN
+        // Linux tcp_clean_rtx_queue acknowledges the SYN (FLAG_SYN_ACKED
+        // clears retrans_stamp)
         self.net_stat(LINUX_MIB_TCPDELIVERED);
         self.syn_unacked = false;
+        self.rtx_stamp = None;
+        // Linux tcp_ack of the SYN-ACK: a timed-out SYN left CA_Loss
+        // (tcp_fastretrans_alert), before tcp_finish_connect
+        let mut flg = flag::SND_UNA_ADVANCED | flag::SYN_ACKED;
+        if self.ack_is_dubious(flg) {
+            let mut rexmit = Rexmit::None;
+            self.rcv_tsecr = s.ts.filter(|_| self.ts_ok).map(|(_, e)| e);
+            self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
+        }
         self.established(s, now, out);
         self.ack_now = true;
         self.rcv_text(s, skb, now, out);

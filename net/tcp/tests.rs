@@ -2934,3 +2934,48 @@ fn frto_off_keeps_the_reduction() {
     assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSUNDO), 0);
     assert!(p.a.cong.snd_ssthresh() < super::cong::INFINITE_SSTHRESH);
 }
+
+/// An active open whose SYN timed out `n` times, then answered
+fn syn_timeouts(n: usize) -> TcpCb {
+    let mut p = Pair::bare();
+    p.filter = drop_all;
+    let mut out = Out::default();
+    p.a.connect(open(1, 1460), 0, &mut out);
+    p.take(true, out);
+    for _ in 0..n {
+        assert!(p.tick());
+    }
+    let synack = SegIn {
+        seq: 5000,
+        ack: 2,
+        flags: flags::SYN | flags::ACK,
+        wnd: 65535,
+        mss: Some(1460),
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    p.a.feed(&synack, p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::Established);
+    p.a
+}
+
+/// A SYN timeout enters CA_Loss (Linux tcp_retransmit_timer's
+/// tcp_enter_loss): ssthresh from the algorithm (reno here, the
+/// options' default: half of 10), and after more than one SYN retransmission the transfer
+/// starts from one packet (tcp_init_transfer)
+#[test]
+fn syn_timeouts_enter_loss() {
+    use super::recovery::CaState;
+    let a = syn_timeouts(2);
+    assert_eq!(a.stats.total_retrans, 2);
+    assert!(a.undo_marker.is_some());
+    assert_eq!(a.cong.snd_ssthresh(), 5);
+    assert_eq!(a.cong.snd_cwnd(), 1);
+    // Without SACK, CA_Loss holds until data above the SYN is acked
+    assert_eq!(a.ca_state, CaState::Loss);
+    let a = syn_timeouts(1);
+    assert_eq!(a.cong.snd_cwnd(), super::cong::INIT_CWND);
+    let a = syn_timeouts(0);
+    assert_eq!(a.ca_state, CaState::Open);
+    assert!(a.cong.in_initial_slowstart());
+}

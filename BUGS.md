@@ -102,10 +102,7 @@ SACK compression
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no cwnd validation of an
 application-limited sender (tcp_cwnd_application_limited,
-snd_cwnd_used) and no tcp_slow_start_after_idle sysctl (always on), a SYN or SYN-ACK timeout
-halves ssthresh and sets cwnd 1 without entering CA_Loss (Linux
-tcp_enter_loss; so tcp_init_transfer's cwnd of 1 after more than one
-SYN retransmission, keyed on undo_marker, never applies), no CUBIC module parameters
+snd_cwnd_used) and no tcp_slow_start_after_idle sysctl (always on), no CUBIC module parameters
 (/sys/module/tcp_cubic/parameters: Linux's defaults are constants), no
 receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
 tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
