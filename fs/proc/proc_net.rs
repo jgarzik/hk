@@ -18,7 +18,7 @@ use crate::fs::KernelError;
 use crate::fs::file::{DirContext, DirEntry};
 use crate::fs::inode::{FileType, Inode, InodeMode, InodeRef};
 use crate::net::NetNamespace;
-use crate::task::percpu::TaskRef;
+use crate::task::tasklist::TaskRef;
 
 /// A /proc/<pid>/net file's content for a namespace
 pub type NetGen = fn(&NetNamespace) -> Vec<u8>;

@@ -41,8 +41,8 @@ use crate::sync::IrqRwLock;
 use crate::sync::rcu::RcuHead;
 use crate::sync::spin::Mutex;
 use crate::task::Uid;
-use crate::task::percpu::{TASKLIST, TaskRef, TaskView};
 use crate::task::pid::Pid;
+use crate::task::tasklist::{TASKLIST, TaskRef, TaskView};
 use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
@@ -453,7 +453,7 @@ fn sigio_target(o: &Owner, t: &TaskView<'_>) -> Option<TaskRef> {
     if !sigio_perm(o, t) {
         return None;
     }
-    Some(crate::task::percpu::task_ref(t.task))
+    Some(crate::task::tasklist::task_ref(t.task))
 }
 
 /// Linux send_sigio_to_task: the chosen signal with its POLL info, or

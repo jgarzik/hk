@@ -2,7 +2,7 @@
 //!
 //! This module implements the seccomp(2) syscall and prctl(2) integration.
 
-use crate::task::percpu::TASKLIST;
+use crate::task::tasklist::TASKLIST;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 
@@ -149,8 +149,9 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
     let (pid, mine, nnp) = (me.task.pid, me.seccomp_filter().cloned(), me.no_new_privs());
     // The other threads TSYNC covers: exiting and zombie ones are
     // skipped (Linux: PF_EXITING)
-    let other =
-        |t: &crate::task::percpu::TaskView<'_>| t.task.tid() != tid && crate::signal::task_live(t);
+    let other = |t: &crate::task::tasklist::TaskView<'_>| {
+        t.task.tid() != tid && crate::signal::task_live(t)
+    };
     if tsync {
         // Linux seccomp_can_sync_threads: every other thread's filter is
         // ours or one ours stacks on; else that thread's tid
@@ -163,7 +164,7 @@ fn set_seccomp_filter(fprog: UserPtr<SockFprog>, log: bool, tsync: bool) -> Kern
             }
         }
     }
-    let install = |table: &mut crate::task::percpu::GlobalTaskTable, t: crate::task::Tid| {
+    let install = |table: &mut crate::task::tasklist::GlobalTaskTable, t: crate::task::Tid| {
         let Some(mut task) = table.get_mut(t) else {
             return;
         };

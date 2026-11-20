@@ -24,8 +24,9 @@ use crate::fs::File;
 use crate::fs::flags::{O_ACCMODE, O_WRONLY};
 use crate::signal::{SIGCONT, SIGHUP, SignalStruct, kill_pgrp_pid};
 use crate::sync::spin::Mutex;
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, current_pid, current_sid};
+use crate::task::percpu::{current_pid, current_sid};
 use crate::task::pid::Pid;
+use crate::task::tasklist::{GlobalTaskTable, TASKLIST};
 use crate::util::error::KernelError;
 
 /// Serializes controlling-tty changes
@@ -63,10 +64,10 @@ impl Ctty {
 /// task_session); None for a kernel thread
 fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
     let me = crate::task::percpu::current();
-    let t = table.view(&me)?;
+    let s = table.view(&me)?.signal()?;
     Some((
-        t.task.pgrp.get_protected(table)?,
-        t.task.session.get_protected(table)?,
+        s.pgrp.get_protected(table)?,
+        s.session.get_protected(table)?,
     ))
 }
 
@@ -338,7 +339,7 @@ pub fn check_change(tty: &Tty, sig: crate::signal::Signal) -> Result<(), KernelE
             Ok(())
         };
     }
-    if crate::task::percpu::pgrp_orphaned(&pg) {
+    if crate::task::pgrp::pgrp_orphaned(&pg) {
         return Err(KernelError::Io);
     }
     kill_pgrp_pid(&pg, sig);

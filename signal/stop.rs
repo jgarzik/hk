@@ -289,7 +289,7 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
     let Some(sig_struct) = me.cpu_group().cloned() else {
         return false;
     };
-    let table = crate::task::percpu::TASKLIST.read();
+    let table = crate::task::tasklist::TASKLIST.read();
     let Some(mv) = table.view(&me) else {
         return false;
     };
@@ -376,7 +376,7 @@ pub fn do_jobctl_trap() {
         return;
     };
     let seized = {
-        let table = crate::task::percpu::TASKLIST.read();
+        let table = crate::task::tasklist::TASKLIST.read();
         table.view(&me).is_some_and(|v| v.ptrace() & PT_SEIZED != 0)
     };
     let rcu = crate::sync::rcu::read_lock();
@@ -447,13 +447,13 @@ pub fn notify_cld() {
         g.flags &= !flags::CLD_MASK;
         why
     };
-    let table = crate::task::percpu::TASKLIST.read();
+    let table = crate::task::tasklist::TASKLIST.read();
     super::notify::notify_parent_cldstop(&table, &me, false, why);
     if let Some(l) = table.get(me.pid)
         && l.ptrace() != 0
         && l.tracer().is_some_and(|tr| tr.pid != l.ppid())
     {
-        let leader = crate::task::percpu::task_ref(l.task);
+        let leader = crate::task::tasklist::task_ref(l.task);
         super::notify::notify_parent_cldstop(&table, &leader, true, why);
     }
 }
@@ -466,7 +466,7 @@ pub fn notify_cld() {
 /// the parent
 pub fn exit_participate() {
     let me = crate::task::percpu::current();
-    let table = crate::task::percpu::TASKLIST.read();
+    let table = crate::task::tasklist::TASKLIST.read();
     let Some(sg) = super::lock_sighand_in(&me, &table) else {
         me.set_flag(crate::task::pf::EXITING);
         return;
@@ -544,6 +544,28 @@ pub fn attach_stopped(t: &Task) {
     }
 }
 
+/// A new child traced from its fork (Linux ptrace_init_task, under
+/// tasklist_lock, before it first runs): a seized tracer's gets a STOP
+/// trap pending, an attached one's SIGSTOP pending, so it stops before
+/// its first instruction
+pub fn ptrace_init_child(t: &Task, seized: bool) {
+    let Some(sig_struct) = t.cpu_group() else {
+        return;
+    };
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(sg) = super::lock_task_sighand(t, &rcu) else {
+        return;
+    };
+    let _g = sig_struct.jobctl(&sg);
+    let mut s = sig_of(t, &sg);
+    if seized {
+        set_pending(t, &mut s, TRAP_STOP);
+    } else {
+        s.pending.signal.add(super::SIGSTOP);
+    }
+    t.set_sigpending(true);
+}
+
 /// `t` is in the middle of an attach's re-trap (JOBCTL_TRAPPING)
 pub fn trapping(t: &Task) -> bool {
     jobctl_of(t) & TRAPPING != 0
@@ -609,8 +631,10 @@ pub fn stop_applies(sig: Signal) -> bool {
         return true;
     }
     let me = crate::task::percpu::current();
-    let pg = me.pgrp.get(&crate::sync::rcu::read_lock());
-    pg.is_none_or(|pg| !crate::task::percpu::pgrp_orphaned(&pg))
+    let pg = me
+        .cpu_group()
+        .and_then(|s| s.pgrp.get(&crate::sync::rcu::read_lock()));
+    pg.is_none_or(|pg| !crate::task::pgrp::pgrp_orphaned(&pg))
 }
 
 /// New thread `child` of `parent`'s group joins its group stop, in

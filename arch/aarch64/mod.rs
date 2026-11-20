@@ -449,7 +449,7 @@ impl ArchBusOps for Aarch64Arch {
 // ============================================================================
 
 impl UserModeOps for Aarch64Arch {
-    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> ! {
+    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64, syscall_nr: u64) -> ! {
         // Enter user mode at `entry` (the task's TTBR0 is loaded:
         // mm::tlb::switch_mm): every register zero, EL0t with
         // interrupts enabled (Linux start_thread; the FP/SIMD state was
@@ -460,9 +460,13 @@ impl UserModeOps for Aarch64Arch {
         // (paging::sync_page).
         let regs = (kernel_stack - core::mem::size_of::<Aarch64TrapFrame>() as u64)
             as *mut Aarch64TrapFrame;
+        // The exec syscall's number stays (Linux start_thread keeps
+        // syscallno)
+        let mut frame = Self::user_entry_frame(entry, user_stack);
+        frame.syscallno = syscall_nr;
         // SAFETY: the top of this task's kernel stack, below the caller's
         // frames only if the caller runs on another stack (init)
-        unsafe { regs.write(Self::user_entry_frame(entry, user_stack)) };
+        unsafe { regs.write(frame) };
         // Its return to user mode (a signal may be pending, the slice
         // used up), with IRQs masked
         cpu::disable_interrupts();

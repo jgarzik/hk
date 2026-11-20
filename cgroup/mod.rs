@@ -758,8 +758,9 @@ pub static CGROUP_THREADGROUP_RWSEM: crate::sync::RwSem<()> = crate::sync::RwSem
 /// namespace (any of its threads; 0: the caller's): ESRCH if none
 /// (Linux cgroup_procs_write_start finds the task by find_task_by_vpid,
 /// then its group leader's whole group; exiting threads are skipped)
-pub fn thread_group(pid: Pid) -> Result<Vec<crate::task::percpu::TaskRef>, KernelError> {
-    use crate::task::percpu::{GlobalTaskTable, current, find_task_by_vpid, task_ref};
+pub fn thread_group(pid: Pid) -> Result<Vec<crate::task::tasklist::TaskRef>, KernelError> {
+    use crate::task::percpu::current;
+    use crate::task::tasklist::{GlobalTaskTable, find_task_by_vpid, task_ref};
     let t = if pid == 0 {
         task_ref(&current())
     } else {

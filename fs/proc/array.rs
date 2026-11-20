@@ -22,7 +22,7 @@ use core::fmt::Write;
 use crate::fs::KernelError;
 use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
 use crate::ns::PidNamespace;
-use crate::task::percpu::{TASKLIST, TaskRef};
+use crate::task::tasklist::{TASKLIST, TaskRef};
 use crate::task::{Cred, Pid, Task, TaskKind, TaskState};
 
 /// Linux PF_KTHREAD / PF_EXITING (stat field 9)
@@ -108,7 +108,7 @@ fn snap(task: &Task, ns: &PidNamespace) -> Option<Box<Snap>> {
     // task_state: task_pgrp_nr_ns, task_session_nr_ns, pid_alive(p) ?
     // task_tgid_nr_ns(rcu_dereference(p->real_parent)) : 0)
     let g = crate::sync::rcu::read_lock();
-    let (pg, se) = (t.task.pgrp.read(&g), t.task.session.read(&g));
+    let (pg, se) = (t.task.pgrp_rcu(&g), t.task.session_rcu(&g));
     let ppid = t.task.parent(&g).map_or(0, |p| p.tgid_nr_ns(ns, &g));
     // Its tracer's thread, under RCU (Linux task_state: ptrace_parent,
     // task_pid_nr_ns)

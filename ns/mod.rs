@@ -571,7 +571,7 @@ pub fn fork_nsproxy(
 ) -> KernelResult<Arc<NsProxy>> {
     let ns_flags = flags & CLONE_NS_FLAGS;
     // CLONE_NEWNS with a shared fs struct was refused before any work
-    // (`percpu::clone_flags_ok`, Linux copy_process); the child's own
+    // (`fork::clone_flags_ok`, Linux copy_process); the child's own
     // copy follows its new mounts
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);
@@ -745,6 +745,6 @@ pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
 /// credentials' too, which move their active reference to it (Linux
 /// commit_creds -> switch_cred_namespaces).
 pub fn switch_task_namespaces(t: &Task, new_ns: Arc<NsProxy>) {
-    crate::task::percpu::switch_cred_namespaces(t, &new_ns.user_ns);
+    crate::task::cred::switch_cred_namespaces(t, &new_ns.user_ns);
     init_task_ns(t, new_ns);
 }

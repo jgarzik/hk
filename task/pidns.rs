@@ -11,7 +11,7 @@
 
 use crate::ns::PidNamespace;
 use crate::task::Task;
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef, task_ref};
+use crate::task::tasklist::{GlobalTaskTable, TASKLIST, TaskRef, task_ref};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -77,7 +77,7 @@ pub fn find_child_reaper(me: &TaskRef) {
         if !is_reaper(&table, ns, me) {
             return;
         }
-        match crate::task::percpu::live_thread(&table, me.pid) {
+        match crate::task::exit::live_thread(&table, me.pid) {
             Some(t) => (false, set_reaper(&mut table, ns, &t)),
             None => (ns.level != 0, None),
         }
@@ -146,7 +146,7 @@ pub fn reboot_pid_ns(cmd: u32) -> Option<crate::util::error::KernelError> {
 /// the namespace's idr from 2); collected under TASKLIST's read lock
 /// with room made before it (nothing allocates under it)
 fn ns_tasks(ns: &PidNamespace, pid: crate::task::Pid) -> Vec<TaskRef> {
-    let mine = |t: &crate::task::percpu::TaskView<'_>| {
+    let mine = |t: &crate::task::tasklist::TaskView<'_>| {
         t.task.pid != pid
             && crate::signal::task_live(t)
             && t.thread_pid_ref().is_some_and(|p| p.nr_in(ns).is_some())
@@ -178,16 +178,21 @@ fn ns_tasks(ns: &PidNamespace, pid: crate::task::Pid) -> Vec<TaskRef> {
 /// `init_pids` pids (Linux zap_pid_ns_processes: kernel_wait4 until
 /// ECHILD, then pid_allocated == init_pids). Linux sets init's SIGCHLD
 /// to SIG_IGN so late zombies autoreap; an exiting hk task has no
-/// handlers left, so it reaps them here (each exit and the namespace's
-/// last pids wake CHILD_EXIT_WQ).
+/// handlers left, so it reaps them here (each child's exit notice wakes
+/// its group's wait_chldexit, the namespace's last pids wake it:
+/// `Pid::wake_reapers`).
 fn reap_ns(me: &TaskRef, ns: &PidNamespace, init_pids: u32) {
     use crate::sync::waitqueue::WaitEntry;
-    use crate::task::percpu::{SleepState, has_children, reap_zombie_child_times, schedule};
-    use crate::task::proc::CHILD_EXIT_WQ;
+    use crate::task::exit::{has_children, reap_zombie_child_times};
+    use crate::task::percpu::{SleepState, schedule};
     use crate::task::wait_options::__WALL;
+    let Some(sig) = me.cpu_group().cloned() else {
+        return;
+    };
+    let wq = &sig.wait_chldexit;
     let w = core::pin::pin!(WaitEntry::new());
     loop {
-        CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Uninterruptible);
+        wq.prepare_to_wait(w.as_ref(), SleepState::Uninterruptible);
         if reap_zombie_child_times(me.pid, -1, __WALL).is_some() {
             continue;
         }
@@ -196,5 +201,5 @@ fn reap_ns(me: &TaskRef, ns: &PidNamespace, init_pids: u32) {
         }
         schedule();
     }
-    CHILD_EXIT_WQ.finish_wait(w.as_ref());
+    wq.finish_wait(w.as_ref());
 }

@@ -594,11 +594,14 @@ pub trait UserModeOps {
     /// * `entry` - User entry point address
     /// * `user_stack` - User stack pointer
     /// * `kernel_stack` - Kernel stack top for syscalls/interrupts
+    /// * `syscall_nr` - The frame's syscall number: the exec syscall's
+    ///   own, which Linux start_thread keeps (orig_ax, syscallno) for
+    ///   its exit stop and tracepoint; u64::MAX for none
     ///
     /// # Safety
     /// The task's address space must be loaded (`mm::tlb::switch_mm`)
     /// and map the entry point and stack. This function never returns.
-    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> !;
+    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64, syscall_nr: u64) -> !;
 }
 
 /// Combined scheduler architecture trait

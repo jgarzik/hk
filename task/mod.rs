@@ -10,6 +10,7 @@ pub mod membarrier;
 pub mod pidfd;
 pub(crate) mod rlimit;
 pub mod task_work;
+pub mod tasklist;
 pub mod wake_q;
 pub mod workqueue;
 
@@ -17,7 +18,10 @@ pub mod exec;
 pub mod fair;
 pub mod fdbits;
 pub use fdbits::FdTable;
+pub mod cred;
+pub mod exit;
 pub mod fdtable;
+pub mod fork;
 pub mod id;
 pub mod kthread;
 pub mod loadavg;
@@ -402,7 +406,7 @@ pub fn commit_creds(new: Arc<Cred>) {
     if moved {
         new.ucounts.inc(Ucount::Nproc, 1);
     }
-    percpu::commit_creds_impl(new);
+    cred::commit_creds_impl(new);
     if moved {
         old.dec(Ucount::Nproc, 1);
     }
@@ -415,7 +419,7 @@ pub fn nproc_exec_check() -> KernelResult<()> {
     let me = percpu::current();
     // rlimit() takes TASKLIST: decide before locking it
     let over = nproc_overlimit(&current_cred().ucounts);
-    let table = percpu::TASKLIST.read();
+    let table = tasklist::TASKLIST.read();
     let Some(t) = table.view(&me) else {
         return Ok(());
     };
@@ -696,7 +700,7 @@ pub mod pf {
     pub const NO_SETAFFINITY: u32 = 0x0400_0000;
 }
 
-/// An io thread's function and its argument (`percpu::create_io_thread`)
+/// An io thread's function and its argument (`fork::create_io_thread`)
 pub type IoThreadFn = (
     fn(Arc<dyn core::any::Any + Send + Sync>),
     Arc<dyn core::any::Any + Send + Sync>,
@@ -799,6 +803,11 @@ pub struct Task {
     pub flags: AtomicU32,
     /// Linux TIF_* ([`tif`])
     pub thread_flags: AtomicU32,
+    /// An exec's ptrace report, due on its first return to user mode,
+    /// once the new image's registers are in place: `EXEC_EVENT` | the
+    /// old thread id as its tracer numbers it (`ptrace::exec_event_*`;
+    /// Linux exec_binprm's ptrace_event(PTRACE_EVENT_EXEC, old_vpid))
+    pub exec_event: AtomicU64,
     /// CPU whose run queue owns this task (Linux task_cpu): changed by
     /// `set_task_cpu` only
     pub cpu: AtomicU32,
@@ -972,15 +981,6 @@ pub struct Task {
     /// ([`Task::tracer_locked`]) or an RCU read guard
     /// ([`Task::tracer`]), written under its write lock
     ptracer: crate::sync::rcu::RcuPtr<Task>,
-    /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
-    /// PIDTYPE_SID]): the same in every thread of the group, the only
-    /// record of its group and session; none for kernel threads and
-    /// once its released leader's group is gone. Replaced under
-    /// TASKLIST's write lock, the old reference dropped a
-    /// grace period later (Linux free_pid -> delayed_put_pid); read
-    /// under its read lock or an RCU read guard
-    pub pgrp: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
-    pub session: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
     /// Releases the task list's reference a grace period after it is
     /// unlisted (type invariant)
     rcu: crate::sync::rcu::RcuHead,
@@ -990,14 +990,14 @@ pub struct Task {
     /// (`put_rcu`); read under TASKLIST or an RCU read guard. Set in
     /// the section that lists the task, cleared at release (a zombie
     /// keeps it, Linux __exit_signal).
-    pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, percpu::GlobalTaskTable>,
+    pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, tasklist::GlobalTaskTable>,
     /// Its process identifier (Linux task->thread_pid; None for the idle
     /// tasks, tid 0): set before the task is listed, exchanged by
     /// de_thread (exchange_tids) and cleared at release (detach_pid)
     /// under TASKLIST's write lock, the replaced reference dropped a
     /// grace period later; read under TASKLIST or an RCU read guard
     /// (task_pid_nr_ns)
-    pub thread_pid: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    pub thread_pid: crate::sync::rcu::RcuLockedArc<pid::Pid, tasklist::GlobalTaskTable>,
     /// Ptrace flags (Linux task->ptrace: PT_PTRACED, PT_SEIZED,
     /// PT_SYSCALL_TRACE, PT_SINGLESTEP; 0: not traced): written under
     /// TASKLIST's write lock (a `TaskViewMut`), read with a Relaxed load
@@ -1013,7 +1013,8 @@ crate::rcu_head!(Task, rcu);
 
 /// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner {
-    /// A group leader on its `Task.pgrp`'s and `session`'s lists
+    /// A group leader on its group's `SignalStruct.pgrp`'s and
+    /// `session`'s lists
     pids_linked: bool,
     /// The user namespace of its credentials (Linux
     /// real_cred->user_ns; hk keeps the namespace itself in the
@@ -1021,7 +1022,7 @@ pub struct TaskInner {
     /// is in the task list, zombie included, it holds an active
     /// reference to it (Linux get_cred_namespaces at fork,
     /// exit_cred_namespaces at release_task), moved by
-    /// `percpu::switch_cred_namespaces`. None for kernel threads (the
+    /// `cred::switch_cred_namespaces`. None for kernel threads (the
     /// initial one, always active)
     user_ns: Option<Arc<crate::ns::UserNamespace>>,
     // =========================================================================
@@ -1221,7 +1222,7 @@ impl TaskInner {
 
 /// Data owned by the TASKLIST lock: reached through a borrow of the
 /// locked table
-pub type TableCell<T> = crate::sync::LockedBy<T, crate::task::percpu::GlobalTaskTable>;
+pub type TableCell<T> = crate::sync::LockedBy<T, crate::task::tasklist::GlobalTaskTable>;
 
 /// The adapter of `Task.sibling` (children lists)
 pub struct Sibling;
@@ -1655,6 +1656,7 @@ impl Task {
             // No CPU's registers hold its user state (Linux copy_thread:
             // fpsimd_flush_task_state)
             thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
+            exec_event: AtomicU64::new(0),
             cpu: AtomicU32::new(cpu),
             wake_cpu: AtomicU32::new(cpu),
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
@@ -1707,8 +1709,6 @@ impl Task {
             session_link: crate::util::rcuhlist::HNode::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
             ptracer: crate::sync::rcu::RcuPtr::null(),
-            pgrp: crate::sync::rcu::RcuLockedArc::none(),
-            session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::new(ids.thread_pid),
@@ -1731,6 +1731,7 @@ impl Task {
             // Its registers hold no user state (Linux init_task:
             // _TIF_FOREIGN_FPSTATE)
             thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
+            exec_event: AtomicU64::new(0),
             cpu: AtomicU32::new(0),
             wake_cpu: AtomicU32::new(0),
             cpus_mask: crate::util::cpumask::CpuMask::new(),
@@ -1783,8 +1784,6 @@ impl Task {
             session_link: crate::util::rcuhlist::HNode::new(),
             real_parent: crate::sync::rcu::RcuPtr::null(),
             ptracer: crate::sync::rcu::RcuPtr::null(),
-            pgrp: crate::sync::rcu::RcuLockedArc::none(),
-            session: crate::sync::rcu::RcuLockedArc::none(),
             rcu: crate::sync::rcu::RcuHead::new(),
             sighand: crate::sync::rcu::RcuLockedArc::none(),
             thread_pid: crate::sync::rcu::RcuLockedArc::none(),
@@ -1830,7 +1829,7 @@ impl Task {
 
     /// Its real parent, TASKLIST held (Linux real_parent under
     /// tasklist_lock); none once it has left the task list
-    pub fn parent_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+    pub fn parent_locked<'a>(&'a self, table: &'a tasklist::GlobalTaskTable) -> Option<&'a Task> {
         let _ = table;
         if !self.tasks_link.is_listed() {
             return None;
@@ -1844,7 +1843,7 @@ impl Task {
     /// Its real parent becomes `p` (TASKLIST held for writing: Linux
     /// rcu_assign_pointer(real_parent) under tasklist_lock); `p` is
     /// listed (the type invariant)
-    pub fn set_parent(&self, p: Option<&Task>, table: &mut percpu::GlobalTaskTable) {
+    pub fn set_parent(&self, p: Option<&Task>, table: &mut tasklist::GlobalTaskTable) {
         let _ = table;
         debug_assert!(p.is_none_or(|p| p.tasks_link.is_listed()));
         // INVARIANT: `p` is listed (the callers'), under the write lock
@@ -1876,7 +1875,7 @@ impl Task {
 
     /// Its tracer, TASKLIST held (Linux task->parent of a ptraced task
     /// under tasklist_lock); none if not traced or no longer listed
-    pub fn tracer_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+    pub fn tracer_locked<'a>(&'a self, table: &'a tasklist::GlobalTaskTable) -> Option<&'a Task> {
         let _ = table;
         if !self.tasks_link.is_listed() {
             return None;
@@ -1923,13 +1922,29 @@ impl Task {
     /// Its process group (root number), 0 for none (Linux
     /// pid_nr(task_pgrp)), under `g`
     pub fn pgid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
-        self.pgrp.read(g).map_or(0, |p| Pid::from(p.nr()))
+        self.pgrp_rcu(g).map_or(0, |p| Pid::from(p.nr()))
     }
 
     /// Its session (root number), 0 for none (Linux
     /// pid_nr(task_session)), under `g`
     pub fn sid(&self, g: &crate::sync::rcu::RcuReadGuard) -> Pid {
-        self.session.read(g).map_or(0, |p| Pid::from(p.nr()))
+        self.session_rcu(g).map_or(0, |p| Pid::from(p.nr()))
+    }
+
+    /// Its process group (Linux task_pgrp: signal->pids[PIDTYPE_PGID]),
+    /// under `g`; none for a kernel thread and once its group is
+    /// released
+    pub fn pgrp_rcu<'g>(&'g self, g: &'g crate::sync::rcu::RcuReadGuard) -> Option<&'g pid::Pid> {
+        self.cpu_group()?.pgrp.read(g)
+    }
+
+    /// Its session (Linux task_session: signal->pids[PIDTYPE_SID]),
+    /// under `g`; likewise
+    pub fn session_rcu<'g>(
+        &'g self,
+        g: &'g crate::sync::rcu::RcuReadGuard,
+    ) -> Option<&'g pid::Pid> {
+        self.cpu_group()?.session.read(g)
     }
 
     /// Its pid namespace, a counted reference (Linux
@@ -2527,7 +2542,7 @@ impl Drop for NprocCharge {
 fn flag_nproc_exceeded(new: &Cred) {
     let over = new.uid != 0 && nproc_overlimit(&new.ucounts);
     let me = percpu::current();
-    let table = percpu::TASKLIST.read();
+    let table = tasklist::TASKLIST.read();
     if let Some(t) = table.view(&me) {
         if over {
             t.task.set_flag(crate::task::pf::NPROC_EXCEEDED);
@@ -2738,7 +2753,7 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 
 /// Set task `t`'s clear_child_tid pointer
 pub fn set_clear_child_tid(t: &Task, addr: u64) {
-    let mut table = percpu::TASKLIST.write();
+    let mut table = tasklist::TASKLIST.write();
     if let Some(mut task) = table.view_mut(t) {
         task.clear_child_tid = addr;
     }
@@ -2753,7 +2768,7 @@ pub fn set_clear_child_tid(t: &Task, addr: u64) {
 
 /// Get and remove task `t`'s set_child_tid pointer (one-time use)
 pub fn get_set_child_tid(t: &Task) -> Option<u64> {
-    let mut table = percpu::TASKLIST.write();
+    let mut table = tasklist::TASKLIST.write();
     if let Some(mut task) = table.view_mut(t) {
         let addr = task.set_child_tid;
         if addr != 0 {
@@ -2767,7 +2782,7 @@ pub fn get_set_child_tid(t: &Task) -> Option<u64> {
 /// Set task `t`'s set_child_tid pointer
 pub fn set_set_child_tid(t: &Task, addr: u64) {
     if addr != 0 {
-        let mut table = percpu::TASKLIST.write();
+        let mut table = tasklist::TASKLIST.write();
         if let Some(mut task) = table.view_mut(t) {
             task.set_child_tid = addr;
         }

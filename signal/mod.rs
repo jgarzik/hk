@@ -430,7 +430,7 @@ impl SigHand {
         &self,
         t: &Task,
         new: Option<Arc<SigHand>>,
-        table: &mut crate::task::percpu::GlobalTaskTable,
+        table: &mut crate::task::tasklist::GlobalTaskTable,
         g: &SigGuard<'_>,
     ) {
         assert!(
@@ -442,12 +442,12 @@ impl SigHand {
     }
 
     /// One more task uses it (under TASKLIST's write lock)
-    fn get(&self, table: &mut crate::task::percpu::GlobalTaskTable) {
+    fn get(&self, table: &mut crate::task::tasklist::GlobalTaskTable) {
         *self.users.access_mut(table) += 1;
     }
 
     /// One task fewer uses it (under TASKLIST's write lock)
-    fn put(&self, table: &mut crate::task::percpu::GlobalTaskTable) {
+    fn put(&self, table: &mut crate::task::tasklist::GlobalTaskTable) {
         let n = self.users.access_mut(table);
         *n = n.saturating_sub(1);
     }
@@ -870,7 +870,7 @@ pub fn sig_of<'a>(
 /// kernel thread (no table)
 pub fn lock_sighand_in<'a>(
     t: &'a Task,
-    table: &'a crate::task::percpu::GlobalTaskTable,
+    table: &'a crate::task::tasklist::GlobalTaskTable,
 ) -> Option<SigGuard<'a>> {
     t.sighand.protected(table).map(SigGuard::lock)
 }
@@ -880,7 +880,7 @@ pub fn lock_sighand_in<'a>(
 /// group stop (Linux task_sig, task_state: under lock_task_sighand);
 /// none once released
 pub fn proc_sig(
-    table: &crate::task::percpu::GlobalTaskTable,
+    table: &crate::task::tasklist::GlobalTaskTable,
     t: &Task,
 ) -> (u64, u64, u64, bool, bool) {
     lock_sighand_in(t, table).map_or((0, 0, 0, false, false), |g| {
@@ -975,7 +975,7 @@ impl TaskSignalState {
 // =============================================================================
 
 use crate::task::Task;
-use crate::task::percpu::{TASKLIST, TaskRef};
+use crate::task::tasklist::{TASKLIST, TaskRef};
 
 // =============================================================================
 // Task Signal APIs
@@ -984,8 +984,14 @@ use crate::task::percpu::{TASKLIST, TaskRef};
 /// Initialize signal state for new task `t`
 ///
 /// Called when creating the init process at boot (failure cannot be
-/// reported). Also initializes the SignalStruct (which contains rlimits).
-pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
+/// reported). Also initializes the SignalStruct (which contains
+/// rlimits), in process group and session `pids` (Linux
+/// init_signals.pids: init_struct_pid).
+pub fn init_task_signal(
+    t: &Task,
+    sighand: Arc<SigHand>,
+    pids: [Option<Arc<crate::task::pid::Pid>>; 2],
+) {
     // Built before TASKLIST is taken, with init's limits (init_rlimits)
     let s = SignalStruct::alloc_nofail();
     // The global init (Linux init_signals: SIGNAL_UNKILLABLE)
@@ -998,7 +1004,7 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
         // init_signals: thread_head holds init_task)
         let mut g = SigGuard::lock(&sighand);
         s.set_owner(&mut table, &mut g, &sighand);
-        let me = crate::task::percpu::task_ref(t);
+        let me = crate::task::tasklist::task_ref(t);
         s.threads.access_mut(&mut table, &mut g).push_back(me);
         // Its own state is the table's from now on
         t.sig.set_owner(&mut g, &sighand);
@@ -1008,11 +1014,17 @@ pub fn init_task_signal(t: &Task, sighand: Arc<SigHand>) {
         // Named before anyone can lock it
         t.sighand.replace(Some(sighand), &mut table).defer_put();
     }
-    if let Some(task) = table.view_mut(t) {
-        task.task.set_cpu_group(&s);
-    }
     let pid = table.view(t).and_then(|v| v.thread_pid());
     s.set_leader_pid(&mut table, pid);
+    if table.view(t).is_some() {
+        let [pg, ses] = pids;
+        // The group had none (new: nothing to retire)
+        s.pgrp.replace(pg, &mut table).defer_put();
+        s.session.replace(ses, &mut table).defer_put();
+        t.set_cpu_group(&s);
+        // Its leader joins their lists (Linux attach_pid)
+        table.attach_pids(t);
+    }
 }
 
 /// Task `t`'s signal handlers, read under RCU (Linux
@@ -1292,7 +1304,7 @@ pub fn fork_cpu_watch(child: &Task, f: &ForkSignal) {
 /// return to user mode looks for them (Linux schedule_tail:
 /// calculate_sigpending).
 pub fn install_fork_signal(
-    table: &mut crate::task::percpu::GlobalTaskTable,
+    table: &mut crate::task::tasklist::GlobalTaskTable,
     child: &Task,
     f: ForkSignal,
     mut delay: ForkDelay,
@@ -1321,7 +1333,7 @@ pub fn install_fork_signal(
                 child.set_sigpending(true);
             }
         }
-        let c = crate::task::percpu::task_ref(child);
+        let c = crate::task::tasklist::task_ref(child);
         f.signal.threads.access_mut(table, &mut g).push_back(c);
         // Its own state, set up unseen, is the table's from now on
         child.sig.set_owner(&mut g, &f.sighand);
@@ -1329,12 +1341,16 @@ pub fn install_fork_signal(
         // Not named before (the child is new): nothing to retire
         child.sighand.replace(Some(f.sighand), table).defer_put();
     }
-    // A new process: the child leads it, with its parent's controlling
-    // tty (Linux copy_process, under tasklist_lock)
+    // A new process: the child leads it, in its parent's process group
+    // and session and with its parent's controlling tty (Linux
+    // copy_process, under tasklist_lock)
+    let me = crate::task::percpu::current();
     if !f.share_signal {
         let pid = table.view(child).and_then(|c| c.thread_pid());
         f.signal.set_leader_pid(table, pid);
-        let me = crate::task::percpu::current();
+        if table.view(&me).is_some() {
+            table.inherit_pids(&f.signal, &me);
+        }
         if let Some(ps) = table.view(&me).and_then(|p| p.signal().cloned()) {
             // One ctty lock at a time: it is a leaf
             let tty = ps.ctty.lock().tty();
@@ -1343,6 +1359,9 @@ pub fn install_fork_signal(
     }
     if table.view(child).is_some() {
         child.set_cpu_group(&f.signal);
+        // A new leader joins its group's and session's lists (Linux
+        // copy_process: attach_pid PIDTYPE_PGID, PIDTYPE_SID)
+        table.attach_pids(child);
     }
 }
 
@@ -1983,7 +2002,7 @@ fn choose(
     init: bool,
 ) -> Option<Chosen> {
     let t = if p_wants {
-        crate::task::percpu::task_ref(p)
+        crate::task::tasklist::task_ref(p)
     } else if ty == PidType::Pid {
         return None;
     } else {
@@ -2031,7 +2050,7 @@ fn pick_thread(g: &SigGuard<'_>, p: &Task, sig: Signal) -> Option<TaskRef> {
         .skip_while(|t| t.tid() != cur)
         .find(wants)
         .or_else(|| s.threads(g).take_while(|t| t.tid() != cur).find(wants))?;
-    let t = crate::task::percpu::task_ref(t);
+    let t = crate::task::tasklist::task_ref(t);
     s.shared(g).curr_target = t.tid();
     Some(t)
 }
@@ -2088,7 +2107,7 @@ pub fn proc_target(
     check: impl Fn(&Task, Option<Signal>) -> KernelResult<()>,
 ) -> KernelResult<TaskRef> {
     let g = crate::sync::rcu::read_lock();
-    let t = crate::task::percpu::pid_ns_task(pid, &crate::ns::INIT_PID_NS, &g);
+    let t = crate::task::tasklist::pid_ns_task(pid, &crate::ns::INIT_PID_NS, &g);
     checked(t, sig, check)
 }
 
@@ -2104,7 +2123,7 @@ fn checked(
 ) -> KernelResult<TaskRef> {
     let t = t.ok_or(KernelError::NoProcess)?;
     check(t, sig?)?;
-    Ok(crate::task::percpu::task_ref(t))
+    Ok(crate::task::tasklist::task_ref(t))
 }
 
 /// `sig` with `info` to task `t`'s thread group, received as `t`
@@ -2216,7 +2235,7 @@ pub fn kill_own_pgrp(
 /// [`kill_pgrp_info`]'s walk of group `pg`, under the caller's TASKLIST
 /// read hold; flushed entries go to `gone`
 fn pgrp_send(
-    table: &crate::task::percpu::GlobalTaskTable,
+    table: &crate::task::tasklist::GlobalTaskTable,
     pg: &crate::task::pid::Pid,
     sig: KillSig,
     info: SendInfo,
@@ -2312,7 +2331,7 @@ fn group_kill(g: &SigGuard<'_>, p: &Task, sig: Signal) {
 }
 
 /// `t` has not started exiting (Linux !PF_EXITING, not a zombie)
-pub fn task_live(t: &crate::task::percpu::TaskView<'_>) -> bool {
+pub fn task_live(t: &crate::task::tasklist::TaskView<'_>) -> bool {
     !t.task.has_flag(crate::task::pf::EXITING)
         && !matches!(t.state(), crate::task::TaskState::Zombie(_))
 }
@@ -2727,8 +2746,32 @@ pub struct SignalStruct {
     /// detach_pid(PIDTYPE_TGID)), the reference dropped a grace period
     /// later; read under RCU. An exec by another thread keeps it (that
     /// thread takes the leader's pid, exchange_tids).
-    pub leader_pid:
-        crate::sync::rcu::RcuLockedArc<crate::task::pid::Pid, crate::task::percpu::GlobalTaskTable>,
+    pub leader_pid: crate::sync::rcu::RcuLockedArc<
+        crate::task::pid::Pid,
+        crate::task::tasklist::GlobalTaskTable,
+    >,
+    /// The group's process group and session (Linux
+    /// signal->pids[PIDTYPE_PGID, PIDTYPE_SID]), the only record of
+    /// either: set under TASKLIST's write lock when the group's first
+    /// task is attached (fork inherits its creator's, the global init
+    /// gets the boot ones), replaced there by setpgid and setsid, and
+    /// cleared there when the group is released (its leader's `remove`,
+    /// Linux __unhash_process detach_pid(PIDTYPE_PGID, PIDTYPE_SID));
+    /// the replaced reference dropped a grace period later (Linux
+    /// free_pid -> delayed_put_pid); read under TASKLIST or RCU
+    pub pgrp: crate::sync::rcu::RcuLockedArc<
+        crate::task::pid::Pid,
+        crate::task::tasklist::GlobalTaskTable,
+    >,
+    pub session: crate::sync::rcu::RcuLockedArc<
+        crate::task::pid::Pid,
+        crate::task::tasklist::GlobalTaskTable,
+    >,
+    /// Its threads waiting in wait4/waitid (Linux
+    /// signal->wait_chldexit): woken by a child's or tracee's exit,
+    /// stop or continue notice (`notify::wake_up_parent`, Linux
+    /// __wake_up_parent), under TASKLIST as Linux holds tasklist_lock
+    pub wait_chldexit: crate::sync::waitqueue::WaitQueue,
     /// Threads not yet exiting (Linux signal->live): +1 at each
     /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
     /// takes it to 0 is the group's last (group_dead)
@@ -2758,7 +2801,7 @@ pub struct SignalStruct {
     /// leaves at release (`unhash`)
     pub threads: crate::sync::LockedByBoth<
         crate::util::list::OwnedList<crate::task::ThreadNode>,
-        crate::task::percpu::GlobalTaskTable,
+        crate::task::tasklist::GlobalTaskTable,
         SigHand,
     >,
     /// Job-control state (Linux signal->flags' stop bits,
@@ -2910,7 +2953,7 @@ impl SignalStruct {
     /// (TASKLIST held for writing)
     fn set_leader_pid(
         &self,
-        table: &mut crate::task::percpu::GlobalTaskTable,
+        table: &mut crate::task::tasklist::GlobalTaskTable,
         pid: Option<Arc<crate::task::pid::Pid>>,
     ) {
         self.leader_pid.replace(pid, table).defer_put();
@@ -2950,6 +2993,9 @@ impl SignalStruct {
             posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
             itimers: itimers,
             leader_pid: crate::sync::rcu::RcuLockedArc::none(),
+            pgrp: crate::sync::rcu::RcuLockedArc::none(),
+            session: crate::sync::rcu::RcuLockedArc::none(),
+            wait_chldexit: crate::sync::waitqueue::WaitQueue::new(),
             live: AtomicU32::new(1),
             dead_times: [const { AtomicU64::new(0) }; 3],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -3013,7 +3059,7 @@ impl SignalStruct {
     /// old table's siglock `g` (any while it has none: a new group)
     fn set_owner(
         &self,
-        table: &mut crate::task::percpu::GlobalTaskTable,
+        table: &mut crate::task::tasklist::GlobalTaskTable,
         g: &mut SigGuard<'_>,
         new: &SigHand,
     ) {
@@ -3049,13 +3095,13 @@ impl SignalStruct {
     }
 
     /// The process is a child subreaper (TASKLIST held)
-    pub fn subreaper(&self, table: &crate::task::percpu::GlobalTaskTable) -> bool {
+    pub fn subreaper(&self, table: &crate::task::tasklist::GlobalTaskTable) -> bool {
         *self.subreaper.access(table)
     }
 
     /// Make the process a child subreaper or not (TASKLIST held for
     /// writing; Linux PR_SET_CHILD_SUBREAPER)
-    pub fn set_subreaper(&self, table: &mut crate::task::percpu::GlobalTaskTable, on: bool) {
+    pub fn set_subreaper(&self, table: &mut crate::task::tasklist::GlobalTaskTable, on: bool) {
         *self.subreaper.access_mut(table) = on;
     }
 

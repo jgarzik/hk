@@ -88,12 +88,12 @@ pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> KernelResult<()> {
     // Privileged: CAP_SETUID (Linux __sys_setuid: ns_capable_setid)
     if super::capable(super::CAP_SETUID) {
         // Set all UIDs: uid, suid, euid, fsuid - permanently drops root
-        return super::percpu::set_current_uid_all(uid);
+        return super::cred::set_current_uid_all(uid);
     }
 
     // Unprivileged: can only set euid to uid or suid
     if uid == current_cred.uid || uid == current_cred.suid {
-        return super::percpu::set_current_euid(uid);
+        return super::cred::set_current_euid(uid);
     }
 
     // Not permitted
@@ -125,12 +125,12 @@ pub fn sys_setgid(gid: u32, current_cred: super::Cred) -> KernelResult<()> {
     // Privileged: CAP_SETGID (Linux __sys_setgid: ns_capable_setid)
     if super::capable(super::CAP_SETGID) {
         // Set all GIDs: gid, sgid, egid, fsgid
-        return super::percpu::set_current_gid_all(gid);
+        return super::cred::set_current_gid_all(gid);
     }
 
     // Unprivileged: can only set egid to gid or sgid
     if gid == current_cred.gid || gid == current_cred.sgid {
-        return super::percpu::set_current_egid(gid);
+        return super::cred::set_current_egid(gid);
     }
 
     // Not permitted
@@ -256,7 +256,7 @@ pub fn sys_setresuid(
     let suid_opt = if suid == NO_CHANGE { None } else { Some(suid) };
 
     // Apply the changes
-    super::percpu::set_current_resuid(ruid_opt, euid_opt, suid_opt)
+    super::cred::set_current_resuid(ruid_opt, euid_opt, suid_opt)
 }
 
 /// sys_setresgid - set real, effective, and saved group IDs
@@ -315,7 +315,7 @@ pub fn sys_setresgid(
     let sgid_opt = if sgid == NO_CHANGE { None } else { Some(sgid) };
 
     // Apply the changes
-    super::percpu::set_current_resgid(rgid_opt, egid_opt, sgid_opt)
+    super::cred::set_current_resgid(rgid_opt, egid_opt, sgid_opt)
 }
 
 /// sys_setreuid - set real and effective user IDs
@@ -382,7 +382,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> KernelRe
     };
 
     // Apply the changes (fsuid follows euid in set_current_reuid)
-    super::percpu::set_current_reuid(ruid_opt, euid_opt, new_suid)
+    super::cred::set_current_reuid(ruid_opt, euid_opt, new_suid)
 }
 
 /// sys_setregid - set real and effective group IDs
@@ -450,7 +450,7 @@ pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> KernelRe
     };
 
     // Apply the changes (fsgid follows egid in set_current_regid)
-    super::percpu::set_current_regid(rgid_opt, egid_opt, new_sgid)
+    super::cred::set_current_regid(rgid_opt, egid_opt, new_sgid)
 }
 
 /// sys_setfsuid - set filesystem UID
@@ -496,7 +496,7 @@ pub fn sys_setfsuid(uid: u32, current_cred: super::Cred) -> i64 {
 
     // Apply the change; without memory for new credentials the old
     // fsuid is returned unchanged (Linux: prepare_creds failure)
-    let _ = super::percpu::set_current_fsuid(uid);
+    let _ = super::cred::set_current_fsuid(uid);
 
     i64::from(old_fsuid)
 }
@@ -545,7 +545,7 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
 
     // Apply the change; without memory for new credentials the old
     // fsgid is returned unchanged (Linux: prepare_creds failure)
-    let _ = super::percpu::set_current_fsgid(gid);
+    let _ = super::cred::set_current_fsgid(gid);
 
     i64::from(old_fsgid)
 }

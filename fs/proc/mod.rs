@@ -49,7 +49,7 @@ use crate::io::poll::{DEFAULT_POLLMASK, POLLIN, POLLRDNORM, PollTable};
 use crate::ns::PidNamespace;
 use crate::task::Cred;
 use crate::task::Pid;
-use crate::task::percpu::TaskRef;
+use crate::task::tasklist::TaskRef;
 use crate::util::kalloc::try_arc;
 
 /// Get current timestamp for new inodes
@@ -90,7 +90,7 @@ impl ProcPid {
     /// under RCU), None once it is reaped. Every per-process path works
     /// on this task, never on its number.
     pub fn task(&self) -> Option<TaskRef> {
-        crate::task::percpu::get_pid_task(&self.0)
+        crate::task::tasklist::get_pid_task(&self.0)
     }
 
     /// Its root number, for inode numbers (fixed)
@@ -941,7 +941,7 @@ fn group_threads(
     t: &crate::task::Task,
     ns: &PidNamespace,
 ) -> Vec<(*const crate::task::Task, crate::task::Tid, u32)> {
-    crate::task::percpu::GlobalTaskTable::collect_group(t, |_, x| {
+    crate::task::tasklist::GlobalTaskTable::collect_group(t, |_, x| {
         if matches!(x.state(), crate::task::TaskState::Zombie(_)) {
             return None;
         }
@@ -2215,12 +2215,12 @@ fn readdir_emit_pids(root: &Inode, ctx: &mut DirContext<'_>) -> Result<(), Kerne
     let ns = opts::pid_ns(root);
     // Each group leader, by its number in ns, gathered with no
     // allocation under TASKLIST (references dropped after it)
-    let mut pids = crate::task::percpu::GlobalTaskTable::collect_tasks(|_, t| {
+    let mut pids = crate::task::tasklist::GlobalTaskTable::collect_tasks(|_, t| {
         if t.task.tid() != t.task.pid || t.task.pid == 0 {
             return None;
         }
         let nr = t.thread_pid()?.nr_in(&ns)?;
-        Some((nr, crate::task::percpu::task_ref(t.task)))
+        Some((nr, crate::task::tasklist::task_ref(t.task)))
     });
     pids.sort_unstable_by_key(|&(nr, _)| nr);
 
@@ -2722,7 +2722,7 @@ pub fn proc_flush_pid(
     t: &crate::task::Task,
     thread: Option<alloc::sync::Arc<crate::task::pid::Pid>>,
 ) {
-    use crate::task::percpu::TASKLIST;
+    use crate::task::tasklist::TASKLIST;
     // Its struct pid (pinned by the release that cleared it) and its
     // leader's, whose numbers stay readable after they are given back;
     // taken under TASKLIST, dropped after it

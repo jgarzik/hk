@@ -6,7 +6,8 @@ use super::percpu::{
     self, ARCH_GET_CPUID, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_CPUID, ARCH_SET_FS, ARCH_SET_GS,
     read_fs_base, write_fs_base,
 };
-use crate::task::percpu::{TASKLIST, current};
+use crate::task::percpu::current;
+use crate::task::tasklist::TASKLIST;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
 

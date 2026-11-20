@@ -9,7 +9,8 @@
 //! - ioprio_get, ioprio_set
 //! - getcpu
 
-use super::percpu::{TaskRef, current_tid};
+use super::percpu::current_tid;
+use super::tasklist::TaskRef;
 use crate::uaccess::{UserPtr, access_ok};
 use crate::util::error::{KernelError, KernelResult};
 
@@ -90,12 +91,12 @@ fn prio_tasks(which: i32, who: u64) -> KernelResult<alloc::vec::Vec<TaskRef>> {
     Ok(match which {
         PRIO_PROCESS => {
             let tid = super::pid::from_vnr_or(who, current_tid()).ok_or(KernelError::NoProcess)?;
-            super::percpu::find_task(tid).into_iter().collect()
+            super::tasklist::find_task(tid).into_iter().collect()
         }
         PRIO_PGRP => {
             let pgid = super::pid::from_vnr_or(who, super::percpu::current_pgid())
                 .ok_or(KernelError::NoProcess)?;
-            super::percpu::pgrp_tasks(pgid)
+            super::pgrp::pgrp_tasks(pgid)
         }
         _ => return Err(KernelError::InvalidArgument),
     })
@@ -114,7 +115,7 @@ fn for_each_user_task(who: u64, mut f: impl FnMut(&Task)) {
     };
     let ns = super::percpu::current_pid_ns();
     let g = crate::sync::rcu::read_lock();
-    for t in super::percpu::for_each_task_rcu(&g) {
+    for t in super::tasklist::for_each_task_rcu(&g) {
         if t.cred_rcu(&g).uid == uid && t.pid_nr_ns(ns, &g) != 0 {
             f(t);
         }
@@ -280,7 +281,7 @@ pub fn sys_sched_setscheduler(
 /// caller; Linux find_process_by_pid): ESRCH if none
 fn sched_target(pid: i64) -> KernelResult<TaskRef> {
     let tid = super::pid::from_vnr_or(pid as u64, current_tid()).ok_or(KernelError::NoProcess)?;
-    super::percpu::find_task(tid).ok_or(KernelError::NoProcess)
+    super::tasklist::find_task(tid).ok_or(KernelError::NoProcess)
 }
 
 /// May the caller give task `t` `policy` at rt priority `prio` (Linux
@@ -630,7 +631,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
         IOPRIO_WHO_PROCESS => {
             let tid =
                 super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
-            let t = super::percpu::find_task(tid).ok_or(KernelError::NoProcess)?;
+            let t = super::tasklist::find_task(tid).ok_or(KernelError::NoProcess)?;
             if !ioprio_owner_ok(&t) {
                 return Err(KernelError::NotPermitted);
             }
@@ -645,8 +646,8 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
             // (Linux walks the group under tasklist_lock and never sees
             // it); ESRCH if none was left
             let mut found = false;
-            for t in &super::percpu::pgrp_tasks(pgid) {
-                if super::percpu::TASKLIST.read().view(t).is_none() {
+            for t in &super::pgrp::pgrp_tasks(pgid) {
+                if super::tasklist::TASKLIST.read().view(t).is_none() {
                     continue;
                 }
                 if !ioprio_owner_ok(t) {
@@ -702,7 +703,7 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> KernelResult<i64> {
         IOPRIO_WHO_PROCESS => {
             let tid =
                 super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
-            let t = super::percpu::find_task(tid).ok_or(KernelError::NoProcess)?;
+            let t = super::tasklist::find_task(tid).ok_or(KernelError::NoProcess)?;
             let ioprio = get_task_io_context(&t).map_or(IOPRIO_DEFAULT, |c| c.get_ioprio());
             Ok(i64::from(ioprio))
         }
@@ -710,7 +711,7 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> KernelResult<i64> {
             let pgid = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
                 .ok_or(KernelError::NoProcess)?;
 
-            let tasks = super::percpu::pgrp_tasks(pgid);
+            let tasks = super::pgrp::pgrp_tasks(pgid);
             if tasks.is_empty() {
                 return Err(KernelError::NoProcess);
             }

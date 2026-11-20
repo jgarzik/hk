@@ -2,7 +2,7 @@
 //! do_notify_parent_cldstop in kernel/signal.c)
 
 use super::{SIGCHLD, SendInfo, SigFields, SigHandler, SigInfo, Signal, sa_flags};
-use crate::task::percpu::{GlobalTaskTable, TaskRef};
+use crate::task::tasklist::{GlobalTaskTable, TaskRef};
 use crate::task::{Task, Tid};
 
 /// SIGCHLD info for child `t` with `code` (CLD_*) and `status`: its
@@ -51,16 +51,16 @@ pub fn notify_parent_cldstop(
     };
     let (tsk, parent) = if for_ptracer {
         (
-            crate::task::percpu::task_ref(t),
-            v.tracer().map(crate::task::percpu::task_ref),
+            crate::task::tasklist::task_ref(t),
+            v.tracer().map(crate::task::tasklist::task_ref),
         )
     } else {
         let Some(l) = table.get(t.pid) else {
             return;
         };
         (
-            crate::task::percpu::task_ref(l.task),
-            l.real_parent().map(crate::task::percpu::task_ref),
+            crate::task::tasklist::task_ref(l.task),
+            l.real_parent().map(crate::task::tasklist::task_ref),
         )
     };
     let Some(parent) = parent else {
@@ -100,8 +100,15 @@ pub fn notify_parent_cldstop(
             &mut gone,
         );
     }
-    // Linux __wake_up_parent
-    crate::task::proc::CHILD_EXIT_WQ.wake_all();
+    wake_up_parent(&parent);
+}
+
+/// `parent`'s threads waiting for a child rechecks (Linux
+/// __wake_up_parent: its group's wait_chldexit)
+pub fn wake_up_parent(parent: &Task) {
+    if let Some(s) = parent.cpu_group() {
+        s.wait_chldexit.wake_all();
+    }
 }
 
 /// si_code and si_status of wait status `status` (Linux
@@ -162,10 +169,10 @@ impl Zombie {
 fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let tid = z.tid();
     let t = table.get(tid)?;
-    let real = t.real_parent().map(crate::task::percpu::task_ref);
+    let real = t.real_parent().map(crate::task::tasklist::task_ref);
     let tracer = match z {
         Zombie::Detached(_) => None,
-        _ => t.tracer().map(crate::task::percpu::task_ref),
+        _ => t.tracer().map(crate::task::tasklist::task_ref),
     };
     let traced = tracer.is_some();
     let parent = tracer.or(real.clone())?;
@@ -176,7 +183,7 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
             let reparented = traced && real.as_ref().is_none_or(|r| r.pid != parent.pid);
             t.leader()
                 && !reparented
-                && !crate::task::percpu::group_pending(table, t.task.pid, &[tid])
+                && !crate::task::exit::group_pending(table, t.task.pid, &[tid])
         }
         Zombie::Leader(_) | Zombie::Detached(_) => true,
     };
@@ -264,7 +271,7 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
     // A stop-signal exit signal's flushed entries, freed after TASKLIST
     let mut gone = super::SigPending::new();
     // Its pidfd pollers first (Linux do_notify_parent: do_notify_pidfd)
-    crate::task::percpu::notify_pidfd(table, tid);
+    crate::task::exit::notify_pidfd(table, tid);
     let Some(r) = receiver(table, z) else {
         return Told {
             gone,
@@ -280,6 +287,8 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
         let info = SendInfo::Notice(info.with_sig(sig));
         let _ = super::send_task_in(&r.to, sig, info, super::PidType::Tgid, false, &mut gone);
     }
+    // Linux do_notify_parent: __wake_up_parent, autoreap or not
+    wake_up_parent(&r.to);
     Told {
         autoreap,
         gone,

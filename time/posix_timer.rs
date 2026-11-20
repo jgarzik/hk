@@ -1155,7 +1155,7 @@ fn own_cpu_clock(clockid: i32) -> Option<crate::time::cpu_timer::CpuClock> {
         // Under RCU (Linux pid_for_clock: find_task_by_vpid,
         // same_thread_group)
         let g = crate::sync::rcu::read_lock();
-        let same = crate::task::percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+        let same = crate::task::tasklist::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
             .is_some_and(|t| t.pid == current_pid());
         return same.then_some(crate::time::cpu_timer::CpuClock {
             thread: Some(tid),
@@ -1298,7 +1298,7 @@ pub fn sys_timer_settime(
     if let Some(crate::time::cpu_timer::CpuClock {
         thread: Some(t), ..
     }) = timer.cpu
-        && crate::task::percpu::pid_ns_task(
+        && crate::task::tasklist::pid_ns_task(
             t,
             &crate::ns::INIT_PID_NS,
             &crate::sync::rcu::read_lock(),

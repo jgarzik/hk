@@ -4,6 +4,7 @@ pub mod fault_signals;
 pub mod fork_delay;
 pub mod jobctl;
 pub mod ptrace_access;
+pub mod ptrace_event;
 pub mod ptrace_exit;
 pub mod ptrace_listen;
 pub mod ptrace_stop;

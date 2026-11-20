@@ -40,6 +40,17 @@ const SIGNAL_WORK: u32 = tif::SIGPENDING | tif::RESTORE_SIGMASK | tif::NOTIFY_SI
 /// exit_to_user_mode_prepare / exit_to_user_mode_loop). Interrupts are
 /// off on entry and on return; `regs` is the current task's pt_regs.
 pub fn exit_to_user_mode(regs: &UserFrame) {
+    // An exec's ptrace report, once its new registers are in the frame
+    // a tracer reads (rare: one load otherwise)
+    if crate::task::percpu::current()
+        .exec_event
+        .load(Ordering::Relaxed)
+        != 0
+    {
+        CurrentArch::enable_interrupts();
+        crate::task::ptrace::exec_event_end();
+        CurrentArch::disable_interrupts();
+    }
     loop {
         let flags = &crate::task::percpu::current().thread_flags;
         let work = flags.load(Ordering::Acquire) & EXIT_WORK;
@@ -111,7 +122,9 @@ pub fn syscall_enter_from_user_mode(regs: &UserFrame) -> u64 {
         regs.set_ret(ret);
         return u64::MAX;
     }
-    nr
+    // Read again: a tracer's PTRACE_EVENT_SECCOMP stop may have changed
+    // it (Linux syscall_trace_enter returns syscall_get_nr after seccomp)
+    regs.syscall_nr()
 }
 
 /// Nothing may be held on the way to user mode: no spin lock (each

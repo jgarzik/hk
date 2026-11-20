@@ -75,7 +75,7 @@ impl Pidfd {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.pid.wait_pidfd);
         }
-        match crate::task::percpu::pidfd_exited(&self.pid) {
+        match crate::task::exit::pidfd_exited(&self.pid) {
             None => POLLIN | POLLRDNORM | POLLHUP,
             Some(true) => POLLIN | POLLRDNORM,
             Some(false) => 0,
@@ -188,9 +188,9 @@ pub fn show_fdinfo(
 /// A pidfd's task (Linux pidfd_get_task: get_pid_task, under RCU):
 /// from its struct pid, never by number, so a reused number never
 /// reaches another process; EBADF for another file, ESRCH once gone
-pub fn pidfd_task(file: &File) -> Result<crate::task::percpu::TaskRef, KernelError> {
+pub fn pidfd_task(file: &File) -> Result<crate::task::tasklist::TaskRef, KernelError> {
     let pidfd = get_pidfd(file).ok_or(KernelError::BadFd)?;
-    crate::task::percpu::get_pid_task(&pidfd.pid).ok_or(KernelError::NoProcess)
+    crate::task::tasklist::get_pid_task(&pidfd.pid).ok_or(KernelError::NoProcess)
 }
 
 /// Check if a file is a pidfd

@@ -449,6 +449,10 @@ pub(crate) fn kmain() -> ! {
 fn run_init() -> ! {
     // Linux kernel_init, before run_init_process
     system_state::set_system_state(system_state::SystemState::Running);
+    // The process Ctrl-Alt-Del signals (Linux kernel_init: cad_pid)
+    if let Some(p) = crate::task::pid::find_vpid(1) {
+        crate::power::set_cad_pid(p);
+    }
     let args = cmdline::init_args(cmdline::saved());
     let rdinit = args.rdinit.as_deref().unwrap_or("/init");
     if fs::lookup_path(rdinit.as_bytes()).is_ok() {
@@ -494,7 +498,14 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> util::error::KernelError {
         return e;
     }
     let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
-    match task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc) {
+    // From the kernel: no syscall in its frame (Linux kernel_execve)
+    match task::exec::do_execve(
+        path.as_bytes().to_vec(),
+        argv,
+        envp,
+        u64::MAX,
+        &mut frame_alloc,
+    ) {
         Ok(never) => match never {},
         Err(e) => e,
     }

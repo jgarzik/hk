@@ -25,6 +25,9 @@ pub enum Verdict {
     /// SECCOMP_RET_TRAP: a forced SIGSYS carrying the filter's 16 bits
     /// of data, the syscall skipped
     Trap(u32),
+    /// SECCOMP_RET_TRACE: a tracer's PTRACE_EVENT_SECCOMP with the
+    /// filter's 16 bits of data, else ENOSYS
+    Trace(u32),
     /// SECCOMP_RET_KILL_THREAD: the thread exits by SIGSYS (the process,
     /// if it is the last thread)
     KillThread,
@@ -80,9 +83,10 @@ fn verdict(result: u32) -> Verdict {
         SECCOMP_RET_ALLOW | SECCOMP_RET_LOG => Verdict::Allow,
         SECCOMP_RET_ERRNO => Verdict::Ret(-i64::from((result & SECCOMP_RET_DATA).min(MAX_ERRNO))),
         SECCOMP_RET_TRAP => Verdict::Trap(result & SECCOMP_RET_DATA),
-        // No tracer (hk has no PTRACE_EVENT_SECCOMP) and no listener:
-        // ENOSYS, the syscall skipped
-        SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => Verdict::Ret(-38),
+        SECCOMP_RET_TRACE => Verdict::Trace(result & SECCOMP_RET_DATA),
+        // No listener (hk has no seccomp user notification): ENOSYS,
+        // the syscall skipped
+        SECCOMP_RET_USER_NOTIF => Verdict::Ret(-38),
         SECCOMP_RET_KILL_THREAD => Verdict::KillThread,
         _ => Verdict::KillProcess,
     }
@@ -93,17 +97,26 @@ fn verdict(result: u32) -> Verdict {
 /// return. The mode is read lock-free (Linux TIF_SECCOMP), the filter
 /// only when it is on.
 pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
+    secure_computing_in(regs, nr, false)
+}
+
+/// [`secure_computing`]; `recheck`: the check after a tracer's
+/// PTRACE_EVENT_SECCOMP stop, where a second RET_TRACE allows the
+/// syscall (Linux __seccomp_filter's recheck_after_trace)
+fn secure_computing_in(regs: &crate::arch::UserFrame, nr: u64, recheck: bool) -> Option<u64> {
     let me = crate::task::percpu::current();
     let mode = me.seccomp_mode();
     if mode == SECCOMP_MODE_DISABLED {
         return None;
     }
     let filter = {
-        let table = crate::task::percpu::TASKLIST.read();
+        let table = crate::task::tasklist::TASKLIST.read();
         table.view(&me)?.seccomp_filter().cloned()
     };
     match check_syscall(mode, filter.as_ref(), nr, regs.ip(), regs.syscall_args()) {
         Verdict::Allow => None,
+        Verdict::Trace(_) if recheck => None,
+        Verdict::Trace(data) => trace(regs, data),
         Verdict::Ret(e) => Some(e as u64),
         Verdict::Trap(data) => {
             // The handler sees the registers as at entry (Linux
@@ -118,6 +131,27 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
         // alone even if it is the last
         Verdict::Strict => crate::task::proc::do_exit(i32::from(crate::signal::SIGKILL)),
     }
+}
+
+/// SECCOMP_RET_TRACE (Linux __seccomp_filter): ENOSYS unless a tracer
+/// asked for PTRACE_EVENT_SECCOMP; then that stop, the data its
+/// message, and the syscall as the tracer left it: skipped if killed
+/// meanwhile or its number is now negative (returning what the tracer put in
+/// the return register), else checked again with every register read
+/// afresh
+fn trace(regs: &crate::arch::UserFrame, data: u32) -> Option<u64> {
+    use crate::task::ptrace::{PTRACE_EVENT_SECCOMP, ptrace_event, ptrace_event_enabled};
+    if !ptrace_event_enabled(PTRACE_EVENT_SECCOMP) {
+        return Some(-38i64 as u64);
+    }
+    ptrace_event(PTRACE_EVENT_SECCOMP, u64::from(data));
+    regs.sync_syscall_args();
+    let nr = regs.syscall_nr();
+    // Any negative number skips it (Linux: the int this_syscall < 0)
+    if crate::signal::fatal_signal_pending() || (nr as i32) < 0 {
+        return Some(regs.ret());
+    }
+    secure_computing_in(regs, nr, true)
 }
 
 /// SIGSYS for syscall `nr` a filter trapped with `data` (Linux

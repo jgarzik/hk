@@ -407,7 +407,7 @@ struct TaskInfo {
 
 /// Task `t`'s information for accounting
 fn get_task_info(t: &Task) -> TaskInfo {
-    use crate::task::percpu::TASKLIST;
+    use crate::task::tasklist::TASKLIST;
 
     let table = TASKLIST.read();
 

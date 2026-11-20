@@ -16,7 +16,8 @@ use crate::signal::{
     dequeue_signal, get_task_sighand, kill_pgrp, proc_target, send_group_signal, send_sig_info,
     si_code, ss_flags, with_task_signal_state,
 };
-use crate::task::percpu::{TaskRef, current, current_tid, get_all_pids};
+use crate::task::percpu::{current, current_tid, get_all_pids};
+use crate::task::tasklist::TaskRef;
 use crate::time::time_syscall::LinuxTimespec;
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
@@ -277,14 +278,14 @@ fn user_thread_send(
     // Found and checked under RCU (Linux do_send_specific)
     let t = {
         let g = crate::sync::rcu::read_lock();
-        let t = crate::task::percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+        let t = crate::task::tasklist::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
             .ok_or(KernelError::NoProcess)?;
         if tgid.is_some_and(|g| t.pid != g) {
             return Err(KernelError::NoProcess);
         }
         // A bad number is EINVAL once the thread is found
         me.may_kill(t, sig?)?;
-        crate::task::percpu::task_ref(t)
+        crate::task::tasklist::task_ref(t)
     };
     // Checked: a signal or a probe
     let Some(sig) = sig? else {
@@ -330,7 +331,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> KernelResult<()> {
 /// were EPERM, ESRCH if there was none
 fn kill_all(sig: KillSig) -> KernelResult<()> {
     let self_tgid = {
-        let table = crate::task::percpu::TASKLIST.read();
+        let table = crate::task::tasklist::TASKLIST.read();
         table.view(&current()).map_or(0, |t| t.task.pid)
     };
     // Only processes the caller's namespace numbers, but its init

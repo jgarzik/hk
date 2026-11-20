@@ -20,12 +20,6 @@ pub fn sys_sched_yield() {
     super::percpu::yield_now();
 }
 
-/// Wait queue for parents in wait4/waitid: woken whenever a task exits
-/// (Linux signal->wait_chldexit, simplified to one global queue; waiters
-/// re-check for their own zombies)
-pub static CHILD_EXIT_WQ: crate::sync::waitqueue::WaitQueue =
-    crate::sync::waitqueue::WaitQueue::new();
-
 /// sys_exit - terminate the calling process
 ///
 /// # Arguments
@@ -50,7 +44,7 @@ pub fn sys_exit_group(status: i32) -> u64 {
 pub fn do_exit(wait_status: i32) -> ! {
     // Release everything, become a zombie carrying the status for
     // wait4/waitid, switch away (never returns)
-    super::percpu::exit_current(Some(wait_status));
+    super::exit::exit_current(Some(wait_status));
 }
 
 /// sys_clone - create a new thread or process
@@ -98,7 +92,7 @@ pub fn sys_clone(
         0
     };
 
-    clone(super::percpu::CloneConfig {
+    clone(super::fork::CloneConfig {
         flags: flags & !0xff, // Remove signal bits from flags
         child_stack,
         parent_tidptr: parent_tidptr.addr(),
@@ -107,7 +101,7 @@ pub fn sys_clone(
         pidfd_ptr,
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
-        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid: super::fork::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
         io_thread: None,
     })
@@ -115,9 +109,9 @@ pub fn sys_clone(
 
 /// Create the task described by `config` (do_clone with the global
 /// frame allocator): the child's tid
-fn clone(config: super::percpu::CloneConfig) -> KernelResult<i64> {
+fn clone(config: super::fork::CloneConfig) -> KernelResult<i64> {
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    Ok(super::percpu::do_clone(config, &mut frame_alloc)? as i64)
+    Ok(super::fork::do_clone(config, &mut frame_alloc)? as i64)
 }
 
 /// sys_fork - create a new process (classic fork)
@@ -131,7 +125,7 @@ fn clone(config: super::percpu::CloneConfig) -> KernelResult<i64> {
 /// * < 0: Error code
 pub fn sys_fork() -> KernelResult<i64> {
     // fork() is clone() with no CLONE_* flags and child_stack = 0 (inherit parent stack)
-    clone(super::percpu::CloneConfig {
+    clone(super::fork::CloneConfig {
         flags: 0,       // No sharing flags = fork semantics
         child_stack: 0, // 0 = inherit parent's stack pointer
         parent_tidptr: 0,
@@ -140,7 +134,7 @@ pub fn sys_fork() -> KernelResult<i64> {
         pidfd_ptr: 0,
         exit_signal: crate::signal::ExitSignal::SIGCHLD, // fork sends SIGCHLD on exit
         cgroup_fd: -1,
-        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid: super::fork::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
         io_thread: None,
     })
@@ -169,7 +163,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
 
     // vfork() = clone(CLONE_VM | CLONE_VFORK, parent_stack)
     // Child shares address space and parent blocks until child exec()s or _exit()s
-    clone(super::percpu::CloneConfig {
+    clone(super::fork::CloneConfig {
         flags: CLONE_VM | CLONE_VFORK,
         child_stack: super::percpu::current_pt_regs().sp(), // the parent's (CLONE_VM needs one)
         parent_tidptr: 0,
@@ -178,7 +172,7 @@ pub fn sys_vfork() -> KernelResult<i64> {
         pidfd_ptr: 0,
         exit_signal: crate::signal::ExitSignal::SIGCHLD, // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
-        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid: super::fork::CloneConfig::NO_SET_TID,
         set_tid_size: 0,
         io_thread: None,
     })
@@ -227,22 +221,27 @@ pub fn sys_wait4(
     use super::percpu::{SleepState, schedule};
     use crate::sync::waitqueue::{WaitEntry, signal_pending};
 
-    // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
+    // Sleep on the group's wait_chldexit until a matching child is
+    // reportable (Linux do_wait)
+    let sig = super::percpu::current()
+        .cpu_group()
+        .cloned()
+        .ok_or(KernelError::NoChild)?;
+    let wq = &sig.wait_chldexit;
     let w = core::pin::pin!(WaitEntry::new());
     let result = loop {
-        CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
+        wq.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
         // A tracee's ptrace stop: (code << 8) | 0x7f (Linux
         // wait_task_stopped)
-        if let Some((tid, code, (utime, stime))) =
-            super::percpu::wait_traced(current_pid, pid, false)
+        if let Some((tid, code, (utime, stime))) = super::exit::wait_traced(current_pid, pid, false)
         {
             let st = ((code as i32) << 8) | 0x7f;
             let r = put_status(wstatus, st).and_then(|()| put_times(rusage, utime, stime));
             break r.map(|()| tid as i64);
         }
         if let Some((child_pid, wait_status, utime, stime)) =
-            super::percpu::reap_zombie_child_times(current_pid, pid, options)
+            super::exit::reap_zombie_child_times(current_pid, pid, options)
         {
             // The zombie holds the Linux wait status word; the child's
             // and its children's CPU time (Linux getrusage(RUSAGE_BOTH))
@@ -254,19 +253,19 @@ pub fn sys_wait4(
         // wait_task_stopped, wait_task_continued: getrusage(p,
         // RUSAGE_BOTH))
         if let Some((tid, r, _, (utime, stime))) =
-            super::percpu::wait_jobctl(current_pid, pid, options)
+            super::exit::wait_jobctl(current_pid, pid, options)
         {
             let st = match r {
-                super::percpu::JobReport::Stopped(code) => ((code as i32) << 8) | 0x7f,
-                super::percpu::JobReport::Continued => 0xffff,
+                super::exit::JobReport::Stopped(code) => ((code as i32) << 8) | 0x7f,
+                super::exit::JobReport::Continued => 0xffff,
             };
             let r = put_status(wstatus, st).and_then(|()| put_times(rusage, utime, stime));
             break r.map(|()| tid as i64);
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, pid, options)
-            && !super::percpu::has_tracees(current_pid, pid)
+        if !super::exit::has_children(current_pid, pid, options)
+            && !super::exit::has_tracees(current_pid, pid)
         {
             break Err(KernelError::NoChild);
         }
@@ -281,7 +280,7 @@ pub fn sys_wait4(
         }
         schedule();
     };
-    CHILD_EXIT_WQ.finish_wait(w.as_ref());
+    wq.finish_wait(w.as_ref());
     result
 }
 
@@ -428,15 +427,21 @@ pub fn sys_waitid(
     use super::percpu::{SleepState, schedule};
     use crate::sync::waitqueue::{WaitEntry, signal_pending};
 
-    // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
+    // Sleep on the group's wait_chldexit until a matching child is
+    // reportable (Linux do_wait)
+    let sig = super::percpu::current()
+        .cpu_group()
+        .cloned()
+        .ok_or(KernelError::NoChild)?;
+    let wq = &sig.wait_chldexit;
     let w = core::pin::pin!(WaitEntry::new());
     let result = loop {
-        CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
+        wq.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
         // A tracee's ptrace stop (CLD_TRAPPED)
         let wnowait = options & super::wait_options::WNOWAIT != 0;
         if let Some((tid, code, (utime, stime))) =
-            super::percpu::wait_traced(current_pid, wait_pid, wnowait)
+            super::exit::wait_traced(current_pid, wait_pid, wnowait)
         {
             let info = chld_info(si_code::CLD_TRAPPED, tid as i32, code as i32);
             let r = put_times(rusage, utime, stime).and_then(|()| put_waitid_info(infop, &info));
@@ -446,7 +451,7 @@ pub fn sys_waitid(
         // Reap a zombie child (with WNOWAIT, only report it); only for
         // WEXITED
         let zombie = if options & WEXITED != 0 {
-            super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
+            super::exit::reap_zombie_child_times(current_pid, wait_pid, options)
         } else {
             None
         };
@@ -469,11 +474,11 @@ pub fn sys_waitid(
         // time (Linux wait_task_stopped / wait_task_continued:
         // getrusage(p, RUSAGE_BOTH))
         if let Some((tid, r, uid, (utime, stime))) =
-            super::percpu::wait_jobctl(current_pid, wait_pid, options)
+            super::exit::wait_jobctl(current_pid, wait_pid, options)
         {
             let (code, status) = match r {
-                super::percpu::JobReport::Stopped(c) => (si_code::CLD_STOPPED, c as i32),
-                super::percpu::JobReport::Continued => {
+                super::exit::JobReport::Stopped(c) => (si_code::CLD_STOPPED, c as i32),
+                super::exit::JobReport::Continued => {
                     (si_code::CLD_CONTINUED, crate::signal::SIGCONT.nr() as i32)
                 }
             };
@@ -490,8 +495,8 @@ pub fn sys_waitid(
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, wait_pid, options)
-            && !super::percpu::has_tracees(current_pid, wait_pid)
+        if !super::exit::has_children(current_pid, wait_pid, options)
+            && !super::exit::has_tracees(current_pid, wait_pid)
         {
             break Err(KernelError::NoChild);
         }
@@ -513,7 +518,7 @@ pub fn sys_waitid(
         }
         schedule();
     };
-    CHILD_EXIT_WQ.finish_wait(w.as_ref());
+    wq.finish_wait(w.as_ref());
     result
 }
 
@@ -610,7 +615,7 @@ const CSIGNAL: u64 = 0x000000ff;
 /// * 0: Child returns 0
 /// * < 0: Error code
 pub fn sys_clone3(uargs: UserPtr<CloneArgs>, size: u64) -> KernelResult<i64> {
-    use super::percpu::CloneConfig;
+    use super::fork::CloneConfig;
 
     use crate::uaccess::copy_struct_from_user;
 

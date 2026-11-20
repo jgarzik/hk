@@ -124,9 +124,17 @@ impl Ctx {
 
     /// Wait (5 s at most) for exactly `ev.len()` events
     pub fn get_all(&self, ev: &mut [IoEvent]) -> Result<(), (&'static [u8], i64)> {
-        let mut got = 0;
+        const EINTR: i64 = -4;
+        let (mut got, mut intr) = (0, 0);
         while got < ev.len() {
             let n = self.get(ev.len() - got, &mut ev[got..], Some(5000));
+            // A signal for this process ends the wait with EINTR, never
+            // restarted, SA_RESTART or not (Linux io_getevents); waited
+            // again, a bounded number of times
+            if n == EINTR && intr < 100 {
+                intr += 1;
+                continue;
+            }
             check(b"io_getevents", n > 0, n)?;
             got += n as usize;
         }

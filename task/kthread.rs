@@ -31,9 +31,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{
-    SleepState, TaskRef, WakeMode, cpu_has_scheduler, create_kthread_task, current_tid, schedule,
+    SleepState, WakeMode, cpu_has_scheduler, create_kthread_task, current_tid, schedule,
     set_current_state, try_to_wake_up,
 };
+use crate::task::tasklist::TaskRef;
 use crate::task::{PRIORITY_NORMAL, Priority, Tid};
 use crate::util::error::KernelError;
 
@@ -158,9 +159,9 @@ fn kthread_exit() -> ! {
     let k = crate::task::percpu::current().kthread.lock().take();
     drop(k);
     // Dropped after TASKLIST (nothing is released under it)
-    let me = crate::task::percpu::TASKLIST.write().remove(tid);
+    let me = crate::task::tasklist::TASKLIST.write().remove(tid);
     drop(me);
-    crate::task::percpu::exit_current(None)
+    crate::task::exit::exit_current(None)
 }
 
 /// True once `kthread_stop` was called on the current thread

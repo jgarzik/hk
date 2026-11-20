@@ -375,7 +375,7 @@ Extended attributes:
 
 10.4 Misc security / sandboxing
 
-- [x] seccomp (STRICT, FILTER; no TRACE, USER_NOTIF)
+- [x] seccomp (STRICT, FILTER, TRACE; no USER_NOTIF)
 - [x] prctl (subset)
 
 11. Namespaces, containers, mounts, cgroups
@@ -404,7 +404,7 @@ Extended attributes:
 - [x] uname
 - [x] sysinfo
 - [x] getrandom
-- [x] reboot
+- [x] reboot (CAD_ON/CAD_OFF, RESTART2)
 - [x] kexec_load (stub: ENOSYS)
 - [x] syslog (console actions no-ops)
 - [x] acct
@@ -414,7 +414,7 @@ Extended attributes:
 
 13. Debugging, perf, BPF
 
-- [x] ptrace (subset)
+- [x] ptrace (subset: event stops; no PEEKUSER/REGSET/FPREGS)
 - [x] perf_event_open (stub: EOPNOTSUPP)
 - [x] bpf (HASH/ARRAY maps, SOCKET_FILTER; not attachable)
 - [x] membarrier

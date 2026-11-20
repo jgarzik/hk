@@ -14,7 +14,7 @@ use alloc::sync::Arc;
 use core::cmp::Ordering;
 
 use crate::task::Task;
-use crate::task::percpu::{TASKLIST, task_ref};
+use crate::task::tasklist::{TASKLIST, task_ref};
 use crate::util::error::{KernelError, KernelResult};
 
 // KCMP comparison types
@@ -146,7 +146,7 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> K
     // find_task_by_vpid and get_task_struct under rcu_read_lock)
     let (t1, t2) = {
         let g = crate::sync::rcu::read_lock();
-        let find = |p: i32| crate::task::percpu::vpid_task(p as u64, &g);
+        let find = |p: i32| crate::task::tasklist::vpid_task(p as u64, &g);
         let task1 = find(pid1).ok_or(KernelError::NoProcess)?;
         let task2 = find(pid2).ok_or(KernelError::NoProcess)?;
         (task_ref(task1), task_ref(task2))

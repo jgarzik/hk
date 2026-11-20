@@ -382,8 +382,7 @@ No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 **Location**: `seccomp/`
 
-No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
-user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
+No user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
 FLAG_WAIT_KILLABLE_RECV are EINVAL), and nothing is logged for RET_LOG
 or FLAG_LOG.
 
@@ -628,14 +627,13 @@ clock_gettime and friends. On arm64 a page holding only the signal
 return trampoline stands in for the vDSO's sigtramp, shown as
 [sigpage] in /proc/<pid>/maps (Linux: [vdso], [vvar]).
 
-## ptrace stop gaps
+## ptrace request gaps
 
-**Location**: `task/ptrace.rs`, `task/exec.rs`,
-`signal/mod.rs`
+**Location**: `task/ptrace.rs`
 
-Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
-clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
-PTRACE_EVENT_FORK..PTRACE_EVENT_EXIT).
+PTRACE_PEEKUSER/POKEUSER, PTRACE_GETFPREGS/SETFPREGS and
+PTRACE_GETREGSET/SETREGSET are EINVAL (Linux arch_ptrace: gdb reads
+debug registers and FP state through them).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 
@@ -1038,7 +1036,7 @@ or discards the range).
 Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
-- **Syscalls that do not deliver** (H/C): inotify queues only
+- **Syscalls that do not deliver** (H): inotify queues only
   IN_DELETE_SELF, IN_UNMOUNT, IN_IGNORED and IN_Q_OVERFLOW, fanotify
   nothing (the other events have no fsnotify hooks in the VFS
   operations); rename has no
@@ -1053,15 +1051,6 @@ Designs that grew one commit at a time. Tag = roadmap phase
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
-- **Process-wide state per thread** (C): the group and session `Pid`
-  references (`Task.pgrp`/`session`) held by every thread, not
-  once per process (Linux signal->pids); one global CHILD_EXIT_WQ wakes every waiting parent on every
-  exit.
-- **`task/percpu.rs` is the largest file** (before C): scheduler core,
-  do_clone, exit, wait, credential setters, several sleep APIs. Split
-  like Linux (sched/core, fork, exit, cred). Other giant functions:
-  copy_process, sys_prctl, sys_semctl, do_mmap, exec_file.
-- **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
   onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and
@@ -1168,10 +1157,16 @@ Tag = roadmap phase (doc/ROADMAP.md).
     taken minutes apart in time and absorbs host contention; interleave
     the low and high batches, or compare more tries.
 
-15. **AIO_VFAT_DIO_CACHE flake on Linux** (`check-linux`, once):
-    `AIO_VFAT_DIO_CACHE:FAIL io_getevents got -4`: io_getevents returned
-    EINTR on the reference Linux; a rerun passed. Find what signal
-    interrupts the wait, or retry the wait on EINTR as Linux allows.
+16. **MEM_SLAB_TIME_WAIT near its bound** (hk x86): 2000 TIME_WAIT
+    entries grow Slab by 1800-2092 kB against a 2000 kB bound
+    (`user/boot_tester/mm/memcore.rs` `slab_time_wait`), failing about
+    one x86 boot in three; arm64 measures about 1570 kB. The test's
+    comment puts an entry at about 600 bytes, and `TimeWait` plus its
+    ehash `Eh` are 392 + 104 bytes (host build, before Arc headers and
+    slab rounding), yet the growth stays near 900 bytes an entry after
+    3 s of settling, so it is not deferred frees. Find what else each
+    entry allocates (`net/tcp/timewait.rs` `TimeWait::new`, its timer,
+    bhash owner and ehash entries) before touching the bound.
 
 ## DRM dumb buffers are the boot framebuffer only
 

@@ -16,7 +16,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
 use super::Task;
-use super::percpu::{GlobalTaskTable, current, task_sched_runtime};
+use super::percpu::{current, task_sched_runtime};
+use super::tasklist::GlobalTaskTable;
 use crate::signal::SignalStruct;
 use crate::sync::{IrqSpinlock, Sole};
 use crate::task::Pid;

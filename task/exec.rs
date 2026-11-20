@@ -11,13 +11,17 @@ use alloc::vec::Vec;
 
 use crate::arch::{FrameAlloc, PageFlags, PageTable, phys_to_virt};
 
-use super::percpu;
+use super::percpu::{self, current};
+use super::tasklist::{TASKLIST, TaskRef, task_ref};
+use crate::arch::{CurrentArch, UserModeOps};
 use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
+use crate::task::{Task, TaskState};
 use crate::uaccess::UserPtr;
 use crate::util::elf::ElfExecutable;
 use crate::util::error::{KernelError, KernelResult};
 use core::convert::Infallible;
+use core::sync::atomic::Ordering;
 
 pub use super::argstr::ArgStrings;
 
@@ -966,22 +970,23 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
 /// running user code end at their next syscall or fault (P7: IRQ
 /// return).
 fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
-    use crate::sync::waitqueue::WaitEntry;
-    use crate::task::percpu::{SleepState, schedule};
+    use crate::task::percpu::{SleepState, schedule, set_current_state};
 
     let Some(sig) = crate::signal::get_task_signal_struct(me) else {
         return Ok(());
     };
-    if percpu::exec_waits(me) {
+    if exec_waits(me) {
         if !sig.start_exec(me) {
             return Err(KernelError::WouldBlock);
         }
         crate::signal::zap_group_others(me);
-        let wq = &crate::task::proc::CHILD_EXIT_WQ;
-        let w = core::pin::pin!(WaitEntry::new());
+        // Woken by each release of one of its threads and by its
+        // leader's exit (Linux de_thread: TASK_KILLABLE until
+        // notify_count drops, wake_up_process(sig->group_exec_task)
+        // from __exit_signal and exit_notify: `exit::wake_exec`)
         let r = loop {
-            wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
-            if !percpu::exec_waits(me) {
+            set_current_state(SleepState::Killable);
+            if !exec_waits(me) {
                 break Ok(());
             }
             if crate::signal::fatal_signal_pending() {
@@ -989,18 +994,12 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
             }
             schedule();
         };
-        wq.finish_wait(w.as_ref());
+        set_current_state(SleepState::Running);
         sig.end_exec(me);
         r?;
     }
-    // Released after TASKLIST: the old leader and exited threads; a
-    // tracer waiting for the old leader rechecks (Linux de_thread:
-    // __wake_up_parent before its silent release)
-    let gone = percpu::take_leadership(me);
-    if !gone.is_empty() {
-        drop(gone);
-        crate::task::proc::CHILD_EXIT_WQ.wake_all();
-    }
+    // Released after TASKLIST: the old leader and exited threads
+    drop(take_leadership(me));
     Ok(())
 }
 
@@ -1030,9 +1029,18 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     path: Vec<u8>,
     argv: ArgStrings,
     envp: ArgStrings,
+    syscall_nr: u64,
     frame_alloc: &mut FA,
 ) -> KernelResult<Infallible> {
-    exec_file(path, kernel_open_exec, false, argv, envp, frame_alloc)
+    exec_file(
+        path,
+        kernel_open_exec,
+        false,
+        argv,
+        envp,
+        syscall_nr,
+        frame_alloc,
+    )
 }
 
 /// do_execve with the file opened by `open` from the name (Linux
@@ -1044,6 +1052,7 @@ fn exec_file<FA, F>(
     path_inaccessible: bool,
     argv: ArgStrings,
     envp: ArgStrings,
+    syscall_nr: u64,
     frame_alloc: &mut FA,
 ) -> KernelResult<Infallible>
 where
@@ -1199,6 +1208,10 @@ where
     // point_of_no_return before de_thread): from here a failure kills
     // the process instead of returning to the old image
 
+    // A tracer's report of the exec, due on the new image's first
+    // return to user mode, names the thread as it was (Linux
+    // exec_binprm: old_vpid before de_thread)
+    let exec_event = crate::task::ptrace::exec_event_begin();
     // The other threads end before the new image starts (Linux
     // begin_new_exec -> de_thread)
     if let Err(e) = de_thread(&percpu::current()) {
@@ -1246,7 +1259,7 @@ where
 
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked
-    percpu::signal_vfork_done();
+    crate::task::fork::signal_vfork_done();
 
     // Initialize brk for the new process
     // Calculate page-aligned start_brk (end of loaded segments, rounded up)
@@ -1291,7 +1304,8 @@ where
     drop(path);
 
     // Switch to the new address space and jump to user mode
-    percpu::exec_replace_image(mm, entry_point, user_sp, ident, guard);
+    crate::task::ptrace::exec_event_arm(exec_event);
+    exec_replace_image(mm, entry_point, user_sp, ident, guard, syscall_nr);
 }
 
 /// sys_execve - execute a program
@@ -1311,7 +1325,8 @@ pub fn sys_execve(
     let path = crate::fs::namei::getname(pathname, false)?;
     let (argv, envp) = copy_args(&path, argv, envp)?;
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    match do_execve(path, argv, envp, &mut frame_alloc)? {}
+    let nr = percpu::current_pt_regs().syscall_nr();
+    match do_execve(path, argv, envp, nr, &mut frame_alloc)? {}
 }
 
 /// sys_execveat - execute a program relative to a directory file descriptor
@@ -1349,7 +1364,8 @@ pub fn sys_execveat(
             != 0;
     let open = |_: &[u8]| exec_lookup(dirfd, &path, flags).and_then(crate::fs::open_exec);
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    match exec_file(name, open, inaccessible, argv, envp, &mut frame_alloc)? {}
+    let nr = percpu::current_pt_regs().syscall_nr();
+    match exec_file(name, open, inaccessible, argv, envp, nr, &mut frame_alloc)? {}
 }
 
 /// bprm->filename for execveat: the path itself when absolute or from
@@ -1465,5 +1481,213 @@ mod tests {
     fn gap_span_above_top() {
         let mut s = [(2 * P, 3 * P), (10 * P, 12 * P)];
         assert_eq!(highest_gap(&mut s, 8 * P, 0), Some(7 * P));
+    }
+}
+
+/// A thread of group `tgid` other than `tid` that an exec by `tid`
+/// still waits for (Linux de_thread: notify_count, dropped at each
+/// thread's release_task, then the leader's exit_state): any other
+/// thread still listed, a traced zombie until its tracer releases it,
+/// but the leader once it is a zombie
+pub fn exec_waits(me: &Task) -> bool {
+    TASKLIST.read().threads(me.pid).any(|u| {
+        !core::ptr::eq(u.task, me) && !(u.leader && matches!(u.state, TaskState::Zombie(_)))
+    })
+}
+
+/// After de_thread: `caller` is the only thread of its group left
+/// running and becomes its leader, taking the old leader's place (Linux de_thread:
+/// its parent, exit signal and start time); the exited threads are
+/// removed from the table and returned, to be released by the caller
+/// after TASKLIST
+pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
+    let (tgid, tid) = (caller.pid, caller.tid());
+    // Room made before the write lock (nothing allocates under
+    // TASKLIST): each thread of the group may be a removed zombie;
+    // again if the group grew
+    let mut room = TASKLIST.read().threads(tgid).count();
+    let (mut zombies, mut gone, mut table) = loop {
+        let zombies: Vec<TaskRef> = Vec::with_capacity(room);
+        let gone: Vec<TaskRef> = Vec::with_capacity(room);
+        let table = TASKLIST.write();
+        let n = table.threads(tgid).count();
+        if n <= room {
+            break (zombies, gone, table);
+        }
+        drop(table);
+        room = n;
+    };
+    let Some(l) = table.get(tgid).filter(|l| l.leader) else {
+        drop(table);
+        return gone;
+    };
+    let ltid = l.task.tid();
+    if ltid == tid {
+        drop(table);
+        return gone;
+    }
+    let (start, ucounts) = (l.task.start_time(), l.ucounts());
+    for t in table.threads(tgid) {
+        if t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)) {
+            zombies.push(task_ref(t.task));
+        }
+    }
+    // exchange_tids first (Linux de_thread: the caller takes the
+    // leader's tid and pid, the old leader its own, then release_task of
+    // the old leader), while both are listed: the leader's pid moves
+    // straight from one task to the other, so an RCU reader of it always
+    // finds one of them
+    let me = table.view(caller).map(|v| task_ref(v.task));
+    let old = zombies.iter().find(|t| t.tid() == ltid).cloned();
+    if let (Some(me), Some(l)) = (&me, &old) {
+        // Each takes the other's struct pid (Linux exchange_tids:
+        // rcu_assign_pointer of thread_pid), the replaced references
+        // dropped a grace period later
+        let (a, b) = (
+            me.thread_pid.get_protected(&table),
+            l.thread_pid.get_protected(&table),
+        );
+        me.thread_pid.replace(b.clone(), &mut table).defer_put();
+        l.thread_pid.replace(a.clone(), &mut table).defer_put();
+        let pids = (b, a);
+        // The pid hash names each by its new number (hlist_replace_rcu)
+        if let Some(p) = &pids.0 {
+            p.set_task(Some(me), &mut table);
+        }
+        if let Some(p) = &pids.1 {
+            p.set_task(Some(l), &mut table);
+        }
+        // Its real parent is the old leader's already: threads share it
+        // (fork copies it, `adopt` moves them all)
+        debug_assert!(core::ptr::eq(me.parent_ptr(), l.parent_ptr()));
+        l.set_tid(tid);
+        me.set_tid(ltid);
+        // The old leader's RLIMIT_NPROC charge goes with it; the caller
+        // keeps its own as the process's
+        ucounts.dec(crate::task::Ucount::Nproc, 1);
+    }
+    // Their numbers go back only once the caller holds the leader's
+    // pid and heads its group and session (Linux de_thread:
+    // exchange_tids and transfer_pid first, free_pid when no task uses
+    // a pid in any role): the leader's pid may be the group's or the
+    // session's, which a removed thread still names
+    let removed = gone.len();
+    // A tracer or parent waiting for the old leader rechecks (Linux
+    // de_thread: __wake_up_parent(leader, leader->parent) under
+    // tasklist_lock, before its silent release)
+    if let Some(l) = &old
+        && let Some(v) = table.view(l)
+        && let Some(p) = v.tracer().or_else(|| v.real_parent())
+    {
+        crate::signal::notify::wake_up_parent(p);
+    }
+    for z in zombies.drain(..) {
+        table.unhash(&z, false);
+        gone.push(z);
+    }
+    let Some(me) = me else {
+        for t in &gone[removed..] {
+            table.release_pids(t);
+            table.detach_thread_pid(t);
+        }
+        drop(table);
+        return gone;
+    };
+    if old.is_none() {
+        me.set_tid(ltid);
+    }
+    // The new leader takes the old one's place among its parent's
+    // children (tracer and parent links are task references: nothing
+    // else names the old tid) and leads the group; the zombies left
+    // its thread list as they were unhashed (Linux release_task)
+    table.link_child(&me);
+    if let Some(mut m) = table.get_mut(ltid) {
+        m.leader = true;
+        // Linux de_thread: the new leader's exit signal is SIGCHLD
+        m.exit_signal = crate::signal::ExitSignal::SIGCHLD;
+        m.task.start_time.store(start, Ordering::Relaxed);
+    }
+    // ... and its place on the group's and session's lists (Linux
+    // de_thread: transfer_pid PIDTYPE_PGID, PIDTYPE_SID)
+    table.attach_pids(&me);
+    // Then the removed threads' numbers no task uses go back: the
+    // caller's old one, now the old leader's, and exited threads' own
+    for t in &gone[removed..] {
+        table.release_pids(t);
+        table.detach_thread_pid(t);
+    }
+    drop(table);
+    gone
+}
+
+/// Replace current task's address space and jump to new entry point
+///
+/// This is used by execve to replace the current process image (Linux
+/// exec_mmap): the task switches to `mm` first, then drops its user
+/// reference on the old address space. That tears it down only if
+/// nothing else uses it -- a vfork parent or other CLONE_VM threads keep
+/// it alive. The function never returns.
+///
+/// # Arguments
+/// * `mm` - The new address space (its top-level table is loaded)
+/// * `entry_point` - The entry point address in the new program
+/// * `user_sp` - The initial user stack pointer
+/// * `syscall_nr` - The exec syscall's number, kept in the new frame
+///   (Linux start_thread), u64::MAX for an exec from the kernel
+pub fn exec_replace_image(
+    mm: crate::mm::MmRef,
+    entry_point: u64,
+    user_sp: u64,
+    ident: crate::task::exec::ExecIdentity,
+    guard: crate::signal::CredGuard,
+    syscall_nr: u64,
+) -> ! {
+    let me = current();
+    let new = mm.arc().clone();
+
+    // The new mm, name and dumpability together (Linux exec_mmap, then
+    // __set_task_comm and set_dumpable), under cred_guard_mutex and
+    // exec_update_lock
+    let old = guard.exec_update(|| {
+        let mut table = TASKLIST.write();
+        let task = table.view_mut(&me);
+        let mut task = task.expect("exec: current task not in the task table");
+        task.pgd = new.pgd();
+        new.set_dumpable(ident.dumpable);
+        // A new execution domain (Linux de_thread): SIGCHLD; a secure
+        // exec is not signalled at its parent's death (begin_new_exec)
+        task.exit_signal = crate::signal::ExitSignal::SIGCHLD;
+        if ident.secure {
+            task.pdeath_signal = None;
+        }
+        // The mm and name change as one under task_lock (Linux
+        // exec_mmap, __set_task_comm): a reader sees both or neither
+        let mut a = task.task.task_lock();
+        a.set_comm(ident.name);
+        a.set_mm(Some(mm))
+    });
+
+    // The new image starts with no user GS base (Linux start_thread:
+    // load_gs_index(0), gsbase 0)
+    current().gsbase.store(0, Ordering::Relaxed);
+    crate::arch::write_user_gsbase(0);
+
+    // Leave the old tables before releasing them: their frames may be
+    // reused at once by another CPU
+    crate::mm::tlb::switch_mm(Some(&new));
+    drop(new);
+    drop(old);
+    drop(guard);
+
+    // Get kernel stack for syscall/interrupt return
+    let kstack_top = {
+        let table = TASKLIST.read();
+        table.view(&me).map_or(0, |t| t.task.kstack_top)
+    };
+
+    // Jump to user mode at the new entry point
+    // This function never returns
+    unsafe {
+        CurrentArch::jump_to_user(entry_point, user_sp, kstack_top, syscall_nr);
     }
 }
