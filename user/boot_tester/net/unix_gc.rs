@@ -158,9 +158,10 @@ fn send_fd(t: &mut T, v: &Variant, fd: &[i32; 32], inflight: usize, receiver: us
 }
 
 /// One graph of scm_rights.c: `n` units, the sends, all closed, then
-/// every socket freed
-fn graph(t: &mut T, v: &Variant, n: usize, sends: &[(usize, usize)]) {
-    t.eq(b"none before", settle(0), 0);
+/// every socket freed (back to the count before; unless `host_bug`
+/// on the reference Linux, which then keeps them)
+fn graph(t: &mut T, v: &Variant, n: usize, sends: &[(usize, usize)], host_bug: bool) {
+    let before = count();
     let mut fd = [-1i32; 32];
     create(v, n, &mut fd);
     for &(a, b) in sends {
@@ -169,19 +170,23 @@ fn graph(t: &mut T, v: &Variant, n: usize, sends: &[(usize, usize)]) {
     for &f in &fd[..2 * n] {
         close(f);
     }
-    t.eq(b"all freed", settle(0), 0);
+    if host_bug && host_mode() {
+        return;
+    }
+    t.eq(b"all freed", settle(before), before);
 }
 
 fn graphs(v: &Variant) {
     let mut t = T::new(v.name);
     // self_ref
-    graph(&mut t, v, 2, &[(0, 0), (1, 1)]);
+    graph(&mut t, v, 2, &[(0, 0), (1, 1)], false);
     // triangle
     graph(
         &mut t,
         v,
         6,
         &[(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)],
+        false,
     );
     // cross_edge
     let cross = [(0, 1), (1, 2), (2, 0), (1, 3), (3, 2)];
@@ -190,15 +195,18 @@ fn graphs(v: &Variant) {
         s[i] = (a, b);
         s[i + 5] = (a + 4, b + 4);
     }
-    graph(&mut t, v, 8, &s);
+    graph(&mut t, v, 8, &s, false);
     // backtrack_from_scc
     let back = [(0, 1), (0, 4), (1, 2), (2, 3), (3, 1)];
     for (i, &(a, b)) in back.iter().enumerate() {
         s[i] = (a, b);
         s[i + 5] = (a + 5, b + 5);
     }
-    graph(&mut t, v, 10, &s);
-    // mixed_lowpoint
+    graph(&mut t, v, 10, &s, false);
+    // mixed_lowpoint: two back edges in one component. The reference
+    // Linux (Ubuntu 6.8.0-149 backports the graph collector,
+    // 4090fa373f0e) lacks 4a4263dfeaba ("af_unix: Unify scc_index when
+    // finalising SCC in __unix_walk_scc()"), so it keeps these sockets
     graph(
         &mut t,
         v,
@@ -213,6 +221,7 @@ fn graphs(v: &Variant) {
             (5, 4),
             (4, 3),
         ],
+        true,
     );
     t.done();
 }
@@ -222,7 +231,7 @@ fn graphs(v: &Variant) {
 /// through the copy; once that is closed too, both go
 fn test_peek() {
     let mut t = T::new(b"UNIX_GC_PEEK");
-    t.eq(b"none before", settle(0), 0);
+    let before = count();
     let (a, b) = pair(SOCK_STREAM);
     let p = a.to_ne_bytes();
     t.eq(
@@ -238,12 +247,12 @@ fn test_peek() {
     close(a);
     close(b);
     // A run of the collector (b's release) must leave a's socket
-    t.eq(b"kept", settle(1), 1);
+    t.eq(b"kept", settle(before + 1), before + 1);
     let (r, _, clen) = recv_msg(pk, &mut buf, &mut ctl, MSG_DONTWAIT);
     let (rd, _) = got_fds(&ctl, clen);
     t.ok(b"read through copy", r == 1 && rd >= 0, r);
     close(pk);
     close(rd);
-    t.eq(b"all freed", settle(0), 0);
+    t.eq(b"all freed", settle(before), before);
     t.done();
 }
