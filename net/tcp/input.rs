@@ -116,8 +116,10 @@ impl TcpCb {
             self.dack.at = Some(now + super::ack::DELACK_MAX);
             return;
         }
+        // Linux: the SYN-ACK's data is dropped (only Fast Open takes it,
+        // tcp_rcv_fastopen_synack); the ACK covers the SYN alone
+        drop(skb);
         self.ack_now = true;
-        self.rcv_text(s, skb, now, out);
         self.output(now, out);
     }
 
@@ -646,7 +648,7 @@ impl TcpCb {
     /// RST accepted (Linux tcp_reset): the error a user sees
     fn on_reset(&mut self, out: &mut Out) {
         let err = match self.state {
-            TcpState::SynReceived => KernelError::ConnectionRefused,
+            TcpState::SynSent => KernelError::ConnectionRefused,
             TcpState::CloseWait => KernelError::BrokenPipe,
             _ => KernelError::ConnectionReset,
         };

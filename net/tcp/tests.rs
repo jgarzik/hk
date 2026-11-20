@@ -2412,6 +2412,62 @@ fn fastopen_child() {
     assert!(b.next_timer().is_some());
 }
 
+/// A reset in SYN_RECEIVED (a simultaneous open) is ECONNRESET: Linux
+/// tcp_reset gives ECONNREFUSED only in SYN_SENT
+#[test]
+fn reset_in_syn_received_is_connreset() {
+    let mut a = TcpCb::new(cfg(), Default::default());
+    let mut out = Out::default();
+    a.connect(open(1000, 1460), 0, &mut out);
+    let syn = SegIn {
+        seq: 7000,
+        flags: flags::SYN,
+        wnd: 1000,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    a.feed(&syn, 0, &mut out);
+    assert_eq!(a.state, TcpState::SynReceived);
+    let rst = SegIn {
+        seq: 7001,
+        flags: flags::RST,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    a.feed(&rst, 0, &mut out);
+    assert_eq!(a.state, TcpState::Closed);
+    assert_eq!(out.err, Some(KernelError::ConnectionReset));
+}
+
+/// Data on a SYN-ACK is dropped without Fast Open (Linux
+/// tcp_rcv_synsent_state_process: the ACK covers the SYN alone, the
+/// peer resends the data)
+#[test]
+fn synack_data_dropped_without_fastopen() {
+    use crate::net::mib::*;
+    let mut a = TcpCb::new(cfg(), Default::default());
+    let mib = NetMib::new().unwrap();
+    a.mib = Some(mib.clone());
+    let mut out = Out::default();
+    a.connect(open(1000, 1460), 0, &mut out);
+    let synack = SegIn {
+        seq: 7000,
+        ack: 1001,
+        flags: flags::SYN | flags::ACK,
+        wnd: 1000,
+        data: b"early",
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    a.feed(&synack, 0, &mut out);
+    assert_eq!(a.state, TcpState::Established);
+    assert_eq!(a.rcvq_len(), 0);
+    let w = wire(&out);
+    assert!(w[0].has(flags::ACK) && w[0].ack == 7001);
+    // Not a zero-window drop: never looked at
+    assert_eq!(mib.net.fold(LINUX_MIB_TCPZEROWINDOWDROP), 0);
+}
+
 // ============================================================================
 // Review findings (reproduce first)
 // ============================================================================
