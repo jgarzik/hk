@@ -2426,8 +2426,11 @@ fn send_some(
     if s.sk.has_err() {
         return Err(s.sk.take_err().unwrap_or(KernelError::BrokenPipe));
     }
+    // A passive Fast Open child sends in SYN_RECEIVED too (Linux
+    // tcp_passive_fastopen)
+    let fastopen = g.cb.state == TcpState::SynReceived && g.cb.tfo;
     if s.sk.shutdown() & SEND_SHUTDOWN != 0
-        || !matches!(g.cb.state, TcpState::Established | TcpState::CloseWait)
+        || !(fastopen || matches!(g.cb.state, TcpState::Established | TcpState::CloseWait))
     {
         return Err(KernelError::BrokenPipe);
     }
