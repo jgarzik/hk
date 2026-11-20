@@ -228,6 +228,11 @@ fn key_of(family: u8, dst: &[u8], ext: &ExtAck, msg: &'static str) -> Result<Key
     Ok(k)
 }
 
+/// The Ethernet address at the start of NDA_LLADDR `l`, if long enough
+fn lladdr_of(l: &[u8]) -> Option<[u8; ETH_ALEN]> {
+    l.get(..ETH_ALEN)?.try_into().ok()
+}
+
 /// The device of ifindex `i` (None for 0); ENODEV if unknown
 fn nd_dev(net: &NetNamespace, i: u32) -> Result<Option<Arc<NetDevice>>, KernelError> {
     match i {
@@ -259,7 +264,6 @@ pub fn newneigh(sk: &NlSock, nlflags: u16, p: &[u8], ext: &ExtAck) -> Result<(),
         return Err(KernelError::InvalidArgument);
     }
     let key = key_of(r.family, dst, ext, "Invalid network address")?;
-    let ll = lladdr.map(|l| [l[0], l[1], l[2], l[3], l[4], l[5]]);
     let state = r.state as u8; // ndm_state is a u16 holding a u8 state
     if ndm_flags & NTF_PROXY != 0 {
         if ndm_flags & (NTF_MANAGED | NTF_EXT_VALIDATED) != 0 {
@@ -274,6 +278,12 @@ pub fn newneigh(sk: &NlSock, nlflags: u16, p: &[u8], ext: &ExtAck) -> Result<(),
     let Some(dev) = dev else {
         ext.msg("Device not specified");
         return Err(KernelError::InvalidArgument);
+    };
+    // Its length was checked against the device above; read only now,
+    // never for a proxy entry (Linux neigh_add)
+    let ll = match lladdr {
+        None => None,
+        Some(l) => Some(lladdr_of(l).ok_or(KernelError::InvalidArgument)?),
     };
     let tbl = arp_tbl();
     let mut flags = upd::ADMIN | upd::OVERRIDE;
@@ -522,4 +532,17 @@ pub fn dump_pneighs<'a>(
         .phash
         .iter(g, net)
         .filter(move |n| !f.filtered(n.dev.as_deref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A short NDA_LLADDR is refused, never indexed past its end
+    #[test]
+    fn lladdr_short() {
+        assert_eq!(lladdr_of(&[1]), None);
+        assert_eq!(lladdr_of(&[1, 2, 3, 4, 5]), None);
+        assert_eq!(lladdr_of(&[1, 2, 3, 4, 5, 6, 7]), Some([1, 2, 3, 4, 5, 6]));
+    }
 }

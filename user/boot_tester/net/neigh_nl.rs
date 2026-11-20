@@ -40,6 +40,7 @@ const NUD_FAILED: u16 = 0x20;
 const NUD_PERMANENT: u16 = 0x80;
 const RTPROT_STATIC: u8 = 4;
 const ENOENT: i64 = -2;
+const EINVAL: i64 = -22;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== Neighbour netlink Tests ===");
@@ -155,6 +156,13 @@ fn add(
     if proto != 0 {
         r.attr(NDA_PROTOCOL, &[proto]);
     }
+    i64::from(nl.ack(&mut r))
+}
+
+/// RTM_NEWNEIGH of `ip` with no device and a 1-byte NDA_LLADDR
+fn short_ll(nl: &mut Nl, ntf: u8, ip: [u8; 4]) -> i64 {
+    let mut r = Req::new(RTM_NEWNEIGH, NLM_F_CREATE, &ndmsg(0, NUD_PERMANENT, ntf));
+    r.attr(NDA_DST, &ip).attr(NDA_LLADDR, &[1]);
     i64::from(nl.ack(&mut r))
 }
 
@@ -307,6 +315,20 @@ fn proxy(name: &'static [u8]) -> bool {
     let px = (NUD_PERMANENT, NTF_PROXY);
     let (a, b) = ([10, 3, 3, 3], [10, 3, 3, 4]);
     t.eq(b"lo up", i64::from(set_link_up(&mut nl, 1, true)), 0);
+    // A short NDA_LLADDR: a proxy entry never reads it; without a
+    // device there is nothing to check it against (Device not
+    // specified)
+    t.eq(
+        b"short ll proxy",
+        short_ll(&mut nl, NTF_PROXY, [10, 3, 3, 8]),
+        0,
+    );
+    t.eq(
+        b"short ll nodev",
+        short_ll(&mut nl, 0, [10, 3, 3, 8]),
+        EINVAL,
+    );
+    t.eq(b"del short", del(&mut nl, 0, NTF_PROXY, [10, 3, 3, 8]), 0);
     t.eq(b"add lo", add(&mut nl, 1, 0, px, a, None, RTPROT_STATIC), 0);
     t.eq(b"add any", add(&mut nl, 0, 0, px, b, None, 0), 0);
     // Again: an update, not EEXIST
