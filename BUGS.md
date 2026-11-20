@@ -1157,11 +1157,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
     taken minutes apart in time and absorbs host contention; interleave
     the low and high batches, or compare more tries.
 
-15. **AIO_VFAT_DIO_CACHE flake on Linux** (`check-linux`, once):
-    `AIO_VFAT_DIO_CACHE:FAIL io_getevents got -4`: io_getevents returned
-    EINTR on the reference Linux; a rerun passed. Find what signal
-    interrupts the wait, or retry the wait on EINTR as Linux allows.
-
 16. **MEM_SLAB_TIME_WAIT near its bound** (hk x86): 2000 TIME_WAIT
     entries grow Slab by 1800-2092 kB against a 2000 kB bound
     (`user/boot_tester/mm/memcore.rs` `slab_time_wait`), failing about
