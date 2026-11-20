@@ -395,11 +395,18 @@ impl TcpCb {
         true
     }
 
-    /// RFC 5961 challenge ACK, rate limited per connection (Linux
-    /// tcp_send_challenge_ack)
+    /// RFC 5961 challenge ACK, rate limited per connection, then by
+    /// the namespace's per-second budget (Linux tcp_send_challenge_ack)
     fn challenge_ack(&mut self, out: &mut Out) {
         if self.oow_recent() {
             self.net_stat(LINUX_MIB_TCPACKSKIPPEDCHALLENGE);
+            return;
+        }
+        if self
+            .net
+            .as_ref()
+            .is_some_and(|n| !n.challenge_ok(self.clock))
+        {
             return;
         }
         self.net_stat(LINUX_MIB_TCPCHALLENGEACK);

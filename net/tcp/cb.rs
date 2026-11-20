@@ -999,6 +999,8 @@ pub struct TcpCb {
     /// The namespace's MIBs, counted in as Linux counts in
     /// sock_net(sk)->mib (None: not counted, unit tests)
     pub mib: Option<Arc<NetMib>>,
+    /// The namespace's shared TCP state (None: unit tests)
+    pub net: Option<Arc<super::netns::TcpNet>>,
 }
 
 /// Counters for TCP_INFO; the u32 ones wrap, as Linux tcp_info's
@@ -1124,6 +1126,7 @@ impl TcpCb {
             stats: Default::default(),
             held: Default::default(),
             mib: Default::default(),
+            net: None,
             live,
         }
     }

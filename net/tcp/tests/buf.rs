@@ -341,3 +341,40 @@ fn buffer_arithmetic_wraps() {
     c.set_window_clamp(-1).unwrap();
     c.init_buffer_space();
 }
+
+/// Challenge ACKs of connections sharing `net` at `now`, one in-window
+/// SYN each (RFC 5961 4.2): how many went out
+fn challenges(net: &alloc::sync::Arc<crate::net::tcp::netns::TcpNet>, n: usize, now: u64) -> usize {
+    let mut sent = 0;
+    for _ in 0..n {
+        let mut p = Pair::new(1460);
+        p.b.net = Some(net.clone());
+        let syn = SegIn {
+            seq: p.b.rcv_nxt,
+            flags: flags::SYN,
+            ..Default::default()
+        };
+        let mut out = Out::default();
+        p.b.feed(&syn, now, &mut out);
+        sent += wire(&out).len();
+    }
+    sent
+}
+
+/// The namespace's challenge-ACK budget (Linux tcp_send_challenge_ack,
+/// tcp_challenge_ack_limit): by default (INT_MAX) none; with a limit,
+/// each second draws a budget from [limit/2, limit*3/2) shared by every
+/// connection
+#[test]
+fn challenge_ack_budget() {
+    let net = alloc::sync::Arc::new(crate::net::tcp::netns::TcpNet::default());
+    assert_eq!(net.challenge_limit(), i32::MAX);
+    assert_eq!(challenges(&net, 8, 5000), 8);
+    net.set_challenge_limit(2).unwrap();
+    // A budget of 1 or 2 for second 6
+    let n = challenges(&net, 8, 6000);
+    assert!((1..=2).contains(&n), "{n}");
+    assert_eq!(challenges(&net, 8, 6500), 0);
+    // A new second, a new budget
+    assert!(challenges(&net, 8, 7000) >= 1);
+}

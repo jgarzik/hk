@@ -54,6 +54,7 @@ pub mod cubic;
 pub mod info;
 pub mod input;
 pub mod mem;
+pub mod netns;
 pub mod output;
 pub mod recovery;
 pub mod sack;
@@ -415,6 +416,7 @@ impl TcpSock {
         let live = try_arc(cb::Live::default())?;
         let mut cb = TcpCb::new(cfg(&sk.net), live.clone());
         cb.mib = Some(Arc::clone(&sk.net.mib));
+        cb.net = Some(Arc::clone(&sk.net.tcp_net));
         // Linux tcp_init_sock: tcp_assign_congestion_control
         cb.opts.ca = sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
         cb.assign_cc(cb.opts.ca);
@@ -1038,6 +1040,7 @@ impl TcpSock {
         }
         let mut cb = TcpCb::new(kc, Arc::clone(&c.live));
         cb.mib = Some(Arc::clone(&self.sk.net.mib));
+        cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
         cb.opts = opts;
         // Linux tcp_ca_openreq_child: the namespace's default unless the
         // listener chose one (icsk_ca_setsockopt)
@@ -1173,6 +1176,8 @@ impl TcpSock {
             c.syn_retries = self.syncnt(&g.cb.opts);
             let mut cb = TcpCb::new(c, Arc::clone(&self.live));
             cb.mib = Some(Arc::clone(&self.sk.net.mib));
+            cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
+            cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
             cb.opts = g.cb.opts;
             (cb.rcvbuf, cb.sndbuf, cb.userlocks) = (g.cb.rcvbuf, g.cb.sndbuf, g.cb.userlocks);
             g.cb = cb;

@@ -107,9 +107,8 @@ TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
 send side counts payload bytes against half of SO_SNDBUF (Linux:
 skb truesize, sk_wmem_queued, against all of it), the receive
 window's free space does not count the socket's backlog (Linux
-tcp_space subtracts sk_backlog.len), no per-netns
-RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
-limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
+tcp_space subtracts sk_backlog.len), and TCP_DEFER_ACCEPT /
+TCP_FASTOPEN are stored only.
 
 UDP has no hash4 (Linux udp_table.hash4: connected sockets by
 four-tuple, looked up before hash2), and its compute_score lacks the

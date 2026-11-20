@@ -117,6 +117,9 @@ pub struct NetNamespace {
     /// control blocks, which count without the namespace at hand
     pub mib: Arc<crate::net::mib::NetMib>,
 
+    /// TCP state its control blocks share (`tcp::netns`)
+    pub tcp_net: Arc<crate::net::tcp::netns::TcpNet>,
+
     /// Loopback device for this namespace
     loopback: RwLock<Option<Arc<NetDevice>>>,
 
@@ -247,6 +250,7 @@ impl NetNamespace {
                     | u64::from(crate::random::get_random_u32()),
             ],
             mib: crate::net::mib::NetMib::new()?,
+            tcp_net: try_arc(Default::default())?,
             loopback: RwLock::new(None),
             active: AtomicUsize::new(0),
             cleanup_next: AtomicPtr::new(null_mut()),

@@ -17,6 +17,8 @@
 //!   the initial namespace (ipv4_table); at 0 an orphan stuck in
 //!   FIN_WAIT_1 against a shut window is aborted at its next probe
 //!   (tcp_out_of_resources, TCPAbortOnMemory).
+//! - TCP_CHALLENGE_ACK_LIMIT: net.ipv4.tcp_challenge_ack_limit is
+//!   INT_MAX (no global budget, Linux 6.0 on) and per namespace.
 
 use hk_syscall::{sys_exit, sys_fork, sys_getsockopt};
 
@@ -37,6 +39,7 @@ pub fn run_tests() {
     test_autotune();
     test_sndbuf();
     test_max_orphans();
+    test_challenge_limit();
 }
 
 /// A connected pair over lo: (client, server, listener)
@@ -256,5 +259,32 @@ fn test_max_orphans() {
     t.ok(b"aborted", aborted, abort_on_memory() - before);
     close(s);
     close(l);
+    t.done();
+}
+
+const CHALLENGE: &[u8] = b"/proc/sys/net/ipv4/tcp_challenge_ack_limit\0";
+
+fn test_challenge_limit() {
+    let mut t = T::new(b"TCP_CHALLENGE_ACK_LIMIT");
+    t.eq(b"default", sysctl_ints(CHALLENGE)[0], 2147483647);
+    let child = sys_fork();
+    if child == 0 {
+        if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+            sys_exit(1);
+        }
+        if sysctl_ints(CHALLENGE)[0] != 2147483647 {
+            sys_exit(2);
+        }
+        if write_file(CHALLENGE, b"100\n") < 0 {
+            sys_exit(3);
+        }
+        sys_exit(if sysctl_ints(CHALLENGE)[0] == 100 {
+            0
+        } else {
+            4
+        });
+    }
+    t.eq(b"netns", wait_child(child) as i64, 0);
+    t.eq(b"init unchanged", sysctl_ints(CHALLENGE)[0], 2147483647);
     t.done();
 }
