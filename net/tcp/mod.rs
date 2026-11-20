@@ -1144,8 +1144,12 @@ impl TcpSock {
         if want_cookie {
             return self.cookie_synack(s, t, &opts, caps, now);
         }
-        let (tfo, foc) = self.try_fastopen(s, &t, &opts);
-        if tfo && self.fastopen_child(s, skb, t, opts, caps, foc, now) {
+        let (tfo, alt, foc) = self.try_fastopen(s, &t, &opts);
+        // The child's SYN-ACK carries the primary key's cookie only
+        // when a backup key matched; without a child the plain
+        // request's carries it whatever key matched
+        let child_foc = foc.filter(|_| alt);
+        if tfo && self.fastopen_child(s, skb, t, opts, caps, child_foc, now) {
             return;
         }
         self.child(s, t, opts, caps, now, isn, foc);
@@ -1157,8 +1161,10 @@ impl TcpSock {
     /// (TCPFastOpenCookieReqd); a valid cookie (or none needed,
     /// TFO_SERVER_COOKIE_NOT_REQD) makes a Fast Open child (true); an
     /// invalid one TCPFastOpenPassiveFail and the valid cookie. Returns
-    /// that and the cookie the SYN-ACK carries
-    fn try_fastopen(&self, s: &SegIn, t: &Tuple, opts: &cb::Opts) -> (bool, Option<cb::Foc>) {
+    /// that, whether a backup key matched (TCPFastOpenPassiveAltKey),
+    /// and the primary key's cookie (Linux valid_foc), which the
+    /// SYN-ACK carries unless a child made with the primary key answers
+    fn try_fastopen(&self, s: &SegIn, t: &Tuple, opts: &cb::Opts) -> (bool, bool, Option<cb::Foc>) {
         let net = &self.sk.net;
         if s.foc.is_some_and(|f| f.len == 0) {
             net.mib.net.inc(LINUX_MIB_TCPFASTOPENCOOKIEREQD);
@@ -1166,15 +1172,15 @@ impl TcpSock {
         let tfo = net.sysctl.tcp_fastopen.load(Ordering::Relaxed);
         let syn_data = s.data_len() != 0;
         if tfo & TFO_SERVER_ENABLE == 0 || !(syn_data || s.foc.is_some()) || !self.fastopen_room() {
-            return (false, None);
+            return (false, false, None);
         }
         // tcp_fastopen_no_cookie (hk has no RTAX_FASTOPEN_NO_COOKIE
         // route metric)
         if tfo & TFO_SERVER_COOKIE_NOT_REQD != 0 || opts.tfo_no_cookie {
-            return (true, None);
+            return (true, false, None);
         }
         let Some(f) = s.foc else {
-            return (false, None);
+            return (false, false, None);
         };
         // The listener's keys, else its namespace's (tcp_fastopen_get_ctx)
         let ctx = (*self.fastopen_ctx.lock()).or_else(|| net.tcp.fastopen_ctx());
@@ -1183,17 +1189,17 @@ impl TcpSock {
             ..fastopen::cookie(&c.key[0], t)
         });
         if f.len == 0 {
-            return (false, valid);
+            return (false, false, valid);
         }
         match ctx.map_or(0, |c| c.check(t, &f)) {
-            1 => (true, None),
+            1 => (true, false, valid),
             2 => {
                 net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEALTKEY);
-                (true, valid)
+                (true, true, valid)
             }
             _ => {
                 net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
-                (false, valid)
+                (false, false, valid)
             }
         }
     }
@@ -1668,7 +1674,6 @@ impl TcpSock {
             c.syn_retries = self.syncnt(&g.cb.opts);
             let mut cb = TcpCb::new(c, Arc::clone(&self.live));
             cb.mib = Some(Arc::clone(&self.sk.net.mib));
-            cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
             cb.net = Some(Arc::clone(&self.sk.net.tcp_net));
             cb.opts = g.cb.opts;
             (cb.rcvbuf, cb.sndbuf, cb.userlocks) = (g.cb.rcvbuf, g.cb.sndbuf, g.cb.userlocks);
