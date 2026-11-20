@@ -55,6 +55,14 @@ fn clock_ns(now: u64, last: u64) -> u64 {
     now.saturating_mul(1_000_000).max(last + 1000)
 }
 
+/// A minimum RTT with no sample yet (Linux tcp_init_sock's
+/// minmax_reset(.., ~0U))
+fn min_rtt_none() -> crate::util::win_minmax::Minmax {
+    let mut m = crate::util::win_minmax::Minmax::default();
+    m.reset(0, !0);
+    m
+}
+
 /// Linux tcp_skb_timestamp_us: when a sent skb last went out, us
 pub(super) fn skb_mstamp_us(skb: &SkBuff) -> u64 {
     skb.tstamp as u64 / 1000
@@ -214,6 +222,8 @@ pub struct Cfg {
     pub keepcnt: u32,
     /// tcp_frto: F-RTO (RFC 5682) after a timeout when nonzero
     pub frto: u8,
+    /// tcp_min_rtt_wlen: the minimum RTT's window, s
+    pub min_rtt_wlen: u32,
 }
 
 impl Default for Cfg {
@@ -237,6 +247,7 @@ impl Default for Cfg {
             keepintvl: 75_000,
             keepcnt: 9,
             frto: 2,
+            min_rtt_wlen: 300,
         }
     }
 }
@@ -913,6 +924,8 @@ pub struct TcpCb {
     /// The ACK being processed echoed this TSval (Linux
     /// rx_opt.saw_tstamp and rcv_tsecr)
     pub(super) rcv_tsecr: Option<u32>,
+    /// The windowed minimum RTT, us (Linux rtt_min)
+    pub(super) rtt_min: crate::util::win_minmax::Minmax,
     /// Delayed ACK state
     pub(super) dack: Dack,
     /// The fields /proc/net/tcp reads with no lock: timers, RTO and
@@ -954,8 +967,6 @@ pub struct Stats {
     pub bytes_retrans: u64,
     pub last_data_recv: u64,
     pub rto_count: u32,
-    /// Smallest RTT sample, us (Linux tcp_min_rtt)
-    pub min_rtt: Option<u64>,
 }
 
 impl TcpCb {
@@ -1047,6 +1058,7 @@ impl TcpCb {
             recv_sack_cache: [(0, 0); NUM_SACKS],
             is_sack_reneg: false,
             rcv_tsecr: None,
+            rtt_min: min_rtt_none(),
             dack: Default::default(),
             orphan: Default::default(),
             soft_err: Default::default(),

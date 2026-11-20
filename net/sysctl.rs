@@ -65,6 +65,8 @@ pub struct NetSysctl {
     pub tcp_keepalive_probes: AtomicU8,
     /// tcp_frto: F-RTO (RFC 5682) after a timeout when nonzero
     pub tcp_frto: AtomicU8,
+    /// tcp_min_rtt_wlen: the windowed minimum RTT's window, s
+    pub tcp_min_rtt_wlen: AtomicI32,
     /// Default congestion control (index into tcp::cong::ALGOS)
     pub tcp_ca: AtomicU8,
     pub somaxconn: AtomicI32,
@@ -109,6 +111,7 @@ impl Default for NetSysctl {
             tcp_keepalive_intvl: AtomicI32::new(75),
             tcp_keepalive_probes: AtomicU8::new(9),
             tcp_frto: AtomicU8::new(2),
+            tcp_min_rtt_wlen: AtomicI32::new(300),
             tcp_ca: AtomicU8::new(crate::net::tcp::cong::DEFAULT as u8),
             somaxconn: AtomicI32::new(4096),
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
@@ -593,6 +596,14 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_u8(n, |s| &s.tcp_frto),
         store: |n, v| set_u8(n, |s| &s.tcp_frto, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_min_rtt_wlen",
+        mode: 0o644,
+        global: false,
+        show: |n| get_i32(n, |s| &s.tcp_min_rtt_wlen),
+        store: |n, v| set_int(n, |s| &s.tcp_min_rtt_wlen, v, 0, 86400),
         text: None,
     },
     NetCtl {

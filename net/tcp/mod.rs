@@ -316,6 +316,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         keepintvl: secs(&s.tcp_keepalive_intvl),
         keepcnt: u32::from(s.tcp_keepalive_probes.load(Ordering::Relaxed)),
         frto: s.tcp_frto.load(Ordering::Relaxed),
+        min_rtt_wlen: s.tcp_min_rtt_wlen.load(Ordering::Relaxed).max(0) as u32,
     }
 }
 

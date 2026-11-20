@@ -1679,7 +1679,7 @@ fn timestamps_echo_and_rtt() {
     // SRTT 0 from the handshake, then a 100 ms sample: 100 / 8
     assert_eq!(p.a.rtt().0, 12);
     // The handshake's 0 us counts as one jiffy (us)
-    assert_eq!(p.a.stats.min_rtt, Some(1000));
+    assert_eq!(p.a.min_rtt(), 1000);
     // A retransmission is timed too (Karn would skip it)
     p.filter = drop_all;
     p.send_a(b"lost");
@@ -2802,7 +2802,7 @@ fn rack_reordering_timer_marks_loss() {
     use crate::net::mib::*;
     let (mut p, m) = sack_pair(1000);
     // A 100 ms path: reordering window min_rtt/4 = 25 ms
-    p.a.stats.min_rtt = Some(100_000);
+    p.a.rtt_min.reset(0, 100_000);
     p.a.srtt8 = 800;
     p.now = 1000;
     p.a.cong.set_cwnd(20);
@@ -2978,4 +2978,32 @@ fn syn_timeouts_enter_loss() {
     let a = syn_timeouts(0);
     assert_eq!(a.ca_state, CaState::Open);
     assert!(a.cong.in_initial_slowstart());
+}
+
+/// The minimum RTT is windowed (Linux tcp_update_rtt_min over
+/// tcp_min_rtt_wlen with lib/win_minmax.c); a suspected delayed ACK's
+/// longer RTT is skipped
+#[test]
+fn min_rtt_windowed() {
+    use super::recovery::flag;
+    let mut a = TcpCb::new(
+        Cfg {
+            min_rtt_wlen: 1,
+            ..cfg()
+        },
+        Default::default(),
+    );
+    assert_eq!(a.min_rtt(), u64::from(u32::MAX));
+    a.tick(0);
+    a.update_rtt_min(100_000, 0);
+    a.tick(500);
+    a.update_rtt_min(200_000, 0);
+    assert_eq!(a.min_rtt(), 100_000);
+    a.update_rtt_min(150_000, flag::ACK_MAYBE_DELAYED);
+    a.tick(1500);
+    a.update_rtt_min(300_000, 0);
+    // The 1 s window passed: the second choice, from its second quarter
+    assert_eq!(a.min_rtt(), 200_000);
+    a.update_rtt_min(0, 0);
+    assert_eq!(a.min_rtt(), 1000);
 }

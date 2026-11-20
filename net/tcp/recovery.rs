@@ -55,6 +55,7 @@ pub mod flag {
     pub const DSACKING_ACK: u32 = 0x800;
     pub const SET_XMIT_TIMER: u32 = 0x1000;
     pub const SACK_RENEGING: u32 = 0x2000;
+    pub const ACK_MAYBE_DELAYED: u32 = 0x10000;
     pub const DSACK_TLP: u32 = 0x20000;
     pub const ACKED: u32 = DATA_ACKED | SYN_ACKED;
     pub const NOT_DUP: u32 = DATA | WIN_UPDATE | ACKED;
@@ -1005,16 +1006,26 @@ impl TcpCb {
         ((self.min_rtt() >> 2) * u64::from(self.rack.reo_wnd_steps)).min(srtt_us)
     }
 
-    /// Linux tcp_min_rtt: the smallest RTT seen, us (~0U for none)
+    /// Linux tcp_min_rtt: the windowed minimum RTT, us (~0U for none)
     pub(super) fn min_rtt(&self) -> u64 {
-        self.stats.min_rtt.unwrap_or(u64::from(u32::MAX))
+        u64::from(self.rtt_min.get())
     }
 
-    /// Linux tcp_update_rtt_min (no windowed filter: the smallest ever),
-    /// `rtt_us` 0 counting as one jiffy
-    pub(super) fn update_rtt_min(&mut self, rtt_us: u64) {
-        let r = if rtt_us == 0 { 1000 } else { rtt_us };
-        self.stats.min_rtt = Some(self.stats.min_rtt.map_or(r, |m| m.min(r)));
+    /// Linux tcp_update_rtt_min: the RTT `rtt_us` into the windowed
+    /// minimum (tcp_min_rtt_wlen seconds; 0 counts as one jiffy), but
+    /// not a suspected delayed ACK's longer one
+    pub(super) fn update_rtt_min(&mut self, rtt_us: u64, flg: u32) {
+        if flg & flag::ACK_MAYBE_DELAYED != 0 && rtt_us > self.min_rtt() {
+            return;
+        }
+        let wlen = self.cfg.min_rtt_wlen.saturating_mul(1000);
+        let r = if rtt_us == 0 {
+            1000
+        } else {
+            rtt_us.min(u64::from(u32::MAX)) as u32
+        };
+        let now = self.jiffies32();
+        self.rtt_min.running_min(wlen, now, r);
     }
 
     /// Linux tcp_rack_detect_loss: a packet sent before the most

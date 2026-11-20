@@ -31,3 +31,4 @@ pub mod seg;
 pub mod siphash;
 pub mod smallvec;
 pub mod textbuf;
+pub mod win_minmax;

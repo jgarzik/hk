@@ -531,6 +531,7 @@ fn test_sysctls() {
         (b"/proc/sys/net/ipv4/tcp_keepalive_intvl\0", b"75\n"),
         (b"/proc/sys/net/ipv4/tcp_keepalive_probes\0", b"9\n"),
         (b"/proc/sys/net/ipv4/tcp_frto\0", b"2\n"),
+        (b"/proc/sys/net/ipv4/tcp_min_rtt_wlen\0", b"300\n"),
     ] {
         let n = read_file(path, &mut b);
         t.ok(

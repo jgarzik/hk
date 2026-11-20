@@ -132,7 +132,7 @@ impl TcpCb {
             self.rtt_sample(r);
             // Linux tcp_synack_rtt_meas -> tcp_ack_update_rtt: the
             // handshake's RTT is the first minimum
-            self.update_rtt_min(r * 1000);
+            self.update_rtt_min(r * 1000, flag::SYN_ACKED);
         } else if self.syn_rtx {
             self.set_rto_fallback();
         }
@@ -547,7 +547,7 @@ impl TcpCb {
             self.mem_settle();
             return true;
         }
-        flg |= self.clean_rtx_queue(prior_fack, &mut st);
+        flg |= self.clean_rtx_queue(prior_snd_una, prior_fack, &mut st);
         self.ack_update_rtt(s, flg, &mut st);
         self.ca_acked(&st);
         self.mem_settle();
@@ -623,7 +623,7 @@ impl TcpCb {
             st.ca_rtt_us = st.seq_rtt_us;
         }
         if st.seq_rtt_us >= 0 && st.ca_rtt_us >= 0 {
-            self.update_rtt_min(st.ca_rtt_us as u64);
+            self.update_rtt_min(st.ca_rtt_us as u64, flg);
         }
     }
 
@@ -648,11 +648,13 @@ impl TcpCb {
     /// retransmit queue, their tags and packets with them; an skb of
     /// several segments loses the acknowledged ones (tcp_tso_acked).
     /// Returns the ACK's FLAG_* bits.
-    fn clean_rtx_queue(&mut self, prior_fack: u32, st: &mut SackState) -> u32 {
+    fn clean_rtx_queue(&mut self, prior_snd_una: u32, prior_fack: u32, st: &mut SackState) -> u32 {
         let mut flg = 0;
         let mut reord = self.snd_max;
         let mut pkts_acked = 0;
         let (mut first_ackt, mut last_ackt) = (None, 0);
+        let prior_sacked = self.sacked_out;
+        let mut fully_acked = true;
         while let Some(f) = self.rtx.first() {
             let (t, tx) = (f.tcp(), skb_mstamp_us(f));
             let acked_pcount;
@@ -699,6 +701,7 @@ impl TcpCb {
             pkts_acked += acked_pcount;
             self.rate_skb_delivered(st, t.seq);
             flg |= flag::DATA_ACKED;
+            fully_acked = fully;
             if !fully {
                 break;
             }
@@ -729,6 +732,17 @@ impl TcpCb {
         {
             st.seq_rtt_us = delta(first);
             st.ca_rtt_us = delta(last_ackt);
+            // A lone runt packet over the round trip, nothing SACKed:
+            // conservatively a delayed ACK
+            if pkts_acked == 1
+                && fully_acked
+                && prior_sacked == 0
+                && self.snd_una.wrapping_sub(prior_snd_una) < self.live.mss.get()
+                && st.prior_delivered.map(|p| p.wrapping_add(1)) == Some(self.delivered)
+                && flg & (flag::CA_ALERT | flag::SYN_ACKED) == 0
+            {
+                flg |= flag::ACK_MAYBE_DELAYED;
+            }
         }
         let mut sack_rtt_us = -1;
         if let (Some(first), Some(last)) = (st.first_sackt, st.last_sackt) {
