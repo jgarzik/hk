@@ -235,13 +235,20 @@ impl TcpCb {
         self.xmit(now, Push::More, out);
     }
 
+    /// Data or a FIN not sent yet (Linux tcp_send_head)
+    fn send_head(&self) -> bool {
+        self.snd_nxt != self.write_seq.wrapping_add(u32::from(self.fin_queued))
+    }
+
     pub(super) fn xmit(&mut self, now: u64, push: Push, out: &mut Out) {
         self.tick(now);
+        // Linux runs tcp_write_xmit only with a send head
+        // (tcp_push_pending_frames)
+        let head = self.send_head();
         let mut sent = false;
-        let mut limited = false;
         let prior_packets = self.packets_out;
         while self.may_send() {
-            let Some(fin) = self.next_seg(now, push, &mut limited, out) else {
+            let Some(fin) = self.next_seg(now, push, out) else {
                 break;
             };
             sent = true;
@@ -261,9 +268,13 @@ impl TcpCb {
             if !push.one() {
                 self.schedule_loss_probe(now, false);
             }
-            self.cwnd_validate(limited);
         } else if self.state.synced() {
             self.ack_snd_check(now, out);
+        }
+        // Linux tcp_write_xmit: cwnd-limited when the flight fills it
+        let limited = self.in_flight() >= self.cong.snd_cwnd();
+        if head && (sent || limited) {
+            self.cwnd_validate(limited);
         }
         self.check_persist(now);
     }
@@ -271,19 +282,17 @@ impl TcpCb {
     /// Room for new data: the bytes the peer's window leaves from
     /// SND.NXT (Linux tcp_snd_wnd_test), none while the packets in
     /// flight fill the congestion window (tcp_cwnd_test) unless this is
-    /// a loss probe (push_one 2: cwnd_quota forced to 1); and whether
-    /// cwnd was the limit
-    fn room(&self, push: Push) -> (u32, bool) {
+    /// a loss probe (push_one 2: cwnd_quota forced to 1)
+    fn room(&self, push: Push) -> u32 {
         if self.in_flight() >= self.cong.snd_cwnd() && push != Push::Tlp {
-            return (0, true);
+            return 0;
         }
         let end = self.snd_una.wrapping_add(self.snd_wnd);
-        let room = if after(end, self.snd_nxt) {
+        if after(end, self.snd_nxt) {
             end.wrapping_sub(self.snd_nxt)
         } else {
             0
-        };
-        (room, false)
+        }
     }
 
     /// Hold a partial segment (Linux tcp_nagle_check with Minshall's
@@ -303,24 +312,17 @@ impl TcpCb {
 
     /// Send the next new segment `output` may send, if any: Some(it
     /// carried the FIN) (Linux tcp_write_xmit's loop body)
-    fn next_seg(
-        &mut self,
-        now: u64,
-        push: Push,
-        limited: &mut bool,
-        out: &mut Out,
-    ) -> Option<bool> {
+    fn next_seg(&mut self, now: u64, push: Push, out: &mut Out) -> Option<bool> {
         if after(self.snd_nxt, self.write_seq) {
             return None; // FIN already sent
         }
         let avail = self.write_seq.wrapping_sub(self.snd_nxt);
-        let (room, cwnd_bound) = self.room(push);
+        let room = self.room(push);
         let mss = self.cur_mss();
         let head = self.wq.front().map_or(0, |s| s.len() as u32);
         let n = head.min(mss).min(room);
         let fin = self.fin_queued && self.snd_nxt.wrapping_add(n) == self.write_seq && room > n;
         if n == 0 && !fin {
-            *limited |= avail > 0 && cwnd_bound;
             return None;
         }
         let in_flight = self.snd_nxt != self.snd_una;
@@ -757,9 +759,8 @@ impl TcpCb {
     /// (zero window, a partial segment held by cork/Nagle, or no
     /// memory): arm the probe timer (Linux tcp_check_probe_timer)
     pub(super) fn check_persist(&mut self, now: u64) {
-        let pending = self.snd_nxt != self.write_seq.wrapping_add(u32::from(self.fin_queued));
         if self.may_send()
-            && pending
+            && self.send_head()
             && self.snd_una == self.snd_max
             && self.live.tmr.get().is_none()
         {

@@ -3096,3 +3096,32 @@ fn loss_probe_ignores_full_cwnd() {
     assert_eq!(p.a.tlp_high_seq, Some(p.a.snd_max));
     assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSPROBES), 1);
 }
+
+/// The flight filling the congestion window after a transmit pass is
+/// cwnd-limited, whether or not the pass sent anything (Linux
+/// tcp_write_xmit: is_cwnd_limited |= in_flight >= cwnd, then
+/// tcp_cwnd_validate on sent_pkts || is_cwnd_limited)
+#[test]
+fn full_flight_is_cwnd_limited() {
+    let mut p = Pair::new(1000);
+    let mss = p.a.live.mss.get() as usize;
+    p.a.cong.set_cwnd(2);
+    p.a.cong.set_ssthresh(2);
+    p.filter = drop_all;
+    // Exactly the window: nothing left queued, yet the window is full
+    p.send_a(&pattern(2 * mss));
+    assert_eq!(p.a.packets_out, 2);
+    assert!(p.a.cong.cwnd_limited());
+    // A pass that sends nothing still records it
+    let mut q = Pair::new(1000);
+    q.a.cong.set_cwnd(2);
+    q.a.cong.set_ssthresh(2);
+    q.filter = drop_all;
+    q.send_a(&pattern(mss));
+    assert!(!q.a.cong.cwnd_limited());
+    q.a.cong.set_cwnd(1);
+    q.a.cong.set_ssthresh(1);
+    q.send_a(&pattern(mss));
+    assert_eq!(q.a.packets_out, 1);
+    assert!(q.a.cong.cwnd_limited());
+}

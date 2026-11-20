@@ -482,7 +482,7 @@ impl TcpCb {
         self.cong.stamp = self.jiffies32();
     }
 
-    /// After a transmit pass with `limited` if cwnd stopped it (Linux
+    /// After a transmit pass, `limited` if the flight fills cwnd (Linux
     /// tcp_cwnd_validate): one sample per window; a window not used for
     /// an RTO shrinks towards what was (RFC 2861 spirit)
     pub(super) fn cwnd_validate(&mut self, limited: bool) {
