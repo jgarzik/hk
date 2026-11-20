@@ -1121,11 +1121,23 @@ impl TcpCb {
         self.mem_settle();
     }
 
-    /// Append an in-order skb starting at RCV.NXT (Linux tcp_queue_rcv)
+    /// Append an in-order skb starting at RCV.NXT (Linux tcp_queue_rcv,
+    /// and tcp_ofo_queue's move): into the tail's room when it fits
+    /// (tcp_try_coalesce), else queued
     fn rcv_queue(&mut self, skb: Box<SkBuff>) {
         let n = skb.len();
         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
         self.rcv_bytes += n;
+        if let Some(mut tail) = self.rcvq.pop_back() {
+            let eaten = try_coalesce(&mut tail, &skb);
+            self.rcvq.push_back(tail);
+            if eaten {
+                // skb_try_coalesce's tailroom case: no truesize moves
+                // (delta 0), the skb is freed uncharged
+                self.net_stat(LINUX_MIB_TCPRCVCOALESCE);
+                return;
+            }
+        }
         self.rcvq_truesize += skb.truesize();
         self.rcvq.push_back(skb);
     }
@@ -1148,6 +1160,24 @@ impl TcpCb {
             _ => {}
         }
     }
+}
+
+/// Linux tcp_try_coalesce: `from` continues `to` and its payload fits
+/// in `to`'s tailroom (skb_try_coalesce's linear case; hk skbs have no
+/// page frags to steal): copied there, `to` takes its end, ACK and flags
+fn try_coalesce(to: &mut SkBuff, from: &SkBuff) -> bool {
+    let (t, f) = (to.tcp(), from.tcp());
+    if f.seq != t.end_seq || from.len() > to.tailroom() {
+        return false;
+    }
+    if to.put_slice(from.data()).is_none() {
+        return false;
+    }
+    let c = to.tcp_mut();
+    c.end_seq = f.end_seq;
+    c.ack_seq = f.ack_seq;
+    c.flags |= f.flags;
+    true
 }
 
 #[cfg(test)]
@@ -1183,5 +1213,42 @@ mod tests {
         assert_eq!(cb.rtx_head(), Some(seq + 1000));
         assert_eq!(cb.packets_out, 1);
         assert_eq!(st.prior_delivered, Some(5));
+    }
+
+    /// An in-order skb `len` bytes at `seq` with `room` bytes of tailroom
+    fn rx_skb(seq: u32, len: usize, room: usize) -> Box<SkBuff> {
+        let mut skb = SkBuff::alloc_tx(len + room, Gfp::KERNEL).unwrap();
+        skb.put_slice(&alloc::vec![seq as u8; len]).unwrap();
+        let t = skb.tcp_mut();
+        t.seq = seq;
+        t.end_seq = seq + len as u32;
+        skb
+    }
+
+    /// In-order data goes into the receive queue's tail when it fits
+    /// there (Linux tcp_queue_rcv -> tcp_try_coalesce, TCPRcvCoalesce),
+    /// else as an skb of its own; the reader sees the bytes in order
+    #[test]
+    fn rcv_queue_coalesces() {
+        let mut cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
+        let mib = crate::net::mib::NetMib::new().unwrap();
+        cb.mib = Some(mib.clone());
+        cb.rcv_nxt = 100;
+        cb.copied_seq = 100;
+        cb.rcv_queue(rx_skb(100, 10, 30));
+        cb.rcv_queue(rx_skb(110, 20, 0));
+        assert_eq!(cb.rcvq.iter().count(), 1);
+        assert_eq!(mib.net.fold(LINUX_MIB_TCPRCVCOALESCE), 1);
+        // No room left: queued apart
+        cb.rcv_queue(rx_skb(130, 20, 0));
+        assert_eq!(cb.rcvq.iter().count(), 2);
+        assert_eq!(cb.rcv_nxt, 150);
+        assert_eq!(cb.rcvq.back().unwrap().tcp().seq, 130);
+        let mut out = Out::default();
+        let mut buf = [0u8; 64];
+        assert_eq!(cb.recv(&mut buf, 0, true, &mut out), 50);
+        assert!(buf[..10].iter().all(|&b| b == 100));
+        assert!(buf[10..30].iter().all(|&b| b == 110));
+        assert!(buf[30..50].iter().all(|&b| b == 130));
     }
 }
