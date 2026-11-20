@@ -1147,13 +1147,13 @@ Tag = roadmap phase (doc/ROADMAP.md).
     (`user/boot_tester/mm/memcore.rs` `slab_time_wait`), failing about
     one x86 boot in three; arm64 measures about 1570 kB (both measured
     with `Arc<TimeWait>` in kmalloc-512). The test's comment puts an
-    entry at about 600 bytes; an `Arc<TimeWait>` is now 408 bytes from
+    entry at about 600 bytes; an `Arc<TimeWait>` is now 312 bytes from
     its own cache (`mm/slab.rs` `TW_CACHE`, no rounding) and its ehash
     `Arc<Eh>` 120 in kmalloc-128 (host build), yet the growth stayed
     near 900 bytes an entry after 3 s of settling, so it is not
-    deferred frees. Find what else each
-    entry allocates (`net/tcp/timewait.rs` `TimeWait::new`, its timer,
-    bhash owner and ehash entries) before touching the bound.
+    deferred frees. Find what else each entry allocates
+    (`net/tcp/timewait.rs` `TimeWait::new`, its timer, bhash owner and
+    ehash entries) before touching the bound.
 
 ## DRM dumb buffers are the boot framebuffer only
 
