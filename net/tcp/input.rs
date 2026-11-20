@@ -16,10 +16,11 @@
 //! goes out, or the delayed ACK timer is armed (`ack.rs`).
 
 use super::cb::{
-    Ins, MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb,
-    TcpState, Tmr, after, before, between, flags, skb_mstamp_us, wake,
+    Ins, MemKind, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb, TcpState, Tmr,
+    after, before, between, flags, skb_mstamp_us, wake,
 };
 use super::cong::AckSample;
+use super::mem;
 use super::recovery::{Rexmit, flag, tag};
 use super::sack::SackState;
 use crate::net::mib::*;
@@ -859,11 +860,6 @@ impl TcpCb {
         } else {
             0
         };
-        let room = if seq == self.rcv_nxt {
-            room.min(self.hard_room())
-        } else {
-            room
-        };
         if len > room {
             let _ = skb.trim(len - room);
             len = room;
@@ -877,11 +873,7 @@ impl TcpCb {
             out.err = Some(KernelError::ConnectionReset);
             return;
         }
-        if len != 0 && seq != self.rcv_nxt {
-            // Linux tcp_data_queue_ofo, before its memory check
-            self.net_stat(LINUX_MIB_TCPOFOQUEUE);
-        }
-        if len != 0 && !self.rmem_ok(seq, len, out) {
+        if len != 0 && !self.rmem_ok(seq, skb.truesize(), out) {
             // Dropped whole, FIN too; it comes again
             return;
         }
@@ -904,55 +896,22 @@ impl TcpCb {
         }
     }
 
-    /// In-order bytes the receive queue may still take: twice the
-    /// window space, i.e. SO_RCVBUF (the window is half of it, as in
-    /// Linux). A scaled window rounds up to its unit and never shrinks
-    /// (Linux tcp_select_window), so a peer trickling bytes can creep
-    /// the right edge past the window space; Linux bounds that with its
-    /// memory accounting (tcp_try_rmem_schedule drops), hk with this.
-    fn hard_room(&self) -> usize {
-        let hard = 2 * self.full_space() as usize;
-        hard.saturating_sub(self.rcv_bytes)
-    }
-
-    /// Memory for `len` bytes at `seq` (Linux tcp_try_rmem_schedule in
-    /// tcp_data_queue / tcp_data_queue_ofo): out-of-order skbs beyond
-    /// `seq` are pruned to make room. Failing that, out-of-order data is
-    /// dropped; in-order data is still taken into an empty receive queue
-    /// (sk_forced_mem_schedule, so the reader can always progress), else
-    /// dropped with an immediate zero-window ACK (ICSK_ACK_NOMEM). The
-    /// reader is woken either way.
-    fn rmem_ok(&mut self, seq: u32, len: usize, out: &mut Out) -> bool {
+    /// Memory for an skb of truesize `size` at `seq` (Linux
+    /// tcp_data_queue / tcp_data_queue_ofo around
+    /// tcp_try_rmem_schedule). Out-of-order data that does not fit is
+    /// dropped (TCPOFODrop); in-order data is still taken into an empty
+    /// receive queue (sk_forced_mem_schedule, so the reader can always
+    /// progress), else dropped (TCPRcvQDrop), with an immediate
+    /// zero-window ACK (ICSK_ACK_NOMEM) either way. The reader is woken
+    /// when it fails.
+    fn rmem_ok(&mut self, seq: u32, size: usize, out: &mut Out) -> bool {
         let in_order = seq == self.rcv_nxt;
-        let size = if in_order { len } else { len + OOO_OVERHEAD };
-        // Linux tcp_prune_queue (when anything is held) and
-        // tcp_prune_ofo_queue
-        let held = self.rcv_bytes != 0 || !self.ooo.is_empty();
-        let mut first = true;
-        let ok = loop {
-            if self.mem_schedule(size, MemKind::Recv) {
-                break true;
+        if self.try_rmem_schedule(seq, size) {
+            if !in_order {
+                self.net_stat(LINUX_MIB_TCPOFOQUEUE);
             }
-            if first {
-                first = false;
-                self.net_stat_if(held, LINUX_MIB_PRUNECALLED);
-            }
-            if !self.ooo.prune_after(seq) {
-                break false;
-            }
-            // Linux tcp_prune_ofo_queue: the blocks are stale now
-            if self.is_sack() {
-                self.sack_reset();
-            }
-            // Each pass that freed some (Linux tcp_prune_ofo_queue)
-            self.net_stat(LINUX_MIB_OFOPRUNED);
-        };
-        if ok {
             return true;
         }
-        // No RcvPruned: Linux counts it only when the receive buffer
-        // limit (tcp_can_ingest) still fails, a check hk lacks
-        self.mem_settle();
         out.wake |= wake::DATA;
         if !in_order {
             self.net_stat(LINUX_MIB_TCPOFODROP);
@@ -960,10 +919,84 @@ impl TcpCb {
         }
         self.ack_nomem = true;
         self.ack_now = true;
-        if self.rcv_bytes != 0 {
+        if !self.rcvq.is_empty() {
             self.net_stat(LINUX_MIB_TCPRCVQDROP);
+            return false;
         }
-        self.rcv_bytes == 0
+        self.mem_force(size);
+        true
+    }
+
+    /// Linux tcp_try_rmem_schedule: past the receive buffer or the
+    /// memory limits, prune; still short of memory, drop out-of-order
+    /// skbs beyond `seq` until it is granted
+    fn try_rmem_schedule(&mut self, seq: u32, size: usize) -> bool {
+        if self.rmem_alloc() <= self.rcvbuf as usize && self.mem_schedule(size, MemKind::Recv) {
+            return true;
+        }
+        if !self.prune_queue(seq) {
+            return false;
+        }
+        while !self.mem_schedule(size, MemKind::Recv) {
+            if !self.prune_ofo_queue(seq) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Linux tcp_prune_queue: get within the receive buffer again;
+    /// false (RcvPruned) when even pruning the out-of-order queue
+    /// beyond `seq` leaves it over. Collapsing the queues into fewer
+    /// skbs (tcp_collapse_ofo_queue, tcp_collapse) is not done.
+    fn prune_queue(&mut self, seq: u32) -> bool {
+        self.net_stat(LINUX_MIB_PRUNECALLED);
+        let over = |c: &Self| c.rmem_alloc() > c.rcvbuf as usize;
+        if self.rmem_alloc() >= self.rcvbuf as usize {
+            self.clamp_window();
+        } else if mem::under_pressure() {
+            self.adjust_rcv_ssthresh();
+        }
+        if !over(self) {
+            return true;
+        }
+        self.prune_ofo_queue(seq);
+        if !over(self) {
+            return true;
+        }
+        self.net_stat(LINUX_MIB_RCVPRUNED);
+        false
+    }
+
+    /// Linux tcp_prune_ofo_queue: drop out-of-order skbs from the
+    /// highest sequence down, stopping at one `seq` would follow, at
+    /// least 1/8 of the receive buffer each pass until the socket is
+    /// within it and not under memory pressure; true if any went
+    fn prune_ofo_queue(&mut self, seq: u32) -> bool {
+        if self.ooo.is_empty() {
+            return false;
+        }
+        let goal0 = i64::from(self.rcvbuf >> 3);
+        let mut goal = goal0;
+        let mut pruned = false;
+        while let Some(ts) = self.ooo.prune_after(seq) {
+            pruned = true;
+            goal -= ts as i64;
+            if self.ooo.is_empty() || goal <= 0 {
+                if self.rmem_alloc() <= self.rcvbuf as usize && !mem::under_pressure() {
+                    break;
+                }
+                goal = goal0;
+            }
+        }
+        if pruned {
+            self.net_stat(LINUX_MIB_OFOPRUNED);
+            // The blocks are stale now
+            if self.is_sack() {
+                self.sack_reset();
+            }
+        }
+        pruned
     }
 
     /// An accepted skb (its payload at `skb.tcp.seq`): in order to the
@@ -974,6 +1007,7 @@ impl TcpCb {
     /// device reference is dropped (TCP has no further use for it).
     fn queue_data(&mut self, mut skb: Box<SkBuff>, now: u64, out: &mut Out) {
         let len = skb.len();
+        let truesize = skb.truesize() as u32;
         self.stats.bytes_received += len as u64;
         skb.dev = None;
         if skb.tcp().seq != self.rcv_nxt {
@@ -982,7 +1016,7 @@ impl TcpCb {
             let d = self.dsack_on().then_some(&mut self.dsack);
             let (ins, sets) = self.ooo.insert(skb, d);
             self.net_add(LINUX_MIB_TCPDSACKOFOSENT, sets);
-            if self.is_sack() && ins != Ins::Full {
+            if self.is_sack() {
                 if first {
                     // Linux tcp_data_queue_ofo: the first one, one block
                     self.selective_acks.n = 1;
@@ -993,6 +1027,10 @@ impl TcpCb {
             }
             let m = core::mem::take(&mut self.ooo.merged);
             self.net_add(LINUX_MIB_TCPOFOMERGE, m);
+            if ins == Ins::Queued {
+                // Linux tcp_data_queue_ofo: an skb kept grows the window
+                self.grow_window(len as u32, truesize, true);
+            }
             self.ack_now = true;
             self.mem_settle();
             return;
@@ -1014,7 +1052,7 @@ impl TcpCb {
         if self.selective_acks.n != 0 {
             self.sack_remove();
         }
-        self.data_recv(len as u32, now);
+        self.data_recv(len as u32, truesize, now);
         if had_ooo {
             self.ack_now = true;
         }
@@ -1027,6 +1065,7 @@ impl TcpCb {
         let n = skb.len();
         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
         self.rcv_bytes += n;
+        self.rcvq_truesize += skb.truesize();
         self.rcvq.push_back(skb);
     }
 

@@ -47,7 +47,7 @@ impl Dack {
 impl TcpCb {
     /// Linux tcp_incr_quickack
     fn incr_quickack(&mut self, max: u32) {
-        let q = (self.rcv_wnd() / (2 * self.dack.rcv_mss.max(1))).max(2);
+        let q = (self.rcv_wnd_adv() / (2 * self.dack.rcv_mss.max(1))).max(2);
         self.live.quick.set(self.live.quick.get().max(q.min(max)));
     }
 
@@ -62,11 +62,17 @@ impl TcpCb {
         self.live.quick.get() > 0 && !self.live.pingpong.get()
     }
 
-    /// In-order data of `len` bytes arrived (Linux tcp_event_data_recv +
-    /// tcp_measure_rcv_mss): owe an ACK, adapt the ATO
-    pub(super) fn data_recv(&mut self, len: u32, now: u64) {
+    /// In-order data of `len` bytes in an skb of `truesize` arrived
+    /// (Linux tcp_event_data_recv + tcp_measure_rcv_mss): owe an ACK,
+    /// adapt the ATO, measure the payload share of truesize when the
+    /// MSS estimate changes, maybe grow the window
+    pub(super) fn data_recv(&mut self, len: u32, truesize: u32, now: u64) {
         self.dack.pending = true;
         if len >= self.dack.rcv_mss {
+            if len != self.dack.rcv_mss {
+                let r = (u64::from(len) << 8) / u64::from(truesize.max(1));
+                self.scaling_ratio = r.clamp(1, 255) as u8;
+            }
             self.dack.rcv_mss = len.min(self.adv_mss).max(MIN_MSS);
         } else {
             self.dack.pushed = true;
@@ -90,6 +96,7 @@ impl TcpCb {
         }
         self.dack.lrcvtime = now;
         self.stats.last_data_recv = now;
+        self.data_grow(len, truesize);
     }
 
     /// An ACK went out (Linux tcp_event_ack_sent): nothing owed any more

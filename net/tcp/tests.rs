@@ -13,6 +13,9 @@ use crate::mm::page_alloc::Gfp;
 use crate::net::skb::{Sacks, SkBuff};
 use crate::util::error::KernelError;
 
+/// Buffers and memory (`buf.rs`)
+mod buf;
+
 /// A segment as the wire sees it: header fields and payload
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Seg {
@@ -156,7 +159,7 @@ fn open(iss: u32, mss: u32) -> Open {
 /// A passive open for `syn` with receive buffer `cap`
 fn passive(syn: &Seg, iss: u32, mss: u32, cap: usize, now: u64, out: &mut Out) -> TcpCb {
     let mut b = TcpCb::new(cfg(), Default::default());
-    b.rcv_cap = cap;
+    b.rcvbuf = cap as u32;
     b.passive_in(&seg_in(syn), open(iss, mss), now, out);
     b
 }
@@ -225,7 +228,7 @@ impl Pair {
         let (_, syn) = p.wire.pop_front().unwrap();
         let mut out = Out::default();
         p.b = TcpCb::new(cb, Default::default());
-        p.b.rcv_cap = cap;
+        p.b.rcvbuf = cap as u32;
         p.b.passive_in(&seg_in(&syn), open(5000, mss), p.now, &mut out);
         p.take(false, out);
         p.run();
@@ -565,8 +568,9 @@ fn zero_window_then_recovery() {
     }
     assert_eq!(p.a.snd_wnd, 0);
     // The scaled window (unit 128) may round past the window space,
-    // never past the buffer (twice that)
-    assert!((4000..=8000).contains(&p.b.rcvq_len()));
+    // never past twice what the buffer holds
+    let q = p.b.rcvq_len();
+    assert!(q >= 1000 && q <= 2 * p.b.full_space() as usize, "{q}");
     let una = p.a.snd_una.wrapping_sub(1);
     let probes = p.log.iter().filter(|l| l.1 && l.2.seq == una).count();
     assert!(probes >= 3, "zero window probes: {}", probes);
@@ -599,20 +603,24 @@ fn drop_window_updates(p: &Pair, to_b: bool, s: &Seg, _: usize) -> Fate {
 
 #[test]
 fn lost_window_update_recovered_by_probe() {
-    let mut p = Pair::with_cap(1000, 3000);
+    let mut p = Pair::with_cap(1000, 6000);
     let data = pattern(3000);
     p.send_a(&data);
     p.run();
     let rest = pattern(5000);
     p.send_a(&rest);
-    p.run();
+    // b's window shuts with part of the data held (its delayed ACKs
+    // fire)
+    assert!(p.until(|p| p.a.snd_wnd == 0, 20));
+    let held = p.b.rcvq_len();
+    assert!((3000..8000).contains(&held), "{held}");
     p.filter = drop_window_updates;
     let first = p.read_b(10_000);
     p.run();
     // The update was lost; the persist timer finds the open window
     let ok = p.until(|p| p.b.rcvq_len() > 0, 50);
     assert!(ok, "probe should find the window");
-    assert_eq!(first.len(), 3000);
+    assert_eq!(first.len(), held);
 }
 
 /// Data in flight is lost while the peer shuts its window (it dropped
@@ -1365,18 +1373,22 @@ fn ooo_prune_from_the_top() {
     let mut o = Ooo::default();
     o.insert(piece(110, 10, 1), None);
     o.insert(piece(130, 10, 3), None);
-    // Only skbs beyond the incoming segment go, highest first
-    assert!(o.prune_after(120));
+    // Only skbs at or beyond the incoming segment go, highest first
+    // (Linux tcp_prune_ofo_queue stops where it would land last)
+    let ts = piece(0, 10, 1).truesize();
+    assert_eq!(o.prune_after(120), Some(ts));
     assert_eq!(o.bytes(), 10);
-    assert!(!o.prune_after(120));
-    assert!(o.prune_after(100));
-    assert!(o.is_empty() && !o.prune_after(100));
+    assert_eq!(o.prune_after(120), None);
+    assert_eq!(o.prune_after(110), Some(ts));
+    assert!(o.is_empty() && o.prune_after(100).is_none());
 }
 
 #[test]
 fn rcv_nxt_only_over_accepted_bytes() {
-    let mut p = Pair::with_cap(60_000, 10_000);
-    // b offers 10000; a 30000-byte flood is cut at the window edge
+    // A 40000-byte buffer offers 40000 * 65 / 256 (Linux
+    // TCP_DEFAULT_SCALING_RATIO before any segment is measured)
+    let mut p = Pair::with_cap(60_000, 40_000);
+    // b offers 10156; a 30000-byte flood is cut at the window edge
     let flood = pattern(30_000);
     let big = SegIn {
         seq: p.b.rcv_nxt,
@@ -1387,7 +1399,7 @@ fn rcv_nxt_only_over_accepted_bytes() {
         ..Default::default()
     };
     let (start, edge) = (p.b.rcv_nxt, p.b.rcv_nxt.wrapping_add(p.b.rcv_wnd()));
-    assert_eq!(p.b.rcv_wnd(), 10_000);
+    assert_eq!(p.b.rcv_wnd(), 10_156);
     let mut out = Out::default();
     p.b.feed(&big, p.now, &mut out);
     assert_eq!(p.b.rcv_nxt, edge);
@@ -1578,15 +1590,16 @@ fn fin_wait1_resends_unacked_synack() {
 }
 
 #[test]
-fn ooo_pieces_bounded() {
-    use super::cb::{OOO_MAX, Ooo};
+fn ooo_truesize() {
+    use super::cb::Ooo;
     let mut o = Ooo::default();
-    // Many tiny scattered segments: bounded pieces, charged overhead
+    // Many tiny scattered segments: each charged its truesize
+    let ts = piece(0, 1, 1).truesize();
     for i in 0..2000u32 {
         o.insert(piece(10 + i * 3, 1, 1), None);
     }
-    assert_eq!(o.pieces(), OOO_MAX);
-    assert_eq!(o.truesize(), OOO_MAX * (1 + super::cb::OOO_OVERHEAD));
+    assert_eq!(o.pieces(), 2000);
+    assert_eq!(o.truesize(), 2000 * ts);
     // Sequence numbers wrap
     let mut o = Ooo::default();
     o.insert(piece(0xffff_fffc, 8, 4), None);
@@ -1656,8 +1669,8 @@ fn wscale_opens_large_window() {
     assert!(p.a.snd_max.wrapping_sub(p.a.snd_una) > 65535);
     // The locked buffer picks its own scale (Linux SOCK_RCVBUF_LOCK)
     let mut b = TcpCb::new(cfg(), Default::default());
-    b.rcv_cap = 4096;
-    b.rcv_locked = true;
+    b.rcvbuf = 4096;
+    b.userlocks = super::buf::RCVBUF_LOCK;
     let mut a = TcpCb::new(cfg(), Default::default());
     let mut out = Out::default();
     a.connect(open(1, 1460), 0, &mut out);
@@ -1925,16 +1938,20 @@ fn iw10_slow_start_growth() {
     p.send_a(&pattern(100_000));
     // The initial window: ten segments
     assert_eq!(p.log.len(), 10);
-    // Slow start roughly doubles per round trip
-    let mut p = Pair::new(1000);
-    p.b.rcv_cap = 1 << 20;
+    // Slow start roughly doubles per round trip: a round delivers the
+    // data on the wire, then the ACKs it drew
+    let mut p = Pair::with_cap(1000, 1 << 20);
+    p.a.sndbuf = 1 << 20;
     let mut rounds = Vec::new();
     p.send_a(&pattern(300_000));
     for _ in 0..3 {
         let before = p.a.snd_max;
-        p.run();
+        for _ in 0..2 {
+            for _ in 0..p.wire.len() {
+                p.step();
+            }
+        }
         rounds.push(p.a.snd_max.wrapping_sub(before) as usize / mss);
-        p.read_b(1 << 20);
     }
     assert!(rounds[1] >= 16, "rounds {:?}", rounds);
     // Congestion avoidance: about one segment per window

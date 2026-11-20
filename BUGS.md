@@ -104,10 +104,11 @@ SACK compression
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
 (/sys/module/tcp_cubic/parameters: Linux's defaults are constants), no
-receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
+receive or send buffer autotuning (tcp_rcv_space_adjust; no
 tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
-SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf; no rcv_ssthresh,
-so memory pressure does not clamp windows), no orphan count limit
+SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf), the receive
+window's free space does not count the socket's backlog (Linux
+tcp_space subtracts sk_backlog.len), no orphan count limit
 (tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
@@ -145,13 +146,12 @@ validated and skipped; source-routed packets are dropped), no
 IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
-and a reader_queue spliced from it. No tcp_can_ingest: a segment is not refused for taking
-receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
+and a reader_queue spliced from it.
 MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
 prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
 ACK counts TCPPureAcks, where Linux's fast path skips it), receive
-coalescing and collapse, RcvPruned (no tcp_can_ingest),
-Fast Open, syncookies, MD5/AO, forwarding and
+coalescing and collapse (tcp_prune_queue prunes the out-of-order
+queue without first collapsing either queue, tcp_collapse), Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP sends are not charged to SO_SNDBUF (Linux sk_wmem_alloc through
 sock_alloc_send_skb, which blocks or fails a send past it; corked

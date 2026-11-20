@@ -57,8 +57,11 @@ pub struct NetSysctl {
     pub tcp_early_retrans: AtomicU8,
     /// Nonzero: a TIME_WAIT entry ignores an in-window RST (RFC 1337)
     pub tcp_rfc1337: AtomicU8,
-    /// tcp_rmem min / default / max (only max is used: window scale)
+    /// tcp_rmem min / default / max (a connection's floor, initial
+    /// SO_RCVBUF, autotuning's bound)
     pub tcp_rmem: [AtomicI32; 3],
+    /// tcp_app_win: 1/2^n of the window kept for the application
+    pub tcp_app_win: AtomicU8,
     /// tcp_keepalive_time / _intvl in seconds
     pub tcp_keepalive_time: AtomicI32,
     pub tcp_keepalive_intvl: AtomicI32,
@@ -117,6 +120,7 @@ impl Default for NetSysctl {
                 AtomicI32::new(131_072),
                 AtomicI32::new(6_291_456),
             ],
+            tcp_app_win: AtomicU8::new(31),
             tcp_keepalive_time: AtomicI32::new(7200),
             tcp_keepalive_intvl: AtomicI32::new(75),
             tcp_keepalive_probes: AtomicU8::new(9),
@@ -579,6 +583,18 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: rmem_show,
         store: rmem_store,
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_app_win",
+        mode: 0o644,
+        global: false,
+        show: |n| get_u8(n, |s| &s.tcp_app_win),
+        store: |n, v| {
+            range(v[0], 0, 31)?;
+            n.sysctl.tcp_app_win.store(v[0] as u8, Ordering::Relaxed);
+            Ok(())
+        },
         text: None,
     },
     NetCtl {

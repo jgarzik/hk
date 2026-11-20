@@ -26,6 +26,7 @@ pub mod sockets;
 pub mod sockopts;
 pub mod sockstat;
 pub mod tcp;
+pub mod tcp_buf;
 pub mod tcp_close;
 pub mod tcp_conn;
 pub mod tcp_mem;

@@ -47,6 +47,7 @@
 //! timer bases (the socket's timers); and either -> FIB / neighbour / device TX (transmit).
 
 pub mod ack;
+pub mod buf;
 pub mod cb;
 pub mod cong;
 pub mod cubic;
@@ -119,6 +120,7 @@ pub const TCP_KEEPINTVL: i32 = 5;
 pub const TCP_KEEPCNT: i32 = 6;
 pub const TCP_SYNCNT: i32 = 7;
 pub const TCP_DEFER_ACCEPT: i32 = 9;
+pub const TCP_WINDOW_CLAMP: i32 = 10;
 pub const TCP_INFO: i32 = 11;
 pub const TCP_QUICKACK: i32 = 12;
 pub const TCP_CONGESTION: i32 = 13;
@@ -169,6 +171,9 @@ struct Inner {
     connecting: bool,
     /// Counted as an orphan (`cb.orphan`) until destroyed
     orphan: Option<mem::Orphan>,
+    /// The socket's SO_RCVBUF / SO_SNDBUF as `sync_caps` gave them to
+    /// `cb`: what it tunes them from (`put_caps`)
+    bufs: (u32, u32),
 }
 
 /// A listener's queues (Linux request_sock_queue + accept queue):
@@ -285,12 +290,16 @@ struct Wake {
 
 /// socket(AF_INET, SOCK_STREAM, 0)
 pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
-    Ok(TcpSock::new(Sock::new(
+    let sk = Sock::new(
         crate::net::current_net_ns(),
         AF_INET,
         SOCK_STREAM,
         PROTO_TCP,
-    ))?)
+    );
+    // Linux tcp_init_sock: tcp_rmem[1]
+    let rmem = sk.net.sysctl.tcp_rmem[1].load(Ordering::Relaxed).max(1) as u32;
+    sk.init_bufs(rmem, sk.sndbuf());
+    Ok(TcpSock::new(sk)?)
 }
 
 /// Connection knobs from the namespace's sysctls
@@ -312,6 +321,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         early_retrans: s.tcp_early_retrans.load(Ordering::Relaxed),
         rmem_min: s.tcp_rmem[0].load(Ordering::Relaxed).max(1) as u32,
         rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
+        app_win: s.tcp_app_win.load(Ordering::Relaxed),
         keepidle: secs(&s.tcp_keepalive_time),
         keepintvl: secs(&s.tcp_keepalive_intvl),
         keepcnt: u32::from(s.tcp_keepalive_probes.load(Ordering::Relaxed)),
@@ -418,6 +428,7 @@ impl TcpSock {
                 parent: None,
                 armed: [None; 3],
                 connecting: false,
+                bufs: (0, 0),
             }),
             queue: Mutex::new(None),
             ack_backlog: AtomicU32::new(0),
@@ -462,12 +473,37 @@ impl TcpSock {
         Some(g)
     }
 
-    /// The buffer limits from SO_RCVBUF / SO_SNDBUF (Linux charges
-    /// about half of them to overhead)
+    /// The buffers from SO_RCVBUF / SO_SNDBUF and whether they were
+    /// set (Linux sk_rcvbuf, sk_sndbuf, sk_userlocks: socket fields the
+    /// control block reads as its own)
     fn sync_caps(&self, g: &mut Inner) {
-        g.cb.rcv_cap = (self.sk.rcvbuf() / 2) as usize;
-        g.cb.snd_cap = (self.sk.sndbuf() / 2) as usize;
-        g.cb.rcv_locked = self.sk.flag(sf::RCVBUF_LOCK);
+        g.bufs = (self.sk.rcvbuf(), self.sk.sndbuf());
+        (g.cb.rcvbuf, g.cb.sndbuf) = g.bufs;
+        g.cb.userlocks = self.userlocks();
+    }
+
+    /// The socket's buffer locks (`buf::RCVBUF_LOCK`, `SNDBUF_LOCK`)
+    fn userlocks(&self) -> u8 {
+        let mut l = 0;
+        if self.sk.flag(sf::RCVBUF_LOCK) {
+            l |= buf::RCVBUF_LOCK;
+        }
+        if self.sk.flag(sf::SNDBUF_LOCK) {
+            l |= buf::SNDBUF_LOCK;
+        }
+        l
+    }
+
+    /// Store buffers the control block tuned in the socket (Linux
+    /// WRITE_ONCE(sk->sk_rcvbuf / sk_sndbuf) under the socket lock)
+    fn put_caps(&self, g: &mut Inner) {
+        if g.cb.rcvbuf != g.bufs.0 {
+            self.sk.tune_rcvbuf(g.bufs.0, g.cb.rcvbuf);
+        }
+        if g.cb.sndbuf != g.bufs.1 {
+            self.sk.tune_sndbuf(g.bufs.1, g.cb.sndbuf);
+        }
+        g.bufs = (g.cb.rcvbuf, g.cb.sndbuf);
     }
 
     /// Linux READ_ONCE(sk->sk_state)
@@ -663,6 +699,7 @@ impl TcpSock {
     /// publish the lockless view; the wakeups follow (`wake_up`)
     fn apply(&self, g: &mut Inner, out: &mut Out) -> Wake {
         let t = g.tuple.or_else(|| self.cur_tuple());
+        self.put_caps(g);
         let ready = self.post(g, out);
         let w = self.emit(out, t);
         if g.cb.state == TcpState::Listen {
@@ -953,11 +990,7 @@ impl TcpSock {
             }
         }
         let opts = *self.listen_opts.lock();
-        let caps = (
-            (self.sk.rcvbuf() / 2) as usize,
-            (self.sk.sndbuf() / 2) as usize,
-            self.sk.flag(sf::RCVBUF_LOCK),
-        );
+        let caps = (self.sk.rcvbuf(), self.sk.sndbuf(), self.userlocks());
         self.child(s, t, opts, caps, now);
     }
 
@@ -966,7 +999,7 @@ impl TcpSock {
     /// the buffer `caps` are the listener's). The child is allocated
     /// GFP_ATOMIC before any lock is taken (Linux inet_reqsk_alloc,
     /// sk_clone_lock)
-    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (usize, usize, bool), now: u64) {
+    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (u32, u32, u8), now: u64) {
         // Out of memory: drop the SYN (Linux inet_reqsk_alloc failing in
         // tcp_conn_request: tcp_listendrop)
         let Ok(c) = with_gfp(Gfp::ATOMIC, || TcpSock::new(Sock::clone_from(&self.sk))) else {
@@ -1007,7 +1040,7 @@ impl TcpSock {
         if !cb.opts.ca_set {
             cb.opts.ca = self.sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
         }
-        (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = caps;
+        (cb.rcvbuf, cb.sndbuf, cb.userlocks) = caps;
         cb.passive(s, o, now, &mut out);
         g.cb = cb;
         if !self.sk.net.tcp.hash(t, &eh, &c) {
@@ -1137,7 +1170,7 @@ impl TcpSock {
             let mut cb = TcpCb::new(c, Arc::clone(&self.live));
             cb.mib = Some(Arc::clone(&self.sk.net.mib));
             cb.opts = g.cb.opts;
-            (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = (g.cb.rcv_cap, g.cb.snd_cap, g.cb.rcv_locked);
+            (cb.rcvbuf, cb.sndbuf, cb.userlocks) = (g.cb.rcvbuf, g.cb.sndbuf, g.cb.userlocks);
             g.cb = cb;
             let o = Open {
                 iss: isn(&t),
@@ -2348,6 +2381,7 @@ impl TcpSock {
                 TCP_USER_TIMEOUT if val < 0 => return bad(),
                 TCP_USER_TIMEOUT => g.cb.opts.user_timeout = val as u32,
                 TCP_DEFER_ACCEPT => g.cb.opts.defer_accept = info::secs_to_retrans(val),
+                TCP_WINDOW_CLAMP => g.cb.set_window_clamp(val)?,
                 TCP_FASTOPEN => {
                     if val < 0 || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen) {
                         return bad();
@@ -2425,6 +2459,7 @@ impl TcpSock {
             TCP_DEFER_ACCEPT => info::retrans_to_secs(o.defer_accept),
             TCP_FASTOPEN => g.cb.live.fastopen.get(),
             TCP_NOTSENT_LOWAT => o.notsent_lowat,
+            TCP_WINDOW_CLAMP => g.cb.window_clamp(),
             _ => return Err(KernelError::NoProtocolOption),
         };
         Ok(OptOut::Int(v as i32))

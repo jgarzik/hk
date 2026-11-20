@@ -113,7 +113,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.ms_ago(now, st.last_data_recv);
     b.ms_ago(now, cb.rcv_tstamp);
     b.u32(cb.path_mss + super::cb::HDRS); // pmtu
-    b.u32(cb.full_space()); // rcv_ssthresh
+    b.u32(cb.rcv_ssthresh());
     let (srtt, var) = cb.rtt();
     b.u32(srtt);
     b.u32(var);

@@ -178,7 +178,7 @@ pub const PAWS_WRAP: u64 = (i32::MAX as u64 / 1_000_000) * 1000;
 /// Linux tcp_wmem[0] (4096) in hk's byte counts, which leave out
 /// truesize overhead (half, as SO_SNDBUF): the send bytes a connection
 /// may queue whatever the memory (tcp_wmem_schedule) and below the hard
-/// limit (__sk_mem_raise_allocated); tcp_rmem[0] / 2 likewise
+/// limit (__sk_mem_raise_allocated)
 const WMEM_MIN: usize = 2048;
 
 /// Which queue a charge is for (Linux SK_MEM_SEND / SK_MEM_RECV)
@@ -215,8 +215,12 @@ pub struct Cfg {
     /// tcp_rmem[0]: receive bytes a connection may always hold below
     /// the hard memory limit
     pub rmem_min: u32,
-    /// tcp_rmem[2]: the receive space the window scale allows for
+    /// tcp_rmem[2]: the receive buffer autotuning may reach, and what
+    /// the window scale allows for
     pub rmem_max: u32,
+    /// tcp_app_win: 1/2^app_win of the window is the application's
+    /// buffer (0: none)
+    pub app_win: u8,
     /// tcp_keepalive_time / _intvl (ms), tcp_keepalive_probes
     pub keepidle: u64,
     pub keepintvl: u64,
@@ -249,6 +253,7 @@ impl Default for Cfg {
             early_retrans: 3,
             rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
+            app_win: 31,
             keepidle: 7_200_000,
             keepintvl: 75_000,
             keepcnt: 9,
@@ -284,6 +289,9 @@ pub struct Opts {
     pub notsent_lowat: u32,
     /// TCP_DEFER_ACCEPT (retransmissions; stored only)
     pub defer_accept: u8,
+    /// TCP_WINDOW_CLAMP as set (0: none), for the next connection and
+    /// a listener's children (Linux tp->window_clamp, copied to them)
+    pub window_clamp: u32,
     /// TCP_CONGESTION (index into `cong::ALGOS`), and whether it was
     /// set (Linux icsk_ca_setsockopt)
     pub ca: usize,
@@ -566,14 +574,6 @@ impl Live {
     }
 }
 
-/// Most out-of-order pieces kept: a peer sending many tiny scattered
-/// segments cannot make insertion slow or the bookkeeping unbounded
-/// (Linux prunes its ofo queue by truesize); later pieces are dropped
-/// and come again with retransmissions
-pub const OOO_MAX: usize = 256;
-/// Bookkeeping charged per piece on top of its bytes (truesize-like)
-pub const OOO_OVERHEAD: usize = 64;
-
 /// The out-of-order queue (Linux tp->out_of_order_queue): received
 /// skbs beyond RCV.NXT in an rbtree by sequence number, linked through
 /// their own `rb` node, so queueing allocates nothing (Linux
@@ -586,6 +586,8 @@ pub struct Ooo {
     tree: SkbTree,
     /// Payload bytes held
     bytes: usize,
+    /// The skbs' truesize (their part of Linux sk_rmem_alloc)
+    truesize: usize,
     /// Skbs dropped as covered since the owner last looked (Linux
     /// TCPOFOMerge)
     pub(super) merged: u64,
@@ -601,9 +603,9 @@ impl Ooo {
         self.bytes
     }
 
-    /// Bytes plus per-piece overhead, charged to the receive buffer
+    /// The skbs' truesize, charged to the receive buffer
     pub fn truesize(&self) -> usize {
-        self.bytes + self.tree.len() * OOO_OVERHEAD
+        self.truesize
     }
 
     pub fn pieces(&self) -> usize {
@@ -638,9 +640,10 @@ impl Ooo {
             if prev.tcp().seq == seq {
                 // It covers `prev` (Linux rb_replace_node)
                 let pseq = prev.tcp().seq;
-                let len = skb.len();
+                let (len, ts) = (skb.len(), skb.truesize());
                 let old = c.replace_current(skb);
                 self.bytes = self.bytes + len - old.len();
+                self.truesize = self.truesize + ts - old.truesize();
                 self.merged += 1;
                 if let Some(d) = d.as_deref_mut() {
                     sets += u64::from(d.extend(pseq, pend));
@@ -656,10 +659,8 @@ impl Ooo {
                 }
             }
         }
-        if self.tree.len() >= OOO_MAX {
-            return (Ins::Full, sets);
-        }
         self.bytes += skb.len();
+        self.truesize += skb.truesize();
         self.tree
             .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
         sets += self.drop_covered(seq, end, d);
@@ -686,6 +687,7 @@ impl Ooo {
             }
             if let Some(gone) = c.remove_current() {
                 self.bytes -= gone.len();
+                self.truesize -= gone.truesize();
                 self.merged += 1;
             }
             if let Some(d) = d.as_deref_mut() {
@@ -695,18 +697,19 @@ impl Ooo {
         sets
     }
 
-    /// Drop the last skb if it lies after `seq`: true if one went
-    /// (Linux tcp_prune_ofo_queue, from the highest sequence down)
-    pub fn prune_after(&mut self, seq: u32) -> bool {
+    /// Drop the last skb unless `seq` lies after it: its truesize if
+    /// one went (Linux tcp_prune_ofo_queue, from the highest sequence
+    /// down, stopping where the incoming skb would land last)
+    pub fn prune_after(&mut self, seq: u32) -> Option<usize> {
         let mut c = self.tree.cursor_back_mut();
         match c.current() {
-            Some(l) if after(l.tcp().seq, seq) => {}
-            _ => return false,
+            Some(l) if !after(seq, l.tcp().seq) => {}
+            _ => return None,
         }
-        if let Some(gone) = c.remove_current() {
-            self.bytes -= gone.len();
-        }
-        true
+        let gone = c.remove_current()?;
+        self.bytes -= gone.len();
+        self.truesize -= gone.truesize();
+        Some(gone.truesize())
     }
 
     /// The first skb that reaches `nxt`, its payload trimmed to start
@@ -731,6 +734,7 @@ impl Ooo {
                 return (None, sets);
             };
             self.bytes -= skb.len();
+            self.truesize -= skb.truesize();
             let (seq, end) = (skb.tcp().seq, data_end(&skb));
             if before(seq, high)
                 && let Some(d) = d.as_deref_mut()
@@ -754,8 +758,6 @@ pub enum Ins {
     Queued,
     /// Its bytes were all held already
     Covered,
-    /// Dropped: `OOO_MAX` pieces held
-    Full,
 }
 
 /// The control block
@@ -785,8 +787,10 @@ pub struct TcpCb {
     pub(super) rtx: SkbTree,
     /// End of the data queued (Linux write_seq; the FIN is after it)
     pub(super) write_seq: u32,
-    /// Send queue limit (from SO_SNDBUF)
-    pub snd_cap: usize,
+    /// Linux sk_sndbuf: the send buffer, of which hk's byte counts
+    /// (payload, no truesize) fill half (`snd_cap`); the socket's
+    /// SO_SNDBUF, grown by tcp_sndbuf_expand
+    pub sndbuf: u32,
     /// The user closed the sending side: a FIN follows the queued data
     pub(super) fin_queued: bool,
     /// End of the last segment shorter than the MSS (Nagle, Minshall)
@@ -809,11 +813,23 @@ pub struct TcpCb {
     pub(super) ooo: Ooo,
     /// A FIN seen beyond a hole: its sequence number
     pub(super) ooo_fin: Option<u32>,
-    /// Receive buffer limit (from SO_RCVBUF)
-    pub rcv_cap: usize,
-    /// SO_RCVBUF was set: the window scale follows it (Linux
-    /// SOCK_RCVBUF_LOCK)
-    pub rcv_locked: bool,
+    /// Linux sk_rcvbuf: the receive buffer, in skb truesize (the
+    /// socket's SO_RCVBUF, grown by tcp_rcv_space_adjust)
+    pub rcvbuf: u32,
+    /// Linux sk_userlocks (`buf::RCVBUF_LOCK`, `buf::SNDBUF_LOCK`):
+    /// SO_RCVBUF / SO_SNDBUF were set, the buffers are not tuned
+    pub userlocks: u8,
+    /// Truesize of the receive and out-of-order queues' skbs (Linux
+    /// sk_rmem_alloc): the receive queue's here, the out-of-order
+    /// queue's in `ooo`
+    pub(super) rcvq_truesize: usize,
+    /// Payload per truesize byte of received skbs, in 1/256 (Linux
+    /// scaling_ratio: tcp_win_from_space)
+    pub(super) scaling_ratio: u8,
+    /// Linux rcv_ssthresh: the window grows to it (tcp_grow_window)
+    pub(super) rcv_ssthresh: u32,
+    /// Linux window_clamp: the largest window offered
+    pub(super) window_clamp: u32,
     /// No more data will be read (close or SHUT_RD): new data in
     /// FIN_WAIT_1/2 resets the connection (Linux tcp_rcv_state_process)
     pub rcv_shut: bool,
@@ -1011,7 +1027,7 @@ impl TcpCb {
             wq: Default::default(),
             rtx: Default::default(),
             write_seq: Default::default(),
-            snd_cap: 64 * 1024,
+            sndbuf: 128 * 1024,
             fin_queued: Default::default(),
             snd_sml: Default::default(),
             irs: Default::default(),
@@ -1023,8 +1039,12 @@ impl TcpCb {
             rcv_bytes: Default::default(),
             ooo: Default::default(),
             ooo_fin: Default::default(),
-            rcv_cap: 64 * 1024,
-            rcv_locked: Default::default(),
+            rcvbuf: 128 * 1024,
+            userlocks: 0,
+            rcvq_truesize: 0,
+            scaling_ratio: super::buf::DEFAULT_SCALING_RATIO,
+            rcv_ssthresh: 0,
+            window_clamp: 0,
             rcv_shut: Default::default(),
             snd_wscale: Default::default(),
             rcv_wscale: Default::default(),
@@ -1134,11 +1154,9 @@ impl TcpCb {
     pub fn connect(&mut self, o: Open, now: u64, out: &mut Out) {
         self.open(&o, now);
         self.wscale_ok = self.cfg.wscale;
-        self.rcv_wscale = if self.wscale_ok {
-            self.pick_wscale()
-        } else {
-            0
-        };
+        // Linux tcp_connect_init: no TS.Recent yet, the whole MSS
+        self.window_clamp = self.opts.window_clamp;
+        self.init_rwin(false);
         self.ts_ok = self.cfg.ts != 0;
         self.sack_ok = if self.cfg.sack { SACK_SEEN } else { 0 };
         self.set_state(TcpState::SynSent);
@@ -1162,6 +1180,10 @@ impl TcpCb {
         } else {
             0
         };
+        // Linux tcp_openreq_init_rwin with the listener's buffer and
+        // clamp, then tcp_create_openreq_child
+        self.window_clamp = self.opts.window_clamp;
+        self.init_rwin(self.ts_ok);
         self.syn_rcvd(syn, now);
         self.set_state(TcpState::SynReceived);
         self.passive = true;
@@ -1174,26 +1196,27 @@ impl TcpCb {
     /// Record the peer's SYN: IRS, window, options (`wscale_ok`,
     /// `ts_ok` and `sack_ok` hold what we offered or accept)
     pub(super) fn syn_rcvd(&mut self, s: &SegIn, now: u64) {
+        let wnd = self.rcv_wnd_adv();
         self.irs = s.seq;
         self.rcv_nxt = s.seq.wrapping_add(1);
         self.copied_seq = self.rcv_nxt;
-        self.rcv_adv = self.rcv_nxt;
+        // The initial window, from RCV.NXT (Linux: rcv_wup moves, the
+        // offered rcv_wnd stays)
         self.rcv_wup = self.rcv_nxt;
+        self.rcv_adv = self.rcv_nxt.wrapping_add(wnd);
         self.snd_wnd = u32::from(s.wnd);
         self.max_wnd = self.snd_wnd;
         self.snd_wl1 = s.seq;
         self.peer_mss = s.mss.map_or(MSS_DEFAULT, |m| u32::from(m).max(64));
         match s.ws {
-            Some(w) if self.wscale_ok => {
-                self.snd_wscale = w.min(MAX_WSCALE);
-                if self.state != TcpState::SynSent {
-                    self.rcv_wscale = self.pick_wscale();
-                }
-            }
+            Some(w) if self.wscale_ok => self.snd_wscale = w.min(MAX_WSCALE),
             _ => {
+                // Linux tcp_rcv_synsent_state_process /
+                // tcp_create_openreq_child without scaling
                 self.wscale_ok = false;
                 self.snd_wscale = 0;
                 self.rcv_wscale = 0;
+                self.window_clamp = self.window_clamp.min(MAX_WINDOW);
             }
         }
         match s.ts {
@@ -1208,19 +1231,7 @@ impl TcpCb {
         }
         self.update_mss();
         self.dack
-            .init(self.adv_mss.min(self.live.mss.get()), self.rcv_cap as u32);
-    }
-
-    /// Our window scale (Linux tcp_select_initial_window): enough for
-    /// tcp_rmem[2] (or the SO_RCVBUF-fixed buffer) in a 16-bit field
-    fn pick_wscale(&self) -> u8 {
-        let space = if self.rcv_locked {
-            self.rcv_cap as u32
-        } else {
-            (self.rcv_cap as u32).max(self.cfg.rmem_max)
-        };
-        let log = 31 - space.max(1).leading_zeros();
-        log.saturating_sub(15).min(u32::from(MAX_WSCALE)) as u8
+            .init(self.adv_mss.min(self.live.mss.get()), self.rcv_wnd_adv());
     }
 
     /// Our MSS from the route (device MTU - 40); also the path limit
@@ -1375,7 +1386,14 @@ impl TcpCb {
         if lowat != 0 && self.unsent() >= lowat {
             return 0;
         }
-        self.snd_cap.saturating_sub(self.sndq_len())
+        self.snd_cap().saturating_sub(self.sndq_len())
+    }
+
+    /// Send bytes the buffer holds: half of SO_SNDBUF, the other half
+    /// the overhead hk's byte counts leave out (Linux compares
+    /// sk_wmem_queued, in truesize, with sk_sndbuf)
+    pub fn snd_cap(&self) -> usize {
+        self.sndbuf as usize / 2
     }
 
     /// Data bytes queued for sending, sent or not (SIOCOUTQ: Linux
@@ -1406,7 +1424,7 @@ impl TcpCb {
     /// is queued, and fewer unsent bytes than TCP_NOTSENT_LOWAT
     pub fn writable(&self) -> bool {
         let q = self.sndq_len();
-        let free = self.snd_cap.saturating_sub(q);
+        let free = self.snd_cap().saturating_sub(q);
         let lowat = self.opts.notsent_lowat;
         free > 0 && free * 2 >= q && (lowat == 0 || self.unsent() < lowat as usize)
     }
@@ -1480,7 +1498,9 @@ impl TcpCb {
             .front()
             .is_some_and(|s| !after(data_end(s), self.copied_seq))
         {
-            drop(self.rcvq.pop_front());
+            if let Some(skb) = self.rcvq.pop_front() {
+                self.rcvq_truesize -= skb.truesize();
+            }
         }
         self.mem_settle();
     }
@@ -1524,7 +1544,7 @@ impl TcpCb {
             return;
         }
         let cur = self.rcv_wnd();
-        if 2 * cur > self.full_space() {
+        if 2 * cur > self.window_clamp {
             return;
         }
         let new = self.window_now();
@@ -1783,18 +1803,6 @@ impl TcpCb {
 
     // --- receive window ----------------------------------------------------
 
-    /// Window space for the receive buffer (Linux tcp_full_space), up
-    /// to what the window field can express
-    pub(super) fn full_space(&self) -> u32 {
-        (self.rcv_cap as u32).clamp(1, MAX_WINDOW << self.rcv_wscale)
-    }
-
-    /// Unused receive space (Linux tcp_space)
-    fn free_space(&self) -> u32 {
-        let used = self.rcv_bytes + self.ooo.truesize();
-        (self.full_space() as usize).saturating_sub(used) as u32
-    }
-
     /// Window currently offered (Linux tcp_receive_window)
     pub fn rcv_wnd(&self) -> u32 {
         if before(self.rcv_adv, self.rcv_nxt) {
@@ -1804,31 +1812,46 @@ impl TcpCb {
         }
     }
 
-    /// Window we would offer now (Linux __tcp_select_window): receiver
-    /// SWS avoidance; without scaling in multiples of the MSS, with
-    /// scaling rounded up to the scale unit
+    /// Window we would offer now (Linux __tcp_select_window): the free
+    /// space up to `rcv_ssthresh`, within the clamp; below half the
+    /// clamped space, receiver SWS avoidance (zero below an MSS
+    /// estimate or 1/16 of the buffer's window); without scaling in
+    /// multiples of the MSS estimate, with scaling rounded up to the
+    /// scale unit
     pub(super) fn window_now(&mut self) -> u32 {
-        let full = self.full_space();
-        let mss = self.adv_mss.min(full);
-        let unit = 1u32 << self.rcv_wscale;
-        let mut free = self.free_space();
-        if free < full / 2 {
-            self.live.quick.set(0);
-            free = free / unit * unit;
-            if free < full / 16 || free < mss {
+        let mut mss = i64::from(self.dack.rcv_mss);
+        let mut free = self.space();
+        let allowed = i64::from(self.full_space());
+        let full = i64::from(self.window_clamp).min(allowed);
+        if mss > full {
+            mss = full;
+            if mss <= 0 {
                 return 0;
             }
         }
-        if self.rcv_wscale != 0 {
-            return free.div_ceil(unit) * unit;
+        let unit = 1i64 << self.rcv_wscale;
+        if free < full >> 1 {
+            self.live.quick.set(0);
+            if mem::under_pressure() {
+                self.adjust_rcv_ssthresh();
+            }
+            free &= !(unit - 1);
+            if free < allowed >> 4 || free < mss {
+                return 0;
+            }
         }
-        let cur = self.rcv_wnd();
-        if cur + mss <= free || cur > free {
-            free / mss * mss
-        } else if mss == full && free > cur + full / 2 {
-            free
+        free = free.min(i64::from(self.rcv_ssthresh));
+        if self.rcv_wscale != 0 {
+            return ((free + unit - 1) & !(unit - 1)) as u32;
+        }
+        let window = self.rcv_wnd_adv();
+        // Linux compares the u32 window with the int free - mss
+        if window <= (free - mss) as i32 as u32 || i64::from(window) > free {
+            (free - free % mss) as u32
+        } else if mss == full && free > i64::from(window) + (full >> 1) {
+            free as u32
         } else {
-            cur
+            window
         }
     }
 
@@ -1836,15 +1859,13 @@ impl TcpCb {
     /// right edge never moves left (a scaled window rounds up to its
     /// unit); records Last.ACK.sent
     pub(super) fn select_window(&mut self) -> u16 {
-        // Data dropped for memory: close the window to stop the sender
-        // (the one case the right edge moves left)
+        // Data dropped for memory: a zero window, not stored: the window
+        // offered stays (Linux ICSK_ACK_NOMEM)
         if self.ack_nomem {
-            self.rcv_adv = self.rcv_nxt;
-            self.rcv_wup = self.rcv_nxt;
             return 0;
         }
         let unit = 1u32 << self.rcv_wscale;
-        let old = self.rcv_adv.wrapping_sub(self.rcv_wup);
+        let old = self.rcv_wnd_adv();
         let cur = self.rcv_wnd();
         let mut w = self.window_now();
         if w < cur {
@@ -1852,9 +1873,9 @@ impl TcpCb {
             self.net_stat_if(w == 0, LINUX_MIB_TCPWANTZEROWINDOWADV);
             w = cur.div_ceil(unit) * unit;
         }
-        let w = w.min(MAX_WINDOW << self.rcv_wscale);
         self.rcv_adv = self.rcv_nxt.wrapping_add(w);
         self.rcv_wup = self.rcv_nxt;
+        let w = w.min(MAX_WINDOW << self.rcv_wscale);
         let field = (w >> self.rcv_wscale) as u16;
         if field == 0 {
             self.net_stat_if(old != 0, LINUX_MIB_TCPTOZEROWINDOWADV);
@@ -1864,14 +1885,10 @@ impl TcpCb {
         field
     }
 
-    /// Window field of a SYN or SYN-ACK: never scaled (RFC 7323 2.2)
+    /// Window field of a SYN or SYN-ACK: the initial window, never
+    /// scaled (RFC 7323 2.2; Linux min(rcv_wnd, 65535))
     pub(super) fn syn_window(&mut self) -> u16 {
-        let w = self.full_space().min(MAX_WINDOW);
-        if self.state == TcpState::SynReceived {
-            self.rcv_adv = self.rcv_nxt.wrapping_add(w);
-            self.rcv_wup = self.rcv_nxt;
-        }
-        w as u16
+        self.rcv_wnd_adv().min(MAX_WINDOW) as u16
     }
 
     /// The peer's window field of `s` in bytes
@@ -1885,9 +1902,10 @@ impl TcpCb {
 
     // --- memory ------------------------------------------------------------
 
-    /// Bytes in the queues (Linux sk_wmem_queued + sk_rmem_alloc)
+    /// Bytes in the queues (Linux sk_wmem_queued + sk_rmem_alloc; the
+    /// send side in hk's byte counts)
     fn mem_used(&self) -> usize {
-        self.sndq_len() + self.rcv_bytes + self.ooo.truesize()
+        self.sndq_len() + self.rmem_alloc()
     }
 
     /// Cover `size` more bytes before queueing them (Linux
@@ -1930,9 +1948,7 @@ impl TcpCb {
         }
         if allocated <= mem::limit(2) {
             let floor = match kind {
-                MemKind::Recv => {
-                    self.rcv_bytes + self.ooo.truesize() < self.cfg.rmem_min as usize / 2
-                }
+                MemKind::Recv => self.rmem_alloc() < self.cfg.rmem_min as usize,
                 MemKind::Send => self.sndq_len() < WMEM_MIN,
             };
             if floor {
@@ -1942,12 +1958,12 @@ impl TcpCb {
                 return true;
             }
         }
-        kind == MemKind::Send && self.sndq_len() + size >= self.snd_cap
+        kind == MemKind::Send && self.sndq_len() + size >= self.snd_cap()
     }
 
     /// Charge `size` more bytes without a limit (Linux
     /// sk_forced_mem_schedule)
-    fn mem_force(&mut self, size: usize) {
+    pub(super) fn mem_force(&mut self, size: usize) {
         let need = mem::quanta(self.mem_used() + size);
         if need > self.held.get() {
             mem::add(need - self.held.get());

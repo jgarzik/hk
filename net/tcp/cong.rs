@@ -435,6 +435,7 @@ impl TcpCb {
         if !self.cong.initialized {
             self.init_cc();
         }
+        self.init_buffer_space();
     }
 
     /// Linux tcp_disconnect's congestion part: the algorithm released

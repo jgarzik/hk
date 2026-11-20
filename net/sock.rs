@@ -65,6 +65,8 @@ pub mod sf {
     pub const RCVBUF_LOCK: u32 = 1 << 15;
     /// SO_PASSPIDFD (Linux SOCK_PASSPIDFD)
     pub const PASSPIDFD: u32 = 1 << 16;
+    /// SO_SNDBUF was set (Linux SOCK_SNDBUF_LOCK in sk_userlocks)
+    pub const SNDBUF_LOCK: u32 = 1 << 17;
 }
 
 /// sock_extended_err origins (SO_EE_ORIGIN_*)
@@ -463,7 +465,32 @@ impl Sock {
     pub fn set_sndbuf(&self, v: i32, force: bool) {
         self.sndbuf
             .store(buf_size(v, force, MIN_SNDBUF), Ordering::Release);
+        self.set_flag(sf::SNDBUF_LOCK, true);
         self.write_space();
+    }
+
+    /// A protocol's initial buffers (Linux tcp_init_sock: tcp_rmem[1],
+    /// tcp_wmem[1])
+    pub fn init_bufs(&self, rcv: u32, snd: u32) {
+        self.rcvbuf.store(rcv, Ordering::Release);
+        self.sndbuf.store(snd, Ordering::Release);
+    }
+
+    /// A protocol tuned the receive buffer from `old` to `new` (Linux
+    /// WRITE_ONCE(sk->sk_rcvbuf) under the socket lock): unless
+    /// SO_RCVBUF changed it meanwhile, which wins
+    pub fn tune_rcvbuf(&self, old: u32, new: u32) {
+        let _ = self
+            .rcvbuf
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// As `tune_rcvbuf`, the send buffer (Linux tcp_sndbuf_expand,
+    /// sk_stream_moderate_sndbuf)
+    pub fn tune_sndbuf(&self, old: u32, new: u32) {
+        let _ = self
+            .sndbuf
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     pub fn rcvlowat(&self) -> i32 {
