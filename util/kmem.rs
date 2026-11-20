@@ -73,6 +73,17 @@ pub fn try_vec_with<T>(n: usize, f: impl FnMut() -> T) -> Result<Vec<T>, KernelE
     Ok(x)
 }
 
+/// Room in `v` for `extra` more items (exactly), or ENOMEM if that is
+/// over [`MAX_KMALLOC`] or the heap cannot provide it (`v` unchanged)
+pub fn try_reserve<T>(v: &mut Vec<T>, extra: usize) -> Result<(), KernelError> {
+    fits::<T>(v.len().checked_add(extra).ok_or(KernelError::OutOfMemory)?)?;
+    if extra > 0 && core::mem::size_of::<T>() > 0 {
+        inject()?;
+    }
+    v.try_reserve_exact(extra)
+        .map_err(|_| KernelError::OutOfMemory)
+}
+
 /// A copy of `s`, or ENOMEM. For buffers made from a packet on a
 /// receive path: where Linux's GFP_ATOMIC allocation (skb_clone,
 /// alloc_skb) fails and the packet is dropped, the caller drops it too.

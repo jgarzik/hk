@@ -602,6 +602,95 @@ fn mss_bound_to_half_wnd() {
     assert!(n < 12 * 1024, "{n}");
 }
 
+/// Send skbs hold about what they are charged (Linux fills page frags
+/// as data are copied): tiny TCP_NODELAY writes on a 64 KiB-MSS path
+/// each pin a buffer of a page at most, not an MSS, through splits,
+/// partial ACKs, SACK merges and retransmit collapsing
+#[test]
+fn send_memory_held_as_charged() {
+    let mut p = Pair::with_cap(65_483, 1 << 20);
+    p.a.opts.nodelay = true;
+    p.filter = drop_all;
+    for _ in 0..200 {
+        assert_eq!(p.send_a(&[1; 3]), 3);
+    }
+    assert!(p.a.rtx.len() >= 10);
+    tight(&p.a);
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+    // Nagle coalescing into one skb grows it by pages
+    let mut p = Pair::with_cap(65_483, 1 << 20);
+    p.filter = drop_all;
+    for _ in 0..100 {
+        p.send_a(&[1; 700]);
+        tight(&p.a);
+    }
+    // A large skb cut by a small window, then partly acknowledged: the
+    // part left behind gives back the buffer it no longer uses
+    let mut p = Pair::with_cap(65_483, 1 << 20);
+    p.filter = |_, to_b, s, _| {
+        if to_b && !s.data.is_empty() {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    };
+    let (una, wnd) = (p.a.snd_una, p.a.snd_wnd);
+    p.a.snd_wnd = 0;
+    let mss = p.a.live.mss.get() as usize;
+    assert!(mss > 3 * 4096, "{mss}");
+    assert_eq!(p.send_a(&pattern(mss)), mss);
+    p.a.snd_wnd = 3000;
+    let mut out = Out::default();
+    p.a.output(p.now, &mut out);
+    assert_eq!(p.a.rtx.len(), 1);
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+    p.a.snd_wnd = wnd;
+    p.a.opts.nodelay = true;
+    p.send_a(&[]);
+    assert!(p.a.rtx.len() > 1);
+    let ack = SegIn {
+        seq: p.a.rcv_nxt,
+        ack: una.wrapping_add(3000 + mss as u32 / 2),
+        flags: flags::ACK,
+        wnd: u16::MAX,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    let now = p.now;
+    p.a.feed(&ack, now, &mut out);
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+    // Its retransmission sends what is unacknowledged (tcp_trim_head)
+    for _ in 0..2 {
+        let t = p.a.next_timer().expect("armed");
+        p.now = t;
+        p.a.on_timer(t, &mut Out::default());
+        assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+    }
+    // A lossy transfer of small writes into a small window
+    let mut p = Pair::with_cap(1000, 6000);
+    p.a.opts.nodelay = true;
+    p.filter = lossy;
+    let data = pattern(100_000);
+    let mut sent = 0;
+    for i in 0..20_000 {
+        if sent < data.len() {
+            let n = (i % 7) * 300 + 1;
+            sent += p.send_a(&data[sent..(sent + n).min(data.len())]);
+        }
+        p.run();
+        tight(&p.a);
+        assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+        p.read_b(1 << 20);
+        if sent == data.len() && p.a.snd_una == p.a.snd_max {
+            break;
+        }
+        if p.wire.is_empty() {
+            p.tick();
+        }
+    }
+    assert_eq!(p.a.snd_una, p.a.snd_max);
+}
+
 /// TCP_LINGER2 (Linux tp->linger2, tcp_fin_time): a positive value is
 /// the orphan's FIN_WAIT_2 lifetime (at least 3.5 RTO); negative, an
 /// orphan reaching FIN_WAIT_2 is done with a reset (TCPAbortOnData),

@@ -233,6 +233,55 @@ impl SkBuff {
         Self::alloc(TX_HEADROOM, data_len, gfp)
     }
 
+    /// Room for `n` bytes after the data: short of it, the buffer
+    /// grows under `gfp` so the data could reach a whole number of
+    /// `step` bytes, no more than `max` (as TCP's send path takes page
+    /// frags of Linux's sk_page_frag_refill). None without memory or
+    /// past [`MAX_SKB_SIZE`] (unchanged).
+    pub fn grow(&mut self, n: usize, step: usize, max: usize, gfp: Gfp) -> Option<()> {
+        if self.tailroom() >= n {
+            return Some(());
+        }
+        let need = self.len().checked_add(n)?;
+        let room = MAX_SKB_SIZE.checked_sub(self.data)?;
+        if need > room {
+            return None;
+        }
+        let want = need
+            .div_ceil(step)
+            .saturating_mul(step)
+            .min(max)
+            .min(room)
+            .max(need);
+        let extra = self.data + want - self.buf.len();
+        with_gfp(gfp, || crate::util::kmem::try_reserve(&mut self.buf, extra)).ok()?;
+        self.buf.resize(self.data + want, 0);
+        Some(())
+    }
+
+    /// Give back the buffer around the data beyond `headroom` before it
+    /// once more than `slack` bytes would go: the data move to a buffer
+    /// that fits, allocated under `gfp` (Linux frees the frags
+    /// tcp_trim_head and tcp_fragment leave unused); header marks are
+    /// dropped. False without memory (unchanged).
+    pub fn compact(&mut self, headroom: usize, slack: usize, gfp: Gfp) -> bool {
+        let waste = self.data.saturating_sub(headroom) + self.tailroom();
+        if waste <= slack {
+            return true;
+        }
+        let h = headroom.min(self.data);
+        let Ok(mut v) = with_gfp(gfp, || crate::util::kmem::try_vec(h + self.len(), 0u8)) else {
+            return false;
+        };
+        v[h..].copy_from_slice(self.data());
+        self.tail = h + self.len();
+        self.data = h;
+        self.buf = v;
+        self.mac = None;
+        self.nh = None;
+        true
+    }
+
     /// Get current data length
     #[inline]
     pub fn len(&self) -> usize {
@@ -403,6 +452,12 @@ impl SkBuff {
     /// header was pulled), if one was recorded
     pub fn network_packet(&self) -> Option<&[u8]> {
         self.buf.get(self.nh?..self.tail)
+    }
+
+    /// Bytes it holds: the buffer and the skb itself (host tests)
+    #[cfg(test)]
+    pub fn mem_size(&self) -> usize {
+        self.buf.capacity() + core::mem::size_of::<Self>()
     }
 
     /// Bytes charged to a socket buffer for it (Linux skb->truesize)

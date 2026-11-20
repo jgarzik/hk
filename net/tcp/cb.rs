@@ -1328,10 +1328,11 @@ impl TcpCb {
 
     /// Queue up to `max` bytes for sending, filled in place by `fill`
     /// (Linux tcp_sendmsg_locked; the caller calls `output`): into the
-    /// tail skb of the write queue while it has room, then into new ones
-    /// of one MSS (tcp_stream_alloc_skb with sk_allocation: socket calls
+    /// tail skb of the write queue while short of the MSS, then into new
+    /// ones of up to one MSS (tcp_stream_alloc_skb with sk_allocation: socket calls
     /// own the socket, nothing atomic), each copy covered first
-    /// (tcp_wmem_schedule) and charged as it lands. `fill` gets each
+    /// (tcp_wmem_schedule), its room grown a page at a time (as Linux
+    /// copies into page frags) and charged as it lands. `fill` gets each
     /// skb's new tail and returns the bytes it stored there, short or
     /// Err after a fault. Returns the bytes queued (0: no room or no
     /// memory), Err if a fault left none; what `fill` did not store is
@@ -1347,7 +1348,13 @@ impl TcpCb {
             let Some(mut skb) = self.wq_tail() else {
                 break;
             };
-            let k = self.wmem_schedule((n - done).min(skb.tailroom()));
+            let mss = self.live.mss.get() as usize;
+            let mut k = self.wmem_schedule((n - done).min(mss - skb.len()));
+            if skb.grow(k, super::output::FRAG, mss, Gfp::KERNEL).is_none() {
+                // Linux sk_page_frag_refill failed: wait_for_space
+                self.alloc_failed();
+                k = 0;
+            }
             let got = match skb.put(k).map(&mut fill) {
                 Some(Ok(g)) => g.min(k),
                 Some(Err(e)) => {
@@ -1390,14 +1397,15 @@ impl TcpCb {
         }
     }
 
-    /// The skb new data goes into: the write queue's tail while it has
-    /// room, else, with the buffer not full (Linux tcp_sendmsg_locked's
-    /// sk_stream_memory_free before a new segment), a new one of one
-    /// MSS charged its head (tcp_stream_alloc_skb: forced into empty
-    /// queues, else sk_wmem_schedule); None without room or memory
+    /// The skb new data goes into: the write queue's tail while short
+    /// of the MSS (Linux tcp_sendmsg_locked: size_goal - skb->len),
+    /// else, with the buffer not full (sk_stream_memory_free before a
+    /// new segment), a new one charged its head (tcp_stream_alloc_skb:
+    /// forced into empty queues, else sk_wmem_schedule); None without
+    /// room or memory
     fn wq_tail(&mut self) -> Option<Box<SkBuff>> {
         if let Some(t) = self.wq.pop_back() {
-            if t.tailroom() > 0 {
+            if t.len() < self.live.mss.get() as usize {
                 return Some(t);
             }
             self.wq.push_back(t);
@@ -1405,14 +1413,8 @@ impl TcpCb {
         if !self.memory_free() {
             return None;
         }
-        let Some(mut skb) = super::output::stream_alloc(self.live.mss.get() as usize, Gfp::KERNEL)
-        else {
-            // Linux tcp_stream_alloc_skb: enter_memory_pressure,
-            // sk_stream_moderate_sndbuf
-            if mem::enter_pressure() {
-                self.net_stat(LINUX_MIB_TCPMEMORYPRESSURES);
-            }
-            self.moderate_sndbuf();
+        let Some(mut skb) = super::output::stream_alloc(0, Gfp::KERNEL) else {
+            self.alloc_failed();
             return None;
         };
         let ts = skb.truesize();
@@ -1440,6 +1442,16 @@ impl TcpCb {
             Ok(b.len())
         })
         .unwrap_or(0)
+    }
+
+    /// A send buffer could not be allocated (Linux tcp_stream_alloc_skb,
+    /// sk_page_frag_refill): enter_memory_pressure,
+    /// sk_stream_moderate_sndbuf
+    fn alloc_failed(&mut self) {
+        if mem::enter_pressure() {
+            self.net_stat(LINUX_MIB_TCPMEMORYPRESSURES);
+        }
+        self.moderate_sndbuf();
     }
 
     /// Cover `copy` more bytes of payload (Linux tcp_wmem_schedule):

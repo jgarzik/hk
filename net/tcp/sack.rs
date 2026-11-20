@@ -24,8 +24,9 @@
 use super::cb::{DSACK_SEEN, TcpCb, after, before, flags, skb_mstamp_us};
 use super::output::{SACK_BASE, SACK_PERBLOCK};
 use super::recovery::{CaState, flag, seglen, tag};
+use crate::mm::page_alloc::Gfp;
 use crate::net::mib::*;
-use crate::net::skb::{NUM_SACKS, Sacks};
+use crate::net::skb::{NUM_SACKS, Sacks, TX_HEADROOM};
 
 /// Option space of a header (Linux MAX_TCP_OPTION_SPACE)
 const MAX_OPTION_SPACE: u32 = 40;
@@ -510,9 +511,10 @@ impl TcpCb {
     /// Move `len` bytes, `pcount` segments, from the head of the skb at
     /// `skb` to the end of the one at `prev` (Linux tcp_skb_shift:
     /// skb_shift moves pages and their truesize; hk's skbs are linear,
-    /// so the bytes are copied into `prev`'s tailroom, false if it lacks
-    /// the room), then account for them (tcp_shifted_skb). Returns true
-    /// if `skb` was eaten whole; None if nothing moved.
+    /// so the bytes are copied into `prev`'s buffer, grown for them,
+    /// and `skb`'s is fitted to what is left), then account for them
+    /// (tcp_shifted_skb). Returns true if `skb` was eaten whole; None if
+    /// nothing moved.
     #[expect(clippy::too_many_arguments)]
     fn shift(
         &mut self,
@@ -524,11 +526,14 @@ impl TcpCb {
         mss: u32,
         dup_sack: bool,
     ) -> Option<bool> {
-        let (room, ppc, plen) =
-            self.rtx_with(prev, |p| (p.tailroom(), p.tcp().pcount(), p.len()))?;
-        if room < len as usize || plen + len as usize >= 65535 * 8 || ppc + pcount > 65535 {
+        let (ppc, plen) = self.rtx_with(prev, |p| (p.tcp().pcount(), p.len()))?;
+        if plen + len as usize >= 65535 * 8 || ppc + pcount > 65535 {
             return None;
         }
+        let frag = super::output::FRAG;
+        self.rtx_with(prev, |p| {
+            p.grow(len as usize, frag, usize::MAX, Gfp::ATOMIC)
+        })??;
         // Linux tcp_shifted_skb: tag the range first (seq advancing
         // moves tcp_highest_sack_seq along when skb is highest_sack)
         let (t, tx) = self.rtx_with(skb, |s| (s.tcp(), skb_mstamp_us(s)))?;
@@ -558,6 +563,7 @@ impl TcpCb {
         });
         let _ = s.pull(len as usize);
         s.set_truesize(s.truesize().saturating_sub(len as usize));
+        s.compact(TX_HEADROOM, frag, Gfp::ATOMIC);
         let new_seq = t.seq.wrapping_add(len);
         if !s.is_empty() {
             let st_ = s.tcp_mut();

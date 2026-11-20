@@ -379,6 +379,7 @@ fn transfer(p: &mut Pair, data: &[u8], limit: usize) -> Vec<u8> {
             sent += p.send_a(&data[sent..]);
         }
         p.run();
+        assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
         got.extend(p.read_b(1 << 20));
         p.run();
         if got.len() >= data.len() {
@@ -456,13 +457,24 @@ fn lossy(_: &Pair, to_b: bool, s: &Seg, i: usize) -> Fate {
 }
 
 /// The send queues' truesize (Linux sk_wmem_queued); each skb's is its
-/// head and its payload, however it was split, merged or trimmed
+/// head and its payload, however it was split, merged or trimmed, and
+/// it holds at most a page more
 fn queued_truesize(c: &TcpCb) -> usize {
+    tight(c);
     for s in c.wq.iter().chain(c.rtx.iter()) {
         assert_eq!(s.truesize(), HEAD_TRUESIZE + s.len());
     }
     c.wq.iter().map(|s| s.truesize()).sum::<usize>()
         + c.rtx.iter().map(|s| s.truesize()).sum::<usize>()
+}
+
+/// Every queued send skb holds at most a page more than it is charged
+/// (Linux's page frag slack)
+fn tight(c: &TcpCb) {
+    for s in c.wq.iter().chain(c.rtx.iter()) {
+        let slack = s.mem_size() - s.truesize();
+        assert!(slack <= 4096, "{} bytes held past {}", slack, s.truesize());
+    }
 }
 
 #[test]
@@ -800,6 +812,7 @@ fn window_edge_never_moves_left() {
             edge = e;
         }
         p.log.clear();
+        assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
         if i % 3 == 0 {
             p.read_b(1500);
         }
@@ -1336,6 +1349,7 @@ fn pmtu_shrinks_segments() {
     assert_eq!(p.a.live.mss.get(), 524);
     assert!(!wire(&out).is_empty());
     assert!(wire(&out).iter().all(|s| s.data.len() <= 524));
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
 }
 
 /// An skb of `len` bytes of `v` at `seq`
