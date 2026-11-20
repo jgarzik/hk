@@ -13,6 +13,10 @@
 //!   connection with the cookie's MSS and the ACK's data; a forged
 //!   cookie gets a RST; the Syncookies* and TCPReqQFullDoCookies
 //!   counters (Linux tcp_conn_request want_cookie, cookie_v4_check)
+//! - TCP_MAX_SYN_BACKLOG: without SYN cookies a listener keeps the last
+//!   quarter of tcp_max_syn_backlog requests for proven peers: past it
+//!   a SYN from a new peer is dropped (ListenDrops), however large the
+//!   listen backlog (Linux tcp_conn_request)
 
 use hk_syscall::{sys_accept, sys_listen, sys_setsockopt};
 
@@ -21,7 +25,7 @@ use crate::helpers::{host_mode, skip};
 use crate::net::sk::*;
 use crate::net::snmp::Mib;
 use crate::net::tcp_synrecv::{ACK, FIN, Peer, RST, SYN, got};
-use crate::proc::sysctl::reads;
+use crate::proc::sysctl::{read_file, reads, write_file};
 
 const NETSTAT: &[u8] = b"/proc/net/netstat\0";
 const TCP_MAXSEG: i32 = 2;
@@ -30,6 +34,7 @@ pub fn run_tests() {
     crate::helpers::println(b"=== TCP Listener Tests ===");
     test_tw_isn();
     test_syncookie();
+    test_max_syn_backlog();
 }
 
 /// SYN options: MSS 1460, SACK permitted, timestamps (`tsval`, 0),
@@ -197,5 +202,42 @@ fn test_syncookie() {
     abort(a);
     peer.send_full(P1, pl, Y + 1, 0, RST, &[], &[]);
     close(l);
+    t.done();
+}
+
+fn test_max_syn_backlog() {
+    const Y: u32 = 0x7000_0000;
+    const MAXSYN: &[u8] = b"/proc/sys/net/ipv4/tcp_max_syn_backlog\0";
+    const COOKIES: &[u8] = b"/proc/sys/net/ipv4/tcp_syncookies\0";
+    let mut t = T::new(b"TCP_MAX_SYN_BACKLOG");
+    // A peer address no earlier test used (no tcp_metrics: unproven)
+    let Some(peer) = Peer::at(&mut t, [192, 0, 2, 79]) else {
+        return t.done();
+    };
+    let mut old = [0u8; 16];
+    let n = read_file(MAXSYN, &mut old);
+    if !t.ok(b"read", n > 0, n) {
+        return t.done();
+    }
+    t.eq(b"set max", write_file(MAXSYN, b"4"), 1);
+    t.eq(b"no cookies", write_file(COOKIES, b"0"), 1);
+    let drops = tcpext(b"ListenDrops");
+    let (l, pl) = listener(100);
+    // Four requests fit: 4 - qlen < 4 / 4 only at qlen 4
+    for i in 0..4u16 {
+        peer.send_full(7801 + i, pl, Y, 0, SYN, &[], &[]);
+        let (f, _, _) = got(peer.from_to(pl, 7801 + i, 1000));
+        t.eq(b"syn-ack", f, i64::from(SYN | ACK));
+    }
+    peer.send_full(7805, pl, Y, 0, SYN, &[], &[]);
+    t.eq(b"dropped", got(peer.from_to(pl, 7805, 500)).0, -1);
+    t.eq(b"ListenDrops", tcpext(b"ListenDrops") - drops, 1);
+    for i in 0..4u16 {
+        peer.send_full(7801 + i, pl, Y + 1, 0, RST, &[], &[]);
+    }
+    close(l);
+    write_file(COOKIES, b"1");
+    write_file(MAXSYN, &old[..n as usize - 1]);
+    t.ok(b"restored", reads(MAXSYN, &old[..n as usize]), 0);
     t.done();
 }

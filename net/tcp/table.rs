@@ -178,6 +178,21 @@ pub fn init() {
         lhash: NullsHead::table(LHASH).expect("tcp: lhash"),
         bhash: bhash.into_boxed_slice(),
     });
+    // Linux tcp_sk_init(init_net) -> tcp_set_hashinfo, after tcp_init
+    // sized the table: the initial namespace was made before it
+    crate::ns::net::init_net_ns()
+        .sysctl
+        .tcp_max_syn_backlog
+        .store(max_syn_backlog(), Ordering::Relaxed);
+}
+
+/// A namespace's initial tcp_max_syn_backlog (Linux tcp_set_hashinfo:
+/// max(128, ehash entries / 128), of the one table every namespace
+/// shares; 128 before it is sized)
+pub fn max_syn_backlog() -> i32 {
+    HASHINFO
+        .get()
+        .map_or(128, |h| (h.ehash.len() / 128).max(128) as i32)
 }
 
 fn hi() -> &'static Hashinfo {

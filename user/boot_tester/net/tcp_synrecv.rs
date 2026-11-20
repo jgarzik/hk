@@ -75,10 +75,18 @@ pub(crate) struct Peer {
     lo: u32,
     raw: i32,
     cap: i32,
+    /// Its address (VOID unless [`Peer::at`])
+    addr: [u8; 4],
 }
 
 impl Peer {
     pub(crate) fn new(t: &mut T) -> Option<Self> {
+        Self::at(t, VOID)
+    }
+
+    /// A peer at `addr` (another TEST-NET-1 address: Linux keeps
+    /// tcp_metrics per peer address)
+    pub(crate) fn at(t: &mut T, addr: [u8; 4]) -> Option<Self> {
         let Some(mut nl) = Nl::open() else {
             t.ok(b"netlink", false, 0);
             return None;
@@ -87,7 +95,7 @@ impl Peer {
         let r = route(
             &mut nl,
             true,
-            VOID,
+            addr,
             32,
             [0; 4],
             lo,
@@ -103,7 +111,13 @@ impl Peer {
         sll[2..4].copy_from_slice(&ETH_P_IP.to_be_bytes());
         sll[4..8].copy_from_slice(&(lo as i32).to_ne_bytes());
         let b = sys_bind(cap, sll.as_ptr(), 20);
-        let p = Self { nl, lo, raw, cap };
+        let p = Self {
+            nl,
+            lo,
+            raw,
+            cap,
+            addr,
+        };
         if !t.ok(b"sockets", raw >= 0 && cap >= 0 && b == 0, b) {
             return None;
         }
@@ -139,7 +153,7 @@ impl Peer {
             0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1,
         ]);
         p[2..4].copy_from_slice(&(n as u16).to_be_bytes());
-        p[12..16].copy_from_slice(&VOID);
+        p[12..16].copy_from_slice(&self.addr);
         let h = &mut p[20..n];
         h[0..2].copy_from_slice(&sport.to_be_bytes());
         h[2..4].copy_from_slice(&dport.to_be_bytes());
@@ -191,7 +205,7 @@ impl Peer {
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        route(&mut self.nl, false, VOID, 32, [0; 4], self.lo, 0);
+        route(&mut self.nl, false, self.addr, 32, [0; 4], self.lo, 0);
         close(self.raw);
         close(self.cap);
     }

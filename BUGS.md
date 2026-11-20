@@ -141,6 +141,12 @@ SYN queue (`TcpSock::child`), not Linux request socks (struct
 request_sock in ehash as TCP_NEW_SYN_RECV, inet_reqsk_alloc,
 reqsk_timer_handler): each costs a socket, and the request paths
 mirror tcp_check_req on the child's control block.
+No tcp_metrics (Linux tcp_metrics.c: the per-destination cache of
+RTT, cwnd and reordering, the TCP_METRICS genetlink family): new
+connections start from defaults (tcp_init_metrics), and no peer is
+proven for tcp_conn_request's last quarter of tcp_max_syn_backlog
+without SYN cookies (tcp_peer_is_proven), so it drops every new
+request there.
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are

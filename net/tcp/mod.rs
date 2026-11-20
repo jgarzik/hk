@@ -1026,12 +1026,12 @@ impl TcpSock {
             return;
         }
         let syncookies = self.sk.net.sysctl.tcp_syncookies.load(Ordering::Relaxed);
-        let (reqq_full, acceptq_full) = {
+        let (qlen, reqq_full, acceptq_full) = {
             let q = self.queue.lock();
             let Some(q) = q.as_ref() else {
                 return;
             };
-            (q.reqsk_full(), q.full())
+            (q.syn.len() as i32, q.reqsk_full(), q.full())
         };
         let mut want_cookie = false;
         if (syncookies == 2 || reqq_full) && isn == 0 {
@@ -1043,6 +1043,19 @@ impl TcpSock {
         }
         if acceptq_full {
             self.listen_overflow();
+            return;
+        }
+        // Linux: "Without syncookies last quarter of backlog is filled
+        // with destinations, proven to be alive" (tcp_peer_is_proven:
+        // hk keeps no tcp_metrics, so no peer is proven)
+        let max = self
+            .sk
+            .net
+            .sysctl
+            .tcp_max_syn_backlog
+            .load(Ordering::Relaxed);
+        if !want_cookie && isn == 0 && syncookies == 0 && max.wrapping_sub(qlen) < (max >> 2) {
+            self.listen_drop();
             return;
         }
         let opts = *self.listen_opts.lock();

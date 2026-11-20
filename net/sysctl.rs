@@ -39,6 +39,9 @@ pub struct NetSysctl {
     pub tcp_synack_retries: AtomicU8,
     /// SYN cookies: 0 never, 1 when the SYN queue is full, 2 always
     pub tcp_syncookies: AtomicU8,
+    /// Without SYN cookies, the last quarter of this many requests is
+    /// kept for proven peers (Linux sysctl_max_syn_backlog)
+    pub tcp_max_syn_backlog: AtomicI32,
     pub tcp_retries2: AtomicU8,
     /// tcp_fin_timeout in seconds
     pub tcp_fin_timeout: AtomicI32,
@@ -113,6 +116,7 @@ impl Default for NetSysctl {
             tcp_synack_retries: AtomicU8::new(5),
             // Linux tcp_sk_init
             tcp_syncookies: AtomicU8::new(1),
+            tcp_max_syn_backlog: AtomicI32::new(crate::net::tcp::table::max_syn_backlog()),
             tcp_retries2: AtomicU8::new(15),
             tcp_fin_timeout: AtomicI32::new(60),
             tcp_window_scaling: AtomicU8::new(1),
@@ -499,6 +503,14 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_u8(n, |s| &s.tcp_syncookies),
         store: |n, v| set_u8(n, |s| &s.tcp_syncookies, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_max_syn_backlog",
+        mode: 0o644,
+        global: false,
+        show: |n| get_i32(n, |s| &s.tcp_max_syn_backlog),
+        store: |n, v| set_int(n, |s| &s.tcp_max_syn_backlog, v, INT_MIN, INT_MAX),
         text: None,
     },
     NetCtl {
