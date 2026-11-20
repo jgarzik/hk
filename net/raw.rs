@@ -390,7 +390,7 @@ impl ProtoOps for RawSock {
             return Err(KernelError::OperationNotSupported);
         }
         let daddr = self.dest(m)?;
-        let c = udp::tx_cmsgs(&m.control)?;
+        let c = udp::tx_cmsgs(&self.sk.net, &m.control)?;
         let a = self.inet.get();
         let oif = if c.oif != 0 {
             c.oif
@@ -402,7 +402,12 @@ impl ProtoOps for RawSock {
         } else {
             c.saddr
         };
-        let rt = self.route(daddr, saddr, oif)?;
+        // Linux raw_sendmsg: a source route goes to its first hop (not
+        // with IP_HDRINCL, whose header the user wrote)
+        let opt = c
+            .opt(&self.inet, daddr)
+            .filter(|_| !self.inet.flag(ipf::HDRINCL));
+        let rt = self.route(ipv4::TxOpt::first_hop(&opt, daddr), saddr, oif)?;
         // Linux raw_sendmsg's do_confirm
         if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {
             route::confirm_neigh(&rt, daddr);
@@ -448,6 +453,7 @@ impl ProtoOps for RawSock {
         p.tos = c.tos.unwrap_or(p.tos);
         p.ttl = c.ttl.unwrap_or(p.ttl);
         p.confirm = flags & MSG_CONFIRM != 0;
+        p.opt = opt;
         match ipv4::ip_send_rt(&self.sk.net, &rt, skb, self.num as u8, p) {
             Err(KernelError::MessageTooLong) => {
                 let e = KernelError::MessageTooLong;

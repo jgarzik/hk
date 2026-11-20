@@ -183,7 +183,7 @@ pub fn deliver(
         m.name = Some(af_inet::sin_bytes(skb.saddr.unwrap_or_default(), cb.sport));
     }
     sock_cmsgs(sk, m, skb.tstamp, skb.dropcount);
-    inet.recv_cmsgs(&mut m.cmsg, &cb.info);
+    inet.recv_cmsgs(&sk.net, &mut m.cmsg, &cb.info, Some(skb));
     Ok(if flags & MSG_TRUNC != 0 {
         data.len()
     } else {

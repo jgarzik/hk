@@ -120,6 +120,8 @@ pub struct SkBuff {
     /// is confirmed as the packet goes out (Linux dst_pending_confirm,
     /// skb_set_dst_pending_confirm; sock_confirm_neigh)
     pub dst_pending_confirm: bool,
+    /// The received IP header's compiled options (Linux IPCB(skb)->opt)
+    pub ip_opt: crate::net::inet::options::OptMeta,
     /// Run when the skb is freed or orphaned (Linux skb->destructor
     /// with skb->sk: a TX ring frame's completion); not cloned
     pub destructor: Option<Box<dyn SkbDestructor>>,
@@ -433,6 +435,7 @@ impl SkBuff {
         self.owner = 0;
         self.csum_partial = false;
         self.dst_pending_confirm = false;
+        self.ip_opt = Default::default();
         self.destructor = None;
         self.mac = None;
         self.nh = None;
@@ -525,6 +528,7 @@ impl SkBuff {
             owner: self.owner,
             csum_partial: self.csum_partial,
             dst_pending_confirm: self.dst_pending_confirm,
+            ip_opt: self.ip_opt,
             destructor: None,
             mac: self.mac,
             nh: self.nh,

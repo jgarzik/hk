@@ -178,8 +178,13 @@ drop_*, disable_xfrm / disable_policy, promote_secondaries), and a
 change sends no RTM_NEWNETCONF (hk has no netconf messages). Of the
 neighbour sysctls (`net/core/neigh_sysctl.rs`) anycast_delay,
 interval_probe_time_ms and gc_interval are kept only.
-IP: no IP options on output (received options are
-validated and skipped; source-routed packets are dropped).
+IP options (`net/inet/options.rs`): UDP, raw and ping sockets send
+IP_OPTIONS / IP_RETOPTS, ICMP replies and errors echo a packet's, but
+TCP keeps IP_OPTIONS without sending them (no icsk_ext_hdr_len in its
+MSS, no echo in SYN-ACKs, resets and accepted children: Linux
+tcp_v4_save_options, ip_send_unicast_reply); a received source route
+with hops left is dropped (no forwarding: ip_options_rcv_srr,
+ip_forward_options), and CIPSO is always refused (no DOI support).
 IP_TRANSPARENT binds and sends from foreign addresses, but nothing
 steers foreign traffic to a transparent socket (no netfilter TPROXY;
 TCP resets of a transparent socket's connections are not sent

@@ -349,7 +349,7 @@ impl ProtoOps for PingSock {
             return Err(KernelError::InvalidArgument);
         }
         let daddr = self.dest(m)?;
-        let c = udp::tx_cmsgs(&m.control)?;
+        let c = udp::tx_cmsgs(&self.sk.net, &m.control)?;
         let a = self.inet.get();
         let oif = if c.oif != 0 {
             c.oif
@@ -361,7 +361,9 @@ impl ProtoOps for PingSock {
         } else {
             c.saddr
         };
-        let rt = self.route(daddr, saddr, oif)?;
+        // Linux ping_v4_sendmsg: a source route goes to its first hop
+        let opt = c.opt(&self.inet, daddr);
+        let rt = self.route(ipv4::TxOpt::first_hop(&opt, daddr), saddr, oif)?;
         // Linux ping_v4_sendmsg's do_confirm (len is never 0); then
         // ip_append_data sends nothing for a probe
         if flags & MSG_PROBE != 0 {
@@ -383,6 +385,7 @@ impl ProtoOps for PingSock {
         p.tos = c.tos.unwrap_or(p.tos);
         p.ttl = c.ttl.unwrap_or(p.ttl);
         p.confirm = flags & MSG_CONFIRM != 0;
+        p.opt = opt;
         match ipv4::ip_send_rt(&self.sk.net, &rt, skb, IPPROTO_ICMP, p) {
             Err(KernelError::MessageTooLong) => {
                 let e = KernelError::MessageTooLong;

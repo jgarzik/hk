@@ -347,14 +347,8 @@ pub fn ip_rcv(mut skb: Box<SkBuff>) {
             skb.len(),
         );
     }
-    match ip_options_check(&skb.data()[IP_HLEN_MIN..ihl]) {
-        Opts::Ok => {}
-        Opts::Bad => {
-            // Linux ip_rcv_options: ip_options_compile failed
-            net.mib.ip.inc(IPSTATS_MIB_INHDRERRORS);
-            return;
-        }
-        Opts::SourceRoute => return,
+    if ihl > IP_HLEN_MIN && !ip_rcv_options(&net, &dev, &mut skb, ihl) {
+        return;
     }
     let fo = u16::from_be_bytes([skb.data()[6], skb.data()[7]]);
     if fo & 0x3fff == 0 {
@@ -407,45 +401,75 @@ fn ip_rcv_core(net: &NetNamespace, skb: &mut SkBuff) -> Option<usize> {
     Some(ihl)
 }
 
-/// IP option types
-const IPOPT_END: u8 = 0;
-const IPOPT_NOOP: u8 = 1;
-const IPOPT_LSRR: u8 = 131;
-const IPOPT_SSRR: u8 = 137;
-
-/// What the options of a received packet allow (Linux ip_rcv_options)
-pub enum Opts {
-    Ok,
-    /// Malformed (ip_options_compile fails)
-    Bad,
-    /// Source routed: dropped (accept_source_route = 0)
-    SourceRoute,
-}
-
-/// Options are skipped, but must be well formed, and source-routed
-/// packets are dropped (Linux ip_options_compile + accept_source_route
-/// = 0)
-pub fn ip_options_check(opt: &[u8]) -> Opts {
-    let mut i = 0;
-    let mut srr = false;
-    while i < opt.len() {
-        match opt[i] {
-            IPOPT_END => break,
-            IPOPT_NOOP => i += 1,
-            t => {
-                let Some(&l) = opt.get(i + 1) else {
-                    return Opts::Bad;
-                };
-                let l = l as usize;
-                if l < 2 || i + l > opt.len() {
-                    return Opts::Bad;
-                }
-                srr |= t == IPOPT_LSRR || t == IPOPT_SSRR;
-                i += l;
+/// A received header's options (Linux ip_rcv_options): compiled, our
+/// record route and timestamp slots filled (the checksum redone); a
+/// malformed set is answered with a parameter problem and dropped
+/// (InHdrErrors). A source-routed packet is dropped unless both "all"
+/// and its device accept source routes (IN_DEV_SOURCE_ROUTE) and its
+/// route is spent: hk does not forward, so one with hops left is
+/// dropped (Linux ip_options_rcv_srr routes it on). Whether to go on.
+fn ip_rcv_options(
+    net: &NetNamespace,
+    dev: &crate::net::NetDevice,
+    skb: &mut SkBuff,
+    ihl: usize,
+) -> bool {
+    use crate::net::inet::devconf::ci;
+    use crate::net::inet::options;
+    let h = skb.data();
+    let saddr = Ipv4Addr::from_be_bytes([h[12], h[13], h[14], h[15]]);
+    let daddr = Ipv4Addr::from_be_bytes([h[16], h[17], h[18], h[19]]);
+    // Linux fib_compute_spec_dst: the address the packet was for, or
+    // ours facing the sender
+    let spec = || {
+        if net.fib.addr_type(daddr) == crate::net::inet::fib::RouteType::Local {
+            daddr
+        } else {
+            crate::net::inet::ifaddr::inet_select_addr(
+                net,
+                dev,
+                saddr,
+                crate::net::inet::ifaddr::RT_SCOPE_UNIVERSE,
+            )
+            .unwrap_or_default()
+        }
+    };
+    let at = |a| net.fib.addr_type(a);
+    let rcv = options::Rcv { spec_dst: &spec };
+    let m = match options::compile(&mut skb.data_mut()[..ihl], &rcv, &at) {
+        Ok(m) => m,
+        Err(pp) => {
+            net.mib.ip.inc(IPSTATS_MIB_INHDRERRORS);
+            skb.mark_network_header();
+            if let Some(o) = crate::net::icmp::Offender::of(skb) {
+                let info = (u32::from(pp) << 24).to_be_bytes();
+                let ty = crate::net::icmp::icmp_type::PARAMETERPROB;
+                crate::net::icmp::icmp_send(net, &o, ty, 0, info);
             }
+            return false;
+        }
+    };
+    if m.is_changed {
+        let h = skb.data_mut();
+        h[10] = 0;
+        h[11] = 0;
+        let c = ip_checksum(&h[..ihl]);
+        h[10..12].copy_from_slice(&c.to_be_bytes());
+    }
+    skb.ip_opt = m;
+    if m.srr != 0 {
+        let all = net.devconf_all.get(ci::ACCEPT_SOURCE_ROUTE) != 0;
+        let mine = dev.in_dev().cnf.get(ci::ACCEPT_SOURCE_ROUTE) != 0;
+        let s = usize::from(m.srr);
+        let h = skb.data();
+        // Linux ip_options_rcv_srr: unicast to us only; a spent route
+        // (pointer past its length) is delivered here
+        let spent = usize::from(h[s + 2]) > usize::from(h[s + 1]);
+        if !(all && mine) || skb.pkt_type != crate::net::ethernet::PktType::Host || !spent {
+            return false;
         }
     }
-    if srr { Opts::SourceRoute } else { Opts::Ok }
+    true
 }
 
 /// Deliver a whole datagram for us to its protocol (Linux
@@ -531,6 +555,34 @@ pub struct IpParams {
     /// Route from a source address that is not local (Linux
     /// FLOWI_FLAG_ANYSRC of inet_sk_flowi_flags)
     pub anysrc: bool,
+    /// Options for the header (Linux ipc.opt / inet_opt) and the
+    /// final destination a source route ends with
+    pub opt: Option<TxOpt>,
+}
+
+/// Options an outgoing header carries (Linux ip_options_build's opt
+/// and daddr)
+#[derive(Clone, Copy, Debug)]
+pub struct TxOpt {
+    pub opt: crate::net::inet::options::IpOptions,
+    pub daddr: Ipv4Addr,
+}
+
+impl TxOpt {
+    /// `opt` if it has any bytes, for a datagram to `daddr`
+    pub fn of(opt: Option<crate::net::inet::options::IpOptions>, daddr: Ipv4Addr) -> Option<Self> {
+        opt.filter(|o| o.m.optlen != 0)
+            .map(|opt| Self { opt, daddr })
+    }
+
+    /// Where the route goes: a source route's first hop, else `daddr`
+    /// (Linux udp_sendmsg's faddr)
+    pub fn first_hop(t: &Option<Self>, daddr: Ipv4Addr) -> Ipv4Addr {
+        match t {
+            Some(t) if t.opt.m.srr != 0 => t.opt.faddr,
+            _ => daddr,
+        }
+    }
 }
 
 impl Default for IpParams {
@@ -543,6 +595,7 @@ impl Default for IpParams {
             icmp_type: None,
             confirm: false,
             anysrc: false,
+            opt: None,
         }
     }
 }
@@ -586,7 +639,9 @@ pub fn ip_send_rt(
 ) -> Result<(), KernelError> {
     let src = skb.saddr.unwrap_or_default();
     let saddr = if src.is_unspecified() { rt.saddr } else { src };
-    let tot_len = IP_HLEN_MIN + skb.len();
+    let optlen = p.opt.map_or(0, |o| usize::from(o.opt.m.optlen));
+    let hlen = IP_HLEN_MIN + optlen;
+    let tot_len = hlen + skb.len();
     let mtu = p.mtu(rt);
     let frag = tot_len > mtu;
     if tot_len > u16::MAX as usize || (frag && !p.may_frag()) {
@@ -598,8 +653,8 @@ pub fn ip_send_rt(
         None if df => 0,
         None => select_ident(net, saddr, rt.daddr, protocol),
     };
-    let h = skb.push(IP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
-    h[0] = 0x45;
+    let h = skb.push(hlen).ok_or(KernelError::NoBufferSpace)?;
+    h[0] = 0x40 | (hlen / 4) as u8;
     h[1] = p.tos;
     h[2..4].copy_from_slice(&(tot_len as u16).to_be_bytes());
     h[4..6].copy_from_slice(&id.to_be_bytes());
@@ -611,10 +666,13 @@ pub fn ip_send_rt(
     h[11] = 0;
     h[12..16].copy_from_slice(&saddr.to_be_bytes());
     h[16..20].copy_from_slice(&rt.daddr.to_be_bytes());
-    let c = ip_checksum(&h[..IP_HLEN_MIN]);
+    if let Some(o) = &p.opt {
+        crate::net::inet::options::build(h, &o.opt, o.daddr, saddr);
+    }
+    let c = ip_checksum(&h[..hlen]);
     h[10..12].copy_from_slice(&c.to_be_bytes());
     if protocol == IPPROTO_ICMP
-        && let Some(ty) = p.icmp_type.or(skb.data().get(IP_HLEN_MIN).copied())
+        && let Some(ty) = p.icmp_type.or(skb.data().get(hlen).copied())
     {
         // Linux __ip_make_skb
         net.mib.icmp_out_count(ty);
@@ -680,8 +738,8 @@ fn ip_finish_output2(
     neigh_output(&rt.dev, rt, rt.nexthop(), skb)
 }
 
-/// Split an IP packet (no options are ever generated, so every fragment
-/// repeats the header) into fragments of at most `mtu` bytes (Linux
+/// Split an IP packet into fragments of at most `mtu` bytes, the first
+/// with the whole header, the rest with only its copied options (Linux
 /// ip_do_fragment slow path); ENOMEM if one cannot be allocated (Linux
 /// ip_frag_next)
 pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelError> {
@@ -692,13 +750,23 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
         return Err(KernelError::MessageTooLong);
     }
     let payload = &pkt[ihl..];
+    // Later fragments repeat only the copied options (Linux
+    // ip_options_fragment after the first)
+    let mut later = [0u8; 60];
+    later[..ihl].copy_from_slice(&pkt[..ihl]);
+    let mut m = crate::net::inet::options::OptMeta {
+        optlen: (ihl - IP_HLEN_MIN) as u8,
+        ..Default::default()
+    };
+    crate::net::inet::options::fragment(&mut later[..ihl], &mut m);
     let mut out = Vec::new();
     let mut off = 0;
     while off < payload.len() {
         let len = room.min(payload.len() - off);
         let more = off + len < payload.len();
         let mut f = SkBuff::alloc_tx(ihl + len, Gfp::ATOMIC).ok_or(KernelError::OutOfMemory)?;
-        f.put_slice(&pkt[..ihl]).ok_or(KernelError::OutOfMemory)?;
+        let hdr = if off == 0 { &pkt[..ihl] } else { &later[..ihl] };
+        f.put_slice(hdr).ok_or(KernelError::OutOfMemory)?;
         f.put_slice(&payload[off..off + len])
             .ok_or(KernelError::OutOfMemory)?;
         let h = f.data_mut();

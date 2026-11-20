@@ -116,6 +116,8 @@ struct Cork {
     /// MSG_CONFIRM of the send that corked it (Linux __ip_append_data
     /// marks the queue's first skb)
     confirm: bool,
+    /// Its options (Linux cork->opt, ip_setup_cork)
+    opt: Option<ipv4::TxOpt>,
 }
 
 /// A UDP socket
@@ -336,7 +338,8 @@ impl UdpSock {
             m.name = Some(af_inet::sin_bytes(skb.saddr.unwrap_or_default(), cb.sport));
         }
         dgram::sock_cmsgs(&self.sk, m, skb.tstamp, skb.dropcount);
-        self.inet.recv_cmsgs(&mut m.cmsg, &cb.info);
+        self.inet
+            .recv_cmsgs(&self.sk.net, &mut m.cmsg, &cb.info, Some(skb));
         Ok(if flags & crate::net::msg::MSG_TRUNC != 0 {
             ulen
         } else {
@@ -483,6 +486,7 @@ impl UdpSock {
         p.tos = c.tos;
         p.ttl = c.ttl.unwrap_or(p.ttl);
         p.confirm = c.confirm;
+        p.opt = c.opt;
         let sport = self.inet.get().sport;
         self.send_out(&c.rt, sport, c.dport, &c.data, p, c.gso)
     }
@@ -615,16 +619,27 @@ fn send_err(e: KernelError, recverr: bool) -> Option<KernelError> {
 }
 
 /// Per-message IP parameters from sendmsg control data (Linux
-/// ip_cmsg_send: IP_PKTINFO, IP_TTL, IP_TOS)
+/// ip_cmsg_send: IP_RETOPTS, IP_PKTINFO, IP_TTL, IP_TOS)
 #[derive(Default)]
 pub struct TxCmsg {
     pub oif: u32,
     pub saddr: Ipv4Addr,
     pub ttl: Option<u8>,
     pub tos: Option<u8>,
+    /// IP_RETOPTS: options for this datagram (Linux ipc->opt)
+    pub opt: Option<crate::net::inet::options::IpOptions>,
 }
 
-pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
+impl TxCmsg {
+    /// The datagram's options to `daddr`: the message's, else the
+    /// socket's (Linux udp_sendmsg / raw_sendmsg: ipc.opt, else a copy
+    /// of inet_opt)
+    pub fn opt(&self, inet: &Inet, daddr: Ipv4Addr) -> Option<ipv4::TxOpt> {
+        ipv4::TxOpt::of(self.opt.or_else(|| inet.options()), daddr)
+    }
+}
+
+pub fn tx_cmsgs(net: &crate::net::NetNamespace, c: &[u8]) -> Result<TxCmsg, KernelError> {
     let mut t = TxCmsg::default();
     for r in cmsgs(c) {
         let (level, ty, d) = r?;
@@ -648,6 +663,11 @@ pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
             }
         };
         match ty {
+            // Linux ip_cmsg_send: at most 40 bytes of it
+            af_inet::IP_RETOPTS => {
+                let n = d.len().min(crate::net::inet::options::MAX_OPTLEN);
+                t.opt = Some(af_inet::options_get(net, &d[..n])?);
+            }
             IP_PKTINFO => {
                 if d.len() != 12 {
                     return Err(KernelError::InvalidArgument);
@@ -879,7 +899,7 @@ impl ProtoOps for UdpSock {
         }
         let (daddr, dport, _connected) = self.dest(m)?;
         let gso = self.cmsg_gso(&m.control)?;
-        let c = tx_cmsgs(&m.control)?;
+        let c = tx_cmsgs(&self.sk.net, &m.control)?;
         let data = m.data.take(len)?;
         let a: InetAddr = self.inet.get();
         let oif = if c.oif != 0 {
@@ -892,7 +912,9 @@ impl ProtoOps for UdpSock {
         } else {
             c.saddr
         };
-        let rt = self.route(daddr, saddr, oif)?;
+        // Linux udp_sendmsg: a source route goes to its first hop
+        let opt = c.opt(&self.inet, daddr);
+        let rt = self.route(ipv4::TxOpt::first_hop(&opt, daddr), saddr, oif)?;
         // Linux udp_sendmsg's do_confirm; then ip_make_skb or
         // ip_append_data send nothing for a probe
         if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {
@@ -912,6 +934,7 @@ impl ProtoOps for UdpSock {
             p.tos = c.tos.unwrap_or(p.tos);
             p.ttl = c.ttl.unwrap_or(p.ttl);
             p.confirm = flags & MSG_CONFIRM != 0;
+            p.opt = opt;
             self.send_out(&rt, a.sport, dport, &data, p, gso)?;
             return Ok(len);
         }
@@ -934,6 +957,7 @@ impl ProtoOps for UdpSock {
             len: 0,
             data: Vec::new(),
             confirm: flags & MSG_CONFIRM != 0,
+            opt,
         });
         self.pending.store(true, Ordering::Relaxed);
         self.append(&mut g, &data, len + UDP_HLEN, corkreq)?;

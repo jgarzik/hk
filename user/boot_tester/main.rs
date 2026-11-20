@@ -423,6 +423,7 @@ pub fn run_all_tests() {
     net::icmp::run_ping_tests();
     net::raw::run_tests();
     net::icmp_ts::run_tests();
+    net::ipopts::run_tests();
     net::packet::run_tests();
     net::packet_ring::run_tests();
     net::packet_fanout::run_tests();

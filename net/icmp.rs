@@ -492,8 +492,14 @@ fn icmp_reply(
     };
     // A broadcast request is answered from our address on that link
     let saddr = if skb.ip_bcast { Ipv4Addr(0) } else { dst };
+    // Linux icmp_reply: the request's options echoed (none sent if
+    // they cannot be), a source route followed back
+    let Some(opt) = echo_opts(net, skb.network_packet(), &skb.ip_opt) else {
+        return;
+    };
+    let opt = ipv4::TxOpt::of(Some(opt), src);
     // Linux icmp_reply: no reply without a route
-    let Ok(rt) = route::output(net, src, saddr, 0) else {
+    let Ok(rt) = route::output(net, ipv4::TxOpt::first_hop(&opt, src), saddr, 0) else {
         return;
     };
     if !xrlim_allow(net, &rt, src, now, apply) {
@@ -524,6 +530,7 @@ fn icmp_reply(
     let p = IpParams {
         tos: skb.ip_tos,
         icmp_type: Some(icmp_type::ECHO_REPLY),
+        opt,
         ..Default::default()
     };
     if ipv4::ip_send_rt(net, &rt, out, IPPROTO_ICMP, p).is_err() {
@@ -666,6 +673,8 @@ pub struct Offender<'a> {
     pub host: bool,
     /// Addressed to a broadcast address (RTCF_BROADCAST)
     pub bcast: bool,
+    /// Its compiled options (Linux IPCB(skb)->opt)
+    pub opt: crate::net::inet::options::OptMeta,
 }
 
 impl<'a> Offender<'a> {
@@ -676,6 +685,7 @@ impl<'a> Offender<'a> {
             in_lo: skb.dev.as_ref().is_some_and(|d| d.is_loopback()),
             host: skb.pkt_type == PktType::Host,
             bcast: skb.ip_bcast,
+            opt: skb.ip_opt,
         })
     }
 }
@@ -730,7 +740,14 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
     } else {
         Ipv4Addr(0)
     };
-    let Ok(rt) = route::output(net, src, saddr, 0) else {
+    // Linux __icmp_send: the offender's options echoed (no error if
+    // they cannot be), a source route followed back
+    let Some(opt) = echo_opts(net, Some(p), &o.opt) else {
+        return;
+    };
+    let optlen = usize::from(opt.m.optlen);
+    let opt = ipv4::TxOpt::of(Some(opt), src);
+    let Ok(rt) = route::output(net, ipv4::TxOpt::first_hop(&opt, src), saddr, 0) else {
         return;
     };
     if matches!(rt.rtype, RouteType::Broadcast | RouteType::Multicast) {
@@ -743,7 +760,7 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
     // quote; Linux __icmp_send's room is an int that goes negative)
     let room = (rt.mtu as usize)
         .min(576)
-        .saturating_sub(IP_HLEN_MIN + ICMP_HLEN);
+        .saturating_sub(IP_HLEN_MIN + optlen + ICMP_HLEN);
     if room <= IP_HLEN_MIN {
         return;
     }
@@ -753,7 +770,28 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
     } else {
         p[1]
     };
-    xmit(net, &rt, ty, code, rest, quote, tos);
+    let p = IpParams {
+        tos,
+        pmtudisc: pmtu::DONT,
+        opt,
+        ..Default::default()
+    };
+    xmit(net, &rt, ty, code, rest, quote, p);
+}
+
+/// The options a reply to the packet `pkt` (from its IP header) with
+/// compiled options `m` carries (Linux ip_options_echo); None when they
+/// cannot be echoed, an empty set without options
+fn echo_opts(
+    net: &NetNamespace,
+    pkt: Option<&[u8]>,
+    m: &crate::net::inet::options::OptMeta,
+) -> Option<crate::net::inet::options::IpOptions> {
+    if m.optlen == 0 {
+        return Some(Default::default());
+    }
+    let at = |a| net.fib.addr_type(a);
+    crate::net::inet::options::echo(pkt?, m, &at).ok()
 }
 
 /// Build and send an ICMP message along `rt`
@@ -764,7 +802,7 @@ fn xmit(
     code: u8,
     rest: [u8; 4],
     data: &[u8],
-    tos: u8,
+    p: IpParams,
 ) {
     let Some(mut skb) = SkBuff::alloc_tx(ICMP_HLEN + data.len(), Gfp::ATOMIC) else {
         // Linux icmp_push_reply: ip_append_data failed
@@ -784,11 +822,6 @@ fn xmit(
     skb.data_mut()[2..4].copy_from_slice(&c.to_be_bytes());
     skb.saddr = Some(rt.saddr);
     skb.daddr = Some(rt.daddr);
-    let p = IpParams {
-        tos,
-        pmtudisc: pmtu::DONT,
-        ..Default::default()
-    };
     if ipv4::ip_send_rt(net, rt, skb, IPPROTO_ICMP, p).is_err() {
         // Linux ip_push_pending_frames -> ip_send_skb
         net.mib.out_discard();
@@ -820,6 +853,9 @@ pub fn link_failure(skb: &SkBuff) {
         in_lo: false,
         host: true,
         bcast: false,
+        // hk keeps no compiled options with it (Linux IPCB(skb)->opt):
+        // the error carries none
+        opt: Default::default(),
     };
     icmp_send(
         &net,
@@ -838,6 +874,9 @@ pub fn frag_expired(net: &NetNamespace, first: &[u8]) {
         in_lo: false,
         host: true,
         bcast: false,
+        // hk keeps no compiled options with it (Linux IPCB(skb)->opt):
+        // the error carries none
+        opt: Default::default(),
     };
     icmp_send(
         net,

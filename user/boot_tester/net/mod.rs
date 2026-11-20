@@ -6,6 +6,7 @@ pub mod fib_flush;
 pub mod fib_rules;
 pub mod icmp;
 pub mod icmp_ts;
+pub mod ipopts;
 pub mod neigh;
 pub mod neigh_sysctl;
 pub mod net_stress;
