@@ -264,7 +264,7 @@ impl Drop for FutexQ {
 /// `q` is on `b`, whose lock the caller holds (`list`).
 unsafe fn wake_mark(b: &FutexHashBucket, list: &mut List<QAdapter>, q: &FutexQ, wq: &mut WakeQ) {
     // SAFETY: the waiter is alive while its entry is queued
-    let t = crate::task::percpu::task_ref(unsafe { &*q.task });
+    let t = crate::task::tasklist::task_ref(unsafe { &*q.task });
     // SAFETY: see above
     unsafe { list.remove(q) };
     b.dec_waiters();
@@ -397,7 +397,7 @@ fn futex_bucket(key: &FutexKey) -> &'static FutexHashBucket {
 // Robust Futex Support - uses Task.robust_list field via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASKLIST;
+use crate::task::tasklist::TASKLIST;
 
 /// Robust list head structure (matches Linux ABI)
 #[repr(C)]

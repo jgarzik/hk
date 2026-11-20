@@ -2,7 +2,7 @@
 //! do_notify_parent_cldstop in kernel/signal.c)
 
 use super::{SIGCHLD, SendInfo, SigFields, SigHandler, SigInfo, Signal, sa_flags};
-use crate::task::percpu::{GlobalTaskTable, TaskRef};
+use crate::task::tasklist::{GlobalTaskTable, TaskRef};
 use crate::task::{Task, Tid};
 
 /// SIGCHLD info for child `t` with `code` (CLD_*) and `status`: its
@@ -51,16 +51,16 @@ pub fn notify_parent_cldstop(
     };
     let (tsk, parent) = if for_ptracer {
         (
-            crate::task::percpu::task_ref(t),
-            v.tracer().map(crate::task::percpu::task_ref),
+            crate::task::tasklist::task_ref(t),
+            v.tracer().map(crate::task::tasklist::task_ref),
         )
     } else {
         let Some(l) = table.get(t.pid) else {
             return;
         };
         (
-            crate::task::percpu::task_ref(l.task),
-            l.real_parent().map(crate::task::percpu::task_ref),
+            crate::task::tasklist::task_ref(l.task),
+            l.real_parent().map(crate::task::tasklist::task_ref),
         )
     };
     let Some(parent) = parent else {
@@ -162,10 +162,10 @@ impl Zombie {
 fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let tid = z.tid();
     let t = table.get(tid)?;
-    let real = t.real_parent().map(crate::task::percpu::task_ref);
+    let real = t.real_parent().map(crate::task::tasklist::task_ref);
     let tracer = match z {
         Zombie::Detached(_) => None,
-        _ => t.tracer().map(crate::task::percpu::task_ref),
+        _ => t.tracer().map(crate::task::tasklist::task_ref),
     };
     let traced = tracer.is_some();
     let parent = tracer.or(real.clone())?;

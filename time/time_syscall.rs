@@ -159,6 +159,7 @@ pub fn tai_offset_ns() -> i128 {
 /// caller's own tid
 fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64, KernelError> {
     use crate::task::percpu;
+    use crate::task::tasklist;
     use crate::time::cpu_timer::{Sample, cpu_clock_sample, group_sample};
     let pid = clock_pid(pid).ok_or(KernelError::InvalidArgument)?;
     let me = percpu::current_tid();
@@ -172,7 +173,7 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
         // Found and sampled under RCU (Linux posix_cpu_clock_get:
         // pid_task, cpu_clock_sample under rcu_read_lock)
         let g = crate::sync::rcu::read_lock();
-        let t = percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+        let t = tasklist::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
             .ok_or(KernelError::InvalidArgument)?;
         if t.pid != percpu::current_pid() {
             return Err(KernelError::InvalidArgument);
@@ -187,7 +188,7 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
         // A group leader's, found under RCU (Linux pid_for_clock:
         // find_task_by_vpid, has_group_leader_pid)
         let g = crate::sync::rcu::read_lock();
-        let t = percpu::pid_ns_task(pid, &crate::ns::INIT_PID_NS, &g);
+        let t = tasklist::pid_ns_task(pid, &crate::ns::INIT_PID_NS, &g);
         let t = t
             .filter(|t| t.pid == pid)
             .ok_or(KernelError::InvalidArgument)?;
@@ -198,7 +199,7 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
     let c = match sig {
         Some(sig) => group_sample(&sig, tgid),
         None => {
-            let table = percpu::TASKLIST.read();
+            let table = tasklist::TASKLIST.read();
             crate::task::cputime::thread_group_cputime(&table, tgid)
         }
     };

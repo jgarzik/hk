@@ -24,8 +24,9 @@ use crate::fs::File;
 use crate::fs::flags::{O_ACCMODE, O_WRONLY};
 use crate::signal::{SIGCONT, SIGHUP, SignalStruct, kill_pgrp_pid};
 use crate::sync::spin::Mutex;
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, current_pid, current_sid};
+use crate::task::percpu::{current_pid, current_sid};
 use crate::task::pid::Pid;
+use crate::task::tasklist::{GlobalTaskTable, TASKLIST};
 use crate::util::error::KernelError;
 
 /// Serializes controlling-tty changes

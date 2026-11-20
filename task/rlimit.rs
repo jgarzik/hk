@@ -271,9 +271,9 @@ pub fn sys_prlimit64(
         Some(new_rlim_ptr.read()?)
     };
     let target = if pid == 0 {
-        crate::task::percpu::task_ref(&current())
+        crate::task::tasklist::task_ref(&current())
     } else {
-        crate::task::percpu::find_task_by_vpid(pid as u64).ok_or(KernelError::NoProcess)?
+        crate::task::tasklist::find_task_by_vpid(pid as u64).ok_or(KernelError::NoProcess)?
     };
     check_prlimit_permission(&target)?;
     if resource as usize >= RLIM_NLIMITS {

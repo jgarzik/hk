@@ -13,7 +13,7 @@ use super::super::mount::{
 };
 use super::super::name::mangle;
 use crate::ns::MntNamespace;
-use crate::task::percpu::TaskRef;
+use crate::task::tasklist::TaskRef;
 use crate::util::error::KernelError;
 use alloc::sync::Arc;
 

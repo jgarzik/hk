@@ -158,7 +158,7 @@ pub const MAX_ERRNO: u32 = 4095;
 // Task Exit Cleanup
 // =============================================================================
 
-use crate::task::percpu::TASKLIST;
+use crate::task::tasklist::TASKLIST;
 
 /// Clean up task `t`'s seccomp state when it exits
 ///

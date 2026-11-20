@@ -120,7 +120,7 @@ fn process_vm_rw_core(
         return Ok(0);
     }
     let target =
-        crate::task::percpu::find_task_by_vpid(pid as Pid).ok_or(KernelError::NoProcess)?;
+        crate::task::tasklist::find_task_by_vpid(pid as Pid).ok_or(KernelError::NoProcess)?;
     let mm = access_mm(&target)?;
     let mut buf = crate::util::kmem::try_vec(PVM_CHUNK, 0u8)?;
     // The target's mmap_lock is held per remote access only, never

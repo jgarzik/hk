@@ -1321,7 +1321,7 @@ syscall entry stack top, set at each switch to a user task.
 
 ### 3.1.1 Task Struct and Credentials
 
-**Location:** `task/mod.rs`, `task/percpu.rs`, `task/cred.rs`
+**Location:** `task/mod.rs`, `task/tasklist.rs`, `task/cred.rs`
 
 A global `TASKLIST: RwLock<GlobalTaskTable>` (Linux tasklist_lock: read
 for lookups and walks, write for any change) protects the task list and
@@ -1335,7 +1335,7 @@ serializes wakers (3.1), the siglock of its handler table owns its signal state
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: the intrusive `RcuList` `TASKS` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, changed only under the write lock (list_add_tail_rcu, list_del_rcu: the reference goes a grace period after the unlink, `RcuUnlinked::defer`), walked under TASKLIST (`GlobalTaskTable::iter`) or an RCU read guard (`percpu::for_each_task_rcu`, Linux for_each_process_thread under rcu_read_lock: PRIO_USER's set/getpriority, whose per-task work takes only spin locks); found by tid through the pid hash (`Pid.task`, an `RcuPtr` set and cleared under the write lock, read under it or an RCU read guard) |
+| `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task: the intrusive `RcuList` `TASKS` (Linux init_task.tasks) holding a `TaskRef` (`Arc<Task>`) each, changed only under the write lock (list_add_tail_rcu, list_del_rcu: the reference goes a grace period after the unlink, `RcuUnlinked::defer`), walked under TASKLIST (`GlobalTaskTable::iter`) or an RCU read guard (`tasklist::for_each_task_rcu`, Linux for_each_process_thread under rcu_read_lock: PRIO_USER's set/getpriority, whose per-task work takes only spin locks); found by tid through the pid hash (`Pid.task`, an `RcuPtr` set and cleared under the write lock, read under it or an RCU read guard) |
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw, `TaskCred`) | Credentials (Linux real_cred/cred, `__rcu`): replaced only by the task, published with Release, the old reference dropped a grace period later (`put_rcu`); read by the task lock-free, by others under an RCU read guard (Credential Handling) |
 | `Task.cred_override` | `Arc<Cred>` (raw) or null | Override credentials, the task's own (no lock) |
@@ -1407,7 +1407,7 @@ caller's number to its `Pid` or root number (`pid::find_vpid`,
 `from_vnr`, `find_pgrp(ns, nr)`: ESRCH if not visible) through the
 hash before TASKLIST is taken, or to its task with no TASKLIST, under
 one RCU read guard (Linux rcu_read_lock; find_task_by_vpid /
-pid_task): `percpu::vpid_task`, `pid_ns_task` borrow it for the
+pid_task): `tasklist::vpid_task`, `pid_ns_task` borrow it for the
 guard, `find_task_by_vpid`, `find_task_by_pid_ns`, `find_task` and,
 from a held `Pid`, `get_pid_task` take a reference (get_task_struct,
 `task_ref`: the list's reference keeps its count). Every pid argument
@@ -6515,7 +6515,7 @@ this is the interrupt-safety invariant:
 
 | Lock | Location | Type | Reason |
 |------|----------|------|--------|
-| `TASKLIST` | task/percpu.rs | `RwLock` | every task (Linux tasklist_lock) |
+| `TASKLIST` | task/tasklist.rs | `RwLock` | every task (Linux tasklist_lock) |
 | `SigHand.siglock` | signal/mod.rs | `Mutex` | Linux sighand->siglock: `Task.sighand` and thread list changes, a send, thread walks (after TASKLIST, before SignalStruct.jobctl; 3.7) |
 | `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over SigHand.siglock) |
 | `FsStruct.seq` | fs/fsstruct.rs | `SeqLock` | Root, cwd, umask (leaf; Linux fs->seq): writers and reference-taking readers lock, RCU walks read root/pwd under its sequence |

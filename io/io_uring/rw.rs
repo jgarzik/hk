@@ -36,8 +36,8 @@ use crate::fs::file::{File, RwFlags};
 use crate::fs::iov::IoVec;
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::mm::gup::{PageSeg, PinnedPages, PinnedSlice};
-use crate::task::percpu::TaskRef;
 use crate::task::percpu::current;
+use crate::task::tasklist::TaskRef;
 use crate::task::{Cred, override_creds};
 use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, KernelResult};
@@ -450,7 +450,7 @@ impl Req {
             link: Link::new(),
             ring: r.clone(),
             tctx: tctx.clone(),
-            task: crate::task::percpu::task_ref(&current()),
+            task: crate::task::tasklist::task_ref(&current()),
             creds: current().cred_arc(),
             user_data: sqe.user_data,
             skip_success: sqe.flags & IOSQE_CQE_SKIP_SUCCESS != 0,

@@ -80,8 +80,8 @@ fn copy_ns_info(m: &crate::ns::MntNamespace, to: u64, usize: usize) -> Result<()
 /// namespace (FROM) or in `ns` (IN); ESRCH if there is none or it has
 /// no number there
 fn pidns_ioctl(ns: &NsRef, cmd: u32, arg: u64) -> Result<i64, KernelError> {
-    use crate::task::percpu::{find_task_by_pid_ns, find_task_by_vpid};
     use crate::task::pid::{nr_ns, vnr};
+    use crate::task::tasklist::{find_task_by_pid_ns, find_task_by_vpid};
     let NsRef::Pid(p) = ns else {
         return Err(KernelError::InvalidArgument);
     };

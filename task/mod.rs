@@ -10,6 +10,7 @@ pub mod membarrier;
 pub mod pidfd;
 pub(crate) mod rlimit;
 pub mod task_work;
+pub mod tasklist;
 pub mod wake_q;
 pub mod workqueue;
 
@@ -418,7 +419,7 @@ pub fn nproc_exec_check() -> KernelResult<()> {
     let me = percpu::current();
     // rlimit() takes TASKLIST: decide before locking it
     let over = nproc_overlimit(&current_cred().ucounts);
-    let table = percpu::TASKLIST.read();
+    let table = tasklist::TASKLIST.read();
     let Some(t) = table.view(&me) else {
         return Ok(());
     };
@@ -982,8 +983,8 @@ pub struct Task {
     /// TASKLIST's write lock, the old reference dropped a
     /// grace period later (Linux free_pid -> delayed_put_pid); read
     /// under its read lock or an RCU read guard
-    pub pgrp: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
-    pub session: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    pub pgrp: crate::sync::rcu::RcuLockedArc<pid::Pid, tasklist::GlobalTaskTable>,
+    pub session: crate::sync::rcu::RcuLockedArc<pid::Pid, tasklist::GlobalTaskTable>,
     /// Releases the task list's reference a grace period after it is
     /// unlisted (type invariant)
     rcu: crate::sync::rcu::RcuHead,
@@ -993,14 +994,14 @@ pub struct Task {
     /// (`put_rcu`); read under TASKLIST or an RCU read guard. Set in
     /// the section that lists the task, cleared at release (a zombie
     /// keeps it, Linux __exit_signal).
-    pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, percpu::GlobalTaskTable>,
+    pub(crate) sighand: crate::sync::rcu::RcuLockedArc<SigHand, tasklist::GlobalTaskTable>,
     /// Its process identifier (Linux task->thread_pid; None for the idle
     /// tasks, tid 0): set before the task is listed, exchanged by
     /// de_thread (exchange_tids) and cleared at release (detach_pid)
     /// under TASKLIST's write lock, the replaced reference dropped a
     /// grace period later; read under TASKLIST or an RCU read guard
     /// (task_pid_nr_ns)
-    pub thread_pid: crate::sync::rcu::RcuLockedArc<pid::Pid, percpu::GlobalTaskTable>,
+    pub thread_pid: crate::sync::rcu::RcuLockedArc<pid::Pid, tasklist::GlobalTaskTable>,
     /// Ptrace flags (Linux task->ptrace: PT_PTRACED, PT_SEIZED,
     /// PT_SYSCALL_TRACE, PT_SINGLESTEP; 0: not traced): written under
     /// TASKLIST's write lock (a `TaskViewMut`), read with a Relaxed load
@@ -1224,7 +1225,7 @@ impl TaskInner {
 
 /// Data owned by the TASKLIST lock: reached through a borrow of the
 /// locked table
-pub type TableCell<T> = crate::sync::LockedBy<T, crate::task::percpu::GlobalTaskTable>;
+pub type TableCell<T> = crate::sync::LockedBy<T, crate::task::tasklist::GlobalTaskTable>;
 
 /// The adapter of `Task.sibling` (children lists)
 pub struct Sibling;
@@ -1833,7 +1834,7 @@ impl Task {
 
     /// Its real parent, TASKLIST held (Linux real_parent under
     /// tasklist_lock); none once it has left the task list
-    pub fn parent_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+    pub fn parent_locked<'a>(&'a self, table: &'a tasklist::GlobalTaskTable) -> Option<&'a Task> {
         let _ = table;
         if !self.tasks_link.is_listed() {
             return None;
@@ -1847,7 +1848,7 @@ impl Task {
     /// Its real parent becomes `p` (TASKLIST held for writing: Linux
     /// rcu_assign_pointer(real_parent) under tasklist_lock); `p` is
     /// listed (the type invariant)
-    pub fn set_parent(&self, p: Option<&Task>, table: &mut percpu::GlobalTaskTable) {
+    pub fn set_parent(&self, p: Option<&Task>, table: &mut tasklist::GlobalTaskTable) {
         let _ = table;
         debug_assert!(p.is_none_or(|p| p.tasks_link.is_listed()));
         // INVARIANT: `p` is listed (the callers'), under the write lock
@@ -1879,7 +1880,7 @@ impl Task {
 
     /// Its tracer, TASKLIST held (Linux task->parent of a ptraced task
     /// under tasklist_lock); none if not traced or no longer listed
-    pub fn tracer_locked<'a>(&'a self, table: &'a percpu::GlobalTaskTable) -> Option<&'a Task> {
+    pub fn tracer_locked<'a>(&'a self, table: &'a tasklist::GlobalTaskTable) -> Option<&'a Task> {
         let _ = table;
         if !self.tasks_link.is_listed() {
             return None;
@@ -2530,7 +2531,7 @@ impl Drop for NprocCharge {
 fn flag_nproc_exceeded(new: &Cred) {
     let over = new.uid != 0 && nproc_overlimit(&new.ucounts);
     let me = percpu::current();
-    let table = percpu::TASKLIST.read();
+    let table = tasklist::TASKLIST.read();
     if let Some(t) = table.view(&me) {
         if over {
             t.task.set_flag(crate::task::pf::NPROC_EXCEEDED);
@@ -2741,7 +2742,7 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 
 /// Set task `t`'s clear_child_tid pointer
 pub fn set_clear_child_tid(t: &Task, addr: u64) {
-    let mut table = percpu::TASKLIST.write();
+    let mut table = tasklist::TASKLIST.write();
     if let Some(mut task) = table.view_mut(t) {
         task.clear_child_tid = addr;
     }
@@ -2756,7 +2757,7 @@ pub fn set_clear_child_tid(t: &Task, addr: u64) {
 
 /// Get and remove task `t`'s set_child_tid pointer (one-time use)
 pub fn get_set_child_tid(t: &Task) -> Option<u64> {
-    let mut table = percpu::TASKLIST.write();
+    let mut table = tasklist::TASKLIST.write();
     if let Some(mut task) = table.view_mut(t) {
         let addr = task.set_child_tid;
         if addr != 0 {
@@ -2770,7 +2771,7 @@ pub fn get_set_child_tid(t: &Task) -> Option<u64> {
 /// Set task `t`'s set_child_tid pointer
 pub fn set_set_child_tid(t: &Task, addr: u64) {
     if addr != 0 {
-        let mut table = percpu::TASKLIST.write();
+        let mut table = tasklist::TASKLIST.write();
         if let Some(mut task) = table.view_mut(t) {
             task.set_child_tid = addr;
         }

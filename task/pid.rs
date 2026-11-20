@@ -28,7 +28,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::ns::{Namespace, PidNamespace};
 use crate::sync::spin::Mutex;
-use crate::task::percpu::{GlobalTaskTable, PgrpLink, SessionLink};
+use crate::task::tasklist::GlobalTaskTable;
+use crate::task::tasklist::{PgrpLink, SessionLink};
 use crate::util::rcuhlist::RcuHListBare;
 
 /// Ids per bitmap page (Linux BITS_PER_PAGE)
@@ -161,7 +162,7 @@ impl Pid {
 
     /// The task it names, no reference taken (Linux pid_task(pid,
     /// PIDTYPE_PID) under rcu_read_lock): it stays allocated while `g`
-    /// is held; `percpu::task_ref` takes a reference (get_task_struct)
+    /// is held; `tasklist::task_ref` takes a reference (get_task_struct)
     pub fn task<'a>(
         &'a self,
         g: &'a crate::sync::rcu::RcuReadGuard,
@@ -179,7 +180,7 @@ impl Pid {
     /// tasklist_lock): listed for the borrow of the table
     pub fn task_locked<'t>(
         &self,
-        table: &'t crate::task::percpu::GlobalTaskTable,
+        table: &'t crate::task::tasklist::GlobalTaskTable,
     ) -> Option<&'t crate::task::Task> {
         let _ = table;
         // SAFETY: a target is listed (the field's rule) and stays so
@@ -194,7 +195,7 @@ impl Pid {
     pub fn set_task(
         &self,
         t: Option<&crate::task::Task>,
-        table: &mut crate::task::percpu::GlobalTaskTable,
+        table: &mut crate::task::tasklist::GlobalTaskTable,
     ) {
         let _ = table;
         // INVARIANT: the caller's: a listed (or joining) task, under the

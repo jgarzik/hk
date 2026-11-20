@@ -410,7 +410,8 @@ use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSE
 /// number or a user pointer, by option.
 pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> KernelResult<i64> {
     use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
-    use crate::task::percpu::{TASKLIST, current_tid};
+    use crate::task::percpu::current_tid;
+    use crate::task::tasklist::TASKLIST;
 
     let tid = current_tid();
     let int_ptr = UserPtr::<i32>::new(arg2);

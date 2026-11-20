@@ -4,9 +4,10 @@
 
 use super::fork::{do_clear_child_tid, signal_vfork_done};
 use super::percpu::{
-    GlobalTaskTable, TASKLIST, TaskRef, TaskView, Times, current, current_pgid, current_pid,
-    current_pid_ns, current_tid, do_task_dead, rusage_both, task_ref,
+    Times, current, current_pgid, current_pid, current_pid_ns, current_tid, do_task_dead,
+    rusage_both,
 };
+use super::tasklist::{GlobalTaskTable, TASKLIST, TaskRef, TaskView, task_ref};
 use crate::signal::notify::{Told, Zombie, notify};
 use crate::task::{Pid, Task, TaskState, Tid};
 use alloc::sync::Arc;

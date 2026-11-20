@@ -13,8 +13,10 @@
 use crate::signal::jobctl::{LISTENING, PTRACE_FROZEN, TRACED, TRAP_NOTIFY, TRAP_STOP};
 use crate::signal::stop::Why;
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP, Signal};
-use crate::task::percpu::TaskRef;
-use crate::task::percpu::{self, TASKLIST};
+use crate::task::percpu;
+use crate::task::tasklist;
+use crate::task::tasklist::TASKLIST;
+use crate::task::tasklist::TaskRef;
 use crate::task::{CAP_SYS_PTRACE, Pid, Task, TaskState, capable};
 use crate::uaccess::{UserPtr, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
@@ -188,7 +190,7 @@ fn attach_refused(t: &Task) -> bool {
 /// The thread `pid` names in the caller's pid namespace (Linux
 /// find_task_by_vpid): ESRCH if none
 fn tracee(pid: Pid) -> KernelResult<TaskRef> {
-    percpu::find_task_by_vpid(pid).ok_or(KernelError::NoProcess)
+    tasklist::find_task_by_vpid(pid).ok_or(KernelError::NoProcess)
 }
 
 /// Check if tracee is stopped and caller is its tracer.
@@ -307,7 +309,7 @@ fn ptrace_traceme() -> KernelResult<i64> {
         // leaves it untraced, still 0)
         task.real_parent()
             .filter(|p| !p.has_flag(crate::task::pf::EXITING))
-            .map(percpu::task_ref)
+            .map(tasklist::task_ref)
     };
     if let Some(p) = &parent
         && let Some(mut task) = table.view_mut(&me)
@@ -1071,7 +1073,7 @@ pub fn ptrace_signal(info: &mut crate::signal::SigInfo, sig: Signal) -> Option<S
 /// woken there (ptrace_signal_wake_up), its code left alone: a stop its
 /// tracer never waited for still delivers its signal, one it did (code
 /// 0) none, a detach's the one PTRACE_DETACH gave
-pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
+pub(crate) fn ptrace_unlink(t: &mut tasklist::TaskViewMut<'_>) {
     t.set_ptrace(0);
     t.set_tracer(None);
     t.ptrace_options = 0;
@@ -1112,7 +1114,7 @@ fn detach_live(me: &crate::task::Task) -> bool {
         return false;
     };
     let exitkill = v.ptrace_options & PTRACE_O_EXITKILL != 0;
-    let t = percpu::task_ref(v.task);
+    let t = tasklist::task_ref(v.task);
     if exitkill {
         // Linux send_sig_info(SIGKILL, SEND_SIG_PRIV)
         let kernel = signal::SendInfo::Kernel;
@@ -1226,14 +1228,14 @@ fn may_access_view(t: &Task, fscreds: bool) -> bool {
 /// equal all of the target's real, effective and saved ids, or the
 /// caller has CAP_SYS_PTRACE; and a non-dumpable target with an address
 /// space needs CAP_SYS_PTRACE too (get_dumpable(mm) != SUID_DUMP_USER)
-pub fn may_access(pick: impl Fn(&percpu::TaskView<'_>) -> bool, fscreds: bool) -> bool {
+pub fn may_access(pick: impl Fn(&tasklist::TaskView<'_>) -> bool, fscreds: bool) -> bool {
     let target = TASKLIST.read().find(|t| pick(t)).map(|v| access_ids(&v));
     access_ok(target, fscreds)
 }
 
 /// What the access check reads of a target (TASKLIST held): its
 /// credentials and its address space's dumpability, if it has one
-fn access_ids(v: &percpu::TaskView<'_>) -> (crate::task::Cred, Option<u8>) {
+fn access_ids(v: &tasklist::TaskView<'_>) -> (crate::task::Cred, Option<u8>) {
     (v.cred(), v.task.task_lock().mm().map(|m| m.dumpable()))
 }
 

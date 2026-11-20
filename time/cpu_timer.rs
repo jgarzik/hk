@@ -187,7 +187,7 @@ fn past(c: &TaskCputime, next: &[AtomicU64; 3]) -> bool {
 /// leave the group's accounting as they found it.
 pub fn group_sample(sig: &crate::signal::SignalStruct, pid: crate::task::Pid) -> TaskCputime {
     sig.cputimer.totals().unwrap_or_else(|| {
-        let table = crate::task::percpu::TASKLIST.read();
+        let table = crate::task::tasklist::TASKLIST.read();
         crate::task::cputime::thread_group_cputime(&table, pid)
     })
 }
@@ -210,7 +210,7 @@ pub fn thread_sample(tid: Tid, s: Sample) -> Option<u64> {
     // Found and sampled under RCU (Linux cpu_timer_task_rcu,
     // cpu_clock_sample under rcu_read_lock)
     let g = crate::sync::rcu::read_lock();
-    crate::task::percpu::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
+    crate::task::tasklist::pid_ns_task(tid, &crate::ns::INIT_PID_NS, &g)
         .map(|t| cpu_clock_sample(t, s))
 }
 
@@ -241,9 +241,9 @@ pub fn arm(clock: CpuClock, at: u64) {
             // recomputes the hint), so a pass under way cannot erase it
             let me = crate::task::percpu::current();
             let task = if me.tid() == tid {
-                Some(crate::task::percpu::task_ref(&me))
+                Some(crate::task::tasklist::task_ref(&me))
             } else {
-                crate::task::percpu::find_task(tid)
+                crate::task::tasklist::find_task(tid)
             };
             let (Some(t), Some(g)) = (task, crate::signal::current_signal()) else {
                 return;

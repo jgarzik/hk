@@ -2,10 +2,8 @@
 //! steps, io threads, and the child-tid and vfork completion a child
 //! signals when it releases its mm.
 
-use super::percpu::{
-    Cur, TASKLIST, TaskRef, current, current_pt_regs, current_tid, policy_class, task_ref,
-    wake_up_new_task,
-};
+use super::percpu::{Cur, current, current_pt_regs, current_tid, policy_class, wake_up_new_task};
+use super::tasklist::{TASKLIST, TaskRef, task_ref};
 use crate::arch::{ArchPageTable, ContextOps, CpuOps, CurrentArch, FrameAlloc, SchedArch};
 use crate::printkln;
 use crate::task::sched;

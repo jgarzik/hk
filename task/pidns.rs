@@ -11,7 +11,7 @@
 
 use crate::ns::PidNamespace;
 use crate::task::Task;
-use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef, task_ref};
+use crate::task::tasklist::{GlobalTaskTable, TASKLIST, TaskRef, task_ref};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -146,7 +146,7 @@ pub fn reboot_pid_ns(cmd: u32) -> Option<crate::util::error::KernelError> {
 /// the namespace's idr from 2); collected under TASKLIST's read lock
 /// with room made before it (nothing allocates under it)
 fn ns_tasks(ns: &PidNamespace, pid: crate::task::Pid) -> Vec<TaskRef> {
-    let mine = |t: &crate::task::percpu::TaskView<'_>| {
+    let mine = |t: &crate::task::tasklist::TaskView<'_>| {
         t.task.pid != pid
             && crate::signal::task_live(t)
             && t.thread_pid_ref().is_some_and(|p| p.nr_in(ns).is_some())

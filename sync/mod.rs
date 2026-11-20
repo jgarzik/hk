@@ -42,7 +42,8 @@ pub use sole::{Sole, SoleCell, Word};
 mod sched {
     pub use crate::sync::waitqueue::signal_pending_state;
     use crate::task::Task;
-    pub use crate::task::percpu::{TaskRef, get_ticks, schedule, set_current_state};
+    pub use crate::task::percpu::{get_ticks, schedule, set_current_state};
+    pub use crate::task::tasklist::TaskRef;
     pub use crate::task::wake_q::WakeQ;
 
     /// The caller is a task that may sleep (not tid 0: an idle task or
@@ -77,7 +78,7 @@ mod sched {
     /// holds the lock's wait lock), so the task is alive.
     pub unsafe fn waiter_ref(t: *const Task) -> TaskRef {
         // SAFETY: alive (the caller); a waiter is never the boot task
-        crate::task::percpu::task_ref(unsafe { &*t })
+        crate::task::tasklist::task_ref(unsafe { &*t })
     }
 }
 

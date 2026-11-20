@@ -289,7 +289,7 @@ pub fn do_signal_stop(signr: Option<Signal>) -> bool {
     let Some(sig_struct) = me.cpu_group().cloned() else {
         return false;
     };
-    let table = crate::task::percpu::TASKLIST.read();
+    let table = crate::task::tasklist::TASKLIST.read();
     let Some(mv) = table.view(&me) else {
         return false;
     };
@@ -376,7 +376,7 @@ pub fn do_jobctl_trap() {
         return;
     };
     let seized = {
-        let table = crate::task::percpu::TASKLIST.read();
+        let table = crate::task::tasklist::TASKLIST.read();
         table.view(&me).is_some_and(|v| v.ptrace() & PT_SEIZED != 0)
     };
     let rcu = crate::sync::rcu::read_lock();
@@ -447,13 +447,13 @@ pub fn notify_cld() {
         g.flags &= !flags::CLD_MASK;
         why
     };
-    let table = crate::task::percpu::TASKLIST.read();
+    let table = crate::task::tasklist::TASKLIST.read();
     super::notify::notify_parent_cldstop(&table, &me, false, why);
     if let Some(l) = table.get(me.pid)
         && l.ptrace() != 0
         && l.tracer().is_some_and(|tr| tr.pid != l.ppid())
     {
-        let leader = crate::task::percpu::task_ref(l.task);
+        let leader = crate::task::tasklist::task_ref(l.task);
         super::notify::notify_parent_cldstop(&table, &leader, true, why);
     }
 }
@@ -466,7 +466,7 @@ pub fn notify_cld() {
 /// the parent
 pub fn exit_participate() {
     let me = crate::task::percpu::current();
-    let table = crate::task::percpu::TASKLIST.read();
+    let table = crate::task::tasklist::TASKLIST.read();
     let Some(sg) = super::lock_sighand_in(&me, &table) else {
         me.set_flag(crate::task::pf::EXITING);
         return;

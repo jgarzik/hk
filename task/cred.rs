@@ -1,7 +1,8 @@
 //! Credential switches (Linux kernel/cred.c): commit_creds' publish and
 //! the current task's id setters the set*id syscalls build on.
 
-use super::percpu::{TASKLIST, current, current_cred};
+use super::percpu::{current, current_cred};
+use super::tasklist::TASKLIST;
 use crate::ns::Namespace;
 use crate::task::{Cred, Task};
 use crate::util::error::KernelError;

@@ -22,7 +22,7 @@ use core::fmt::Write;
 use crate::fs::KernelError;
 use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
 use crate::ns::PidNamespace;
-use crate::task::percpu::{TASKLIST, TaskRef};
+use crate::task::tasklist::{TASKLIST, TaskRef};
 use crate::task::{Cred, Pid, Task, TaskKind, TaskState};
 
 /// Linux PF_KTHREAD / PF_EXITING (stat field 9)

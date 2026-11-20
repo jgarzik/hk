@@ -11,7 +11,8 @@ use alloc::vec::Vec;
 
 use crate::arch::{FrameAlloc, PageFlags, PageTable, phys_to_virt};
 
-use super::percpu::{self, TASKLIST, TaskRef, task_ref};
+use super::percpu;
+use super::tasklist::{TASKLIST, TaskRef, task_ref};
 use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 use crate::task::{Task, TaskState};

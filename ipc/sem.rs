@@ -173,7 +173,7 @@ unsafe fn complete(q: *const SemQueue, r: KernelResult<()>, wq: &mut WakeQ) {
     // has not returned (the caller)
     let q = unsafe { &*q };
     // SAFETY: the sleeper is in semop until it sees the status
-    let t = crate::task::percpu::task_ref(unsafe { &*q.sleeper });
+    let t = crate::task::tasklist::task_ref(unsafe { &*q.sleeper });
     q.status.store(status_code(r), Ordering::Release);
     wq.add_safe(t);
 }
@@ -1415,7 +1415,7 @@ fn find_alloc_undo(
 // Task SemUndo accessors - uses Task.sysvsem field directly via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASKLIST;
+use crate::task::tasklist::TASKLIST;
 
 /// Task `t`'s undo list, created if it has none (Linux get_undo_list):
 /// allocated before TASKLIST, which is checked again

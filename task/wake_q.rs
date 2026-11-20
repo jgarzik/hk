@@ -17,7 +17,8 @@ use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
 
 use super::Task;
-use super::percpu::{TaskRef, WakeMode, try_to_wake_up};
+use super::percpu::{WakeMode, try_to_wake_up};
+use super::tasklist::TaskRef;
 
 /// `Task.wake_q` of the last task queued (Linux WAKE_Q_TAIL): non-null,
 /// never a task's address
