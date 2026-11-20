@@ -303,17 +303,16 @@ fn send_skb(
             return Err(KernelError::BrokenPipe);
         }
         if urg {
-            queue_oob(other, skb)
+            let old = queue_oob(other, skb);
+            // Under unix_state_lock, as Linux queue_oob
+            other.sk.send_sigurg();
+            old
         } else {
             queue(other, skb);
             None
         }
     };
     drop(old);
-    if urg {
-        // After unix_state_lock (Linux sends it under it)
-        other.sk.send_sigurg();
-    }
     other.sk.data_ready();
     Ok(())
 }

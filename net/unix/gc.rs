@@ -338,7 +338,9 @@ pub fn del_edges(fpl: &mut FpList) {
 }
 
 /// An embryo's listener holds it until accepted (Linux unix_stream_connect
-/// newu->listener = other), set under the sockets' `st`
+/// newu->listener = other), set under the sockets' `st`. Linux writes
+/// it without unix_gc_lock (the embryo is not in the graph yet); the
+/// cell is the graph's, so this takes `UNIX_GC` (doc/LOCKING.md)
 pub fn set_listener(embryo: &UnixSock, listener: &Arc<UnixSock>) {
     let mut g = lock();
     *embryo.listener.access_mut(&mut g) = Some(listener.clone());
