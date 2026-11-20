@@ -179,6 +179,9 @@ pub struct UnixCb {
     /// Bytes already read (stream; Linux UNIXCB.consumed): written
     /// under `iolock`
     consumed: AtomicUsize,
+    /// A zero-length datagram was peeked: a peek at offset 0 passes it
+    /// from now on (Linux skb->peeked)
+    peeked: AtomicBool,
     /// A listener's pending connection (Linux: the embryo is skb->sk)
     pub embryo: Option<Arc<UnixSock>>,
 }
@@ -197,6 +200,7 @@ fn unix_skb(from: &Arc<UnixSock>, data: Vec<u8>) -> Result<SkBuff, KernelError> 
         creds: None,
         fp: Mutex::new(None),
         consumed: AtomicUsize::new(0),
+        peeked: AtomicBool::new(false),
         embryo: None,
     })?;
     let mut skb = SkBuff::from_vec(data);
@@ -1104,6 +1108,17 @@ impl ProtoOps for UnixSock {
         a.set_state(ESTABLISHED);
         b.set_state(ESTABLISHED);
         Ok(())
+    }
+
+    /// Linux sk_set_peek_off (unix_stream_ops, unix_dgram_ops,
+    /// unix_seqpacket_ops)
+    fn set_peek_off(&self, val: i32) -> Option<Result<(), KernelError>> {
+        self.sk.set_peek_off(val);
+        Some(Ok(()))
+    }
+
+    fn has_set_peek_off(&self) -> bool {
+        true
     }
 
     /// Only stream sockets raise SIGPIPE (Linux unix_stream_sendmsg;

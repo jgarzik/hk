@@ -871,6 +871,12 @@ impl<A: OwnerAdapter, P: RefPtr<Target = A::Item>> OwnedList<A, P> {
         self.list.front()
     }
 
+    /// The last entry, borrowed for as long as the list is (Linux
+    /// skb_peek_tail)
+    pub fn last(&self) -> Option<&A::Item> {
+        self.list.back()
+    }
+
     /// A new reference to the first entry
     pub fn front(&self) -> Option<P> {
         // SAFETY: inserted with `into_raw`; the list holds that

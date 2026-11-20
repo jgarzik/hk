@@ -282,24 +282,55 @@ pub fn seqpacket_recvmsg(
 /// MSG_PEEK; its files taken (or copied for MSG_PEEK)
 struct Rx {
     skb: Arc<SkBuff>,
+    /// Where the copy starts (a peek offset into this message)
+    skip: usize,
     creds: Option<Creds>,
     fds: Option<FpList>,
 }
 
-/// Take (or reference, with MSG_PEEK) the head message; a dequeue
-/// makes room for blocked or polling senders. The caller holds
-/// `iolock`, so only it takes the files.
-fn take(s: &UnixSock, peek: bool) -> Option<Rx> {
-    let skb = if peek {
-        s.rq.peek()?
-    } else {
-        let mut q = s.rq.lock();
+/// Linux __skb_try_recv_from_queue: the head message taken off, or
+/// for MSG_PEEK a reference to the message at the peek offset `off`
+/// (-1: the head), whole messages before it skipped (a zero-length
+/// one once it was peeked); `off` becomes the offset into it
+fn try_recv(s: &UnixSock, peek: bool, off: &mut i32) -> Option<Arc<SkBuff>> {
+    let mut q = s.rq.lock();
+    if !peek {
         let skb = q.pop_front()?;
         s.inq_len.fetch_sub(unix_len(&skb), Ordering::AcqRel);
-        drop(q);
+        *off = 0;
+        return Some(skb);
+    }
+    let at_off = *off >= 0;
+    let mut o = if at_off { *off as usize } else { 0 };
+    let mut cur = q.front();
+    while let Some(skb) = cur {
+        let cb = ucb(&skb);
+        if at_off && o >= skb.len() && (o != 0 || cb.peeked.load(Ordering::Relaxed)) {
+            o -= skb.len();
+            // A reference the queue also holds: not the last one
+            cur = q.next(&skb);
+            continue;
+        }
+        if skb.is_empty() {
+            // Linux skb_set_peeked
+            cb.peeked.store(true, Ordering::Relaxed);
+        }
+        *off = o as i32;
+        return Some(skb);
+    }
+    None
+}
+
+/// Take (or reference, with MSG_PEEK) the message at the peek offset;
+/// a dequeue makes room for blocked or polling senders. The caller
+/// holds `iolock`, so only it takes the files.
+fn take(s: &UnixSock, flags: i32) -> Option<Rx> {
+    let peek = flags & MSG_PEEK != 0;
+    let mut off = s.sk.peek_offset(flags);
+    let skb = try_recv(s, peek, &mut off)?;
+    if !peek {
         s.relay_wake();
-        skb
-    };
+    }
     let fds = if peek {
         peek_fds(&skb)
     } else {
@@ -307,6 +338,7 @@ fn take(s: &UnixSock, peek: bool) -> Option<Rx> {
     };
     Some(Rx {
         creds: ucb(&skb).creds.clone(),
+        skip: off as usize,
         fds,
         skb,
     })
@@ -328,7 +360,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
         }
         {
             let _io = s.iolock.lock();
-            if let Some(rx) = take(s, flags & MSG_PEEK != 0) {
+            if let Some(rx) = take(s, flags) {
                 return deliver(s, m, flags, rx);
             }
         }
@@ -358,7 +390,9 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
     }
 }
 
-/// Copy one message out with its address and ancillary data
+/// Copy one message out with its address and ancillary data, from
+/// the peek offset; the offset moves past what a peek copied, back by
+/// what a read took (Linux sk_peek_offset_fwd / _bwd)
 fn deliver(
     s: &UnixSock,
     m: &mut RecvMsg<'_>,
@@ -368,12 +402,17 @@ fn deliver(
     if m.want_name {
         m.name = ucb(&rx.skb).wmem.from.addr().map(|a| a.name.clone());
     }
-    let n = rx.skb.len();
+    let n = rx.skb.len() - rx.skip;
     let size = n.min(m.data.len());
     if size < n {
         m.flags |= MSG_TRUNC;
     }
-    m.data.put(0, &rx.skb.data()[..size])?;
+    m.data.put(0, &rx.skb.data()[rx.skip..rx.skip + size])?;
+    if flags & MSG_PEEK != 0 {
+        s.sk.peek_offset_fwd(size as i32);
+    } else {
+        s.sk.peek_offset_bwd(rx.skb.len() as i32);
+    }
     super::scm_recv(s, m, rx.creds.take(), rx.fds.take());
     drop(rx);
     Ok(if flags & MSG_TRUNC != 0 { n } else { size })

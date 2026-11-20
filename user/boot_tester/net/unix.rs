@@ -139,7 +139,7 @@ fn uname(fd: i32, peer: bool) -> (i64, u32, [u8; 128]) {
     (r, len, b)
 }
 
-fn pair(t: i32) -> (i32, i32) {
+pub fn pair(t: i32) -> (i32, i32) {
     let mut sv = [-1i32; 2];
     sys_socketpair(AF_UNIX, t, 0, &mut sv);
     (sv[0], sv[1])

@@ -5978,10 +5978,9 @@ NetNamespace tables (RwLocks; lookups drop the guard before returning);
 **AF_UNIX** (`net/unix/`, Linux af_unix.c order). Sockets talk
 directly: a sender queues a message on the receiver's `rq` while
 holding the receiver's `st`, after copying the data in with no lock
-held; readers copy out under `iolock` only, and take an end (error,
-shutdown) seen with the queue empty only if `rq` is still empty after
-it (a peer queues before it shuts down; Linux tests both under
-`unix_state_lock`). Messages (and the files
+held; a stream reader holds `iolock`, finds the skb to copy (and,
+finding none, tests error and shutdown) under its own `st`, and copies
+with only `iolock` held (Linux unix_stream_read_generic). Messages (and the files
 they carry) are dropped only with no spinlock held: dropping a file
 can release a socket, which takes its own and its peer's `st`.
 Each file's release is deferred (`fput`, 3.3 Descriptor Tables), so a
