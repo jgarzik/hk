@@ -375,7 +375,7 @@ Extended attributes:
 
 10.4 Misc security / sandboxing
 
-- [x] seccomp (STRICT, FILTER; no TRACE, USER_NOTIF)
+- [x] seccomp (STRICT, FILTER, TRACE; no USER_NOTIF)
 - [x] prctl (subset)
 
 11. Namespaces, containers, mounts, cgroups

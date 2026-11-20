@@ -21,6 +21,11 @@
 //!   stop, the EXEC event and the execve exit stop come in that order,
 //!   the last two still naming execve as the syscall (x86 orig_rax:
 //!   Linux start_thread keeps it)
+//! - PTRACE_EVENT_SECCOMP: with PTRACE_O_TRACESECCOMP a filter's
+//!   SECCOMP_RET_TRACE stops the tracee (SIGTRAP | PTRACE_EVENT_SECCOMP
+//!   << 8, the filter's data its message); resumed, the syscall runs;
+//!   a tracer that sets any negative syscall number there skips it,
+//!   its return value what the tracer left (x86: PTRACE_SETREGS)
 
 use crate::harness::verdict;
 use hk_syscall::{
@@ -33,6 +38,8 @@ const PTRACE_SYSCALL: i64 = 24;
 const PTRACE_O_TRACESYSGOOD: u64 = 1;
 const PTRACE_O_TRACEEXEC: u64 = 1 << 4;
 const PTRACE_EVENT_EXEC: i32 = 4;
+const PTRACE_O_TRACESECCOMP: u64 = 1 << 7;
+const PTRACE_EVENT_SECCOMP: i32 = 7;
 const PTRACE_SETOPTIONS: i64 = 0x4200;
 const PTRACE_GETEVENTMSG: i64 = 0x4201;
 const PTRACE_GETSIGINFO: i64 = 0x4202;
@@ -68,6 +75,45 @@ pub fn run_tests() {
         r => r,
     };
     verdict(b"PTRACE_EVENT_EXEC", r == 0, r);
+    let r = match event_seccomp() {
+        0 => seccomp_skip(),
+        r => r,
+    };
+    verdict(b"PTRACE_EVENT_SECCOMP", r == 0, r);
+}
+
+/// getppid under a filter that traces it: the syscall still runs once
+/// the tracer resumes
+fn seccomp_kid() -> ! {
+    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    const RET_TRACE: u32 = 0x7ff0_0000;
+    let parent = hk_syscall::sys_getppid();
+    if hk_syscall::sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+        || super::seccomp::install(RET_TRACE | 0x42, 0) != 0
+    {
+        sys_exit(8);
+    }
+    sys_exit(if hk_syscall::sys_getppid() == parent {
+        0
+    } else {
+        9
+    })
+}
+
+fn event_seccomp() -> i64 {
+    let c = traced_child(PTRACE_O_TRACESECCOMP, seccomp_kid);
+    if c < 0 {
+        return 1;
+    }
+    sys_ptrace(PTRACE_CONT, c, 0, 0);
+    let st = wait(c);
+    if !stopped(st, SIGTRAP, PTRACE_EVENT_SECCOMP) {
+        return 1000 + i64::from(st);
+    }
+    if event_msg(c) != 0x42 {
+        return 2000 + event_msg(c) as i64;
+    }
+    finish(c, 3000)
 }
 
 /// Exec `busybox true`
@@ -268,6 +314,47 @@ fn orig_nr(pid: i64) -> Option<i64> {
 #[cfg(target_arch = "aarch64")]
 fn orig_nr(_pid: i64) -> Option<i64> {
     None
+}
+
+/// A child whose filter traces getppid: at the PTRACE_EVENT_SECCOMP
+/// stop its tracer sets the syscall number to -2 (any negative skips
+/// it, Linux __seccomp_filter) and the return value to 0; getppid then
+/// returns 0 (x86: PTRACE_SETREGS; arm64 has only SETREGSET)
+#[cfg(target_arch = "x86_64")]
+fn seccomp_skip() -> i64 {
+    const PTRACE_GETREGS: i64 = 12;
+    const PTRACE_SETREGS: i64 = 13;
+    let c = traced_child(PTRACE_O_TRACESECCOMP, || {
+        const PR_SET_NO_NEW_PRIVS: i32 = 38;
+        const RET_TRACE: u32 = 0x7ff0_0000;
+        if hk_syscall::sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || super::seccomp::install(RET_TRACE, 0) != 0
+        {
+            sys_exit(8);
+        }
+        sys_exit(if hk_syscall::sys_getppid() == 0 { 0 } else { 9 })
+    });
+    if c < 0 {
+        return 11;
+    }
+    sys_ptrace(PTRACE_CONT, c, 0, 0);
+    let st = wait(c);
+    if !stopped(st, SIGTRAP, PTRACE_EVENT_SECCOMP) {
+        return 11_000 + i64::from(st);
+    }
+    let mut r = [0u64; REGS];
+    sys_ptrace(PTRACE_GETREGS, c, 0, r.as_mut_ptr() as u64);
+    r[15] = -2i64 as u64;
+    r[10] = 0;
+    if sys_ptrace(PTRACE_SETREGS, c, 0, r.as_ptr() as u64) != 0 {
+        return 12;
+    }
+    finish(c, 13_000)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn seccomp_skip() -> i64 {
+    0
 }
 
 /// Wait for `pid` (any kind of child): its status, or -1

@@ -382,8 +382,7 @@ No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 **Location**: `seccomp/`
 
-No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
-user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
+No user notification (SECCOMP_RET_USER_NOTIF; FLAG_NEW_LISTENER and
 FLAG_WAIT_KILLABLE_RECV are EINVAL), and nothing is logged for RET_LOG
 or FLAG_LOG.
 

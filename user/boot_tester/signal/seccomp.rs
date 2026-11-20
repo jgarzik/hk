@@ -98,7 +98,7 @@ const AUDIT_ARCH: u32 = 0xc000_003e;
 const AUDIT_ARCH: u32 = 0xc000_00b7;
 
 /// Install "getppid -> `action`, else ALLOW" with `flags`
-fn install(action: u32, flags: u32) -> i64 {
+pub(super) fn install(action: u32, flags: u32) -> i64 {
     let prog = [
         ins(LD_W_ABS, 0, 0, 0),
         ins(JEQ_K, 0, 1, SYS_GETPPID as u32),

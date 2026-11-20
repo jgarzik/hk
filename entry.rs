@@ -122,7 +122,9 @@ pub fn syscall_enter_from_user_mode(regs: &UserFrame) -> u64 {
         regs.set_ret(ret);
         return u64::MAX;
     }
-    nr
+    // Read again: a tracer's PTRACE_EVENT_SECCOMP stop may have changed
+    // it (Linux syscall_trace_enter returns syscall_get_nr after seccomp)
+    regs.syscall_nr()
 }
 
 /// Nothing may be held on the way to user mode: no spin lock (each
