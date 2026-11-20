@@ -331,6 +331,15 @@ impl<'a> Attrs<'a> {
         }
     }
 
+    /// Payload of attribute `ty` of at most `max` bytes (Linux
+    /// NLA_BINARY with a length); ERANGE if longer
+    pub fn max(&self, ty: u16, max: usize) -> Result<Option<&'a [u8]>, KernelError> {
+        match self.get(ty) {
+            Some(p) if p.len() > max => Err(self.policy_err(p)),
+            r => Ok(r),
+        }
+    }
+
     /// u32 attribute (NLA_U32); ERANGE if present but too short
     pub fn u32(&self, ty: u16) -> Result<Option<u32>, KernelError> {
         Ok(self

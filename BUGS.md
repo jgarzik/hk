@@ -698,10 +698,15 @@ reproduced, cause unknown.
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 
-**Location**: `net/netlink/rtnetlink.rs`, `net/devioctl.rs`
+**Location**: `net/netlink/rtnetlink.rs`, `net/core/neigh_nl.rs`, `net/devioctl.rs`
 
-No notifications for neighbour state changes (no RTNLGRP_NEIGH); no
-proxy ARP entries, NTF_USE or NDA_PROTOCOL.
+Neighbour entries keep no NTF_* flags: NTF_ROUTER, NTF_EXT_LEARNED,
+NTF_MANAGED and NTF_EXT_VALIDATED of RTM_NEWNEIGH are ignored (Linux
+stores and reports them, and probes managed entries periodically);
+ndm_type is always RTN_UNICAST (Linux arp_constructor types local and
+broadcast keys) and nda_cacheinfo.ndm_refcnt 0. Proxy entries are a
+table only: ARP does not answer for them yet (Linux arp_process's
+pneigh_lookup and proxy_queue).
 Missing, each answered with a Linux errno rather than silently: link
 creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
 (EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),

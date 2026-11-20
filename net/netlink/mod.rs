@@ -895,6 +895,26 @@ pub fn notify(net: &NetNamespace, protocol: i32, skb: SkBuff, portid: u32, repor
     }
 }
 
+/// Report `err` on every socket of `protocol` in `net` subscribed to
+/// `group` (Linux netlink_set_err): ENOBUFS spares those with
+/// NETLINK_NO_ENOBUFS
+pub fn set_err(net: &NetNamespace, protocol: i32, group: u32, err: KernelError) {
+    if group == 0 || group > 64 || !(0..MAX_LINKS as i32).contains(&protocol) {
+        return;
+    }
+    let bit = 1u64 << (group - 1);
+    let g = crate::sync::rcu::read_lock();
+    for s in net.nl.mc(protocol).iter_ref(&g).map(|s| s.item()) {
+        if s.groups_all() & bit == 0 {
+            continue;
+        }
+        if err == KernelError::NoBufferSpace && s.has_flag(sflags::NO_ENOBUFS) {
+            continue;
+        }
+        s.sk.set_err(err);
+    }
+}
+
 /// References to the sockets on `list`, for a broadcast whose clones
 /// may sleep: sized under the table lock, allocated with no lock, then
 /// filled under RCU without allocating; again if the list grew

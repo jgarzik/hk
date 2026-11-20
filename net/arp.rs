@@ -25,6 +25,7 @@ use crate::net::ipv4::{self, Ipv4Addr};
 use crate::net::neigh::{
     self, HASH_RND, Key, Lladdr, NeighCb, NeighOps, NeighTable, Neighbour, nud, upd,
 };
+use crate::net::pneigh::PneighEntry;
 use crate::net::skb::SkBuff;
 
 /// ARP hardware type: Ethernet
@@ -335,7 +336,7 @@ fn arp_process(skb: Box<SkBuff>) {
             } else {
                 0
             };
-            tbl.update(&n, Some(sha), state, flags);
+            let _ = tbl.update(&n, Some(sha), state, flags, 0);
         }
     }
 }
@@ -345,7 +346,7 @@ fn arp_process(skb: Box<SkBuff>) {
 fn neigh_event_ns(dev: &Arc<NetDevice>, sip: Ipv4Addr, sha: Lladdr) {
     let tbl = arp_tbl();
     if let Ok(n) = tbl.create(dev, &neigh::key4(sip), false) {
-        tbl.update(&n, Some(sha), nud::STALE, upd::OVERRIDE);
+        let _ = tbl.update(&n, Some(sha), nud::STALE, upd::OVERRIDE, 0);
     }
 }
 
@@ -437,10 +438,11 @@ fn send_arp_reply(
 /// ATF_* flags of /proc/net/arp (Linux arp_state_to_flags)
 const ATF_COM: u32 = 0x02;
 const ATF_PERM: u32 = 0x04;
+const ATF_PUBL: u32 = 0x08;
 
 /// `/proc/net/arp` (Linux arp_seq_show; NOARP entries are hidden):
-/// `net`'s entries, walked under RCU into a fixed
-/// buffer (Linux neigh_seq_start's rcu_read_lock)
+/// `net`'s entries, then its proxy entries, walked under RCU into a
+/// fixed buffer (Linux neigh_seq_start's rcu_read_lock)
 pub fn proc_net_arp(net: &crate::net::NetNamespace) -> Vec<u8> {
     crate::fs::proc::seq::generate(|m| {
         let _ = m.write_str(
@@ -450,7 +452,27 @@ pub fn proc_net_arp(net: &crate::net::NetNamespace) -> Vec<u8> {
         for n in arp_tbl().iter_rcu(&g).filter(|n| n.dev.net_is(net)) {
             arp_format_neigh_entry(m, n);
         }
+        let pn = arp_tbl().phash.iter(&g, net);
+        for n in pn {
+            arp_format_pneigh_entry(m, n);
+        }
     })
+}
+
+/// A proxy entry's line (Linux arp_format_pneigh_entry)
+fn arp_format_pneigh_entry(m: &mut crate::fs::proc::seq::SeqBuf, n: &PneighEntry) {
+    let hatype = n.dev.as_ref().map_or(0, |d| d.link().dev_type);
+    let ip = Ipv4Addr::from_be_bytes([n.key[0], n.key[1], n.key[2], n.key[3]]);
+    m.setwidth(16);
+    let _ = write!(m, "{}", ip);
+    m.pad(' ');
+    let _ = writeln!(
+        m,
+        "0x{:<10x}0x{:<10x}00:00:00:00:00:00     *        {}",
+        hatype,
+        ATF_PUBL | ATF_PERM,
+        n.dev.as_ref().map_or("*", |d| d.name())
+    );
 }
 
 /// One entry's line (Linux arp_format_neigh_entry)

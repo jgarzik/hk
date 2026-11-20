@@ -3,7 +3,7 @@
 //!
 //! Requests are dispatched by message type and family: links (any
 //! family), IPv4 addresses and routes (AF_INET), the ARP neighbour
-//! table (RTM_{NEW,DEL,GET}NEIGH) and the IPv4 rule dump. AF_INET6
+//! table (RTM_{NEW,DEL,GET}NEIGH, `neigh_nl`) and the IPv4 rule dump. AF_INET6
 //! requests get empty dumps (no IPv6 addresses/routes exist yet; rule
 //! dumps are EAFNOSUPPORT) and EAFNOSUPPORT for changes. NEW/DEL/SET
 //! need CAP_NET_ADMIN.
@@ -31,7 +31,7 @@ use crate::net::inet::ifaddr::{
 };
 use crate::net::inet::route;
 use crate::net::ipv4::Ipv4Addr;
-use crate::net::neigh::{self, NeighInfo, nud};
+use crate::net::neigh_nl::{self, NeighFilter};
 use crate::net::rtnl::{self, RtnlGuard};
 use crate::ns::NetRef;
 use crate::util::kmem::KVec;
@@ -48,8 +48,7 @@ pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
-pub const RTM_NEWNEIGH: u16 = 28;
-pub const RTM_DELNEIGH: u16 = 29;
+pub use crate::net::neigh_nl::{RTM_DELNEIGH, RTM_NEWNEIGH};
 pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_NEWRULE: u16 = 32;
 pub const RTM_GETRULE: u16 = 34;
@@ -172,31 +171,11 @@ const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 const FRA_TABLE: u16 = 15;
 const FRA_PROTOCOL: u16 = 21;
 
-// NDA_*
-const NDA_DST: u16 = 1;
-const NDA_LLADDR: u16 = 2;
-const NDA_CACHEINFO: u16 = 3;
-const NDA_PROBES: u16 = 4;
-const NDA_MAX: u16 = 16;
-
 /// Family header sizes
 const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
 const RTMSG_LEN: usize = 12;
-const NDMSG_LEN: usize = 12;
 const FIB_RULE_HDR_LEN: usize = 12;
-/// Longest hardware address (Linux MAX_ADDR_LEN)
-const MAX_ADDR_LEN: usize = 32;
-/// An RTM_NEWNEIGH message (Linux nlmsg_new(neigh_nlmsg_size()): DST,
-/// LLADDR, CACHEINFO, PROBES, FLAGS_EXT, PROTOCOL)
-const NEIGH_NLMSG_SIZE: usize = msg_size(
-    align(NDMSG_LEN)
-        + 2 * attr_size(MAX_ADDR_LEN)
-        + attr_size(16)
-        + attr_size(4)
-        + attr_size(4)
-        + attr_size(1),
-);
 
 /// Largest dump datagram
 pub const DUMP_SIZE: usize = 8192;
@@ -390,9 +369,20 @@ fn rcv_msg(
         report: h.flags & NLM_F_ECHO != 0,
     };
     match h.ty {
-        RTM_NEWNEIGH => newneigh(sk, h, p),
-        RTM_DELNEIGH => delneigh(sk, p),
-        RTM_GETNEIGH => getneigh(sk, h, p),
+        RTM_NEWNEIGH | RTM_DELNEIGH => {
+            // Configuration changes: under RTNL from the device lookup
+            // on (Linux neigh_add / neigh_delete are locked doits)
+            let _r = rtnl::lock();
+            match h.ty {
+                RTM_NEWNEIGH => neigh_nl::newneigh(sk, h.flags, p, ext)?,
+                _ => neigh_nl::delneigh(sk, p, ext)?,
+            }
+            Ok(Done::Ok)
+        }
+        RTM_GETNEIGH => {
+            reply(sk, neigh_nl::getneigh(sk, h.seq, p, ext)?);
+            Ok(Done::Ok)
+        }
         RTM_NEWLINK => newlink(sk, h, p, nl, ext),
         RTM_SETLINK => setlink(sk, p, nl, ext),
         RTM_GETLINK => getlink(sk, h, p, ext),
@@ -418,7 +408,8 @@ enum DumpKind {
     Addr(u32),
     /// Routes (of one table if non-zero)
     Route(u32),
-    Neigh,
+    /// Neighbours or proxy entries
+    Neigh(NeighFilter),
     /// IPv4 routing rules
     Rule,
     /// Nothing (other families, RTM_F_CLONED)
@@ -454,7 +445,7 @@ impl RtDump {
             RTM_GETLINK => DumpKind::Link,
             RTM_GETADDR if inet => addr_dump_kind(sk.net(), p, strict, &mut flags),
             RTM_GETROUTE if inet => route_dump_kind(p, strict, &mut flags),
-            RTM_GETNEIGH if inet => DumpKind::Neigh,
+            RTM_GETNEIGH if inet => neigh_dump_kind(p, strict, &mut flags),
             RTM_GETRULE => rule_dump_kind(p, family, strict),
             _ => DumpKind::Empty,
         };
@@ -540,17 +531,24 @@ impl DumpCb for RtDump {
                     fill_route(nb, e, RTM_NEWROUTE, f, seq, pid)
                 })
             }
-            DumpKind::Neigh => {
+            DumpKind::Neigh(nf) if nf.proxy => {
+                // Linux pneigh_dump_table: the chains walked under RCU
+                let g = crate::sync::rcu::read_lock();
+                let ns = neigh_nl::dump_pneighs(&g, net, nf);
+                let mut nb = NlBuf::new(buf, DUMP_SIZE);
+                self.take_nl(&mut nb, ns, |nb, n| {
+                    neigh_nl::fill_pneigh(nb, n, RTM_NEWNEIGH, f, seq, pid)
+                })
+            }
+            DumpKind::Neigh(nf) => {
                 // Linux neigh_dump_table: the buckets walked under RCU,
                 // each entry of the namespace filled as it is reached
                 let g = crate::sync::rcu::read_lock();
-                let now = neigh::now_ms();
-                let ns = crate::net::arp::arp_tbl()
-                    .iter_rcu(&g)
-                    .filter(|n| n.dev.net_is(net));
+                let now = crate::net::neigh::now_ms();
+                let ns = neigh_nl::dump_neighs(&g, net, nf);
                 let mut nb = NlBuf::new(buf, DUMP_SIZE);
                 self.take_nl(&mut nb, ns, |nb, n| {
-                    fill_neigh(nb, &n.info(now), RTM_NEWNEIGH, f, seq, pid)
+                    neigh_nl::fill_neigh(nb, &n.info(now), RTM_NEWNEIGH, f, seq, pid)
                 })
             }
             DumpKind::Rule => {
@@ -567,6 +565,19 @@ impl DumpCb for RtDump {
             DumpKind::Bad(_, m) => m,
             _ => None,
         }
+    }
+}
+
+/// Neighbour dump request (Linux neigh_dump_info): its filter, or the
+/// strict check's error
+fn neigh_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
+    let ext = ExtAck::default();
+    match neigh_nl::dump_req(p, strict, &ext) {
+        Ok(nf) => {
+            *flags |= nf.nlflags();
+            DumpKind::Neigh(nf)
+        }
+        Err(e) => DumpKind::Bad(e, ext.get_msg()),
     }
 }
 
@@ -1651,142 +1662,6 @@ fn fill_rt(rt: &route::Rtable, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
     let uid = crate::task::percpu::current_cred().uid;
     m.u32(RTA_UID, uid).attr(RTA_CACHEINFO, &[0u8; 32]);
     m.finish()
-}
-
-// ============================================================================
-// Neighbours
-// ============================================================================
-
-/// RTM_NEWNEIGH message for a neighbour (Linux neigh_fill_info)
-/// One neighbour as a message in `nb` (Linux neigh_fill_info):
-/// EMSGSIZE, nothing left behind, if it does not fit
-fn fill_neigh(
-    nb: &mut NlBuf<'_>,
-    e: &NeighInfo,
-    ty: u16,
-    flags: u16,
-    seq: u32,
-    pid: u32,
-) -> Result<(), KernelError> {
-    let mut h = [0u8; NDMSG_LEN];
-    h[0] = AF_INET;
-    h[4..8].copy_from_slice(&e.ifindex.to_ne_bytes());
-    h[8..10].copy_from_slice(&u16::from(e.state).to_ne_bytes());
-    h[11] = RouteType::Unicast as u8;
-    let m = nb.msg_put(ty, flags, seq, pid, &h)?;
-    match neigh_attrs(nb, e) {
-        Ok(()) => {
-            nb.msg_end(m);
-            Ok(())
-        }
-        Err(err) => {
-            nb.msg_cancel(m);
-            Err(err)
-        }
-    }
-}
-
-/// A neighbour's attributes (neigh_fill_info's nla_puts)
-fn neigh_attrs(nb: &mut NlBuf<'_>, e: &NeighInfo) -> Result<(), KernelError> {
-    nb.put(NDA_DST, &e.key[..4])?;
-    if e.state & nud::VALID != 0 {
-        nb.put(NDA_LLADDR, &e.ha)?;
-    }
-    // struct nda_cacheinfo: ages in clock_t
-    let mut ci = [0u8; 16];
-    ci[0..4].copy_from_slice(&(crate::time::ms_to_clock_t(e.confirmed) as u32).to_ne_bytes());
-    ci[4..8].copy_from_slice(&(crate::time::ms_to_clock_t(e.used) as u32).to_ne_bytes());
-    ci[8..12].copy_from_slice(&(crate::time::ms_to_clock_t(e.updated) as u32).to_ne_bytes());
-    nb.put_u32(NDA_PROBES, e.probes)?;
-    nb.put(NDA_CACHEINFO, &ci)
-}
-
-/// struct ndmsg fields and the request's attributes
-struct NdReq<'a> {
-    family: u8,
-    ifindex: u32,
-    state: u8,
-    attrs: Attrs<'a>,
-}
-
-fn ndmsg(p: &[u8]) -> Result<NdReq<'_>, KernelError> {
-    if p.len() < NDMSG_LEN {
-        return Err(KernelError::InvalidArgument);
-    }
-    Ok(NdReq {
-        family: p[0],
-        ifindex: u32::from_ne_bytes([p[4], p[5], p[6], p[7]]),
-        state: u16::from_ne_bytes([p[8], p[9]]) as u8,
-        attrs: Attrs::parse(&p[NDMSG_LEN..], NDA_MAX)?,
-    })
-}
-
-/// Device and key of a neighbour request (Linux neigh_add/neigh_delete
-/// checks, in their order): EINVAL without NDA_DST or a device,
-/// ENODEV for an unknown device, EAFNOSUPPORT for other families
-fn nd_target(
-    net: &NetNamespace,
-    r: &NdReq<'_>,
-) -> Result<(Arc<NetDevice>, neigh::Key), KernelError> {
-    let dst = r.attrs.get(NDA_DST).ok_or(KernelError::InvalidArgument)?;
-    let dev = match r.ifindex {
-        0 => None,
-        i => Some(net.dev_get_by_index(i).ok_or(KernelError::NoDevice)?),
-    };
-    if r.family != AF_INET {
-        return Err(KernelError::AddressFamilyNotSupported);
-    }
-    if dst.len() < 4 {
-        return Err(KernelError::InvalidArgument);
-    }
-    let dev = dev.ok_or(KernelError::InvalidArgument)?;
-    let a = Ipv4Addr::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]);
-    Ok((dev, neigh::key4(a)))
-}
-
-/// RTM_NEWNEIGH ("ip neigh add/replace/change"; Linux neigh_add)
-fn newneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
-    let r = ndmsg(p)?;
-    // Configuration change: under RTNL from the device lookup on (Linux
-    // neigh_add is a locked doit)
-    let _r = rtnl::lock();
-    let (dev, key) = nd_target(sk.net(), &r)?;
-    let ll = match r.attrs.get(NDA_LLADDR) {
-        Some(a) if a.len() < 6 => return Err(KernelError::InvalidArgument),
-        Some(a) => Some([a[0], a[1], a[2], a[3], a[4], a[5]]),
-        None => None,
-    };
-    crate::net::arp::arp_tbl().admin_add(&dev, &key, ll, r.state, h.flags)?;
-    Ok(Done::Ok)
-}
-
-/// RTM_DELNEIGH (Linux neigh_delete): ENOENT if absent
-fn delneigh(sk: &NlSock, p: &[u8]) -> Result<Done, KernelError> {
-    let r = ndmsg(p)?;
-    let (dev, key) = nd_target(sk.net(), &r)?;
-    let _r = rtnl::lock();
-    crate::net::arp::arp_tbl().admin_del(&dev, &key)?;
-    Ok(Done::Ok)
-}
-
-/// RTM_GETNEIGH for one entry (Linux neigh_get): ENOENT if absent
-fn getneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
-    let r = ndmsg(p)?;
-    let (dev, key) = nd_target(sk.net(), &r)?;
-    let e = crate::net::arp::arp_tbl()
-        .info(&dev, &key)
-        .ok_or(KernelError::NotFound)?;
-    let mut v = nlmsg_new(NEIGH_NLMSG_SIZE)?;
-    fill_neigh(
-        &mut NlBuf::new(&mut v, NEIGH_NLMSG_SIZE),
-        &e,
-        RTM_NEWNEIGH,
-        0,
-        h.seq,
-        sk.portid(),
-    )?;
-    reply(sk, v);
-    Ok(Done::Ok)
 }
 
 #[cfg(test)]

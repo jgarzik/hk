@@ -39,6 +39,10 @@
 //! - Each entry runs on its device's parameters (`NeighParms`, Linux
 //!   n->parms; `NeighOps::parms`); the table's are the defaults new
 //!   devices copy.
+//! - State changes are announced to RTNLGRP_NEIGH under the entry's
+//!   lock (Linux __neigh_notify, GFP_ATOMIC), and an entry leaving the
+//!   table with RTM_DELNEIGH (neigh_cleanup_and_release); the messages
+//!   are built in `neigh_nl`. Proxy entries are in `pneigh`.
 //!
 //! ## Locking (thread context only; see doc/LOCKING.md)
 //!
@@ -47,7 +51,9 @@
 //! under `inner`). The table lock serializes the hash chains, the gc
 //! list and every device's list (their writers borrow `TblLocked`). No
 //! packet is transmitted, solicited or reported under either lock:
-//! state changes return actions that run after the unlock.
+//! state changes return actions that run after the unlock. Notifications
+//! are queued under `inner` (-> `NlSock.rxq`, as Linux sends them under
+//! neigh->lock).
 
 use crate::util::kalloc::{try_arc_gfp, with_gfp};
 use alloc::boxed::Box;
@@ -96,6 +102,9 @@ pub mod upd {
     pub const OVERRIDE: u32 = 1 << 0;
     /// Different address in a connected state: keep it, go STALE
     pub const WEAK_OVERRIDE: u32 = 1 << 1;
+    /// User-triggered (NTF_USE): only drops PERMANENT, then resolution
+    /// is started by the caller
+    pub const USE: u32 = 1 << 4;
     /// Administrative change (netlink): may touch PERMANENT/NOARP
     pub const ADMIN: u32 = 1 << 31;
 }
@@ -390,14 +399,17 @@ impl NState {
         (Send::Queue, self.probe(p))
     }
 
-    /// The entry's timer fired (Linux neigh_timer_handler)
-    pub fn timer(&mut self, p: &Parms, now: u64) -> Act {
+    /// The entry's timer fired (Linux neigh_timer_handler): the action
+    /// and whether the change is announced (to STALE, back to REACHABLE,
+    /// to PROBE, to FAILED)
+    pub fn timer(&mut self, p: &Parms, now: u64) -> (Act, bool) {
         let s = self.state;
         if s & nud::IN_TIMER == 0 {
             self.timer = None;
-            return Act::None;
+            return (Act::None, false);
         }
         let mut next = now + 1000;
+        let mut notify = false;
         if s & nud::REACHABLE != 0 {
             if now <= self.confirmed + p.reachable {
                 next = self.confirmed + p.reachable;
@@ -408,8 +420,10 @@ impl NState {
             } else {
                 self.state = nud::STALE;
                 self.updated = now;
+                notify = true;
             }
         } else if s & nud::DELAY != 0 {
+            notify = true;
             if now <= self.confirmed + p.delay_probe {
                 self.state = nud::REACHABLE;
                 self.updated = now;
@@ -427,33 +441,48 @@ impl NState {
             self.state = nud::FAILED;
             self.updated = now;
             self.timer = None;
-            return Act::Fail;
+            return (Act::Fail, true);
         }
         self.timer = (self.state & nud::IN_TIMER != 0).then(|| next.max(now + 10));
         if self.state & (nud::INCOMPLETE | nud::PROBE) != 0 {
-            return self.probe(p);
+            return (self.probe(p), notify);
         }
-        Act::None
+        (Act::None, notify)
     }
 
     /// New information (Linux __neigh_update): `ll` = advertised
-    /// address (None: keep the cached one), `new` = target state
-    pub fn update(&mut self, p: &Parms, ll: Option<Lladdr>, new: u8, flags: u32, now: u64) -> Act {
+    /// address (None: keep the cached one), `new` = target state, `p`
+    /// the entry's parameters. Returns the action and whether the
+    /// change is announced; EPERM for a non-administrative change of a
+    /// NOARP or PERMANENT entry, EINVAL for a valid state without any
+    /// address.
+    pub fn update(
+        &mut self,
+        p: &Parms,
+        ll: Option<Lladdr>,
+        new: u8,
+        flags: u32,
+        now: u64,
+    ) -> Result<(Act, bool), KernelError> {
         let old = self.state;
         if flags & upd::ADMIN == 0 && old & (nud::NOARP | nud::PERMANENT) != 0 {
-            return Act::None;
+            return Err(KernelError::NotPermitted);
+        }
+        if flags & upd::USE != 0 {
+            self.state = old & !nud::PERMANENT;
+            return Ok((Act::None, false));
         }
         if new & nud::VALID == 0 {
             self.timer = None;
             self.state = new;
             if old & (nud::INCOMPLETE | nud::PROBE) != 0 && new & nud::FAILED != 0 {
-                return Act::Fail;
+                return Ok((Act::Fail, true));
             }
-            return Act::None;
+            return Ok((Act::None, old & nud::VALID != 0));
         }
         let mut ll = match ll {
             Some(a) => a,
-            None if old & nud::VALID == 0 => return Act::None,
+            None if old & nud::VALID == 0 => return Err(KernelError::InvalidArgument),
             None => self.ha,
         };
         if new & nud::CONNECTED != 0 {
@@ -466,13 +495,14 @@ impl NState {
                     ll = self.ha;
                     new = nud::STALE;
                 } else {
-                    return Act::None;
+                    return Ok((Act::None, false));
                 }
             } else if ll == self.ha && new == nud::STALE && flags & upd::ADMIN == 0 {
                 new = old;
             }
         }
-        if new != old || ll != self.ha {
+        let notify = new != old || ll != self.ha;
+        if notify {
             self.updated = now;
         }
         if new != old {
@@ -497,9 +527,9 @@ impl NState {
             }
         }
         if new != old && old & nud::VALID == 0 {
-            return Act::Flush(self.ha);
+            return Ok((Act::Flush(self.ha), notify));
         }
-        Act::None
+        Ok((Act::None, notify))
     }
 
     /// Removable by GC (Linux neigh_periodic_work rule)
@@ -588,6 +618,8 @@ struct Inner {
     arp_queue_len_bytes: usize,
     /// Off the table (Linux neigh->dead)
     dead: bool,
+    /// Who added it (NDA_PROTOCOL, RTPROT_*; Linux neigh->protocol)
+    protocol: u8,
 }
 
 impl Inner {
@@ -664,6 +696,8 @@ pub struct NeighInfo {
     pub confirmed: u64,
     pub used: u64,
     pub updated: u64,
+    /// NDA_PROTOCOL (0: none)
+    pub protocol: u8,
 }
 
 /// The data of a table's lock (Linux tbl->lock): the gc list, and the
@@ -944,6 +978,7 @@ impl NeighTable {
                     arp_queue: SkbHead::new(),
                     arp_queue_len_bytes: 0,
                     dead: true,
+                    protocol: 0,
                 }),
             },
             Gfp::ATOMIC,
@@ -1030,8 +1065,9 @@ impl NeighTable {
     }
 
     /// Unhash `n` and take it off its device's list (Linux
-    /// hlist_del_rcu of hash and dev_list), mark it dead; the hash's
-    /// reference goes a grace period later (neigh_cleanup_and_release)
+    /// hlist_del_rcu of hash and dev_list), mark it dead, announce
+    /// RTM_DELNEIGH; the hash's reference goes a grace period later
+    /// (neigh_cleanup_and_release)
     fn unlink(&self, o: &mut TblLocked, nht: &NeighHash, n: &Neighbour, i: &mut Inner) {
         let b = nht.bucket(self.ops, &n.key, &n.dev);
         if let Some(u) = b.del_init(n, o) {
@@ -1039,6 +1075,7 @@ impl NeighTable {
         }
         drop(n.dev.neighbours.access_mut(o).remove(n));
         self.mark_dead(o, n, i);
+        n.notify(i, crate::net::neigh_nl::RTM_DELNEIGH, 0);
     }
 
     /// Free unused entries from the front of the gc list, down to
@@ -1194,23 +1231,56 @@ impl NeighTable {
         }
     }
 
-    /// New information about `n` (Linux neigh_update); a dead entry
-    /// changes no more
-    pub fn update(&self, n: &Arc<Neighbour>, ll: Option<Lladdr>, new: u8, flags: u32) {
+    /// New information about `n` (Linux __neigh_update): a change is
+    /// announced under the entry's lock, naming port `pid` (the request
+    /// behind it, 0: none); EPERM for a dead entry (it changes no more)
+    /// or a non-administrative change of a NOARP or PERMANENT one,
+    /// EINVAL for a valid state without any address
+    pub fn update(
+        &self,
+        n: &Arc<Neighbour>,
+        ll: Option<Lladdr>,
+        new: u8,
+        flags: u32,
+        pid: u32,
+    ) -> Result<(), KernelError> {
         let (act, gc) = {
             let mut i = n.inner.lock();
             if i.dead {
-                return;
+                return Err(KernelError::NotPermitted);
             }
             let old = i.st.state;
             let now = now_ms();
-            let act = i.st.update(&self.nparms(n, now), ll, new, flags, now);
+            let (act, notify) = i.st.update(&self.nparms(n, now), ll, new, flags, now)?;
             sync_timer(n, &i.st);
+            if notify {
+                n.notify(&i, crate::net::neigh_nl::RTM_NEWNEIGH, pid);
+            }
             (act, (old ^ i.st.state) & nud::PERMANENT != 0)
         };
         if gc {
             self.update_gc_list(n);
         }
+        self.after(n, act);
+        Ok(())
+    }
+
+    /// Start resolving `n` without a packet (Linux neigh_event_send
+    /// with no skb: NTF_USE)
+    pub fn event_send(&self, n: &Arc<Neighbour>) {
+        let act = {
+            let mut i = n.inner.lock();
+            if i.dead {
+                return;
+            }
+            let deadline = i.st.timer;
+            let now = now_ms();
+            let (_, act) = i.st.event_send(&self.nparms(n, now), now);
+            if i.st.timer != deadline {
+                sync_timer(n, &i.st);
+            }
+            act
+        };
         self.after(n, act);
     }
 
@@ -1262,19 +1332,25 @@ impl NeighTable {
     }
 
     /// Take `n` off the table for good (Linux neigh_flush_one): its
-    /// timer stops and its queue goes; a user still holding it finds it
-    /// dead, NOARP if its address was valid, else NONE
+    /// timer stops; a user still holding it (`n` is the caller's own
+    /// reference) finds it dead, its queue gone, NOARP if its address
+    /// was valid, else NONE. RTM_DELNEIGH reports that state.
     fn flush_one(&self, o: &mut TblLocked, nht: &NeighHash, n: &Arc<Neighbour>) {
+        let stray = !Self::unused(o, n, 1);
         let mut i = n.inner.lock();
-        self.unlink(o, nht, n, &mut i);
         n.timer.stop();
         i.st.timer = None;
-        let q = i.take_queue();
-        i.st.state = if i.st.state & nud::VALID != 0 {
-            nud::NOARP
+        let q = if stray {
+            i.st.state = if i.st.state & nud::VALID != 0 {
+                nud::NOARP
+            } else {
+                nud::NONE
+            };
+            i.take_queue()
         } else {
-            nud::NONE
+            SkbHead::new()
         };
+        self.unlink(o, nht, n, &mut i);
         drop(i);
         drop(q);
     }
@@ -1374,56 +1450,17 @@ impl NeighTable {
         drop(gone);
     }
 
-    /// Administrative add/replace (RTM_NEWNEIGH with netlink flags
-    /// `nlflags`; Linux neigh_add): EEXIST with NLM_F_EXCL, ENOENT
-    /// without NLM_F_CREATE for a missing entry; an existing entry's
-    /// address changes only with NLM_F_REPLACE. A PERMANENT entry is
-    /// never collected.
-    pub fn admin_add(
-        &'static self,
-        dev: &Arc<NetDevice>,
-        key: &Key,
-        ll: Option<Lladdr>,
-        state: u8,
-        nlflags: u16,
-    ) -> Result<(), KernelError> {
-        use crate::net::inet::fib::{NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE};
-        let create = nlflags & NLM_F_CREATE != 0;
-        let excl = nlflags & NLM_F_EXCL != 0;
-        let replace = nlflags & NLM_F_REPLACE != 0;
-        let (n, new) = match self.lookup(dev, key) {
-            Some(_) if excl => return Err(KernelError::AlreadyExists),
-            Some(n) => (n, false),
-            None if !create => return Err(KernelError::NotFound),
-            None => (self.create(dev, key, state & nud::PERMANENT != 0)?, true),
-        };
-        if ll.is_none() && state & nud::VALID != 0 && n.state() & nud::VALID == 0 {
-            // No link-layer address to make it usable
-            return Err(KernelError::InvalidArgument);
-        }
-        let mut flags = upd::ADMIN;
-        if new || replace {
-            flags |= upd::OVERRIDE;
-        }
-        self.update(&n, ll, state, flags);
-        Ok(())
-    }
-
-    /// Administrative delete (RTM_DELNEIGH; Linux neigh_delete):
-    /// ENOENT if absent. The entry fails, then leaves the table unless
-    /// someone still uses it (then GC frees it later).
-    pub fn admin_del(&self, dev: &NetDevice, key: &Key) -> Result<(), KernelError> {
-        let n = self.lookup(dev, key).ok_or(KernelError::NotFound)?;
-        self.update(&n, None, nud::FAILED, upd::ADMIN | upd::OVERRIDE);
-        // Linux neigh_release + neigh_remove_one under tbl->lock
+    /// Take `n` off the table if only the table and the caller's
+    /// reference hold it (Linux neigh_release + neigh_remove_one under
+    /// tbl->lock); RTM_DELNEIGH announces it
+    pub fn remove_one(&self, n: &Arc<Neighbour>) {
         let mut o = self.lock.lock();
         let g = rcu::read_lock();
         let nht = self.nht.read(&g);
         let mut i = n.inner.lock();
-        if !i.dead && Self::unused(&o, &n, 1) {
-            self.unlink(&mut o, nht, &n, &mut i);
+        if !i.dead && Self::unused(&o, n, 1) {
+            self.unlink(&mut o, nht, n, &mut i);
         }
-        Ok(())
     }
 
     /// Every entry, while `g` is held (Linux neigh_dump_table and
@@ -1451,7 +1488,10 @@ fn neigh_timer_handler(n: Arc<Neighbour>) {
             return;
         }
         let now = now_ms();
-        let act = i.st.timer(&tbl.nparms(&n, now), now);
+        let (act, notify) = i.st.timer(&tbl.nparms(&n, now), now);
+        if notify {
+            n.notify(&i, crate::net::neigh_nl::RTM_NEWNEIGH, 0);
+        }
         sync_timer(&n, &i.st);
         act
     };
@@ -1466,7 +1506,12 @@ impl Neighbour {
 
     /// Its state for a dump at `now` (ms)
     pub fn info(&self, now: u64) -> NeighInfo {
-        let s = self.inner.lock().st;
+        self.info_locked(&self.inner.lock(), now)
+    }
+
+    /// Its state from its locked part
+    fn info_locked(&self, i: &Inner, now: u64) -> NeighInfo {
+        let s = &i.st;
         NeighInfo {
             key: self.key,
             ifindex: self.dev.ifindex(),
@@ -1476,7 +1521,23 @@ impl Neighbour {
             confirmed: now.saturating_sub(s.confirmed),
             used: now.saturating_sub(s.used),
             updated: now.saturating_sub(s.updated),
+            protocol: i.protocol,
         }
+    }
+
+    /// Announce it to RTNLGRP_NEIGH (Linux __neigh_notify, under
+    /// neigh->lock)
+    fn notify(&self, i: &Inner, ty: u16, pid: u32) {
+        let Some(net) = self.dev.net() else {
+            return;
+        };
+        crate::net::neigh_nl::notify(&net, &self.info_locked(i, now_ms()), ty, pid);
+    }
+
+    /// Record who added it (NDA_PROTOCOL; Linux neigh_add's
+    /// neigh->protocol)
+    pub fn set_protocol(&self, p: u8) {
+        self.inner.lock().protocol = p;
     }
 
     /// Protocol address as IPv4 (first 4 key bytes)
@@ -1510,7 +1571,7 @@ mod tests {
             if t > until {
                 break;
             }
-            out.push((t, s.timer(&P, t)));
+            out.push((t, s.timer(&P, t).0));
         }
         out
     }
@@ -1544,7 +1605,7 @@ mod tests {
         s.event_send(&P, 100_000);
         assert_eq!(
             s.update(&P, Some(MAC), nud::REACHABLE, 0, 100_200),
-            Act::Flush(MAC)
+            Ok((Act::Flush(MAC), true))
         );
         assert_eq!(s.state, nud::REACHABLE);
         assert_eq!(s.event_send(&P, 100_300).0, Send::Now(MAC));
@@ -1553,7 +1614,8 @@ mod tests {
     #[test]
     fn reachable_ages_to_stale_then_probes() {
         let mut s = fresh();
-        s.update(&P, Some(MAC), nud::REACHABLE, upd::OVERRIDE, 100_000);
+        s.update(&P, Some(MAC), nud::REACHABLE, upd::OVERRIDE, 100_000)
+            .unwrap();
         // Unused: REACHABLE -> STALE after the reachable time
         let acts = run(&mut s, 200_000);
         assert!(acts.iter().all(|&(t, a)| a == Act::None && t >= 130_000));
@@ -1594,7 +1656,7 @@ mod tests {
         let other = [2, 0, 0, 0, 0, 9];
         assert_eq!(
             s.update(&P, Some(other), nud::REACHABLE, 0, 100_100),
-            Act::None
+            Ok((Act::None, false))
         );
         assert_eq!(s.ha, MAC);
         s.update(&P, Some(other), nud::REACHABLE, upd::OVERRIDE, 100_200);
@@ -1607,12 +1669,60 @@ mod tests {
         s.update(&P, Some(MAC), nud::PERMANENT, upd::ADMIN | upd::OVERRIDE, 1);
         assert_eq!(
             s.update(&P, Some([1; 6]), nud::REACHABLE, upd::OVERRIDE, 2),
-            Act::None
+            Err(KernelError::NotPermitted)
         );
         assert_eq!(s.state, nud::PERMANENT);
         assert!(!s.stale_gc(&P, u64::MAX / 2));
         assert!(!s.forced_gc(u64::MAX / 2));
         assert_eq!(s.event_send(&P, 3).0, Send::Now(MAC));
+    }
+
+    /// What Linux announces (__neigh_update, neigh_timer_handler): a
+    /// new state or address, an invalidation of a valid entry, a
+    /// failure; not a no-op or REACHABLE -> DELAY
+    #[test]
+    fn notify_rules() {
+        let mut s = fresh();
+        assert_eq!(
+            s.update(&P, None, nud::REACHABLE, 0, 1),
+            Err(KernelError::InvalidArgument)
+        );
+        let f = upd::ADMIN | upd::OVERRIDE;
+        assert_eq!(
+            s.update(&P, Some(MAC), nud::PERMANENT, f, 1),
+            Ok((Act::Flush(MAC), true))
+        );
+        assert_eq!(
+            s.update(&P, Some(MAC), nud::PERMANENT, f, 2),
+            Ok((Act::None, false))
+        );
+        assert_eq!(
+            s.update(&P, Some([1; 6]), nud::PERMANENT, f, 3),
+            Ok((Act::None, true))
+        );
+        assert_eq!(s.update(&P, None, nud::FAILED, f, 4), Ok((Act::None, true)));
+        assert_eq!(
+            s.update(&P, None, nud::FAILED, f, 5),
+            Ok((Act::None, false))
+        );
+        // NTF_USE: PERMANENT dropped, nothing announced
+        s.update(&P, Some(MAC), nud::PERMANENT, f, 6).unwrap();
+        assert_eq!(
+            s.update(&P, None, 0, upd::ADMIN | upd::USE, 7),
+            Ok((Act::None, false))
+        );
+        assert_eq!(s.state, nud::NONE);
+        // Timer: REACHABLE -> DELAY quietly, DELAY -> PROBE announced
+        let mut s = fresh();
+        s.update(&P, Some(MAC), nud::REACHABLE, upd::OVERRIDE, 100_000)
+            .unwrap();
+        s.used = 130_000;
+        let t = s.timer.unwrap();
+        assert_eq!(s.timer(&P, t + 1), (Act::None, false));
+        assert_eq!(s.state, nud::DELAY);
+        let t = s.timer.unwrap();
+        assert_eq!(s.timer(&P, t).1, true);
+        assert_eq!(s.state, nud::PROBE);
     }
 
     #[test]
@@ -1640,6 +1750,7 @@ mod tests {
             arp_queue: SkbHead::new(),
             arp_queue_len_bytes: 0,
             dead: false,
+            protocol: 0,
         };
         let size = skb(100).truesize();
         let limit = 3 * size + size / 2;

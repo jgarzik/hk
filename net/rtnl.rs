@@ -272,6 +272,9 @@ pub fn netns_exit(net: &Arc<crate::net::NetNamespace>) {
     for dev in devs {
         unregister_netdevice(&r, &dev);
     }
+    // Device-less proxy entries go with their namespace (Linux keeps
+    // them until the table is cleared: a leak)
+    crate::net::arp::arp_tbl().phash.net_exit(net.id);
     drop(r);
 }
 

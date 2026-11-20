@@ -68,6 +68,8 @@ pub mod mib;
 pub mod msg;
 #[path = "core/neigh.rs"]
 pub mod neigh;
+#[path = "core/neigh_nl.rs"]
+pub mod neigh_nl;
 #[path = "core/neigh_sysctl.rs"]
 pub mod neigh_sysctl;
 pub mod netlink;

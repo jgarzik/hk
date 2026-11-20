@@ -210,6 +210,48 @@ impl PneighTable {
         }
     }
 
+    /// The entry for `key` in `net` answering on `dev` or on any device,
+    /// while `g` is held (Linux pneigh_lookup returning it: neigh_get)
+    pub fn get<'a>(
+        &'a self,
+        g: &'a RcuReadGuard,
+        net: &NetNamespace,
+        key: &Key,
+        dev: Option<&NetDevice>,
+    ) -> Option<&'a PneighEntry> {
+        self.chain(key).iter(g).find(|n| {
+            n.is(net, key)
+                && n.dev
+                    .as_deref()
+                    .is_none_or(|d| dev.is_some_and(|x| core::ptr::eq(d, x)))
+        })
+    }
+
+    /// `net`'s entries, chain by chain, while `g` is held (a dump's
+    /// resumable walk, Linux pneigh_dump_table)
+    pub fn iter<'a>(
+        &'a self,
+        g: &'a RcuReadGuard,
+        net: &'a NetNamespace,
+    ) -> impl Iterator<Item = &'a PneighEntry> + 'a {
+        self.heads
+            .iter()
+            .flat_map(move |h| h.iter(g))
+            .filter(move |n| n.net_id == net.id)
+    }
+
+    /// Remove the entries of a namespace going away, the device-less
+    /// ones included (Linux keeps those until the table is cleared: a
+    /// leak)
+    pub fn net_exit(&self, net_id: u64) {
+        let mut o = self.lock.lock();
+        for head in &self.heads {
+            while let Some(u) = head.remove_first(|n| n.net_id == net_id, &mut o) {
+                u.defer();
+            }
+        }
+    }
+
     /// Call `f` on `net`'s entries while `g` is held (Linux
     /// pneigh_dump_table, the /proc walk)
     pub fn for_each<'a>(
