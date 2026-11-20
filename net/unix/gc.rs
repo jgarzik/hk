@@ -41,13 +41,12 @@
 //! the collector) and read without it (Linux READ_ONCE).
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use crate::fs::FileRef;
 use crate::net::skb::SkbOwned;
 use crate::sync::IrqSpinlock;
 use crate::sync::spin::{Mutex, MutexGuard};
-use crate::sync::waitqueue::WaitQueue;
 use crate::sync::{LockedBy, SeqCount, UniqueOwner};
 use crate::task::ucount::{Ucount, UcountsRef};
 use crate::task::workqueue::{SYSTEM_WQ, Work};
@@ -605,17 +604,8 @@ fn set_cyclic(n: usize) {
     STATE.store(if n != 0 { CYCLIC } else { NOT_CYCLIC }, Ordering::Release);
 }
 
-/// Requests (`schedule`) and the last one a finished run covered: a
-/// run covers every request made before it started (Linux flush_work's
-/// wait for the queued or running instance)
-static TICKET: AtomicU64 = AtomicU64::new(0);
-static CUR: AtomicU64 = AtomicU64::new(0);
-static DONE: AtomicU64 = AtomicU64::new(0);
-static DONE_WAIT: WaitQueue = WaitQueue::new();
-
 /// Linux unix_gc (unix_gc_work): free the dead components' queues
 fn unix_gc() {
-    CUR.store(TICKET.load(Ordering::SeqCst), Ordering::SeqCst);
     IN_PROGRESS.store(true, Ordering::SeqCst);
     let mut hit: OwnedList<SkbOwned> = OwnedList::new();
     {
@@ -635,8 +625,6 @@ fn unix_gc() {
     }
     drop(hit);
     IN_PROGRESS.store(false, Ordering::SeqCst);
-    DONE.fetch_max(CUR.load(Ordering::SeqCst), Ordering::SeqCst);
-    DONE_WAIT.wake_all();
 }
 
 static GC_WORK: spin::Once<Arc<IrqSpinlock<Work>>> = spin::Once::new();
@@ -662,17 +650,13 @@ pub fn schedule(user: Option<&UcountsRef>) {
     {
         return;
     }
-    let target = if IN_PROGRESS.load(Ordering::SeqCst) {
-        CUR.load(Ordering::SeqCst)
-    } else {
-        let Some(w) = gc_work() else {
-            return;
-        };
-        let t = TICKET.fetch_add(1, Ordering::SeqCst) + 1;
-        SYSTEM_WQ.queue_work(w);
-        t
+    let Some(w) = gc_work() else {
+        return;
     };
+    if !IN_PROGRESS.load(Ordering::SeqCst) {
+        SYSTEM_WQ.queue_work(w.clone());
+    }
     if user.is_some() && CYCLIC_SCCS.load(Ordering::Acquire) != 0 {
-        DONE_WAIT.wait_event(|| DONE.load(Ordering::SeqCst) >= target);
+        SYSTEM_WQ.flush_work(&w);
     }
 }
