@@ -466,8 +466,18 @@ pub struct TcpSkbCb {
     /// one (Linux tcp_skb_pcount, tcp_gso_size)
     pub pcount: u32,
     pub gso_size: u32,
-    /// When a sent skb last went out, ms (Linux skb_mstamp_ns)
+    /// When a sent skb last went out, ms (Linux skb_mstamp_ns), and
+    /// the connection's transmission count then: its place in send
+    /// order (Linux orders by skb_mstamp_ns, in µs, and keeps
+    /// tsorted_sent_queue; hk's clock is in ms, so ties within a ms are
+    /// broken by this order)
     pub sent: u64,
+    pub tx_order: u64,
+    /// The connection's delivered count when it went out, and whether
+    /// a SACK already counted its delivery (Linux tx.delivered,
+    /// tx.delivered_mstamp == 0)
+    pub tx_delivered: u32,
+    pub tx_counted: bool,
     /// The ports of a received segment (its header is pulled)
     pub sport: u16,
     pub dport: u16,

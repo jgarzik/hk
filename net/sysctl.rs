@@ -50,6 +50,9 @@ pub struct NetSysctl {
     /// Initial reordering degree of a connection (packets) and its bound
     pub tcp_reordering: AtomicI32,
     pub tcp_max_reordering: AtomicI32,
+    /// RACK option bits (1 loss detection, 2 static reordering window,
+    /// 4 no dupthresh)
+    pub tcp_recovery: AtomicU8,
     /// Nonzero: a TIME_WAIT entry ignores an in-window RST (RFC 1337)
     pub tcp_rfc1337: AtomicU8,
     /// tcp_rmem min / default / max (only max is used: window scale)
@@ -90,6 +93,7 @@ impl Default for NetSysctl {
             tcp_dsack: AtomicU8::new(1),
             tcp_reordering: AtomicI32::new(3),
             tcp_max_reordering: AtomicI32::new(300),
+            tcp_recovery: AtomicU8::new(1),
             tcp_rfc1337: AtomicU8::new(0),
             tcp_rmem: [
                 AtomicI32::new(4096),
@@ -476,6 +480,13 @@ pub static CTLS: &[NetCtl] = &[
         mode: 0o644,
         show: |n| get_i32(n, |s| &s.tcp_max_reordering),
         store: |n, v| set_int(n, |s| &s.tcp_max_reordering, v, 1, INT_MAX),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_recovery",
+        mode: 0o644,
+        show: |n| get_u8(n, |s| &s.tcp_recovery),
+        store: |n, v| set_u8(n, |s| &s.tcp_recovery, v),
         text: None,
     },
     NetCtl {

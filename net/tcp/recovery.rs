@@ -16,7 +16,7 @@
 //! 6937), after a timeout it slow-starts from one packet (CA_Loss).
 //! Reductions found spurious (timestamps, D-SACKs) are undone.
 
-use super::cb::{TcpCb, TcpState, after, before};
+use super::cb::{TcpCb, TcpState, Tmr, after, before};
 use super::cong::INFINITE_SSTHRESH;
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
@@ -55,6 +55,7 @@ pub mod flag {
     pub const DSACKING_ACK: u32 = 0x800;
     pub const SET_XMIT_TIMER: u32 = 0x1000;
     pub const SACK_RENEGING: u32 = 0x2000;
+    pub const DSACK_TLP: u32 = 0x20000;
     pub const ACKED: u32 = DATA_ACKED | SYN_ACKED;
     pub const NOT_DUP: u32 = DATA | WIN_UPDATE | ACKED;
     pub const CA_ALERT: u32 = DATA_SACKED | DSACKING_ACK;
@@ -69,12 +70,50 @@ pub(super) enum Rexmit {
     Lost,
 }
 
-/// RACK state (Linux tcp_sock.rack)
-#[derive(Clone, Copy, Debug, Default)]
+/// RACK state (Linux tcp_sock.rack, RFC 8985)
+#[derive(Clone, Copy, Debug)]
 pub struct Rack {
-    /// RTT of the most recently (re)sent packet (s)acked, ms
+    /// Send order and end of the most recently (re)sent packet s/acked
+    /// (Linux rack.mstamp: its send time; see `TcpSkbCb::tx_order`)
+    pub mstamp: u64,
+    pub end_seq: u32,
+    /// Its RTT, ms
     pub rtt: u64,
+    /// The reordering window in min_rtt/4 steps, the recoveries it
+    /// persists for
+    pub reo_wnd_steps: u8,
+    pub reo_wnd_persist: u8,
+    /// A D-SACK asks to widen the window
+    pub dsack_seen: bool,
+    /// Something was s/acked since the last loss detection
+    pub advanced: bool,
+    /// The delivered count when the window last widened
+    pub last_delivered: u32,
 }
+
+impl Default for Rack {
+    fn default() -> Self {
+        Self {
+            mstamp: 0,
+            end_seq: 0,
+            rtt: 0,
+            reo_wnd_steps: 1,
+            reo_wnd_persist: 0,
+            dsack_seen: false,
+            advanced: false,
+            last_delivered: 0,
+        }
+    }
+}
+
+/// net.ipv4.tcp_recovery bits (Linux TCP_RACK_*)
+pub const RACK_STATIC_REO_WND: u8 = 2;
+pub const RACK_NO_DUPTHRESH: u8 = 4;
+/// Recoveries a widened reordering window persists for (Linux
+/// TCP_RACK_RECOVERY_THRESH)
+const RACK_RECOVERY_THRESH: u8 = 16;
+/// Slack added to the reordering timer, ms (Linux TCP_TIMEOUT_MIN_US)
+const TIMEOUT_MIN: u64 = 2;
 
 /// Segments of `len` bytes at `mss` each (Linux tcp_set_skb_tso_segs):
 /// (pcount, gso_size)
@@ -135,8 +174,7 @@ impl TcpCb {
     /// Linux tcp_is_reno: no SACK scoreboard, duplicate ACKs stand in
     /// for SACKed packets
     pub(super) fn is_reno(&self) -> bool {
-        // The SACK scoreboard is not kept yet: every peer is Reno
-        true
+        !self.is_sack()
     }
 
     /// Linux tcp_in_cwnd_reduction
@@ -295,15 +333,29 @@ impl TcpCb {
     /// the most recently sent; a SACKed head means the receiver reneged
     fn timeout_mark_lost(&mut self) {
         let head = self.rtx_head();
-        if head.is_some() && self.is_reno() {
+        let reneg = self
+            .rtx
+            .first()
+            .is_some_and(|h| h.tcp().sacked & tag::SACKED_ACKED != 0);
+        if reneg {
+            self.net_stat(LINUX_MIB_TCPSACKRENEGING);
+            self.sacked_out = 0;
+            // Until this loss is recovered from
+            self.is_sack_reneg = true;
+        } else if self.is_reno() {
             self.reset_reno_sack();
         }
         let mut cur = head;
         while let Some(seq) = cur {
             let sent = self.rtx_with(seq, |s| s.tcp().sent).unwrap_or(0);
-            if Some(seq) == head || self.rack_skb_timeout(sent, 0) <= 0 {
-                self.mark_skb_lost(seq);
+            if reneg {
+                self.rtx_with(seq, |s| s.tcp_mut().sacked &= !tag::SACKED_ACKED);
+            } else if Some(seq) != head && self.rack_skb_timeout(sent, 0) > 0 {
+                // Recently sent: not lost yet
+                cur = self.rtx_next(seq);
+                continue;
             }
+            self.mark_skb_lost(seq);
             cur = self.rtx_next(seq);
         }
         self.rtx_hint = None;
@@ -330,6 +382,7 @@ impl TcpCb {
         }
         self.set_ca_state(CaState::Loss);
         self.high_seq = self.snd_max;
+        self.tlp_high_seq = None;
     }
 
     /// Linux tcp_simple_retransmit (path MTU reduced): what no longer
@@ -417,6 +470,8 @@ impl TcpCb {
             }
         }
         self.undo_marker = None;
+        // Force RACK to examine the losses again
+        self.rack.advanced = true;
     }
 
     /// Linux tcp_may_undo
@@ -445,17 +500,21 @@ impl TcpCb {
             } else {
                 LINUX_MIB_TCPFULLUNDO
             });
+        } else if self.rack.reo_wnd_persist > 0 {
+            self.rack.reo_wnd_persist -= 1;
         }
         if self.non_sack_preventing_reopen() {
             return true;
         }
         self.set_ca_state(CaState::Open);
+        self.is_sack_reneg = false;
         false
     }
 
     /// Linux tcp_try_undo_dsack: D-SACKs covered every retransmission
     fn try_undo_dsack(&mut self) -> bool {
         if self.undo_marker.is_some() && self.undo_retrans == 0 {
+            self.rack.reo_wnd_persist = (self.rack.reo_wnd_persist + 1).min(RACK_RECOVERY_THRESH);
             self.undo_cwnd_reduction(false);
             self.net_stat(LINUX_MIB_TCPDSACKUNDO);
             return true;
@@ -476,6 +535,7 @@ impl TcpCb {
         }
         if self.is_sack() {
             self.set_ca_state(CaState::Open);
+            self.is_sack_reneg = false;
         }
         true
     }
@@ -532,6 +592,7 @@ impl TcpCb {
     /// Linux tcp_init_cwnd_reduction
     fn init_cwnd_reduction(&mut self) {
         self.high_seq = self.snd_max;
+        self.tlp_high_seq = None;
         self.cong.reset_cnt();
         self.prior_cwnd = self.cong.snd_cwnd();
         self.prr_delivered = 0;
@@ -672,6 +733,14 @@ impl TcpCb {
         }
         if self.is_reno() {
             self.newreno_mark_lost(*flg & flag::SND_UNA_ADVANCED != 0);
+        } else {
+            let prior = self.retrans_out;
+            if self.rack_mark_lost() {
+                *flg &= !flag::SET_XMIT_TIMER;
+            }
+            if prior > self.retrans_out {
+                *flg |= flag::LOST_RETRANS;
+            }
         }
     }
 
@@ -694,6 +763,10 @@ impl TcpCb {
         let f = *flg;
         if self.packets_out == 0 && self.sacked_out != 0 {
             self.sacked_out = 0;
+        }
+        // B. In all the states check for reneging SACKs
+        if self.check_sack_reneging(flg) {
+            return;
         }
         // D. State exit when high_seq is acked
         if self.ca_state == CaState::Open {
@@ -814,12 +887,167 @@ impl TcpCb {
     }
 
     /// Linux tcp_rearm_rto: restart the retransmission timer after
-    /// forward progress, or stop it with nothing in flight
+    /// forward progress, or stop it with nothing in flight; replacing
+    /// the reordering or loss probe timer, only what is left of the RTO
+    /// since the head was sent (tcp_rto_delta_us)
     pub(super) fn rearm_rto(&mut self, now: u64) {
         if self.packets_out == 0 {
             self.live.tmr.set(None);
+            return;
+        }
+        let pending = self.live.tmr.get().map(|t| t.0);
+        if matches!(pending, Some(Tmr::Reo) | Some(Tmr::LossProbe)) {
+            let delta = self.rto_delta(now).max(1) as u64;
+            self.live.tmr.set(Some((Tmr::Rtx, now + delta)));
         } else {
             self.arm_rtx(now);
+        }
+    }
+
+    /// Linux tcp_rto_delta_us: how far in the future the RTO of the
+    /// head's last transmission is, ms
+    pub(super) fn rto_delta(&self, now: u64) -> i64 {
+        let sent = self.rtx.first().map_or(now, |s| s.tcp().sent);
+        self.rto_cur() as i64 - now.saturating_sub(sent) as i64
+    }
+
+    /// Linux tcp_check_sack_reneging: SND.UNA advanced onto a SACKed
+    /// skb, so the receiver dropped what it SACKed (or the scoreboard is
+    /// briefly odd): give it max(RTT/2, 10 ms) to set it straight
+    /// before the RTO clears the scoreboard
+    fn check_sack_reneging(&mut self, flg: &mut u32) -> bool {
+        if *flg & flag::SACK_RENEGING != 0 && *flg & flag::SND_UNA_ADVANCED != 0 {
+            let delay = (self.srtt8 / 16).max(10);
+            self.live.tmr.set(Some((Tmr::Rtx, self.clock + delay)));
+            *flg &= !flag::SET_XMIT_TIMER;
+            return true;
+        }
+        false
+    }
+
+    // --- RACK (Linux tcp_recovery.c, RFC 8985) ------------------------------
+
+    /// Linux tcp_rack_advance: the most recently (re)sent packet
+    /// s/acked; a retransmission acked sooner than min_rtt is ambiguous
+    /// and skipped
+    pub(super) fn rack_advance(&mut self, sacked: u8, end_seq: u32, (xmit, order): (u64, u64)) {
+        let rtt = self.clock.saturating_sub(xmit);
+        let min_rtt = self.stats.min_rtt.unwrap_or(u64::MAX);
+        if rtt < min_rtt && sacked & tag::RETRANS != 0 {
+            return;
+        }
+        self.rack.advanced = true;
+        self.rack.rtt = rtt;
+        if super::sack::sent_after(order, self.rack.mstamp, end_seq, self.rack.end_seq) {
+            self.rack.mstamp = order;
+            self.rack.end_seq = end_seq;
+        }
+    }
+
+    /// Linux tcp_rack_reo_wnd: no settling time before reordering is
+    /// seen once recovery started or dupthresh packets are SACKed, else
+    /// min_rtt/4 per step, at most SRTT
+    fn rack_reo_wnd(&self) -> u64 {
+        if self.reord_seen == 0 {
+            if self.ca_state >= CaState::Recovery {
+                return 0;
+            }
+            if self.sacked_out >= self.reordering && self.cfg.recovery & RACK_NO_DUPTHRESH == 0 {
+                return 0;
+            }
+        }
+        let min_rtt = self.stats.min_rtt.unwrap_or(u64::from(u32::MAX));
+        ((min_rtt >> 2) * u64::from(self.rack.reo_wnd_steps)).min(self.srtt8 / 8)
+    }
+
+    /// Linux tcp_rack_detect_loss: a packet sent before the most
+    /// recently s/acked one and not s/acked within RTT + the reordering
+    /// window is lost. Returns the longest wait left for the others, ms
+    /// (Linux walks tsorted_sent_queue in send order and stops at the
+    /// first sent later; hk checks every skb of the queue: the same set)
+    fn rack_detect_loss(&mut self) -> u64 {
+        let reo_wnd = self.rack_reo_wnd();
+        let mut wait = 0;
+        let mut cur = self.rtx_head();
+        while let Some(seq) = cur {
+            cur = self.rtx_next(seq);
+            let Some(t) = self.rtx_with(seq, |s| s.tcp()) else {
+                break;
+            };
+            if t.sacked & tag::SACKED_ACKED != 0 {
+                continue;
+            }
+            // Marked lost, not yet retransmitted
+            if t.sacked & tag::LOST != 0 && t.sacked & tag::SACKED_RETRANS == 0 {
+                continue;
+            }
+            if !super::sack::sent_after(self.rack.mstamp, t.tx_order, self.rack.end_seq, t.end_seq)
+            {
+                continue;
+            }
+            let left = self.rack_skb_timeout(t.sent, reo_wnd);
+            if left <= 0 {
+                self.mark_skb_lost(seq);
+            } else {
+                wait = wait.max(left as u64);
+            }
+        }
+        wait
+    }
+
+    /// Linux tcp_rack_mark_lost: detect losses after an advance; arm
+    /// the reordering timer for the ones still waiting
+    fn rack_mark_lost(&mut self) -> bool {
+        if !self.rack.advanced {
+            return false;
+        }
+        self.rack.advanced = false;
+        let wait = self.rack_detect_loss();
+        if wait != 0 {
+            let at = self.clock + (wait + TIMEOUT_MIN).min(self.rto_cur().max(1));
+            self.live.tmr.set(Some((Tmr::Reo, at)));
+        }
+        wait != 0
+    }
+
+    /// Linux tcp_rack_reo_timeout: the reordering window passed: mark
+    /// the expired packets lost and retransmit them
+    pub(super) fn rack_reo_timeout(&mut self, now: u64, out: &mut super::cb::Out) {
+        let lost = self.lost;
+        let prior = self.in_flight();
+        self.rack_detect_loss();
+        if prior != self.in_flight() {
+            if self.ca_state != CaState::Recovery {
+                self.enter_recovery();
+                self.cwnd_reduction(1, self.lost.wrapping_sub(lost), 0);
+            }
+            self.xmit_retransmit_queue(out);
+        }
+        if self.live.tmr.get().is_none_or(|t| t.0 != Tmr::Rtx) {
+            self.rearm_rto(now);
+        }
+    }
+
+    /// Linux tcp_rack_update_reo_wnd: widen the window by a step for a
+    /// D-SACK at most once a round trip, keep it for
+    /// RACK_RECOVERY_THRESH recoveries, then back to one step
+    pub(super) fn rack_update_reo_wnd(&mut self, prior_delivered: Option<u32>) {
+        let Some(pd) = prior_delivered.filter(|&d| d != 0) else {
+            return;
+        };
+        if self.cfg.recovery & RACK_STATIC_REO_WND != 0 {
+            return;
+        }
+        if before(pd, self.rack.last_delivered) {
+            self.rack.dsack_seen = false;
+        }
+        if self.rack.dsack_seen {
+            self.rack.reo_wnd_steps = self.rack.reo_wnd_steps.saturating_add(1);
+            self.rack.dsack_seen = false;
+            self.rack.last_delivered = self.delivered;
+            self.rack.reo_wnd_persist = RACK_RECOVERY_THRESH;
+        } else if self.rack.reo_wnd_persist == 0 {
+            self.rack.reo_wnd_steps = 1;
         }
     }
 

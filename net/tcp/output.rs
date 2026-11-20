@@ -380,6 +380,11 @@ impl TcpCb {
         t.pcount = 1;
         t.gso_size = 0;
         t.sent = now;
+        self.tx_count += 1;
+        t.tx_order = self.tx_count;
+        // Linux tcp_rate_skb_sent
+        t.tx_delivered = self.delivered;
+        t.tx_counted = false;
         self.packets_out += 1;
         self.rtx
             .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
@@ -596,17 +601,24 @@ impl TcpCb {
         self.tcp_add(TCP_MIB_RETRANSSEGS, u64::from(pc));
         self.stats.total_retrans = self.stats.total_retrans.wrapping_add(pc);
         self.stats.bytes_retrans += n as u64;
+        let delivered = self.delivered;
+        self.tx_count += 1;
+        let order = self.tx_count;
         self.rtx_with(seq, |s| {
             let t = s.tcp_mut();
             t.sacked |= tag::EVER_RETRANS;
             t.sent = now;
+            t.tx_order = order;
+            t.tx_delivered = delivered;
+            t.tx_counted = false;
         });
         Some(seq)
     }
 
     /// Linux tcp_retransmit_skb: `retransmit_raw`, then the skb is a
-    /// retransmission in flight; the first retransmission of an episode
-    /// stamps it (retrans_stamp: the skb's previous send) and each one
+    /// retransmission in flight; the first (attempted) retransmission of
+    /// an episode stamps it (retrans_stamp: the skb's send time after the
+    /// attempt) and each one
     /// counts towards undo. Returns the seq it went out at.
     pub(super) fn retransmit_skb(
         &mut self,
@@ -615,7 +627,6 @@ impl TcpCb {
         now: u64,
         out: &mut Out,
     ) -> Option<u32> {
-        let sent = self.rtx_with(seq, |s| s.tcp().sent).unwrap_or(now);
         let r = self.retransmit_raw(seq, segs, now, out);
         let mut pc = 1;
         if let Some(at) = r
@@ -631,7 +642,8 @@ impl TcpCb {
             }
         }
         if self.rtx_stamp.is_none() {
-            self.rtx_stamp = Some(sent);
+            let at = r.unwrap_or(seq);
+            self.rtx_stamp = Some(self.rtx_with(at, |s| s.tcp().sent).unwrap_or(now));
         }
         if self.undo_retrans < 0 {
             self.undo_retrans = 0;
@@ -696,7 +708,7 @@ impl TcpCb {
             if self.in_cwnd_reduction() {
                 self.prr_out += pc;
             }
-            if Some(at) == self.rtx_head() {
+            if Some(at) == self.rtx_head() && self.live.tmr.get().is_none_or(|t| t.0 != Tmr::Reo) {
                 rearm = true;
             }
             cur = self.rtx_next(at);

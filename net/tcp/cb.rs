@@ -38,7 +38,7 @@ use super::recovery::{CaState, Rack};
 use super::sack::Dsack;
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::*;
-use crate::net::skb::{Sacks, SkBuff, SkbHead, SkbTree};
+use crate::net::skb::{NUM_SACKS, Sacks, SkBuff, SkbHead, SkbTree};
 use crate::sync::{SoleCell, Word};
 use crate::util::error::KernelError;
 
@@ -181,6 +181,8 @@ pub struct Cfg {
     /// tcp_max_reordering: its bound
     pub reordering: u32,
     pub max_reordering: u32,
+    /// tcp_recovery: RACK option bits (`recovery::RACK_*`)
+    pub recovery: u8,
     /// tcp_rmem[0]: receive bytes a connection may always hold below
     /// the hard memory limit
     pub rmem_min: u32,
@@ -205,6 +207,7 @@ impl Default for Cfg {
             dsack: true,
             reordering: 3,
             max_reordering: 300,
+            recovery: 1,
             rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
             keepidle: 7_200_000,
@@ -388,9 +391,13 @@ pub(super) enum Tmr {
     Rtx,
     /// Zero-window probe (persist)
     Probe,
+    /// RACK reordering window (Linux ICSK_TIME_REO_TIMEOUT)
+    Reo,
+    /// Tail loss probe (Linux ICSK_TIME_LOSS_PROBE)
+    LossProbe,
 }
 
-/// The kind in the top two bits (0: none), the deadline (ms) below
+/// The kind in the top three bits (0: none), the deadline (ms) below
 impl Word for Option<(Tmr, u64)> {
     fn pack(self) -> u64 {
         match self {
@@ -399,24 +406,28 @@ impl Word for Option<(Tmr, u64)> {
                 let k = match k {
                     Tmr::Rtx => 1,
                     Tmr::Probe => 2,
+                    Tmr::Reo => 3,
+                    Tmr::LossProbe => 4,
                 };
-                k << 62 | t.min(TMR_AT)
+                k << 61 | t.min(TMR_AT)
             }
         }
     }
 
     fn unpack(w: u64) -> Self {
         let t = w & TMR_AT;
-        match w >> 62 {
+        match w >> 61 {
             1 => Some((Tmr::Rtx, t)),
             2 => Some((Tmr::Probe, t)),
+            3 => Some((Tmr::Reo, t)),
+            4 => Some((Tmr::LossProbe, t)),
             _ => None,
         }
     }
 }
 
 /// The deadline bits of a packed `Tmr`
-const TMR_AT: u64 = (1 << 62) - 1;
+const TMR_AT: u64 = (1 << 61) - 1;
 
 /// The control block's fields /proc/net/tcp reads with no lock (Linux
 /// get_tcp4_sock's racy reads: icsk_pending and icsk_timeout, the
@@ -825,6 +836,19 @@ pub struct TcpCb {
     pub(super) highest_sack: Option<u32>,
     /// RACK loss detection state (Linux rack)
     pub(super) rack: Rack,
+    /// SND.NXT after a loss probe went out, until its episode ends
+    /// (Linux tlp_high_seq, None for 0)
+    pub(super) tlp_high_seq: Option<u32>,
+    /// Data transmissions so far: the send order of each (`tx_order`)
+    pub(super) tx_count: u64,
+    /// Duplicates the peer D-SACKed (Linux dsack_dups)
+    pub(super) dsack_dups: u32,
+    /// The last ACK's SACK blocks, sorted, at the end (Linux
+    /// recv_sack_cache)
+    pub(super) recv_sack_cache: [(u32, u32); NUM_SACKS],
+    /// The receiver reneged on SACKs; until the loss is recovered from
+    /// (Linux is_sack_reneg)
+    pub(super) is_sack_reneg: bool,
     /// The ACK being processed echoed this TSval (Linux
     /// rx_opt.saw_tstamp and rcv_tsecr)
     pub(super) rcv_tsecr: Option<u32>,
@@ -952,6 +976,11 @@ impl TcpCb {
             rtx_hint: None,
             highest_sack: None,
             rack: Rack::default(),
+            tlp_high_seq: None,
+            tx_count: 0,
+            dsack_dups: 0,
+            recv_sack_cache: [(0, 0); NUM_SACKS],
+            is_sack_reneg: false,
             rcv_tsecr: None,
             dack: Default::default(),
             orphan: Default::default(),

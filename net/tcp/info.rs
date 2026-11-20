@@ -153,7 +153,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32(0); // delivered_ce
     b.u64(st.bytes_sent);
     b.u64(st.bytes_retrans);
-    b.u32(0); // dsack_dups
+    b.u32(cb.dsack_dups);
     b.u32(cb.reord_seen);
     b.u32(0); // rcv_ooopack
     b.u32(if synced { cb.snd_wnd } else { 0 });
@@ -236,7 +236,7 @@ impl ProcView {
     /// (each field read once, racily: Linux get_tcp4_sock)
     pub fn of(l: &Live, state: TcpState) -> Self {
         let (tr, when) = match (l.tmr.get(), l.keep_at.get().or(l.wait_at.get())) {
-            (Some((Tmr::Rtx, t)), _) => (1, t),
+            (Some((Tmr::Rtx | Tmr::Reo | Tmr::LossProbe, t)), _) => (1, t),
             (Some((Tmr::Probe, t)), _) => (4, t),
             (None, Some(t)) => (2, t),
             _ => (0, 0),

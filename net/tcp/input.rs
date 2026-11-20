@@ -20,6 +20,7 @@ use super::cb::{
     TcpState, Tmr, after, before, between, flags, wake,
 };
 use super::recovery::{Rexmit, flag, tag};
+use super::sack::SackState;
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
 use crate::util::error::KernelError;
@@ -457,7 +458,19 @@ impl TcpCb {
         }
         let prior_snd_una = self.snd_una;
         self.rcv_tsecr = s.ts.filter(|_| self.ts_ok).map(|(_, e)| e);
+        let blocks = if self.is_sack() { s.sack.blocks() } else { &[] };
+        let mut st = SackState::default();
+        let mut rexmit = Rexmit::None;
         if before(ack, prior_snd_una) {
+            // Linux old_ack: its SACK blocks may still tell something
+            if !blocks.is_empty() {
+                self.update_ts_recent(s);
+                let prior_delivered = self.delivered;
+                let mut flg = self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
+                self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
+                self.newly_delivered(prior_delivered);
+                self.xmit_recovery(rexmit, out);
+            }
             return true;
         }
         let mut flg = 0;
@@ -484,6 +497,12 @@ impl TcpCb {
         }
         self.update_ts_recent(s);
         self.update_window(s, out);
+        if !blocks.is_empty() {
+            flg |= self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
+        }
+        if st.sack_delivered != 0 {
+            self.count_delivered(st.sack_delivered);
+        }
         self.live.probes.set(0);
         self.rcv_tstamp = now;
         let acked = ack.wrapping_sub(prior_snd_una);
@@ -503,16 +522,20 @@ impl TcpCb {
             out.wake |= wake::SPACE;
         }
         if prior_packets == 0 {
-            // Linux no_queue
+            // Linux no_queue: a D-SACK may undo a reduction
+            if flg & flag::DSACKING_ACK != 0 {
+                self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
+                self.newly_delivered(prior_delivered);
+            }
             if flg & flag::SET_XMIT_TIMER != 0 {
                 self.set_xmit_timer(now);
             }
             self.mem_settle();
             return true;
         }
-        flg |= self.clean_rtx_queue(prior_fack);
+        flg |= self.clean_rtx_queue(prior_fack, &mut st);
         self.mem_settle();
-        let mut rexmit = Rexmit::None;
+        self.rack_update_reo_wnd(st.prior_delivered);
         if self.ack_is_dubious(flg) {
             let num_dupack =
                 u32::from(flg & (flag::SND_UNA_ADVANCED | flag::NOT_DUP | flag::DSACKING_ACK) == 0);
@@ -521,13 +544,18 @@ impl TcpCb {
         if flg & flag::SET_XMIT_TIMER != 0 {
             self.set_xmit_timer(now);
         }
-        // Linux tcp_newly_delivered
-        let delivered = self.delivered.wrapping_sub(prior_delivered);
-        self.net_add(LINUX_MIB_TCPDELIVERED, u64::from(delivered));
+        let delivered = self.newly_delivered(prior_delivered);
         let lost = self.lost.wrapping_sub(prior_lost);
         self.cong_control(delivered, lost, flg, acked);
         self.xmit_recovery(rexmit, out);
         true
+    }
+
+    /// Linux tcp_newly_delivered: the packets this ACK delivered
+    fn newly_delivered(&self, prior: u32) -> u32 {
+        let d = self.delivered.wrapping_sub(prior);
+        self.net_add(LINUX_MIB_TCPDELIVERED, u64::from(d));
+        d
     }
 
     /// The window of an acceptable ACK (SND.WL1/WL2 rule); one opening a
@@ -569,7 +597,7 @@ impl TcpCb {
     /// retransmit queue, their tags and packets with them; an skb of
     /// several segments loses the acknowledged ones (tcp_tso_acked).
     /// Returns the ACK's FLAG_* bits.
-    fn clean_rtx_queue(&mut self, prior_fack: u32) -> u32 {
+    fn clean_rtx_queue(&mut self, prior_fack: u32, st: &mut SackState) -> u32 {
         let mut flg = 0;
         let mut reord = self.snd_max;
         let mut pkts_acked = 0;
@@ -606,12 +634,16 @@ impl TcpCb {
                 self.sacked_out = self.sacked_out.saturating_sub(acked_pcount);
             } else if !self.is_reno() {
                 self.count_delivered(acked_pcount);
+                if !self.spurious_retrans(t.sacked, t.sent) {
+                    self.rack_advance(t.sacked, t.end_seq, (t.sent, t.tx_order));
+                }
             }
             if t.sacked & tag::LOST != 0 {
                 self.lost_out = self.lost_out.saturating_sub(acked_pcount);
             }
             self.packets_out = self.packets_out.saturating_sub(acked_pcount);
             pkts_acked += acked_pcount;
+            self.rate_skb_delivered(st, t.seq);
             flg |= flag::DATA_ACKED;
             if !fully {
                 break;
@@ -644,8 +676,21 @@ impl TcpCb {
                 // A never retransmitted hole filled: reordering
                 self.check_sack_reordering(reord, false);
             }
+        } else if let Some(first) = st.first_sackt
+            && self.rtx.first().is_some_and(|h| first < h.tcp().sent)
+        {
+            // The SACK round trip is from data sent before the head was
+            // last (re)sent: rearm (else the RTO keeps stretching)
+            flg |= flag::SET_XMIT_TIMER;
         }
         flg
+    }
+
+    /// Linux tcp_skb_spurious_retrans: a retransmitted skb whose echo
+    /// predates its (last) transmission
+    fn spurious_retrans(&self, sacked: u8, sent: u64) -> bool {
+        let ts = (sent as u32).wrapping_add(self.ts_off);
+        sacked & tag::RETRANS != 0 && self.rcv_tsecr.is_some_and(|e| e != 0 && before(e, ts))
     }
 
     /// Segment text and FIN (Linux tcp_data_queue / tcp_fin): `skb`'s

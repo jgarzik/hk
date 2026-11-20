@@ -154,10 +154,16 @@ impl TcpCb {
         if at > now {
             return;
         }
-        self.live.tmr.set(None);
+        // Linux tcp_write_timer_handler: icsk_pending stays set while
+        // the reordering timer's handler runs (tcp_rearm_rto reads it)
+        if kind != Tmr::Reo {
+            self.live.tmr.set(None);
+        }
         match kind {
             Tmr::Rtx => self.rtx_timer(now, out),
             Tmr::Probe => self.probe_timer(now, out),
+            Tmr::Reo => self.rack_reo_timeout(now, out),
+            Tmr::LossProbe => {}
         }
     }
 

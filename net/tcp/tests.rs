@@ -2519,3 +2519,186 @@ fn rto_enters_loss_as_linux() {
     assert_eq!(p.a.ca_state, CaState::Open);
     assert_eq!((p.a.packets_out, p.a.lost_out, p.a.retrans_out), (0, 0, 0));
 }
+
+/// A pair with SACK, a's MIBs counted
+fn sack_pair(mss: u32) -> (Pair, alloc::sync::Arc<crate::net::mib::NetMib>) {
+    let mut p = Pair::new(mss);
+    let m = crate::net::mib::NetMib::new().unwrap();
+    p.a.mib = Some(m.clone());
+    (p, m)
+}
+
+/// Drop the first transmission of data at the seqs `p.a` lists in
+/// `DROP` (a filter's state lives in a static: filters are fn pointers)
+fn drop_listed(_: &Pair, to_b: bool, s: &Seg, _: usize) -> Fate {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !to_b || s.data.is_empty() {
+        return Fate::Pass;
+    }
+    for d in DROP.iter() {
+        if d.load(Relaxed) == s.seq {
+            d.store(0, Relaxed);
+            return Fate::Drop;
+        }
+    }
+    Fate::Pass
+}
+
+static DROP: [core::sync::atomic::AtomicU32; 3] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 3];
+
+/// Losses in a window are found by SACK and RACK and repaired by fast
+/// retransmissions of just the lost segments, no timeout (Linux
+/// tcp_sacktag_write_queue, tcp_rack_mark_lost, tcp_enter_recovery,
+/// tcp_xmit_retransmit_queue)
+#[test]
+fn sack_recovers_lost_segments_only() {
+    use super::recovery::CaState;
+    use crate::net::mib::*;
+    use core::sync::atomic::Ordering::Relaxed;
+    let (mut p, m) = sack_pair(1000);
+    let mss = p.a.live.mss.get();
+    let base = p.a.snd_nxt;
+    for (d, i) in DROP.iter().zip([2u32, 5, 6]) {
+        d.store(base + i * mss, Relaxed);
+    }
+    p.filter = drop_listed;
+    p.a.cong.set_snd_cwnd(20);
+    p.send_a(&pattern(12 * mss as usize));
+    let t = p.now;
+    p.run();
+    assert_eq!(p.now, t, "no timeout");
+    assert_eq!(p.b.rcvq_len(), 12 * mss as usize);
+    let s = sends(&p);
+    let again: Vec<u32> = s.iter().filter(|(_, n)| **n > 1).map(|(k, _)| *k).collect();
+    assert_eq!(again, [base + 2 * mss, base + 5 * mss, base + 6 * mss]);
+    assert!(s.values().all(|&n| n <= 2));
+    assert_eq!(m.net.fold(LINUX_MIB_TCPSACKRECOVERY), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPRENORECOVERY), 0);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPFASTRETRANS), 3);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 0);
+    // SACK recovery ends as soon as high_seq is acked
+    assert_eq!(p.a.ca_state, CaState::Open);
+    assert_eq!(
+        (
+            p.a.packets_out,
+            p.a.sacked_out,
+            p.a.lost_out,
+            p.a.retrans_out
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(p.a.cong.snd_cwnd(), p.a.cong.snd_ssthresh());
+}
+
+/// A reordered segment looks lost (no reordering seen yet: no RACK
+/// window); its spurious retransmission comes back D-SACKed after the
+/// cumulative ACK forgot it, and the reduction is undone (Linux
+/// tcp_check_dsack's "dumb counting" of undo_retrans,
+/// tcp_try_undo_dsack). The reordering itself is not seen: on the
+/// test's frozen clock the original and the retransmission share one
+/// timestamp (Linux tcp_try_undo_partial needs an earlier echo)
+#[test]
+fn dsack_undoes_spurious_retransmission() {
+    use crate::net::mib::*;
+    let (mut p, m) = sack_pair(1000);
+    fn delay_third(_: &Pair, to_b: bool, s: &Seg, _: usize) -> Fate {
+        static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if to_b
+            && !s.data.is_empty()
+            && s.data[0] == pattern(3000)[2 * 988]
+            && !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            Fate::Delay
+        } else {
+            Fate::Pass
+        }
+    }
+    p.filter = delay_third;
+    p.a.cong.set_snd_cwnd(20);
+    let data = pattern(10 * 988);
+    p.send_a(&data);
+    p.run();
+    assert_eq!(p.b.rcvq_len(), data.len());
+    assert!(m.net.fold(LINUX_MIB_TCPDSACKRECV) >= 1);
+    assert!(p.a.dsack_dups >= 1);
+    assert!(p.a.sack_ok & super::cb::DSACK_SEEN != 0);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPDSACKUNDO), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 0);
+}
+
+/// A hole filled by its original, not the retransmission (the echo
+/// predates the retransmission): reordering of the distance to the
+/// highest SACK (Linux tcp_try_undo_partial -> tcp_check_sack_reordering,
+/// TCPTSReorder)
+#[test]
+fn reordering_seen_by_timestamps() {
+    use crate::net::mib::*;
+    let (mut p, m) = sack_pair(1000);
+    p.a.cong.set_snd_cwnd(20);
+    p.send_a(&pattern(8 * 988));
+    let segs = take_to_b(&mut p);
+    p.now = 100;
+    // 3 is late, 7 lost; b SACKs 4..7
+    let mut acks = Vec::new();
+    for i in [0, 1, 2, 4, 5, 6] {
+        acks.extend(feed_b(&mut p, &segs[i]));
+    }
+    for a in &acks {
+        p.a.feed(&seg_in(a), p.now, &mut Out::default());
+    }
+    assert_eq!(p.a.ca_state, super::recovery::CaState::Recovery);
+    assert_eq!(p.a.retrans_out, 1);
+    assert_eq!(p.a.reordering, 3);
+    // The original 3 arrives: a partial ACK echoing its old TSval
+    let ack = feed_b(&mut p, &segs[3]);
+    p.a.feed(&seg_in(&ack[0]), p.now, &mut Out::default());
+    assert_eq!(p.a.reordering, 4);
+    assert_eq!(p.a.reord_seen, 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTSREORDER), 1);
+}
+
+/// SACKed small segments join the SACKed skb before them when its
+/// buffer has room (Linux tcp_shift_skb_data / tcp_shifted_skb:
+/// SACKMerged; the first one has no SACKed skb before it:
+/// SACKShiftFallback), and the counts stay right through recovery
+#[test]
+fn sacked_skbs_merge() {
+    use crate::net::mib::*;
+    let (mut p, m) = sack_pair(1000);
+    p.a.opts.nodelay = true;
+    let mut segs = Vec::new();
+    for i in 0..6u8 {
+        p.send_a(&[i; 100]);
+        segs.extend(take_to_b(&mut p));
+    }
+    assert_eq!((segs.len(), p.a.packets_out, p.a.rtx.len()), (6, 6, 6));
+    let mut acks = Vec::new();
+    for s in &segs[1..] {
+        acks.extend(feed_b(&mut p, s));
+    }
+    let mut out = Out::default();
+    for a in &acks {
+        p.a.feed(&seg_in(a), p.now, &mut out);
+    }
+    assert_eq!(m.net.fold(LINUX_MIB_SACKSHIFTFALLBACK), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_SACKMERGED), 4);
+    // One SACKed skb of five segments behind the lost one
+    assert_eq!(p.a.rtx.len(), 2);
+    assert_eq!((p.a.packets_out, p.a.sacked_out), (6, 5));
+    // The lost one went again; its ACK clears everything
+    let w = wire(&out);
+    assert_eq!(w.last().unwrap().seq, segs[0].seq);
+    let ack = feed_b(&mut p, &segs[0]);
+    p.a.feed(&seg_in(&ack[0]), p.now, &mut Out::default());
+    assert_eq!(
+        (
+            p.a.packets_out,
+            p.a.sacked_out,
+            p.a.lost_out,
+            p.a.retrans_out
+        ),
+        (0, 0, 0, 0)
+    );
+    assert!(p.a.rtx.is_empty());
+}
