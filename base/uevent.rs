@@ -109,6 +109,57 @@ pub fn uevent(dev: &Device, action: Action) {
     uevent_env(dev, action, &[]);
 }
 
+/// Largest uevent message (Linux UEVENT_BUFFER_SIZE)
+const UEVENT_BUFFER_SIZE: usize = 2048;
+
+/// Serializes the kernel input's rebroadcasts (Linux uevent_sock_mutex)
+static UEVENT_SOCK_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+/// Messages a user sends to port 0 of NETLINK_KOBJECT_UEVENT (Linux
+/// uevent_net_rcv): each request is rebroadcast in the sender's
+/// namespace (`uevent_net_rcv_skb`)
+pub fn uevent_net_rcv(sk: &alloc::sync::Arc<netlink::NlSock>, data: &[u8], explicit: bool) {
+    let _g = UEVENT_SOCK_MUTEX.lock();
+    netlink::rcv_skb(sk, data, |_, _| uevent_net_rcv_skb(sk, data, explicit));
+}
+
+/// Linux uevent_net_rcv_skb: CAP_SYS_ADMIN by netlink_ns_capable (the
+/// socket opener's and the sender's, as rtnetlink; over the
+/// namespace's owner, hk's capabilities being global), then uevent_net_broadcast: the
+/// sender's whole message, its first header taken off and the next
+/// SEQNUM appended, on group 1 from port 0 (the kernel) to every
+/// listener of the namespace; EINVAL past UEVENT_BUFFER_SIZE
+fn uevent_net_rcv_skb(
+    sk: &netlink::NlSock,
+    data: &[u8],
+    explicit: bool,
+) -> Result<(), KernelError> {
+    if !sk.net_capable(crate::task::CAP_SYS_ADMIN, explicit) {
+        return Err(KernelError::NotPermitted);
+    }
+    let seq = UEVENT_SEQNUM.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut tail = format!("SEQNUM={}", seq).into_bytes();
+    tail.push(0);
+    if data.len() + tail.len() > UEVENT_BUFFER_SIZE {
+        return Err(KernelError::InvalidArgument);
+    }
+    let body = &data[netlink::attr::NLMSG_HDRLEN..];
+    let mut msg = Vec::new();
+    msg.try_reserve_exact(body.len() + tail.len())
+        .map_err(|_| KernelError::OutOfMemory)?;
+    msg.extend_from_slice(body);
+    msg.extend_from_slice(&tail);
+    // ENOBUFS and no listener are not the sender's errors
+    netlink::broadcast(
+        &sk.sk.net,
+        NETLINK_KOBJECT_UEVENT,
+        netlink::kernel_skb(msg, 1),
+        0,
+        Gfp::KERNEL,
+    );
+    Ok(())
+}
+
 /// Linux uuid_is_valid: 8-4-4-4-12 hex digits
 fn uuid_valid(u: &[u8]) -> bool {
     u.len() == 36

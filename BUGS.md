@@ -587,9 +587,6 @@ hub6, where Linux moves the port (uart_change_port).
 
 - `/sys/kernel/uevent_helper` stores a path, but no helper is run per
   event (Linux call_usermodehelper; hk has no usermode helper).
-- NETLINK_KOBJECT_UEVENT has no kernel input: messages a
-  CAP_SYS_ADMIN sender addresses to port 0 are not rebroadcast (Linux
-  uevent_net_rcv, used by container managers).
 - Network namespaces have no owning user namespace, so uevents go to
   every namespace; Linux sends untagged events only into namespaces
   owned by the initial user namespace (uevent_sock_list).

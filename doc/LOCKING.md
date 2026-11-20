@@ -3788,7 +3788,12 @@ creation and by `cleanup_net` (from the `netns` workqueue, before it
 takes RTNL); thread context, a uevent is sent from a sleepable context as
 Linux's kobject_uevent), then each namespace's uevent multicast list (a snapshot: the clones are GFP_KERNEL) -> `NlSock.rxq`;
 `ksysfs::UEVENT_HELPER` (a fixed array, Linux uevent_helper) is a spin
-leaf: show copies it out and emits after releasing it.
+leaf: show copies it out and emits after releasing it. The kernel input
+(`uevent_net_rcv`, a user's message to port 0) holds
+`uevent::UEVENT_SOCK_MUTEX` (sleeping `sync::Mutex<()>`, Linux
+uevent_sock_mutex; thread context, the sender's sendmsg, no other lock
+held) across the rebroadcast into the sender's namespace (its multicast
+list snapshot -> `NlSock.rxq`) and the sender's ACK (-> its `NlSock.rxq`).
 
 show()/store() run under an active reference (`KNode::get_active`),
 not a lock. `KNode::remove` deactivates the subtree and sleeps until

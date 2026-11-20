@@ -26,6 +26,7 @@ pub fn run_tests() {
     test_basic();
     test_class_mem();
     test_uevent_synth();
+    test_uevent_input();
     test_bus_platform();
     test_bus_pci();
     test_bus_virtio();
@@ -335,6 +336,83 @@ fn exact_vars(m: &[u8], want: &[&[u8]]) -> Option<u64> {
     }
     let seq = num(it.next()?.strip_prefix(b"SEQNUM=")?);
     if it.next().is_some() { None } else { Some(seq) }
+}
+
+/// Send `payload` to the kernel (port 0) on a fresh uevent socket as
+/// one request asking for an ACK; the ACK's error (or -1000)
+fn uevent_send(payload: &[u8]) -> i64 {
+    use hk_syscall::{SOCK_DGRAM, sys_recvfrom};
+    let fd = sys_socket(16, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+    if fd < 0 {
+        return -1000;
+    }
+    let fd = fd as i32;
+    let mut m = [0u8; 128];
+    let len = 16 + payload.len();
+    m[0..4].copy_from_slice(&(len as u32).to_ne_bytes());
+    m[4..6].copy_from_slice(&0x10u16.to_ne_bytes());
+    m[6..8].copy_from_slice(&5u16.to_ne_bytes());
+    m[8..12].copy_from_slice(&7u32.to_ne_bytes());
+    m[16..len].copy_from_slice(payload);
+    let a = nladdr(0, 0);
+    let mut r = -1000;
+    if sys_sendto(fd, m.as_ptr(), len, 0, a.as_ptr(), 12) == len as i64 {
+        let mut b = [0u8; 256];
+        let n = sys_recvfrom(
+            fd,
+            b.as_mut_ptr(),
+            b.len(),
+            0x40,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        if n >= 20 && u16::from_ne_bytes([b[4], b[5]]) == 2 {
+            r = i64::from(i32::from_ne_bytes([b[16], b[17], b[18], b[19]]));
+        }
+    }
+    sys_close(fd as u64);
+    r
+}
+
+/// NETLINK_KOBJECT_UEVENT kernel input (Linux uevent_net_rcv): a
+/// CAP_SYS_ADMIN sender's message to port 0 is rebroadcast on group 1
+/// from the kernel, its header off and a SEQNUM appended, and ACKed;
+/// an unprivileged sender's is refused (EPERM)
+fn test_uevent_input() {
+    const N: &[u8] = b"UEVENT_INPUT";
+    let Some(fd) = uevent_sock() else {
+        return fail_why(N, b"uevent socket", 0);
+    };
+    let r = uevent_send(b"add@/hk/input\0ACTION=add\0");
+    let mut buf = [0u8; 512];
+    let ev = next_event(fd, b"add@/hk/input", &mut buf);
+    sys_close(fd as u64);
+    if r != 0 {
+        return fail_why(N, b"ack", r);
+    }
+    let Some((n, c)) = ev else {
+        return fail_why(N, b"rebroadcast", 0);
+    };
+    if exact_vars(&buf[..n], &[b"ACTION=add"]).is_none() {
+        return fail_why(N, b"vars", n as i64);
+    }
+    if c.0 != 0 {
+        return fail_why(N, b"from kernel", i64::from(c.0));
+    }
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        if hk_syscall::sys_setresuid(65534, 65534, 65534) != 0 {
+            hk_syscall::sys_exit(90);
+        }
+        let r = uevent_send(b"add@/hk/nope\0ACTION=add\0");
+        hk_syscall::sys_exit(if r == -1 { 0 } else { 1 });
+    }
+    let mut st = 0;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    if st != 0 {
+        return fail_why(N, b"unprivileged", i64::from(st));
+    }
+    pass(N);
 }
 
 /// Writing to a device's uevent file: the synthetic event's header,

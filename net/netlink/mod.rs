@@ -1,8 +1,9 @@
 //! AF_NETLINK sockets (Linux net/netlink/af_netlink.c)
 //!
 //! Protocols are described by `NlProto` (Linux netlink_kernel_cfg):
-//! NETLINK_ROUTE (`rtnetlink.rs`) and NETLINK_KOBJECT_UEVENT (kernel
-//! to user only, `base/uevent.rs`); others are EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
+//! NETLINK_ROUTE (`rtnetlink.rs`) and NETLINK_KOBJECT_UEVENT
+//! (`base/uevent.rs`: events to user space, and a privileged sender's
+//! rebroadcast in its namespace); others are EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
 //! bound explicitly, or autobound on first use to the process's tgid, then
 //! to unique negative values. Multicast groups are a bitmap; kernel
 //! notifications go to every subscribed socket of the namespace.
@@ -189,7 +190,7 @@ static ROUTE: NlProto = NlProto {
 
 static UEVENT: NlProto = NlProto {
     ngroups: 1,
-    input: None,
+    input: Some(crate::base::uevent::uevent_net_rcv),
 };
 
 /// The protocol of socket(AF_NETLINK, _, `protocol`)
@@ -962,4 +963,68 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     }
     let p = proto(protocol).ok_or(KernelError::ProtocolNotSupported)?;
     Ok(NlSock::new(p, protocol, stype)?)
+}
+
+/// Run `cb` on each request message of `data` (Linux netlink_rcv_skb):
+/// messages without NLM_F_REQUEST and control types are skipped, a
+/// short or truncated one ends the walk; each that fails is answered
+/// with its error, each that asks with an ACK (`ack`)
+pub fn rcv_skb(
+    sk: &NlSock,
+    mut data: &[u8],
+    mut cb: impl FnMut(&attr::Hdr, &[u8]) -> Result<(), KernelError>,
+) {
+    while data.len() >= attr::NLMSG_HDRLEN {
+        let Some(h) = attr::Hdr::parse(data) else {
+            return;
+        };
+        let len = h.len as usize;
+        if len < attr::NLMSG_HDRLEN || data.len() < len {
+            return;
+        }
+        let msg = &data[..len];
+        if h.flags & NLM_F_REQUEST != 0 && h.ty >= NLMSG_MIN_TYPE {
+            match cb(&h, msg) {
+                Err(e) => ack(sk, &h, msg, -e.errno()),
+                Ok(()) if h.flags & NLM_F_ACK != 0 => ack(sk, &h, msg, 0),
+                Ok(()) => {}
+            }
+        }
+        data = &data[attr::align(len).min(data.len())..];
+    }
+}
+
+/// Queue an NLMSG_ERROR (0: an ACK) for request `msg` with header `h`
+/// (Linux netlink_ack without extended ACK attributes): an error
+/// echoes the request unless NETLINK_CAP_ACK; with no memory for even
+/// the capped form the socket gets ENOBUFS
+pub fn ack(sk: &NlSock, h: &attr::Hdr, msg: &[u8], err: i32) {
+    let echo = err != 0 && !sk.has_flag(sflags::CAP_ACK);
+    let len = attr::NLMSG_HDRLEN
+        + 4
+        + if echo {
+            attr::align(msg.len())
+        } else {
+            attr::NLMSG_HDRLEN
+        };
+    let flags = if echo { 0 } else { NLM_F_CAPPED };
+    let mut m = Vec::new();
+    if m.try_reserve_exact(len).is_err() {
+        sk.sk.set_err(KernelError::NoBufferSpace);
+        return;
+    }
+    m.extend_from_slice(&(len as u32).to_ne_bytes());
+    m.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+    m.extend_from_slice(&flags.to_ne_bytes());
+    m.extend_from_slice(&h.seq.to_ne_bytes());
+    m.extend_from_slice(&sk.portid().to_ne_bytes());
+    m.extend_from_slice(&err.to_ne_bytes());
+    let body = if echo {
+        msg
+    } else {
+        &msg[..attr::NLMSG_HDRLEN]
+    };
+    m.extend_from_slice(body);
+    m.resize(len, 0);
+    sk.queue(kernel_skb(m, 0));
 }
