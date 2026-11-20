@@ -168,10 +168,8 @@ IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
 and a reader_queue spliced from it.
-MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: receive
-collapse (tcp_prune_queue prunes the out-of-order queue without
-first collapsing either queue, tcp_collapse), Fast Open, MD5/AO,
-forwarding and
+MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: Fast Open,
+MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP sends are not charged to SO_SNDBUF (Linux sk_wmem_alloc through
 sock_alloc_send_skb, which blocks or fails a send past it; corked

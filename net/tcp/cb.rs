@@ -712,6 +712,27 @@ impl Ooo {
         sets
     }
 
+    /// Every skb, in sequence order, the queue left empty (collapsing)
+    pub(super) fn take_all(&mut self) -> SkbHead<Box<SkBuff>> {
+        let mut q = SkbHead::new();
+        while let Some(s) = self.tree.pop_first() {
+            q.push_back(s);
+        }
+        self.bytes = 0;
+        self.truesize = 0;
+        q
+    }
+
+    /// Queue the skbs of `q` (as `take_all` gave them, collapsed)
+    pub(super) fn put_all(&mut self, mut q: SkbHead<Box<SkBuff>>) {
+        while let Some(s) = q.pop_front() {
+            self.bytes += s.len();
+            self.truesize += s.truesize();
+            self.tree
+                .insert_by(s, |a, b| before(a.tcp().seq, b.tcp().seq));
+        }
+    }
+
     /// Drop the last skb unless `seq` lies after it: its truesize if
     /// one went (Linux tcp_prune_ofo_queue, from the highest sequence
     /// down, stopping where the incoming skb would land last)

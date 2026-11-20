@@ -1140,8 +1140,8 @@ impl TcpCb {
 
     /// Linux tcp_prune_queue: get within the receive buffer again;
     /// false (RcvPruned) when even pruning the out-of-order queue
-    /// beyond `seq` leaves it over. Collapsing the queues into fewer
-    /// skbs (tcp_collapse_ofo_queue, tcp_collapse) is not done.
+    /// beyond `seq` leaves it over, after collapsing the queues into
+    /// fewer skbs (tcp_collapse_ofo_queue, tcp_collapse) did not.
     fn prune_queue(&mut self, seq: u32) -> bool {
         self.net_stat(LINUX_MIB_PRUNECALLED);
         let over = |c: &Self| c.rmem_alloc() > c.rcvbuf as usize;
@@ -1153,9 +1153,17 @@ impl TcpCb {
         if !over(self) {
             return true;
         }
-        // Linux's order: tcp_collapse_ofo_queue (`collapse_ofo`), then
-        // tcp_collapse of the receive queue (`collapse_rcvq`), checked
-        // again, before the destructive pruning below (not done yet)
+        // Linux's order: tcp_collapse_ofo_queue, then tcp_collapse of the
+        // receive queue, the memory reclaimed (sk_mem_reclaim) and checked
+        // again, before the destructive pruning below
+        self.collapse_ofo();
+        if !self.rcvq.is_empty() {
+            self.collapse_rcvq();
+        }
+        self.mem_settle();
+        if !over(self) {
+            return true;
+        }
         self.prune_ofo_queue(seq);
         if !over(self) {
             return true;

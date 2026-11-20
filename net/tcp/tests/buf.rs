@@ -116,8 +116,8 @@ fn rcv_ssthresh_grows() {
 /// (tcp_clamp_window), prunes the out-of-order queue from the top down
 /// to the incoming skb (OfoPruned) and, still over, drops it
 /// (RcvPruned, TCPOFODrop); an in-order skb prunes what lies above
-/// it, and with data queued and nothing to prune it is dropped
-/// (TCPRcvQDrop) with a zero window
+/// it; in-order one-byte skbs filling the buffer collapse into a
+/// compact one (tcp_collapse, TCPRcvCollapsed), and the next byte fits
 #[test]
 fn rcvbuf_limit_prunes() {
     let (mut p, m) = mib_pair_buf(1460, 4000, crate::net::tcp::buf::RCVBUF_LOCK);
@@ -158,17 +158,20 @@ fn rcvbuf_limit_prunes() {
     assert_eq!(m.net.fold(LINUX_MIB_OFOPRUNED), 1);
     assert!(p.b.ooo.pieces() < held);
     assert_eq!(p.b.rcvq_len(), 1);
-    // Fill the buffer in order (nothing out of order is left to prune)
+    // Fill the buffer in order (nothing out of order is left to prune):
+    // the bloated one-byte skbs collapse into a compact one (Linux
+    // tcp_prune_queue's tcp_collapse), so the next byte still fits
     p.b.ooo = super::super::cb::Ooo::default();
     let mut n = 1;
     while p.b.rmem_alloc() <= p.b.rcvbuf as usize {
         one(&mut p, n);
         n += 1;
     }
-    let segs = one(&mut p, n);
-    assert_eq!(m.net.fold(LINUX_MIB_TCPRCVQDROP), 1);
-    assert_eq!(p.b.rcvq_len(), n as usize);
-    assert_eq!(segs.last().map(|s| s.wnd), Some(0));
+    one(&mut p, n);
+    assert!(m.net.fold(LINUX_MIB_TCPRCVCOLLAPSED) > 0);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPRCVQDROP), 0);
+    assert_eq!(p.b.rcvq_len(), n as usize + 1);
+    assert!(p.b.rmem_alloc() <= p.b.rcvbuf as usize);
 }
 
 /// Push `data` from a to b, b reading what arrived every `step` ms of

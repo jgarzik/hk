@@ -49,6 +49,7 @@
 pub mod ack;
 pub mod buf;
 pub mod cb;
+pub mod collapse;
 pub mod cong;
 pub mod cubic;
 pub mod info;
