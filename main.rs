@@ -338,8 +338,10 @@ pub(crate) fn kmain() -> ! {
     fs::ramfs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
-    // tracefs (Linux tracefs_init, a core initcall), then the trace
-    // files (tracer_init_tracefs, event_trace_init: fs initcalls)
+    // debugfs and tracefs (Linux debugfs_init, tracefs_init: core
+    // initcalls), then the trace files (tracer_init_tracefs,
+    // event_trace_init: fs initcalls)
+    fs::debugfs::init();
     fs::tracefs::init();
     trace::init();
     // sock_init, a core initcall after kernel/'s (ksysfs)
@@ -377,6 +379,9 @@ pub(crate) fn kmain() -> ! {
 
     // RAM disk rd0 (Linux brd_init, a device initcall)
     let _ = crate::block::create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);
+    // Late initcalls: the fault-injection knobs (Linux
+    // failslab_debugfs_init, fail_page_alloc_debugfs)
+    mm::fault_inject::init_debugfs();
 
     // pid 1's root and working directory: the VFS exists now
     if let Some(fs) = crate::fs::FsStruct::new_root() {

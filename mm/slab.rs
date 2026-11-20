@@ -580,7 +580,7 @@ pub struct KernelPages;
 /// __gfp_pfmemalloc_flags). User data, kernel buffers of it included
 /// (pipe pages), stops at low, so heap objects get low - min to
 /// themselves.
-fn heap_gfp() -> Gfp {
+pub(crate) fn heap_gfp() -> Gfp {
     #[cfg(not(test))]
     {
         use crate::arch::{CurrentArch, PerCpuOps};
@@ -600,7 +600,9 @@ fn heap_gfp() -> Gfp {
 
 impl SlabPages for KernelPages {
     fn alloc(&self, order: u32) -> Option<usize> {
-        let pa = crate::FRAME_ALLOCATOR.alloc_pages(order, heap_gfp())?;
+        // NOFAIL: the heap backs infallible allocations, its failure a
+        // panic; failslab injects into its fallible ones
+        let pa = crate::FRAME_ALLOCATOR.alloc_pages(order, heap_gfp().with(Gfp::NOFAIL))?;
         Some(crate::arch::phys_to_virt(pa) as usize)
     }
 

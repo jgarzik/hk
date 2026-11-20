@@ -515,9 +515,6 @@ pub fn dma_alloc_coherent_aligned<D: DmaDevice>(
     size: usize,
     align: usize,
 ) -> Option<DmaCoherent> {
-    if crate::mm::fault_inject::should_fail() {
-        return None;
-    }
     ops()?.alloc_coherent(dev.dma_config(), size, align, Gfp::KERNEL)
 }
 
@@ -563,11 +560,6 @@ impl DmaBox {
         size: usize,
         gfp: Gfp,
     ) -> Option<Self> {
-        // The task's fail-nth countdown (Linux fail_page_alloc under the
-        // DMA allocator, with ignore-gfp-wait off)
-        if crate::mm::fault_inject::should_fail() {
-            return None;
-        }
         let mem = ops.alloc_coherent(config, size, FRAME_SIZE, gfp)?;
         // INVARIANT: allocated by `ops`, freed only by drop
         Some(Self {

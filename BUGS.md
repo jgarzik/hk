@@ -718,6 +718,28 @@ F_SEAL_WRITE (`mm/memfd.rs` fcntl) does not wait for or refuse pages
 pinned by other references (Linux memfd_wait_for_pins: EBUSY after
 waiting).
 
+## Fault injection and debugfs gaps
+
+**Location**: `mm/fault_inject.rs`, `fs/debugfs.rs`
+
+- Only fail-nth injects: fault_create_debugfs_attr's generic files
+  (probability, interval, times, space, verbose, verbose_ratelimit_*,
+  task-filter with /proc/<pid>/make-it-fail, stacktrace-depth and the
+  require/reject address filters) and the failslab= / fail_page_alloc=
+  boot parameters are missing, as are failslab's cache-filter (and
+  /sys/kernel/slab/<cache>/failslab) and the other fault types
+  (fail_futex, fail_usercopy, fail_make_request, fail_io_timeout,
+  fail_function).
+- The heap's page refills (`mm::slab` `KernelPages`, `mm::vmalloc`
+  `alloc`) pass `Gfp::NOFAIL`, so fail_page_alloc never fails a
+  kmalloc's slab refill as in Linux: the heap also serves infallible
+  allocations, whose failure panics (failslab covers its fallible
+  ones).
+- debugfs has no removal (debugfs_remove), no debugfs= boot option
+  (debugfs_allow) or lockdown check, no automount points and only the
+  bool and u32 file helpers; a u32 file formats its value on every read
+  (Linux simple_attr keeps it per open for a continued read).
+
 ## tracefs gaps
 
 **Location**: `fs/tracefs.rs`

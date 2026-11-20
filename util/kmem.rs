@@ -39,7 +39,7 @@ fn fits<T>(count: usize) -> Result<usize, KernelError> {
 /// An allocation is about to be made: ENOMEM if fault injection picked
 /// it (`mm::fault_inject`)
 fn inject() -> Result<(), KernelError> {
-    if crate::mm::fault_inject::should_fail() {
+    if crate::mm::fault_inject::should_failslab() {
         return Err(KernelError::OutOfMemory);
     }
     Ok(())

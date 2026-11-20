@@ -68,6 +68,15 @@ impl Gfp {
     pub const MOVABLE: Gfp = Gfp(1 << 5);
     /// Failure is expected; do not report it
     pub const NOWARN: Gfp = Gfp(1 << 6);
+    /// The caller cannot handle a failure (Linux __GFP_NOFAIL): the
+    /// heap's own page refills, which back its infallible allocations
+    /// (failing them panics). Consulted only by fault injection
+    /// (`fault_inject`); the allocator does not retry for it.
+    pub const NOFAIL: Gfp = Gfp(1 << 7);
+    /// User data, highmem on 32-bit (Linux __GFP_HIGHMEM, part of
+    /// GFP_HIGHUSER): a 64-bit kernel has no highmem zone, so only
+    /// fault injection (fail_page_alloc's ignore-gfp-highmem) reads it
+    pub const HIGHMEM: Gfp = Gfp(1 << 8);
     /// Kernel allocation from thread context
     pub const KERNEL: Gfp = Gfp::RECLAIM;
     /// Cannot sleep, may dip into reserves (interrupt context)
@@ -77,13 +86,14 @@ impl Gfp {
     /// User memory the kernel needs to address
     pub const USER: Gfp = Gfp(Gfp::KERNEL.0 | Gfp::HARDWALL.0);
     /// User page data (anonymous memory, page cache)
-    pub const HIGHUSER_MOVABLE: Gfp = Gfp(Gfp::USER.0 | Gfp::MOVABLE.0);
+    pub const HIGHUSER_MOVABLE: Gfp = Gfp(Gfp::USER.0 | Gfp::HIGHMEM.0 | Gfp::MOVABLE.0);
     /// User page data for a caller that may reclaim (a page fault with
     /// only the mmap_lock held)
     /// An opportunistic huge page for user data (Linux
     /// GFP_TRANSHUGE_LIGHT): never drains or reclaims, the fault falls
     /// back to 4KB pages
-    pub const TRANSHUGE_LIGHT: Gfp = Gfp(Gfp::HARDWALL.0 | Gfp::MOVABLE.0 | Gfp::NOWARN.0);
+    pub const TRANSHUGE_LIGHT: Gfp =
+        Gfp(Gfp::HARDWALL.0 | Gfp::HIGHMEM.0 | Gfp::MOVABLE.0 | Gfp::NOWARN.0);
 
     pub const fn has(self, f: Gfp) -> bool {
         self.0 & f.0 == f.0
@@ -564,6 +574,10 @@ impl Zone {
             crate::sync::might_alloc_pages(order);
         }
         if order > MAX_ORDER {
+            return None;
+        }
+        // Linux prepare_alloc_pages
+        if crate::mm::fault_inject::should_fail_alloc_page(gfp, order) {
             return None;
         }
         self.try_alloc(order, gfp)

@@ -1388,21 +1388,27 @@ const BIND_LEAK_SLACK_KB: i64 = 1024;
 /// a failed allocation in the probe: Linux its goto unwind) until a bind
 /// completes without reaching one: a failed bind leaves the device with
 /// no driver and no eth0, and over the run MemFree comes back (no ring,
-/// buffer or mapping leaks). hk only: Linux's fail-nth does not fail
-/// GFP_KERNEL pages by default and its MemFree moves with its caches.
+/// buffer or mapping leaks). failslab's and fail_page_alloc's
+/// ignore-gfp-wait are N and min-order 0 meanwhile (`Reach`), so the
+/// probe's GFP_KERNEL heap, page and coherent DMA allocations fail too.
+/// hk only: Linux's MemFree moves with its caches.
 /// The device ends bound; eth0's flags are not kept (it runs before the
 /// network tests configure eth0).
 fn test_bind_fail_nth() {
     const N: &[u8] = b"SYSFS_BIND_FAIL_NTH";
     if host_mode() {
-        return skip(N, b"hk's fail-nth and MemFree");
+        return skip(N, b"MemFree accounting is hk's");
     }
     let fi = sys_open(b"/proc/self/fail-nth\0".as_ptr(), hk_syscall::O_RDWR, 0);
     if fi < 0 {
         return skip(N, b"no /proc/self/fail-nth");
     }
+    // Sleeping slab and page allocations, single pages too, fail as
+    // well (Linux's defaults skip them)
+    let reach = crate::io::fault_inject::Reach::new(true);
     let r = bind_fail_nth(fi as i32);
     crate::io::fault_inject::set(fi as i32, 0);
+    drop(reach);
     sys_close(fi as u64);
     match r {
         Err((why, v)) => fail_why(N, why, v),

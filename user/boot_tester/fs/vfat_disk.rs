@@ -407,6 +407,8 @@ fn dir_nomem(dev: &[u8]) {
         return;
     }
     let fd = fd as i32;
+    // GFP_KERNEL allocations fail too (failslab/ignore-gfp-wait N)
+    let _reach = crate::io::fault_inject::Reach::new(false);
     let mut t = T::new(b"VFAT_DIR_NOMEM");
     let p = sys_open(pad.as_ptr(), O_CREAT | O_WRONLY, 0o644);
     if t.ok(b"create PAD", p >= 0, p) {

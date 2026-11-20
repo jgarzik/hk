@@ -322,8 +322,11 @@ pub fn alloc(size: usize) -> *mut u8 {
     // SAFETY: the pages (and guard page) just taken from AREA, ours
     // alone until put back
     let mut area = unsafe { VmArea::new(va_of(p), pages) };
+    // NOFAIL: the heap's large blocks (its only user), as its slab
+    // pages (`mm::slab`)
+    let gfp = crate::mm::page_alloc::Gfp::KERNEL.with(crate::mm::page_alloc::Gfp::NOFAIL);
     for i in 0..pages {
-        let ok = crate::FRAME_ALLOCATOR.alloc().is_some_and(|pa| {
+        let ok = crate::FRAME_ALLOCATOR.alloc_gfp(gfp).is_some_and(|pa| {
             // SAFETY: a fresh frame, ours, handed to the area
             let mapped = unsafe { area.map(i, pa) };
             if !mapped {

@@ -276,6 +276,8 @@ fn each_failure(call: &mut dyn FnMut() -> i64, undo: &mut dyn FnMut(i64)) -> boo
         return false;
     }
     let fd = fd as i32;
+    // GFP_KERNEL allocations fail too (failslab/ignore-gfp-wait N)
+    let reach = crate::io::fault_inject::Reach::new(false);
     for nth in 1..64 {
         set(fd, nth);
         let r = call();
@@ -288,6 +290,7 @@ fn each_failure(call: &mut dyn FnMut() -> i64, undo: &mut dyn FnMut(i64)) -> boo
             break;
         }
     }
+    drop(reach);
     sys_close(fd as u64);
     true
 }

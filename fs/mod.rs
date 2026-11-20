@@ -47,6 +47,7 @@ pub mod pseudo;
 pub mod stat;
 
 // Filesystem implementations
+pub mod debugfs;
 pub mod kernfs;
 pub mod nullfs;
 pub mod proc;

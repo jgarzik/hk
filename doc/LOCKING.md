@@ -3700,6 +3700,13 @@ writes i_uid there), the root's inode borrowed with no reference under
 ti->private, a plain pointer: no inode holds another, so none is put
 from an inode's RCU-freed data); a uid=/gid= remount walks the superblock's inodes
 (`for_each_sb_inode`, Linux the tracefs_inodes RCU list) setting them.
+debugfs (`fs/debugfs.rs`, Linux fs/debugfs) makes its entries the same
+way (`libfs::simple_create` under the parent's `i_rwsem`, its kernel
+mount a `PinnedFs`) and removes none; its mount options are a spin leaf
+like tracefs's. Its bool and u32 files read and write their values
+(the fault-injection knobs, `mm::fault_inject`) as atomics, with no
+lock, as Linux reads and writes the plain variables; the allocators
+read the knobs lock-free.
 
 #### kernfs / sysfs (fs/kernfs/, fs/kernfs/sysfs.rs; Linux fs/kernfs)
 
