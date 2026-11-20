@@ -151,6 +151,7 @@ const FRA_FWMARK: u16 = 10;
 const FRA_UID_RANGE: u16 = 20;
 const RTA_SRC: u16 = 2;
 const RTA_TABLE: u16 = 15;
+const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 const FR_ACT_GOTO: u8 = 2;
 const FR_ACT_BLACKHOLE: u8 = 6;
 const FR_ACT_UNREACHABLE: u8 = 7;
@@ -204,10 +205,17 @@ fn find_rule(nl: &mut Nl, pref: u32, attr: u16) -> Option<(u32, u32, u8, u32)> {
     out
 }
 
-/// "ip route get `dst` [from `src`]": the table of the answer, or the
-/// error
+/// "ip route get `dst` [from `src`] table lookup": the table of the
+/// answer, or the error (without RTM_F_LOOKUP_TABLE Linux reports
+/// main, checked once)
 fn route_get(nl: &mut Nl, dst: [u8; 4], src: Option<[u8; 4]>) -> i64 {
-    let mut r = Req::new(RTM_GETROUTE, 0, &rtmsg(32, 0, 0, 0, 0));
+    route_get_flags(nl, dst, src, RTM_F_LOOKUP_TABLE)
+}
+
+fn route_get_flags(nl: &mut Nl, dst: [u8; 4], src: Option<[u8; 4]>, flags: u32) -> i64 {
+    let mut h = rtmsg(32, 0, 0, 0, 0);
+    h[8..].copy_from_slice(&flags.to_ne_bytes());
+    let mut r = Req::new(RTM_GETROUTE, 0, &h);
     r.attr(RTA_DST, &dst);
     if let Some(s) = src {
         r.attr(RTA_SRC, &s);
@@ -288,6 +296,11 @@ fn rule_engine(name: &'static [u8]) -> bool {
         b"get default",
         route_get(&mut nl, [10, 50, 0, 9], None),
         253,
+    );
+    t.eq(
+        b"get reports main",
+        route_get_flags(&mut nl, [10, 50, 0, 9], None, 0),
+        254,
     );
     t.eq(
         b"get no rule",

@@ -160,6 +160,7 @@ const RTA_UID: u16 = 25;
 const RTA_NH_ID: u16 = 30;
 const RTA_MAX: u16 = 31;
 const RTM_F_CLONED: u32 = 0x200;
+const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
 const RTM_F_FIB_MATCH: u32 = 0x2000;
 const RT_TABLE_COMPAT: u8 = 252;
 
@@ -1649,23 +1650,25 @@ fn getroute(sk: &NlSock, h: &Hdr, p: &[u8], ext: &ExtAck) -> Result<Done, Kernel
         return Ok(Done::Ok);
     }
     let rt = route::output(net, dst, src, oif)?;
-    reply(sk, fill_rt(&rt, src, h.seq, sk.portid()));
-    Ok(Done::Ok)
-}
-
-/// RTM_NEWROUTE answer for an output route (Linux rt_fill_info)
-fn fill_rt(rt: &route::Rtable, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
-    let table = if rt.table != 0 {
+    // The table looked up only on request, else main (Linux)
+    let table = if rtm.flags & RTM_F_LOOKUP_TABLE != 0 {
         rt.table
     } else {
         RT_TABLE_MAIN
     };
+    reply(sk, fill_rt(&rt, table, src, h.seq, sk.portid()));
+    Ok(Done::Ok)
+}
+
+/// RTM_NEWROUTE answer for an output route, reporting `table` (Linux
+/// rt_fill_info)
+fn fill_rt(rt: &route::Rtable, table: u32, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
     let mut m = Msg::new(RTM_NEWROUTE, 0, seq, pid);
     let mut hd = [0u8; RTMSG_LEN];
     hd[0] = AF_INET;
     hd[1] = 32;
     hd[2] = if src.is_unspecified() { 0 } else { 32 };
-    hd[4] = table as u8;
+    hd[4] = u8::try_from(table).unwrap_or(RT_TABLE_COMPAT);
     hd[7] = rt.rtype as u8;
     hd[8..12].copy_from_slice(&RTM_F_CLONED.to_ne_bytes());
     m.put(&hd)
