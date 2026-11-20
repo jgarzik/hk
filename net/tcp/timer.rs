@@ -94,10 +94,11 @@ impl TcpCb {
         now.saturating_sub(start) >= timeout
     }
 
-    /// Linux tcp_orphan_retries (tcp_orphan_retries sysctl 0): 8 while
-    /// the RTO is below its maximum, else none
-    fn orphan_retries(&self, alive: bool) -> u32 {
-        let mut retries = 0;
+    /// Linux tcp_orphan_retries: the sysctl (which may be 0), none after
+    /// an ICMP error once the RTO is at its maximum, 8 for 0 while it is
+    /// below (over 100 s from a 200 ms RTO)
+    pub(super) fn orphan_retries(&self, alive: bool) -> u32 {
+        let mut retries = self.cfg.orphan_retries;
         if self.soft_err.is_some() && !alive {
             retries = 0;
         }

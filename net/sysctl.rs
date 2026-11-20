@@ -69,6 +69,9 @@ pub struct NetSysctl {
     pub tcp_min_rtt_wlen: AtomicI32,
     /// tcp_slow_start_after_idle (RFC 2861 window validation)
     pub tcp_slow_start_after_idle: AtomicU8,
+    /// tcp_orphan_retries: an orphan's retransmissions (0: 8 while its
+    /// RTO is below the maximum)
+    pub tcp_orphan_retries: AtomicU8,
     /// Default congestion control (index into tcp::cong::ALGOS)
     pub tcp_ca: AtomicU8,
     pub somaxconn: AtomicI32,
@@ -115,6 +118,7 @@ impl Default for NetSysctl {
             tcp_frto: AtomicU8::new(2),
             tcp_min_rtt_wlen: AtomicI32::new(300),
             tcp_slow_start_after_idle: AtomicU8::new(1),
+            tcp_orphan_retries: AtomicU8::new(0),
             tcp_ca: AtomicU8::new(crate::net::tcp::cong::DEFAULT as u8),
             somaxconn: AtomicI32::new(4096),
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
@@ -615,6 +619,14 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_u8(n, |s| &s.tcp_slow_start_after_idle),
         store: |n, v| set_u8(n, |s| &s.tcp_slow_start_after_idle, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_orphan_retries",
+        mode: 0o644,
+        global: false,
+        show: |n| get_u8(n, |s| &s.tcp_orphan_retries),
+        store: |n, v| set_u8(n, |s| &s.tcp_orphan_retries, v),
         text: None,
     },
     NetCtl {

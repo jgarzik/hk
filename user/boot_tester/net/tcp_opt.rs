@@ -533,6 +533,7 @@ fn test_sysctls() {
         (b"/proc/sys/net/ipv4/tcp_frto\0", b"2\n"),
         (b"/proc/sys/net/ipv4/tcp_min_rtt_wlen\0", b"300\n"),
         (b"/proc/sys/net/ipv4/tcp_slow_start_after_idle\0", b"1\n"),
+        (b"/proc/sys/net/ipv4/tcp_orphan_retries\0", b"0\n"),
     ] {
         let n = read_file(path, &mut b);
         t.ok(

@@ -3052,3 +3052,16 @@ fn rtt_estimator_as_linux() {
         (200_000, 2000, 364)
     );
 }
+
+/// Linux tcp_orphan_retries with net.ipv4.tcp_orphan_retries
+#[test]
+fn orphan_retries_sysctl() {
+    let mut a = TcpCb::new(cfg(), Default::default());
+    // 0 (the default): 8 while the RTO is below its maximum, else none
+    assert_eq!((a.orphan_retries(true), a.orphan_retries(false)), (8, 0));
+    a.cfg.orphan_retries = 3;
+    assert_eq!((a.orphan_retries(true), a.orphan_retries(false)), (3, 3));
+    // An ICMP error and the RTO at its maximum: none
+    a.soft_err = Some(KernelError::HostUnreachable);
+    assert_eq!((a.orphan_retries(true), a.orphan_retries(false)), (3, 0));
+}

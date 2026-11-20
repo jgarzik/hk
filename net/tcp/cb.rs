@@ -228,6 +228,8 @@ pub struct Cfg {
     /// tcp_slow_start_after_idle: restart and validate the window after
     /// idle (RFC 2861)
     pub slow_start_after_idle: bool,
+    /// tcp_orphan_retries (0: Linux's default, 8 while alive)
+    pub orphan_retries: u32,
 }
 
 impl Default for Cfg {
@@ -253,6 +255,7 @@ impl Default for Cfg {
             frto: 2,
             min_rtt_wlen: 300,
             slow_start_after_idle: true,
+            orphan_retries: 0,
         }
     }
 }
