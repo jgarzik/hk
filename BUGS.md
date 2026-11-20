@@ -11,6 +11,13 @@ infallible, so each one is investigated, not written off.
   -95 (EOPNOTSUPP) on Ubuntu 26.04's 7.0 kernel
   (`LINUX_RELEASE=resolute ./tools/linux-boot-tester.sh`); passes on 6.8
   and hk. Likely the boot's poll queues or the 7.0 IOPOLL rules.
+- **AF_UNIX GC leaks `mixed_lowpoint` on the reference kernel**
+  (`user/boot_tester/net/unix_gc.rs`): Ubuntu's 6.8 kernel carries the
+  graph collector (4090fa373f0e, v6.10) without 4a4263dfeaba
+  ("af_unix: Unify scc_index when finalising SCC in
+  __unix_walk_scc()"), so a component with two back edges is never
+  freed there; hk has the fix. The test skips that one check on the
+  host; drop the skip once the reference kernels carry the fix.
 - **ICMP reply counted as echo reply:** Linux icmp_reply leaves
   fl4_icmp_type 0 and the ICMP control socket is SOCK_RAW, so
   __ip_make_skb's icmp_out_count counts every reply (timestamp replies
