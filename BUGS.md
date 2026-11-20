@@ -18,6 +18,15 @@ infallible, so each one is investigated, not written off.
   __unix_walk_scc()"), so a component with two back edges is never
   freed there; hk has the fix. The test skips that one check on the
   host; drop the skip once the reference kernels carry the fix.
+- **Stale per-CPU `tcp_tw_isn` on the reference kernel**
+  (`user/boot_tester/net/tcp_listen.rs`): Ubuntu's 6.8 kernel keeps the
+  TIME_WAIT-derived ISN per CPU (41eecbd712b7, v6.10) without
+  1bbf0ced1d9d ("tcp: fix stale per-CPU tcp_tw_isn leak enabling ISN
+  prediction"): a value left by a dropped SYN makes a later SYN look
+  like a TIME_WAIT takeover, so it gets that predictable ISN. hk keeps
+  the ISN with the segment, as current Linux. TCP_TW_ISN's ISN check
+  skips on the host; drop the skip once the reference kernels carry
+  the fix.
 - **ICMP reply counted as echo reply:** Linux icmp_reply leaves
   fl4_icmp_type 0 and the ICMP control socket is SOCK_RAW, so
   __ip_make_skb's icmp_out_count counts every reply (timestamp replies
@@ -109,10 +118,6 @@ TCP_FASTOPEN are stored only.
 UDP has no hash4 (Linux udp_table.hash4: connected sockets by
 four-tuple, looked up before hash2), and its compute_score lacks the
 sk_incoming_cpu point (hk does not track a socket's receiving CPU).
-
-TIME_WAIT (`net/tcp/timewait.rs`): a takeover SYN's connection gets
-a fresh ISN, not the entry's SND.NXT + 65537 (Linux TCP_SKB_CB
-tcp_tw_isn).
 
 skbs are linear (no paged frags, skb_shinfo frags): TCP's SACK
 shifting (`sack.rs` shift, Linux tcp_shift_skb_data / skb_shift moving

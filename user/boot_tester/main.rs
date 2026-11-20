@@ -437,6 +437,7 @@ pub fn run_all_tests() {
     net::snmp::run_tests();
     net::sockstat::run_tests();
     net::tcp_synrecv::run_tests();
+    net::tcp_listen::run_tests();
     net::net_stress::run_tests();
     ipc::keys::run_tests();
     process::kcmp::run_tests();

@@ -886,7 +886,7 @@ impl TcpSock {
         let _ = skb.pull(doff);
         let s = &s;
         if g.cb.state == TcpState::Listen {
-            return self.conn_request(s, t, now);
+            return self.conn_request(s, t, now, skb.tcp().tw_isn);
         }
         if g.tuple != Some(t) {
             return;
@@ -973,16 +973,20 @@ impl TcpSock {
         let Some(s) = seg_of(&skb) else {
             return;
         };
+        let isn = skb.tcp().tw_isn;
         drop(skb);
-        self.conn_request(&s, t, now_ms());
+        self.conn_request(&s, t, now_ms(), isn);
     }
 
     /// A segment in LISTEN (Linux tcp_rcv_state_process,
     /// tcp_conn_request): a SYN makes a child in SYN_RECEIVED that
     /// answers with SYN-ACK. Dropped when the accept queue or the SYN
     /// queue is full (no syncookies). Takes no lock of the listener but
-    /// its queue's (the options and buffer sizes are read as published)
-    fn conn_request(&self, s: &SegIn, t: Tuple, now: u64) {
+    /// its queue's (the options and buffer sizes are read as published).
+    /// `isn`: a TIME_WAIT takeover's ISN (Linux tcp_tw_isn), else 0; such
+    /// a request is not limited by the SYN queue (Linux: "TW buckets are
+    /// converted to open requests without limitations")
+    fn conn_request(&self, s: &SegIn, t: Tuple, now: u64, isn: u32) {
         if s.has(flags::RST) {
             return;
         }
@@ -1002,7 +1006,7 @@ impl TcpSock {
             let Some(q) = q.as_ref() else {
                 return;
             };
-            if q.syn.len() as u32 >= q.backlog.max(1) {
+            if q.syn.len() as u32 >= q.backlog.max(1) && isn == 0 {
                 // Linux tcp_syn_flood_action without syncookies
                 self.sk.net.mib.net.inc(LINUX_MIB_TCPREQQFULLDROP);
                 self.listen_drop();
@@ -1015,15 +1019,16 @@ impl TcpSock {
         }
         let opts = *self.listen_opts.lock();
         let caps = (self.sk.rcvbuf(), self.sk.sndbuf(), self.userlocks());
-        self.child(s, t, opts, caps, now);
+        self.child(s, t, opts, caps, now, isn);
     }
 
     /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK
     /// (under the new child's `slock`: nobody owns it yet; `opts` and
-    /// the buffer `caps` are the listener's). The child is allocated
+    /// the buffer `caps` are the listener's; `isn` a TIME_WAIT
+    /// takeover's, else 0 for a fresh one). The child is allocated
     /// GFP_ATOMIC before any lock is taken (Linux inet_reqsk_alloc,
     /// sk_clone_lock)
-    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (u32, u32, u8), now: u64) {
+    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (u32, u32, u8), now: u64, isn: u32) {
         // Out of memory: drop the SYN (Linux inet_reqsk_alloc failing in
         // tcp_conn_request: tcp_listendrop)
         let Ok(c) = with_gfp(Gfp::ATOMIC, || TcpSock::new(Sock::clone_from(&self.sk))) else {
@@ -1045,7 +1050,11 @@ impl TcpSock {
             return;
         };
         let mut out = Out::default();
-        let o = open(&self.sk.net, &t, self.oif());
+        let mut o = open(&self.sk.net, &t, self.oif());
+        // Linux tcp_conn_request: af_ops->init_seq only without tcp_tw_isn
+        if isn != 0 {
+            o.iss = isn;
+        }
         let mut b = c.lock.bh_lock();
         let Some(g) = b.get() else {
             return;
@@ -1541,6 +1550,7 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
     cb.end_seq = s.end_seq;
     cb.ack_seq = s.ack;
     cb.flags = s.flags;
+    cb.tw_isn = 0;
     let Some(t) = tuple_of(&skb, &s) else {
         return;
     };

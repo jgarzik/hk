@@ -559,6 +559,9 @@ pub struct TcpSkbCb {
     pub end_seq: u32,
     /// The ACK field of a received segment (Linux ack_seq)
     pub ack_seq: u32,
+    /// A SYN taking over a TIME_WAIT tuple: the new connection's ISN,
+    /// else 0 (Linux tcp_tw_isn)
+    pub tw_isn: u32,
     /// Segments a sent skb counts as, and their size when more than
     /// one (Linux tcp_gso_segs, tcp_gso_size)
     gso_segs: u16,

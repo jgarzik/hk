@@ -64,7 +64,7 @@ pub struct TwCb {
     /// Linux tw_rcv_nxt
     pub rcv_nxt: u32,
     /// Linux tw_snd_nxt (hk's SND.MAX)
-    snd_nxt: u32,
+    pub(super) snd_nxt: u32,
     /// Window offered at entry (Linux tw_rcv_wnd), its scale
     /// (tw_rcv_wscale)
     rcv_wnd: u32,
@@ -88,9 +88,10 @@ pub enum TwStatus {
     Success,
     /// ACK it (TCP_TW_ACK_OOW)
     Ack,
-    /// A new connection's SYN: a listener may take the tuple over, else
-    /// ACK it (TCP_TW_SYN)
-    Syn,
+    /// A new connection's SYN: a listener may take the tuple over with
+    /// this ISN (Linux TCP_SKB_CB(skb)->tcp_tw_isn), else ACK it
+    /// (TCP_TW_SYN)
+    Syn(u32),
     /// The entry ends (an in-window RST: inet_twsk_deschedule_put)
     Kill,
     /// Reset the sender and end the entry (TCP_TW_RST: data or a SYN
@@ -193,7 +194,9 @@ impl TwCb {
             && (after(s.seq, self.rcv_nxt)
                 || ts.is_some_and(|v| (self.ts_recent.wrapping_sub(v) as i32) < 0))
         {
-            return TwStatus::Syn;
+            // Linux: past anything the old connection sent, 0 meaning none
+            let isn = self.snd_nxt.wrapping_add(65535 + 2);
+            return TwStatus::Syn(isn.max(1));
         }
         if paws && let Some(m) = mib {
             m.net.inc(LINUX_MIB_PAWS_TW_REJECTED);
@@ -450,7 +453,11 @@ impl TimeWait {
         let mut g = self.inner.lock();
         let st = g.0.rcv(&s, now, rfc1337, Some(&self.net.mib));
         match st {
-            TwStatus::Syn => return Some(skb),
+            TwStatus::Syn(isn) => {
+                let mut skb = skb;
+                skb.tcp_mut().tw_isn = isn;
+                return Some(skb);
+            }
             TwStatus::Kill => {
                 drop(g);
                 self.kill();

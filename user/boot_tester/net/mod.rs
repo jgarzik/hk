@@ -29,6 +29,7 @@ pub mod tcp;
 pub mod tcp_buf;
 pub mod tcp_close;
 pub mod tcp_conn;
+pub mod tcp_listen;
 pub mod tcp_mem;
 pub mod tcp_opt;
 pub mod tcp_synrecv;

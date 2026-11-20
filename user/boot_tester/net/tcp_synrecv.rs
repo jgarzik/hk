@@ -32,17 +32,17 @@ use crate::net::sk::*;
 use crate::net::tcp_xfer::set_timeo;
 
 /// The played peer's address (TEST-NET-1), routed out lo
-const VOID: [u8; 4] = [192, 0, 2, 78];
-const PEER_PORT: u16 = 7781;
+pub(crate) const VOID: [u8; 4] = [192, 0, 2, 78];
+pub(crate) const PEER_PORT: u16 = 7781;
 const AF_PACKET: i32 = 17;
 const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_RAW: i32 = 255;
 const ECONNRESET: i64 = -104;
 
-const FIN: u8 = 0x01;
-const SYN: u8 = 0x02;
-const RST: u8 = 0x04;
-const ACK: u8 = 0x10;
+pub(crate) const FIN: u8 = 0x01;
+pub(crate) const SYN: u8 = 0x02;
+pub(crate) const RST: u8 = 0x04;
+pub(crate) const ACK: u8 = 0x10;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== TCP SYN_RECEIVED Close Tests ===");
@@ -55,18 +55,18 @@ pub fn run_tests() {
 
 /// A TCP segment as captured
 #[derive(Clone, Copy, Default)]
-struct Seg {
-    saddr: [u8; 4],
-    sport: u16,
-    dport: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
+pub(crate) struct Seg {
+    pub saddr: [u8; 4],
+    pub sport: u16,
+    pub dport: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
 }
 
 /// The played peer: the route, a raw socket to send, a packet socket
 /// to capture
-struct Peer {
+pub(crate) struct Peer {
     nl: Nl,
     lo: u32,
     raw: i32,
@@ -74,7 +74,7 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(t: &mut T) -> Option<Self> {
+    pub(crate) fn new(t: &mut T) -> Option<Self> {
         let Some(mut nl) = Nl::open() else {
             t.ok(b"netlink", false, 0);
             return None;
@@ -107,27 +107,49 @@ impl Peer {
     }
 
     /// Send a segment VOID:PEER_PORT -> 127.0.0.1:`dport` (no options)
-    fn send(&self, dport: u16, seq: u32, ack: u32, flags: u8) -> i64 {
-        let mut p = [0u8; 40];
+    pub(crate) fn send(&self, dport: u16, seq: u32, ack: u32, flags: u8) -> i64 {
+        self.send_full(dport, seq, ack, flags, &[], &[])
+    }
+
+    /// [`Peer::send`] with TCP options `opts` (padded by the caller to a
+    /// multiple of 4) and payload `data`; the IP length on success
+    pub(crate) fn send_full(
+        &self,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        opts: &[u8],
+        data: &[u8],
+    ) -> i64 {
+        let mut p = [0u8; 1500];
+        let hl = 20 + opts.len();
+        let n = 20 + hl + data.len();
+        if opts.len() % 4 != 0 || hl > 60 || n > p.len() {
+            return -1;
+        }
         p[..20].copy_from_slice(&[
-            0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1,
+            0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1,
         ]);
+        p[2..4].copy_from_slice(&(n as u16).to_be_bytes());
         p[12..16].copy_from_slice(&VOID);
-        let h = &mut p[20..];
+        let h = &mut p[20..n];
         h[0..2].copy_from_slice(&PEER_PORT.to_be_bytes());
         h[2..4].copy_from_slice(&dport.to_be_bytes());
         h[4..8].copy_from_slice(&seq.to_be_bytes());
         h[8..12].copy_from_slice(&ack.to_be_bytes());
-        h[12] = 5 << 4;
+        h[12] = ((hl / 4) as u8) << 4;
         h[13] = flags;
         h[14..16].copy_from_slice(&65535u16.to_be_bytes());
-        let c = tcp_csum(&p[12..16], &p[16..20], &p[20..]);
+        h[20..hl].copy_from_slice(opts);
+        h[hl..].copy_from_slice(data);
+        let c = tcp_csum(&p[12..16], &p[16..20], &p[20..n]);
         p[36..38].copy_from_slice(&c.to_be_bytes());
-        send_to(self.raw, &p, LO, 0, 0)
+        send_to(self.raw, &p[..n], LO, 0, 0)
     }
 
     /// The next segment within `ms` from 127.0.0.1:`port` to the peer
-    fn from(&self, port: u16, ms: u64) -> Option<Seg> {
+    pub(crate) fn from(&self, port: u16, ms: u64) -> Option<Seg> {
         let end = now_ms() + ms;
         let mut b = [0u8; 256];
         loop {
@@ -181,7 +203,7 @@ fn parse(b: &[u8]) -> Option<Seg> {
 }
 
 /// TCP checksum over the pseudo header and `seg`
-fn tcp_csum(src: &[u8], dst: &[u8], seg: &[u8]) -> u16 {
+pub(crate) fn tcp_csum(src: &[u8], dst: &[u8], seg: &[u8]) -> u16 {
     let mut s: u32 = 6 + seg.len() as u32;
     for c in src.chunks(2).chain(dst.chunks(2)).chain(seg.chunks(2)) {
         s += u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]));
@@ -193,7 +215,7 @@ fn tcp_csum(src: &[u8], dst: &[u8], seg: &[u8]) -> u16 {
 }
 
 /// TCP_INFO's tcpi_state
-fn tcp_state(fd: i32) -> i64 {
+pub(crate) fn tcp_state(fd: i32) -> i64 {
     let mut b = [0u8; 8];
     let mut len = b.len() as u32;
     sys_getsockopt(fd, IPPROTO_TCP, 11, b.as_mut_ptr(), &mut len);
@@ -201,7 +223,7 @@ fn tcp_state(fd: i32) -> i64 {
 }
 
 /// The flags and numbers of `s`, or a sign it never came
-fn got(s: Option<Seg>) -> (i64, u32, u32) {
+pub(crate) fn got(s: Option<Seg>) -> (i64, u32, u32) {
     s.map_or((-1, 0, 0), |s| (i64::from(s.flags), s.seq, s.ack))
 }
 

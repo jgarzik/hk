@@ -2100,13 +2100,16 @@ fn tw_reopens_with_newer_timestamp() {
     // An old SYN with an older timestamp fails PAWS: ACKed, no takeover
     let s = tw_seg(old, flags::SYN, Some((r.wrapping_sub(1), 0)));
     assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Ack);
+    // The new connection's ISN is past the old one's sequence space
+    // (Linux tcp_tw_isn = tw_snd_nxt + 65535 + 2)
+    let isn = tw.snd_nxt.wrapping_add(65537);
     let s = tw_seg(old, flags::SYN, Some((r.wrapping_add(1), 0)));
-    assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Syn);
+    assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Syn(isn));
     let s = tw_seg(next, flags::SYN, None);
-    assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Syn);
+    assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Syn(isn));
     // Not with ACK
     let s = tw_seg(next, flags::SYN | flags::ACK, None);
-    assert_ne!(tw.rcv(&s, now, false, None), TwStatus::Syn);
+    assert!(!matches!(tw.rcv(&s, now, false, None), TwStatus::Syn(_)));
 }
 
 // ============================================================================
