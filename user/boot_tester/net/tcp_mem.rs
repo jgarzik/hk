@@ -4,7 +4,7 @@
 //!   sized from RAM as tcp_init_mem (min = 3/4 of pressure, max = twice
 //!   min); it takes writes back as written and refuses negative values.
 //! - TCP_MEM_NETNS: from another network namespace tcp_mem cannot be
-//!   changed (Linux: no such file there; hk: EPERM), nor is it.
+//!   changed (no such file there: ENOENT), nor is it.
 //! - MEM_PCPU_RSV: net.core.mem_pcpu_rsv, the per-CPU reserve batching
 //!   the count (1 MiB in pages), refuses less than that.
 //! - TCP_MEM_PRESSURE: with every limit at 4 pages, 8 loopback pairs each
@@ -22,6 +22,7 @@ use crate::proc::sysctl::{read_file, write_file};
 
 const PATH: &[u8] = b"/proc/sys/net/ipv4/tcp_mem\0";
 const EINVAL: i64 = -22;
+const ENOENT: i64 = -2;
 const PAIRS: usize = 8;
 const LEN: usize = 128 * 1024;
 
@@ -91,7 +92,7 @@ fn test_netns() {
         if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
             sys_exit(1);
         }
-        sys_exit(if write_file(PATH, b"1 1 1\n") < 0 {
+        sys_exit(if write_file(PATH, b"1 1 1\n") == ENOENT {
             0
         } else {
             2

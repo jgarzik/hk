@@ -3382,7 +3382,9 @@ the candidate's own d_lock (read; Linux spin_lock(&dentry->d_lock)):
 still a child of the parent, hashed, the name matching (a
 filesystem's `DentryOps`, Linux d_hash/d_compare, hash and compare
 where names match more than their bytes: vfat, without case or
-trailing dots; no lock of their own), then takes its reference there
+trailing dots; procfs, a namespace's /proc/sys/net entry only for
+that namespace's tasks; given the candidate, read as an RCU reader
+would; no lock of their own), then takes its reference there
 with `DentryRef::try_get` (Linux d_lockref.count++, refusing a dying
 one). So `Dentry::add` and `d_delete`, which decide on a child's
 count under that child's d_lock (write), see every lookup's
@@ -5903,7 +5905,7 @@ not rely on either.
 | driver `netdev` / `Napi.poller` (`spin::Once<Weak<..>>`) | set once at probe, before the IRQ is registered and the NAPI added | read lock-free by polls (thread) | ISRs never read them (they use the driver struct passed as IRQ data) |
 | `icmp::ICMP_ECHO_REPLY_WQ` | `WaitQueue` | woken by ICMP input (softnet) | kernel self-test waiter only (`selftest.rs`), woken after the reply is recorded |
 | `UnixSock.peer_wait` | `WaitQueue` | thread only | Linux peer_wait: dgram senders blocked on a full peer wait here (no lock held); woken (POLLOUT) by the peer's reads and release; a linked `peer_wake` entry's callback (Linux unix_dgram_peer_wake_relay), under this head, is unlinked by the waker (`add_wait_queue_once`), clears `peer_wake_to` and wakes its socket's `Sock.wq`: `peer_wait` head -> `Sock.wq` head, never the reverse |
-| `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range, ip_local_port_range) is one packed atomic word, so readers never see half an update; the boot port/ISN secret is a `spin::Once` |
+| `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range, ip_local_port_range) is one packed atomic word, so readers never see half an update; the boot port/ISN secret is a `spin::Once`. A /proc/sys/net inode is bound to the namespace it was looked up in (`sysctl::Entry`, `proc_sysctl::NetDir`: a `Weak` and the id, Linux the inode's ctl_table_header of net->sysctls); each open, read, write and ref-mode revalidate takes an active reference for its duration (`maybe_get`, Linux sysctl_head_grab / use_table), ENOENT once there is none, never under the inode data's lock (the drop may be the last); procfs's `d_compare` (`proc_sysctl::compare`, Linux proc_sys_compare) reads the candidate's `ProcRcu.net` id and the caller's own nsproxy, no lock |
 | `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier`, `promiscuity`, `allmulti` | atomics | any (`promiscuity`/`allmulti` written only under RTNL) | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
 | e1000 `rx` ring | `spin::Mutex<Option<..>>` | thread only (NAPI poll, open, stop, remove) | leaf; frames are allocated under it with `Gfp::ATOMIC` (Linux napi_alloc_skb; dropped and counted without memory), linked on an `SkbHead` through their own `list` and delivered after it is dropped; also holds `napi_off` (NAPI disabled by `stop`), read by remove after `unregister_netdev` to disable a NAPI that never was; taken out (rings freed) by remove after the chip reset and IRQ free |
 | e1000 `tx` ring | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
@@ -6011,7 +6013,7 @@ netdev_wait_allrefs) because skbs in socket queues hold them.
 A namespace has active references (`NetRef`, Linux net->ns.count:
 tasks' nsproxies and user sockets) and passive ones (its `Arc`, Linux
 net->passive: the memory; TIME_WAIT entries, devices' back pointers,
-walkers). Dropping the last active reference, in any context (a
+walkers; /proc/sys/net inodes hold only a `Weak`). Dropping the last active reference, in any context (a
 socket's table reference released in `rcuc/N`), pushes the namespace
 on a lock-free list (`CLEANUP_LIST`, Linux cleanup_list) and queues one
 static work item on the `netns` workqueue, allocating nothing (Linux

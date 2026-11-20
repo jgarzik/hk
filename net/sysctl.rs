@@ -2,16 +2,19 @@
 //! net/core/sysctl_net_core.c subset)
 //!
 //! Values are per network namespace (`NetNamespace.sysctl`, plus
-//! `port_range`), atomics only; /proc/sys/net files act on the
-//! current task's namespace like Linux.
+//! `port_range`), atomics only. A namespace's files are `CTLS`, plus
+//! `INIT_CTLS` in the initial one (Linux register_net_sysctl of
+//! ipv4_net_table / netns_core_table per namespace, ipv4_table /
+//! net_core_table for init_net only); a /proc/sys/net file acts on the
+//! namespace it was looked up in (`sysctl::Entry`), whoever reads it.
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crate::net::current_net_ns;
-use crate::sysctl::{Ctl, Text, range};
+use crate::net::NetNamespace;
+use crate::sysctl::range;
 use crate::util::error::KernelError;
 
 /// GID_T_MAX: largest gid in ping_group_range
@@ -120,39 +123,81 @@ impl NetSysctl {
     }
 }
 
-fn get_i32(f: fn(&NetSysctl) -> &AtomicI32) -> Vec<i64> {
-    vec![i64::from(
-        f(&current_net_ns().sysctl).load(Ordering::Relaxed),
-    )]
+/// One network sysctl, in every namespace or the initial one only
+/// (Linux a ctl_table of net_sysctl_root, its data pointer moved into
+/// each namespace's copy: here the namespace is an argument)
+pub struct NetCtl {
+    /// Path below /proc/sys ("net/ipv4/ip_local_port_range")
+    pub path: &'static str,
+    /// File mode bits (0644, 0444)
+    pub mode: u16,
+    /// Current value in a namespace
+    pub show: fn(&NetNamespace) -> Vec<i64>,
+    /// Validate and store a value (as `sysctl::Ctl::store`)
+    pub store: fn(&NetNamespace, &[i64]) -> Result<(), KernelError>,
+    /// A string value instead (as `sysctl::Ctl::text`)
+    pub text: Option<NetText>,
 }
 
-fn get_u8(f: fn(&NetSysctl) -> &AtomicU8) -> Vec<i64> {
-    vec![i64::from(
-        f(&current_net_ns().sysctl).load(Ordering::Relaxed),
-    )]
+/// Show / store of a string network sysctl
+pub struct NetText {
+    pub show: fn(&NetNamespace) -> String,
+    pub store: fn(&NetNamespace, &str) -> Result<(), KernelError>,
+}
+
+/// `net` is the initial namespace (Linux net_eq(net, &init_net))
+fn is_init(net: &NetNamespace) -> bool {
+    let init: &NetNamespace = &crate::net::INIT_NET_NS;
+    core::ptr::eq(net, init)
+}
+
+/// The sysctls registered in `net` (Linux net->sysctls: the per-net
+/// tables, and the init_net-only ones there)
+pub fn registered(net: &NetNamespace) -> impl Iterator<Item = &'static NetCtl> + use<> {
+    let init: &'static [NetCtl] = if is_init(net) { INIT_CTLS } else { &[] };
+    CTLS.iter().chain(init)
+}
+
+/// Every network sysctl, whichever namespaces register it (what the
+/// links of the root set's /proc/sys/net name: Linux insert_links)
+pub fn all() -> impl Iterator<Item = &'static NetCtl> {
+    CTLS.iter().chain(INIT_CTLS)
+}
+
+fn get_i32(n: &NetNamespace, f: fn(&NetSysctl) -> &AtomicI32) -> Vec<i64> {
+    vec![i64::from(f(&n.sysctl).load(Ordering::Relaxed))]
+}
+
+fn get_u8(n: &NetNamespace, f: fn(&NetSysctl) -> &AtomicU8) -> Vec<i64> {
+    vec![i64::from(f(&n.sysctl).load(Ordering::Relaxed))]
 }
 
 /// A u8 sysctl (Linux proc_dou8vec_minmax: 0..=255)
-fn set_u8(f: fn(&NetSysctl) -> &AtomicU8, v: &[i64]) -> Result<(), KernelError> {
+fn set_u8(n: &NetNamespace, f: fn(&NetSysctl) -> &AtomicU8, v: &[i64]) -> Result<(), KernelError> {
     range(v[0], 0, 255)?;
-    f(&current_net_ns().sysctl).store(v[0] as u8, Ordering::Relaxed);
+    f(&n.sysctl).store(v[0] as u8, Ordering::Relaxed);
     Ok(())
 }
 
-fn set_bool(f: fn(&NetSysctl) -> &AtomicU8, v: &[i64]) -> Result<(), KernelError> {
+fn set_bool(
+    n: &NetNamespace,
+    f: fn(&NetSysctl) -> &AtomicU8,
+    v: &[i64],
+) -> Result<(), KernelError> {
     range(v[0], 0, 1)?;
-    f(&current_net_ns().sysctl).store(v[0] as u8, Ordering::Relaxed);
+    f(&n.sysctl).store(v[0] as u8, Ordering::Relaxed);
     Ok(())
 }
 
 fn set_int(
+    n: &NetNamespace,
     f: fn(&NetSysctl) -> &AtomicI32,
     v: &[i64],
     lo: i64,
     hi: i64,
 ) -> Result<(), KernelError> {
     range(v[0], lo, hi)?;
-    f(&current_net_ns().sysctl).store(v[0] as i32, Ordering::Relaxed);
+    f(&n.sysctl).store(v[0] as i32, Ordering::Relaxed);
     Ok(())
 }
 
@@ -160,7 +205,7 @@ const INT_MAX: i64 = i32::MAX as i64;
 const INT_MIN: i64 = i32::MIN as i64;
 
 /// Linux ipv4_ping_group_range: an inverted range means "nobody" (1 0)
-fn ping_group_store(v: &[i64]) -> Result<(), KernelError> {
+fn ping_group_store(n: &NetNamespace, v: &[i64]) -> Result<(), KernelError> {
     range(v[0], 0, GID_MAX)?;
     range(v[1], 0, GID_MAX)?;
     let (lo, hi) = if v[1] < v[0] {
@@ -168,41 +213,41 @@ fn ping_group_store(v: &[i64]) -> Result<(), KernelError> {
     } else {
         (v[0] as u32, v[1] as u32)
     };
-    current_net_ns().sysctl.set_ping_group(lo, hi);
+    n.sysctl.set_ping_group(lo, hi);
     Ok(())
 }
 
-fn ping_group_show() -> Vec<i64> {
-    let (lo, hi) = current_net_ns().sysctl.ping_group();
+fn ping_group_show(n: &NetNamespace) -> Vec<i64> {
+    let (lo, hi) = n.sysctl.ping_group();
     vec![i64::from(lo), i64::from(hi)]
 }
 
 /// Linux ipv4_local_port_range: 1..65535, low <= high, low above the
 /// privileged ports
-fn port_range_store(v: &[i64]) -> Result<(), KernelError> {
+fn port_range_store(n: &NetNamespace, v: &[i64]) -> Result<(), KernelError> {
     range(v[0], 1, 65535)?;
     range(v[1], 1, 65535)?;
     if v[1] < v[0] || v[0] < PROT_SOCK {
         return Err(KernelError::InvalidArgument);
     }
-    current_net_ns().port_range.set(v[0] as u16, v[1] as u16);
+    n.port_range.set(v[0] as u16, v[1] as u16);
     Ok(())
 }
 
-fn port_range_show() -> Vec<i64> {
-    let (lo, hi) = current_net_ns().port_range.get();
+fn port_range_show(n: &NetNamespace) -> Vec<i64> {
+    let (lo, hi) = n.port_range.get();
     vec![i64::from(lo), i64::from(hi)]
 }
 
-fn frag_show(high: bool) -> Vec<i64> {
-    let s = &current_net_ns().sysctl;
+fn frag_show(n: &NetNamespace, high: bool) -> Vec<i64> {
+    let s = &n.sysctl;
     let v = if high { &s.frag_high } else { &s.frag_low };
     vec![v.load(Ordering::Relaxed) as i64]
 }
 
 /// ipfrag_high_thresh >= ipfrag_low_thresh (Linux extra1/extra2 bounds)
-fn frag_store(high: bool, v: &[i64]) -> Result<(), KernelError> {
-    let s = &current_net_ns().sysctl;
+fn frag_store(n: &NetNamespace, high: bool, v: &[i64]) -> Result<(), KernelError> {
+    let s = &n.sysctl;
     if high {
         range(v[0], s.frag_low.load(Ordering::Relaxed) as i64, i64::MAX)?;
         s.frag_high.store(v[0] as usize, Ordering::Relaxed);
@@ -213,8 +258,8 @@ fn frag_store(high: bool, v: &[i64]) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn rmem_show() -> Vec<i64> {
-    let s = &current_net_ns().sysctl;
+fn rmem_show(n: &NetNamespace) -> Vec<i64> {
+    let s = &n.sysctl;
     s.tcp_rmem
         .iter()
         .map(|v| i64::from(v.load(Ordering::Relaxed)))
@@ -222,261 +267,264 @@ fn rmem_show() -> Vec<i64> {
 }
 
 /// tcp_rmem: three integers, each at least 1
-fn rmem_store(v: &[i64]) -> Result<(), KernelError> {
+fn rmem_store(n: &NetNamespace, v: &[i64]) -> Result<(), KernelError> {
     for &x in v {
         range(x, 1, INT_MAX)?;
     }
-    let s = &current_net_ns().sysctl;
+    let s = &n.sysctl;
     for (a, &x) in s.tcp_rmem.iter().zip(v) {
         a.store(x as i32, Ordering::Relaxed);
     }
     Ok(())
 }
 
-fn ca_show() -> String {
-    let i = current_net_ns().sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
+fn ca_show(n: &NetNamespace) -> String {
+    let i = n.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
     String::from(crate::net::tcp::cong::ALGOS[i].name())
 }
 
 /// tcp_congestion_control: a built-in algorithm (Linux: ENOENT when
 /// no module provides it)
-fn ca_store(name: &str) -> Result<(), KernelError> {
+fn ca_store(n: &NetNamespace, name: &str) -> Result<(), KernelError> {
     let i = crate::net::tcp::cong::find(name).ok_or(KernelError::NotFound)?;
-    current_net_ns()
-        .sysctl
-        .tcp_ca
-        .store(i as u8, Ordering::Relaxed);
+    n.sysctl.tcp_ca.store(i as u8, Ordering::Relaxed);
     Ok(())
 }
 
-fn ro_text(_: &str) -> Result<(), KernelError> {
+fn ro_text(_: &NetNamespace, _: &str) -> Result<(), KernelError> {
     Err(KernelError::PermissionDenied)
 }
 
-fn no_ints() -> Vec<i64> {
+fn no_ints(_: &NetNamespace) -> Vec<i64> {
     Vec::new()
 }
 
-fn ro(_: &[i64]) -> Result<(), KernelError> {
+fn ro(_: &NetNamespace, _: &[i64]) -> Result<(), KernelError> {
     Err(KernelError::PermissionDenied)
 }
 
-/// The /proc/sys/net files
-pub static CTLS: &[Ctl] = &[
-    Ctl {
+/// The /proc/sys/net files of every namespace (Linux ipv4_net_table,
+/// netns_core_table, ip4_frags_ns_ctl_table, devinet's ip_forward,
+/// unix_table)
+pub static CTLS: &[NetCtl] = &[
+    NetCtl {
         path: "net/ipv4/ping_group_range",
         mode: 0o644,
         show: ping_group_show,
         store: ping_group_store,
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/ip_local_port_range",
         mode: 0o644,
         show: port_range_show,
         store: port_range_store,
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/icmp_echo_ignore_all",
         mode: 0o644,
-        show: || get_u8(|s| &s.icmp_echo_ignore_all),
-        store: |v| set_bool(|s| &s.icmp_echo_ignore_all, v),
+        show: |n| get_u8(n, |s| &s.icmp_echo_ignore_all),
+        store: |n, v| set_bool(n, |s| &s.icmp_echo_ignore_all, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/icmp_echo_ignore_broadcasts",
         mode: 0o644,
-        show: || get_u8(|s| &s.icmp_echo_ignore_bcast),
-        store: |v| set_bool(|s| &s.icmp_echo_ignore_bcast, v),
+        show: |n| get_u8(n, |s| &s.icmp_echo_ignore_bcast),
+        store: |n, v| set_bool(n, |s| &s.icmp_echo_ignore_bcast, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/icmp_ratelimit",
         mode: 0o644,
-        show: || get_i32(|s| &s.icmp_ratelimit),
-        store: |v| set_int(|s| &s.icmp_ratelimit, v, 0, INT_MAX),
+        show: |n| get_i32(n, |s| &s.icmp_ratelimit),
+        store: |n, v| set_int(n, |s| &s.icmp_ratelimit, v, 0, INT_MAX),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/icmp_ratemask",
         mode: 0o644,
-        show: || get_i32(|s| &s.icmp_ratemask),
-        store: |v| set_int(|s| &s.icmp_ratemask, v, INT_MIN, INT_MAX),
+        show: |n| get_i32(n, |s| &s.icmp_ratemask),
+        store: |n, v| set_int(n, |s| &s.icmp_ratemask, v, INT_MIN, INT_MAX),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/icmp_msgs_per_sec",
         mode: 0o644,
-        show: || get_i32(|s| &s.icmp_msgs_per_sec),
-        store: |v| set_int(|s| &s.icmp_msgs_per_sec, v, 0, INT_MAX),
+        show: |n| get_i32(n, |s| &s.icmp_msgs_per_sec),
+        store: |n, v| set_int(n, |s| &s.icmp_msgs_per_sec, v, 0, INT_MAX),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/icmp_msgs_burst",
         mode: 0o644,
-        show: || get_i32(|s| &s.icmp_msgs_burst),
-        store: |v| set_int(|s| &s.icmp_msgs_burst, v, 0, INT_MAX),
+        show: |n| get_i32(n, |s| &s.icmp_msgs_burst),
+        store: |n, v| set_int(n, |s| &s.icmp_msgs_burst, v, 0, INT_MAX),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_syn_retries",
         mode: 0o644,
-        show: || get_u8(|s| &s.tcp_syn_retries),
-        store: |v| {
+        show: |n| get_u8(n, |s| &s.tcp_syn_retries),
+        store: |n, v| {
             range(v[0], 1, MAX_SYNCNT)?;
-            current_net_ns()
-                .sysctl
+            n.sysctl
                 .tcp_syn_retries
                 .store(v[0] as u8, Ordering::Relaxed);
             Ok(())
         },
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_synack_retries",
         mode: 0o644,
-        show: || get_u8(|s| &s.tcp_synack_retries),
-        store: |v| set_u8(|s| &s.tcp_synack_retries, v),
+        show: |n| get_u8(n, |s| &s.tcp_synack_retries),
+        store: |n, v| set_u8(n, |s| &s.tcp_synack_retries, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_retries2",
         mode: 0o644,
-        show: || get_u8(|s| &s.tcp_retries2),
-        store: |v| set_u8(|s| &s.tcp_retries2, v),
+        show: |n| get_u8(n, |s| &s.tcp_retries2),
+        store: |n, v| set_u8(n, |s| &s.tcp_retries2, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_fin_timeout",
         mode: 0o644,
-        show: || get_i32(|s| &s.tcp_fin_timeout),
-        store: |v| set_int(|s| &s.tcp_fin_timeout, v, 1, INT_MAX / 1000),
+        show: |n| get_i32(n, |s| &s.tcp_fin_timeout),
+        store: |n, v| set_int(n, |s| &s.tcp_fin_timeout, v, 1, INT_MAX / 1000),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_window_scaling",
         mode: 0o644,
-        show: || get_u8(|s| &s.tcp_window_scaling),
-        store: |v| set_u8(|s| &s.tcp_window_scaling, v),
+        show: |n| get_u8(n, |s| &s.tcp_window_scaling),
+        store: |n, v| set_u8(n, |s| &s.tcp_window_scaling, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_timestamps",
         mode: 0o644,
-        show: || get_u8(|s| &s.tcp_timestamps),
-        store: |v| set_u8(|s| &s.tcp_timestamps, v),
+        show: |n| get_u8(n, |s| &s.tcp_timestamps),
+        store: |n, v| set_u8(n, |s| &s.tcp_timestamps, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_rfc1337",
         mode: 0o644,
-        show: || get_u8(|s| &s.tcp_rfc1337),
-        store: |v| set_u8(|s| &s.tcp_rfc1337, v),
+        show: |n| get_u8(n, |s| &s.tcp_rfc1337),
+        store: |n, v| set_u8(n, |s| &s.tcp_rfc1337, v),
         text: None,
     },
-    Ctl {
-        path: "net/ipv4/tcp_mem",
-        mode: 0o644,
-        show: crate::net::tcp::mem::sysctl_show,
-        store: crate::net::tcp::mem::sysctl_store,
-        text: None,
-    },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_rmem",
         mode: 0o644,
         show: rmem_show,
         store: rmem_store,
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_keepalive_time",
         mode: 0o644,
-        show: || get_i32(|s| &s.tcp_keepalive_time),
-        store: |v| set_int(|s| &s.tcp_keepalive_time, v, 1, INT_MAX / 1000),
+        show: |n| get_i32(n, |s| &s.tcp_keepalive_time),
+        store: |n, v| set_int(n, |s| &s.tcp_keepalive_time, v, 1, INT_MAX / 1000),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_keepalive_intvl",
         mode: 0o644,
-        show: || get_i32(|s| &s.tcp_keepalive_intvl),
-        store: |v| set_int(|s| &s.tcp_keepalive_intvl, v, 1, INT_MAX / 1000),
+        show: |n| get_i32(n, |s| &s.tcp_keepalive_intvl),
+        store: |n, v| set_int(n, |s| &s.tcp_keepalive_intvl, v, 1, INT_MAX / 1000),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_keepalive_probes",
         mode: 0o644,
-        show: || get_u8(|s| &s.tcp_keepalive_probes),
-        store: |v| set_u8(|s| &s.tcp_keepalive_probes, v),
+        show: |n| get_u8(n, |s| &s.tcp_keepalive_probes),
+        store: |n, v| set_u8(n, |s| &s.tcp_keepalive_probes, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_congestion_control",
         mode: 0o644,
         show: no_ints,
         store: ro,
-        text: Some(Text {
+        text: Some(NetText {
             show: ca_show,
             store: ca_store,
         }),
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/tcp_available_congestion_control",
         mode: 0o444,
         show: no_ints,
         store: ro,
-        text: Some(Text {
-            show: crate::net::tcp::cong::names,
+        text: Some(NetText {
+            show: |_| crate::net::tcp::cong::names(),
             store: ro_text,
         }),
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/ip_forward",
         mode: 0o444,
-        show: || vec![0],
+        show: |_| vec![0],
         store: ro,
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/ipfrag_high_thresh",
         mode: 0o644,
-        show: || frag_show(true),
-        store: |v| frag_store(true, v),
+        show: |n| frag_show(n, true),
+        store: |n, v| frag_store(n, true, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/ipfrag_low_thresh",
         mode: 0o644,
-        show: || frag_show(false),
-        store: |v| frag_store(false, v),
+        show: |n| frag_show(n, false),
+        store: |n, v| frag_store(n, false, v),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/ipv4/ipfrag_time",
         mode: 0o644,
-        show: || get_i32(|s| &s.frag_time),
-        store: |v| set_int(|s| &s.frag_time, v, 1, INT_MAX),
+        show: |n| get_i32(n, |s| &s.frag_time),
+        store: |n, v| set_int(n, |s| &s.frag_time, v, 1, INT_MAX),
         text: None,
     },
-    Ctl {
-        path: "net/core/mem_pcpu_rsv",
-        mode: 0o644,
-        show: crate::net::tcp::mem::rsv_show,
-        store: crate::net::tcp::mem::rsv_store,
-        text: None,
-    },
-    Ctl {
+    NetCtl {
         path: "net/core/somaxconn",
         mode: 0o644,
-        show: || get_i32(|s| &s.somaxconn),
-        store: |v| set_int(|s| &s.somaxconn, v, 0, INT_MAX),
+        show: |n| get_i32(n, |s| &s.somaxconn),
+        store: |n, v| set_int(n, |s| &s.somaxconn, v, 0, INT_MAX),
         text: None,
     },
-    Ctl {
+    NetCtl {
         path: "net/unix/max_dgram_qlen",
         mode: 0o644,
-        show: || get_i32(|s| &s.unix_max_dgram_qlen),
-        store: |v| set_int(|s| &s.unix_max_dgram_qlen, v, INT_MIN, INT_MAX),
+        show: |n| get_i32(n, |s| &s.unix_max_dgram_qlen),
+        store: |n, v| set_int(n, |s| &s.unix_max_dgram_qlen, v, INT_MIN, INT_MAX),
+        text: None,
+    },
+];
+
+/// The machine-wide network sysctls, registered for the initial
+/// namespace only (Linux ipv4_table, net_core_table): absent elsewhere
+pub static INIT_CTLS: &[NetCtl] = &[
+    NetCtl {
+        path: "net/ipv4/tcp_mem",
+        mode: 0o644,
+        show: |_| crate::net::tcp::mem::sysctl_show(),
+        store: |_, v| crate::net::tcp::mem::sysctl_store(v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/core/mem_pcpu_rsv",
+        mode: 0o644,
+        show: |_| crate::net::tcp::mem::rsv_show(),
+        store: |_, v| crate::net::tcp::mem::rsv_store(v),
         text: None,
     },
 ];

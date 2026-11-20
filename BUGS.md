@@ -1056,13 +1056,6 @@ Designs that grew one commit at a time. Tag = roadmap phase
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
   as old as its first.
-  /proc/sys is one static tree: the sysctls Linux registers for the
-  initial network namespace only (net/ipv4/tcp_mem,
-  net/core/mem_pcpu_rsv) appear in every
-  namespace. /proc/sys/net values act on the namespace of the task
-  reading or writing, not the one the file was opened in (Linux binds
-  the file to the opener's namespace): an fd passed across namespaces
-  reads and writes the other one's values.
 - **Stale comments** (as touched): "for now"/TODO markers.
 
 ## Review gaps, by phase
