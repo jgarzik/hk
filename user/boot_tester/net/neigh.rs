@@ -333,15 +333,16 @@ fn test_confirm(idx: u32) {
     t.done();
 }
 
-const ETH_P_ARP: u16 = 0x0806;
 const IPPROTO_RAW: i32 = 255;
 
 /// Have slirp ask for `ip` (it reflects an echo from that made-up
 /// source to the gateway, so it must resolve it) and wait for a reply
-/// of ours claiming it, seen leaving eth0
+/// of ours claiming it, seen leaving eth0: an ETH_P_ALL tap, as only
+/// those see outgoing frames (Linux dev_queue_xmit_nit)
 fn proxied(eth: u32, ip: [u8; 4]) -> bool {
-    use crate::net::packet::{bound, find};
-    let ps = bound(SOCK_RAW, ETH_P_ARP, eth as i32);
+    use crate::net::packet::{ETH_P_ALL, bound, find};
+    const PACKET_OUTGOING: u8 = 4;
+    let ps = bound(SOCK_RAW, ETH_P_ALL, eth as i32);
     let raw = hk_syscall::sys_socket(2, SOCK_RAW, IPPROTO_RAW) as i32;
     let mut pkt = [0u8; 28];
     pkt[..20].copy_from_slice(&[
@@ -355,8 +356,9 @@ fn proxied(eth: u32, ip: [u8; 4]) -> bool {
     pkt[10..12].copy_from_slice(&hc.to_be_bytes());
     let sent = send_to(raw, &pkt, GW, 0, 0) == 28;
     let mut buf = [0u8; 128];
-    let got = find(ps, &mut buf, 3000, &|f, _| {
-        f.len() >= 42
+    let got = find(ps, &mut buf, 3000, &|f, a| {
+        a.pkttype == PACKET_OUTGOING
+            && f.len() >= 42
             && f[12..14] == [8, 6]
             && f[20..22] == [0, 2]
             && f[28..32] == ip
