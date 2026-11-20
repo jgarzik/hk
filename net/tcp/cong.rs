@@ -208,7 +208,7 @@ pub fn set_allowed(names: &str) -> Result<(), KernelError> {
 /// pick a restricted one (EPERM); the default is unrestricted from then
 pub fn set_default(init: bool, i: usize) -> Result<(), KernelError> {
     if !init && !allowed(i) {
-        return Err(KernelError::PermissionDenied);
+        return Err(KernelError::NotPermitted);
     }
     ALLOWED.fetch_or(1 << i, Ordering::Relaxed);
     Ok(())
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(ALLOWED.load(Ordering::Relaxed), saved);
         set_allowed("cubic").unwrap();
         assert_eq!(allowed_names(), "cubic");
-        assert_eq!(set_default(false, 0), Err(KernelError::PermissionDenied));
+        assert_eq!(set_default(false, 0), Err(KernelError::NotPermitted));
         set_default(true, 0).unwrap();
         assert_eq!(allowed_names(), "reno cubic");
         set_allowed("").unwrap();

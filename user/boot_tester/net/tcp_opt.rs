@@ -281,10 +281,32 @@ fn test_congestion() {
 }
 
 const ALLOWED: &[u8] = b"/proc/sys/net/ipv4/tcp_allowed_congestion_control\0";
+const CA_DEFAULT: &[u8] = b"/proc/sys/net/ipv4/tcp_congestion_control\0";
+
+/// A child namespace's tcp_congestion_control takes only an allowed
+/// algorithm (Linux tcp_set_default_congestion_control: EPERM): the
+/// child's exit status, 2 if unshare was refused
+fn ca_default_child() -> i32 {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        if write_file(CA_DEFAULT, b"cubic") != EPERM {
+            sys_exit(3);
+        }
+        if write_file(CA_DEFAULT, b"reno") != 4 || !reads(CA_DEFAULT, b"reno\n") {
+            sys_exit(4);
+        }
+        sys_exit(0);
+    }
+    wait_child(pid)
+}
 
 /// tcp_allowed_congestion_control: a restricted algorithm needs
 /// CAP_NET_ADMIN (Linux tcp_set_congestion_control), the current one
-/// does not; unknown names are ENOENT
+/// does not, and only the initial namespace may make it a default;
+/// unknown names are ENOENT
 fn test_congestion_allowed() {
     let mut t = T::new(b"TCP_CONGESTION_ALLOWED");
     t.eq(b"restrict", write_file(ALLOWED, b"reno"), 4);
@@ -310,6 +332,15 @@ fn test_congestion_allowed() {
         sys_exit(0);
     }
     t.eq(b"unprivileged", wait_child(pid) as i64, 0);
+    let st = ca_default_child();
+    if st == 2 << 8 && crate::helpers::host_mode() {
+        crate::helpers::skip(
+            b"TCP_CONGESTION_ALLOWED netns",
+            b"unshare(CLONE_NEWNET) not permitted",
+        );
+    } else {
+        t.eq(b"netns default", st as i64, 0);
+    }
     // Privileged: restricted ones too
     let fd = tcp();
     t.eq(b"cap_net_admin", set_ca(fd, b"cubic"), 0);
