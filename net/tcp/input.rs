@@ -759,6 +759,7 @@ impl TcpCb {
         match self.state {
             TcpState::FinWait1 => {
                 self.set_state(TcpState::FinWait2);
+                self.dst_pending_confirm = true;
                 self.live.tmr.set(None);
                 out.wake |= wake::STATE;
                 let fin = s.has(flags::FIN);
@@ -923,6 +924,10 @@ impl TcpCb {
         }
         if flg & flag::SET_XMIT_TIMER != 0 {
             self.set_xmit_timer(now);
+        }
+        if flg & flag::FORWARD_PROGRESS != 0 || flg & flag::NOT_DUP == 0 {
+            // Linux sk_dst_confirm
+            self.dst_pending_confirm = true;
         }
         let delivered = self.newly_delivered(prior_delivered);
         let lost = self.lost.wrapping_sub(prior_lost);

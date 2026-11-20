@@ -41,7 +41,7 @@ use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IP_HLEN_MIN, IPPROTO_ICMP, Ipv4Addr, ip_checksum, pmtu};
 use crate::net::mib::IPSTATS_MIB_OUTDISCARDS;
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, RecvMsg, SendMsg};
+use crate::net::msg::{MSG_CONFIRM, MSG_ERRQUEUE, MSG_OOB, MSG_PROBE, RecvMsg, SendMsg};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -159,9 +159,23 @@ impl RawSock {
     /// IP_HDRINCL send (Linux raw_send_hdrinc): at most the device MTU,
     /// a sane header length; source (if 0), total length, id (if 0)
     /// and checksum filled in
-    fn send_hdrinc(&self, rt: &route::Rtable, data: &[u8]) -> Result<(), KernelError> {
+    fn send_hdrinc(
+        &self,
+        rt: &route::Rtable,
+        data: &[u8],
+        confirm: bool,
+    ) -> Result<(), KernelError> {
+        let mtu = self.hdrinc_size(rt, data.len())?;
+        // Linux raw_send_hdrinc's error path past the size checks
+        self.xmit_hdrinc(rt, data, mtu, confirm)
+            .inspect_err(|_| self.sk.net.mib.ip.inc(IPSTATS_MIB_OUTDISCARDS))
+    }
+
+    /// raw_send_hdrinc's size checks of a `len`-byte packet (a probe
+    /// stops after them): the device MTU it may fill
+    fn hdrinc_size(&self, rt: &route::Rtable, len: usize) -> Result<usize, KernelError> {
         let mtu = rt.dev.mtu() as usize;
-        if data.len() > mtu {
+        if len > mtu {
             let e = KernelError::MessageTooLong;
             af_inet::ip_local_error(
                 &self.sk,
@@ -173,17 +187,21 @@ impl RawSock {
             );
             return Err(e);
         }
-        if data.len() < IP_HLEN_MIN {
+        if len < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
         }
-        // Linux raw_send_hdrinc's error path past the size checks
-        self.xmit_hdrinc(rt, data, mtu)
-            .inspect_err(|_| self.sk.net.mib.ip.inc(IPSTATS_MIB_OUTDISCARDS))
+        Ok(mtu)
     }
 
     /// The header of an IP_HDRINCL packet completed, then out along
     /// `rt` (without __ip_local_out, so not in OutRequests, as Linux)
-    fn xmit_hdrinc(&self, rt: &route::Rtable, data: &[u8], mtu: usize) -> Result<(), KernelError> {
+    fn xmit_hdrinc(
+        &self,
+        rt: &route::Rtable,
+        data: &[u8],
+        mtu: usize,
+        confirm: bool,
+    ) -> Result<(), KernelError> {
         let ihl = ((data[0] & 0x0f) as usize) * 4;
         if ihl > data.len() || ihl < IP_HLEN_MIN {
             return Err(KernelError::InvalidArgument);
@@ -191,6 +209,7 @@ impl RawSock {
         let mut skb =
             SkBuff::alloc_tx(data.len(), Gfp::KERNEL).ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(data).ok_or(KernelError::NoBufferSpace)?;
+        skb.dst_pending_confirm = confirm;
         let h = skb.data_mut();
         if h[12..16] == [0; 4] {
             h[12..16].copy_from_slice(&rt.saddr.to_be_bytes());
@@ -384,12 +403,33 @@ impl ProtoOps for RawSock {
             c.saddr
         };
         let rt = self.route(daddr, saddr, oif)?;
+        // Linux raw_sendmsg's do_confirm
+        if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {
+            route::confirm_neigh(&rt, daddr);
+            if len == 0 {
+                return Ok(0);
+            }
+        }
+        if self.inet.flag(ipf::HDRINCL) {
+            // Linux raw_send_hdrinc: a probe returns after the size
+            // checks
+            if flags & MSG_PROBE != 0 {
+                return self.hdrinc_size(&rt, len).map(|_| len);
+            }
+            let data = m.data.take(len)?;
+            if let Some(e) = self.sk.take_err() {
+                return Err(e);
+            }
+            let confirm = flags & MSG_CONFIRM != 0;
+            return self.send_hdrinc(&rt, &data, confirm).map(|()| len);
+        }
+        // Linux ip_append_data: a probe sends nothing
+        if flags & MSG_PROBE != 0 {
+            return Ok(len);
+        }
         let data = m.data.take(len)?;
         if let Some(e) = self.sk.take_err() {
             return Err(e);
-        }
-        if self.inet.flag(ipf::HDRINCL) {
-            return self.send_hdrinc(&rt, &data).map(|()| len);
         }
         // Linux ip_append_data's error path, then ip_send_skb's
         let discard = |e| {
@@ -407,6 +447,7 @@ impl ProtoOps for RawSock {
         let mut p = self.inet.params();
         p.tos = c.tos.unwrap_or(p.tos);
         p.ttl = c.ttl.unwrap_or(p.ttl);
+        p.confirm = flags & MSG_CONFIRM != 0;
         match ipv4::ip_send_rt(&self.sk.net, &rt, skb, self.num as u8, p) {
             Err(KernelError::MessageTooLong) => {
                 let e = KernelError::MessageTooLong;

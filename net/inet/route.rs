@@ -54,6 +54,25 @@ impl Rtable {
     }
 }
 
+/// Forward progress towards `daddr` along `rt`: confirm the next
+/// hop's neighbour entry, never making one (Linux ipv4_confirm_neigh,
+/// dst_confirm_neigh); nothing for a local, broadcast or multicast
+/// route without a gateway
+pub fn confirm_neigh(rt: &Rtable, daddr: Ipv4Addr) {
+    let key = match rt.gateway {
+        Some(gw) => gw,
+        None if matches!(
+            rt.rtype,
+            RouteType::Local | RouteType::Broadcast | RouteType::Multicast
+        ) =>
+        {
+            return;
+        }
+        None => daddr,
+    };
+    crate::net::arp::arp_tbl().confirm_key(&rt.dev, &crate::net::neigh::key4(key));
+}
+
 fn zeronet(a: Ipv4Addr) -> bool {
     (a.0 >> 24) == 0
 }

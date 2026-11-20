@@ -525,6 +525,9 @@ pub struct IpParams {
     /// (Linux fl4_icmp_type of a SOCK_RAW sender, which
     /// __ip_make_skb counts)
     pub icmp_type: Option<u8>,
+    /// Confirm the next hop's neighbour as it goes out (Linux
+    /// skb_set_dst_pending_confirm: MSG_CONFIRM, TCP's forward progress)
+    pub confirm: bool,
 }
 
 impl Default for IpParams {
@@ -535,6 +538,7 @@ impl Default for IpParams {
             pmtudisc: pmtu::WANT,
             id: None,
             icmp_type: None,
+            confirm: false,
         }
     }
 }
@@ -610,6 +614,9 @@ pub fn ip_send_rt(
     {
         // Linux __ip_make_skb
         net.mib.icmp_out_count(ty);
+    }
+    if p.confirm {
+        skb.dst_pending_confirm = true;
     }
     // Linux __ip_local_out
     net.mib.ip.inc(IPSTATS_MIB_OUTREQUESTS);
@@ -701,6 +708,8 @@ pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelErro
         f.dev = skb.dev.clone();
         f.saddr = skb.saddr;
         f.daddr = skb.daddr;
+        // Linux __ip_append_data marks the first skb only
+        f.dst_pending_confirm = off == 0 && skb.dst_pending_confirm;
         out.push(f);
         off += len;
     }

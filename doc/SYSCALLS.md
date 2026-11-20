@@ -300,7 +300,7 @@ Extended attributes:
 - [x] getsockopt / setsockopt (SOL_SOCKET, SOL_IP, IPPROTO_TCP, SOL_NETLINK, SOL_PACKET subsets)
 - [x] sendto
 - [x] recvfrom
-- [x] sendmsg
+- [x] sendmsg (MSG_CONFIRM, MSG_PROBE on UDP, raw, ping)
 - [x] recvmsg (MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_ERRQUEUE, MSG_OOB on AF_UNIX streams)
 - [x] sendmmsg
 - [x] recvmmsg

@@ -1,7 +1,8 @@
 //! Neighbour (ARP) table over eth0 and QEMU slirp (hk and Linux):
 //! resolution of the gateway (/proc/net/arp, RTM_GETNEIGH), failure of
 //! an unused address after three probes, administrative entries
-//! (RTM_NEWNEIGH / RTM_DELNEIGH errors and PERMANENT state), and a
+//! (RTM_NEWNEIGH / RTM_DELNEIGH errors and PERMANENT state),
+//! confirmation by forward progress (MSG_CONFIRM, MSG_PROBE), and a
 //! table of hundreds: a multipart dump and /proc/net/arp past a page.
 
 use crate::harness::T;
@@ -17,6 +18,12 @@ const RTM_DELNEIGH: u16 = 29;
 const NLM_F_REPLACE: u16 = 0x100;
 const NDA_DST: u16 = 1;
 const NDA_LLADDR: u16 = 2;
+const NDA_CACHEINFO: u16 = 3;
+const NUD_STALE: u16 = 0x04;
+const MSG_PROBE: i32 = 0x10;
+const MSG_CONFIRM: i32 = 0x800;
+const SOCK_RAW: i32 = 3;
+const IPPROTO_RAW_TEST: i32 = 253;
 const NUD_INCOMPLETE: u16 = 0x01;
 const NUD_FAILED: u16 = 0x20;
 const NUD_PERMANENT: u16 = 0x80;
@@ -43,6 +50,7 @@ pub fn run_tests() {
     test_gateway(idx);
     test_failed(idx);
     test_admin(idx);
+    test_confirm(idx);
     test_many(idx);
 }
 
@@ -225,6 +233,101 @@ fn test_admin(idx: u32) {
     t.eq(b"del", del(&mut nl), 0);
     t.eq(b"del again", del(&mut nl), ENOENT);
     t.ok(b"gone", neigh_state(&mut nl, idx, ip).is_none(), 0);
+    t.done();
+}
+
+/// The age of `ip`'s confirmation on `ifindex` in clock ticks
+/// (nda_cacheinfo.ndm_confirmed)
+fn neigh_confirmed(nl: &mut Nl, ifindex: u32, ip: [u8; 4]) -> Option<u32> {
+    let mut out = None;
+    let mut r = Req::new(RTM_GETNEIGH, 0, &ndmsg(AF_INET, 0, 0));
+    nl.dump(&mut r, &mut |m: &Msg| {
+        if m.ty != RTM_NEWNEIGH || m.body.len() < 12 || m.body[0] != AF_INET {
+            return;
+        }
+        if m.u32_at(4) == ifindex && m.attr_ip(12, NDA_DST) == Some(ip) {
+            out = m.attr_u32(12, NDA_CACHEINFO);
+        }
+    });
+    out
+}
+
+/// A STALE entry for `ip` with a made-up address
+fn add_stale(nl: &mut Nl, ifindex: u32, ip: [u8; 4]) -> i64 {
+    let mut r = Req::new(
+        RTM_NEWNEIGH,
+        NLM_F_CREATE | NLM_F_EXCL,
+        &ndmsg(AF_INET, ifindex, NUD_STALE),
+    );
+    r.attr(NDA_DST, &ip);
+    r.attr(NDA_LLADDR, &[0x02, 0, 0, 0, 0, ip[3]]);
+    nl.ack(&mut r) as i64
+}
+
+fn del_neigh(nl: &mut Nl, ifindex: u32, ip: [u8; 4]) {
+    let mut r = Req::new(RTM_DELNEIGH, 0, &ndmsg(AF_INET, ifindex, 0));
+    r.attr(NDA_DST, &ip);
+    nl.ack(&mut r);
+}
+
+/// Forward progress confirms an entry (Linux dst_confirm_neigh,
+/// sock_confirm_neigh): a fresh administrative STALE entry was never
+/// confirmed (age of two reachable times); MSG_CONFIRM | MSG_PROBE on
+/// UDP or raw confirms it without sending, MSG_CONFIRM with data
+/// confirms it as the datagram leaves, a plain send or probe does not
+fn test_confirm(idx: u32) {
+    let mut t = T::new(b"NEIGH_CONFIRM");
+    let Some(mut nl) = Nl::open() else {
+        t.ok(b"netlink", false, 0);
+        return t.done();
+    };
+    let ips = [[10, 0, 2, 96], [10, 0, 2, 97], [10, 0, 2, 98]];
+    for ip in ips {
+        t.eq(b"add", add_stale(&mut nl, idx, ip), 0);
+    }
+    let age = |nl: &mut Nl, ip| neigh_confirmed(nl, idx, ip).map_or(-1, i64::from);
+    let old = |a: i64| a >= 1000;
+    let fresh = |a: i64| (0..100).contains(&a);
+    let fd = udp();
+    // A plain datagram and a probe confirm nothing
+    t.eq(b"plain", send_to(fd, b"x", ips[0], 9, 0), 1);
+    t.eq(b"probe", send_to(fd, b"probe", ips[0], 9, MSG_PROBE), 5);
+    let a = age(&mut nl, ips[0]);
+    t.ok(b"unconfirmed", old(a), a);
+    // MSG_CONFIRM with data: as it leaves
+    t.eq(
+        b"confirm data",
+        send_to(fd, b"x", ips[0], 9, MSG_CONFIRM),
+        1,
+    );
+    let a = age(&mut nl, ips[0]);
+    t.ok(b"data confirmed", fresh(a), a);
+    // MSG_CONFIRM | MSG_PROBE, no data: confirmed, nothing sent
+    let a = age(&mut nl, ips[1]);
+    t.ok(b"udp before", old(a), a);
+    t.eq(
+        b"udp probe",
+        send_to(fd, b"", ips[1], 9, MSG_CONFIRM | MSG_PROBE),
+        0,
+    );
+    let a = age(&mut nl, ips[1]);
+    t.ok(b"udp confirmed", fresh(a), a);
+    close(fd);
+    let raw = hk_syscall::sys_socket(2, SOCK_RAW, IPPROTO_RAW_TEST) as i32;
+    t.ok(b"raw", raw >= 0, raw as i64);
+    let a = age(&mut nl, ips[2]);
+    t.ok(b"raw before", old(a), a);
+    t.eq(
+        b"raw probe",
+        send_to(raw, b"", ips[2], 0, MSG_CONFIRM | MSG_PROBE),
+        0,
+    );
+    let a = age(&mut nl, ips[2]);
+    t.ok(b"raw confirmed", fresh(a), a);
+    close(raw);
+    for ip in ips {
+        del_neigh(&mut nl, idx, ip);
+    }
     t.done();
 }
 

@@ -450,12 +450,28 @@ fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) 
 }
 
 /// Transmit `out`'s segments to `t` in order (Linux tcp_transmit_skb
-/// with ip_queue_xmit), each header put on its payload skb
-pub(super) fn send_segs(net: &NetNamespace, t: &Tuple, out: &mut Out, p: IpParams, oif: u32) {
+/// with ip_queue_xmit), each header put on its payload skb; each
+/// carries the socket's pending neighbour confirmation, cleared once a
+/// segment is routed with it (Linux skb_set_dst_pending_confirm from
+/// sk_dst_pending_confirm, cleared by sock_confirm_neigh)
+pub(super) fn send_segs(
+    net: &NetNamespace,
+    t: &Tuple,
+    out: &mut Out,
+    mut p: IpParams,
+    oif: u32,
+    confirm: &mut bool,
+) {
     while let Some(mut skb) = out.segs.pop_front() {
         // Linux tcp_v4_send_check: CHECKSUM_PARTIAL (hk sums it anyway)
         skb.csum_partial = true;
-        if output::finish_hdr(&mut skb, t).is_some() && !send(net, t, skb, p, oif) {
+        p.confirm = *confirm;
+        if output::finish_hdr(&mut skb, t).is_none() {
+            continue;
+        }
+        if send(net, t, skb, p, oif) {
+            *confirm = false;
+        } else {
             // Linux __ip_queue_xmit's no_route
             net.mib.ip.inc(crate::net::mib::IPSTATS_MIB_OUTNOROUTES);
         }
@@ -783,7 +799,7 @@ impl TcpSock {
     /// sk_shutdown under the socket lock): publish the shutdown bits and
     /// the error (reported with the wakeups), then transmit to `t`.
     /// Returns the wakeups still to make.
-    fn emit(&self, out: &mut Out, t: Option<Tuple>) -> u8 {
+    fn emit(&self, out: &mut Out, t: Option<Tuple>, confirm: &mut bool) -> u8 {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
@@ -791,7 +807,8 @@ impl TcpSock {
             self.sk.store_err(e as u32);
         }
         if let Some(t) = t {
-            send_segs(&self.sk.net, &t, out, self.inet.params(), self.oif());
+            let p = self.inet.params();
+            send_segs(&self.sk.net, &t, out, p, self.oif(), confirm);
         }
         if out.err.is_some() {
             out.wake | cb::wake::ERR
@@ -807,7 +824,7 @@ impl TcpSock {
         let t = g.tuple.or_else(|| self.cur_tuple());
         self.put_caps(g);
         let ready = self.post(g, out);
-        let w = self.emit(out, t);
+        let w = self.emit(out, t, &mut g.cb.dst_pending_confirm);
         if g.cb.state == TcpState::Listen {
             *self.listen_opts.lock() = g.cb.opts;
         }

@@ -825,6 +825,27 @@ fn window_edge_never_moves_left() {
     }
 }
 
+/// An ACK of new data asks to confirm the next hop's neighbour (Linux
+/// tcp_ack's FLAG_FORWARD_PROGRESS -> sk_dst_confirm); data acking
+/// nothing new does not, and our FIN acked does (FIN_WAIT1 -> 2)
+#[test]
+fn forward_progress_confirms_neighbour() {
+    let mut p = Pair::new(1460);
+    p.a.dst_pending_confirm = false;
+    p.b.dst_pending_confirm = false;
+    p.send_a(b"hello");
+    p.run();
+    assert!(p.a.dst_pending_confirm);
+    assert!(!p.b.dst_pending_confirm);
+    p.a.dst_pending_confirm = false;
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::FinWait2);
+    assert!(p.a.dst_pending_confirm);
+}
+
 #[test]
 fn active_close_and_time_wait() {
     let mut p = Pair::new(1460);

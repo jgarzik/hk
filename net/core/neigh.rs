@@ -1028,6 +1028,27 @@ impl NeighTable {
         now_ms() > n.inner.lock().st.updated + self.parms.locktime
     }
 
+    /// Forward progress through `n` was seen: it is confirmed now,
+    /// its state untouched (Linux neigh_confirm, from sock_confirm_neigh
+    /// and dst_confirm_neigh); the timer finds the fresh confirmation
+    pub fn confirm(&self, n: &Neighbour) {
+        let now = now_ms();
+        let mut i = n.inner.lock();
+        if i.st.confirmed != now {
+            i.st.confirmed = now;
+        }
+    }
+
+    /// Confirm the entry for `key` on `dev`, if there is one (Linux
+    /// __ipv4_confirm_neigh: __ipv4_neigh_lookup_noref under RCU, no
+    /// entry made)
+    pub fn confirm_key(&self, dev: &NetDevice, key: &Key) {
+        let g = rcu::read_lock();
+        if let Some(n) = self.lookup_rcu(&g, dev, key) {
+            self.confirm(&n);
+        }
+    }
+
     /// Take `n` off the table for good (Linux neigh_flush_one): its
     /// timer stops and its queue goes; a user still holding it finds it
     /// dead, NOARP if its address was valid, else NONE

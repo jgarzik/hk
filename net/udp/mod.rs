@@ -56,7 +56,9 @@ use crate::net::inet::port::{BindInfo, Flow};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
 use crate::net::mib::*;
-use crate::net::msg::{MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, RecvMsg, SendMsg, cmsgs};
+use crate::net::msg::{
+    MSG_CONFIRM, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_PROBE, RecvMsg, SendMsg, cmsgs,
+};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -111,7 +113,11 @@ struct Cork {
     /// Bytes appended, the UDP header counted (Linux up->len)
     len: usize,
     data: Vec<u8>,
+    /// MSG_CONFIRM of the send that corked it (Linux __ip_append_data
+    /// marks the queue's first skb)
+    confirm: bool,
 }
+
 /// A UDP socket
 pub struct UdpSock {
     sk: Sock,
@@ -476,6 +482,7 @@ impl UdpSock {
         let mut p = self.inet.params();
         p.tos = c.tos;
         p.ttl = c.ttl.unwrap_or(p.ttl);
+        p.confirm = c.confirm;
         let sport = self.inet.get().sport;
         self.send_out(&c.rt, sport, c.dport, &c.data, p, c.gso)
     }
@@ -848,6 +855,12 @@ impl ProtoOps for UdpSock {
         if self.pending.load(Ordering::Relaxed) {
             let mut g = self.op.lock();
             if g.is_some() {
+                // Linux ip_append_data: a probe appends nothing (and
+                // pushes the cork unless more is to come)
+                if flags & MSG_PROBE != 0 {
+                    self.append(&mut g, &[], 0, corkreq)?;
+                    return Ok(len);
+                }
                 // Linux do_append_data: any ip_append_data error (a
                 // fault copying the data included) drops the cork
                 let data = match m.data.take(len) {
@@ -880,6 +893,14 @@ impl ProtoOps for UdpSock {
             c.saddr
         };
         let rt = self.route(daddr, saddr, oif)?;
+        // Linux udp_sendmsg's do_confirm; then ip_make_skb or
+        // ip_append_data send nothing for a probe
+        if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {
+            route::confirm_neigh(&rt, daddr);
+        }
+        if flags & MSG_PROBE != 0 {
+            return Ok(len);
+        }
         // Linux sock_alloc_send_pskb, for the datagram's first skb (a
         // corked one's later appends allocate with no error check,
         // __ip_append_data with transhdrlen 0): a pending error first
@@ -890,6 +911,7 @@ impl ProtoOps for UdpSock {
             let mut p = self.inet.params();
             p.tos = c.tos.unwrap_or(p.tos);
             p.ttl = c.ttl.unwrap_or(p.ttl);
+            p.confirm = flags & MSG_CONFIRM != 0;
             self.send_out(&rt, a.sport, dport, &data, p, gso)?;
             return Ok(len);
         }
@@ -911,6 +933,7 @@ impl ProtoOps for UdpSock {
             gso,
             len: 0,
             data: Vec::new(),
+            confirm: flags & MSG_CONFIRM != 0,
         });
         self.pending.store(true, Ordering::Relaxed);
         self.append(&mut g, &data, len + UDP_HLEN, corkreq)?;

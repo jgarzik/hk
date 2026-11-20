@@ -392,6 +392,10 @@ pub fn output(
 ) -> Result<(), crate::util::error::KernelError> {
     let tbl = arp_tbl();
     let n = tbl.create(dev, &neigh::key4(nexthop), dev.is_loopback())?;
+    // Linux sock_confirm_neigh
+    if skb.dst_pending_confirm {
+        tbl.confirm(&n);
+    }
     tbl.output(&n, skb)
 }
 

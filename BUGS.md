@@ -165,8 +165,8 @@ connections start from defaults (tcp_init_metrics), and no peer is
 proven for tcp_conn_request's last quarter of tcp_max_syn_backlog
 without SYN cookies (tcp_peer_is_proven), so it drops every new
 request there.
-Neighbour entries are not confirmed by TCP progress (only ARP), there is
-no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
+There is no proxy ARP and no per-device neighbour sysctls
+(net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
 IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP

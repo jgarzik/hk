@@ -39,7 +39,7 @@ use crate::net::icmp::{IcmpErr, icmp_type};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IPPROTO_ICMP, Ipv4Addr, ip_checksum};
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, MSG_TRUNC, RecvMsg, SendMsg};
+use crate::net::msg::{MSG_CONFIRM, MSG_ERRQUEUE, MSG_OOB, MSG_PROBE, MSG_TRUNC, RecvMsg, SendMsg};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -362,6 +362,14 @@ impl ProtoOps for PingSock {
             c.saddr
         };
         let rt = self.route(daddr, saddr, oif)?;
+        // Linux ping_v4_sendmsg's do_confirm (len is never 0); then
+        // ip_append_data sends nothing for a probe
+        if flags & MSG_PROBE != 0 {
+            if flags & MSG_CONFIRM != 0 {
+                route::confirm_neigh(&rt, daddr);
+            }
+            return Ok(len);
+        }
         if let Some(e) = self.sk.take_err() {
             return Err(e);
         }
@@ -374,6 +382,7 @@ impl ProtoOps for PingSock {
         let mut p = self.inet.params();
         p.tos = c.tos.unwrap_or(p.tos);
         p.ttl = c.ttl.unwrap_or(p.ttl);
+        p.confirm = flags & MSG_CONFIRM != 0;
         match ipv4::ip_send_rt(&self.sk.net, &rt, skb, IPPROTO_ICMP, p) {
             Err(KernelError::MessageTooLong) => {
                 let e = KernelError::MessageTooLong;

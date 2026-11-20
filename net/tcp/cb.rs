@@ -1159,6 +1159,10 @@ pub struct TcpCb {
     /// Last ICMP error (Linux sk_err_soft), reported if the connection
     /// times out; an acceptable ACK clears it
     pub soft_err: Option<KernelError>,
+    /// The peer showed forward progress: the next segment out confirms
+    /// the next hop's neighbour, which clears it (Linux
+    /// sk_dst_pending_confirm, sk_dst_confirm)
+    pub dst_pending_confirm: bool,
     /// The timeout of the timewait entry it is handed to (ms; Linux
     /// tcp_time_wait's timeo)
     pub(super) tw_timeo: u64,
@@ -1313,6 +1317,7 @@ impl TcpCb {
             dack: Default::default(),
             orphan: Default::default(),
             soft_err: Default::default(),
+            dst_pending_confirm: false,
             tw_timeo: TIMEWAIT_LEN,
             owned: false,
             ack_now: Default::default(),

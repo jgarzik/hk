@@ -132,6 +132,7 @@ pub const MSG_OOB: i32 = 0x01;
 pub const MSG_PEEK: i32 = 0x02;
 pub const MSG_DONTROUTE: i32 = 0x04;
 pub const MSG_CTRUNC: i32 = 0x08;
+pub const MSG_PROBE: i32 = 0x10;
 pub const MSG_TRUNC: i32 = 0x20;
 pub const MSG_DONTWAIT: i32 = 0x40;
 pub const MSG_EOR: i32 = 0x80;
