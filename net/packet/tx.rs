@@ -22,6 +22,7 @@ use crate::net::socket::{SOCK_DGRAM, SOCK_RAW};
 use crate::util::error::KernelError;
 
 use super::ring::{Frame, PgRing, TPACKET_V2, TPACKET_V3};
+use super::vnet::{VNET_HDR_LEN, VnetHdr};
 use super::{Dest, PacketSock, SLL_LEN, VLAN_HLEN, pf};
 
 /// Frame header status words (transmit)
@@ -102,27 +103,48 @@ impl PacketSock {
     /// ring (Linux tpacket_fill_skb, which maps the ring pages instead):
     /// EINVAL short of an Ethernet header (dev_validate_header),
     /// EMSGSIZE over the MTU unless VLAN-tagged
+    /// With PACKET_VNET_HDR the frame starts with a struct
+    /// virtio_net_hdr (Linux tpacket_snd). The skb and its tp_len.
     fn tx_skb(
         &self,
         d: &Dest,
         f: &Frame<'_>,
         off: usize,
         tp_len: usize,
-    ) -> Result<Box<SkBuff>, KernelError> {
+    ) -> Result<(Box<SkBuff>, usize), KernelError> {
         let raw = self.sk.stype == SOCK_RAW;
+        let vnet = self.vnet_hdr_len();
+        let (mut off, mut tp_len, mut hdr) = (off, tp_len, None);
+        if vnet != 0 {
+            tp_len = tp_len
+                .checked_sub(vnet)
+                .ok_or(KernelError::InvalidArgument)?;
+            let mut b = [0u8; VNET_HDR_LEN];
+            f.r.copy_out(f.off + off, &mut b);
+            let mut h = VnetHdr::parse(&b);
+            super::vnet::snd_parse(&mut h, tp_len)?;
+            hdr = Some(h);
+            off += vnet;
+        }
         if raw && tp_len < ETH_HLEN {
             return Err(KernelError::InvalidArgument);
         }
         let mut data = crate::util::kmem::try_vec(tp_len, 0u8)?;
         f.r.copy_out(f.off + off, &mut data);
+        if let Some(h) = &hdr {
+            super::vnet::to_frame(h, &mut data)?;
+        }
         let mut skb = self.build(&d.dev, d.proto, d.addr, &data)?;
         let reserve = if raw { ETH_HLEN } else { 0 };
-        if tp_len > d.dev.mtu() as usize + reserve && !super::extra_vlan_allowed(skb.data()) {
+        if tp_len > d.dev.mtu() as usize + reserve
+            && vnet == 0
+            && !super::extra_vlan_allowed(skb.data())
+        {
             return Err(KernelError::MessageTooLong);
         }
         skb.dev = Some(d.dev.clone());
         skb.owner = self.id();
-        Ok(skb)
+        Ok((skb, tp_len))
     }
 }
 
@@ -140,8 +162,10 @@ pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>) -> Result<usize, KernelError
     let hdrlen = s.tp_hdrlen.load(Ordering::Acquire) as usize;
     let frame_size = ring.frame_size as usize;
     let reserve = if s.sk.stype == SOCK_RAW { ETH_HLEN } else { 0 };
-    let size_max =
-        (frame_size - (hdrlen - SLL_LEN)).min(d.dev.mtu() as usize + reserve + VLAN_HLEN);
+    let mut size_max = frame_size - (hdrlen - SLL_LEN);
+    if s.vnet_hdr_len() == 0 {
+        size_max = size_max.min(d.dev.mtu() as usize + reserve + VLAN_HLEN);
+    }
     let mut len_sum: usize = 0;
     // Each frame is copied and sent before the next: none is still in
     // flight when the walk ends (Linux waits for pending frames when
@@ -154,7 +178,7 @@ pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>) -> Result<usize, KernelError
                 if tp_len > i32::MAX as usize - len_sum {
                     return Ok(None);
                 }
-                s.tx_skb(&d, &f, off, tp_len).map(|skb| Some((skb, tp_len)))
+                s.tx_skb(&d, &f, off, tp_len).map(Some)
             });
         match r {
             Ok(Some((skb, tp_len))) => {

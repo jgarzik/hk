@@ -362,11 +362,12 @@ impl PacketSock {
     ) {
         let hdrlen = self.tp_hdrlen.load(Ordering::Acquire) as usize;
         let reserve = self.tp_reserve.load(Ordering::Acquire) as usize;
+        let vnet = self.vnet_hdr_len();
         let (macoff, netoff) = if self.sk.stype == SOCK_DGRAM {
             let n = tpacket_align(hdrlen) + 16 + reserve;
             (n, n)
         } else {
-            let n = tpacket_align(hdrlen + ETH_HLEN.max(16)) + reserve;
+            let n = tpacket_align(hdrlen + ETH_HLEN.max(16)) + reserve + vnet;
             (n - ETH_HLEN, n)
         };
         if netoff > usize::from(u16::MAX) {
@@ -374,12 +375,21 @@ impl PacketSock {
             return;
         }
         let hash = super::rcv::flow_hash(t.frame, false);
-        let Some((ring, bn, off, macoff, snaplen)) = self.v3_claim(macoff, snaplen, hash) else {
+        let Some((ring, bn, off, mac, snaplen)) = self.v3_claim(macoff, snaplen, hash) else {
             self.drops.fetch_add(1, Ordering::Relaxed);
             self.sk.data_ready();
             return;
         };
         let b = blk(&ring, bn);
+        // Linux: no header when the frame room fell short of macoff
+        let macoff = mac;
+        if vnet != 0 && macoff == netoff - ETH_HLEN {
+            let h = super::vnet::from_frame(status, t.frame).bytes();
+            b.copy_in(
+                off + macoff - super::vnet::VNET_HDR_LEN,
+                &h[..super::vnet::VNET_HDR_LEN],
+            );
+        }
         if snaplen > 0 {
             b.copy_in(off + macoff, &data[..snaplen]);
         }

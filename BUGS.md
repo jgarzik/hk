@@ -307,9 +307,8 @@ without it).
 
 **Location**: `net/packet/`
 
-Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT),
-PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
-(ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
+Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), SO_ATTACH_BPF,
+SO_GET_FILTER, and
 socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
 every socket). Memberships only count promiscuity/allmulti users (the
 drivers have no promiscuous or multicast filtering; set_promisc is a
@@ -331,6 +330,11 @@ reassembled before hashing (Linux ip_check_defrag); PACKET_FANOUT_EBPF
 groups take no program (hk has no bpf(2): PACKET_FANOUT_DATA is EBADF
 or EINVAL, frames go to member 0); the flow hash is a jhash of the
 IPv4 5-tuple, not Linux's siphash flow dissector.
+PACKET_VNET_HDR: no GSO, so a send whose virtio_net_hdr asks for
+segmentation (longer than gso_size) is EINVAL where Linux segments it,
+and a NEEDS_CSUM checksum is completed in software before transmit
+where Linux leaves it CHECKSUM_PARTIAL on lo (the bytes on the wire
+differ from Linux lo, not from a device without offload).
 Ring blocks are physically contiguous (`mm::shared::PgVec`): a
 tp_block_size past the buddy allocator's largest order is ENOMEM where
 Linux alloc_one_pg_vec_page falls back to vzalloc.

@@ -24,12 +24,15 @@ const PACKET_HDRLEN: i32 = 11;
 const PACKET_RESERVE: i32 = 12;
 const PACKET_TX_RING: i32 = 13;
 const PACKET_LOSS: i32 = 14;
+const PACKET_VNET_HDR: i32 = 15;
 const PACKET_TIMESTAMP: i32 = 17;
 const PACKET_FANOUT: i32 = 18;
 const PACKET_TX_HAS_OFF: i32 = 19;
+const PACKET_QDISC_BYPASS: i32 = 20;
 const PACKET_ROLLOVER_STATS: i32 = 21;
 const PACKET_FANOUT_DATA: i32 = 22;
 const PACKET_IGNORE_OUTGOING: i32 = 23;
+const PACKET_VNET_HDR_SZ: i32 = 24;
 
 /// sizeof(struct tpacket_req), sizeof(struct tpacket_req3)
 const REQ_LEN: usize = 16;
@@ -136,6 +139,30 @@ fn set_packet(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
         PACKET_LOSS => {
             let val = int_exact(v)?;
             unless_ring(s, || s.set_flag(pf::TP_LOSS, val != 0))
+        }
+        PACKET_VNET_HDR | PACKET_VNET_HDR_SZ => {
+            if s.sk.stype != crate::net::socket::SOCK_RAW {
+                return Err(KernelError::InvalidArgument);
+            }
+            let val = v.int()?;
+            let sz = if opt == PACKET_VNET_HDR_SZ {
+                if val != 0
+                    && val as usize != super::vnet::VNET_HDR_LEN
+                    && val as usize != super::vnet::VNET_HDR_MRG_LEN
+                {
+                    return Err(KernelError::InvalidArgument);
+                }
+                val as u32
+            } else if val != 0 {
+                super::vnet::VNET_HDR_LEN as u32
+            } else {
+                0
+            };
+            unless_ring(s, || s.vnet_hdr_sz.store(sz, Ordering::Release))
+        }
+        PACKET_QDISC_BYPASS => {
+            s.set_flag(pf::QDISC_BYPASS, int_exact(v)? != 0);
+            Ok(())
         }
         PACKET_FANOUT => super::fanout::set(s, v),
         PACKET_FANOUT_DATA => super::fanout::set_data(s, v),
@@ -383,6 +410,9 @@ fn get_packet(s: &PacketSock, opt: i32, v: Option<OptIn>) -> Result<OptOut, Kern
         PACKET_IGNORE_OUTGOING => flag(pf::IGNORE_OUTGOING),
         PACKET_TX_HAS_OFF => flag(pf::TX_HAS_OFF),
         PACKET_FANOUT => Ok(super::fanout::get(s)),
+        PACKET_VNET_HDR => Ok(OptOut::Int(i32::from(s.vnet_hdr_len() != 0))),
+        PACKET_VNET_HDR_SZ => int(&s.vnet_hdr_sz),
+        PACKET_QDISC_BYPASS => flag(pf::QDISC_BYPASS),
         PACKET_ROLLOVER_STATS => super::fanout::rollover_stats(s),
         _ => Err(KernelError::NoProtocolOption),
     }

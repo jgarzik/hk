@@ -217,7 +217,17 @@ pub fn deliver(
         return Err(KernelError::InvalidArgument);
     };
     let data = skb.data();
-    let n = m.data.put(0, data)?;
+    // Linux packet_rcv_vnet: the header first, EINVAL in a shorter
+    // buffer
+    let vnet = s.vnet_hdr_len();
+    if vnet != 0 {
+        if m.data.len() < vnet {
+            return Err(KernelError::InvalidArgument);
+        }
+        let h = super::vnet::from_frame(cb.csum, data).bytes();
+        m.data.put(0, &h[..vnet])?;
+    }
+    let n = m.data.put(vnet, data)?;
     if n < data.len() {
         m.flags |= MSG_TRUNC;
     }
@@ -229,11 +239,12 @@ pub fn deliver(
         m.cmsg
             .put(SOL_PACKET, PACKET_AUXDATA, &auxdata(&cb, data.len()));
     }
-    Ok(if flags & MSG_TRUNC != 0 {
-        data.len()
-    } else {
-        n
-    })
+    Ok(vnet
+        + if flags & MSG_TRUNC != 0 {
+            data.len()
+        } else {
+            n
+        })
 }
 
 /// struct tpacket_auxdata (20 bytes) of a frame of `snaplen` bytes

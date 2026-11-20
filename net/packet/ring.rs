@@ -45,6 +45,7 @@ pub const TP_STATUS_KERNEL: u32 = 0;
 pub const TP_STATUS_USER: u32 = 1 << 0;
 pub const TP_STATUS_COPY: u32 = 1 << 1;
 pub const TP_STATUS_LOSING: u32 = 1 << 2;
+pub const TP_STATUS_CSUMNOTREADY: u32 = 1 << 3;
 pub const TP_STATUS_CSUM_VALID: u32 = 1 << 7;
 
 const TPACKET_ALIGNMENT: usize = 16;
@@ -377,12 +378,13 @@ impl PacketSock {
         }
         let hdrlen = self.tp_hdrlen.load(Ordering::Acquire) as usize;
         let reserve = self.tp_reserve.load(Ordering::Acquire) as usize;
+        let mut vnet = self.vnet_hdr_len();
         let (macoff, netoff) = if self.sk.stype == SOCK_DGRAM {
             let n = tpacket_align(hdrlen) + 16 + reserve;
             (n, n)
         } else {
             let maclen = ETH_HLEN;
-            let n = tpacket_align(hdrlen + maclen.max(16)) + reserve;
+            let n = tpacket_align(hdrlen + maclen.max(16)) + reserve + vnet;
             (n - maclen, n)
         };
         if netoff > usize::from(u16::MAX) {
@@ -408,6 +410,9 @@ impl PacketSock {
                 copy = frame_skb(data, cb, self.sk.drops.load(Ordering::Relaxed));
             }
             snaplen = frame_size.saturating_sub(macoff);
+            if macoff > frame_size {
+                vnet = 0;
+            }
         }
         let mut rx = self.rx.lock();
         // The ring changes only with the socket unhooked and a grace
@@ -437,6 +442,13 @@ impl PacketSock {
         }
         drop(rx);
 
+        if vnet != 0 {
+            let h = super::vnet::from_frame(status, t.frame).bytes();
+            f.r.copy_in(
+                f.off + macoff - super::vnet::VNET_HDR_LEN,
+                &h[..super::vnet::VNET_HDR_LEN],
+            );
+        }
         if snaplen > 0 {
             f.r.copy_in(f.off + macoff, &data[..snaplen]);
         }

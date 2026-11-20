@@ -425,6 +425,7 @@ pub fn run_all_tests() {
     net::packet::run_tests();
     net::packet_ring::run_tests();
     net::packet_fanout::run_tests();
+    net::packet_vnet::run_tests();
     net::fasync_tap::run_tests();
     net::tcp_xfer::run_tests();
     net::tcp_conn::run_tests();

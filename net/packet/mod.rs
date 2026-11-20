@@ -45,6 +45,7 @@ mod rcv;
 mod ring;
 mod tx;
 mod v3;
+mod vnet;
 
 use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
@@ -102,6 +103,10 @@ mod pf {
     pub const TP_LOSS: u32 = 1 << 7;
     /// Short of room, skipped by rollover (Linux PACKET_SOCK_PRESSURE)
     pub const PRESSURE: u32 = 1 << 8;
+    /// PACKET_QDISC_BYPASS (Linux PACKET_SOCK_QDISC_BYPASS: hk has no
+    /// qdisc, dev_queue_xmit already goes straight to the driver as
+    /// Linux packet_direct_xmit)
+    pub const QDISC_BYPASS: u32 = 1 << 9;
 }
 
 /// A link-layer address (struct sockaddr_ll)
@@ -197,6 +202,8 @@ pub struct PacketSock {
     tp_reserve: AtomicU32,
     tp_tstamp: AtomicU32,
     copy_thresh: AtomicU32,
+    /// PACKET_VNET_HDR(_SZ): 0, 10 or 12 (Linux po->vnet_hdr_sz)
+    vnet_hdr_sz: AtomicU32,
     /// PACKET_ADD_MEMBERSHIP entries (changed under RTNL)
     mclist: crate::sync::Mutex<Vec<opts::Mreq>>,
     /// Link on its namespace's list (Linux sk_node)
@@ -242,6 +249,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         tp_reserve: AtomicU32::new(0),
         tp_tstamp: AtomicU32::new(0),
         copy_thresh: AtomicU32::new(0),
+        vnet_hdr_sz: AtomicU32::new(0),
         mclist: crate::sync::Mutex::new(Vec::new()),
         link: crate::util::list::Link::new(),
         rcu: crate::sync::rcu::RcuHead::new(),
@@ -438,6 +446,11 @@ impl PacketSock {
             self.sk.set_err(KernelError::NetworkDown);
         }
         Ok(())
+    }
+
+    /// PACKET_VNET_HDR's header size, 0 without
+    fn vnet_hdr_len(&self) -> usize {
+        self.vnet_hdr_sz.load(Ordering::Acquire) as usize
     }
 
     /// Identity for skipping our own outgoing frames
@@ -701,18 +714,39 @@ impl ProtoOps for PacketSock {
         if !dev.is_up() {
             return Err(KernelError::NetworkDown);
         }
-        let len = m.data.len();
+        let total = m.data.len();
+        // Linux packet_snd_vnet_parse: the header first
+        let vnet = self.vnet_hdr_len();
+        let mut hdr = vnet::VnetHdr::default();
+        if vnet != 0 {
+            if total < vnet {
+                return Err(KernelError::InvalidArgument);
+            }
+            hdr = vnet::VnetHdr::parse(&m.data.take(vnet::VNET_HDR_LEN)?);
+            vnet::snd_parse(&mut hdr, total - vnet)?;
+        }
+        let len = total - vnet;
         let mtu = dev.mtu() as usize;
-        if len > mtu + ETH_HLEN + VLAN_HLEN {
+        let gso = hdr.gso_type != 0;
+        if !gso && len > mtu + ETH_HLEN + VLAN_HLEN {
             return Err(KernelError::MessageTooLong);
         }
-        let data = m.data.take(len)?;
-        check_len(self.sk.stype, mtu, &data)?;
+        let mut data = m.data.take_at(vnet, len)?;
+        if gso {
+            if self.sk.stype == SOCK_RAW && data.len() < ETH_HLEN {
+                return Err(KernelError::InvalidArgument);
+            }
+        } else {
+            check_len(self.sk.stype, mtu, &data)?;
+        }
+        if vnet != 0 {
+            vnet::to_frame(&hdr, &mut data)?;
+        }
         let mut skb = self.build(&dev, proto, addr, &data)?;
         skb.dev = Some(dev);
         skb.owner = self.id();
         crate::net::dev::dev_queue_xmit(skb)?;
-        Ok(len)
+        Ok(total)
     }
 
     /// Linux packet_recvmsg
