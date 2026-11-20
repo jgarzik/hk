@@ -17,6 +17,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
+use crate::time::timer::TimerList;
 use crate::util::error::KernelError;
 
 /// Accounting quantum (Linux PAGE_SIZE: sk_forward_alloc is charged in
@@ -67,13 +68,14 @@ crate::percpu! {
 /// net.ipv4.tcp_max_orphans (Linux sysctl_tcp_max_orphans: half the
 /// ehash entries, set with the tables, `set_max_orphans`)
 static MAX_ORPHANS: AtomicI32 = AtomicI32::new(512);
-/// Linux tcp_orphan_cache: the orphan sum as last taken, and when
-/// (ms); refreshed at most every TCP_ORPHAN_TIMER_PERIOD when read
-/// (Linux refreshes it from a timer at that period)
+/// Linux tcp_orphan_cache: the orphan sum as `ORPHAN_TIMER` last took
+/// it
 static ORPHAN_CACHE: AtomicUsize = AtomicUsize::new(0);
-static ORPHAN_STAMP: AtomicU64 = AtomicU64::new(0);
-/// Linux TCP_ORPHAN_TIMER_PERIOD (ms)
-const ORPHAN_PERIOD: u64 = 100;
+/// Linux TCP_ORPHAN_TIMER_PERIOD (ns)
+const ORPHAN_PERIOD_NS: u64 = 100_000_000;
+/// Linux tcp_orphan_timer: refreshes `ORPHAN_CACHE` every period, from
+/// boot (`init`) on
+static ORPHAN_TIMER: TimerList = TimerList::new(orphan_update, 0);
 
 /// Quanta covering `bytes` (Linux sk_mem_pages)
 pub fn quanta(bytes: usize) -> usize {
@@ -85,6 +87,31 @@ pub fn quanta(bytes: usize) -> usize {
 pub fn init() {
     let limit = (crate::FRAME_ALLOCATOR.buffer_pages() / 16).max(128);
     set_limits([limit / 4 * 3, limit, limit / 4 * 3 * 2]);
+}
+
+/// Start the orphan count's refresh once timers run (Linux tcp_init
+/// arms tcp_orphan_timer from inet_init, an fs initcall, after the
+/// timer bases exist)
+pub fn start() {
+    orphan_timer_arm();
+}
+
+/// Arm `ORPHAN_TIMER` a period from now
+fn orphan_timer_arm() {
+    let at = crate::time::monotonic_ns().saturating_add(ORPHAN_PERIOD_NS);
+    let _ = core::pin::Pin::static_ref(&ORPHAN_TIMER).mod_timer_ns(at);
+}
+
+/// Linux tcp_orphan_update (`ktimers/N`): take the orphan sum, again in
+/// a period
+fn orphan_update(_: &TimerList) {
+    orphan_refresh();
+    orphan_timer_arm();
+}
+
+/// Take the orphan sum into `ORPHAN_CACHE`
+fn orphan_refresh() {
+    ORPHAN_CACHE.store(orphans(), Ordering::Relaxed);
 }
 
 fn set_limits(v: [usize; 3]) {
@@ -174,26 +201,18 @@ pub fn orphans() -> usize {
     n.max(0) as usize
 }
 
-/// Linux tcp_too_many_orphans: the (cached) orphan count, doubled
+/// Linux tcp_too_many_orphans: the cached orphan count, doubled
 /// `shift` times for a connection that looks dead, past
 /// tcp_max_orphans
-pub fn too_many_orphans(shift: u32, now: u64) -> bool {
-    let at = ORPHAN_STAMP.load(Ordering::Relaxed);
-    if now.wrapping_sub(at) >= ORPHAN_PERIOD
-        && ORPHAN_STAMP
-            .compare_exchange(at, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        ORPHAN_CACHE.store(orphans(), Ordering::Relaxed);
-    }
+pub fn too_many_orphans(shift: u32) -> bool {
     let n = ORPHAN_CACHE.load(Ordering::Relaxed) as i64;
     (n << shift) > i64::from(MAX_ORPHANS.load(Ordering::Relaxed))
 }
 
 /// Linux tcp_check_oom: too many orphans, or a connection with
 /// `wmem` bytes queued past the hard memory limit
-pub fn check_oom(shift: u32, wmem: usize, now: u64) -> bool {
-    too_many_orphans(shift, now) || out_of_memory(wmem)
+pub fn check_oom(shift: u32, wmem: usize) -> bool {
+    too_many_orphans(shift) || out_of_memory(wmem)
 }
 
 /// Linux tcp_init: tcp_max_orphans is half the ehash entries
@@ -300,4 +319,24 @@ pub fn sysctl_store(v: &[i64]) -> Result<(), KernelError> {
     }
     set_limits([v[0] as usize, v[1] as usize, v[2] as usize]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// tcp_too_many_orphans reads the cache the timer refreshes (Linux
+    /// tcp_orphan_cache, tcp_orphan_update), never the live sum
+    #[test]
+    fn orphan_cache_from_timer() {
+        orphan_refresh();
+        let cached = ORPHAN_CACHE.load(Ordering::Relaxed);
+        let held: alloc::vec::Vec<Orphan> = (0..3).map(|_| Orphan::new()).collect();
+        let _ = too_many_orphans(0);
+        assert_eq!(ORPHAN_CACHE.load(Ordering::Relaxed), cached);
+        orphan_refresh();
+        assert_eq!(ORPHAN_CACHE.load(Ordering::Relaxed), orphans());
+        assert!(orphans() >= 3);
+        drop(held);
+    }
 }

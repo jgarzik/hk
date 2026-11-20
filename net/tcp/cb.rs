@@ -1651,7 +1651,7 @@ impl TcpCb {
             return;
         }
         // Too many orphans or past the memory limit, it goes now
-        if self.state != TcpState::Closed && mem::check_oom(0, self.wmem_queued, now) {
+        if self.state != TcpState::Closed && mem::check_oom(0, self.wmem_queued) {
             self.send_reset(out);
             self.set_closed(out);
             self.net_stat(LINUX_MIB_TCPABORTONMEMORY);

@@ -101,6 +101,7 @@ use crate::util::error::KernelError;
 pub fn start_threads() {
     dev::softnet_init();
     crate::ns::net::net_ns_start();
+    tcp::mem::start();
 }
 
 /// Initialize the network subsystem
