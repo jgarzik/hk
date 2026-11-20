@@ -3200,3 +3200,18 @@ fn ack_clears_soft_error() {
     p.a.feed(&dup, p.now, &mut Out::default());
     assert_eq!(p.a.soft_err, None);
 }
+
+/// A retransmission is data sent too (Linux __tcp_transmit_skb ->
+/// tcp_event_data_sent): lsndtime follows it
+#[test]
+fn retransmission_is_data_sent() {
+    let mut p = Pair::new(1000);
+    p.filter = drop_all;
+    p.now = 100;
+    p.send_a(&pattern(2000));
+    assert_eq!(p.a.lsndtime, 100);
+    assert!(p.tick());
+    assert!(p.now > 100);
+    assert!(p.a.stats.total_retrans > 0 || p.a.tlp_high_seq.is_some());
+    assert_eq!(p.a.lsndtime, p.now);
+}

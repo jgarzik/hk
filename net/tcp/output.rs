@@ -152,6 +152,9 @@ impl TcpCb {
         if fl & flags::ACK != 0 {
             self.ack_sent();
         }
+        if len != 0 {
+            self.event_data_sent();
+        }
         // Linux __tcp_transmit_skb: OutSegs leaves out retransmissions
         // (hk's SND.MAX is Linux's snd_nxt)
         let end = seq.wrapping_add(len + u32::from(fl & flags::FIN != 0));
@@ -175,6 +178,18 @@ impl TcpCb {
         };
         h.set_len(len);
         h
+    }
+
+    /// A segment with data is about to go out, new or a retransmission
+    /// (Linux tcp_event_data_sent from __tcp_transmit_skb): the
+    /// algorithm hears of a start from an empty flight, lsndtime, and a
+    /// reply within the ATO makes the connection interactive
+    fn event_data_sent(&mut self) {
+        if self.in_flight() == 0 {
+            self.ca_event(super::cong::CaEvent::TxStart);
+        }
+        self.lsndtime = self.clock;
+        self.data_sent(self.clock);
     }
 
     /// Send `skb`'s payload (a queued skb) at `seq` with flags `fl`
@@ -344,8 +359,6 @@ impl TcpCb {
         if fin {
             fl |= flags::FIN;
         }
-        // Linux tcp_event_data_sent: nothing was in flight
-        let tx_start = self.in_flight() == 0;
         // Idle longer than an RTO: the window restarts
         self.slow_start_after_idle_check(now);
         if !self.send_new(n, fl, out) {
@@ -354,13 +367,6 @@ impl TcpCb {
         let next = seq.wrapping_add(n + u32::from(fin));
         if n < mss {
             self.snd_sml = next;
-        }
-        if n > 0 {
-            if tx_start {
-                self.ca_event(super::cong::CaEvent::TxStart);
-            }
-            self.data_sent(now);
-            self.lsndtime = now;
         }
         // Linux tcp_event_new_data_sent
         self.net_stat(LINUX_MIB_TCPORIGDATASENT);

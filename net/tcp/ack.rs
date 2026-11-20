@@ -107,7 +107,7 @@ impl TcpCb {
         self.ack_nomem = false;
     }
 
-    /// New data went out at `now` (Linux tcp_event_data_sent): a reply
+    /// Data went out at `now` (Linux tcp_event_data_sent): a reply
     /// within the ATO of the last data received makes the connection
     /// interactive
     pub(super) fn data_sent(&mut self, now: u64) {
