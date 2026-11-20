@@ -558,6 +558,11 @@ pub struct Live {
     /// sk_stream_write_space); the window validation reads it. Survives
     /// a new block, as the socket's.
     pub(super) nospace: AtomicBool,
+    /// Truesize in the socket's backlog (Linux sk_backlog.len, which
+    /// tcp_space reads): stored under `slock` as the backlog grows and
+    /// when a release zeroes it, read by the block's holder. The
+    /// socket's: survives a new block.
+    pub(super) backlog_len: core::sync::atomic::AtomicUsize,
 }
 
 impl Live {

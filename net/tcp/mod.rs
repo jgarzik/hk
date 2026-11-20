@@ -209,6 +209,8 @@ struct Snap {
     state: AtomicU8,
     /// Readable bytes (Linux tcp_inq)
     rcvq: AtomicUsize,
+    /// Receive memory (Linux sk_rmem_alloc: the backlog limit reads it)
+    rmem: AtomicUsize,
     /// Bytes queued for sending (Linux write_seq - snd_una)
     sndq: AtomicUsize,
     /// Linux sk_stream_is_writeable
@@ -223,6 +225,7 @@ impl Snap {
     /// queue it describes)
     fn store(&self, c: &TcpCb) {
         self.rcvq.store(c.rcvq_len(), Ordering::Release);
+        self.rmem.store(c.rmem_alloc(), Ordering::Release);
         self.sndq.store(c.sndq_len(), Ordering::Release);
         self.writable.store(c.writable(), Ordering::Release);
         self.snd_una.store(c.snd_una, Ordering::Release);
@@ -848,15 +851,19 @@ impl TcpSock {
         }
     }
 
-    /// Linux tcp_add_backlog: over rcvbuf * 2 + sndbuf / 2 + 64 KiB of
-    /// backlog and receive queue the segment is dropped (after `slock`)
+    /// Linux tcp_add_backlog: over rcvbuf + sndbuf / 2 + 64 KiB of
+    /// backlog and receive memory the segment is dropped (after `slock`;
+    /// sk_rcvqueues_full)
     fn add_backlog(&self, mut b: BhGuard<'_, Inner>, skb: Box<SkBuff>) {
         let limit = (self.sk.rcvbuf() as usize)
-            .saturating_mul(2)
             .saturating_add(self.sk.sndbuf() as usize / 2)
             .saturating_add(64 * 1024);
-        let rmem = self.snap.rcvq.load(Ordering::Relaxed);
+        let rmem = self.snap.rmem.load(Ordering::Relaxed);
         let r = b.add_backlog(skb, rmem, limit);
+        // Linux sk_backlog.len, which tcp_space reads
+        self.live
+            .backlog_len
+            .store(b.backlog_len(), Ordering::Relaxed);
         drop(b);
         if r.is_err() {
             self.sk.net.mib.net.inc(LINUX_MIB_TCPBACKLOGDROP);
@@ -1454,6 +1461,8 @@ impl SockHooks<Inner> for TcpSock {
     /// while still owned are Linux's too (release_sock runs the backlog
     /// and release_cb before sock_release_ownership).
     fn release_cb(&self, g: &mut Inner, flags: u32) {
+        // The release emptied the backlog and zeroed its length
+        self.live.backlog_len.store(0, Ordering::Relaxed);
         let mut out = Out::default();
         let now = now_ms();
         if flags & deferred::TIMER != 0 {

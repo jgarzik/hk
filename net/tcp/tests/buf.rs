@@ -453,3 +453,16 @@ fn fin_wait2_timewait_entry() {
     assert_eq!(tw.expires(), now + TIMEWAIT_LEN);
     assert_eq!(tw.ack(now).ack, nxt.wrapping_add(1));
 }
+
+/// Linux tcp_space subtracts the socket's backlog (sk_backlog.len): the
+/// window offered shrinks while segments wait for the owner
+#[test]
+fn backlog_counts_in_space() {
+    use core::sync::atomic::Ordering;
+    let mut p = Pair::with_cap(1460, 1 << 16);
+    let free = p.b.space();
+    p.b.live.backlog_len.store(1 << 15, Ordering::Relaxed);
+    assert_eq!(p.b.space(), free - p.b.win_from_space(1 << 15));
+    p.b.live.backlog_len.store(1 << 16, Ordering::Relaxed);
+    assert_eq!(p.b.window_now(), 0);
+}

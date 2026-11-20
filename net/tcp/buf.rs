@@ -80,11 +80,14 @@ impl TcpCb {
         self.rcvq_truesize + self.ooo.truesize()
     }
 
-    /// Linux tcp_space: the window the unused buffer holds; negative
-    /// past the buffer. The socket's backlog is not counted (Linux
-    /// subtracts sk_backlog.len; the control block does not see it)
+    /// Linux tcp_space: the window the unused buffer, less the
+    /// socket's backlog, holds; negative past the buffer
     pub(super) fn space(&self) -> i64 {
-        self.win_from_space(i64::from(self.rcvbuf) - self.rmem_alloc() as i64)
+        let backlog = self
+            .live
+            .backlog_len
+            .load(core::sync::atomic::Ordering::Relaxed);
+        self.win_from_space(i64::from(self.rcvbuf) - backlog as i64 - self.rmem_alloc() as i64)
     }
 
     /// Linux tcp_full_space: the window the whole buffer holds
@@ -289,9 +292,12 @@ impl TcpCb {
         // Linux grows an out-of-order skb's window before charging it
         // (skb_set_owner_r follows): its truesize is not counted yet
         let space = if uncharged {
-            self.win_from_space(
-                i64::from(self.rcvbuf) - self.rmem_alloc() as i64 + i64::from(truesize),
-            )
+            let backlog = self
+                .live
+                .backlog_len
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let free = i64::from(self.rcvbuf) - backlog as i64 - self.rmem_alloc() as i64;
+            self.win_from_space(free + i64::from(truesize))
         } else {
             self.space()
         };
