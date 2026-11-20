@@ -29,6 +29,7 @@ use crate::net::socket::{OptIn, OptOut};
 use crate::sync::spin::RwLock;
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
+use crate::util::kmem::KVec;
 
 use super::ring::Room;
 use super::{ETH_P_ALL, PacketSock, pf};
@@ -267,7 +268,12 @@ impl PacketSock {
     /// `bind_lock` held
     pub(super) fn fanout_link(&self, f: &Fanout) {
         if let Some(me) = self.me.get().and_then(alloc::sync::Weak::upgrade) {
-            f.arr.write().push(me);
+            let mut arr = f.arr.write();
+            // Room for every member (`add`): no allocation here
+            debug_assert!(arr.len() < arr.capacity());
+            if arr.len() < arr.capacity() {
+                arr.push(me);
+            }
         }
     }
 
@@ -330,22 +336,25 @@ pub fn add(s: &PacketSock, id: u16, type_flags: u16, max: u32) -> Result<(), Ker
             if max > PACKET_FANOUT_MAX {
                 return Err(KernelError::InvalidArgument);
             }
+            let max = if max == 0 { FANOUT_DEFAULT_MAX } else { max };
+            // The member array whole, before any spin lock (Linux
+            // kvzalloc_flex of arr[max_num_members]): linking a member
+            // under bind_lock never allocates
+            let arr = KVec::try_with_capacity(max as usize)?.into_vec();
             let f = try_arc(Fanout {
                 id,
                 ty,
                 flags,
-                max_num_members: if max == 0 { FANOUT_DEFAULT_MAX } else { max },
+                max_num_members: max,
                 proto: num,
                 ifindex: ifindex.max(0),
                 ignore_outgoing: type_flags & FLAG_IGNORE_OUTGOING != 0,
                 rr_cur: AtomicU32::new(0),
                 bpf: RwLock::new(None),
-                arr: RwLock::new(Vec::new()),
+                arr: RwLock::new(arr),
                 sk_ref: AtomicU32::new(0),
             })?;
-            let mut l = net.packet.fanouts.write();
-            l.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
-            l.push(f.clone());
+            list_add(net, f.clone())?;
             f
         }
     };
@@ -375,6 +384,33 @@ pub fn add(s: &PacketSock, id: u16, type_flags: u16, max: u32) -> Result<(), Ker
         net.packet.fanouts.write().retain(|g| !Arc::ptr_eq(g, &f));
     }
     r
+}
+
+/// Add a group to the namespace's list (Linux list_add to
+/// fanout_list), `FANOUT` held: a full list is grown into a vector
+/// allocated before the spin lock, the old one freed after it
+fn list_add(net: &crate::net::NetNamespace, f: Arc<Fanout>) -> Result<(), KernelError> {
+    let (len, cap) = {
+        let l = net.packet.fanouts.read();
+        (l.len(), l.capacity())
+    };
+    let mut grown = None;
+    if len == cap {
+        // `FANOUT` keeps other writers out until the swap
+        grown = Some(KVec::try_with_capacity(cap * 2 + 4)?.into_vec());
+    }
+    let old = {
+        let mut l = net.packet.fanouts.write();
+        let old = grown.map(|mut g| {
+            g.append(&mut l);
+            core::mem::replace(&mut *l, g)
+        });
+        debug_assert!(l.len() < l.capacity());
+        l.push(f);
+        old
+    };
+    drop(old);
+    Ok(())
 }
 
 /// Linux __fanout_id_is_free / fanout_find_new_id
