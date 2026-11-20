@@ -404,7 +404,7 @@ Extended attributes:
 - [x] uname
 - [x] sysinfo
 - [x] getrandom
-- [x] reboot
+- [x] reboot (CAD_ON/CAD_OFF, RESTART2)
 - [x] kexec_load (stub: ENOSYS)
 - [x] syslog (console actions no-ops)
 - [x] acct

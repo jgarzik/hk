@@ -1,6 +1,6 @@
 # Linux-equivalent virtual terminals for hk: design and plan
 
-Design and plan for doc/ROADMAP.md phase V; its P0 prerequisites are in phases C (Ctrl-Alt-Del) and Y (tty and console core). Reference: Linux drivers/tty/vt, drivers/video/fbdev/core/fbcon.c, drivers/video/console/vgacon.c, drivers/input, drivers/hid/usbhid, kernel/printk. Linux semantics are binding: no deviations; anything not yet built is a staged missing feature.
+Design and plan for doc/ROADMAP.md phase V; its P0 prerequisites are in phase Y (tty and console core); reboot(2)'s Ctrl-Alt-Del modes exist. Reference: Linux drivers/tty/vt, drivers/video/fbdev/core/fbcon.c, drivers/video/console/vgacon.c, drivers/input, drivers/hid/usbhid, kernel/printk. Linux semantics are binding: no deviations; anything not yet built is a staged missing feature.
 
 ## 0. Constraints
 | # | Topic | Rule |
@@ -14,7 +14,7 @@ Design and plan for doc/ROADMAP.md phase V; its P0 prerequisites are in phases C
 | 7 | ttyflip thread | **Per-port flip work** on the new IRQ-safe work items; the thread goes. |
 | 8 | ABI version | **Linux 6.8** (the reference VM); newer features (VT_GETCONSIZECSRPOS, bracketed-paste TIOCL) when the reference is upgraded. |
 | 9 | Screen tests | **`make check-gfx`**, optional, outside `make gate`, run at phase ends. |
-| 11 | Ctrl-Alt-Del | **In P6**: reboot(2) CAD_ON/CAD_OFF + cad_pid + the keyboard trigger. |
+| 11 | Ctrl-Alt-Del | **In P6**: the keyboard trigger, `power::ctrl_alt_del` (C_A_D: deferred restart, else SIGINT to cad_pid); reboot(2) CAD_ON/CAD_OFF, cad_pid and their sysctls exist. |
 | 12 | sysfs + uevent | On the existing sysfs/uevent core: /sys/class/tty (tty0/active + poll), /sys/class/input, uevents for vcs/input nodes are in scope here. |
 
 ## 1. Binding Linux behavior; what the reference VMs provide
@@ -131,7 +131,7 @@ P2 Parser, consolemap, vcs (deps P1): ESC/CSI core; SGR + build_attr + palette O
 P3 Renderers (deps P2, 0d): Consw dispatch + dirty-row batching; vgacon Consw (CRTC cursor, hw attrs, VRAM-bounded scrolldelta); fbcon Consw (bitblit, cursor, palette → pixel format, takeover, resize; no scrollback, rule 2); remove GfxConsole + console-role VgaCon; panic path. Tests: suite + fbcon selftest; `make check-gfx` at phase end, outside the gate (rule 9). LOCKING: drop GfxConsole rows.
 P4 Switching + mode ioctls (deps P1, 0c, 0e; /sys/class/tty/tty0/active): set_console/change_console work, VT_ACTIVATE/WAITACTIVE/SETACTIVATE/WAITEVENT, VT_SETMODE/GETMODE/RELDISP (signals, dead-pid reset), KD(S/G)ETMODE (stop drawing, printk suppression), VT_DISALLOCATE, VT_RESIZE/RESIZEX, VT_LOCK/UNLOCKSWITCH, TIOCLINUX subset (6, 10, 11, 12, 13, 14, 17; 4 unblank), permission (ctty or CAP_SYS_TTY_CONFIG). Tests VT_SWITCH.
 P5 Input core, evdev, uinput (deps 0c; parallel to P1–P4): input/ core + autorepeat + setkeycode; /sys/class/input + uevents; evdev full EVIOC* subset, clock ids, grab, revoke, mask; misc major 10 + /dev/uinput (legacy + UI_DEV_SETUP, UI_GET_SYSNAME). Tests INPUT. LOCKING §3.10.
-P6 Keyboard handler (with defkeymap/accent data; deps P4, P5): kbd handler, all k_handlers (self, fn, spec, pad, dead, cons, cur, shift, meta, ascii, lock, lowercase, slock, dead2, brl), four modes, unicode, diacritics; KD(G/S)KBENT, KD(G/S)KBSENT, KD(G/S)KBDIACR(UC), KD(G/S)KBMETA, KD(G/S)KBLED, KD(G/S)ETLED, K(G/S)KBMODE, KD(G/S)ETKEYCODE, KDKBDREP, KDSIGACCEPT; LED work; Alt-Fn; Ctrl-Alt-Del with reboot(2) CAD_ON/CAD_OFF + cad_pid (SIGINT to init) (rule 11). Tests KBD, REBOOT_CAD (hk + Linux: reboot(CAD_OFF) as root returns 0).
+P6 Keyboard handler (with defkeymap/accent data; deps P4, P5): kbd handler, all k_handlers (self, fn, spec, pad, dead, cons, cur, shift, meta, ascii, lock, lowercase, slock, dead2, brl), four modes, unicode, diacritics; KD(G/S)KBENT, KD(G/S)KBSENT, KD(G/S)KBDIACR(UC), KD(G/S)KBMETA, KD(G/S)KBLED, KD(G/S)ETLED, K(G/S)KBMODE, KD(G/S)ETKEYCODE, KDKBDREP, KDSIGACCEPT; LED work; Alt-Fn; Ctrl-Alt-Del: `power::ctrl_alt_del` over the existing C_A_D and cad_pid (SIGINT to init) (rule 11). Test KBD.
 P7 Keyboard hw, Dell first (rule 3): xHCI interrupt endpoints + event thread; USB HID boot keyboard (QEMU usb-kbd); i8042 + atkbd (the x86 reference VM has an AT keyboard); virtio-input. No hub driver (BUGS). QEMU sendkey/usb-kbd checks in check-gfx.
 P8 Fonts/maps: KDFONTOP (fbcon width ≤32, 256/512 glyphs; vgacon plane-2), PIO/GIO_UNIMAP, UNIMAPCLR, (G/P)IO_(UNI)SCRNMAP, GIO/PIO_CMAP, VT_GETHIFONTMASK, KIOCSOUND/KDMKTONE (pcspkr input dev x86, no-op otherwise as Linux). Round-trip tests.
 P9 Display: virtio-gpu 2D (rule 4; arm64 and x86; fbcon damage/flush hook), checked in check-gfx, not the gate.

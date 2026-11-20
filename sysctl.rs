@@ -64,6 +64,7 @@ pub fn tables() -> &'static [&'static [Ctl]] {
         crate::bpf::syscall::BPF_CTLS,
         crate::io::inotify::INOTIFY_CTLS,
         crate::io::aio::AIO_CTLS,
+        crate::power::CAD_CTLS,
     ];
     TABLES
 }

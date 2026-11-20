@@ -276,6 +276,7 @@ pub fn run_all_tests() {
     io::gencalls::run_tests();
     process::init_args::run_tests();
     process::init_signals::run_tests();
+    process::reboot_cad::run_tests();
     exec::exec_at::run_tests();
     exec::script_exec::run_tests();
     time::clock_ids::run_tests();

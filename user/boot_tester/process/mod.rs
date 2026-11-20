@@ -22,6 +22,7 @@ pub mod prctl;
 pub mod prctl_extra;
 pub mod preempt;
 pub mod process;
+pub mod reboot_cad;
 pub mod rlimit;
 pub mod sched_ids;
 pub mod setpgid;
