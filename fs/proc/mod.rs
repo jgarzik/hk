@@ -273,6 +273,8 @@ pub enum ProcfsInodeData {
     SysctlDir {
         dir: &'static str,
         net: Option<proc_sysctl::NetDir>,
+        /// What a per-device directory (net/ipv4/conf/<name>) stands for
+        sel: Option<crate::net::sysctl::Sel>,
     },
     /// /proc/<pid>/fail-nth: the task's fault-injection countdown
     /// (Linux proc_fail_nth_operations, `mm::fault_inject`)
@@ -859,7 +861,11 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         Task(ProcPid),
         Fdinfo(ProcPid),
         Net(ProcPid),
-        Sysctl(&'static str, Option<proc_sysctl::NetDir>),
+        Sysctl(
+            &'static str,
+            Option<proc_sysctl::NetDir>,
+            Option<crate::net::sysctl::Sel>,
+        ),
     }
     let kind = with_data(dir, |d| -> Result<_, KernelError> {
         Ok(match d {
@@ -875,7 +881,9 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
             ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
             ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
             ProcfsInodeData::PidNetDirectory { pid } => Dir::Net(pid.clone()),
-            ProcfsInodeData::SysctlDir { dir, net } => Dir::Sysctl(dir, net.clone()),
+            ProcfsInodeData::SysctlDir { dir, net, sel } => {
+                Dir::Sysctl(dir, net.clone(), sel.clone())
+            }
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
@@ -947,7 +955,9 @@ fn proc_lookup(dir: &Inode, name: &[u8]) -> Result<InodeRef, KernelError> {
         }
         Dir::Fdinfo(p) => lookup_pid_fdinfo_entry(dir, &p, name),
         Dir::Net(p) => proc_net::lookup(dir, &p, name),
-        Dir::Sysctl(path, net) => proc_sysctl::lookup(dir, path, net.as_ref(), name),
+        Dir::Sysctl(path, net, sel) => {
+            proc_sysctl::lookup(dir, path, net.as_ref(), sel.as_ref(), name)
+        }
     }
 }
 
@@ -2106,7 +2116,11 @@ impl FileOps for ProcfsFileOps {
             Task(ProcPid),
             Fdinfo(ProcPid),
             Net(ProcPid),
-            Sysctl(&'static str, Option<proc_sysctl::NetDir>),
+            Sysctl(
+                &'static str,
+                Option<proc_sysctl::NetDir>,
+                Option<crate::net::sysctl::Sel>,
+            ),
         }
         let kind = with_data(&inode, |d| -> Result<_, KernelError> {
             Ok(match d {
@@ -2117,7 +2131,9 @@ impl FileOps for ProcfsFileOps {
                 ProcfsInodeData::PidTaskDirectory { pid } => Dir::Task(pid.clone()),
                 ProcfsInodeData::PidFdinfoDirectory { pid } => Dir::Fdinfo(pid.clone()),
                 ProcfsInodeData::PidNetDirectory { pid } => Dir::Net(pid.clone()),
-                ProcfsInodeData::SysctlDir { dir, net } => Dir::Sysctl(dir, net.clone()),
+                ProcfsInodeData::SysctlDir { dir, net, sel } => {
+                    Dir::Sysctl(dir, net.clone(), sel.clone())
+                }
                 ProcfsInodeData::File { .. }
                 | ProcfsInodeData::NamespaceFile { .. }
                 | ProcfsInodeData::FdSymlink { .. }
@@ -2227,7 +2243,9 @@ impl FileOps for ProcfsFileOps {
                     proc_net::readdir(t, ctx)?;
                 }
             }
-            Dir::Sysctl(path, net) => proc_sysctl::readdir(file, &inode, path, net.as_ref(), ctx)?,
+            Dir::Sysctl(path, net, sel) => {
+                proc_sysctl::readdir(file, &inode, path, net.as_ref(), sel.as_ref(), ctx)?
+            }
         }
 
         Ok(())
@@ -2659,7 +2677,9 @@ fn sysctl_permission(
 fn sysctl_unregistering(d: &ProcfsInodeData) -> bool {
     match d {
         ProcfsInodeData::Sysctl { ctl } => ctl.unregistering(),
-        ProcfsInodeData::SysctlDir { net: Some(n), .. } => n.unregistering(),
+        ProcfsInodeData::SysctlDir {
+            net: Some(n), sel, ..
+        } => n.unregistering() || sel.as_ref().is_some_and(|s| s.gone()),
         _ => false,
     }
 }
@@ -2779,6 +2799,7 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &mut DirBuild) -> Result<(), KernelErro
         ProcfsInodeData::SysctlDir {
             dir: "net",
             net: None,
+            sel: None,
         },
     )?;
     for ctl in crate::sysctl::tables().iter().flat_map(|t| t.iter()) {

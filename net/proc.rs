@@ -397,7 +397,7 @@ pub fn proc_net_sockstat(net: &crate::net::NetNamespace) -> Vec<u8> {
 pub fn proc_net_snmp(net: &crate::net::NetNamespace) -> Vec<u8> {
     let mib = &net.mib;
     crate::fs::proc::seq::generate(|m| {
-        ipstats_show(m, mib);
+        ipstats_show(m, net, mib);
         icmp_put(m, mib);
         icmpmsg_put(m, mib);
         tcp_udp_show(m, mib);
@@ -417,14 +417,22 @@ fn mib_head<'a>(
     let _ = write!(m, "\n{}:", tag);
 }
 
-/// Linux snmp_seq_show_ipstats: Forwarding is 2 (hk does not forward,
-/// net.ipv4.ip_forward is 0), DefaultTTL the IP default
-fn ipstats_show(m: &mut crate::fs::proc::seq::SeqBuf, mib: &NetMib) {
+/// Linux snmp_seq_show_ipstats: Forwarding 1 with "all"'s forwarding
+/// on, else 2; DefaultTTL the IP default
+fn ipstats_show(
+    m: &mut crate::fs::proc::seq::SeqBuf,
+    net: &crate::net::NetNamespace,
+    mib: &NetMib,
+) {
     let _ = m.write_str("Ip: Forwarding DefaultTTL");
     for (n, _) in SNMP4_IPSTATS_LIST {
         let _ = write!(m, " {}", n);
     }
-    let _ = write!(m, "\nIp: {} {}", 2, crate::net::ipv4::IP_DEFAULT_TTL);
+    let fwd = net
+        .devconf_all
+        .get(crate::net::inet::devconf::ci::FORWARDING);
+    let fwd = if fwd != 0 { 1 } else { 2 };
+    let _ = write!(m, "\nIp: {} {}", fwd, crate::net::ipv4::IP_DEFAULT_TTL);
     for (_, f) in SNMP4_IPSTATS_LIST {
         let _ = write!(m, " {}", mib.ip.fold(f));
     }

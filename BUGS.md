@@ -165,8 +165,19 @@ connections start from defaults (tcp_init_metrics), and no peer is
 proven for tcp_conn_request's last quarter of tcp_max_syn_backlog
 without SYN cookies (tcp_peer_is_proven), so it drops every new
 request there.
-There is no proxy ARP and no per-device neighbour sysctls
-(net/ipv4/neigh/*).
+There is no proxy ARP. No IP forwarding: net.ipv4.conf.*.forwarding
+(and ip_forward) is kept and propagated as Linux, but packets for other
+hosts are still dropped (no ip_forward / ip_route_input forwarding
+path). Of the net.ipv4.conf.* attributes (`net/inet/devconf.rs`) only
+forwarding and proxy_arp act; the rest are kept and shown only
+(rp_filter, accept/send/secure_redirects, accept_source_route,
+accept_local, route_localnet, log_martians, arp_filter / announce /
+ignore / accept / notify / evict_nocarrier, shared_media, bootp_relay,
+tag, medium_id, src_valid_mark, bc_forwarding, the IGMP knobs,
+drop_*, disable_xfrm / disable_policy, promote_secondaries), and a
+change sends no RTM_NEWNETCONF (hk has no netconf messages). Of the
+neighbour sysctls (`net/core/neigh_sysctl.rs`) anycast_delay,
+interval_probe_time_ms and gc_interval are kept only.
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
 IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP

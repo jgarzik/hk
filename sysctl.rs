@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 
-use crate::net::sysctl::NetCtl;
+use crate::net::sysctl::{CtlGrab, CtlRef};
 use crate::net::{NetNamespace, NetRef};
 use crate::util::error::KernelError;
 
@@ -52,7 +52,7 @@ pub struct Text {
 pub enum Entry {
     Global(&'static Ctl),
     Net {
-        ctl: &'static NetCtl,
+        ctl: CtlRef,
         net: Weak<NetNamespace>,
         id: u64,
         /// The entry's mode in that namespace (`NetCtl::mode_in`)
@@ -66,7 +66,7 @@ pub enum Entry {
 /// (Linux start_unregistering waits for the users)
 enum Grab {
     Global(&'static Ctl),
-    Net(&'static NetCtl, NetRef),
+    Net(CtlGrab, NetRef),
 }
 
 /// What a permission check needs of an entry (Linux sysctl_perm: the
@@ -80,27 +80,30 @@ pub struct Perm {
 
 impl Entry {
     /// A network entry of `net`
-    pub fn net(ctl: &'static NetCtl, net: &alloc::sync::Arc<NetNamespace>) -> Self {
+    pub fn net(ctl: CtlRef, net: &alloc::sync::Arc<NetNamespace>) -> Self {
         Self::Net {
+            mode: ctl.mode_in(net),
             ctl,
             net: alloc::sync::Arc::downgrade(net),
             id: net.id,
-            mode: ctl.mode_in(net),
             set: net.sysctls.clone(),
         }
     }
 
-    /// In use, or ENOENT once its namespace is going (Linux
-    /// sysctl_head_grab: -ENOENT while unregistering)
+    /// In use, or ENOENT once its namespace is going or its device's
+    /// directory went (Linux sysctl_head_grab: -ENOENT while
+    /// unregistering)
     fn grab(&self) -> Result<Grab, KernelError> {
         match self {
             Self::Global(c) => Ok(Grab::Global(c)),
             Self::Net { set, .. } if set.unregistering() => Err(KernelError::NotFound),
-            Self::Net { ctl, net, .. } => net
-                .upgrade()
-                .and_then(|n| n.maybe_get())
-                .map(|n| Grab::Net(ctl, n))
-                .ok_or(KernelError::NotFound),
+            Self::Net { ctl, net, .. } => {
+                let n = net
+                    .upgrade()
+                    .and_then(|n| n.maybe_get())
+                    .ok_or(KernelError::NotFound)?;
+                Ok(Grab::Net(ctl.grab()?, n))
+            }
         }
     }
 
@@ -109,7 +112,7 @@ impl Entry {
     pub fn unregistering(&self) -> bool {
         match self {
             Self::Global(_) => false,
-            Self::Net { set, .. } => set.unregistering(),
+            Self::Net { set, ctl, .. } => set.unregistering() || ctl.gone(),
         }
     }
 
@@ -131,7 +134,7 @@ impl Entry {
     pub fn is_text(&self) -> bool {
         match self {
             Self::Global(c) => c.text.is_some(),
-            Self::Net { ctl, .. } => ctl.text.is_some(),
+            Self::Net { ctl, .. } => ctl.is_text(),
         }
     }
 
@@ -148,14 +151,14 @@ impl Grab {
     fn show(&self) -> Vec<i64> {
         match self {
             Self::Global(c) => (c.show)(),
-            Self::Net(c, n) => (c.show)(n),
+            Self::Net(c, n) => c.show(n),
         }
     }
 
     fn store(&self, v: &[i64]) -> Result<(), KernelError> {
         match self {
             Self::Global(c) => (c.store)(v),
-            Self::Net(c, n) => (c.store)(n, v),
+            Self::Net(c, n) => c.store(n, v),
         }
     }
 
@@ -163,7 +166,7 @@ impl Grab {
     fn text_show(&self) -> Option<String> {
         match self {
             Self::Global(c) => c.text.as_ref().map(|t| (t.show)()),
-            Self::Net(c, n) => c.text.as_ref().map(|t| (t.show)(n)),
+            Self::Net(c, n) => c.text().map(|t| (t.show)(n)),
         }
     }
 
@@ -171,7 +174,7 @@ impl Grab {
     fn text_store(&self, s: &str) -> Option<Result<(), KernelError>> {
         match self {
             Self::Global(c) => c.text.as_ref().map(|t| (t.store)(s)),
-            Self::Net(c, n) => c.text.as_ref().map(|t| (t.store)(n, s)),
+            Self::Net(c, n) => c.text().map(|t| (t.store)(n, s)),
         }
     }
 }

@@ -12,9 +12,14 @@
 //! it. A cached dentry of a namespace's tree matches only lookups by a
 //! task of that namespace (proc_sys_compare -> sysctl_is_seen), so each
 //! namespace walking /proc/sys/net finds its own, and an fd keeps the
-//! one it was opened on.
+//! one it was opened on. The per-device directories
+//! (net/ipv4/conf/<name>, net/ipv4/neigh/<name>: `net::sysctl::DEV_DIRS`)
+//! list the namespace's fixed names and devices when looked up; one
+//! stands for what it was found as (`Sel`), gone once its device is
+//! unregistered or renamed (Linux unregisters a device's tables then).
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -23,7 +28,7 @@ use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{DirContext, DirEntry, File};
 use crate::fs::inode::{FileType, Inode, InodeMode, InodeRef};
-use crate::net::sysctl::{NetCtl, all, registered};
+use crate::net::sysctl::{CtlRef, DEV_DIRS, DevDir, Sel, registered};
 use crate::net::{NetNamespace, NetRef};
 use crate::sysctl::Entry;
 
@@ -65,31 +70,84 @@ impl NetDir {
 }
 
 /// An entry of a sysctl directory
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Child {
-    File(&'static NetCtl),
+    File(CtlRef),
     /// A subdirectory, by its path below /proc/sys
     Dir(&'static str),
+    /// One name of a per-device directory (Linux the table devinet or
+    /// neigh registered for "all", "default" or a device)
+    DevDir(&'static DevDir, Sel),
 }
 
-/// The entries of directory `dir` ("net", "net/ipv4") among `ctls`,
-/// by name in name order (Linux a ctl_dir's rb-tree, namecmp)
-fn children(
-    ctls: impl Iterator<Item = &'static NetCtl>,
-    dir: &str,
-) -> BTreeMap<&'static str, Child> {
+/// The per-device directory at `path`
+fn dev_dir(path: &str) -> Option<&'static DevDir> {
+    DEV_DIRS.iter().copied().find(|d| d.path == path)
+}
+
+/// The files of a per-device directory standing for `sel`
+fn dev_files(dir: &str, sel: &Sel) -> BTreeMap<String, Child> {
     let mut m = BTreeMap::new();
-    for c in ctls {
-        let Some(rest) = c.path.strip_prefix(dir).and_then(|r| r.strip_prefix('/')) else {
-            continue;
-        };
-        let child = match rest.split_once('/') {
-            Some((name, _)) => (name, Child::Dir(&c.path[..dir.len() + 1 + name.len()])),
-            None => (rest, Child::File(c)),
-        };
-        m.entry(child.0).or_insert(child.1);
+    let Some(d) = dev_dir(dir) else {
+        return m;
+    };
+    let dflt = matches!(sel, Sel::Default);
+    for c in d.ctls.iter().filter(|c| dflt || !c.default_only) {
+        m.insert(
+            String::from(c.name),
+            Child::File(CtlRef::Dev(c, sel.clone())),
+        );
     }
     m
+}
+
+/// The entries of directory `dir` ("net", "net/ipv4") by name in name
+/// order (Linux a ctl_dir's rb-tree, namecmp): of namespace `net`'s
+/// tables, or of every table for the root set (None); `sel` is what a
+/// per-device directory stands for
+fn children(net: Option<&NetNamespace>, dir: &str, sel: Option<&Sel>) -> BTreeMap<String, Child> {
+    if let Some(sel) = sel {
+        return dev_files(dir, sel);
+    }
+    let mut m = BTreeMap::new();
+    let paths = registered(net)
+        .map(|c| (c.path, Some(c)))
+        .chain(DEV_DIRS.iter().map(|d| (d.path, None)));
+    for (path, ctl) in paths {
+        let Some(rest) = path.strip_prefix(dir).and_then(|r| r.strip_prefix('/')) else {
+            continue;
+        };
+        let child = match (rest.split_once('/'), ctl) {
+            (None, Some(c)) => (rest, Child::File(CtlRef::Net(c))),
+            (split, _) => {
+                let name = split.map_or(rest, |(n, _)| n);
+                (name, Child::Dir(&path[..dir.len() + 1 + name.len()]))
+            }
+        };
+        m.entry(String::from(child.0)).or_insert(child.1);
+    }
+    if let (Some(net), Some(d)) = (net, dev_dir(dir)) {
+        dev_names(net, d, &mut m);
+    }
+    m
+}
+
+/// The names of the per-device directory `d` in `net`: its fixed ones,
+/// then every device (Linux registers each device's table as the
+/// device registers; a device named like a fixed one never registers)
+fn dev_names(net: &NetNamespace, d: &'static DevDir, m: &mut BTreeMap<String, Child>) {
+    for &(name, all) in (d.fixed)(net) {
+        let sel = if all { Sel::All } else { Sel::Default };
+        m.insert(String::from(name), Child::DevDir(d, sel));
+    }
+    for dev in net.devices() {
+        let sel = Sel::Dev {
+            dev: Arc::downgrade(&dev),
+            name: String::from(dev.name()),
+        };
+        m.entry(String::from(dev.name()))
+            .or_insert(Child::DevDir(d, sel));
+    }
 }
 
 /// The current task's network namespace, its id (Linux
@@ -101,19 +159,21 @@ fn current_net_id() -> u64 {
 }
 
 /// The child `name` of the sysctl directory `parent` (path `dir`, of
-/// namespace `net`, None for the root set's /proc/sys/net) (Linux
-/// proc_sys_lookup: lookup_entry, sysctl_follow_link for a link)
+/// namespace `net`, None for the root set's /proc/sys/net; `sel` what a
+/// per-device directory stands for) (Linux proc_sys_lookup:
+/// lookup_entry, sysctl_follow_link for a link)
 pub(super) fn lookup(
     parent: &Inode,
     dir: &'static str,
     net: Option<&NetDir>,
+    sel: Option<&Sel>,
     name: &str,
 ) -> Result<InodeRef, KernelError> {
     let (net, nd) = match net {
         // A link: the directory of that name in the current task's
         // namespace (sysctl_follow_link: ENOENT if it has none)
         None => {
-            if !matches!(children(all(), dir).get(name), Some(Child::Dir(_))) {
+            if !matches!(children(None, dir, None).get(name), Some(Child::Dir(_))) {
                 return Err(KernelError::NotFound);
             }
             let n = crate::net::current_net_ns();
@@ -122,8 +182,11 @@ pub(super) fn lookup(
         }
         Some(nd) => (nd.grab()?, nd.clone()),
     };
-    let child = *children(registered(&net), dir)
-        .get(name)
+    if sel.is_some_and(Sel::gone) {
+        return Err(KernelError::NotFound);
+    }
+    let child = children(Some(&net), dir, sel)
+        .remove(name)
         .ok_or(KernelError::NotFound)?;
     make_inode(parent, &net, nd, child)
 }
@@ -154,6 +217,16 @@ fn make_inode(
             ProcfsInodeData::SysctlDir {
                 dir: path,
                 net: Some(nd),
+                sel: None,
+            },
+        )?,
+        Child::DevDir(d, sel) => create_dir_inode(
+            parent,
+            ino,
+            ProcfsInodeData::SysctlDir {
+                dir: d.path,
+                net: Some(nd),
+                sel: Some(sel),
             },
         )?,
     };
@@ -167,25 +240,24 @@ fn make_inode(
 }
 
 /// The entries of the sysctl directory `inode` (path `dir`, namespace
-/// `net` as for [`lookup`]) after "." and ".." (Linux
-/// proc_sys_readdir: each through the dcache, proc_sys_fill_cache; a
-/// link followed into the reader's namespace, skipped if it has none
-/// there, proc_sys_link_fill_cache)
+/// `net` and selection `sel` as for [`lookup`]) after "." and ".."
+/// (Linux proc_sys_readdir: each through the dcache,
+/// proc_sys_fill_cache; a link followed into the reader's namespace,
+/// skipped if it has none there, proc_sys_link_fill_cache)
 pub(super) fn readdir(
     file: &File,
     inode: &Inode,
     dir: &'static str,
     net: Option<&NetDir>,
+    sel: Option<&Sel>,
     ctx: &mut DirContext<'_>,
 ) -> Result<(), KernelError> {
-    let names: Vec<&'static str> = match net {
-        None => children(all(), dir).into_keys().collect(),
-        Some(nd) => children(registered(&*nd.grab()?), dir)
-            .into_keys()
-            .collect(),
+    let names: Vec<String> = match net {
+        None => children(None, dir, None).into_keys().collect(),
+        Some(nd) => children(Some(&*nd.grab()?), dir, sel).into_keys().collect(),
     };
     for name in names {
-        let Some((ino, file_type)) = fill_cache(file, inode, dir, net, name)? else {
+        let Some((ino, file_type)) = fill_cache(file, inode, dir, net, sel, &name)? else {
             continue;
         };
         let e = DirEntry {
@@ -209,13 +281,14 @@ fn fill_cache(
     inode: &Inode,
     dir: &'static str,
     net: Option<&NetDir>,
-    name: &'static str,
+    sel: Option<&Sel>,
+    name: &str,
 ) -> Result<Option<(u64, FileType)>, KernelError> {
     let parent = &file.dentry;
     let child = match parent.lookup_child(name.as_bytes()) {
         Some(c) if !c.is_negative() => c,
         _ => {
-            let Ok(i) = lookup(inode, dir, net, name) else {
+            let Ok(i) = lookup(inode, dir, net, sel, name) else {
                 return Ok(None);
             };
             let d = Dentry::prealloc(parent, name.as_bytes())?;

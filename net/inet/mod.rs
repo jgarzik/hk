@@ -3,6 +3,7 @@
 //! Family-specific; IPv6 gets a sibling `inet6` with the same shape
 //! (per-device address list, per-namespace FIB, input/output routing).
 
+pub mod devconf;
 pub mod fib;
 pub mod fib_rules;
 pub mod frag;

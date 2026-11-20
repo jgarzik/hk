@@ -418,6 +418,7 @@ pub fn run_all_tests() {
     net::netdev_ioctl::run_tests();
     net::netdev::run_tests();
     net::neigh::run_tests();
+    net::neigh_sysctl::run_tests();
     net::icmp::run_tests();
     net::icmp::run_ping_tests();
     net::raw::run_tests();

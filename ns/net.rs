@@ -91,6 +91,11 @@ pub struct NetNamespace {
     /// /proc/sys/net values (`net::sysctl`)
     pub sysctl: crate::net::sysctl::NetSysctl,
 
+    /// IPv4 device configuration: "all" and the defaults new devices
+    /// copy (Linux net->ipv4.devconf_all / devconf_dflt)
+    pub devconf_all: crate::net::inet::devconf::DevConf,
+    pub devconf_dflt: crate::net::inet::devconf::DevConf,
+
     /// Its sysctl registration, held by its /proc/sys/net inodes
     /// (Linux net->sysctls' headers)
     pub sysctls: Arc<crate::net::sysctl::SysctlSet>,
@@ -195,6 +200,12 @@ impl NetNamespace {
             .tcp_ca
             .load(Ordering::Relaxed);
         ns.sysctl.tcp_ca.store(ca, Ordering::Relaxed);
+        // Linux devinet_init_net (devconf_inherit_init_net 0): init_net's
+        // "all" and "default"
+        ns.devconf_all
+            .copy_from(&crate::net::INIT_NET_NS.devconf_all);
+        ns.devconf_dflt
+            .copy_from(&crate::net::INIT_NET_NS.devconf_dflt);
         // ... and its tcp_rmem / tcp_wmem
         let init = &crate::net::INIT_NET_NS.sysctl;
         for (d, s) in [
@@ -237,6 +248,8 @@ impl NetNamespace {
             tcp: Default::default(),
             port_range: PortRange::default(),
             sysctl: Default::default(),
+            devconf_all: crate::net::inet::devconf::DevConf::all(),
+            devconf_dflt: crate::net::inet::devconf::DevConf::dflt(),
             sysctls: try_arc(Default::default())?,
             frags: Default::default(),
             icmp: Default::default(),
@@ -364,6 +377,8 @@ impl NetNamespace {
     pub fn register_device(self: &Arc<Self>, dev: Arc<NetDevice>) {
         let idx = self.next_ifindex.fetch_add(1, Ordering::Relaxed);
         dev.set_net(self, idx);
+        // Linux inetdev_init from the NETDEV_REGISTER notifier
+        dev.in_dev().init(self);
         self.devices.push_back(dev.clone());
         // Sleeping sysfs work
         crate::net::sysfs::netdev_register_kobject(&dev);

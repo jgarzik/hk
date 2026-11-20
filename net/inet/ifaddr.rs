@@ -235,14 +235,37 @@ pub fn inet_mask_len(mask: Ipv4Addr) -> Option<u8> {
 }
 
 /// A device's IPv4 state (Linux struct in_device)
-#[derive(Default)]
 pub struct InDevice {
     /// Addresses: primaries (by scope) then secondaries (Linux
     /// ifa_list); read under RCU, changed under RTNL
     pub ifa_list: RcuList<IfaList>,
+    /// Configuration (Linux in_dev->cnf): net/ipv4/conf/<dev>
+    pub cnf: crate::net::inet::devconf::DevConf,
+    /// ARP parameters (Linux in_dev->arp_parms): net/ipv4/neigh/<dev>
+    pub arp_parms: crate::net::neigh::NeighParms,
+}
+
+impl Default for InDevice {
+    fn default() -> Self {
+        Self {
+            ifa_list: RcuList::new(),
+            cnf: crate::net::inet::devconf::DevConf::dflt(),
+            arp_parms: crate::net::neigh::NeighParms::arp_default(),
+        }
+    }
 }
 
 impl InDevice {
+    /// Registration in `net` (Linux inetdev_init): the namespace's
+    /// default configuration and ARP's default parameters
+    /// (neigh_parms_alloc), state bits included
+    pub fn init(&self, net: &crate::net::NetNamespace) {
+        self.cnf.copy_from(&net.devconf_dflt);
+        if let Some(tbl) = crate::net::arp::arp_tbl_get() {
+            self.arp_parms.copy_from(&tbl.parms);
+        }
+    }
+
     /// The addresses, while `g` is held (Linux in_dev_for_each_ifa_rcu)
     pub fn addrs<'a>(&'a self, g: &'a RcuReadGuard) -> RcuIter<'a, IfaList> {
         self.ifa_list.iter(g)

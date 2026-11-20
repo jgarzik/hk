@@ -164,6 +164,7 @@ pub static ARP_OPS: NeighOps = NeighOps {
     solicit: arp_solicit,
     output: ipv4::ip_finish_output,
     error_report: ipv4::ip_link_failure,
+    parms: |dev| &dev.in_dev().arp_parms,
 };
 
 /// The ARP table (Linux arp_tbl), made by `arp_init`
@@ -172,6 +173,12 @@ static ARP_TBL: spin::Once<NeighTable> = spin::Once::new();
 /// The ARP table (after `arp_init`)
 pub fn arp_tbl() -> &'static NeighTable {
     ARP_TBL.get().expect("arp: used before arp_init")
+}
+
+/// The ARP table, if `arp_init` ran (devices registered before it keep
+/// the compiled-in defaults, which nothing has changed yet)
+pub fn arp_tbl_get() -> Option<&'static NeighTable> {
+    ARP_TBL.get()
 }
 
 /// Make the ARP table and start its GC (Linux arp_init ->

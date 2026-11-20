@@ -7,13 +7,18 @@
 //! ipv4_net_table / netns_core_table per namespace, ipv4_table /
 //! net_core_table for init_net only); a /proc/sys/net file acts on the
 //! namespace it was looked up in (`sysctl::Entry`), whoever reads it.
+//! Per-device directories (`DevDir`: net/ipv4/conf, net/ipv4/neigh)
+//! hold one set of files (`DevCtl`) per fixed name and device.
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
+use alloc::sync::{Arc, Weak};
+
 use crate::net::NetNamespace;
+use crate::net::device::NetDevice;
 use crate::sysctl::range;
 use crate::util::error::KernelError;
 
@@ -258,23 +263,163 @@ impl NetCtl {
     }
 }
 
+/// What a per-device sysctl directory stands for (Linux the data a
+/// devinet or neigh table registered for "all", "default" or a device
+/// points at): a device by a weak reference and the name it was found
+/// under (Linux unregisters a device's tables at unregistration and
+/// re-registers them on rename)
+#[derive(Clone)]
+pub enum Sel {
+    All,
+    Default,
+    Dev { dev: Weak<NetDevice>, name: String },
+}
+
+impl Sel {
+    /// A device's directory whose device was unregistered or renamed
+    /// (Linux its header unregistering)
+    pub fn gone(&self) -> bool {
+        match self {
+            Self::All | Self::Default => false,
+            Self::Dev { dev, name } => dev
+                .upgrade()
+                .is_none_or(|d| d.is_gone() || d.name() != name),
+        }
+    }
+
+    /// In use: what a show or store acts on (ENOENT for a device gone)
+    fn grab(&self) -> Result<Target, KernelError> {
+        match self {
+            Self::All => Ok(Target::All),
+            Self::Default => Ok(Target::Default),
+            Self::Dev { dev, .. } if !self.gone() => {
+                dev.upgrade().map(Target::Dev).ok_or(KernelError::NotFound)
+            }
+            Self::Dev { .. } => Err(KernelError::NotFound),
+        }
+    }
+}
+
+/// A [`Sel`] in use
+pub enum Target {
+    All,
+    Default,
+    Dev(Arc<NetDevice>),
+}
+
+/// One file of a per-device directory (Linux an entry of
+/// devinet_sysctl or neigh_sysctl_template)
+pub struct DevCtl {
+    pub name: &'static str,
+    pub mode: u16,
+    /// Only in the "default" directory (Linux neigh's gc_interval and
+    /// gc_thresh*, cut from a device's table)
+    pub default_only: bool,
+    pub show: fn(&NetNamespace, &Target) -> Vec<i64>,
+    /// Validate and store; the namespace's other directories follow as
+    /// Linux propagates (devinet_copy_dflt_conf, neigh_copy_dflt_parms)
+    pub store: fn(&NetNamespace, &Target, &[i64]) -> Result<(), KernelError>,
+}
+
+/// A directory of per-device directories (Linux net/ipv4/conf/<name>,
+/// net/ipv4/neigh/<name>: one table registered per name)
+pub struct DevDir {
+    /// "net/ipv4/conf"
+    pub path: &'static str,
+    /// The fixed names it has in a namespace ("all", "default")
+    pub fixed: fn(&NetNamespace) -> &'static [(&'static str, bool)],
+    /// The files of each name
+    pub ctls: &'static [DevCtl],
+}
+
+/// A network sysctl file: a namespace-wide one, or one of a per-device
+/// directory with what that directory stands for
+#[derive(Clone)]
+pub enum CtlRef {
+    Net(&'static NetCtl),
+    Dev(&'static DevCtl, Sel),
+}
+
+impl CtlRef {
+    /// Its mode in `net`
+    pub fn mode_in(&self, net: &NetNamespace) -> u16 {
+        match self {
+            Self::Net(c) => c.mode_in(net),
+            Self::Dev(c, _) => c.mode,
+        }
+    }
+
+    /// A string sysctl
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Net(c) if c.text.is_some())
+    }
+
+    /// A device's file whose device was unregistered or renamed
+    pub fn gone(&self) -> bool {
+        matches!(self, Self::Dev(_, s) if s.gone())
+    }
+
+    /// In use in `net`
+    pub fn grab(&self) -> Result<CtlGrab, KernelError> {
+        Ok(match self {
+            Self::Net(c) => CtlGrab::Net(c),
+            Self::Dev(c, s) => CtlGrab::Dev(c, s.grab()?),
+        })
+    }
+}
+
+/// A [`CtlRef`] in use
+pub enum CtlGrab {
+    Net(&'static NetCtl),
+    Dev(&'static DevCtl, Target),
+}
+
+impl CtlGrab {
+    pub fn show(&self, n: &NetNamespace) -> Vec<i64> {
+        match self {
+            Self::Net(c) => (c.show)(n),
+            Self::Dev(c, t) => (c.show)(n, t),
+        }
+    }
+
+    pub fn store(&self, n: &NetNamespace, v: &[i64]) -> Result<(), KernelError> {
+        match self {
+            Self::Net(c) => (c.store)(n, v),
+            Self::Dev(c, t) => (c.store)(n, t, v),
+        }
+    }
+
+    pub fn text(&self) -> Option<&'static NetText> {
+        match self {
+            Self::Net(c) => c.text.as_ref(),
+            Self::Dev(..) => None,
+        }
+    }
+}
+
+/// The per-device directories (Linux devinet's and neigh's tables)
+pub static DEV_DIRS: &[&DevDir] = &[
+    &crate::net::inet::devconf::CONF_DIR,
+    &crate::net::neigh_sysctl::NEIGH_DIR,
+];
+
 /// `net` is the initial namespace (Linux net_eq(net, &init_net))
-fn is_init(net: &NetNamespace) -> bool {
+pub fn is_init(net: &NetNamespace) -> bool {
     let init: &NetNamespace = &crate::net::INIT_NET_NS;
     core::ptr::eq(net, init)
 }
 
 /// The sysctls registered in `net` (Linux net->sysctls: the per-net
-/// tables, and the init_net-only ones there)
-pub fn registered(net: &NetNamespace) -> impl Iterator<Item = &'static NetCtl> + use<> {
-    let init: &'static [NetCtl] = if is_init(net) { INIT_CTLS } else { &[] };
+/// tables, and the init_net-only ones there); for None every one,
+/// whichever namespaces register it (what the links of the root set's
+/// /proc/sys/net name: Linux insert_links)
+pub fn registered(net: Option<&NetNamespace>) -> impl Iterator<Item = &'static NetCtl> + use<> {
+    let init: &'static [NetCtl] = if net.is_none_or(is_init) {
+        INIT_CTLS
+    } else {
+        &[]
+    };
     CTLS.iter().chain(init)
-}
-
-/// Every network sysctl, whichever namespaces register it (what the
-/// links of the root set's /proc/sys/net name: Linux insert_links)
-pub fn all() -> impl Iterator<Item = &'static NetCtl> {
-    CTLS.iter().chain(INIT_CTLS)
 }
 
 fn get_i32(n: &NetNamespace, f: fn(&NetSysctl) -> &AtomicI32) -> Vec<i64> {
@@ -829,12 +974,16 @@ pub static CTLS: &[NetCtl] = &[
         store: |n, v| set_int(n, |s| &s.udp_wmem_min, v, 1, INT_MAX),
         text: None,
     },
+    // Linux devinet's ctl_forward_entry: "all"'s forwarding
     NetCtl {
         path: "net/ipv4/ip_forward",
-        mode: 0o444,
+        mode: 0o644,
         global: false,
-        show: |_| vec![0],
-        store: ro,
+        show: |n| {
+            let v = n.devconf_all.get(crate::net::inet::devconf::ci::FORWARDING);
+            vec![i64::from(v)]
+        },
+        store: |n, v| crate::net::inet::devconf::forward_store(n, &Target::All, v),
         text: None,
     },
     NetCtl {
