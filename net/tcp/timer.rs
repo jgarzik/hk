@@ -68,7 +68,6 @@ impl TcpCb {
     /// SRTT, rttvar4 = 4 * RTTVAR); a valid sample ends the backoff
     pub(super) fn rtt_sample(&mut self, r: u64) {
         let r = r.min(RTO_MAX);
-        self.stats.min_rtt = Some(self.stats.min_rtt.map_or(r, |m| m.min(r)));
         if self.srtt8 == 0 {
             self.srtt8 = (r * 8).max(1);
             self.rttvar4 = r * 2;

@@ -22,7 +22,9 @@
 use alloc::boxed::Box;
 
 use super::ack::DELACK_MAX;
-use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, flags};
+use super::cb::{
+    Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, flags, skb_mstamp_us,
+};
 use super::recovery::{CaState, tag, tso_segs};
 use crate::mm::page_alloc::Gfp;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
@@ -87,6 +89,7 @@ fn fragment(skb: &mut SkBuff, at: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
     n.put_slice(&skb.data()[at..])?;
     skb.trim(rest)?;
     n.set_tcp(skb.tcp());
+    n.tstamp = skb.tstamp;
     n.tcp_mut().seq = skb.tcp().seq.wrapping_add(at as u32);
     skb.tcp_mut().end_seq = n.tcp().seq;
     skb.tcp_mut().flags &= !(flags::FIN | flags::PSH);
@@ -335,7 +338,7 @@ impl TcpCb {
         }
         // Linux tcp_event_data_sent: nothing was in flight
         let tx_start = self.in_flight() == 0;
-        if !self.send_new(n, fl, now, out) {
+        if !self.send_new(n, fl, out) {
             return None;
         }
         if !in_flight && now.saturating_sub(self.lsndtime) > self.live.rto.get() {
@@ -373,7 +376,7 @@ impl TcpCb {
     /// packet more out (tcp_event_new_data_sent); a FIN in `fl` rides on
     /// them, or on an skb of its own once the data is gone (Linux
     /// tcp_send_fin). False without memory.
-    fn send_new(&mut self, n: u32, fl: u8, now: u64, out: &mut Out) -> bool {
+    fn send_new(&mut self, n: u32, fl: u8, out: &mut Out) -> bool {
         let mut skb = match self.wq.pop_front() {
             Some(s) => s,
             None => {
@@ -404,12 +407,11 @@ impl TcpCb {
         t.sacked = 0;
         t.pcount = 1;
         t.gso_size = 0;
-        t.sent = now;
-        self.tx_count += 1;
-        t.tx_order = self.tx_count;
         // Linux tcp_rate_skb_sent
         t.tx_delivered = self.delivered;
-        t.tx_counted = false;
+        t.tx_delivered_mstamp = self.tcp_mstamp.max(1);
+        // Linux __tcp_transmit_skb: skb_mstamp_ns
+        skb.tstamp = self.tcp_clock_cache as i64;
         self.packets_out += 1;
         self.rtx
             .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
@@ -565,13 +567,7 @@ impl TcpCb {
     /// skb beyond a shrunk window waits unless it heads the queue,
     /// longer ones are cut, shorter ones merged with the next). Returns
     /// the seq it went out at, None if nothing did
-    pub(super) fn retransmit_raw(
-        &mut self,
-        seq: u32,
-        segs: u32,
-        now: u64,
-        out: &mut Out,
-    ) -> Option<u32> {
+    pub(super) fn retransmit_raw(&mut self, seq: u32, segs: u32, out: &mut Out) -> Option<u32> {
         let mut seq = seq;
         let (start, end) = self.rtx_with(seq, |s| (s.tcp().seq, s.tcp().end_seq))?;
         if before(start, self.snd_una) {
@@ -632,16 +628,13 @@ impl TcpCb {
         self.tcp_add(TCP_MIB_RETRANSSEGS, u64::from(pc));
         self.stats.total_retrans = self.stats.total_retrans.wrapping_add(pc);
         self.stats.bytes_retrans += n as u64;
-        let delivered = self.delivered;
-        self.tx_count += 1;
-        let order = self.tx_count;
+        let (delivered, stamp, ns) = (self.delivered, self.tcp_mstamp.max(1), self.tcp_clock_cache);
         self.rtx_with(seq, |s| {
             let t = s.tcp_mut();
             t.sacked |= tag::EVER_RETRANS;
-            t.sent = now;
-            t.tx_order = order;
             t.tx_delivered = delivered;
-            t.tx_counted = false;
+            t.tx_delivered_mstamp = stamp;
+            s.tstamp = ns as i64;
         });
         Some(seq)
     }
@@ -658,7 +651,7 @@ impl TcpCb {
         now: u64,
         out: &mut Out,
     ) -> Option<u32> {
-        let r = self.retransmit_raw(seq, segs, now, out);
+        let r = self.retransmit_raw(seq, segs, out);
         let mut pc = 1;
         if let Some(at) = r
             && let Some((tags, p)) = self.rtx_with(at, |s| {
@@ -674,7 +667,8 @@ impl TcpCb {
         }
         if self.rtx_stamp.is_none() {
             let at = r.unwrap_or(seq);
-            self.rtx_stamp = Some(self.rtx_with(at, |s| s.tcp().sent).unwrap_or(now));
+            let sent = self.rtx_with(at, |s| skb_mstamp_us(s) / 1000);
+            self.rtx_stamp = Some(sent.unwrap_or(now));
         }
         if self.undo_retrans < 0 {
             self.undo_retrans = 0;

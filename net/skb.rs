@@ -108,7 +108,9 @@ pub struct SkBuff {
     /// Start of the IP header of a received packet (None until marked)
     nh: Option<usize>,
     /// Arrival time, CLOCK_REALTIME ns (Linux skb->tstamp, a ktime_t;
-    /// 0: not stamped yet, the receiving socket stamps it as it queues)
+    /// 0: not stamped yet, the receiving socket stamps it as it queues);
+    /// of an skb TCP sent, when it last went out, monotonic ns (Linux
+    /// skb_mstamp_ns, the same union)
     pub tstamp: i64,
     /// The receiving socket's drop count when it was queued (Linux
     /// SOCK_SKB_CB(skb)->dropcount, for SO_RXQ_OVFL)
@@ -466,18 +468,12 @@ pub struct TcpSkbCb {
     /// one (Linux tcp_skb_pcount, tcp_gso_size)
     pub pcount: u32,
     pub gso_size: u32,
-    /// When a sent skb last went out, ms (Linux skb_mstamp_ns), and
-    /// the connection's transmission count then: its place in send
-    /// order (Linux orders by skb_mstamp_ns, in µs, and keeps
-    /// tsorted_sent_queue; hk's clock is in ms, so ties within a ms are
-    /// broken by this order)
-    pub sent: u64,
-    pub tx_order: u64,
-    /// The connection's delivered count when it went out, and whether
-    /// a SACK already counted its delivery (Linux tx.delivered,
-    /// tx.delivered_mstamp == 0)
+    /// The connection's delivered count when it went out, and a
+    /// nonzero µs stamp until a SACK counted its delivery (Linux
+    /// tx.delivered, tx.delivered_mstamp; its send time is the skb's
+    /// `tstamp`, Linux skb_mstamp_ns)
     pub tx_delivered: u32,
-    pub tx_counted: bool,
+    pub tx_delivered_mstamp: u64,
     /// The ports of a received segment (its header is pulled)
     pub sport: u16,
     pub dport: u16,

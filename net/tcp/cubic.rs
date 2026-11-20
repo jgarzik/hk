@@ -4,10 +4,10 @@
 //! Linux's integer arithmetic, unchanged, with its module parameters'
 //! defaults as constants (built in: no /sys/module parameters). Time:
 //! Linux's tcp_jiffies32 is hk's ms clock (HZ 1000, so HZ / 32 is 31 and
-//! usecs_to_jiffies rounds up to ms), tcp_mstamp (bictcp_clock_us) that
-//! clock in us. An ACK's RTT sample is whole ms in us, so HyStart's
-//! delays are ms-grained. No pacing: hystart_ack_delay is 0 and the
-//! ACK-train threshold is half the minimum delay.
+//! usecs_to_jiffies rounds up to ms); bictcp_clock_us is tcp_mstamp
+//! and the ACK's RTT the us sample of tcp_clean_rtx_queue, as Linux. No
+//! pacing: hystart_ack_delay is 0 and the ACK-train threshold is half
+//! the minimum delay.
 
 use super::cb::{TcpCb, before};
 use super::cong::{AckSample, CaEvent, CongOps, reno_undo_cwnd};
@@ -550,7 +550,7 @@ mod tests {
         tp.cong.ca.cubic.end_seq = tp.snd_max;
         // Samples 10 ms apart in time (no ACK train), 20 ms RTT
         for i in 0..9 {
-            tp.clock = 100 + 10 * i;
+            tp.tick(100 + 10 * i);
             sample(&mut tp, 20_000);
         }
         assert!(!tp.cong.ca.cubic.found);
@@ -559,7 +559,7 @@ mod tests {
         tp.snd_max = tp.snd_max.wrapping_add(64_000);
         tp.snd_una = tp.cong.ca.cubic.end_seq.wrapping_add(1000);
         for i in 0..9 {
-            tp.clock = 300 + 10 * i;
+            tp.tick(300 + 10 * i);
             sample(&mut tp, 25_000);
         }
         assert!(tp.cong.ca.cubic.found);
@@ -572,13 +572,13 @@ mod tests {
         let mut tp = cb();
         tp.cong.set_cwnd(32);
         tp.snd_max = tp.snd_max.wrapping_add(64_000);
-        tp.clock = 1000;
+        tp.tick(1000);
         tp.cong.ca.cubic.end_seq = tp.snd_max;
         tp.cong.ca.cubic.round_start = tp.mstamp_us();
         tp.cong.ca.cubic.last_ack = tp.mstamp_us();
         // ACKs 1 ms apart for 6 ms of a 10 ms RTT: past half of it
         for i in 0..=6 {
-            tp.clock = 1000 + i;
+            tp.tick(1000 + i);
             sample(&mut tp, 10_000);
         }
         assert!(tp.cong.ca.cubic.found);
@@ -589,7 +589,7 @@ mod tests {
     fn hystart_waits_for_low_window() {
         let mut tp = cb();
         for i in 0..20 {
-            tp.clock = 1000 + i;
+            tp.tick(1000 + i);
             sample(&mut tp, 10_000);
         }
         assert!(!tp.cong.ca.cubic.found);
@@ -601,7 +601,7 @@ mod tests {
         tp.cong.set_ssthresh(10);
         tp.packets_out = 10;
         tp.cwnd_validate(true);
-        tp.clock = 5000;
+        tp.tick(5000);
         // First epoch: cnt 20, so 20 ACKed packets add one
         for _ in 0..19 {
             Cubic.cong_avoid(&mut tp, 0, 1);

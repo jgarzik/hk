@@ -372,9 +372,9 @@ impl TcpCb {
         self.clock as u32
     }
 
-    /// Linux tcp_mstamp in us: the ms clock in us
+    /// Linux tcp_mstamp as bictcp_clock_us reads it (u32 us)
     pub(super) fn mstamp_us(&self) -> u32 {
-        self.clock.wrapping_mul(1000) as u32
+        self.tcp_mstamp as u32
     }
 
     /// Linux tcp_assign_congestion_control / the algorithm switch of

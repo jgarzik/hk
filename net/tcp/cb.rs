@@ -42,6 +42,24 @@ use crate::net::skb::{NUM_SACKS, Sacks, SkBuff, SkbHead, SkbTree};
 use crate::sync::{SoleCell, Word};
 use crate::util::error::KernelError;
 
+/// Linux tcp_clock_ns: the monotonic clock (host tests: the caller's
+/// virtual ms clock, a us later at each entry within one ms, as a real
+/// clock moves on; `last` is the previous reading)
+#[cfg(not(test))]
+fn clock_ns(_now: u64, _last: u64) -> u64 {
+    crate::time::monotonic_ns()
+}
+
+#[cfg(test)]
+fn clock_ns(now: u64, last: u64) -> u64 {
+    now.saturating_mul(1_000_000).max(last + 1000)
+}
+
+/// Linux tcp_skb_timestamp_us: when a sent skb last went out, us
+pub(super) fn skb_mstamp_us(skb: &SkBuff) -> u64 {
+    skb.tstamp as u64 / 1000
+}
+
 /// TCP header flags
 pub mod flags {
     pub const FIN: u8 = 0x01;
@@ -774,6 +792,11 @@ pub struct TcpCb {
     pub(super) ts_stamp: u64,
     /// Latest clock value seen (ms; stamps segments built without `now`)
     pub(super) clock: u64,
+    /// The monotonic clock when last read, ns, and in us (Linux
+    /// tcp_clock_cache, tcp_mstamp: refreshed at every entry, `tick`):
+    /// send times and RTTs of loss detection and congestion control
+    pub(super) tcp_clock_cache: u64,
+    pub(super) tcp_mstamp: u64,
 
     // --- segment sizes (the send MSS is `live.mss`) ------------------------
     pub(super) peer_mss: u32,
@@ -851,8 +874,6 @@ pub struct TcpCb {
     /// (tlp_retrans)
     pub(super) tlp_high_seq: Option<u32>,
     pub(super) tlp_retrans: bool,
-    /// Data transmissions so far: the send order of each (`tx_order`)
-    pub(super) tx_count: u64,
     /// Duplicates the peer D-SACKed (Linux dsack_dups)
     pub(super) dsack_dups: u32,
     /// The last ACK's SACK blocks, sorted, at the end (Linux
@@ -905,7 +926,7 @@ pub struct Stats {
     pub bytes_retrans: u64,
     pub last_data_recv: u64,
     pub rto_count: u32,
-    /// Smallest RTT sample (ms)
+    /// Smallest RTT sample, us (Linux tcp_min_rtt)
     pub min_rtt: Option<u64>,
 }
 
@@ -955,6 +976,8 @@ impl TcpCb {
             ts_recent: Default::default(),
             ts_stamp: Default::default(),
             clock: Default::default(),
+            tcp_clock_cache: 0,
+            tcp_mstamp: 0,
             peer_mss: MSS_DEFAULT,
             path_mss: 65495,
             adv_mss: MSS_DEFAULT,
@@ -991,7 +1014,6 @@ impl TcpCb {
             rack: Rack::default(),
             tlp_high_seq: None,
             tlp_retrans: false,
-            tx_count: 0,
             dsack_dups: 0,
             recv_sack_cache: [(0, 0); NUM_SACKS],
             is_sack_reneg: false,
@@ -1012,6 +1034,12 @@ impl TcpCb {
     /// Advance the clock (every entry point with a time calls this)
     pub(super) fn tick(&mut self, now: u64) {
         self.clock = self.clock.max(now);
+        // Linux tcp_mstamp_refresh
+        let ns = clock_ns(now, self.tcp_clock_cache);
+        if ns > self.tcp_clock_cache {
+            self.tcp_clock_cache = ns;
+            self.tcp_mstamp = ns / 1000;
+        }
     }
 
     /// Our current TSval

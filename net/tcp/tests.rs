@@ -1664,7 +1664,8 @@ fn timestamps_echo_and_rtt() {
     assert_eq!(ack.ts.unwrap().1, v, "ACK echoes the data's TSval");
     // SRTT 0 from the handshake, then a 100 ms sample: 100 / 8
     assert_eq!(p.a.rtt().0, 12);
-    assert_eq!(p.a.stats.min_rtt, Some(0));
+    // The handshake's 0 us counts as one jiffy (us)
+    assert_eq!(p.a.stats.min_rtt, Some(1000));
     // A retransmission is timed too (Karn would skip it)
     p.filter = drop_all;
     p.send_a(b"lost");
@@ -2785,7 +2786,7 @@ fn rack_reordering_timer_marks_loss() {
     use crate::net::mib::*;
     let (mut p, m) = sack_pair(1000);
     // A 100 ms path: reordering window min_rtt/4 = 25 ms
-    p.a.stats.min_rtt = Some(100);
+    p.a.stats.min_rtt = Some(100_000);
     p.a.srtt8 = 800;
     p.now = 1000;
     p.a.cong.set_cwnd(20);

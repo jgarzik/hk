@@ -21,7 +21,7 @@
 //! where Linux moves pages), and each skb is tagged
 //! (tcp_sacktag_one), feeding RACK, reordering detection and undo.
 
-use super::cb::{DSACK_SEEN, TcpCb, after, before, flags};
+use super::cb::{DSACK_SEEN, TcpCb, after, before, flags, skb_mstamp_us};
 use super::output::{SACK_BASE, SACK_PERBLOCK};
 use super::recovery::{CaState, flag, seglen, tag};
 use crate::net::mib::*;
@@ -227,7 +227,7 @@ impl TcpCb {
 /// rate sample's prior_delivered from tcp_rate_skb_delivered)
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct SackState {
-    /// Send times of the earliest and latest never retransmitted
+    /// Send times (us) of the earliest and latest never retransmitted
     /// segment newly SACKed
     pub first_sackt: Option<u64>,
     pub last_sackt: Option<u64>,
@@ -240,11 +240,15 @@ pub(super) struct SackState {
     pub pkts_acked: u32,
     pub flag: u32,
     /// Delivered count when the most recently sent s/acked skb went out,
-    /// that skb's send time and end (Linux rs->prior_delivered,
-    /// prior_mstamp, last_end_seq)
+    /// that skb's send time (us) and end (Linux rs->prior_delivered,
+    /// tp->first_tx_mstamp, rs->last_end_seq)
     pub prior_delivered: Option<u32>,
-    prior_mstamp: u64,
+    first_tx_mstamp: u64,
     last_end_seq: u32,
+    /// RTTs of this ACK, us, -1 if none (Linux tcp_clean_rtx_queue's
+    /// seq_rtt_us, sack_rtt_us, ca_rtt_us)
+    pub seq_rtt_us: i64,
+    pub ca_rtt_us: i64,
 }
 
 /// What tcp_shift_skb_data did
@@ -257,9 +261,8 @@ enum Shift {
     Moved(u32),
 }
 
-/// Linux tcp_skb_sent_after: sent at `t1` (ending at `seq1`) after `t2`
-/// (`seq2`), the end deciding a tie; hk compares send order
-/// (`TcpSkbCb::tx_order`), Linux µs send times
+/// Linux tcp_skb_sent_after: sent at `t1` (us, ending at `seq1`) after
+/// `t2` (`seq2`), the end deciding a tie
 pub(super) fn sent_after(t1: u64, t2: u64, seq1: u32, seq2: u32) -> bool {
     t1 > t2 || (t1 == t2 && after(seq1, seq2))
 }
@@ -423,9 +426,8 @@ impl TcpCb {
         end: u32,
         dup_sack: bool,
         pcount: u32,
-        sent: (u64, u64),
+        xmit: u64,
     ) -> u8 {
-        let xmit = sent.0;
         // A D-SACK of a retransmission
         if dup_sack && sacked & tag::RETRANS != 0 {
             if let Some(um) = self.undo_marker
@@ -443,7 +445,7 @@ impl TcpCb {
             return sacked;
         }
         if sacked & tag::SACKED_ACKED == 0 {
-            self.rack_advance(sacked, end, sent);
+            self.rack_advance(sacked, end, xmit);
             if sacked & tag::SACKED_RETRANS != 0 {
                 // Not lost: the retransmission is still believed in flight
                 if sacked & tag::LOST != 0 {
@@ -486,21 +488,22 @@ impl TcpCb {
     /// Linux tcp_rate_skb_delivered (its prior_delivered part): the skb
     /// at `seq` was s/acked; a SACKed one counts once
     pub(super) fn rate_skb_delivered(&mut self, st: &mut SackState, seq: u32) {
-        let Some(t) = self.rtx_with(seq, |s| s.tcp()) else {
+        let Some((t, tx)) = self.rtx_with(seq, |s| (s.tcp(), skb_mstamp_us(s))) else {
             return;
         };
-        if t.tx_counted {
+        if t.tx_delivered_mstamp == 0 {
             return;
         }
         if st.prior_delivered.is_none()
-            || sent_after(t.tx_order, st.prior_mstamp, t.end_seq, st.last_end_seq)
+            || sent_after(tx, st.first_tx_mstamp, t.end_seq, st.last_end_seq)
         {
             st.prior_delivered = Some(t.tx_delivered);
-            st.prior_mstamp = t.tx_order;
+            st.first_tx_mstamp = tx;
             st.last_end_seq = t.end_seq;
         }
+        // A SACKed skb's delivery is counted once
         if t.sacked & tag::SACKED_ACKED != 0 {
-            self.rtx_with(seq, |s| s.tcp_mut().tx_counted = true);
+            self.rtx_with(seq, |s| s.tcp_mut().tx_delivered_mstamp = 0);
         }
     }
 
@@ -527,7 +530,7 @@ impl TcpCb {
         }
         // Linux tcp_shifted_skb: tag the range first (seq advancing
         // moves tcp_highest_sack_seq along when skb is highest_sack)
-        let t = self.rtx_with(skb, |s| s.tcp())?;
+        let (t, tx) = self.rtx_with(skb, |s| (s.tcp(), skb_mstamp_us(s)))?;
         self.sacktag_one(
             st,
             t.sacked,
@@ -535,7 +538,7 @@ impl TcpCb {
             t.seq.wrapping_add(len),
             dup_sack,
             pcount,
-            (t.sent, t.tx_order),
+            tx,
         );
         self.rate_skb_delivered(st, skb);
         let mut c = self.rtx.cursor_floor_mut(|s| !after(s.tcp().seq, skb));
@@ -729,18 +732,10 @@ impl TcpCb {
                 break;
             }
             if in_sack > 0 {
-                let Some(t) = self.rtx_with(cur, |s| s.tcp()) else {
+                let Some((t, tx)) = self.rtx_with(cur, |s| (s.tcp(), skb_mstamp_us(s))) else {
                     break;
                 };
-                let sacked = self.sacktag_one(
-                    st,
-                    t.sacked,
-                    t.seq,
-                    t.end_seq,
-                    dup,
-                    t.pcount,
-                    (t.sent, t.tx_order),
-                );
+                let sacked = self.sacktag_one(st, t.sacked, t.seq, t.end_seq, dup, t.pcount, tx);
                 self.rtx_with(cur, |s| s.tcp_mut().sacked = sacked);
                 self.rate_skb_delivered(st, cur);
                 if !before(t.seq, self.highest_sack_seq()) {

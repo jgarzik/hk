@@ -136,7 +136,10 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32(st.segs_out);
     b.u32(st.segs_in);
     b.u32(cb.unsent() as u32);
-    b.u32(st.min_rtt.map_or(u32::MAX, |r| (r * 1000) as u32));
+    b.u32(
+        st.min_rtt
+            .map_or(u32::MAX, |r| r.min(u64::from(u32::MAX)) as u32),
+    );
     b.u32(st.data_segs_in);
     b.u32(st.data_segs_out);
     b.u64(0); // delivery_rate

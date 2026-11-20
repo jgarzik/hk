@@ -17,7 +17,7 @@
 
 use super::cb::{
     Ins, MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb,
-    TcpState, Tmr, after, before, between, flags, wake,
+    TcpState, Tmr, after, before, between, flags, skb_mstamp_us, wake,
 };
 use super::cong::AckSample;
 use super::recovery::{Rexmit, flag, tag};
@@ -116,12 +116,12 @@ impl TcpCb {
         self.max_wnd = self.max_wnd.max(self.snd_wnd);
         self.snd_wl1 = s.seq;
         self.snd_wl2 = s.ack;
-        if let Some(r) = self.ts_rtt(s) {
+        let timed = self.rtt_seq.filter(|&(seq, _)| !before(s.ack, seq));
+        if let Some(r) = self.ts_rtt(s).or(timed.map(|(_, t)| now.saturating_sub(t))) {
             self.rtt_sample(r);
-        } else if let Some((seq, t)) = self.rtt_seq
-            && !before(s.ack, seq)
-        {
-            self.rtt_sample(now.saturating_sub(t));
+            // Linux tcp_synack_rtt_meas -> tcp_ack_update_rtt: the
+            // handshake's RTT is the first minimum
+            self.update_rtt_min(r * 1000);
         } else if self.syn_rtx {
             self.set_rto_fallback();
         }
@@ -508,7 +508,6 @@ impl TcpCb {
         self.live.probes.set(0);
         self.rcv_tstamp = now;
         let acked = ack.wrapping_sub(prior_snd_una);
-        let mut rtt = None;
         if acked != 0 {
             self.stats.bytes_acked += u64::from(acked);
             self.snd_una = ack;
@@ -521,7 +520,7 @@ impl TcpCb {
             if before(self.snd_nxt, ack) {
                 self.snd_nxt = ack;
             }
-            rtt = self.ack_rtt(s, now);
+            self.ack_rtt(s, now);
             out.wake |= wake::SPACE;
         }
         if prior_packets == 0 {
@@ -538,7 +537,8 @@ impl TcpCb {
             return true;
         }
         flg |= self.clean_rtx_queue(prior_fack, &mut st);
-        self.ca_acked(&st, rtt);
+        self.ack_update_rtt(s, flg, &mut st);
+        self.ca_acked(&st);
         self.mem_settle();
         self.rack_update_reo_wnd(st.prior_delivered);
         self.process_tlp_ack(ack, flg);
@@ -585,9 +585,9 @@ impl TcpCb {
         }
     }
 
-    /// An RTT sample from an ACK of new data: the timestamp echo, else
-    /// the timed segment (Karn); returns it (ms)
-    fn ack_rtt(&mut self, s: &SegIn, now: u64) -> Option<u64> {
+    /// An RTT sample for the RTO from an ACK of new data: the timestamp
+    /// echo, else the timed segment (Karn)
+    fn ack_rtt(&mut self, s: &SegIn, now: u64) {
         let timed = self.rtt_seq.filter(|&(seq, _)| !before(s.ack, seq));
         let rtt = self.ts_rtt(s).or(timed.map(|(_, t)| now.saturating_sub(t)));
         if let Some(r) = rtt {
@@ -596,15 +596,31 @@ impl TcpCb {
         if timed.is_some() {
             self.rtt_seq = None;
         }
-        rtt
+    }
+
+    /// Linux tcp_ack_update_rtt's us part: the RTT of the packets acked
+    /// or SACKed, else of the timestamp echo, feeds the minimum RTT and
+    /// the congestion sample (rs->rtt_us)
+    fn ack_update_rtt(&mut self, s: &SegIn, flg: u32, st: &mut SackState) {
+        if st.seq_rtt_us < 0
+            && flg & flag::ACKED != 0
+            && let Some(r) = self.ts_rtt(s)
+        {
+            // tcp_rtt_tsopt_us: the echo's ms in us
+            st.seq_rtt_us = (r * 1000) as i64;
+            st.ca_rtt_us = st.seq_rtt_us;
+        }
+        if st.seq_rtt_us >= 0 && st.ca_rtt_us >= 0 {
+            self.update_rtt_min(st.ca_rtt_us as u64);
+        }
     }
 
     /// The algorithm's accounting of the ACK (Linux tcp_clean_rtx_queue
     /// calling icsk_ca_ops->pkts_acked): the packets it acknowledged,
     /// its RTT (us, -1 if none), the bytes delivered over that round
     /// trip
-    fn ca_acked(&mut self, st: &SackState, rtt_ms: Option<u64>) {
-        let rtt_us = rtt_ms.map_or(-1, |r| r.saturating_mul(1000).min(i32::MAX as u64) as i32);
+    fn ca_acked(&mut self, st: &SackState) {
+        let rtt_us = st.ca_rtt_us.clamp(-1, i64::from(i32::MAX)) as i32;
         let dlv = st
             .prior_delivered
             .map_or(0, |p| self.delivered.wrapping_sub(p));
@@ -624,8 +640,9 @@ impl TcpCb {
         let mut flg = 0;
         let mut reord = self.snd_max;
         let mut pkts_acked = 0;
+        let (mut first_ackt, mut last_ackt) = (None, 0);
         while let Some(f) = self.rtx.first() {
-            let t = f.tcp();
+            let (t, tx) = (f.tcp(), skb_mstamp_us(f));
             let acked_pcount;
             let mut fully = true;
             if after(t.end_seq, self.snd_una) {
@@ -646,6 +663,8 @@ impl TcpCb {
                 }
                 flg |= flag::RETRANS_DATA_ACKED;
             } else if t.sacked & tag::SACKED_ACKED == 0 {
+                last_ackt = tx;
+                first_ackt.get_or_insert(tx);
                 if before(t.seq, reord) {
                     reord = t.seq;
                 }
@@ -657,8 +676,8 @@ impl TcpCb {
                 self.sacked_out = self.sacked_out.saturating_sub(acked_pcount);
             } else if !self.is_reno() {
                 self.count_delivered(acked_pcount);
-                if !self.spurious_retrans(t.sacked, t.sent) {
-                    self.rack_advance(t.sacked, t.end_seq, (t.sent, t.tx_order));
+                if !self.spurious_retrans(t.sacked, tx) {
+                    self.rack_advance(t.sacked, t.end_seq, tx);
                 }
             }
             if t.sacked & tag::LOST != 0 {
@@ -688,6 +707,25 @@ impl TcpCb {
             flg |= flag::SACK_RENEGING;
         }
         st.pkts_acked = pkts_acked;
+        // The RTTs: of the oldest and newest never retransmitted data
+        // acked (Karn), of the newest SACKed
+        let now = self.tcp_mstamp;
+        let delta = |t: u64| now.saturating_sub(t) as i64;
+        (st.seq_rtt_us, st.ca_rtt_us) = (-1, -1);
+        if let Some(first) = first_ackt
+            && flg & flag::RETRANS_DATA_ACKED == 0
+        {
+            st.seq_rtt_us = delta(first);
+            st.ca_rtt_us = delta(last_ackt);
+        }
+        let mut sack_rtt_us = -1;
+        if let (Some(first), Some(last)) = (st.first_sackt, st.last_sackt) {
+            sack_rtt_us = delta(first);
+            st.ca_rtt_us = delta(last);
+        }
+        if st.seq_rtt_us < 0 {
+            st.seq_rtt_us = sack_rtt_us;
+        }
         if flg & flag::ACKED != 0 {
             flg |= flag::SET_XMIT_TIMER;
             if self.is_reno() {
@@ -701,7 +739,7 @@ impl TcpCb {
                 self.check_sack_reordering(reord, false);
             }
         } else if let Some(first) = st.first_sackt
-            && self.rtx.first().is_some_and(|h| first < h.tcp().sent)
+            && self.rtx.first().is_some_and(|h| first < skb_mstamp_us(h))
         {
             // The SACK round trip is from data sent before the head was
             // last (re)sent: rearm (else the RTO keeps stretching)
@@ -711,9 +749,9 @@ impl TcpCb {
     }
 
     /// Linux tcp_skb_spurious_retrans: a retransmitted skb whose echo
-    /// predates its (last) transmission
+    /// predates its (last) transmission at `sent` us
     fn spurious_retrans(&self, sacked: u8, sent: u64) -> bool {
-        let ts = (sent as u32).wrapping_add(self.ts_off);
+        let ts = ((sent / 1000) as u32).wrapping_add(self.ts_off);
         sacked & tag::RETRANS != 0 && self.rcv_tsecr.is_some_and(|e| e != 0 && before(e, ts))
     }
 
