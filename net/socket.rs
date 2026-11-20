@@ -470,9 +470,18 @@ fn bool_opt(opt: i32) -> Option<u32> {
         SO_RXQ_OVFL => sf::RXQ_OVFL,
         SO_NO_CHECK => sf::NO_CHECK,
         SO_PASSSEC => sf::PASSSEC,
-        SO_PASSPIDFD => sf::PASSPIDFD,
         _ => return None,
     })
+}
+
+/// An option only AF_UNIX takes (Linux sk_is_unix): EOPNOTSUPP on
+/// others
+fn unix_only(family: u16) -> Result<(), KernelError> {
+    if family == AF_UNIX {
+        Ok(())
+    } else {
+        Err(KernelError::OperationNotSupported)
+    }
 }
 
 fn cap(c: u32) -> bool {
@@ -542,6 +551,10 @@ pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), Kerne
             sk.mark.store(val as u32, Ordering::Release);
         }
         SO_BINDTOIFINDEX => bind_ifindex(sk, val)?,
+        SO_PASSPIDFD => {
+            unix_only(sk.family)?;
+            sk.set_flag(sf::PASSPIDFD, val != 0);
+        }
         // Linux sock_setsockopt: the protocol's set_peek_off
         SO_PEEK_OFF => {
             return s
@@ -644,6 +657,10 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_RCVLOWAT => int(sk.rcvlowat()),
         SO_SNDLOWAT => int(1),
         SO_BINDTOIFINDEX => int(sk.bound_dev_if() as i32),
+        SO_PASSPIDFD => {
+            unix_only(sk.family)?;
+            int(i32::from(sk.flag(sf::PASSPIDFD)))
+        }
         // Linux sock_getsockopt: only with a set_peek_off
         SO_PEEK_OFF if s.has_set_peek_off() => int(sk.peek_off.load(Ordering::Relaxed)),
         SO_PEEK_OFF => Err(KernelError::OperationNotSupported),
@@ -722,5 +739,21 @@ pub fn shut_bits(how: i32) -> Result<u8, KernelError> {
         SHUT_WR => Ok(SEND_SHUTDOWN),
         SHUT_RDWR => Ok(RCV_SHUTDOWN | SEND_SHUTDOWN),
         _ => Err(KernelError::InvalidArgument),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Linux sk_setsockopt / sk_getsockopt SO_PASSPIDFD: AF_UNIX only
+    #[test]
+    fn passpidfd_unix_only() {
+        assert_eq!(unix_only(AF_UNIX), Ok(()));
+        assert_eq!(unix_only(AF_INET), Err(KernelError::OperationNotSupported));
+        assert_eq!(
+            unix_only(AF_NETLINK),
+            Err(KernelError::OperationNotSupported)
+        );
     }
 }
