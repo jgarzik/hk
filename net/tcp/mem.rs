@@ -64,6 +64,16 @@ crate::percpu! {
     /// tcp_orphan_count): a part may go negative, the sum does not
     static ORPHANS: AtomicIsize = AtomicIsize::new(0);
 }
+/// net.ipv4.tcp_max_orphans (Linux sysctl_tcp_max_orphans: half the
+/// ehash entries, set with the tables, `set_max_orphans`)
+static MAX_ORPHANS: AtomicI32 = AtomicI32::new(512);
+/// Linux tcp_orphan_cache: the orphan sum as last taken, and when
+/// (ms); refreshed at most every TCP_ORPHAN_TIMER_PERIOD when read
+/// (Linux refreshes it from a timer at that period)
+static ORPHAN_CACHE: AtomicUsize = AtomicUsize::new(0);
+static ORPHAN_STAMP: AtomicU64 = AtomicU64::new(0);
+/// Linux TCP_ORPHAN_TIMER_PERIOD (ms)
+const ORPHAN_PERIOD: u64 = 100;
 
 /// Quanta covering `bytes` (Linux sk_mem_pages)
 pub fn quanta(bytes: usize) -> usize {
@@ -162,6 +172,47 @@ pub fn orphans() -> usize {
         .map(|(_, c)| c.load(Ordering::Relaxed))
         .sum();
     n.max(0) as usize
+}
+
+/// Linux tcp_too_many_orphans: the (cached) orphan count, doubled
+/// `shift` times for a connection that looks dead, past
+/// tcp_max_orphans
+pub fn too_many_orphans(shift: u32, now: u64) -> bool {
+    let at = ORPHAN_STAMP.load(Ordering::Relaxed);
+    if now.wrapping_sub(at) >= ORPHAN_PERIOD
+        && ORPHAN_STAMP
+            .compare_exchange(at, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        ORPHAN_CACHE.store(orphans(), Ordering::Relaxed);
+    }
+    let n = ORPHAN_CACHE.load(Ordering::Relaxed) as i64;
+    (n << shift) > i64::from(MAX_ORPHANS.load(Ordering::Relaxed))
+}
+
+/// Linux tcp_check_oom: too many orphans, or a connection with
+/// `wmem` bytes queued past the hard memory limit
+pub fn check_oom(shift: u32, wmem: usize, now: u64) -> bool {
+    too_many_orphans(shift, now) || out_of_memory(wmem)
+}
+
+/// Linux tcp_init: tcp_max_orphans is half the ehash entries
+pub fn set_max_orphans(ehash: usize) {
+    let v = (ehash / 2).min(i32::MAX as usize) as i32;
+    MAX_ORPHANS.store(v, Ordering::Relaxed);
+}
+
+/// /proc/sys/net/ipv4/tcp_max_orphans (machine-wide: in the initial
+/// network namespace's tree only, Linux ipv4_table)
+pub fn max_orphans_show() -> Vec<i64> {
+    alloc::vec![i64::from(MAX_ORPHANS.load(Ordering::Relaxed))]
+}
+
+/// tcp_max_orphans write (Linux proc_dointvec: any int)
+pub fn max_orphans_store(v: &[i64]) -> Result<(), KernelError> {
+    crate::sysctl::range(v[0], i64::from(i32::MIN), i64::from(i32::MAX))?;
+    MAX_ORPHANS.store(v[0] as i32, Ordering::Relaxed);
+    Ok(())
 }
 
 /// A connection counted as an orphan (closed by its owner, or a child

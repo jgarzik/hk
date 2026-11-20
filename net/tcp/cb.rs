@@ -1619,6 +1619,13 @@ impl TcpCb {
                 }
             }
         }
+        // Linux __tcp_close's adjudge_to_death: too many orphans or
+        // past the memory limit, it goes now
+        if self.state != TcpState::Closed && mem::check_oom(0, self.sndq_len(), now) {
+            self.send_reset(out);
+            self.set_closed(out);
+            self.net_stat(LINUX_MIB_TCPABORTONMEMORY);
+        }
     }
 
     /// Abort: RST to a synchronized peer, then CLOSED (Linux

@@ -171,6 +171,7 @@ pub fn init() {
         .clamp(1 << 10, 1 << 20);
     let mut bhash = alloc::vec::Vec::new();
     bhash.resize_with(n, || Mutex::new(ArcList::new()));
+    super::mem::set_max_orphans(n);
     HASHINFO.call_once(|| Hashinfo {
         ehash: NullsHead::table(n).expect("tcp: ehash"),
         lhash: NullsHead::table(LHASH).expect("tcp: lhash"),

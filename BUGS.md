@@ -107,8 +107,7 @@ TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
 send side counts payload bytes against half of SO_SNDBUF (Linux:
 skb truesize, sk_wmem_queued, against all of it), the receive
 window's free space does not count the socket's backlog (Linux
-tcp_space subtracts sk_backlog.len), no orphan count limit
-(tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
+tcp_space subtracts sk_backlog.len), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
 

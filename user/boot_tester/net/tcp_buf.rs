@@ -13,13 +13,18 @@
 //!   connected it is expanded for the initial window
 //!   (tcp_sndbuf_expand), within tcp_wmem[2]; one with SO_SNDBUF set
 //!   keeps it.
+//! - TCP_MAX_ORPHANS: net.ipv4.tcp_max_orphans is positive and only in
+//!   the initial namespace (ipv4_table); at 0 an orphan stuck in
+//!   FIN_WAIT_1 against a shut window is aborted at its next probe
+//!   (tcp_out_of_resources, TCPAbortOnMemory).
 
 use hk_syscall::{sys_exit, sys_fork, sys_getsockopt};
 
 use crate::harness::T;
 use crate::net::sk::*;
+use crate::net::snmp::Mib;
 use crate::net::tcp_xfer::{accept, listener, recv_pat, send_pat, set_timeo, wait_child};
-use crate::proc::sysctl::read_file;
+use crate::proc::sysctl::{read_file, write_file};
 
 const TCP_WINDOW_CLAMP: i32 = 10;
 const TCP_INFO: i32 = 11;
@@ -31,6 +36,7 @@ pub fn run_tests() {
     test_rcv_ssthresh();
     test_autotune();
     test_sndbuf();
+    test_max_orphans();
 }
 
 /// A connected pair over lo: (client, server, listener)
@@ -187,6 +193,67 @@ fn test_sndbuf() {
     let s = accept(l);
     t.eq(b"fixed", getint(c, SOL_SOCKET, SO_SNDBUF).1 as i64, 40000);
     close(c);
+    close(s);
+    close(l);
+    t.done();
+}
+
+const MAX_ORPHANS: &[u8] = b"/proc/sys/net/ipv4/tcp_max_orphans\0";
+
+/// TcpExt TCPAbortOnMemory
+fn abort_on_memory() -> i64 {
+    Mib::read(b"/proc/net/netstat\0").map_or(-1, |m| m.val(b"TcpExt", b"TCPAbortOnMemory"))
+}
+
+fn test_max_orphans() {
+    let mut t = T::new(b"TCP_MAX_ORPHANS");
+    let mut old = [0u8; 32];
+    let n = read_file(MAX_ORPHANS, &mut old);
+    let max = sysctl_ints(MAX_ORPHANS)[0];
+    t.ok(b"default", n > 0 && max > 0, max);
+    let child = sys_fork();
+    if child == 0 {
+        if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+            sys_exit(1);
+        }
+        let mut b = [0u8; 32];
+        sys_exit(if read_file(MAX_ORPHANS, &mut b) < 0 {
+            0
+        } else {
+            2
+        });
+    }
+    t.eq(b"netns", wait_child(child) as i64, 0);
+    if n <= 0 {
+        t.done();
+        return;
+    }
+    // A receiver that never reads, behind a small buffer
+    let (l, p) = listener(4);
+    setint(l, SOL_SOCKET, SO_RCVBUF, 4096);
+    let c = tcp();
+    connect(c, LO, p);
+    let s = accept(l);
+    let buf = [7u8; 4096];
+    for _ in 0..1000 {
+        if send(c, &buf, MSG_DONTWAIT | MSG_NOSIGNAL) <= 0 {
+            break;
+        }
+    }
+    let before = abort_on_memory();
+    // An orphan holding data, probing the shut window
+    close(c);
+    write_file(MAX_ORPHANS, b"0\n");
+    let mut aborted = false;
+    for _ in 0..300 {
+        if abort_on_memory() > before {
+            aborted = true;
+            break;
+        }
+        crate::helpers::msleep(50);
+    }
+    write_file(MAX_ORPHANS, &old[..n as usize]);
+    t.ok(b"aborted", aborted, abort_on_memory() - before);
     close(s);
     close(l);
     t.done();

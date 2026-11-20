@@ -804,6 +804,14 @@ pub static INIT_CTLS: &[NetCtl] = &[
         text: None,
     },
     NetCtl {
+        path: "net/ipv4/tcp_max_orphans",
+        mode: 0o644,
+        global: false,
+        show: |_| crate::net::tcp::mem::max_orphans_show(),
+        store: |_, v| crate::net::tcp::mem::max_orphans_store(v),
+        text: None,
+    },
+    NetCtl {
         path: "net/ipv4/udp_mem",
         mode: 0o644,
         global: false,

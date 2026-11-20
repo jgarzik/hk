@@ -384,12 +384,25 @@ impl TcpCb {
         self.arm_rtx(now);
     }
 
-    /// An orphan holding send data while TCP memory is past its hard
-    /// limit is dropped (Linux tcp_out_of_resources, its memory half):
-    /// with a reset when `reset`, when it sent within TIME_WAIT's length,
-    /// or when the peer's window is shut with nothing in flight
+    /// An orphan is dropped when there are too many orphans (counted
+    /// double for one idle past twice RTO_MAX or not to be reset, again
+    /// for one with an ICMP error) or it holds send data while TCP
+    /// memory is past its hard limit (Linux tcp_out_of_resources,
+    /// tcp_check_oom): with a reset when `reset`, when it sent within
+    /// TIME_WAIT's length, or when the peer's window is shut with
+    /// nothing in flight
     fn out_of_resources(&mut self, now: u64, reset: bool, out: &mut Out) -> bool {
-        if !self.orphan || !super::mem::out_of_memory(self.sndq_len()) {
+        if !self.orphan {
+            return false;
+        }
+        let mut shift = 0;
+        if now.saturating_sub(self.lsndtime) > 2 * RTO_MAX || !reset {
+            shift += 1;
+        }
+        if self.soft_err.is_some() {
+            shift += 1;
+        }
+        if !super::mem::check_oom(shift, self.sndq_len(), now) {
             return false;
         }
         let reset = reset
