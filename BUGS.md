@@ -113,7 +113,14 @@ SACK compression
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
 (/sys/module/tcp_cubic/parameters: Linux's defaults are constants), and
-TCP_FASTOPEN is stored only. A request's SYN-ACK retries
+Fast Open is server-side only: no client (MSG_FASTOPEN,
+TCP_FASTOPEN_CONNECT, the per-destination cookie cache Linux keeps in
+tcp_metrics, TCPFastOpenActive*, blackhole detection), no
+TCP_FASTOPEN_KEY / TCP_FASTOPEN_NO_COOKIE / net.ipv4.tcp_fastopen_key
+(one random key per namespace, no backup key: TCPFastOpenPassiveAltKey
+stays 0), and a reset Fast Open child frees its queue slot at once
+(Linux keeps it on fastopenq.rskq_rst_head for a timeout against RST
+floods). A request's SYN-ACK retries
 are not cut while old requests clog the SYN queue (reqsk_timer_handler
 lowers max_syn_ack_retries when qlen * 2 exceeds max(8, backlog) and
 young requests are few: hk keeps no young count), and a connecting
@@ -168,8 +175,8 @@ IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
 and a reader_queue spliced from it.
-MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: Fast Open,
-MD5/AO, forwarding and
+MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: Fast Open's
+client side, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP sends are not charged to SO_SNDBUF (Linux sk_wmem_alloc through
 sock_alloc_send_skb, which blocks or fails a send past it; corked

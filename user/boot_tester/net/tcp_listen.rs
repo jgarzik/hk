@@ -21,6 +21,13 @@
 //!   (TCPDeferAcceptDrop) and is accepted once data comes (Linux
 //!   tcp_check_req); a connecting socket with it saves the handshake's
 //!   last ACK for the delayed ACK timer (tcp_rcv_synsent_state_process)
+//! - TCP_FASTOPEN_SERVER: with tcp_fastopen 3 and TCP_FASTOPEN on the
+//!   listener a cookie request gets a cookie; a SYN with that cookie and
+//!   data is accepted at once, its data readable and acknowledged by the
+//!   SYN-ACK, the child sending before the handshake completes; a wrong
+//!   cookie gets the SYN only acknowledged and the right cookie
+//!   (TCPFastOpenCookieReqd, TCPFastOpenPassive, TCPFastOpenPassiveFail;
+//!   Linux tcp_try_fastopen)
 
 use hk_syscall::{
     AF_INET, SOCK_NONBLOCK, SOCK_STREAM, sys_accept, sys_listen, sys_setsockopt, sys_socket,
@@ -36,6 +43,7 @@ use crate::proc::sysctl::{read_file, reads, write_file};
 const NETSTAT: &[u8] = b"/proc/net/netstat\0";
 const TCP_MAXSEG: i32 = 2;
 const TCP_DEFER_ACCEPT: i32 = 9;
+const TCP_FASTOPEN: i32 = 23;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== TCP Listener Tests ===");
@@ -43,6 +51,7 @@ pub fn run_tests() {
     test_syncookie();
     test_max_syn_backlog();
     test_defer_accept();
+    test_fastopen_server();
 }
 
 /// SYN options: MSS 1460, SACK permitted, timestamps (`tsval`, 0),
@@ -302,5 +311,94 @@ fn test_defer_accept() {
     t.ok(b"ack", f == i64::from(ACK) && ack == S + 1, f);
     t.ok(b"delayed", (150..1000).contains(&waited), waited as i64);
     abort(c);
+    t.done();
+}
+
+fn test_fastopen_server() {
+    const Y: u32 = 0x7a00_0000;
+    const P1: u16 = 7821;
+    const P2: u16 = 7822;
+    const P3: u16 = 7823;
+    const TFO: &[u8] = b"/proc/sys/net/ipv4/tcp_fastopen\0";
+    let mut t = T::new(b"TCP_FASTOPEN_SERVER");
+    let Some(peer) = Peer::new(&mut t) else {
+        return t.done();
+    };
+    let mut old = [0u8; 16];
+    let n = read_file(TFO, &mut old);
+    if !t.ok(b"read", n > 0, n) {
+        return t.done();
+    }
+    t.eq(b"enable", write_file(TFO, b"3"), 1);
+    let names: [&[u8]; 3] = [
+        b"TCPFastOpenCookieReqd",
+        b"TCPFastOpenPassive",
+        b"TCPFastOpenPassiveFail",
+    ];
+    let before = names.map(tcpext);
+    let l = tcp();
+    bind(l, LO, 0);
+    let pl = port(l);
+    t.eq(b"TCP_FASTOPEN", setint(l, IPPROTO_TCP, TCP_FASTOPEN, 5), 0);
+    sys_listen(l, 8);
+    // A cookie request
+    peer.send_full(P1, pl, Y, 0, SYN, &[34, 2, 1, 1], &[]);
+    let sa = peer.from_to(pl, P1, 1000).unwrap_or_default();
+    t.ok(
+        b"syn-ack",
+        sa.flags == SYN | ACK && sa.ack == Y + 1,
+        i64::from(sa.flags),
+    );
+    let (clen, cookie) = sa.foc.unwrap_or_default();
+    t.eq(b"cookie", clen as i64, 8);
+    peer.send_full(P1, pl, Y + 1, 0, RST, &[], &[]);
+    // The cookie with data: accepted at once
+    let mut opt = [0u8; 12];
+    opt[..2].copy_from_slice(&[34, 10]);
+    opt[2..10].copy_from_slice(&cookie[..8]);
+    opt[10..].copy_from_slice(&[1, 1]);
+    peer.send_full(P2, pl, Y, 0, SYN, &opt, b"hello");
+    let sa = peer.from_to(pl, P2, 1000).unwrap_or_default();
+    t.ok(
+        b"data acked",
+        sa.flags == SYN | ACK && sa.ack == Y + 6,
+        i64::from(sa.ack.wrapping_sub(Y)),
+    );
+    let a = accept_in(l, 1000);
+    t.ok(b"accept", a >= 0, i64::from(a));
+    let mut b = [0u8; 8];
+    t.eq(b"recv", recv(a, &mut b, MSG_DONTWAIT), 5);
+    t.ok(b"bytes", &b[..5] == b"hello", 0);
+    t.eq(b"send", send(a, b"ok", MSG_DONTWAIT), 2);
+    let d = peer.from_to(pl, P2, 1000).unwrap_or_default();
+    t.ok(
+        b"sent early",
+        d.len == 2 && d.seq == sa.seq + 1,
+        d.len as i64,
+    );
+    peer.send_full(P2, pl, Y + 6, sa.seq + 3, ACK, &[], &[]);
+    // A wrong cookie: the SYN alone is acknowledged, with the cookie
+    let mut bad = opt;
+    bad[2..10].fill(0);
+    peer.send_full(P3, pl, Y, 0, SYN, &bad, b"hello");
+    let sa = peer.from_to(pl, P3, 1000).unwrap_or_default();
+    t.ok(
+        b"syn only",
+        sa.flags == SYN | ACK && sa.ack == Y + 1,
+        i64::from(sa.ack.wrapping_sub(Y)),
+    );
+    t.ok(
+        b"right cookie",
+        sa.foc.is_some_and(|(n, c)| n == 8 && c == cookie),
+        0,
+    );
+    peer.send_full(P3, pl, Y + 1, 0, RST, &[], &[]);
+    let after = names.map(tcpext);
+    for (i, n) in names.iter().enumerate() {
+        t.ok(n, after[i] == before[i] + 1, after[i] - before[i]);
+    }
+    abort(a);
+    close(l);
+    write_file(TFO, &old[..n as usize - 1]);
     t.done();
 }

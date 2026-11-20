@@ -23,7 +23,7 @@ use alloc::boxed::Box;
 
 use super::ack::DELACK_MAX;
 use super::cb::{
-    Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, flags, skb_mstamp_us,
+    Foc, Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, flags, skb_mstamp_us,
 };
 use super::recovery::{CaState, tag, tso_segs};
 use crate::mm::page_alloc::Gfp;
@@ -43,6 +43,11 @@ const OPT_WS: u8 = 3;
 const OPT_SACK_PERM: u8 = 4;
 const OPT_SACK: u8 = 5;
 const OPT_TS: u8 = 8;
+/// Fast Open (RFC 7413) and the experimental option with its magic
+/// (Linux TCPOPT_FASTOPEN, TCPOPT_EXP, TCPOPT_FASTOPEN_MAGIC)
+const OPT_FASTOPEN: u8 = 34;
+const OPT_EXP: u8 = 254;
+const FASTOPEN_MAGIC: u16 = 0xF989;
 /// SACK option bytes: the kind and length (with two NOPs before them,
 /// Linux TCPOLEN_SACK_BASE_ALIGNED), then 8 per block
 pub(super) const SACK_BASE: u32 = 4;
@@ -146,6 +151,7 @@ impl TcpCb {
             ws: self.wscale_ok.then_some(self.rcv_wscale),
             ts,
             sack_perm: self.sack_ok != 0,
+            foc: if synack { self.synack_foc.take() } else { None },
             ..Default::default()
         };
         out.ctl(h)
@@ -260,7 +266,7 @@ impl TcpCb {
                 | TcpState::FinWait1
                 | TcpState::Closing
                 | TcpState::LastAck
-        )
+        ) || (self.state == TcpState::SynReceived && self.tfo)
     }
 
     /// Send the new data the peer's window and the congestion window
@@ -945,8 +951,47 @@ fn put_hdr(h: &Seg, b: &mut [u8; HLEN_MAX]) -> usize {
             n += 8;
         }
     }
+    if let Some(f) = h.foc {
+        n += put_foc(&f, &mut b[n..]);
+    }
     b[12] = ((n / 4) as u8) << 4;
     n
+}
+
+/// A Fast Open option into `b`, NOP-padded to a word (Linux
+/// tcp_options_write's OPTION_FAST_OPEN_COOKIE); its length
+fn put_foc(f: &Foc, b: &mut [u8]) -> usize {
+    let n = usize::from(f.len.min(16));
+    let (len, at) = if f.exp {
+        let len = 4 + n;
+        b[..2].copy_from_slice(&[OPT_EXP, len as u8]);
+        b[2..4].copy_from_slice(&FASTOPEN_MAGIC.to_be_bytes());
+        (len, 4)
+    } else {
+        let len = 2 + n;
+        b[..2].copy_from_slice(&[OPT_FASTOPEN, len as u8]);
+        (len, 2)
+    };
+    b[at..at + n].copy_from_slice(&f.val[..n]);
+    if len & 3 == 2 {
+        b[len..len + 2].copy_from_slice(&[OPT_NOP, OPT_NOP]);
+    }
+    (len + 3) & !3
+}
+
+/// Linux tcp_parse_fastopen_option: on a SYN, an even cookie length of
+/// 0 (a request) or 4..=16
+fn parse_foc(c: &[u8], exp: bool) -> Option<Foc> {
+    if c.len() & 1 != 0 || !(c.is_empty() || (4..=16).contains(&c.len())) {
+        return None;
+    }
+    let mut f = Foc {
+        len: c.len() as u8,
+        exp,
+        ..Foc::default()
+    };
+    f.val[..c.len()].copy_from_slice(c);
+    Some(f)
 }
 
 /// The length of `h`'s header on the wire, options included
@@ -1052,6 +1097,12 @@ fn parse_opts(mut o: &[u8], s: &mut Seg) {
                         s.ts = Some((v, e));
                     }
                     (OPT_SACK_PERM, 2) if syn => s.sack_perm = true,
+                    (OPT_FASTOPEN, _) if syn => s.foc = parse_foc(&o[2..l], false),
+                    (OPT_EXP, _)
+                        if syn && l >= 4 && u16::from_be_bytes([o[2], o[3]]) == FASTOPEN_MAGIC =>
+                    {
+                        s.foc = parse_foc(&o[4..l], true)
+                    }
                     (OPT_SACK, _)
                         if l >= (SACK_BASE - 2 + SACK_PERBLOCK) as usize
                             && (l - 2).is_multiple_of(SACK_PERBLOCK as usize) =>

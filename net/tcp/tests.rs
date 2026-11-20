@@ -2330,6 +2330,88 @@ fn header_prediction() {
     assert_eq!(ma.net.fold(LINUX_MIB_TCPPUREACKS), pure + 1);
 }
 
+/// Fast Open options on the wire (Linux tcp_options_write,
+/// tcp_parse_fastopen_option): a cookie request, a cookie padded to a
+/// word, the experimental option; an odd length is no option
+#[test]
+fn fastopen_option_wire() {
+    use super::cb::Foc;
+    let mut f = Foc {
+        len: 8,
+        ..Foc::default()
+    };
+    f.val[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    for foc in [Foc::default(), f, Foc { exp: true, ..f }] {
+        let mut h = super::cb::Seg {
+            seq: 7,
+            flags: flags::SYN,
+            mss: Some(1460),
+            ts: Some((1, 0)),
+            foc: Some(foc),
+            ..Default::default()
+        };
+        h.set_len(0);
+        let skb = super::output::build(&h, &Default::default(), Gfp::KERNEL).unwrap();
+        let (p, doff) = super::output::parse(skb.data()).unwrap();
+        assert_eq!(doff % 4, 0);
+        assert_eq!(p.foc, Some(foc));
+    }
+    // A cookie of 5 bytes is no option
+    let mut b = [0u8; 28];
+    b[12] = 7 << 4;
+    b[13] = flags::SYN;
+    b[20..27].copy_from_slice(&[34, 7, 1, 2, 3, 4, 5]);
+    b[27] = 1;
+    assert_eq!(super::output::parse(&b).unwrap().0.foc, None);
+}
+
+/// A Fast Open child (Linux tcp_fastopen_create_child): the SYN's data
+/// is readable at once and acknowledged by the SYN-ACK; the child sends
+/// in SYN_RECEIVED; the ACK of its SYN-ACK completes the handshake
+#[test]
+fn fastopen_child() {
+    let mut a = TcpCb::new(cfg(), Default::default());
+    let mut out = Out::default();
+    a.connect(open(1000, 1460), 0, &mut out);
+    let syn = wire(&out).remove(0);
+    let data = b"fast open data";
+    let mut s = seg_in(&syn);
+    s.data = data;
+    let mut b = TcpCb::new(cfg(), Default::default());
+    let mut out = Out::default();
+    b.fastopen_open(&s.hdr(), s.skb(), open(5000, 1460), 0, &mut out);
+    assert_eq!(b.state, TcpState::SynReceived);
+    assert!(b.tfo);
+    let w = wire(&out);
+    assert!(w[0].has(flags::SYN | flags::ACK));
+    assert_eq!(w[0].ack, 1001 + data.len() as u32);
+    let mut buf = [0u8; 32];
+    let mut out = Out::default();
+    assert_eq!(b.recv(&mut buf, 0, true, &mut out), data.len());
+    assert_eq!(&buf[..data.len()], data);
+    // It sends before the handshake completes
+    assert_eq!(b.send(b"reply"), 5);
+    let mut out = Out::default();
+    b.output(10, &mut out);
+    let w = wire(&out);
+    assert!(w.iter().any(|s| s.data == b"reply" && s.seq == 5001));
+    // The peer's ACK of the SYN-ACK
+    let ack = SegIn {
+        seq: 1001 + data.len() as u32,
+        ack: 5001,
+        flags: flags::ACK,
+        wnd: 1000,
+        ts: syn.ts.map(|(v, _)| (v + 10, b.tsval())),
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    b.feed(&ack, 20, &mut out);
+    assert_eq!(b.state, TcpState::Established);
+    assert!(!b.tfo);
+    // The reply is in flight: its timer runs
+    assert!(b.next_timer().is_some());
+}
+
 // ============================================================================
 // Review findings (reproduce first)
 // ============================================================================

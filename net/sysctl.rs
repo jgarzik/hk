@@ -42,6 +42,9 @@ pub struct NetSysctl {
     /// Without SYN cookies, the last quarter of this many requests is
     /// kept for proven peers (Linux sysctl_max_syn_backlog)
     pub tcp_max_syn_backlog: AtomicI32,
+    /// Fast Open bits (Linux TFO_CLIENT_ENABLE 1, TFO_SERVER_ENABLE 2,
+    /// TFO_SERVER_COOKIE_NOT_REQD 0x200, TFO_SERVER_WO_SOCKOPT1 0x400)
+    pub tcp_fastopen: AtomicI32,
     pub tcp_retries2: AtomicU8,
     /// tcp_fin_timeout in seconds
     pub tcp_fin_timeout: AtomicI32,
@@ -117,6 +120,8 @@ impl Default for NetSysctl {
             // Linux tcp_sk_init
             tcp_syncookies: AtomicU8::new(1),
             tcp_max_syn_backlog: AtomicI32::new(crate::net::tcp::table::max_syn_backlog()),
+            // Linux tcp_sk_init: TFO_CLIENT_ENABLE
+            tcp_fastopen: AtomicI32::new(1),
             tcp_retries2: AtomicU8::new(15),
             tcp_fin_timeout: AtomicI32::new(60),
             tcp_window_scaling: AtomicU8::new(1),
@@ -511,6 +516,14 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_i32(n, |s| &s.tcp_max_syn_backlog),
         store: |n, v| set_int(n, |s| &s.tcp_max_syn_backlog, v, INT_MIN, INT_MAX),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_fastopen",
+        mode: 0o644,
+        global: false,
+        show: |n| get_i32(n, |s| &s.tcp_fastopen),
+        store: |n, v| set_int(n, |s| &s.tcp_fastopen, v, INT_MIN, INT_MAX),
         text: None,
     },
     NetCtl {

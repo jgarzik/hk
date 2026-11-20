@@ -133,6 +133,11 @@ pub const TCP_FASTOPEN: i32 = 23;
 pub const TCP_NOTSENT_LOWAT: i32 = 25;
 /// Linux TCP_FIN_TIMEOUT_MAX (s): the largest TCP_LINGER2
 const FIN_TIMEOUT_MAX: i32 = 120;
+/// net.ipv4.tcp_fastopen server bits (Linux TFO_SERVER_ENABLE,
+/// TFO_SERVER_COOKIE_NOT_REQD, TFO_SERVER_WO_SOCKOPT1)
+const TFO_SERVER_ENABLE: i32 = 2;
+const TFO_SERVER_COOKIE_NOT_REQD: i32 = 0x200;
+const TFO_SERVER_WO_SOCKOPT1: i32 = 0x400;
 /// Linux MAX_TCP_KEEPIDLE / KEEPINTVL / KEEPCNT, MAX_TCP_SYNCNT
 const MAX_KEEPIDLE: i32 = 32767;
 const MAX_KEEPCNT: i32 = 127;
@@ -170,6 +175,9 @@ struct Inner {
     bound: bool,
     /// The listener of a child still in SYN_RECEIVED
     parent: Option<Weak<TcpSock>>,
+    /// The listener whose Fast Open queue counts this child while it is
+    /// in SYN_RECEIVED (Linux fastopen_rsk->rsk_listener)
+    tfo_parent: Option<Weak<TcpSock>>,
     /// The deadline (ms) each of `TcpSock.timers` was last armed for
     armed: [Option<u64>; 3],
     /// A non-blocking connect is in progress (Linux sock->state
@@ -193,6 +201,8 @@ struct Accept {
     syn: OwnedList<AcceptLink>,
     /// Established, not yet accepted
     ready: OwnedList<AcceptLink>,
+    /// Fast Open children still in SYN_RECEIVED (Linux fastopenq.qlen)
+    tfo_qlen: u32,
 }
 
 crate::owned_adapter!(AcceptLink, TcpSock, accept_link, accept_owner);
@@ -229,6 +239,9 @@ struct Snap {
     /// Linux snd_una / snd_nxt (the ICMP error sequence check)
     snd_una: AtomicU32,
     snd_max: AtomicU32,
+    /// A Fast Open child in SYN_RECEIVED (Linux tp->fastopen_rsk, which
+    /// tcp_poll reads)
+    tfo: AtomicBool,
 }
 
 impl Snap {
@@ -241,6 +254,7 @@ impl Snap {
         self.writable.store(c.writable(), Ordering::Release);
         self.snd_una.store(c.snd_una, Ordering::Release);
         self.snd_max.store(c.snd_max, Ordering::Release);
+        self.tfo.store(c.tfo, Ordering::Release);
         self.state.store(c.state.linux(), Ordering::Release);
     }
 }
@@ -453,6 +467,7 @@ impl TcpSock {
                 bound: false,
                 orphan: None,
                 parent: None,
+                tfo_parent: None,
                 armed: [None; 3],
                 connecting: false,
                 bufs: (0, 0),
@@ -579,6 +594,16 @@ impl TcpSock {
             // listener (`syn_recv_sock`): wake it (Linux
             // tcp_child_process -> sk_data_ready)
             ready = w.upgrade();
+        }
+        if g.tfo_parent.is_some() && !(g.cb.tfo && g.cb.state == TcpState::SynReceived) {
+            // Linux reqsk_fastopen_remove: the handshake completed or the
+            // child died
+            if let Some(p) = g.tfo_parent.take().and_then(|w| w.upgrade()) {
+                if let Some(q) = p.queue.lock().as_mut() {
+                    q.tfo_qlen = q.tfo_qlen.saturating_sub(1);
+                }
+                put_listener(p);
+            }
         }
         if out.done {
             if let Some(p) = g.parent.take().and_then(|w| w.upgrade()) {
@@ -861,7 +886,7 @@ impl TcpSock {
     /// tcp_check_req and reqsk_timer_handler read the listener's
     /// rskq_defer_accept)
     fn req_dead(&self, g: &mut Inner) -> bool {
-        if !(g.cb.passive && g.cb.state == TcpState::SynReceived) {
+        if !(g.cb.passive && g.cb.state == TcpState::SynReceived) || g.cb.tfo {
             return false;
         }
         match g.parent.as_ref().and_then(Weak::upgrade) {
@@ -1015,9 +1040,14 @@ impl TcpSock {
     /// a request is not limited by the SYN queue (Linux: "TW buckets are
     /// converted to open requests without limitations")
     fn conn_request(&self, s: &SegIn, skb: Box<SkBuff>, t: Tuple, now: u64, isn: u32) {
-        if !s.has(flags::SYN) && self.cookie_check(s, skb, t, now).is_none() {
-            return;
-        }
+        let skb = if s.has(flags::SYN) {
+            skb
+        } else {
+            match self.cookie_check(s, skb, t, now) {
+                Some(skb) => skb,
+                None => return,
+            }
+        };
         if s.has(flags::RST) {
             return;
         }
@@ -1070,7 +1100,130 @@ impl TcpSock {
         if want_cookie {
             return self.cookie_synack(s, t, &opts, caps, now);
         }
-        self.child(s, t, opts, caps, now, isn);
+        let (tfo, foc) = self.try_fastopen(s, &t);
+        if tfo && self.fastopen_child(s, skb, t, opts, caps, now) {
+            return;
+        }
+        self.child(s, t, opts, caps, now, isn, foc);
+    }
+
+    /// Linux tcp_try_fastopen: with TFO_SERVER_ENABLE, a SYN with data
+    /// or a Fast Open option, and room in the listener's Fast Open
+    /// queue: a cookie request gets a cookie for the SYN-ACK
+    /// (TCPFastOpenCookieReqd); a valid cookie (or none needed,
+    /// TFO_SERVER_COOKIE_NOT_REQD) makes a Fast Open child (true); an
+    /// invalid one TCPFastOpenPassiveFail and the valid cookie. Returns
+    /// that and the cookie the SYN-ACK carries
+    fn try_fastopen(&self, s: &SegIn, t: &Tuple) -> (bool, Option<cb::Foc>) {
+        let net = &self.sk.net;
+        if s.foc.is_some_and(|f| f.len == 0) {
+            net.mib.net.inc(LINUX_MIB_TCPFASTOPENCOOKIEREQD);
+        }
+        let tfo = net.sysctl.tcp_fastopen.load(Ordering::Relaxed);
+        let syn_data = s.data_len() != 0;
+        if tfo & TFO_SERVER_ENABLE == 0 || !(syn_data || s.foc.is_some()) || !self.fastopen_room() {
+            return (false, None);
+        }
+        if tfo & TFO_SERVER_COOKIE_NOT_REQD != 0 {
+            return (true, None);
+        }
+        let Some(f) = s.foc else {
+            return (false, None);
+        };
+        let mut valid = net.tcp.fastopen_cookie(t);
+        valid.exp = f.exp;
+        if f.len == 0 {
+            return (false, Some(valid));
+        }
+        let n = usize::from(valid.len);
+        if f.len == valid.len && f.val[..n] == valid.val[..n] {
+            return (true, None);
+        }
+        net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
+        (false, Some(valid))
+    }
+
+    /// Linux tcp_fastopen_queue_check: TCP_FASTOPEN set and fewer Fast
+    /// Open children than it allows (else TCPFastOpenListenOverflow)
+    fn fastopen_room(&self) -> bool {
+        let max = self.live.fastopen.get();
+        if max == 0 {
+            return false;
+        }
+        let full = self.queue.lock().as_ref().is_none_or(|q| q.tfo_qlen >= max);
+        if full {
+            self.sk.net.mib.net.inc(LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
+        }
+        !full
+    }
+
+    /// Make the Fast Open child of the SYN `s` (its payload `skb`) and
+    /// queue it to be accepted at once (Linux tcp_fastopen_create_child:
+    /// tcp_v4_syn_recv_sock hashes it and inherits the port; then
+    /// tcp_conn_request sends its SYN-ACK, acknowledging the data,
+    /// inet_csk_reqsk_queue_add queues it and the listener is woken).
+    /// False if it could not be made (TCPFastOpenPassiveFail: a plain
+    /// request follows)
+    fn fastopen_child(
+        &self,
+        s: &SegIn,
+        skb: Box<SkBuff>,
+        t: Tuple,
+        opts: cb::Opts,
+        caps: (u32, u32, u8),
+        now: u64,
+    ) -> bool {
+        let net = &self.sk.net;
+        let fail = || {
+            net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
+            false
+        };
+        let Some((c, eh)) = self.new_child(&t) else {
+            return fail();
+        };
+        let mut b = c.lock.bh_lock();
+        let Some(g) = b.get() else {
+            return fail();
+        };
+        let mut out = Out::default();
+        let o = open(net, &t, self.oif());
+        let mut cb = self.child_cb(&c, opts, caps);
+        cb.fastopen_open(s, skb, o, now, &mut out);
+        g.cb = cb;
+        if !net.tcp.hash(t, &eh, &c) {
+            return fail();
+        }
+        g.tuple = Some(t);
+        g.eh = Some(eh);
+        if !net.tcp.inherit(&c, t.lport) {
+            c.forget(g);
+            return fail();
+        }
+        g.bound = true;
+        let queued = match self.queue.lock().as_mut() {
+            Some(q) => {
+                q.tfo_qlen += 1;
+                q.ready.push_back(c.clone());
+                // Under `queue` (Linux sk_acceptq_added)
+                self.ack_backlog
+                    .store(q.ready.len() as u32, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        };
+        if !queued {
+            c.forget(g);
+            return fail();
+        }
+        g.tfo_parent = Some(self.me.clone());
+        net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVE);
+        // A full socket now (Linux sk_clone_lock): counted in use
+        c.sk.inuse_start();
+        table::tcp_inuse(&c, true);
+        let _ = c.apply(g, &mut out);
+        // Linux tcp_conn_request: sk->sk_data_ready(listener)
+        self.sk.data_ready();
+        true
     }
 
     /// The buffer limits a child inherits: receive, send, SO_RCVBUF set
@@ -1232,7 +1385,17 @@ impl TcpSock {
     /// takeover's, else 0 for a fresh one). The child is allocated
     /// GFP_ATOMIC before any lock is taken (Linux inet_reqsk_alloc,
     /// sk_clone_lock)
-    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, caps: (u32, u32, u8), now: u64, isn: u32) {
+    #[allow(clippy::too_many_arguments)]
+    fn child(
+        &self,
+        s: &SegIn,
+        t: Tuple,
+        opts: cb::Opts,
+        caps: (u32, u32, u8),
+        now: u64,
+        isn: u32,
+        foc: Option<cb::Foc>,
+    ) {
         let Some((c, eh)) = self.new_child(&t) else {
             return;
         };
@@ -1247,6 +1410,7 @@ impl TcpSock {
             return;
         };
         let mut cb = self.child_cb(&c, opts, caps);
+        cb.synack_foc = foc;
         cb.passive(s, o, now, &mut out);
         g.cb = cb;
         if !self.sk.net.tcp.hash(t, &eh, &c) {
@@ -2122,6 +2286,8 @@ fn wait_connected(s: &TcpSock, g: &mut Guard<'_>, timeo: &mut u64) -> Result<(),
         }
         match g.cb.state {
             TcpState::Established | TcpState::CloseWait => return Ok(()),
+            // Linux tcp_sendmsg_locked: tcp_passive_fastopen
+            TcpState::SynReceived if g.cb.tfo => return Ok(()),
             TcpState::SynSent | TcpState::SynReceived => {
                 let t = *timeo;
                 *timeo = g.unlocked(|| {
@@ -2429,7 +2595,17 @@ impl ProtoOps for TcpSock {
             backlog,
             syn: OwnedList::new(),
             ready: OwnedList::new(),
+            tfo_qlen: 0,
         });
+        // Linux inet_listen: TFO_SERVER_WO_SOCKOPT1 gives a listener
+        // without TCP_FASTOPEN a queue of its backlog
+        let tfo = self.sk.net.sysctl.tcp_fastopen.load(Ordering::Relaxed);
+        if tfo & TFO_SERVER_WO_SOCKOPT1 != 0
+            && tfo & TFO_SERVER_ENABLE != 0
+            && g.cb.live.fastopen.get() == 0
+        {
+            g.cb.live.fastopen.set(backlog);
+        }
         g.cb.state = TcpState::Listen;
         self.sk.set_flag(sf::ACCEPTCONN, true);
         // The options children copy, set before the listener can be
@@ -2512,7 +2688,8 @@ impl ProtoOps for TcpSock {
         if sh & RCV_SHUTDOWN != 0 {
             mask |= POLLIN | POLLRDNORM | POLLRDHUP;
         }
-        if !matches!(state, TcpState::SynSent | TcpState::SynReceived) {
+        let tfo = self.snap.tfo.load(Ordering::Acquire);
+        if state != TcpState::SynSent && (state != TcpState::SynReceived || tfo) {
             let inq = self.snap.rcvq.load(Ordering::Acquire);
             if inq >= self.sk.rcvlowat().max(1) as usize {
                 mask |= POLLIN | POLLRDNORM;

@@ -66,6 +66,10 @@ pub(crate) struct Seg {
     pub ts: Option<(u32, u32)>,
     /// Window scale option
     pub ws: Option<u8>,
+    /// Payload bytes
+    pub len: usize,
+    /// Fast Open option: cookie length and bytes
+    pub foc: Option<(usize, [u8; 16])>,
 }
 
 /// The played peer: the route, a raw socket to send, a packet socket
@@ -220,7 +224,9 @@ fn parse(b: &[u8]) -> Option<Seg> {
     let h = b.get(ihl..ihl + 20)?;
     let be = |o: usize| u32::from_be_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
     let doff = usize::from(h[12] >> 4) * 4;
+    let tot = usize::from(u16::from_be_bytes([b[2], b[3]])).min(b.len());
     let mut s = Seg {
+        len: tot.saturating_sub(ihl + doff),
         saddr: [b[12], b[13], b[14], b[15]],
         sport: u16::from_be_bytes([h[0], h[1]]),
         dport: u16::from_be_bytes([h[2], h[3]]),
@@ -246,6 +252,11 @@ fn parse(b: &[u8]) -> Option<Seg> {
         match (k, l) {
             (8, 10) => s.ts = Some((w(2), w(6))),
             (3, 3) => s.ws = Some(o[2]),
+            (34, 2..=18) => {
+                let mut c = [0u8; 16];
+                c[..l - 2].copy_from_slice(&o[2..l]);
+                s.foc = Some((l - 2, c));
+            }
             _ => {}
         }
         o = &o[l..];

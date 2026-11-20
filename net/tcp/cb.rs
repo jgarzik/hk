@@ -339,8 +339,20 @@ pub struct Seg {
     pub sack_perm: bool,
     /// SACK option blocks
     pub sack: Sacks,
+    /// Fast Open option (SYN and SYN-ACK)
+    pub foc: Option<Foc>,
     pub sport: u16,
     pub dport: u16,
+}
+
+/// A Fast Open cookie option (Linux struct tcp_fastopen_cookie): `len`
+/// bytes of `val` (0: a cookie request), in the RFC 7413 option or the
+/// experimental one (`exp`: kind 254, magic 0xF989)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Foc {
+    pub len: u8,
+    pub val: [u8; 16],
+    pub exp: bool,
 }
 
 /// A received segment's header, checksummed and parsed (its payload is
@@ -938,6 +950,12 @@ pub struct TcpCb {
     /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
     /// processed as tcp_child_process does
     pub(super) req_full: bool,
+    /// A listener's Fast Open child still in SYN_RECEIVED (Linux
+    /// tp->fastopen_rsk): already accepted, it may send and receive
+    pub tfo: bool,
+    /// The cookie its first SYN-ACK carries (Linux tcp_conn_request's
+    /// foc; retransmissions carry none)
+    pub(super) synack_foc: Option<Foc>,
     /// Header prediction (Linux pred_flags): the header length, flags
     /// (ACK only, PSH ignored) and window field word of the segment the
     /// fast path takes, 0 when off
@@ -1136,6 +1154,8 @@ impl TcpCb {
             req_full: Default::default(),
             req_acked: false,
             pred_flags: 0,
+            tfo: false,
+            synack_foc: None,
             rtx_stamp: Default::default(),
             probes_tstamp: None,
             rcv_tstamp: Default::default(),
@@ -1240,6 +1260,11 @@ impl TcpCb {
     /// sysctls allow
     pub fn passive(&mut self, syn: &SegIn, o: Open, now: u64, out: &mut Out) {
         self.passive_open(syn, o, now, None);
+        self.synack_send(now, out);
+    }
+
+    /// The first SYN-ACK and its timer
+    fn synack_send(&mut self, now: u64, out: &mut Out) {
         if self.syn_seg(out) {
             self.tcp_stat(TCP_MIB_OUTSEGS);
         }
@@ -1269,6 +1294,43 @@ impl TcpCb {
         self.syn_rcvd(syn, now);
         self.set_state(TcpState::SynReceived);
         self.passive = true;
+    }
+
+    /// A Fast Open child for `syn`, its payload `data` (Linux
+    /// tcp_fastopen_create_child, tcp_fastopen_add_skb): a full socket
+    /// in SYN_RECEIVED at once, the SYN's data queued and acknowledged by
+    /// the SYN-ACK, its transfer state set up (tcp_init_transfer)
+    pub fn fastopen_open(
+        &mut self,
+        syn: &SegIn,
+        mut data: Box<SkBuff>,
+        o: Open,
+        now: u64,
+        out: &mut Out,
+    ) {
+        self.passive_open(syn, o, now, None);
+        self.tfo = true;
+        self.req_full = true;
+        self.init_transfer();
+        let len = data.len();
+        if len != 0 {
+            data.dev = None;
+            let c = data.tcp_mut();
+            c.seq = self.rcv_nxt;
+            c.end_seq = self.rcv_nxt.wrapping_add(len as u32);
+            c.flags &= !flags::SYN;
+            // sk_forced_mem_schedule, skb_set_owner_r
+            let ts = data.truesize();
+            self.mem_force(ts);
+            self.rcvq_truesize += ts;
+            self.stats.bytes_received = len as u64;
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(len as u32);
+            self.rcv_bytes += len;
+            self.rcvq.push_back(data);
+            out.wake |= wake::DATA;
+        }
+        self.rcv_wup = self.rcv_nxt;
+        self.synack_send(now, out);
     }
 
     /// A SYN cookie's request becomes the child (Linux cookie_v4_check

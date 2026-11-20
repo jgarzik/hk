@@ -120,7 +120,15 @@ impl TcpCb {
     fn write_timeout(&mut self, now: u64, out: &mut Out) -> bool {
         let mut expired = false;
         let mut retry_until;
-        if self.passive && self.state == TcpState::SynReceived {
+        if self.tfo {
+            // Linux tcp_fastopen_synack_timer: one more retry
+            // ("Paranoid") unless TCP_SYNCNT set it
+            retry_until = match self.opts.syncnt {
+                0 => self.cfg.synack_retries + 1,
+                n => n,
+            };
+            expired = self.live.retransmits.get() >= retry_until;
+        } else if self.passive && self.state == TcpState::SynReceived {
             retry_until = self.syn_retries();
             expired = self.syn_ack_recalc().0;
         } else if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
@@ -244,7 +252,7 @@ impl TcpCb {
     /// uncounted by its timer, reqsk_timer_handler)
     fn timed_out(&mut self, out: &mut Out) {
         let e = self.soft_err.take().unwrap_or(KernelError::TimedOut);
-        if self.passive && self.state == TcpState::SynReceived {
+        if self.passive && self.state == TcpState::SynReceived && !self.tfo {
             out.err = Some(e);
             self.set_closed(out);
             return;
@@ -333,8 +341,10 @@ impl TcpCb {
         }
         // A request's SYN-ACK timer has no congestion state (Linux
         // tcp_syn_ack_timeout); a SYN_SENT or SYN_RECV socket's does
-        let req = self.passive && self.state == TcpState::SynReceived;
-        if !req {
+        let req = self.passive && self.state == TcpState::SynReceived && !self.tfo;
+        // A Fast Open child lowers its window at its second timeout
+        // (Linux tcp_fastopen_synack_timer)
+        if !req && (!self.tfo || self.live.retransmits.get() == 1) {
             self.enter_loss();
         }
         // A deferred request waiting for data is not resent, its timer

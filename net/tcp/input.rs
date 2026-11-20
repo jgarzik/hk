@@ -170,7 +170,15 @@ impl TcpCb {
         self.rtx_stamp = None;
         self.live.tmr.set(None);
         self.rcv_tstamp = now;
-        self.init_transfer();
+        if self.tfo {
+            // Linux tcp_rcv_synrecv_state_fastopen: set up at creation;
+            // the request goes (reqsk_fastopen_remove), the RTO follows
+            // what the child sent meanwhile (tcp_rearm_rto)
+            self.tfo = false;
+            self.rearm_rto(now);
+        } else {
+            self.init_transfer();
+        }
         self.arm_keepalive(now);
         out.established = true;
         out.wake |= wake::STATE | wake::EST;
@@ -357,7 +365,9 @@ impl TcpCb {
         } else {
             skb
         };
-        let req = self.passive && self.state == TcpState::SynReceived;
+        // A Fast Open child is a full socket (Linux tcp_rcv_state_process,
+        // not tcp_check_req)
+        let req = self.passive && self.state == TcpState::SynReceived && !self.tfo;
         if req
             && s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)

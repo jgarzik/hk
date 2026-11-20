@@ -264,6 +264,34 @@ impl EhKey {
 #[derive(Default)]
 pub struct TcpTables {
     _id: u8,
+    /// The namespace's Fast Open key (Linux net->ipv4.tcp_fastopen_ctx,
+    /// its primary key: tcp_fastopen_init_key_once, drawn at first use)
+    fastopen_key: spin::Once<[u64; 2]>,
+}
+
+impl TcpTables {
+    /// Linux tcp_fastopen_cookie_gen for the SYN from `t.raddr` to
+    /// `t.laddr`: siphash of its source and destination addresses (as
+    /// they lie in the IP header) under the namespace's key, 8 bytes
+    /// little-endian
+    pub fn fastopen_cookie(&self, t: &Tuple) -> super::cb::Foc {
+        let key = *self.fastopen_key.call_once(|| {
+            let r = || {
+                (u64::from(crate::random::get_random_u32()) << 32)
+                    | u64::from(crate::random::get_random_u32())
+            };
+            [r(), r()]
+        });
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&t.raddr.0.to_be_bytes());
+        b[4..].copy_from_slice(&t.laddr.0.to_be_bytes());
+        let mut f = super::cb::Foc {
+            len: 8,
+            ..Default::default()
+        };
+        f.val[..8].copy_from_slice(&crate::util::siphash::siphash_bytes(key, &b).to_le_bytes());
+        f
+    }
 }
 
 /// End every TIME_WAIT entry of the namespaces `nets` going (Linux
