@@ -249,6 +249,10 @@ fn ctx<'a>(t: &'a Tap<'_>, proto: u16) -> Ctx<'a> {
 
 /// Deliver a tapped frame to the namespace's groups that take it
 pub fn deliver(net: &crate::net::NetNamespace, t: &Tap<'_>, proto: u16) {
+    // Under RCU as the socket walk (Linux: ptype handlers run under
+    // rcu_read_lock): a ring swap's grace period waits for the member's
+    // delivery, so a ring is never last released here
+    let _rcu = crate::sync::rcu::read_lock();
     let mut i = 0;
     loop {
         let Some(f) = net.packet.fanouts.read().get(i).cloned() else {

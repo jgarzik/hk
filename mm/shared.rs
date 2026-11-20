@@ -20,15 +20,20 @@ use crate::util::pod::{FromBytes, IntoBytes};
 
 use super::PAGE_SIZE;
 
-/// Zeroed contiguous frames shared with user space
+/// Zeroed frames shared with user space: physically contiguous, or
+/// (a ring block too large for that, `new_pg_vec`) virtually
+/// contiguous in the vmalloc area
 ///
 /// # Invariants
-/// `phys` is the first of `pages` contiguous RAM frames from
-/// `alloc_contig`, zeroed when made, each holding one reference owned
-/// by the region (dropped in `Drop`).
+/// Without `vm`: `phys` is the first of `pages` contiguous RAM frames
+/// from `alloc_contig`, zeroed when made, each holding one reference
+/// owned by the region (dropped in `Drop`). With `vm`: its `pages`
+/// zeroed frames, mapped contiguously at its base, each with the
+/// reference it owns (`VmUser`), and `phys` unused.
 pub struct SharedRegion {
     phys: u64,
     pages: usize,
+    vm: Option<super::vmalloc::VmUser>,
 }
 
 impl SharedRegion {
@@ -44,7 +49,28 @@ impl SharedRegion {
             unsafe { super::page::clear_page(phys + i as u64 * PAGE_SIZE) };
         }
         // INVARIANT: contiguous fresh frames, zeroed, one reference each
-        Ok(Self { phys, pages })
+        Ok(Self {
+            phys,
+            pages,
+            vm: None,
+        })
+    }
+
+    /// A ring block of `bytes` (Linux alloc_one_pg_vec_page): physically
+    /// contiguous when the buddy allocator has it (__get_free_pages),
+    /// else vmalloc'ed pages (vzalloc), else ENOMEM; thread context
+    pub fn new_pg_vec(bytes: usize) -> Result<Self, KernelError> {
+        if let Ok(r) = Self::new(bytes) {
+            return Ok(r);
+        }
+        let pages = bytes.div_ceil(PAGE_SIZE as usize).max(1);
+        let vm = super::vmalloc::VmUser::new(pages).ok_or(KernelError::OutOfMemory)?;
+        // INVARIANT: the VmUser's zeroed, mapped frames
+        Ok(Self {
+            phys: 0,
+            pages,
+            vm: Some(vm),
+        })
     }
 
     /// Its size in pages
@@ -63,7 +89,10 @@ impl SharedRegion {
         if i >= self.pages as u64 {
             return None;
         }
-        let phys = self.phys + i * PAGE_SIZE;
+        let phys = match &self.vm {
+            Some(vm) => vm.frame(i as usize)?,
+            None => self.phys + i * PAGE_SIZE,
+        };
         // The region's own reference keeps the count above zero
         let held = FRAME_ALLOCATOR.incref(phys);
         debug_assert!(held, "shared region page without a reference");
@@ -76,8 +105,12 @@ impl SharedRegion {
             off.checked_add(size).is_some_and(|e| e <= self.len()) && off.is_multiple_of(align),
             "shared region access out of bounds"
         );
-        // In bounds of the contiguous frames (type invariant), checked above
-        crate::arch::phys_to_virt(self.phys).wrapping_add(off)
+        // In bounds of the frames, contiguous in the direct map or the
+        // vmalloc area (type invariant), checked above
+        match &self.vm {
+            Some(vm) => vm.base().wrapping_add(off),
+            None => crate::arch::phys_to_virt(self.phys).wrapping_add(off),
+        }
     }
 
     /// The 32-bit word at byte `off` (4-aligned, in bounds: asserted),
@@ -167,7 +200,7 @@ impl PgVec {
         );
         let mut blocks = crate::util::kmem::KVec::try_with_capacity(nr)?;
         for _ in 0..nr {
-            blocks.try_push(SharedRegion::new(block_size)?)?;
+            blocks.try_push(SharedRegion::new_pg_vec(block_size)?)?;
         }
         Ok(Self {
             blocks: blocks.into_vec(),
@@ -208,6 +241,10 @@ impl PgVec {
 
 impl Drop for SharedRegion {
     fn drop(&mut self) {
+        // A vmalloc'ed region's frames go with its `VmUser`
+        if self.vm.is_some() {
+            return;
+        }
         for i in 0..self.pages {
             // A page still mapped keeps its frame until it is unmapped
             FRAME_ALLOCATOR.decref(self.phys + i as u64 * PAGE_SIZE);

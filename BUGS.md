@@ -333,9 +333,6 @@ segmentation (longer than gso_size) is EINVAL where Linux segments it,
 and a NEEDS_CSUM checksum is completed in software before transmit
 where Linux leaves it CHECKSUM_PARTIAL on lo (the bytes on the wire
 differ from Linux lo, not from a device without offload).
-Ring blocks are physically contiguous (`mm::shared::PgVec`): a
-tp_block_size past the buddy allocator's largest order is ENOMEM where
-Linux alloc_one_pg_vec_page falls back to vzalloc.
 
 ## fanotify gaps
 

@@ -46,6 +46,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | `DmaBox` (`hw/dma.rs`, Rust-for-Linux CoherentAllocation) | owned device memory, freed on drop |
 | page-table `PgTables` / `Pte` / `PteTable` / `Pmd` / `Dir`, `PgPrune` (`mm/pgtable.rs`) | typed handle borrowing the lock |
 | vmalloc-area range `VmArea` (`mm/vmalloc.rs`, Linux vm_struct) | ownership token |
+| user-mappable vmalloc pages `VmUser` (`mm/vmalloc.rs`, Linux vzalloc + vmalloc_to_page), the shared regions over them and over contiguous frames `SharedRegion` / `PgVec` (`mm/shared.rs`) | owned range whose frames each hold a reference, dropped with it (a user mapping keeps its own); accessed only through atomics and volatile copies |
 | kernel stack `VmStack`, a task's `StackSlot` (`mm/vmstack.rs`) | ownership token |
 | red-black tree `RbTree` / `RbTreeNodeReservation` (`util/rbtree.rs`, Linux rb_root) | owning container of preallocated nodes |
 | intrusive red-black tree `RbRoot` / `RbNode` / `RbCursorMut` over a `ListPtr` (`util/rbtree.rs`, Linux rb_node embedded, `skb->rbnode`) | owning intrusive container, membership checked |

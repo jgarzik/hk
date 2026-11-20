@@ -343,6 +343,93 @@ pub fn alloc(size: usize) -> *mut u8 {
     area.base() as *mut u8
 }
 
+/// Zeroed pages, virtually contiguous in the vmalloc area, that user
+/// space may map too (Linux vzalloc pages mapped by vmalloc_to_page +
+/// vm_insert_page, as af_packet's alloc_one_pg_vec_page fallback)
+///
+/// Each frame holds one reference owned by the area (a user mapping
+/// takes its own, `incref`): dropping it unmaps the range and drops
+/// those references, so a frame still mapped by user space lives on.
+/// Made and dropped in thread context (`new` refuses atomic context;
+/// the drop unmaps under `ioremap::KTABLES`).
+///
+/// # Invariants
+/// `frames[i]` is mapped at page `i` of `area`, with one reference
+/// owned by this value.
+pub struct VmUser {
+    area: VmArea,
+    frames: alloc::vec::Vec<u64>,
+}
+
+impl VmUser {
+    /// `pages` zeroed pages; None out of memory, area or in atomic
+    /// context
+    pub fn new(pages: usize) -> Option<Self> {
+        if crate::sync::in_atomic() || pages == 0 {
+            return None;
+        }
+        let mut frames = crate::util::kmem::KVec::try_with_capacity(pages).ok()?;
+        drain_deferred();
+        let p = take_range(pages + 1)?;
+        // SAFETY: the pages (and guard page) just taken from AREA, ours
+        // alone until put back
+        let area = unsafe { VmArea::new(va_of(p), pages) };
+        let mut v = Self {
+            area,
+            frames: alloc::vec::Vec::new(),
+        };
+        for i in 0..pages {
+            let Some(pa) = crate::FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::KERNEL)
+            else {
+                v.frames = frames.into_vec();
+                return None;
+            };
+            // SAFETY: a fresh frame of ours, not yet shared
+            unsafe { crate::mm::page::clear_page(pa) };
+            // SAFETY: a fresh frame, ours, handed to the area
+            if !unsafe { v.area.map(i, pa) } {
+                crate::FRAME_ALLOCATOR.free(pa);
+                v.frames = frames.into_vec();
+                return None;
+            }
+            // Room reserved above: no allocation
+            let _ = frames.try_push(pa);
+        }
+        // INVARIANT: every page mapped with its fresh frame
+        v.frames = frames.into_vec();
+        Some(v)
+    }
+
+    /// The first page, to the kernel (as `alloc`'s pointer)
+    pub fn base(&self) -> *mut u8 {
+        self.area.base() as *mut u8
+    }
+
+    /// Its size in pages
+    pub fn pages(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// The frame of page `i` (None past the end)
+    pub fn frame(&self, i: usize) -> Option<u64> {
+        self.frames.get(i).copied()
+    }
+}
+
+impl Drop for VmUser {
+    fn drop(&mut self) {
+        crate::sync::might_sleep();
+        // Only the pages mapped so far (a failed `new` maps fewer)
+        for i in 0..self.frames.len() {
+            if let Some(pa) = self.area.unmap(i) {
+                crate::FRAME_ALLOCATOR.decref(pa);
+            }
+        }
+        AREA.lock()
+            .put(page_of(self.area.base()), self.area.pages() + 1);
+    }
+}
+
 /// Unmap and free the first `pages` pages of `area`
 fn unmap(area: &mut VmArea, pages: usize) {
     for i in 0..pages {

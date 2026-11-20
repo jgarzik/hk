@@ -57,6 +57,7 @@ pub fn run_tests() {
     test_rx(lo, TPACKET_V2, SOCK_DGRAM, b"PACKET_RING_RX_V2_DGRAM");
     test_full(lo);
     test_copy_thresh(lo);
+    test_big_block(lo);
     test_tx(lo, TPACKET_V1, b"PACKET_RING_TX_V1");
     test_tx(lo, TPACKET_V2, b"PACKET_RING_TX_V2");
     test_tx_rules(lo);
@@ -935,6 +936,43 @@ fn test_v3_tx(lo: i32) {
         sys_munmap(f, 4096);
     }
     close(tx);
+    close(rx);
+    t.done();
+}
+
+/// An 8 MiB block, past the buddy allocator's largest order: Linux
+/// alloc_one_pg_vec_page falls back to vzalloc, and the ring maps and
+/// fills as any
+fn test_big_block(lo: i32) {
+    let mut t = T::new(b"PACKET_RING_BIG_BLOCK");
+    const BS: u32 = 8 << 20;
+    let rx = psock(SOCK_RAW, ETH_P_TEST);
+    pbind(rx, ETH_P_TEST, lo);
+    setint(rx, SOL_PACKET, PACKET_VERSION, TPACKET_V2);
+    t.eq(
+        b"ring",
+        ring_req(rx, PACKET_RX_RING, &[BS, 1, 2048, BS / 2048], 16),
+        0,
+    );
+    let m = map(rx, BS as u64, 0);
+    t.ok(b"map", m > 0, m);
+    if m > 0 {
+        let base = m as u64;
+        let tx = psock(SOCK_RAW, 0);
+        let mut buf = [0u8; 128];
+        sendto_ll(
+            tx,
+            test_frame(&mut buf, 0x6a, 60),
+            &Sll::new(ETH_P_TEST, lo),
+            20,
+        );
+        t.ok(b"filled", wait_user(base, TPACKET_V2, 3000), 0);
+        t.eq(b"tag", rd8(base + 66 + 14) as i64, 0x6a);
+        // The last frame, deep in the block, is the kernel's and zeroed
+        t.eq(b"last frame", rd32(base + BS as u64 - 2048) as i64, 0);
+        sys_munmap(base, BS as u64);
+        close(tx);
+    }
     close(rx);
     t.done();
 }

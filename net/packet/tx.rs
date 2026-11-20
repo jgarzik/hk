@@ -210,7 +210,7 @@ pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>, flags: i32) -> Result<usize,
             Ok(Some((mut skb, tp_len))) => {
                 let done = crate::util::kalloc::try_box(TxDone {
                     sk: s.me.get().and_then(alloc::sync::Weak::upgrade),
-                    ring: ring.clone(),
+                    ring: Arc::as_ptr(&ring).addr(),
                     frame: head,
                 });
                 // Linux tpacket_snd's failed uarg allocation: what was
@@ -254,10 +254,13 @@ pub fn tpacket_snd(s: &PacketSock, m: &SendMsg<'_>, flags: i32) -> Result<usize,
 /// A sent frame's completion, run when its skb is freed or orphaned
 /// (Linux tpacket_destruct_skb, 6.8): the frame available again, the
 /// pending count down, a blocked sender woken once none is pending.
-/// Nothing is written once the ring was replaced.
+/// Nothing is written once the ring was replaced. The ring is named,
+/// not held: a ring is freed only by `set_ring`, in thread context,
+/// never by an skb freed in atomic context.
 struct TxDone {
     sk: Option<Arc<PacketSock>>,
-    ring: Arc<PgRing>,
+    /// The ring's address, compared only
+    ring: usize,
     frame: u32,
 }
 
@@ -266,19 +269,20 @@ impl crate::net::skb::SkbDestructor for TxDone {}
 impl Drop for TxDone {
     fn drop(&mut self) {
         let Some(s) = &self.sk else { return };
-        if !s
-            .tx
-            .lock()
-            .ring
-            .as_ref()
-            .is_some_and(|r| Arc::ptr_eq(r, &self.ring))
-        {
-            return;
-        }
-        let left = s.tx_pending.fetch_sub(1, Ordering::AcqRel) - 1;
-        self.ring
-            .frame(self.frame)
-            .set_status(s.version(), TP_STATUS_AVAILABLE);
+        let left = {
+            let tx = s.tx.lock();
+            let Some(ring) = tx
+                .ring
+                .as_ref()
+                .filter(|r| Arc::as_ptr(r).addr() == self.ring)
+            else {
+                return;
+            };
+            let left = s.tx_pending.fetch_sub(1, Ordering::AcqRel) - 1;
+            ring.frame(self.frame)
+                .set_status(s.version(), TP_STATUS_AVAILABLE);
+            left
+        };
         if left == 0 {
             s.tx_done.fetch_add(1, Ordering::AcqRel);
             s.tx_wq.wake_all();
