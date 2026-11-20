@@ -824,6 +824,10 @@ impl ProtoOps for UdpSock {
     /// or UDP_CORK is cleared); a send to a corked socket appends,
     /// whatever its address and control messages
     fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
+        // Linux inet_sendmsg -> inet_send_prepare: an unhashed socket
+        // (never bound, or disconnected) gets an ephemeral port before
+        // udp_sendmsg runs, a corked one too
+        self.autobind()?;
         let len = m.data.len();
         if len > 0xffff {
             return Err(KernelError::MessageTooLong);
@@ -847,7 +851,6 @@ impl ProtoOps for UdpSock {
         let gso = self.cmsg_gso(&m.control)?;
         let c = tx_cmsgs(&m.control)?;
         let data = m.data.take(len)?;
-        self.autobind()?;
         let a: InetAddr = self.inet.get();
         let oif = if c.oif != 0 {
             c.oif

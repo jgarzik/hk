@@ -114,10 +114,10 @@ fn test_cork_emsgsize() {
 }
 
 /// A datagram corked on an autobound connected socket, then a
-/// disconnect (the port released), then the send that ends it: it goes
-/// to the corked destination from the socket's port as it is then, 0
-/// (Linux udp_disconnect keeps the cork, udp_send_skb reads
-/// inet_sport)
+/// disconnect (the port released), then the send that ends it: the send
+/// autobinds a new port first (Linux inet_send_prepare), and the cork
+/// goes to its corked destination from that port (udp_disconnect keeps
+/// the cork, udp_send_skb reads inet_sport)
 fn test_cork_disconnect() {
     let mut t = T::new(b"UDP_CORK_DISCONNECT");
     let (b, pb) = udp_lo();
@@ -136,7 +136,11 @@ fn test_cork_disconnect() {
     t.ok(b"waited", poll1(b, 1, 1000).0 == 1, 0);
     let (n, ip, p) = recv_from(b, &mut buf, MSG_DONTWAIT);
     t.ok(b"one datagram", n == 4 && &buf[..4] == b"abcd", n);
-    t.ok(b"from port 0", ip == LO && p == 0, i64::from(p));
+    t.ok(
+        b"from the new port",
+        ip == LO && p != 0 && p == port(a),
+        i64::from(p),
+    );
     close(a);
     close(b);
     t.done();
