@@ -120,7 +120,10 @@ impl TcpCb {
     fn write_timeout(&mut self, now: u64, out: &mut Out) -> bool {
         let mut expired = false;
         let mut retry_until;
-        if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
+        if self.passive && self.state == TcpState::SynReceived {
+            retry_until = self.syn_retries();
+            expired = self.syn_ack_recalc().0;
+        } else if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
             retry_until = self.syn_retries();
             expired = self.live.retransmits.get() >= retry_until;
         } else {
@@ -220,6 +223,22 @@ impl TcpCb {
         }
     }
 
+    /// A request's timeout (Linux syn_ack_recalc, its retransmissions
+    /// so far being num_timeout): (expire, resend). With
+    /// TCP_DEFER_ACCEPT, a request acked by a bare ACK lives on until
+    /// the defer period ends and its SYN-ACK is resent only for the last
+    /// chance before that, so the peer's next ACK may complete it
+    pub(super) fn syn_ack_recalc(&self) -> (bool, bool) {
+        let n = self.live.retransmits.get();
+        let max = self.syn_retries();
+        let defer = u32::from(self.opts.defer_accept);
+        if defer == 0 {
+            return (n >= max, true);
+        }
+        let expire = n >= max && (!self.req_acked || n >= defer);
+        (expire, !self.req_acked || n + 1 >= defer)
+    }
+
     /// Give up: the last soft (ICMP) error, else ETIMEDOUT (Linux
     /// tcp_write_err; a listener's child is a request sock, dropped
     /// uncounted by its timer, reqsk_timer_handler)
@@ -314,13 +333,18 @@ impl TcpCb {
         }
         // A request's SYN-ACK timer has no congestion state (Linux
         // tcp_syn_ack_timeout); a SYN_SENT or SYN_RECV socket's does
-        if !(self.passive && self.state == TcpState::SynReceived) {
+        let req = self.passive && self.state == TcpState::SynReceived;
+        if !req {
             self.enter_loss();
         }
+        // A deferred request waiting for data is not resent, its timer
+        // runs on (Linux reqsk_timer_handler: syn_ack_recalc, before
+        // num_timeout counts this timeout)
+        let resend = !req || self.syn_ack_recalc().1;
         // Linux tcp_update_rto_stats
         self.live.retransmits.set(self.live.retransmits.get() + 1);
         self.stats.rto_count = self.stats.rto_count.wrapping_add(1);
-        if handshake || self.syn_unacked {
+        if (handshake || self.syn_unacked) && resend {
             // Closed in SYN_RECEIVED: the SYN-ACK heads the queue and
             // goes alone (a SYN is never collapsed), what follows once
             // it is acked (the loss state resends it)
@@ -331,7 +355,10 @@ impl TcpCb {
             // one more retransmission towards undo
             self.rtx_stamp.get_or_insert(now);
             self.undo_retrans = self.undo_retrans.max(0) + 1;
-        } else if let Some(head) = self.rtx_head() {
+        } else if !handshake
+            && !self.syn_unacked
+            && let Some(head) = self.rtx_head()
+        {
             self.retransmit_skb(head, 1, now, out);
         }
         self.live.backoff.set(self.live.backoff.get() + 1);

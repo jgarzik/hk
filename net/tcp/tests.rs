@@ -2184,6 +2184,89 @@ fn syncookie_handshake() {
     assert_eq!(transfer(&mut p, &data, 500), data);
 }
 
+/// A request of a listener with TCP_DEFER_ACCEPT `defer` (in SYN-ACK
+/// retransmissions) after a's bare ACK: dropped, the request acked
+fn defer_pair(defer: u8) -> Pair {
+    let mut p = Pair::bare();
+    let mut out = Out::default();
+    p.a.connect(open(1000, 1460), p.now, &mut out);
+    let syn = wire(&out).remove(0);
+    let mut out = Out::default();
+    p.b.opts.defer_accept = defer;
+    p.b.passive_in(&seg_in(&syn), open(5000, 1460), p.now, &mut out);
+    p.take(false, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::Established);
+    // Linux tcp_check_req: the bare ACK is dropped
+    assert_eq!(p.b.state, TcpState::SynReceived);
+    assert!(p.b.req_acked);
+    p
+}
+
+/// TCP_DEFER_ACCEPT: data after the dropped bare ACK completes the
+/// request at once
+#[test]
+fn defer_accept_data_completes() {
+    let mut p = defer_pair(super::info::secs_to_retrans(5));
+    p.now += 100;
+    p.send_a(b"hello");
+    p.run();
+    assert_eq!(p.b.state, TcpState::Established);
+    assert_eq!(p.read_b(16), b"hello");
+}
+
+/// TCP_DEFER_ACCEPT without data: no SYN-ACK resent while deferring
+/// (Linux syn_ack_recalc), one last chance at the end of the period,
+/// whose ACK completes the request
+#[test]
+fn defer_accept_last_chance() {
+    let defer = super::info::secs_to_retrans(5);
+    assert_eq!(defer, 3);
+    let mut p = defer_pair(defer);
+    let synacks = |p: &Pair| {
+        p.log
+            .iter()
+            .filter(|(_, to_b, s)| !to_b && s.has(flags::SYN))
+            .count()
+    };
+    assert_eq!(synacks(&p), 1);
+    // Two timeouts (1 s, 2 s): silent
+    for _ in 0..2 {
+        assert!(p.tick());
+        p.run();
+        assert_eq!(synacks(&p), 1);
+        assert_eq!(p.b.state, TcpState::SynReceived);
+    }
+    // The third resends; the peer's duplicate ACK completes it
+    assert!(p.tick());
+    assert_eq!(synacks(&p), 2);
+    p.run();
+    assert_eq!(p.b.state, TcpState::Established);
+}
+
+/// TCP_DEFER_ACCEPT on a connecting socket saves the handshake's last
+/// ACK for the delayed ACK timer (Linux tcp_rcv_synsent_state_process)
+#[test]
+fn defer_accept_active_delays_ack() {
+    let mut p = Pair::bare();
+    p.a.opts.defer_accept = 1;
+    let mut out = Out::default();
+    p.a.connect(open(1000, 1460), p.now, &mut out);
+    let syn = wire(&out).remove(0);
+    let mut out = Out::default();
+    p.b.passive_in(&seg_in(&syn), open(5000, 1460), p.now, &mut out);
+    let synack = wire(&out).remove(0);
+    let mut out = Out::default();
+    p.a.feed(&seg_in(&synack), p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::Established);
+    assert!(wire(&out).is_empty());
+    assert_eq!(p.a.next_timer(), Some(p.now + super::ack::DELACK_MAX));
+    let mut out = Out::default();
+    p.a.on_timer(p.now + super::ack::DELACK_MAX, &mut out);
+    let w = wire(&out);
+    assert!(w.len() == 1 && w[0].has(flags::ACK) && w[0].ack == 5001);
+}
+
 // ============================================================================
 // Review findings (reproduce first)
 // ============================================================================

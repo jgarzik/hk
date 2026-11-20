@@ -291,7 +291,10 @@ pub struct Opts {
     pub syncnt: u32,
     /// TCP_NOTSENT_LOWAT (0 = unlimited)
     pub notsent_lowat: u32,
-    /// TCP_DEFER_ACCEPT (retransmissions; stored only)
+    /// TCP_DEFER_ACCEPT in SYN-ACK retransmissions (Linux
+    /// rskq_defer_accept): a listener's requests drop bare ACKs until
+    /// data comes or that many timeouts pass; a connecting socket
+    /// delays the handshake's last ACK
     pub defer_accept: u8,
     /// TCP_LINGER2: an orphan's FIN_WAIT_2 lifetime, ms (Linux
     /// tp->linger2: 0 for tcp_fin_timeout, negative for none: reset)
@@ -914,6 +917,10 @@ pub struct TcpCb {
     /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
     /// processed as tcp_child_process does
     pub(super) req_full: bool,
+    /// A request's SYN-ACK was acknowledged by a bare ACK it dropped
+    /// (TCP_DEFER_ACCEPT) or by one its full accept queue could not
+    /// take (Linux inet_rsk(req)->acked)
+    pub(super) req_acked: bool,
     /// The first retransmission of the episode, ms (Linux
     /// retrans_stamp: the retry and user timeouts count from it, the
     /// timestamp echo is compared with it for undo)
@@ -1102,6 +1109,7 @@ impl TcpCb {
             syn_unacked: Default::default(),
             passive: Default::default(),
             req_full: Default::default(),
+            req_acked: false,
             rtx_stamp: Default::default(),
             probes_tstamp: None,
             rcv_tstamp: Default::default(),

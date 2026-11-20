@@ -855,8 +855,11 @@ impl TcpSock {
     }
 
     /// A listener's child still in SYN_RECEIVED (Linux's request sock)
-    /// whose listener is no longer listening (closed, or gone)
-    fn req_dead(&self, g: &Inner) -> bool {
+    /// whose listener is no longer listening (closed, or gone). A live
+    /// one takes the listener's TCP_DEFER_ACCEPT as it is now (Linux
+    /// tcp_check_req and reqsk_timer_handler read the listener's
+    /// rskq_defer_accept)
+    fn req_dead(&self, g: &mut Inner) -> bool {
         if !(g.cb.passive && g.cb.state == TcpState::SynReceived) {
             return false;
         }
@@ -864,6 +867,7 @@ impl TcpSock {
             None => true,
             Some(p) => {
                 let dead = !p.listening();
+                g.cb.opts.defer_accept = p.listen_opts.lock().defer_accept;
                 put_listener(p);
                 dead
             }
@@ -936,6 +940,8 @@ impl TcpSock {
         };
         let full = p.acceptq_full();
         if full {
+            // Linux tcp_check_req listen_overflow: the request is acked
+            g.cb.req_acked = true;
             self.listen_overflow();
         } else if !self.sk.net.tcp.inherit(&self.arc(), t.lport) {
             self.listen_drop();

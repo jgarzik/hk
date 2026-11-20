@@ -112,8 +112,14 @@ SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
-(/sys/module/tcp_cubic/parameters: Linux's defaults are constants), and TCP_DEFER_ACCEPT /
-TCP_FASTOPEN are stored only.
+(/sys/module/tcp_cubic/parameters: Linux's defaults are constants), and
+TCP_FASTOPEN is stored only. A request's SYN-ACK retries
+are not cut while old requests clog the SYN queue (reqsk_timer_handler
+lowers max_syn_ack_retries when qlen * 2 exceeds max(8, backlog) and
+young requests are few: hk keeps no young count), and a connecting
+socket saves the handshake's last ACK for TCP_DEFER_ACCEPT or pingpong
+mode but not for sk_write_pending (tcp_rcv_synsent_state_process: a
+writer waiting for the connection).
 
 UDP has no hash4 (Linux udp_table.hash4: connected sockets by
 four-tuple, looked up before hash2), and its compute_score lacks the

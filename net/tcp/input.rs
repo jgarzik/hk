@@ -100,6 +100,15 @@ impl TcpCb {
             self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
         }
         self.established(s, now, out);
+        if self.opts.defer_accept != 0 || self.live.pingpong.get() {
+            // Linux: "Save one ACK" for the data expected soon: the
+            // ACK owed, quickack mode, the delayed ACK timer at
+            // TCP_DELACK_MAX; the segment consumed
+            self.dack.pending = true;
+            self.enter_quickack();
+            self.dack.at = Some(now + super::ack::DELACK_MAX);
+            return;
+        }
         self.ack_now = true;
         self.rcv_text(s, skb, now, out);
         self.output(now, out);
@@ -331,6 +340,16 @@ impl TcpCb {
                 return;
             }
             if req && !self.req_full {
+                // Linux tcp_check_req: "While TCP_DEFER_ACCEPT is
+                // active, drop bare ACK" (the request remembers it was
+                // acked, its TSval noted first)
+                let defer = u32::from(self.opts.defer_accept);
+                if self.live.retransmits.get() < defer && s.end_seq == self.irs.wrapping_add(1) {
+                    self.update_ts_recent(s);
+                    self.req_acked = true;
+                    self.net_stat(LINUX_MIB_TCPDEFERACCEPTDROP);
+                    return;
+                }
                 // tcp_check_req accepted it: the listener makes the
                 // child, then the child processes it (state unchanged)
                 out.req_ack = Some(skb);

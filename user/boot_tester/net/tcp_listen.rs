@@ -17,24 +17,32 @@
 //!   quarter of tcp_max_syn_backlog requests for proven peers: past it
 //!   a SYN from a new peer is dropped (ListenDrops), however large the
 //!   listen backlog (Linux tcp_conn_request)
+//! - TCP_DEFER_ACCEPT: a listener's request drops the bare ACK
+//!   (TCPDeferAcceptDrop) and is accepted once data comes (Linux
+//!   tcp_check_req); a connecting socket with it saves the handshake's
+//!   last ACK for the delayed ACK timer (tcp_rcv_synsent_state_process)
 
-use hk_syscall::{sys_accept, sys_listen, sys_setsockopt};
+use hk_syscall::{
+    AF_INET, SOCK_NONBLOCK, SOCK_STREAM, sys_accept, sys_listen, sys_setsockopt, sys_socket,
+};
 
 use crate::harness::T;
 use crate::helpers::{host_mode, skip};
 use crate::net::sk::*;
 use crate::net::snmp::Mib;
-use crate::net::tcp_synrecv::{ACK, FIN, Peer, RST, SYN, got};
+use crate::net::tcp_synrecv::{ACK, FIN, PEER_PORT, Peer, RST, SYN, VOID, got};
 use crate::proc::sysctl::{read_file, reads, write_file};
 
 const NETSTAT: &[u8] = b"/proc/net/netstat\0";
 const TCP_MAXSEG: i32 = 2;
+const TCP_DEFER_ACCEPT: i32 = 9;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== TCP Listener Tests ===");
     test_tw_isn();
     test_syncookie();
     test_max_syn_backlog();
+    test_defer_accept();
 }
 
 /// SYN options: MSS 1460, SACK permitted, timestamps (`tsval`, 0),
@@ -239,5 +247,60 @@ fn test_max_syn_backlog() {
     write_file(COOKIES, b"1");
     write_file(MAXSYN, &old[..n as usize - 1]);
     t.ok(b"restored", reads(MAXSYN, &old[..n as usize]), 0);
+    t.done();
+}
+
+fn test_defer_accept() {
+    const Y: u32 = 0x7800_0000;
+    const S: u32 = 0x7900_0000;
+    let mut t = T::new(b"TCP_DEFER_ACCEPT");
+    let Some(peer) = Peer::new(&mut t) else {
+        return t.done();
+    };
+    let l = tcp();
+    bind(l, LO, 0);
+    let pl = port(l);
+    t.eq(b"defer", setint(l, IPPROTO_TCP, TCP_DEFER_ACCEPT, 5), 0);
+    sys_listen(l, 8);
+    let drops = tcpext(b"TCPDeferAcceptDrop");
+    t.eq(b"syn", peer.send(pl, Y, 0, SYN), 40);
+    let (f, s, _) = got(peer.from(pl, 1000));
+    t.eq(b"syn-ack", f, i64::from(SYN | ACK));
+    // The bare ACK is dropped: nothing to accept
+    t.eq(b"bare ack", peer.send(pl, Y + 1, s + 1, ACK), 40);
+    t.eq(b"not ready", poll1(l, 1, 300).0, 0);
+    t.eq(
+        b"TCPDeferAcceptDrop",
+        tcpext(b"TCPDeferAcceptDrop") - drops,
+        1,
+    );
+    // Data completes it
+    let r = peer.send_full(PEER_PORT, pl, Y + 1, s + 1, ACK, &[], b"hi");
+    t.eq(b"data", r, 42);
+    let a = accept_in(l, 1000);
+    t.ok(b"accept", a >= 0, i64::from(a));
+    let mut b = [0u8; 4];
+    t.eq(b"recv", recv(a, &mut b, MSG_DONTWAIT), 2);
+    abort(a);
+    close(l);
+    // A connecting socket with it delays the handshake's last ACK
+    let c = sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0) as i32;
+    t.eq(
+        b"client defer",
+        setint(c, IPPROTO_TCP, TCP_DEFER_ACCEPT, 1),
+        0,
+    );
+    bind(c, LO, 0);
+    t.eq(b"connect", connect(c, VOID, PEER_PORT), EINPROGRESS);
+    let pc = port(c);
+    let (f, iss, _) = got(peer.from(pc, 1000));
+    t.eq(b"client syn", f, i64::from(SYN));
+    let start = now_ms();
+    t.eq(b"peer syn-ack", peer.send(pc, S, iss + 1, SYN | ACK), 40);
+    let (f, _, ack) = got(peer.from(pc, 1000));
+    let waited = now_ms() - start;
+    t.ok(b"ack", f == i64::from(ACK) && ack == S + 1, f);
+    t.ok(b"delayed", (150..1000).contains(&waited), waited as i64);
+    abort(c);
     t.done();
 }
