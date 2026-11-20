@@ -60,8 +60,8 @@ pub const PATH_MAX: usize = 4096;
 /// file types copy straight between their data and the caller (`fs::iov_iter`)
 pub const MAX_RW_COUNT: usize = 0x7fff_f000;
 
-/// Maximum number of iovec entries (Linux default)
-pub const IOV_MAX: usize = 1024;
+/// Most segments in one iovec array (Linux UIO_MAXIOV)
+pub const UIO_MAXIOV: usize = 1024;
 
 // =============================================================================
 // RLIMIT_NOFILE enforcement helpers

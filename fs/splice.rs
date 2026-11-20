@@ -662,7 +662,7 @@ pub fn sys_vmsplice(
 
     let file = fget(fd)?;
     // The segments as readv takes them (Linux import_iovec): EINVAL
-    // past IOV_MAX or for a negative length, cut to MAX_RW_COUNT
+    // past UIO_MAXIOV or for a negative length, cut to MAX_RW_COUNT
     let n = i32::try_from(nr_segs).map_err(|_| KernelError::InvalidArgument)?;
     let segs = crate::fs::iov::import_iovec(iov, n)?;
     // Not a pipe: EBADF (Linux get_pipe_info failing in both directions)

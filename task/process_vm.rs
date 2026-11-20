@@ -6,15 +6,12 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
-use crate::fs::iov::{IoVec, import_iovec};
-use crate::fs::syscall::IOV_MAX;
+use crate::fs::iov::{IoVec, import_iovec, iovec_from_user};
 use crate::mm::MmRef;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
 use crate::task::percpu::current;
 use crate::task::{Pid, Task};
-use crate::uaccess::{UserPtr, UserSlice, access_ok, copy_from_user, copy_to_user};
+use crate::uaccess::{UserPtr, copy_from_user, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
 
 /// Bytes copied per step: the bounce buffer stays small whatever the
@@ -52,7 +49,7 @@ pub fn sys_process_vm_writev(
 }
 
 /// Linux process_vm_rw: flags (EINVAL), the local iovecs as readv
-/// takes them (import_iovec: IOV_MAX and negative lengths EINVAL, an
+/// takes them (import_iovec: UIO_MAXIOV and negative lengths EINVAL, an
 /// address outside user space EFAULT, the total cut to MAX_RW_COUNT),
 /// nothing to do if they hold no byte, then the remote iovecs
 /// (iovec_from_user) and the copy
@@ -69,41 +66,15 @@ fn process_vm_rw(
         return Err(KernelError::InvalidArgument);
     }
     // import_iovec takes the count as an unsigned int: truncated on
-    // purpose, as in Linux; above IOV_MAX it is EINVAL either way
+    // purpose, as in Linux; above UIO_MAXIOV it is EINVAL either way
     let lcnt = i32::try_from(liovcnt as u32).unwrap_or(-1);
     let local = import_iovec(lvec, lcnt)?;
     if local.iter().all(|v| v.iov_len == 0) {
         return Ok(0);
     }
-    let remote = remote_iovecs(rvec, riovcnt)?;
+    // The remote addresses are the target's, checked only when copied
+    let remote = iovec_from_user(rvec, riovcnt as usize)?;
     process_vm_rw_core(pid, &local, &remote, write)
-}
-
-/// The remote iovecs (Linux iovec_from_user): none for a count of 0;
-/// more than IOV_MAX, or a length negative as ssize_t, EINVAL; an
-/// array outside user space EFAULT. Their addresses are the target's,
-/// checked only when copied.
-fn remote_iovecs(uvec: UserPtr<IoVec>, n: u64) -> KernelResult<Vec<IoVec>> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let n = usize::try_from(n)
-        .ok()
-        .filter(|&n| n <= IOV_MAX)
-        .ok_or(KernelError::InvalidArgument)?;
-    let size = n * core::mem::size_of::<IoVec>();
-    if !access_ok(uvec.addr(), size) {
-        return Err(KernelError::BadAddress);
-    }
-    let mut v = crate::util::kmem::try_vec(n, IoVec::default())?;
-    let mut r = UserSlice::new(uvec.addr(), size).reader();
-    for iov in &mut v {
-        *iov = r.read::<IoVec>()?;
-        if i64::try_from(iov.iov_len).is_err() {
-            return Err(KernelError::InvalidArgument);
-        }
-    }
-    Ok(v)
 }
 
 /// Linux process_vm_rw_core: nothing to do if no remote iovec has a
