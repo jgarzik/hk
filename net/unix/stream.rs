@@ -159,6 +159,9 @@ fn try_connect(
     // The server side passes credentials if the listener does
     let pass = other.sk.flag(sf::PASSCRED);
     newsk.sk.set_flag(sf::PASSCRED, pass);
+    newsk
+        .sk
+        .set_flag(sf::PASSPIDFD, other.sk.flag(sf::PASSPIDFD));
     newsk.sk.set_flag(sf::PASSSEC, other.sk.flag(sf::PASSSEC));
     *newsk.addr.write() = other.addr();
     // Linux unix_stream_connect: path_get(&otheru->path), the copy
@@ -670,7 +673,7 @@ fn may_join(
         if creds != g.creds.as_ref() {
             return false;
         }
-    } else if s.passcred() {
+    } else if s.may_passcred() {
         g.creds = creds.cloned();
         g.check_creds = true;
     }

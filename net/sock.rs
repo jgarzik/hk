@@ -63,6 +63,8 @@ pub mod sf {
     pub const ACCEPTCONN: u32 = 1 << 14;
     /// SO_RCVBUF was set (Linux SOCK_RCVBUF_LOCK in sk_userlocks)
     pub const RCVBUF_LOCK: u32 = 1 << 15;
+    /// SO_PASSPIDFD (Linux SOCK_PASSPIDFD)
+    pub const PASSPIDFD: u32 = 1 << 16;
 }
 
 /// sock_extended_err origins (SO_EE_ORIGIN_*)

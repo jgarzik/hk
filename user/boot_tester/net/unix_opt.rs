@@ -1,7 +1,11 @@
 //! AF_UNIX options (hk and Linux): SO_PEEK_OFF on stream, datagram and
-//! seqpacket sockets (Linux selftests af_unix/so_peek_off.c).
+//! seqpacket sockets (Linux selftests af_unix/so_peek_off.c);
+//! SO_PASSPIDFD / SCM_PIDFD and SO_PEERPIDFD (af_unix/scm_pidfd.c).
 
-use hk_syscall::{SOCK_DGRAM, SOCK_STREAM};
+use hk_syscall::{
+    O_RDONLY, SOCK_DGRAM, SOCK_STREAM, sys_exit, sys_fcntl, sys_fork, sys_getpid, sys_open,
+    sys_pidfd_send_signal, sys_pipe, sys_read, sys_wait4, sys_write,
+};
 
 use crate::harness::T;
 use crate::net::sk::*;
@@ -9,12 +13,18 @@ use crate::net::unix::pair;
 
 const SOCK_SEQPACKET: i32 = 5;
 const SO_PEEK_OFF: i32 = 42;
+const SO_PASSPIDFD: i32 = 76;
+const SO_PEERPIDFD: i32 = 77;
+const SCM_PIDFD: i32 = 4;
+const F_GETFD: i32 = 1;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== AF_UNIX option Tests ===");
     for ty in [SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET] {
         test_peek_off(ty);
     }
+    test_pidfd();
+    test_pidfd_child();
 }
 
 /// Receive into a `len`-byte buffer: exactly the bytes `want`
@@ -91,5 +101,132 @@ fn test_peek_off(ty: i32) {
     t.ok(b"read after", recveq(b, 8, 0, b"cc"), 0);
     close(a);
     close(b);
+    t.done();
+}
+
+/// The `Pid:` of a pidfd's /proc/self/fdinfo (-1000 if unreadable)
+fn fdinfo_pid(fd: i32) -> i64 {
+    let mut path = *b"/proc/self/fdinfo/\0\0\0\0\0";
+    let mut d = [0u8; 5];
+    let (mut v, mut k) = (fd as u32, 0);
+    loop {
+        d[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..k {
+        path[18 + i] = d[k - 1 - i];
+    }
+    let f = sys_open(path.as_ptr(), O_RDONLY, 0) as i32;
+    if f < 0 {
+        return -1000;
+    }
+    let mut buf = [0u8; 512];
+    let n = sys_read(f as u64, buf.as_mut_ptr(), buf.len() as u64);
+    close(f);
+    if n <= 0 {
+        return -1000;
+    }
+    let text = &buf[..n as usize];
+    let Some(line) = text
+        .split(|&c| c == b'\n')
+        .find(|l| l.starts_with(b"Pid:\t"))
+    else {
+        return -1000;
+    };
+    let mut v: i64 = 0;
+    let mut neg = false;
+    for &c in &line[5..] {
+        match c {
+            b'-' => neg = true,
+            b'0'..=b'9' => v = v * 10 + i64::from(c - b'0'),
+            _ => break,
+        }
+    }
+    if neg { -v } else { v }
+}
+
+/// The SCM_PIDFD of a received message (-1000 if none)
+fn recv_pidfd(fd: i32) -> i64 {
+    let mut buf = [0u8; 8];
+    let mut ctl = [0u8; 64];
+    let (r, _, clen) = recv_msg(fd, &mut buf, &mut ctl, 0);
+    if r < 0 {
+        return r;
+    }
+    match cmsg_find(&ctl, clen, SOL_SOCKET, SCM_PIDFD) {
+        Some(d) if d.len() >= 4 => i32::from_ne_bytes(d[..4].try_into().unwrap()) as i64,
+        _ => -1000,
+    }
+}
+
+/// A pidfd names `pid`, is O_CLOEXEC and signals (signal 0)
+fn pidfd_is(t: &mut T, fd: i64, pid: i64) {
+    t.ok(b"pidfd", fd >= 0, fd);
+    if fd < 0 {
+        return;
+    }
+    let fd = fd as i32;
+    t.eq(b"fdinfo Pid", fdinfo_pid(fd), pid);
+    t.eq(b"FD_CLOEXEC", sys_fcntl(fd, F_GETFD, 0) & 1, 1);
+    t.eq(
+        b"pidfd_send_signal 0",
+        sys_pidfd_send_signal(fd, 0, core::ptr::null(), 0),
+        0,
+    );
+    close(fd);
+}
+
+/// SO_PASSPIDFD: a message comes with SCM_PIDFD of its sender;
+/// SO_PEERPIDFD: a pidfd of the peer's creator; ENODATA without peer
+fn test_pidfd() {
+    let mut t = T::new(b"UNIX_PIDFD");
+    let me = sys_getpid();
+    let (a, b) = pair(SOCK_STREAM);
+    t.eq(b"off", getint(b, SOL_SOCKET, SO_PASSPIDFD).1 as i64, 0);
+    t.eq(b"set", setint(b, SOL_SOCKET, SO_PASSPIDFD, 1), 0);
+    t.eq(b"on", getint(b, SOL_SOCKET, SO_PASSPIDFD).1 as i64, 1);
+    send(a, b"x", 0);
+    let fd = recv_pidfd(b);
+    pidfd_is(&mut t, fd, me);
+    // Without the option, none
+    send(b, b"y", 0);
+    t.eq(b"none unasked", recv_pidfd(a), -1000);
+    let (r, fd) = getint(a, SOL_SOCKET, SO_PEERPIDFD);
+    t.eq(b"SO_PEERPIDFD", r, 0);
+    pidfd_is(&mut t, fd as i64, me);
+    let u = udp();
+    t.eq(b"udp", getint(u, SOL_SOCKET, SO_PEERPIDFD).0, -61);
+    for f in [a, b, u] {
+        close(f);
+    }
+    t.done();
+}
+
+/// Another process's datagram: SCM_PIDFD names it
+fn test_pidfd_child() {
+    let mut t = T::new(b"UNIX_PIDFD_CHILD");
+    let (a, b) = pair(SOCK_DGRAM);
+    setint(b, SOL_SOCKET, SO_PASSPIDFD, 1);
+    let mut p = [0i32; 2];
+    sys_pipe(p.as_mut_ptr());
+    let pid = sys_fork();
+    if pid == 0 {
+        send(a, b"c", 0);
+        let mut c = [0u8; 1];
+        sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let fd = recv_pidfd(b);
+    pidfd_is(&mut t, fd, pid);
+    sys_write(p[1] as u64, b"x".as_ptr(), 1);
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    for f in [a, b, p[0], p[1]] {
+        close(f);
+    }
     t.done();
 }

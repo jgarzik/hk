@@ -44,6 +44,8 @@ use crate::util::error::KernelError;
 
 pub const SCM_RIGHTS: i32 = 1;
 pub const SCM_CREDENTIALS: i32 = 2;
+/// A pidfd of the sender (Linux SCM_PIDFD)
+pub const SCM_PIDFD: i32 = 4;
 /// Most files in one message (Linux SCM_MAX_FD)
 pub const SCM_MAX_FD: usize = 253;
 /// struct cmsghdr
@@ -350,11 +352,18 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
 }
 
 /// Deliver received ancillary data (Linux scm_recv_unix): credentials
-/// when the receiver set SO_PASSCRED, then the files. Without control
-/// space everything is truncated (MSG_CTRUNC) and the files closed.
-pub fn put(m: &mut RecvMsg<'_>, passcred: bool, creds: Option<Creds>, fds: Option<FpList>) {
+/// when the receiver set SO_PASSCRED, then the files, then with
+/// SO_PASSPIDFD a pidfd of the sender. Without control space
+/// everything is truncated (MSG_CTRUNC) and the files closed.
+pub fn put(
+    m: &mut RecvMsg<'_>,
+    passcred: bool,
+    passpidfd: bool,
+    creds: Option<Creds>,
+    fds: Option<FpList>,
+) {
     if m.cmsg.capacity() == 0 {
-        if passcred || fds.is_some() {
+        if passcred || passpidfd || fds.is_some() {
             m.cmsg.trunc = true;
         }
         drop(fds);
@@ -367,6 +376,26 @@ pub fn put(m: &mut RecvMsg<'_>, passcred: bool, creds: Option<Creds>, fds: Optio
     if let Some(f) = fds {
         put_fds(m, f);
     }
+    if passpidfd {
+        put_pidfd(m, creds.as_ref());
+    }
+}
+
+/// Linux scm_pidfd_recv: SCM_PIDFD, a pidfd (O_CLOEXEC) for the
+/// sender's process, or the error making it gave; MSG_CTRUNC without
+/// room for it; nothing for a message without a sender pid
+fn put_pidfd(m: &mut RecvMsg<'_>, creds: Option<&Creds>) {
+    if m.cmsg.room() < CMSG_HDR + 4 {
+        m.cmsg.trunc = true;
+        return;
+    }
+    let Some(pid) = creds.and_then(|c| c.pid.clone()) else {
+        return;
+    };
+    let fd = crate::task::pidfd::pidfd_file(pid, 0)
+        .and_then(|f| crate::net::syscall::fd_install(f, true))
+        .unwrap_or_else(|e| e.to_errno_neg());
+    m.cmsg.put(SOL_SOCKET, SCM_PIDFD, &fd.to_ne_bytes());
 }
 
 /// Install as many files as fit (Linux scm_detach_fds); the rest are

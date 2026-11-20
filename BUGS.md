@@ -399,8 +399,7 @@ or FLAG_LOG.
 
 **Location**: `net/unix/`
 
-Not implemented: SO_PASSPIDFD / SCM_PIDFD /
-SO_PEERPIDFD, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC, SIOCUNIXFILE,
+Not implemented: SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC, SIOCUNIXFILE,
 SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 ## File permission (DAC) gaps

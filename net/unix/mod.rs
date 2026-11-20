@@ -91,7 +91,7 @@ use crate::net::skb::{SkBuff, SkbCb, SkbOwned, SkbOwnedQueue};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
     AF_UNIX, OptIn, OptOut, ProtoOps, SIOCATMARK, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SO_PEERGROUPS,
-    SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
+    SO_PEERPIDFD, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
 };
 use crate::net::{NetNamespace, NetRef};
 use crate::sync::Mutex as SMutex;
@@ -241,7 +241,7 @@ pub fn unix_len(skb: &SkBuff) -> usize {
 /// yet), unless the sender gave SCM_CREDENTIALS
 fn add_creds(skb: &mut SkBuff, me: &UnixSock, other: &UnixSock) {
     let cb = ucb_mut(skb);
-    if cb.creds.is_none() && (me.passcred() || other.passcred() || !other.has_file()) {
+    if cb.creds.is_none() && (me.may_passcred() || other.may_passcred() || !other.has_file()) {
         cb.creds = Some(Creds::current());
     }
 }
@@ -610,6 +610,12 @@ impl UnixSock {
         self.sk.flag(sf::PASSCRED)
     }
 
+    /// Credentials travel with messages (Linux unix_may_passcred:
+    /// SO_PASSCRED or SO_PASSPIDFD)
+    fn may_passcred(&self) -> bool {
+        self.sk.flag(sf::PASSCRED) || self.sk.flag(sf::PASSPIDFD)
+    }
+
     /// Has a socket file (an embryo gets one when accepted)
     fn has_file(&self) -> bool {
         self.sk.ino.load(Ordering::Acquire) != 0
@@ -771,7 +777,7 @@ impl UnixSock {
     /// Autobind first when credentials are passed (Linux
     /// unix_may_passcred && !u->addr)
     fn passcred_autobind(&self) -> Result<(), KernelError> {
-        if self.passcred() && self.addr().is_none() {
+        if self.may_passcred() && self.addr().is_none() {
             self.autobind()?;
         }
         Ok(())
@@ -942,6 +948,15 @@ impl UnixSock {
             _ => false,
         };
         Ok(is(Some(&skb)) || (unix_len(&skb) == 0 && (oob.is_none() || is(next.as_ref()))))
+    }
+
+    /// SO_PEERPIDFD (Linux sk_getsockopt): a pidfd (O_CLOEXEC) for the
+    /// peer's process, ENODATA without peer credentials
+    fn peerpidfd_opt(&self) -> Result<OptOut, KernelError> {
+        let pid = self.peercred.lock().as_ref().and_then(|c| c.pid.clone());
+        let pid = pid.ok_or(KernelError::NoData)?;
+        let f = crate::task::pidfd::pidfd_file(pid, 0)?;
+        Ok(OptOut::Int(crate::net::syscall::fd_install(f, true)?))
     }
 
     /// Linux unix_inq_len: EINVAL on a listener; a stream's unread
@@ -1137,6 +1152,7 @@ impl ProtoOps for UnixSock {
         match opt {
             SO_PEERCRED => Some(Ok(self.peercred_opt())),
             SO_PEERGROUPS => Some(self.peergroups_opt()),
+            SO_PEERPIDFD => Some(self.peerpidfd_opt()),
             _ => None,
         }
     }
@@ -1299,5 +1315,5 @@ fn rcv_shut(s: &UnixSock) -> bool {
 
 /// Common receive tail: credentials and files into control messages
 fn scm_recv(s: &UnixSock, m: &mut RecvMsg<'_>, creds: Option<Creds>, fds: Option<FpList>) {
-    scm::put(m, s.passcred(), creds, fds);
+    scm::put(m, s.passcred(), s.sk.flag(sf::PASSPIDFD), creds, fds);
 }

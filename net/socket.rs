@@ -450,6 +450,8 @@ pub const SO_RXQ_OVFL: i32 = 40;
 pub const SO_PEEK_OFF: i32 = 42;
 pub const SO_COOKIE: i32 = 57;
 pub const SO_PEERGROUPS: i32 = 59;
+pub const SO_PASSPIDFD: i32 = 76;
+pub const SO_PEERPIDFD: i32 = 77;
 pub const SO_BINDTOIFINDEX: i32 = 62;
 pub const SO_RCVTIMEO_NEW: i32 = 66;
 pub const SO_SNDTIMEO_NEW: i32 = 67;
@@ -468,6 +470,7 @@ fn bool_opt(opt: i32) -> Option<u32> {
         SO_RXQ_OVFL => sf::RXQ_OVFL,
         SO_NO_CHECK => sf::NO_CHECK,
         SO_PASSSEC => sf::PASSSEC,
+        SO_PASSPIDFD => sf::PASSPIDFD,
         _ => return None,
     })
 }
@@ -658,7 +661,7 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.sndtimeo()))),
         SO_PEERCRED => Ok(OptOut::Bytes(peercred_bytes(None))),
         // Only AF_UNIX (and Linux's Bluetooth) has peer credentials
-        SO_PEERGROUPS => Err(KernelError::NoData),
+        SO_PEERGROUPS | SO_PEERPIDFD => Err(KernelError::NoData),
         SO_BINDTODEVICE => {
             let i = sk.bound_dev_if();
             let mut b = Vec::new();
