@@ -11,7 +11,8 @@
 //! - TCP_SYNCOOKIE: with the SYN queue full a SYN gets a cookie SYN-ACK
 //!   (timestamp and window scale kept); its ACK makes an accepted
 //!   connection with the cookie's MSS and the ACK's data; a forged
-//!   cookie gets a RST; the Syncookies* and TCPReqQFullDoCookies
+//!   cookie gets a RST, and so does a valid one whose timestamp names
+//!   SACK once tcp_sack is off; the Syncookies* and TCPReqQFullDoCookies
 //!   counters (Linux tcp_conn_request want_cookie, cookie_v4_check)
 //! - TCP_MAX_SYN_BACKLOG: without SYN cookies a listener keeps the last
 //!   quarter of tcp_max_syn_backlog requests for proven peers: past it
@@ -168,6 +169,8 @@ fn test_syncookie() {
     const P1: u16 = 7791;
     const P2: u16 = 7792;
     const P3: u16 = 7793;
+    const P4: u16 = 7794;
+    const SACK: &[u8] = b"/proc/sys/net/ipv4/tcp_sack\0";
     if host_mode() {
         // Ubuntu's 6.8: a stale per-CPU tcp_tw_isn makes a SYN look
         // like a TIME_WAIT takeover, never a cookie (BUGS.md)
@@ -225,9 +228,31 @@ fn test_syncookie() {
     t.eq(b"forged ack", r, 40);
     let (f, seq, _) = got(peer.from_to(pl, P3, 1000));
     t.ok(b"reset", f == i64::from(RST) && seq == 0x1234_5678, f);
+    // A valid cookie whose timestamp names an option turned off since:
+    // the listener answers the ACK with a RST (cookie_timestamp_decode
+    // fails, cookie_v4_check returns the listener)
+    peer.send_full(P4, pl, Y, 0, SYN, &syn_opts(200), &[]);
+    let sa = peer.from_to(pl, P4, 1000).unwrap_or_default();
+    t.ok(
+        b"sack cookie",
+        sa.flags == SYN | ACK && sa.ts.is_some(),
+        i64::from(sa.flags),
+    );
+    let (tsval, _) = sa.ts.unwrap_or((0, 0));
+    t.eq(b"sack off", write_file(SACK, b"0"), 1);
+    let ack = ts_opt(201, tsval);
+    peer.send_full(P4, pl, Y + 1, sa.seq + 1, ACK, &ack, &[]);
+    let (f, seq, _) = got(peer.from_to(pl, P4, 1000));
+    t.eq(b"sack on", write_file(SACK, b"1"), 1);
+    t.ok(
+        b"decode reset",
+        f == i64::from(RST) && seq == sa.seq.wrapping_add(1),
+        f,
+    );
     let after = names.map(tcpext);
     for (i, n) in names.iter().enumerate() {
-        t.ok(n, after[i] == before[i] + 1, after[i] - before[i]);
+        let want = [2, 2, 1, 2][i];
+        t.ok(n, after[i] == before[i] + want, after[i] - before[i]);
     }
     abort(a);
     peer.send_full(P1, pl, Y + 1, 0, RST, &[], &[]);

@@ -1363,7 +1363,8 @@ impl TcpSock {
     /// tcp_syncookies, after a recent SYN queue overflow, a valid cookie
     /// whose timestamp names only enabled options makes the child
     /// (`cookie_child`). Handed back when the listener answers the
-    /// segment itself (no cookie: RST); consumed when a child was made
+    /// segment itself (no cookie, or one naming options turned off:
+    /// RST); consumed when a child was made
     /// or the accept queue is full (dropped)
     fn cookie_check(&self, s: &SegIn, skb: Box<SkBuff>, t: Tuple, now: u64) -> Option<Box<SkBuff>> {
         let net = &self.sk.net;
@@ -1392,7 +1393,12 @@ impl TcpSock {
             tsoff = if c.ts == 1 { ts_off(&t) } else { 0 };
             ts = Some((v, e.wrapping_sub(tsoff)));
         }
-        let r = syncookies::timestamp_decode(ts, &c)?;
+        // Options turned off since: the listener answers (Linux
+        // cookie_tcp_check fails, cookie_v4_check returns the listener,
+        // whose tcp_rcv_state_process resets the ACK)
+        let Some(r) = syncookies::timestamp_decode(ts, &c) else {
+            return Some(skb);
+        };
         // tcp_v4_syn_recv_sock: a full accept queue drops it
         if self.acceptq_full() {
             self.listen_overflow();
