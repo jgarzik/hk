@@ -675,6 +675,11 @@ PTRACE_PEEKUSER/POKEUSER, PTRACE_GETFPREGS/SETFPREGS and
 PTRACE_GETREGSET/SETREGSET are EINVAL (Linux arch_ptrace: gdb reads
 debug registers and FP state through them).
 
+PTRACE_TRACER_SIPID (`user/boot_tester/signal/ptrace_stop.rs`
+`test_tracer_sipid`) hung once in 20 `make check-stress OVERFLOW=1` x86
+boots (no output after PTRACE_SINGLESTEP_TRACE, boot timeout); not
+reproduced, cause unknown.
+
 ## NETLINK_ROUTE / SIOC* subset gaps
 
 **Location**: `net/netlink/rtnetlink.rs`, `net/devioctl.rs`
