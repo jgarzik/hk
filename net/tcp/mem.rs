@@ -40,10 +40,19 @@ const PCPU_RSV_MIN: i32 = (1 << 20) / QUANTUM as i32;
 static PCPU_RSV: AtomicI32 = AtomicI32::new(PCPU_RSV_MIN);
 /// tcp_mem in quanta; the boot value is the floor tcp_init_mem
 /// allows (128) until `init` sizes it
+#[cfg(not(test))]
 static LIMITS: [AtomicUsize; 3] = [
     AtomicUsize::new(96),
     AtomicUsize::new(128),
     AtomicUsize::new(192),
+];
+/// Host tests run in parallel against this one global count and never
+/// call `init`: limits no test reaches, so none sees another's memory
+#[cfg(test)]
+static LIMITS: [AtomicUsize; 3] = [
+    AtomicUsize::new(1 << 30),
+    AtomicUsize::new(1 << 30),
+    AtomicUsize::new(1 << 30),
 ];
 /// Linux tcp_memory_pressure: past tcp_mem[1], until back under [0];
 /// when it began (ms, never 0), 0 when off
