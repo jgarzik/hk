@@ -759,6 +759,38 @@ fn linger2() {
     assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONLINGER), 1);
 }
 
+/// An orphan whose FIN is acknowledged by a segment bringing data or a
+/// FIN beyond RCV.NXT is done at once (Linux tcp_rcv_state_process
+/// FIN_WAIT1: tcp_done, TCPAbortOnData, the segment answered with a
+/// RST; an active Fast Open connection's FIN pauses Fast Open), not
+/// left in FIN_WAIT_2 without a timer
+#[test]
+fn orphan_fin_acked_with_ooo_fin() {
+    let (mut p, m) = mib_pair_buf(1460, 1 << 20, 0);
+    p.a.syn_fastopen = true;
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::FinWait1);
+    let seg = SegIn {
+        seq: p.a.rcv_nxt.wrapping_add(10),
+        ack: p.a.snd_max,
+        flags: flags::ACK | flags::FIN,
+        wnd: 1000,
+        ts: Some((p.b.tsval(), p.a.tsval())),
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    p.a.feed(&seg, p.now, &mut out);
+    assert_eq!(p.a.state, TcpState::Closed);
+    assert!(out.done && out.tfo_disable);
+    assert!(
+        wire(&out)
+            .iter()
+            .any(|s| s.has(flags::RST) && s.seq == seg.ack)
+    );
+    assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONDATA), 1);
+}
+
 /// An orphan reaching FIN_WAIT_2 from its backlog, the socket owned,
 /// keeps its socket on the keepalive timer for all of tcp_fin_time
 /// (Linux tcp_rcv_state_process's sock_owned_by_user), which then

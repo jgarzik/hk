@@ -715,8 +715,9 @@ impl TcpCb {
 
     /// State changes once our FIN is acknowledged by `s`; false if the
     /// segment is consumed (Linux tcp_rcv_state_process: an orphan
-    /// reaching FIN_WAIT_2 may go to a timewait entry at once, unless
-    /// the segment brings data, which resets it as for a closed reader)
+    /// reaching FIN_WAIT_2 may go to a timewait entry at once; one with
+    /// TCP_LINGER2 negative, or whose segment brings data or a FIN
+    /// beyond RCV.NXT, is done with a reset)
     fn after_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
         if !self.fin_acked() {
             return true;
@@ -731,18 +732,19 @@ impl TcpCb {
                 if !self.orphan {
                     return true;
                 }
-                if self.opts.linger2 < 0 {
+                let ooo = s.seq != s.end_seq && after(end, self.rcv_nxt);
+                if self.opts.linger2 < 0 || ooo {
                     // Linux tcp_done, TCPAbortOnData; the segment is
-                    // answered with a reset (tcp_v4_do_rcv)
+                    // answered with a reset (tcp_v4_do_rcv). An out of
+                    // order FIN after close() on an active Fast Open
+                    // connection pauses Fast Open
+                    out.tfo_disable |= self.opts.linger2 >= 0 && self.syn_fastopen && fin;
                     if let Some(r) = super::output::reset_for(s) {
                         self.reset_seg(r, out);
                     }
                     self.set_closed(out);
                     self.net_stat(LINUX_MIB_TCPABORTONDATA);
                     return false;
-                }
-                if s.seq != s.end_seq && after(end, self.rcv_nxt) {
-                    return true;
                 }
                 !self.orphan_fw2(now, fin, out)
             }
