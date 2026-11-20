@@ -1819,6 +1819,8 @@ fn wait_connected(s: &TcpSock, g: &mut Guard<'_>, timeo: &mut u64) -> Result<(),
 fn wait_memory(s: &TcpSock, g: &mut Guard<'_>, timeo: &mut u64) -> Result<(), KernelError> {
     use crate::net::sock::TIMEO_FOREVER;
     s.sk.send_nospace(*timeo);
+    // SOCK_NOSPACE, whether it waits or not
+    s.live.nospace.store(true, Ordering::Release);
     if *timeo == 0 {
         return Err(KernelError::WouldBlock);
     }
@@ -1848,6 +1850,7 @@ fn wait_memory(s: &TcpSock, g: &mut Guard<'_>, timeo: &mut u64) -> Result<(), Ke
 /// socket released while asleep
 fn wait_space(s: &TcpSock, g: &mut Guard<'_>, timeo: &mut u64) -> Result<(), KernelError> {
     s.sk.send_nospace(*timeo);
+    s.live.nospace.store(true, Ordering::Release);
     let t = *timeo;
     *timeo = g.unlocked(|| {
         dev::netif_rx_flush_local();
@@ -2195,9 +2198,11 @@ impl ProtoOps for TcpSock {
             if sh & SEND_SHUTDOWN != 0 || writable() {
                 mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
             } else {
-                // SIGIO once there is room; room made before the bit
-                // was set is seen by the second look (Linux tcp_poll)
+                // SIGIO once there is room; room made before the bits
+                // were set is seen by the second look (Linux tcp_poll:
+                // SOCKWQ_ASYNC_NOSPACE and SOCK_NOSPACE)
                 self.sk.set_nospace();
+                self.live.nospace.store(true, Ordering::Release);
                 if writable() {
                     mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
                 }

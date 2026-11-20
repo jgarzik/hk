@@ -30,6 +30,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::sync::atomic::AtomicBool;
 
 use super::ack::Dack;
 use super::cong::Cong;
@@ -536,6 +537,12 @@ pub struct Live {
     /// not the connection's (Linux fastopenq, in the accept queue): a
     /// new block keeps it, a listener's child starts at 0
     pub(super) fastopen: SoleCell<u32>,
+    /// A writer or poll found the send buffer full (Linux SOCK_NOSPACE,
+    /// a socket flag: set lock-free by tcp_poll and under the lock by a
+    /// waiting sender, cleared when an ACK makes the socket writable,
+    /// sk_stream_write_space); the window validation reads it. Survives
+    /// a new block, as the socket's.
+    pub(super) nospace: AtomicBool,
 }
 
 impl Live {
@@ -935,9 +942,6 @@ pub struct TcpCb {
     /// The ACK being processed echoed this TSval (Linux
     /// rx_opt.saw_tstamp and rcv_tsecr)
     pub(super) rcv_tsecr: Option<u32>,
-    /// A writer found the send buffer full (Linux SOCK_NOSPACE), until
-    /// ACKs make it writable again (sk_stream_write_space)
-    pub(super) nospace: bool,
     /// The windowed minimum RTT, us (Linux rtt_min)
     pub(super) rtt_min: crate::util::win_minmax::Minmax,
     /// Delayed ACK state
@@ -1075,7 +1079,6 @@ impl TcpCb {
             recv_sack_cache: [(0, 0); NUM_SACKS],
             is_sack_reneg: false,
             rcv_tsecr: None,
-            nospace: false,
             rtt_min: min_rtt_none(),
             dack: Default::default(),
             orphan: Default::default(),
@@ -1277,10 +1280,6 @@ impl TcpCb {
         mut fill: impl FnMut(&mut [u8]) -> Result<usize, KernelError>,
     ) -> Result<usize, KernelError> {
         let n = self.wmem_schedule(max.min(self.snd_space()));
-        // Linux sk_stream_wait_memory: a writer found no room
-        if n < max {
-            self.nospace = true;
-        }
         let (mut done, mut err, mut short) = (0, None, false);
         while done < n {
             let Some(mut skb) = self.wq_tail() else {

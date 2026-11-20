@@ -513,7 +513,11 @@ impl TcpCb {
     /// or the receiver's window (not by a full send buffer), the window
     /// goes half way down to what was used, at least the initial window
     fn cwnd_application_limited(&mut self) {
-        if self.ca_state == CaState::Open && !self.orphan && !self.nospace {
+        let nospace = self
+            .live
+            .nospace
+            .load(core::sync::atomic::Ordering::Acquire);
+        if self.ca_state == CaState::Open && !self.orphan && !nospace {
             let used = self.cong.used.max(INIT_CWND);
             if used < self.cong.snd_cwnd() {
                 let ss = self.current_ssthresh();
@@ -676,7 +680,11 @@ mod tests {
         assert_eq!(tp.cong.snd_ssthresh(), (40 >> 1) + (40 >> 2));
         assert_eq!((tp.cong.used, tp.cong.stamp), (0, 300));
         // A full send buffer, not the application, limited it
-        let tp = idle_window(|tp| tp.nospace = true);
+        let tp = idle_window(|tp| {
+            tp.live
+                .nospace
+                .store(true, core::sync::atomic::Ordering::Release)
+        });
         assert_eq!(tp.cong.snd_cwnd(), 40);
         assert_eq!((tp.cong.used, tp.cong.stamp), (5, 300));
         // tcp_slow_start_after_idle 0

@@ -556,8 +556,9 @@ impl TcpCb {
         self.ca_acked(&st);
         self.mem_settle();
         // Linux tcp_check_space -> sk_stream_write_space
-        if self.nospace && self.writable() {
-            self.nospace = false;
+        if self.writable() {
+            use core::sync::atomic::Ordering;
+            self.live.nospace.store(false, Ordering::Release);
         }
         self.rack_update_reo_wnd(st.prior_delivered);
         self.process_tlp_ack(ack, flg);
