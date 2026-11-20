@@ -1765,10 +1765,11 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
     }
     // The control block from the header, which stays until TCP
     // processes the segment (Linux tcp_v4_fill_cb)
-    let Some((s, _)) = output::parse(skb.data()) else {
+    let Some((s, doff)) = output::parse(skb.data()) else {
         return;
     };
     let cb = skb.tcp_mut();
+    cb.doff = (doff / 4) as u8;
     cb.seq = s.seq;
     cb.end_seq = s.end_seq;
     cb.ack_seq = s.ack;

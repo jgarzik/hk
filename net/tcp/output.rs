@@ -271,6 +271,12 @@ impl TcpCb {
         self.xmit(now, Push::Normal, out);
     }
 
+    /// Send what the windows allow, no ACK check (Linux
+    /// tcp_data_snd_check, as header prediction's pure ACK path runs it)
+    pub(super) fn data_snd_check(&mut self, now: u64, out: &mut Out) {
+        self.xmit_inner(now, Push::Normal, false, out);
+    }
+
     /// `output` for a send with MSG_MORE
     pub fn output_more(&mut self, now: u64, out: &mut Out) {
         self.xmit(now, Push::More, out);
@@ -282,6 +288,13 @@ impl TcpCb {
     }
 
     pub(super) fn xmit(&mut self, now: u64, push: Push, out: &mut Out) {
+        self.xmit_inner(now, push, true, out);
+    }
+
+    /// `xmit`; with nothing sent, the owed ACK goes out or is delayed
+    /// only when `ack_check` (Linux tcp_ack_snd_check after
+    /// tcp_data_snd_check)
+    fn xmit_inner(&mut self, now: u64, push: Push, ack_check: bool, out: &mut Out) {
         self.tick(now);
         // Linux runs tcp_write_xmit only with a send head
         // (tcp_push_pending_frames)
@@ -309,7 +322,7 @@ impl TcpCb {
             if !push.one() {
                 self.schedule_loss_probe(now, false);
             }
-        } else if self.state.synced() {
+        } else if self.state.synced() && ack_check {
             self.ack_snd_check(now, out);
         }
         // Linux tcp_write_xmit: cwnd-limited when the flight fills it
@@ -934,6 +947,12 @@ fn put_hdr(h: &Seg, b: &mut [u8; HLEN_MAX]) -> usize {
     }
     b[12] = ((n / 4) as u8) << 4;
     n
+}
+
+/// The length of `h`'s header on the wire, options included
+#[cfg(test)]
+pub(super) fn hdr_len(h: &Seg) -> usize {
+    put_hdr(h, &mut [0u8; HLEN_MAX])
 }
 
 /// Put the TCP header of `h` before `skb`'s payload (Linux

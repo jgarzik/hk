@@ -16,11 +16,12 @@
 //! goes out, or the delayed ACK timer is armed (`ack.rs`).
 
 use super::cb::{
-    Ins, MemKind, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb, TcpState, Tmr,
-    after, before, between, flags, skb_mstamp_us, wake,
+    Ins, MemKind, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TS_LEN, TcpCb, TcpState,
+    Tmr, after, before, between, flags, skb_mstamp_us, wake,
 };
 use super::cong::AckSample;
 use super::mem;
+use super::output::HLEN;
 use super::recovery::{Rexmit, flag, tag};
 use super::sack::SackState;
 use crate::net::mib::*;
@@ -100,6 +101,12 @@ impl TcpCb {
             self.fastretrans_alert(prior_snd_una, 0, &mut flg, &mut rexmit);
         }
         self.established(s, now, out);
+        // Linux tcp_finish_connect: predicted only unscaled
+        if self.snd_wscale == 0 {
+            self.fast_path_on(self.snd_wnd);
+        } else {
+            self.pred_flags = 0;
+        }
         if self.opts.defer_accept != 0 || self.live.pingpong.get() {
             // Linux: "Save one ACK" for the data expected soon: the
             // ACK owed, quickack mode, the delayed ACK timer at
@@ -234,8 +241,122 @@ impl TcpCb {
         (d >= 0).then_some((d as u64 * 1000).max(1))
     }
 
+    /// Header length the fast path predicts (Linux tcp_header_len)
+    fn tcp_header_len(&self) -> u32 {
+        HLEN as u32 + self.opt_len()
+    }
+
+    /// Linux __tcp_fast_path_on: predict segments with our header
+    /// length, ACK alone and the window field `wnd`
+    pub(super) fn fast_path_on(&mut self, wnd: u32) {
+        self.pred_flags = ((self.tcp_header_len() / 4) << 28) | (u32::from(flags::ACK) << 16) | wnd;
+    }
+
+    /// Linux tcp_fast_path_check: back on with nothing out of order, an
+    /// open window and sk_rmem_alloc below sk_rcvbuf (hk has no urgent
+    /// data)
+    fn fast_path_check(&mut self) {
+        if self.ooo.is_empty() && self.rcv_wnd() != 0 && self.rmem_alloc() < self.rcvbuf as usize {
+            self.fast_path_on(self.snd_wnd >> self.snd_wscale);
+        }
+    }
+
+    /// Linux tcp_rcv_established's header prediction: in ESTABLISHED a
+    /// segment with the predicted header word (`pred_flags`), at
+    /// RCV.NXT, acknowledging nothing unsent, with a timestamp not older
+    /// than TS.Recent when one is expected, skips validation. A pure ACK
+    /// is processed as a fast ACK (TCPHPAcks if it advances SND.UNA,
+    /// else TCPPureAcks); data that fits the memory already held goes
+    /// straight to the receive queue (TCPHPHits), the ACK taken only if
+    /// it moved. Handed back for the slow path otherwise
+    fn rcv_established_fast(
+        &mut self,
+        s: &SegIn,
+        skb: Box<SkBuff>,
+        now: u64,
+        out: &mut Out,
+    ) -> Option<Box<SkBuff>> {
+        let word = (u32::from(skb.tcp().doff) << 28)
+            | (u32::from(s.flags & !flags::PSH) << 16)
+            | u32::from(s.wnd);
+        if self.pred_flags == 0
+            || word != self.pred_flags
+            || s.seq != self.rcv_nxt
+            || after(s.ack, self.snd_max)
+        {
+            return Some(skb);
+        }
+        let ts = self.tcp_header_len() == HLEN as u32 + TS_LEN;
+        if ts {
+            // tcp_parse_aligned_timestamp, then "If PAWS failed, check
+            // it more carefully in slow path"
+            let Some((v, _)) = s.ts else {
+                return Some(skb);
+            };
+            if (v.wrapping_sub(self.ts_recent) as i32) < 0 {
+                return Some(skb);
+            }
+        }
+        let len = skb.len();
+        self.rcv_tsecr = s.ts.filter(|_| self.ts_ok).map(|(_, e)| e);
+        if len == 0 {
+            if ts && self.rcv_nxt == self.rcv_wup {
+                self.store_ts_recent(s);
+            }
+            self.rcv_ack(s, now, 0, out);
+            self.data_snd_check(now, out);
+            // "update last ts ecr directly instead of calling
+            // tcp_rcv_rtt_measure_ts()"
+            self.rcv_rtt_note_tsecr();
+            return None;
+        }
+        // Linux: truesize past sk_forward_alloc takes the slow path's
+        // steps 5 on
+        let truesize = skb.truesize();
+        if !self.rmem_fits(truesize) {
+            return Some(skb);
+        }
+        if ts && self.rcv_nxt == self.rcv_wup {
+            self.store_ts_recent(s);
+        }
+        self.rcv_rtt_measure_ts(len as u32);
+        self.net_stat(LINUX_MIB_TCPHPHITS);
+        let mut skb = skb;
+        skb.dev = None;
+        skb.tcp_mut().end_seq = s.seq.wrapping_add(len as u32);
+        self.stats.bytes_received += len as u64;
+        self.rcv_queue(skb);
+        self.data_recv(len as u32, truesize as u32, now);
+        if s.ack != self.snd_una {
+            self.rcv_ack(s, now, flag::DATA, out);
+        } else {
+            // tcp_update_wl
+            self.snd_wl1 = s.seq;
+        }
+        self.output(now, out);
+        out.wake |= wake::DATA;
+        self.mem_settle();
+        None
+    }
+
+    /// Linux tcp_store_ts_recent: the timestamp of a predicted segment
+    fn store_ts_recent(&mut self, s: &SegIn) {
+        if let Some((v, _)) = s.ts {
+            self.ts_recent = v;
+            self.ts_stamp = self.clock;
+        }
+    }
+
     /// Synchronized states and SYN_RECEIVED
     fn rcv_synced(&mut self, s: &SegIn, skb: Box<SkBuff>, now: u64, out: &mut Out) {
+        let skb = if self.state == TcpState::Established {
+            match self.rcv_established_fast(s, skb, now, out) {
+                Some(skb) => skb,
+                None => return,
+            }
+        } else {
+            skb
+        };
         let req = self.passive && self.state == TcpState::SynReceived;
         if req
             && s.has(flags::SYN)
@@ -372,6 +493,7 @@ impl TcpCb {
             // Linux tcp_rcv_state_process scales the completing
             // segment's window, a SYN-ACK's too
             self.snd_wnd = u32::from(s.wnd) << self.snd_wscale;
+            self.fast_path_on(self.snd_wnd >> self.snd_wscale);
             if cross {
                 // Its SYN is old: a duplicate, ACKed at once (Linux
                 // tcp_data_queue: a retransmit, DelayedACKLost)
@@ -379,7 +501,7 @@ impl TcpCb {
                 self.enter_quickack();
                 self.ack_now = true;
             }
-        } else if !self.rcv_ack(s, now, out) {
+        } else if !self.rcv_ack(s, now, flag::SLOWPATH, out) {
             return;
         }
         if !self.after_ack(s, now, out) {
@@ -530,7 +652,8 @@ impl TcpCb {
     /// (tcp_fastretrans_alert), the timers, the congestion window
     /// (tcp_cong_control) and the retransmissions it allows
     /// (tcp_xmit_recovery).
-    fn rcv_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
+    /// `fl`: flags the caller knows (SLOWPATH off the fast path, DATA)
+    fn rcv_ack(&mut self, s: &SegIn, now: u64, fl: u32, out: &mut Out) -> bool {
         let ack = s.ack;
         let span = self
             .max_wnd
@@ -558,7 +681,7 @@ impl TcpCb {
             }
             return true;
         }
-        let mut flg = 0;
+        let mut flg = fl;
         if after(ack, prior_snd_una) {
             flg |= flag::SND_UNA_ADVANCED;
             self.live.retransmits.set(0);
@@ -570,17 +693,25 @@ impl TcpCb {
         };
         let prior_packets = self.packets_out;
         let (prior_delivered, prior_lost) = (self.delivered, self.lost);
-        // Linux tcp_ack's slow path (hk has no header prediction, so
-        // never TCPHPAcks)
-        if s.seq_len() != 0 {
-            flg |= flag::DATA;
-        } else {
-            self.net_stat(LINUX_MIB_TCPPUREACKS);
+        // FLAG_UPDATE_TS_RECENT comes with the slow path
+        if fl & flag::SLOWPATH != 0 {
+            self.update_ts_recent(s);
         }
-        self.update_ts_recent(s);
-        flg |= self.ack_update_window(s, out);
-        if !blocks.is_empty() {
-            flg |= self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
+        if flg & (flag::SLOWPATH | flag::SND_UNA_ADVANCED) == flag::SND_UNA_ADVANCED {
+            // Linux: "Window is constant, pure forward advance"
+            self.snd_wl1 = s.seq;
+            flg |= flag::WIN_UPDATE;
+            self.net_stat(LINUX_MIB_TCPHPACKS);
+        } else {
+            if s.seq_len() != 0 {
+                flg |= flag::DATA;
+            } else {
+                self.net_stat(LINUX_MIB_TCPPUREACKS);
+            }
+            flg |= self.ack_update_window(s, out);
+            if !blocks.is_empty() {
+                flg |= self.sacktag_write_queue(ack, blocks, prior_snd_una, &mut st);
+            }
         }
         if st.sack_delivered != 0 {
             self.count_delivered(st.sack_delivered);
@@ -662,6 +793,10 @@ impl TcpCb {
         }
         let old_wnd = self.snd_wnd;
         self.snd_wnd = nwin;
+        // Linux: "the only place, where fast path is recovered for
+        // sending TCP"
+        self.pred_flags = 0;
+        self.fast_path_check();
         if self.send_head() {
             self.slow_start_after_idle_check(self.clock);
         }
@@ -1026,6 +1161,8 @@ impl TcpCb {
             return true;
         }
         self.net_stat(LINUX_MIB_RCVPRUNED);
+        // "Massive buffer overcommit": header prediction off
+        self.pred_flags = 0;
         false
     }
 
@@ -1092,6 +1229,8 @@ impl TcpCb {
                 // Linux tcp_data_queue_ofo: an skb kept grows the window
                 self.grow_window(len as u32, truesize, true);
             }
+            // Linux tcp_data_queue_ofo: "Disable header prediction"
+            self.pred_flags = 0;
             self.ack_now = true;
             self.mem_settle();
             return;
@@ -1117,6 +1256,7 @@ impl TcpCb {
         if had_ooo {
             self.ack_now = true;
         }
+        self.fast_path_check();
         out.wake |= wake::DATA;
         self.mem_settle();
     }

@@ -65,6 +65,7 @@ impl SegIn<'_> {
         t.end_seq = h.end_seq;
         t.ack_seq = h.ack;
         t.flags = h.flags;
+        t.doff = (super::output::hdr_len(&h) / 4) as u8;
         skb
     }
 
@@ -2265,6 +2266,68 @@ fn defer_accept_active_delays_ack() {
     p.a.on_timer(p.now + super::ack::DELACK_MAX, &mut out);
     let w = wire(&out);
     assert!(w.len() == 1 && w[0].has(flags::ACK) && w[0].ack == 5001);
+}
+
+/// Header prediction (Linux tcp_rcv_established): bulk data goes the
+/// fast path (TCPHPHits), its ACKs too (TCPHPAcks); out-of-order data
+/// turns prediction off until the hole is filled (tcp_data_queue_ofo,
+/// tcp_fast_path_check)
+#[test]
+fn header_prediction() {
+    use crate::net::mib::*;
+    let mut p = Pair::new(1460);
+    let (ma, mb) = (NetMib::new().unwrap(), NetMib::new().unwrap());
+    p.a.mib = Some(ma.clone());
+    p.b.mib = Some(mb.clone());
+    assert_ne!(p.b.pred_flags, 0);
+    let data = pattern(50_000);
+    assert_eq!(transfer(&mut p, &data, 200), data);
+    assert!(mb.net.fold(LINUX_MIB_TCPHPHITS) > 10);
+    // A hole: the next segment held back, the one after it arrives
+    let s = p.a.snd_max;
+    p.send_a(&pattern(2 * 1448));
+    let mut w: Vec<_> = p.wire.drain(..).collect();
+    assert_eq!(w.len(), 2);
+    let second = w.pop().unwrap();
+    let first = w.pop().unwrap();
+    assert_eq!(first.1.seq, s);
+    let mut out = Out::default();
+    p.b.feed(&seg_in(&second.1), p.now, &mut out);
+    assert_eq!(p.b.pred_flags, 0);
+    let hits = mb.net.fold(LINUX_MIB_TCPHPHITS);
+    let mut out = Out::default();
+    p.b.feed(&seg_in(&first.1), p.now, &mut out);
+    // Filled on the slow path, prediction back on
+    assert_eq!(mb.net.fold(LINUX_MIB_TCPHPHITS), hits);
+    assert_ne!(p.b.pred_flags, 0);
+    assert_eq!(p.b.rcv_nxt, s.wrapping_add(2 * 1448));
+    // An ACK with the predicted window advancing SND.UNA: a fast ACK
+    assert_ne!(p.a.pred_flags, 0);
+    let s = p.a.snd_max;
+    p.send_a(&pattern(1448));
+    p.wire.clear();
+    let ack = SegIn {
+        seq: p.a.rcv_nxt,
+        ack: s.wrapping_add(1448),
+        flags: flags::ACK,
+        wnd: p.a.pred_flags as u16,
+        ts: Some((p.a.ts_recent, p.a.tsval())),
+        ..Default::default()
+    };
+    let (hp, pure) = (
+        ma.net.fold(LINUX_MIB_TCPHPACKS),
+        ma.net.fold(LINUX_MIB_TCPPUREACKS),
+    );
+    let mut out = Out::default();
+    p.a.feed(&ack, p.now, &mut out);
+    assert_eq!(p.a.snd_una, s.wrapping_add(1448));
+    assert_eq!(ma.net.fold(LINUX_MIB_TCPHPACKS), hp + 1);
+    // The same again advances nothing: a pure ACK (Linux tcp_ack's
+    // slow branch, entered from the fast path)
+    let mut out = Out::default();
+    p.a.feed(&ack, p.now, &mut out);
+    assert_eq!(ma.net.fold(LINUX_MIB_TCPHPACKS), hp + 1);
+    assert_eq!(ma.net.fold(LINUX_MIB_TCPPUREACKS), pure + 1);
 }
 
 // ============================================================================

@@ -151,7 +151,9 @@ TCP coalesces in-order data into the receive queue's tail only when
 it fits the tail's room (skbs are linear: Linux skb_try_coalesce also
 steals page frags, so it nearly always merges), and never into the
 out-of-order queue (tcp_data_queue_ofo's tcp_ooo_try_coalesce with
-the skb before or ooo_last_skb).
+the skb before or ooo_last_skb). Header prediction compares a
+segment's flags without ECE and CWR (hk's header parse drops them;
+Linux's pred_flags word includes them).
 No tcp_metrics (Linux tcp_metrics.c: the per-destination cache of
 RTT, cwnd and reordering, the TCP_METRICS genetlink family): new
 connections start from defaults (tcp_init_metrics), and no peer is
@@ -166,9 +168,7 @@ IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
 and a reader_queue spliced from it.
-MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
-prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
-ACK counts TCPPureAcks, where Linux's fast path skips it), receive
+MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: receive
 collapse (tcp_prune_queue prunes the out-of-order queue without
 first collapsing either queue, tcp_collapse), Fast Open, MD5/AO,
 forwarding and

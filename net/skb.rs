@@ -562,6 +562,9 @@ pub struct TcpSkbCb {
     /// A SYN taking over a TIME_WAIT tuple: the new connection's ISN,
     /// else 0 (Linux tcp_tw_isn)
     pub tw_isn: u32,
+    /// A received segment's header length in words (Linux
+    /// tcp_hdr(skb)->doff, which header prediction compares)
+    pub doff: u8,
     /// Segments a sent skb counts as, and their size when more than
     /// one (Linux tcp_gso_segs, tcp_gso_size)
     gso_segs: u16,

@@ -917,6 +917,10 @@ pub struct TcpCb {
     /// sock exists, tcp_v4_syn_recv_sock): its completing ACK is
     /// processed as tcp_child_process does
     pub(super) req_full: bool,
+    /// Header prediction (Linux pred_flags): the header length, flags
+    /// (ACK only, PSH ignored) and window field word of the segment the
+    /// fast path takes, 0 when off
+    pub(super) pred_flags: u32,
     /// A request's SYN-ACK was acknowledged by a bare ACK it dropped
     /// (TCP_DEFER_ACCEPT) or by one its full accept queue could not
     /// take (Linux inet_rsk(req)->acked)
@@ -1110,6 +1114,7 @@ impl TcpCb {
             passive: Default::default(),
             req_full: Default::default(),
             req_acked: false,
+            pred_flags: 0,
             rtx_stamp: Default::default(),
             probes_tstamp: None,
             rcv_tstamp: Default::default(),
@@ -2055,6 +2060,8 @@ impl TcpCb {
         let w = w.min(MAX_WINDOW << self.rcv_wscale);
         let field = (w >> self.rcv_wscale) as u16;
         if field == 0 {
+            // Linux: a zero window turns header prediction off
+            self.pred_flags = 0;
             self.net_stat_if(old != 0, LINUX_MIB_TCPTOZEROWINDOWADV);
         } else if old == 0 {
             self.net_stat(LINUX_MIB_TCPFROMZEROWINDOWADV);
@@ -2082,6 +2089,12 @@ impl TcpCb {
     /// Truesize in the queues (Linux sk_wmem_queued + sk_rmem_alloc)
     fn mem_used(&self) -> usize {
         self.wmem_queued + self.rmem_alloc()
+    }
+
+    /// `size` more bytes fit in the memory already held (Linux: an
+    /// skb's truesize within sk_forward_alloc, header prediction's test)
+    pub(super) fn rmem_fits(&self, size: usize) -> bool {
+        mem::quanta(self.mem_used() + size) <= self.held.get()
     }
 
     /// Cover `size` more bytes before queueing them (Linux

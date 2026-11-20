@@ -261,6 +261,14 @@ impl TcpCb {
         self.rcv_rtt.time = self.tcp_mstamp;
     }
 
+    /// The fast path's pure ACK: its TSecr is the last sampled (Linux
+    /// tp->rcv_rtt_last_tsecr = tp->rx_opt.rcv_tsecr)
+    pub(super) fn rcv_rtt_note_tsecr(&mut self) {
+        if let Some(e) = self.rcv_tsecr {
+            self.rcv_rtt.last_tsecr = e;
+        }
+    }
+
     /// Linux tcp_rcv_rtt_measure_ts (tcp_rcv_established, after
     /// tcp_ack): a segment of at least the MSS estimate echoing a new
     /// TSval samples the time since we sent it

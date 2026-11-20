@@ -51,6 +51,8 @@ pub mod flag {
     pub const SYN_ACKED: u32 = 0x10;
     pub const DATA_SACKED: u32 = 0x20;
     pub const LOST_RETRANS: u32 = 0x80;
+    /// Not the header prediction fast path (Linux FLAG_SLOWPATH)
+    pub const SLOWPATH: u32 = 0x100;
     pub const ORIG_SACK_ACKED: u32 = 0x200;
     pub const SND_UNA_ADVANCED: u32 = 0x400;
     pub const DSACKING_ACK: u32 = 0x800;
