@@ -36,8 +36,8 @@ use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::fib::{self, RouteType};
 use crate::net::ipv4::Ipv4Addr;
-use crate::net::netlink::NlInfo;
 use crate::net::netlink::rtnetlink;
+use crate::net::netlink::{ExtAck, NlInfo};
 use crate::net::rtnl::RtnlGuard;
 use crate::sync::rcu::{RcuHead, RcuReadGuard};
 use crate::util::error::KernelError;
@@ -383,7 +383,9 @@ pub fn ip_dev_find(net: &NetNamespace, addr: Ipv4Addr) -> Option<Arc<NetDevice>>
 // ============================================================================
 
 /// Insert `ifa` on `dev` (Linux __inet_insert_ifa): EEXIST for the same
-/// local address in the same subnet; secondaries are detected here. A
+/// local address in the same subnet, EINVAL for a secondary of another
+/// scope (each with Linux's message for `ext`); secondaries are
+/// detected here. A
 /// primary goes after the last primary of its scope or a wider one,
 /// a secondary last. The RTM_NEWADDR notification precedes the FIB
 /// update like Linux.
@@ -393,6 +395,7 @@ pub fn inet_insert_ifa(
     dev: &Arc<NetDevice>,
     mut ifa: InIfaddr,
     nl: NlInfo,
+    ext: Option<&ExtAck>,
 ) -> Result<(), KernelError> {
     ifa.set_flags(ifa.flags() & !(IFA_F_SECONDARY | IPV6ONLY_FLAGS));
     let mut last_primary: *const InIfaddr = core::ptr::null();
@@ -404,9 +407,11 @@ pub fn inet_insert_ifa(
             }
             if ifa1.same_subnet(&ifa) {
                 if ifa1.local == ifa.local {
+                    ext.inspect(|e| e.msg("ipv4: Address already assigned"));
                     return Err(KernelError::AlreadyExists);
                 }
                 if ifa1.scope != ifa.scope {
+                    ext.inspect(|e| e.msg("ipv4: Invalid scope value"));
                     return Err(KernelError::InvalidArgument);
                 }
                 ifa.set_flags(ifa.flags() | IFA_F_SECONDARY);
@@ -544,7 +549,7 @@ pub fn inetdev_up(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
     if dev.is_loopback() && !dev.in_dev().has_addrs() {
         let mut ifa = InIfaddr::new(Ipv4Addr::new(127, 0, 0, 1), 8, dev.name());
         ifa.scope = RT_SCOPE_HOST;
-        let _ = inet_insert_ifa(rtnl, net, dev, ifa, NlInfo::default());
+        let _ = inet_insert_ifa(rtnl, net, dev, ifa, NlInfo::default(), None);
     }
     // Each route insert takes RTNL-side locks: a reference per address
     for ifa in dev.in_dev().ifa_list.snapshot() {

@@ -705,8 +705,11 @@ proxy ARP entries, NTF_USE or NDA_PROTOCOL.
 Missing, each answered with a Linux errno rather than silently: link
 creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
 (EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),
-NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
 address lifetimes are always infinite, promote_secondaries is off.
+Attribute policies are checked as attributes are read, not all at
+parse time (Linux nla_parse validates every one first, so with several
+bad attributes another may be named), and extended ACKs never carry
+NLMSGERR_ATTR_POLICY (Linux netlink_policy_dump_write_attr).
 Routing rules are Linux's three IPv4 defaults, fixed: RTM_NEWRULE and
 RTM_DELRULE are EOPNOTSUPP, lookups walk tables local then main and never
 default (no rule engine), and rule dumps of other families are

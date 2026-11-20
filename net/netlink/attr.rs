@@ -9,6 +9,7 @@
 
 use alloc::vec::Vec;
 
+use super::ExtAck;
 use crate::util::error::KernelError;
 
 /// struct nlmsghdr size
@@ -269,9 +270,13 @@ impl<'a> NlBuf<'a> {
     }
 }
 
-/// Attribute table: `tb[type]` = payload of the last attribute of that type
+/// Attribute table: `tb[type]` = payload of the last attribute of that
+/// type. A typed read of an attribute too short for its type fails as
+/// Linux's policy validation does: ERANGE, and with an [`ExtAck`]
+/// attached "Attribute failed policy validation" naming it.
 pub struct Attrs<'a> {
     tb: Vec<Option<&'a [u8]>>,
+    ext: Option<&'a ExtAck>,
 }
 
 impl<'a> Attrs<'a> {
@@ -291,7 +296,21 @@ impl<'a> Attrs<'a> {
             }
             b = &b[align(len).min(b.len())..];
         }
-        Ok(Self { tb })
+        Ok(Self { tb, ext: None })
+    }
+
+    /// Report policy failures to `ext`
+    pub fn ext(mut self, ext: &'a ExtAck) -> Self {
+        self.ext = Some(ext);
+        self
+    }
+
+    /// An attribute failing its policy (Linux validate_nla's out_err)
+    fn policy_err(&self, p: &[u8]) -> KernelError {
+        if let Some(e) = self.ext {
+            e.attr_msg(p, "Attribute failed policy validation");
+        }
+        KernelError::Range
     }
 
     /// Raw payload of attribute `ty`
@@ -303,44 +322,43 @@ impl<'a> Attrs<'a> {
         self.get(ty).is_some()
     }
 
-    /// u32 attribute; EINVAL if present but too short
+    /// Payload of attribute `ty` of at least `min` bytes (Linux a
+    /// policy's minimum length); ERANGE if shorter
+    pub fn min(&self, ty: u16, min: usize) -> Result<Option<&'a [u8]>, KernelError> {
+        match self.get(ty) {
+            Some(p) if p.len() < min => Err(self.policy_err(p)),
+            r => Ok(r),
+        }
+    }
+
+    /// u32 attribute (NLA_U32); ERANGE if present but too short
     pub fn u32(&self, ty: u16) -> Result<Option<u32>, KernelError> {
-        match self.get(ty) {
-            None => Ok(None),
-            Some(p) if p.len() >= 4 => Ok(Some(u32::from_ne_bytes([p[0], p[1], p[2], p[3]]))),
-            Some(_) => Err(KernelError::InvalidArgument),
-        }
+        Ok(self
+            .min(ty, 4)?
+            .map(|p| u32::from_ne_bytes([p[0], p[1], p[2], p[3]])))
     }
 
-    /// u8 attribute; EINVAL if empty
+    /// u8 attribute (NLA_U8); ERANGE if empty
     pub fn u8(&self, ty: u16) -> Result<Option<u8>, KernelError> {
-        match self.get(ty) {
-            None => Ok(None),
-            Some(p) if !p.is_empty() => Ok(Some(p[0])),
-            Some(_) => Err(KernelError::InvalidArgument),
-        }
+        Ok(self.min(ty, 1)?.map(|p| p[0]))
     }
 
-    /// IPv4 address attribute (network order bytes)
+    /// IPv4 address attribute (network order bytes; NLA_U32)
     pub fn in_addr(&self, ty: u16) -> Result<Option<crate::net::Ipv4Addr>, KernelError> {
-        match self.get(ty) {
-            None => Ok(None),
-            Some(p) if p.len() >= 4 => Ok(Some(crate::net::Ipv4Addr::from_be_bytes([
-                p[0], p[1], p[2], p[3],
-            ]))),
-            Some(_) => Err(KernelError::InvalidArgument),
-        }
+        Ok(self
+            .min(ty, 4)?
+            .map(|p| crate::net::Ipv4Addr::from_be_bytes([p[0], p[1], p[2], p[3]])))
     }
 
-    /// String attribute up to the first NUL (EINVAL if not UTF-8 or
-    /// `max` bytes or longer, like NLA_STRING with a length limit)
+    /// String attribute up to the first NUL (NLA_STRING with a length
+    /// limit: ERANGE if `max` bytes or longer; EINVAL if not UTF-8)
     pub fn str(&self, ty: u16, max: usize) -> Result<Option<&'a str>, KernelError> {
         let Some(p) = self.get(ty) else {
             return Ok(None);
         };
         let n = p.iter().position(|&c| c == 0).unwrap_or(p.len());
         if n >= max {
-            return Err(KernelError::InvalidArgument);
+            return Err(self.policy_err(p));
         }
         core::str::from_utf8(&p[..n])
             .map(Some)

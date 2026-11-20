@@ -20,6 +20,7 @@ pub mod packet_ring;
 pub mod packet_spkt;
 pub mod packet_vnet;
 pub mod raw;
+pub mod rtnl_ack;
 pub mod rtnl_link;
 pub mod sk;
 pub mod snmp;

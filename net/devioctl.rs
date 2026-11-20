@@ -286,7 +286,7 @@ impl Ctx<'_> {
     }
 
     fn add(&self, ifa: InIfaddr) -> Result<(), KernelError> {
-        ifaddr::inet_insert_ifa(self.r, self.net, self.dev, ifa, NlInfo::default())
+        ifaddr::inet_insert_ifa(self.r, self.net, self.dev, ifa, NlInfo::default(), None)
     }
 
     fn bcast_ok(&self, plen: u8) -> bool {
