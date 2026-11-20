@@ -118,9 +118,7 @@ period after its close: the chain's `Arc` is released by
 `RcuHRef::defer_put`, and the count drops with the `Sock`. Linux
 drops the count at sk_free (the last reference, at unhash) and defers
 only the memory (SOCK_RCU_FREE).
-No SYN cookies (a full listener drops SYNs). Echo and timestamp
-replies skip the ICMP rate limits (Linux icmp_reply applies them when
-icmp_ratemask names the reply type, which the default does not).
+No SYN cookies (a full listener drops SYNs).
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are

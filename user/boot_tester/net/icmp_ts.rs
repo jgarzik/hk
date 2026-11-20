@@ -15,6 +15,14 @@
 //! - ICMP_ECHO_CODE: an echo reply keeps the request's code (Linux
 //!   icmp_echo copies the header and changes only the type); run after
 //!   ICMP_TS_SNMP, whose counts it would move
+//! - ICMP_REPLY_RATELIMIT: with echo reply in icmp_ratemask and the
+//!   global limit at 1 message/s (burst 1), a burst of echo requests
+//!   to 127.0.0.1 is mostly unanswered, each dropped reply counted as
+//!   Icmp OutRateLimitGlobal (Linux icmp_reply: loopback input is not
+//!   exempt; the per-peer limit skips loopback routes); with the
+//!   default ratemask a request is answered again. Linux 6.8 keeps
+//!   icmp_msgs_per_sec/burst global (init_net only), later kernels and
+//!   hk per namespace, so both the parent and the child set them
 
 use hk_syscall::{
     AF_INET, CLOCK_REALTIME, CLONE_NEWNET, SOCK_RAW, Timespec, sys_clock_gettime, sys_exit,
@@ -28,6 +36,13 @@ use crate::net::raw::csum;
 use crate::net::sk::*;
 use crate::net::snmp::{Mib, SNMP};
 use crate::net::tcp_xfer::wait_child;
+use crate::proc::sysctl::{read_file, write_file};
+
+const PER_SEC: &[u8] = b"/proc/sys/net/ipv4/icmp_msgs_per_sec\0";
+const BURST: &[u8] = b"/proc/sys/net/ipv4/icmp_msgs_burst\0";
+const RATEMASK: &[u8] = b"/proc/sys/net/ipv4/icmp_ratemask\0";
+/// Echo requests in the rate-limit burst
+const BURST_REQS: usize = 20;
 
 const IPPROTO_ICMP: i32 = 1;
 const TIMESTAMP: u8 = 13;
@@ -38,8 +53,14 @@ const DAY_MS: i64 = 86_400_000;
 
 pub fn run_tests() {
     println(b"=== ICMP Timestamp Tests ===");
+    // Linux 6.8's global limit is init_net's: tighten it here too (the
+    // child's ratemask keeps it from touching anything else)
+    let per_sec = save_set(PER_SEC, b"1");
+    let burst = save_set(BURST, b"1");
     let pid = sys_fork();
     if pid < 0 {
+        restore(PER_SEC, &per_sec);
+        restore(BURST, &burst);
         fail_num(b"ICMP_TS_NETNS:FAIL fork", pid);
         return;
     }
@@ -51,6 +72,8 @@ pub fn run_tests() {
         sys_exit(if netns_tests() { 0 } else { 1 });
     }
     let st = wait_child(pid);
+    restore(PER_SEC, &per_sec);
+    restore(BURST, &burst);
     let code = (st >> 8) & 0xff;
     if st & 0x7f == 0 && code == 0 {
         pass(b"ICMP_TS_NETNS");
@@ -75,8 +98,92 @@ fn netns_tests() -> bool {
     let ok = test_reply(fd) & test_short(fd);
     let snmp = test_snmp(&before);
     let echo = test_echo_code(fd);
+    let lim = test_reply_ratelimit(fd);
     close(fd);
-    ok & snmp & echo
+    ok & snmp & echo & lim
+}
+
+/// A sysctl's value (up to 32 bytes; empty if unreadable), then `val`
+/// written to it
+fn save_set(path: &[u8], val: &[u8]) -> ([u8; 32], usize) {
+    let mut buf = [0u8; 32];
+    let n = read_file(path, &mut buf).max(0) as usize;
+    write_file(path, val);
+    (buf, n)
+}
+
+/// Write back a value `save_set` read
+fn restore(path: &[u8], (buf, n): &([u8; 32], usize)) {
+    if *n != 0 {
+        write_file(path, &buf[..*n]);
+    }
+}
+
+/// Send an echo request (id `ID`, sequence `seq`) to 127.0.0.1
+fn send_echo(fd: i32, seq: u16) -> i64 {
+    let mut req = [0u8; 16];
+    req[0] = 8;
+    req[4..6].copy_from_slice(&ID.to_be_bytes());
+    req[6..8].copy_from_slice(&seq.to_be_bytes());
+    let c = csum(&req);
+    req[2..4].copy_from_slice(&c.to_be_bytes());
+    send_to(fd, &req, LO, 0, 0)
+}
+
+/// Echo replies to sequences `lo..hi` read until 300 ms pass quietly
+fn count_replies(fd: i32, lo: u16, hi: u16) -> i64 {
+    let mut buf = [0u8; 256];
+    let mut n = 0;
+    loop {
+        let (r, ip) = recv_wait(fd, &mut buf, 300);
+        if r < 28 {
+            return n;
+        }
+        let ihl = ((buf[0] & 0xf) * 4) as usize;
+        let m = &buf[ihl..r as usize];
+        let id = u16::from_be_bytes([m[4], m[5]]);
+        let seq = u16::from_be_bytes([m[6], m[7]]);
+        if ip == LO && m[0] == 0 && id == ID && (lo..hi).contains(&seq) {
+            n += 1;
+        }
+    }
+}
+
+/// Echo reply in icmp_ratemask, 1 message/s: replies beyond the credit
+/// are dropped and counted as OutRateLimitGlobal
+fn test_reply_ratelimit(fd: i32) -> bool {
+    let mut t = T::new(b"ICMP_REPLY_RATELIMIT");
+    // Linux 6.8 has no per-namespace icmp_msgs_*: the parent set them
+    write_file(PER_SEC, b"1");
+    write_file(BURST, b"1");
+    t.eq(b"ratemask", write_file(RATEMASK, b"6169"), 4);
+    let Some(a) = Mib::read(SNMP) else {
+        t.ok(b"read", false, 0);
+        return false;
+    };
+    let n = BURST_REQS as u16;
+    for i in 0..n {
+        send_echo(fd, 200 + i);
+    }
+    let got = count_replies(fd, 200, 200 + n);
+    let Some(b) = Mib::read(SNMP) else {
+        t.ok(b"read", false, 0);
+        return false;
+    };
+    let rl = |m: &Mib| m.val(b"Icmp", b"OutRateLimitGlobal");
+    let dropped = rl(&b) - rl(&a);
+    t.ok(b"limited", got < BURST_REQS as i64, got);
+    t.eq(
+        b"replies + OutRateLimitGlobal",
+        got + dropped,
+        BURST_REQS as i64,
+    );
+    t.eq(b"ratemask default", write_file(RATEMASK, b"6168"), 4);
+    send_echo(fd, 300);
+    t.eq(b"unlimited reply", count_replies(fd, 300, 301), 1);
+    let ok = !t.failed();
+    t.done();
+    ok
 }
 
 /// An echo request with code 5 gets an echo reply with code 5

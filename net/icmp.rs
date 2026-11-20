@@ -13,7 +13,9 @@
 //! link-level multicast or non-first fragments) and rate limits: a
 //! global token bucket (icmp_msgs_per_sec / icmp_msgs_burst) and a
 //! per-destination one (icmp_ratelimit) for the types in
-//! icmp_ratemask; loopback is exempt.
+//! icmp_ratemask; loopback is exempt. Echo and timestamp replies
+//! (`icmp_reply`) take the same limits when icmp_ratemask names the
+//! reply type (Linux icmp_reply), loopback input included.
 //!
 //! ## Locking
 //!
@@ -328,6 +330,42 @@ fn limited(net: &NetNamespace, ty: u8, code: u8) -> bool {
     (1i32 << ty) & net.sysctl.icmp_ratemask.load(Ordering::Relaxed) != 0
 }
 
+/// Linux icmpv4_global_allow: None if the global limit refuses `ty`
+/// (counted); else whether the limits apply (`limited`: then the
+/// global credit allowed it and `xrlim_allow` must follow)
+fn global_allow(net: &NetNamespace, ty: u8, code: u8, now: u64) -> Option<bool> {
+    if !limited(net, ty, code) {
+        return Some(false);
+    }
+    if net.icmp.global_allow(net, now) {
+        return Some(true);
+    }
+    net.mib.icmp.inc(ICMP_MIB_RATELIMITGLOBAL);
+    None
+}
+
+/// Linux icmpv4_xrlim_allow: if `apply`, the per-destination limit for
+/// `daddr` (icmp_ratelimit; 0 or a loopback route is unlimited), then
+/// spend the global credit
+fn xrlim_allow(
+    net: &NetNamespace,
+    rt: &route::Rtable,
+    daddr: Ipv4Addr,
+    now: u64,
+    apply: bool,
+) -> bool {
+    if !apply {
+        return true;
+    }
+    let timeout = net.sysctl.icmp_ratelimit.load(Ordering::Relaxed).max(0) as u64;
+    if timeout != 0 && !rt.dev.is_loopback() && !net.icmp.peer_allow(daddr, now, timeout) {
+        net.mib.icmp.inc(ICMP_MIB_RATELIMITHOST);
+        return false;
+    }
+    net.icmp.consume();
+    true
+}
+
 // ============================================================================
 // Receive
 // ============================================================================
@@ -430,7 +468,8 @@ fn ms_of_day(ns: u64) -> u32 {
 /// Send `head` (a received request's ICMP header and leading data)
 /// then `tail` back to its sender as type `ty`, its code `code` or, if
 /// None, the request's (Linux icmp_echo keeps it, icmp_timestamp sets
-/// 0; icmp_reply + icmp_push_reply)
+/// 0; icmp_reply + icmp_push_reply): rate limited as an error is when
+/// icmp_ratemask names `ty`
 fn icmp_reply(
     net: &NetNamespace,
     skb: &SkBuff,
@@ -446,6 +485,20 @@ fn icmp_reply(
     if bad(src) {
         return;
     }
+    let now = crate::net::neigh::now_ms();
+    let code = code.unwrap_or(head[1]);
+    let Some(apply) = global_allow(net, ty, code, now) else {
+        return;
+    };
+    // A broadcast request is answered from our address on that link
+    let saddr = if skb.ip_bcast { Ipv4Addr(0) } else { dst };
+    // Linux icmp_reply: no reply without a route
+    let Ok(rt) = route::output(net, src, saddr, 0) else {
+        return;
+    };
+    if !xrlim_allow(net, &rt, src, now, apply) {
+        return;
+    }
     let Some(mut out) = SkBuff::alloc_tx(head.len() + tail.len(), Gfp::ATOMIC) else {
         // Linux icmp_push_reply: ip_append_data failed
         net.mib.icmp.inc(ICMP_MIB_OUTERRORS);
@@ -459,15 +512,12 @@ fn icmp_reply(
     }
     let h = out.data_mut();
     h[0] = ty;
-    if let Some(c) = code {
-        h[1] = c;
-    }
+    h[1] = code;
     h[2] = 0;
     h[3] = 0;
     let c = ip_checksum(h);
     h[2..4].copy_from_slice(&c.to_be_bytes());
-    // A broadcast request is answered from our address on that link
-    out.saddr = Some(if skb.ip_bcast { Ipv4Addr(0) } else { dst });
+    out.saddr = Some(saddr);
     out.daddr = Some(src);
     // Linux icmp_reply leaves fl4_icmp_type 0, so every reply counts
     // as an echo reply (Icmp OutEchoReps, IcmpMsg OutType0)
@@ -475,10 +525,6 @@ fn icmp_reply(
         tos: skb.ip_tos,
         icmp_type: Some(icmp_type::ECHO_REPLY),
         ..Default::default()
-    };
-    // Linux icmp_reply: no reply without a route
-    let Ok(rt) = route::output(net, src, out.saddr.unwrap_or_default(), 0) else {
-        return;
     };
     if ipv4::ip_send_rt(net, &rt, out, IPPROTO_ICMP, p).is_err() {
         net.mib.out_discard();
@@ -667,11 +713,14 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
     }
     let now = crate::net::neigh::now_ms();
     // Rate limits apply to the ratemask types, not to loopback input
-    let apply = limited(net, ty, code) && !o.in_lo;
-    if apply && !net.icmp.global_allow(net, now) {
-        net.mib.icmp.inc(ICMP_MIB_RATELIMITGLOBAL);
-        return;
-    }
+    let apply = if o.in_lo {
+        false
+    } else {
+        match global_allow(net, ty, code, now) {
+            Some(a) => a,
+            None => return,
+        }
+    };
     let p = o.pkt;
     let src = Ipv4Addr::from_be_bytes([p[12], p[13], p[14], p[15]]);
     let dst = Ipv4Addr::from_be_bytes([p[16], p[17], p[18], p[19]]);
@@ -687,13 +736,8 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
     if matches!(rt.rtype, RouteType::Broadcast | RouteType::Multicast) {
         return;
     }
-    if apply {
-        let timeout = net.sysctl.icmp_ratelimit.load(Ordering::Relaxed).max(0) as u64;
-        if timeout != 0 && !rt.dev.is_loopback() && !net.icmp.peer_allow(src, now, timeout) {
-            net.mib.icmp.inc(ICMP_MIB_RATELIMITHOST);
-            return;
-        }
-        net.icmp.consume();
+    if !xrlim_allow(net, &rt, src, now, apply) {
+        return;
     }
     // A route MTU below the headers leaves no room (no wrap to a huge
     // quote; Linux __icmp_send's room is an int that goes negative)
