@@ -162,6 +162,9 @@ pub struct Sock {
     errmem: AtomicUsize,
     /// O_ASYNC files of the socket (Linux socket_wq.fasync_list)
     pub fasync: FasyncList,
+    /// The socket file's owner (F_SETOWN; Linux sk->sk_socket->file's
+    /// f_owner), set with the file: SIGURG goes to it
+    pub fown: spin::Once<alloc::sync::Arc<crate::io::fasync::FOwner>>,
     /// `wqf` bits
     wq_flags: AtomicU32,
     /// In its namespace's INUSE_ALL: `INUSE_*` (`inuse_start`,
@@ -250,6 +253,7 @@ impl Sock {
             errq: SkbQueue::new(),
             errmem: AtomicUsize::new(0),
             fasync: FasyncList::new(),
+            fown: spin::Once::new(),
             wq_flags: AtomicU32::new(0),
             inuse: AtomicU8::new(INUSE_NOT_YET),
             peek_off: AtomicI32::new(-1),
@@ -581,6 +585,20 @@ impl Sock {
         };
         if !skip {
             kill_fasync(&self.fasync, crate::signal::SIGIO, band);
+        }
+    }
+
+    /// Linux sk_send_sigurg: SIGURG to the file's owner, then, if it
+    /// has one, to the O_ASYNC files that chose a signal (SOCK_WAKE_URG)
+    pub fn send_sigurg(&self) {
+        if let Some(o) = self.fown.get()
+            && crate::io::fasync::send_sigurg(o)
+        {
+            kill_fasync(
+                &self.fasync,
+                crate::signal::SIGURG,
+                crate::io::fasync::POLL_PRI,
+            );
         }
     }
 

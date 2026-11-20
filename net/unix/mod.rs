@@ -40,6 +40,8 @@
 //!   queue to a dead socket); a leaf (`UnixCb.fp` aside): a message's
 //!   `Arc` is made before it, a reader takes a reference under it and
 //!   copies after, and taken messages are freed after it.
+//! - `oob` (spin leaf under `rq`): a stream's pending out-of-band skb
+//!   (Linux u->oob_skb), changed under `st` and `rq`.
 //! - `UnixTable` buckets (per netns) and `BSD` buckets (global):
 //!   `crate::sync::spin::Mutex` per bucket (Linux unx.table.locks,
 //!   bsd_socket_locks), sockets linked intrusively and held weakly;
@@ -82,8 +84,8 @@ use crate::net::msg::{RecvMsg, SendMsg};
 use crate::net::skb::{SkBuff, SkbCb, SkbOwned, SkbOwnedQueue};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
-    AF_UNIX, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SO_PEERGROUPS, SOCK_DGRAM,
-    SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
+    AF_UNIX, OptIn, OptOut, ProtoOps, SIOCATMARK, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SO_PEERGROUPS,
+    SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
 };
 use crate::net::{NetNamespace, NetRef};
 use crate::sync::Mutex as SMutex;
@@ -273,6 +275,11 @@ pub struct UnixSock {
     /// Unread bytes queued (Linux unix_sock.inq_len), changed under
     /// `rq`'s lock
     inq_len: AtomicUsize,
+    /// The queued out-of-band skb of a stream (Linux u->oob_skb):
+    /// changed under `st` and `rq`'s lock (a leaf beneath them), read
+    /// under it alone by poll and SIOCATMARK; the skb it replaces or
+    /// clears is dropped after the locks
+    oob: Mutex<Option<Arc<SkBuff>>>,
     addr: RwLock<Option<Arc<UnixAddr>>>,
     /// The socket inode a filesystem name binds, with its mount (Linux
     /// unix_sock.path: a bound socket keeps the filesystem busy for
@@ -533,6 +540,7 @@ impl UnixSock {
             state: AtomicU8::new(CLOSE),
             rq: SkbOwnedQueue::new(),
             inq_len: AtomicUsize::new(0),
+            oob: Mutex::new(None),
             addr: RwLock::new(None),
             path: Mutex::new(None),
             iolock: SMutex::new(()),
@@ -775,11 +783,20 @@ impl UnixSock {
             self.set_state(CLOSE);
             (state, st.take(), path)
         };
+        let oob = self.oob.lock().take();
+        drop(oob);
         self.sk.state_change();
         self.peer_wait.wake_all();
         if let Some(p) = peer {
             if self.connected_type() {
-                let unread = !self.rq.is_empty();
+                // A read out-of-band skb is not unread data
+                let unread = {
+                    let q = self.rq.lock();
+                    match q.front() {
+                        Some(h) if unix_len(&h) == 0 => q.next(&h).is_some(),
+                        h => h.is_some(),
+                    }
+                };
                 {
                     let _g = p.st.lock();
                     p.sk.or_shutdown(SHUTDOWN_MASK);
@@ -874,6 +891,41 @@ impl UnixSock {
             b.extend_from_slice(&ns.from_kgid_munged(k).to_ne_bytes());
         }
         Ok(OptOut::Whole(b))
+    }
+
+    /// `skb` is the out-of-band skb (Linux skb == u->oob_skb)
+    fn is_oob(&self, skb: &SkBuff) -> bool {
+        self.oob
+            .lock()
+            .as_deref()
+            .is_some_and(|o| core::ptr::eq(o, skb))
+    }
+
+    /// An out-of-band byte is pending (Linux READ_ONCE(u->oob_skb))
+    fn has_oob(&self) -> bool {
+        self.oob.lock().is_some()
+    }
+
+    /// SIOCATMARK (Linux unix_ioctl, streams only): the next byte is
+    /// the out-of-band byte, or the head is a read one followed by it
+    /// or by nothing out of band
+    fn atmark(&self) -> Result<bool, KernelError> {
+        if self.sk.stype != SOCK_STREAM {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let _io = self.iolock.lock();
+        let q = self.rq.lock();
+        let Some(skb) = q.front() else {
+            return Ok(false);
+        };
+        let oob = self.oob.lock().clone();
+        let next = q.next(&skb);
+        drop(q);
+        let is = |x: Option<&Arc<SkBuff>>| match (x, &oob) {
+            (Some(x), Some(o)) => Arc::ptr_eq(x, o),
+            _ => false,
+        };
+        Ok(is(Some(&skb)) || (unix_len(&skb) == 0 && (oob.is_none() || is(next.as_ref()))))
     }
 
     /// Linux unix_inq_len: EINVAL on a listener; a stream's unread
@@ -1012,6 +1064,7 @@ impl ProtoOps for UnixSock {
         let v = match cmd {
             SIOCOUTQ => self.wmem.load(Ordering::Acquire),
             SIOCINQ => self.inq_len()?,
+            SIOCATMARK => usize::from(self.atmark()?),
             _ => return Err(KernelError::NotTty),
         };
         crate::uaccess::put_user::<i32>(arg, v as i32).map_err(|_| KernelError::BadAddress)?;
@@ -1206,6 +1259,21 @@ fn queue(to: &UnixSock, skb: Arc<SkBuff>) {
     let mut q = to.rq.lock();
     q.push_back(skb);
     to.inq_len.fetch_add(len, Ordering::AcqRel);
+}
+
+/// Queue the out-of-band skb on `to` (Linux queue_oob, the caller
+/// holding `to.st`): it replaces the pending one, which stays queued
+/// as an ordinary byte; the old reference is returned for the caller
+/// to drop after the lock
+fn queue_oob(to: &UnixSock, skb: Arc<SkBuff>) -> Option<Arc<SkBuff>> {
+    if let Some(f) = ucb(&skb).fp.lock().as_mut() {
+        f.queued();
+    }
+    let mut q = to.rq.lock();
+    let old = to.oob.lock().replace(skb.clone());
+    to.inq_len.fetch_add(1, Ordering::AcqRel);
+    q.push_back(skb);
+    old
 }
 
 /// Shutdown bits test helper

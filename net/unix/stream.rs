@@ -11,12 +11,18 @@
 //! but stops after one that carried files (so files arrive with the
 //! bytes sent with them, and never with a later message's), and with
 //! SO_PASSCRED never joins messages of different senders.
+//!
+//! MSG_OOB (Linux CONFIG_AF_UNIX_OOB) sends the last byte as its own
+//! skb, the receiver's out-of-band byte: reads stop before it; MSG_OOB
+//! takes it, unless SO_OOBINLINE leaves it in the stream; a read past
+//! it without SO_OOBINLINE drops it. The owner gets SIGURG, poll
+//! POLLPRI.
 
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
 use crate::io::poll::{
-    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
+    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
 use crate::net::msg::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_WAITALL, RecvMsg, SendMsg};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, sf};
@@ -25,8 +31,8 @@ use crate::util::error::KernelError;
 
 use super::scm::{Creds, FpList, Scm, too_many_fds};
 use super::{
-    CLOSE, ESTABLISHED, LISTEN, PeerCred, UnixSock, add_creds, find_other, peek_fds, queue, ucb,
-    ucb_mut, unix_len, unix_skb, validate,
+    CLOSE, ESTABLISHED, LISTEN, PeerCred, UnixSock, add_creds, find_other, peek_fds, queue,
+    queue_oob, ucb, ucb_mut, unix_len, unix_skb, validate,
 };
 use crate::mm::page_alloc::Gfp;
 use crate::net::skb::SkBuff;
@@ -210,13 +216,19 @@ pub fn accept(s: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, KernelError
 }
 
 /// Linux unix_stream_sendmsg: chunks of at most `chunk_max` bytes, each
-/// waiting for sndbuf room; files ride on the first chunk only. A
-/// partial write returns its count; EPIPE (SIGPIPE from the socket
-/// layer) only when nothing was sent.
+/// waiting for sndbuf room; files ride on the first skb only. With
+/// MSG_OOB the last byte goes alone as the out-of-band byte (queue_oob;
+/// EOPNOTSUPP for an empty send). A partial write returns its count;
+/// EPIPE (SIGPIPE from the socket layer) only when nothing was sent.
 pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     let mut scm = Scm::parse(&m.control)?;
-    if flags & MSG_OOB != 0 {
-        return Err(KernelError::OperationNotSupported);
+    let oob = flags & MSG_OOB != 0;
+    let mut len = m.data.len();
+    if oob {
+        if len == 0 {
+            return Err(KernelError::OperationNotSupported);
+        }
+        len -= 1;
     }
     if m.addr.is_some() {
         return Err(if s.state() == ESTABLISHED {
@@ -229,29 +241,39 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
     if s.sk.shutdown() & SEND_SHUTDOWN != 0 {
         return Err(KernelError::BrokenPipe);
     }
-    let len = m.data.len();
     let mut timeo = s.sk.snd_timeo(flags & MSG_DONTWAIT != 0);
     let mut sent = 0;
     while sent < len {
-        match send_chunk(s, &other, m, sent, &mut scm, &mut timeo) {
-            Ok(n) => sent += n,
+        let size = (len - sent).min(chunk_max(s));
+        match send_skb(s, &other, m, sent, size, &mut scm, &mut timeo, false) {
+            Ok(()) => sent += size,
             Err(e) if sent == 0 => return Err(e),
-            Err(_) => break,
+            Err(_) => return Ok(sent),
+        }
+    }
+    if oob {
+        match send_skb(s, &other, m, sent, 1, &mut scm, &mut timeo, true) {
+            Ok(()) => sent += 1,
+            Err(e) if sent == 0 => return Err(e),
+            Err(_) => {}
         }
     }
     Ok(sent)
 }
 
-/// Queue the next chunk at `off`; returns its size
-fn send_chunk(
+/// Queue `size` bytes at `off` as one skb, or as the out-of-band byte
+/// (`urg`, Linux queue_oob: the receiver's owner gets SIGURG)
+#[expect(clippy::too_many_arguments)]
+fn send_skb(
     s: &UnixSock,
     other: &Arc<UnixSock>,
     m: &mut SendMsg<'_>,
     off: usize,
+    size: usize,
     scm: &mut Scm,
     timeo: &mut u64,
-) -> Result<usize, KernelError> {
-    let size = (m.data.len() - off).min(chunk_max(s));
+    urg: bool,
+) -> Result<(), KernelError> {
     s.wmem_wait(timeo)?;
     let data = m.data.take_at(off, size)?;
     let mut skb = unix_skb(&s.arc(), data)?;
@@ -264,17 +286,27 @@ fn send_chunk(
     }
     add_creds(&mut skb, s, other);
     let skb = try_arc_gfp(skb, Gfp::KERNEL)?;
-    {
+    let old = {
         let _ost = other.st.lock();
         if other.is_dead() || super::rcv_shut(other) {
             drop(_ost);
             drop(skb);
             return Err(KernelError::BrokenPipe);
         }
-        queue(other, skb);
+        if urg {
+            queue_oob(other, skb)
+        } else {
+            queue(other, skb);
+            None
+        }
+    };
+    drop(old);
+    if urg {
+        // After unix_state_lock (Linux sends it under it)
+        other.sk.send_sigurg();
     }
     other.sk.data_ready();
-    Ok(size)
+    Ok(())
 }
 
 /// What a read accumulated (Linux scm_cookie of the receive)
@@ -304,7 +336,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
         return Err(KernelError::InvalidArgument);
     }
     if flags & MSG_OOB != 0 {
-        return Err(KernelError::OperationNotSupported);
+        return recv_urg(s, m, flags);
     }
     let size = m.data.len();
     // Linux sock_rcvlowat: at least 1
@@ -374,6 +406,8 @@ fn read_locked(
     // An skb a peek continues with (Linux `goto again` from the tail)
     let mut resume: Option<Arc<SkBuff>> = None;
     loop {
+        // Skbs `find` unlinked, freed after `st`
+        let mut drops: Drops = [None, None];
         let st = s.st.lock();
         let first = match resume.take() {
             Some(r) => Some(r),
@@ -384,7 +418,9 @@ fn read_locked(
                 s.rq.peek()
             }
         };
-        let skb = match find(s, first, &mut skip, g.copied, target) {
+        let skb = match find(
+            s, first, &mut skip, flags, size, g.copied, target, &mut drops,
+        ) {
             Next::Copy(skb) => skb,
             Next::Out(e) => return e.map_or(Ok(None), Err),
             Next::Wait(last) => {
@@ -431,17 +467,31 @@ fn read_locked(
     }
 }
 
+/// Skbs unlinked under `unix_state_lock`, freed after it
+type Drops = [Option<Arc<SkBuff>>; 2];
+
 /// From `skb` (the head, or the skb a peek continues with) under
-/// `unix_state_lock`: the skb to copy from, past `skip` bytes, or what
-/// to do with none (Linux the `again` label's tests)
+/// `unix_state_lock`: past the out-of-band byte (`manage_oob`), the skb
+/// to copy from, past `skip` bytes, or what to do with none (Linux the
+/// `again` label's tests)
+#[expect(clippy::too_many_arguments)]
 fn find(
     s: &UnixSock,
     mut skb: Option<Arc<SkBuff>>,
     skip: &mut usize,
+    flags: i32,
+    size: usize,
     copied: usize,
     target: usize,
+    drops: &mut Drops,
 ) -> Next {
     let mut last = skb.clone();
+    if let Some(cur) = skb {
+        skb = manage_oob(s, cur, &mut last, flags, copied, drops);
+        if skb.is_none() && (copied > 0 || size == 0) {
+            return Next::Out(None);
+        }
+    }
     loop {
         let Some(cur) = skb else {
             if copied >= target {
@@ -463,6 +513,115 @@ fn find(
         skb = s.rq.peek_next(&cur);
         last = Some(cur);
     }
+}
+
+/// Linux manage_oob, under `unix_state_lock`: a read stops before the
+/// out-of-band skb once it copied anything; without SO_OOBINLINE that
+/// skb is skipped by a peek and dropped by a read (the mark passed),
+/// and a fully read skb at the head (a read out-of-band byte) is
+/// stepped over or unlinked. Unlinked skbs go to `drops`.
+fn manage_oob(
+    s: &UnixSock,
+    skb: Arc<SkBuff>,
+    last: &mut Option<Arc<SkBuff>>,
+    flags: i32,
+    copied: usize,
+    drops: &mut Drops,
+) -> Option<Arc<SkBuff>> {
+    if unix_len(&skb) != 0 && !s.is_oob(&skb) {
+        return Some(skb);
+    }
+    let peek = flags & MSG_PEEK != 0;
+    let inline = s.sk.flag(sf::OOBINLINE);
+    let mut q = s.rq.lock();
+    let mut oob = s.oob.lock();
+    let is_oob =
+        |x: &SkBuff, o: &Option<Arc<SkBuff>>| o.as_deref().is_some_and(|o| core::ptr::eq(o, x));
+    let mut skb = skb;
+    if unix_len(&skb) == 0 {
+        let next = if copied > 0 && (oob.is_none() || is_oob(&skb, &oob)) {
+            None
+        } else if peek {
+            let n = q.next(&skb);
+            *last = Some(skb);
+            n
+        } else {
+            let n = q.next(&skb);
+            drops[0] = q.remove(&skb);
+            *last = n.clone();
+            n
+        };
+        skb = next?;
+    }
+    if !is_oob(&skb, &oob) {
+        return Some(skb);
+    }
+    if copied > 0 {
+        None
+    } else if !peek {
+        let o = oob.take();
+        if inline {
+            drops[1] = o;
+            return Some(skb);
+        }
+        drops[1] = q.remove(&skb);
+        drop(o);
+        // The unread byte leaves the count (Linux v6.8 summed the queue)
+        s.inq_len.fetch_sub(unix_len(&skb), Ordering::AcqRel);
+        let head = q.front();
+        *last = head.clone();
+        head
+    } else if !inline {
+        let n = q.next(&skb);
+        *last = Some(skb);
+        n
+    } else {
+        Some(skb)
+    }
+}
+
+/// Linux unix_stream_recv_urg: MSG_OOB reads (or peeks at) the
+/// out-of-band byte; EINVAL with SO_OOBINLINE or none pending. A read
+/// marks it consumed and unlinks the read skb before it, if any.
+fn recv_urg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
+    let peek = flags & MSG_PEEK != 0;
+    let io = s.iolock.lock();
+    let (skb, read) = {
+        let _st = s.st.lock();
+        let q = s.rq.lock();
+        let mut oob = s.oob.lock();
+        if s.sk.flag(sf::OOBINLINE) {
+            return Err(KernelError::InvalidArgument);
+        }
+        let Some(o) = oob.clone() else {
+            return Err(KernelError::InvalidArgument);
+        };
+        let mut read = None;
+        if !peek {
+            let held = oob.take();
+            s.inq_len.fetch_sub(1, Ordering::AcqRel);
+            drop(oob);
+            let mut q = q;
+            if let Some(p) = q.prev(&o).filter(|p| unix_len(p) == 0) {
+                read = q.remove(&p);
+            }
+            // The queue's reference remains: not the last
+            drop(held);
+        }
+        (o, read)
+    };
+    let cb = ucb(&skb);
+    let off = cb.consumed.load(Ordering::Acquire);
+    let r = m.data.put(0, &skb.data()[off..off + 1]);
+    if !peek {
+        cb.consumed.fetch_add(1, Ordering::AcqRel);
+    }
+    drop(io);
+    drop(read);
+    drop(skb);
+    r.map_err(|_| KernelError::BadAddress)?;
+    m.flags |= MSG_OOB;
+    Ok(1)
 }
 
 /// Mark `chunk` bytes of `skb` read (Linux, without MSG_PEEK): the
@@ -528,6 +687,9 @@ pub fn poll(s: &UnixSock) -> u16 {
     }
     if !s.rq.is_empty() {
         mask |= POLLIN | POLLRDNORM;
+    }
+    if s.has_oob() {
+        mask |= POLLPRI;
     }
     if s.state() == CLOSE {
         mask |= POLLHUP;

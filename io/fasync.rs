@@ -495,6 +495,41 @@ fn sigio_to_task(
     let _ = send(SIGIO, SendInfo::Kernel);
 }
 
+/// Linux send_sigurg: SIGURG (SEND_SIG_PRIV) to the owner's thread or
+/// process, or each process of its group, that the setter may signal
+/// (sigio_perm); true if an owner is set (the caller then signals the
+/// O_ASYNC files, Linux sk_send_sigurg). Any context but hardirq, as
+/// [`kill_fasync`].
+pub fn send_sigurg(fown: &FOwner) -> bool {
+    let o = fown.st.read();
+    let Some(pid) = &o.pid else {
+        return false;
+    };
+    let ty = match o.kind {
+        PidType::Tid => crate::signal::PidType::Pid,
+        PidType::Pgrp => crate::signal::PidType::Pgid,
+        PidType::Tgid => crate::signal::PidType::Tgid,
+    };
+    let mut gone = crate::signal::SigPending::new();
+    with_gfp(Gfp::ATOMIC, || {
+        let table = TASKLIST.read();
+        let mut send = |v: &TaskView<'_>| {
+            if let Some(t) = sigio_target(&o, v) {
+                let _ = send_sig_info_in(&t, SIGURG, SendInfo::Kernel, ty, &mut gone);
+            }
+        };
+        match o.kind {
+            PidType::Tid | PidType::Tgid => {
+                if let Some(v) = table.pid_tid(pid).and_then(|tid| table.get(tid)) {
+                    send(&v);
+                }
+            }
+            PidType::Pgrp => table.pgrp(pid).for_each(|v| send(&v)),
+        }
+    });
+    true
+}
+
 /// Linux send_sigio: to the owner's thread or process, or once to each
 /// process of its group, each found through the owner's struct pid
 /// (never by a number its process may have freed for reuse). All under

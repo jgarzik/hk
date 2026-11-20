@@ -218,6 +218,10 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelE
         Some(&crate::fs::pseudo::SOCKFS.sb()?),
         &NULL_INODE_OPS,
     ))?;
+    // The file's owner, shared with the socket for SIGURG (Linux
+    // sk_send_sigurg reaches it through sk->sk_socket->file)
+    let fown = try_arc(crate::io::fasync::FOwner::default())?;
+    sock.sk().fown.call_once(|| fown.clone());
     inode.set_private(try_arc(SockInode(sock))?);
     // On sockfs (Linux sock_alloc_file: alloc_file_pseudo, dname
     // "socket:[ino]")
@@ -226,7 +230,9 @@ fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<FileRef, KernelE
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    File::new(dentry, Some(mnt), flags, &SOCK_FOPS).alloc()
+    let f = File::new(dentry, Some(mnt), flags, &SOCK_FOPS).alloc()?;
+    f.f_owner.call_once(|| fown);
+    Ok(f)
 }
 
 /// Create a protocol socket (Linux __sock_create)
@@ -376,6 +382,8 @@ const FIOSETOWN: u32 = 0x8901;
 const SIOCSPGRP: u32 = 0x8902;
 const FIOGETOWN: u32 = 0x8903;
 const SIOCGPGRP: u32 = 0x8904;
+/// Linux SIOCATMARK: at the out-of-band mark
+pub const SIOCATMARK: u32 = 0x8905;
 
 /// Linux sock_ioctl: owner commands, then the protocol, then the
 /// interface ioctls of the socket's namespace

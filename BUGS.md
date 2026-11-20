@@ -412,8 +412,7 @@ max_dgram_qlen). Unlike Linux the count is also capped at 2024 (Linux's
 UNIX_INFLIGHT_SANE_USER), so raising RLIMIT_NOFILE does not raise what
 can be pinned.
 
-Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
-out-of-band byte), SO_PASSPIDFD / SCM_PIDFD /
+Not implemented: SO_PASSPIDFD / SCM_PIDFD /
 SO_PEERPIDFD, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC, SIOCUNIXFILE,
 SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 

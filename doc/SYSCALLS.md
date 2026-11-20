@@ -301,7 +301,7 @@ Extended attributes:
 - [x] sendto
 - [x] recvfrom
 - [x] sendmsg
-- [x] recvmsg (MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_ERRQUEUE)
+- [x] recvmsg (MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_ERRQUEUE, MSG_OOB on AF_UNIX streams)
 - [x] sendmmsg
 - [x] recvmmsg
 - [x] shutdown

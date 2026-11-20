@@ -33,4 +33,5 @@ pub mod udp_cork;
 pub mod udp_hash;
 pub mod udp_mem;
 pub mod unix;
+pub mod unix_oob;
 pub mod unix_opt;
