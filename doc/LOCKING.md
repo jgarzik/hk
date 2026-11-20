@@ -3756,7 +3756,10 @@ devices leave sysfs when it is dropped, in thread context. A NIC
 driver's probe and remove run under its device's lock and take RTNL
 (`register_netdev` / `unregister_netdev`): `Device.lock` -> RTNL ->
 KERNFS_RWSEM; no net device attribute's show() takes RTNL, so the
-removal's drain cannot wait on itself.
+removal's drain cannot wait on itself. `unregister_netdev` then waits
+for the device's references with RTNL released and `Device.lock`
+held (Linux the same, in netdev_run_todo): no holder of a net device
+reference takes a device's lock (its attributes hold it weakly).
 Block devices: a disk's partitions are registered and removed (their
 sysfs entries, devtmpfs nodes, uevents) under the disk's `open_mutex`:
 `Disk.open_mutex` -> KERNFS_RWSEM -> devtmpfs root i_rwsem. Their
@@ -5875,7 +5878,8 @@ not rely on either.
 | `PacketSock.bind` | `AtomicU64` (protocol << 32 \| ifindex) | thread only (bind, device unregister; read by receive, send, getname) | the binding (Linux po->num/ifindex under po->bind_lock): changed only by compare-exchange from the value the change was decided on, so bind and unregister never undo each other. bind looks the device up again after storing: unregister unlists a device before visiting its sockets, so either that visit sees the new binding or the lookup misses the device and bind moves the socket to ifindex -1 (Linux "unlisted") |
 | `PING_TABLE.lock` (`net/ping.rs`, one for every namespace, entries matched in their own, net_eq) | `spin::Mutex<PingLocked>` (Linux ping_table.lock; its `UniqueOwner` proves writers of the 64 `RcuHList` chains) | thread only | ping sockets by echo identifier and namespace in 64 RCU hash chains (`util::rcuhlist`, Linux hlist_*_rcu): an identifier search and its insert are one hold of `lock` (the new socket's identifier is set under it; the rover is per namespace), removals take it too; candidates' `Inet.addr` is read under it (order table -> Inet.addr). Receive/error lookups walk a chain under `rcu::read_lock`, take a reference to the match under the guard (sock_hold) and queue after dropping it. A removed socket's table reference is released a grace period later (`RcuHRef::defer_put`, Linux SOCK_RCU_FREE), possibly in `rcuc/N` |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups, so bind sets the addresses before publishing the port in a table (reset on failure; Linux inet_bind) |
-| `RTNL` (`net/rtnl.rs`) | `sync::Mutex<()>` (sleeping, Linux rtnl_mutex) | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes, neighbour entries, device naming + registration via `alloc_netdev`/`register_netdev`) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Never taken while any spinlock is held (a socket's last close, which may take it for AF_PACKET memberships, runs only after the fd table lock is dropped). Holders may sleep (user copies such as SIOCADDRT's `rt_dev` name, like Linux rtentry_to_fib_config; driver open/stop waiting for NAPI) but never take a socket lock (`sk_lock`) and never wait for packets |
+| `RTNL` (`net/rtnl.rs`) | `sync::Mutex<()>` (sleeping, Linux rtnl_mutex) | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes, neighbour entries, device naming + registration via `alloc_netdev`/`register_netdev`) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Never taken while any spinlock is held (a socket's last close, which may take it for AF_PACKET memberships, runs only after the fd table lock is dropped). Holders may sleep (user copies such as SIOCADDRT's `rt_dev` name, like Linux rtentry_to_fib_config; driver open/stop waiting for NAPI) but never take a socket lock (`sk_lock`) and never wait for packets. Releasing it (`RtnlGuard` drop, Linux rtnl_unlock -> netdev_run_todo) takes the todo list under it, unlocks, then waits for the devices unregistered under that hold (sleeps, RCU barriers; Unregistration below): the guard's drop sleeps when the hold unregistered a device, so it is never dropped under a spinlock |
+| `rtnl::NET_TODO` (`net/rtnl.rs`, Linux net_todo_list) | `spin::Mutex<ArcList<TodoList>>` | thread only | leaf, taken only under RTNL: `unregister_netdevice` links the device (`NetDevice.todo_list`, a reference held), the RTNL release takes the whole list; nothing is dropped under it |
 | `NetNamespace.devices` | `RcuList` (Linux dev_base_head) | readers under RCU, any context; writers thread only | registration and unlisting run under RTNL (or before the namespace is listed) and take the list's leaf writer lock; lookups (`get_device`, `dev_get_by_index`) walk it under RCU and take a reference, no lock, no copy; `/proc/net/dev` formats under the guard into a `SeqBuf` (fs/proc/seq.rs, Linux seq_file: a fixed buffer, the walk rerun into a doubled one on overflow), allocating nothing inside; `devices()` references every device for work done per device; unlisting returns after a grace period (Linux synchronize_net), so no reader still walks over the device |
 | `NetNamespace.loopback` | `spin::RwLock` | thread only | reached only via methods returning owned values / `Arc` (no guard escapes) |
 | UDP hash slot locks (`net/udp.rs` `UDP_TABLE`, one table for every namespace, sized at boot) | `spin::Mutex<()>` per slot (`util::hlist_nulls` buckets; Linux udp_hslot.lock) | thread only | one held at a time: a bind's conflict check, its insert and the port it sets are one hold of its port's slot (ephemeral search locks each candidate's slot in turn), and so is an unhash with its reuseport detach; candidates' `Inet.addr` is read under it (order slot -> `REUSEPORT_LOCK` -> Inet.addr). Receive, multicast, ICMP-error lookups and /proc/net/udp walk a slot under `rcu::read_lock` (Linux __udp4_lib_lookup, __udp4_lib_mcast_deliver) and queue GFP_ATOMIC clones under the guard. A removed socket's table reference is released a grace period later (`NullsUnlinked::defer`, Linux SOCK_RCU_FREE), possibly in `rcuc/N` |
@@ -6009,9 +6013,24 @@ The driver then disables a NAPI that is still enabled (`napi_disable`
 waits for a running poll), quiesces the hardware, frees its IRQ (no
 ISR runs after its `IrqRegistration` is dropped, which takes the
 line's `IrqDesc.lock` every dispatch of the line holds), `netif_napi_del`s and frees its DMA
-memory. A `NetDevice` still referenced (queued skbs) stays down and
-driverless; hk cannot wait for those references (Linux
-netdev_wait_allrefs) because skbs in socket queues hold them.
+memory. Before that, releasing RTNL waits for the device (Linux
+netdev_run_todo, `rtnl::NET_TODO`): with RTNL dropped and an
+`rcu_barrier` (routes and neighbours unlinked under RTNL are freed by
+RCU callbacks), until its `Arc` count shows only its owner (the
+driver's binding, or its namespace's loopback slot) and the todo
+list's (Linux netdev_refcnt_read == 1). Holders let go on
+NETDEV_UNREGISTER (`netdev_unregister_notify`: addresses, routes,
+neighbours and their queued packets; packet sockets keep only the
+index); skbs keep no device reference once queued to a socket or a
+reassembly queue (Linux skb->dev = NULL there), the rest (in-flight
+packets, a route or a `dev_get_by_*` reference of a running call) go
+when the call ends, none of them waiting for RTNL or a lock the
+waiter holds (`Device.lock` in a driver's remove). The waiter checks
+after an RCU barrier and a sleep of 1 ms doubling to 250, sends
+NETDEV_UNREGISTER again every second under RTNL (released without
+running the list: Linux __rtnl_unlock), and every 10 s prints
+"unregister_netdevice: waiting for <dev> to become free. Usage count
+= <n>" for each device still held (Linux netdev_wait_allrefs_any).
 A namespace has active references (`NetRef`, Linux net->ns.count:
 tasks' nsproxies and user sockets) and passive ones (its `Arc`, Linux
 net->passive: the memory; TIME_WAIT entries, devices' back pointers,
@@ -6023,7 +6042,9 @@ __put_net). `cleanup_net` there unlists the namespaces from
 `NET_NAMESPACE_LIST` (write), unregisters each device under RTNL
 through `rtnl::unregister_netdevice`, loopback last (Linux
 default_device_exit_batch: its addresses, routes, neighbours and
-sysfs device go) and clears its loopback (loopback_net_exit), ends
+sysfs device go; the RTNL release waits for them, its own device
+references dropped first, the loopback slot the owner's), clears
+its loopback (loopback_net_exit), ends
 the batch's TIME_WAIT entries in one walk (`TimeWait::kill`, Linux
 tcp_twsk_purge: timer stopped for good under the entry's lock,
 unhashed), waits for queued RCU

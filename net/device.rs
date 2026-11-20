@@ -292,9 +292,12 @@ pub struct NetDevice {
     /// Its ARP entries (Linux dev->neighbours[NEIGH_ARP_TABLE]), under
     /// the ARP table's lock
     pub neighbours: crate::net::neigh::DevNeighbours,
+    /// On the unregistration todo list (Linux todo_list; `net::rtnl`)
+    todo_list: crate::util::list::Link,
 }
 
 crate::adapter!(pub DevList, NetDevice, dev_list);
+crate::adapter!(pub TodoList, NetDevice, todo_list);
 
 impl NetDevice {
     /// Create a device named `name` (see `net::dev_alloc_name`)
@@ -323,6 +326,7 @@ impl NetDevice {
             kdev: spin::Once::new(),
             dev_list: crate::util::list::Link::new(),
             neighbours: crate::net::neigh::dev_neighbours(),
+            todo_list: crate::util::list::Link::new(),
         }
     }
 

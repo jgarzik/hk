@@ -136,8 +136,6 @@ SACK/DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
-NIC removal: an unregistered `NetDevice` lives on while queued skbs
-reference it (no netdev_wait_allrefs; it is down and driverless).
 A device MTU change leaves path MTU exceptions (`route::NhExceptions`)
 as they are (Linux NETDEV_CHANGEMTU fib_sync_mtu lowers them with it and
 raises those equal to the old MTU).

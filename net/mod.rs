@@ -163,8 +163,10 @@ pub fn register_netdev(rtnl: rtnl::RtnlGuard, dev: Arc<NetDevice>) {
 }
 
 /// Unregister a driver's device (Linux unregister_netdev: takes RTNL;
-/// see `rtnl::unregister_netdevice`). On return no driver callback runs
-/// for it again; the driver then stops its NAPI and frees the hardware.
+/// see `rtnl::unregister_netdevice`; the RTNL release waits until only
+/// the caller's reference is left, Linux netdev_run_todo). On return no
+/// driver callback runs for it again; the driver then stops its NAPI
+/// and frees the hardware.
 pub fn unregister_netdev(dev: &Arc<NetDevice>) {
     let r = rtnl::lock();
     rtnl::unregister_netdevice(&r, dev);
