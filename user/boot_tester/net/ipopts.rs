@@ -2,7 +2,8 @@
 //! as given, carried in a datagram's header with our address recorded
 //! (ip_options_build), IP_RECVOPTS / IP_RETOPTS control messages on
 //! receive, and an ICMP echo reply echoing a record route with its own
-//! entry added (ip_options_echo); malformed sets refused.
+//! entry added (ip_options_echo); malformed sets refused, and options
+//! with IP_HDRINCL.
 
 use hk_syscall::{AF_INET, SOCK_RAW, sys_getsockopt, sys_setsockopt, sys_socket};
 
@@ -56,6 +57,11 @@ fn test_sockopt() {
     t.eq(b"clear", set_opts(u, &[]), 0);
     t.eq(b"cleared", get_opts(u, &mut b).1 as i64, 0);
     close(u);
+    // Linux raw_sendmsg: options, even set empty, with IP_HDRINCL
+    let raw = sys_socket(AF_INET, SOCK_RAW, 255) as i32;
+    t.eq(b"hdrincl set", set_opts(raw, &[]), 0);
+    t.eq(b"hdrincl", send_to(raw, &[0x45; 20], LO, 0, 0), EINVAL);
+    close(raw);
     t.done();
 }
 

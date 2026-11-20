@@ -407,20 +407,25 @@ impl ProtoOps for RawSock {
         } else {
             c.saddr
         };
-        // Linux raw_sendmsg: a source route goes to its first hop (not
-        // with IP_HDRINCL, whose header the user wrote)
-        let opt = c
-            .opt(&self.inet, daddr)
-            .filter(|_| !self.inet.flag(ipf::HDRINCL));
-        let rt = self.route(ipv4::TxOpt::first_hop(&opt, daddr), saddr, oif)?;
-        // Linux raw_sendmsg's do_confirm
+        // Linux raw_sendmsg: options (an IP_RETOPTS control message or
+        // the socket's IP_OPTIONS, even set empty) with IP_HDRINCL are
+        // EINVAL, as raw headers are not mangled; a source route goes
+        // to its first hop
+        let hdrincl = self.inet.flag(ipf::HDRINCL);
+        if hdrincl && (c.opt.is_some() || self.inet.options().is_some()) {
+            return Err(KernelError::InvalidArgument);
+        }
+        let opt = c.opt(&self.inet, daddr);
+        let hop = ipv4::TxOpt::first_hop(&opt, daddr);
+        let rt = self.route(hop, saddr, oif)?;
+        // Linux raw_sendmsg's do_confirm: fl4.daddr, the first hop
         if flags & MSG_CONFIRM != 0 && flags & MSG_PROBE != 0 {
-            route::confirm_neigh(&rt, daddr);
+            route::confirm_neigh(&rt, hop);
             if len == 0 {
                 return Ok(0);
             }
         }
-        if self.inet.flag(ipf::HDRINCL) {
+        if hdrincl {
             // Linux raw_send_hdrinc: a probe returns after the size
             // checks
             if flags & MSG_PROBE != 0 {

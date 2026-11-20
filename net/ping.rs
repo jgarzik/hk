@@ -368,12 +368,13 @@ impl ProtoOps for PingSock {
         };
         // Linux ping_v4_sendmsg: a source route goes to its first hop
         let opt = c.opt(&self.inet, daddr);
-        let rt = self.route(ipv4::TxOpt::first_hop(&opt, daddr), saddr, oif)?;
+        let hop = ipv4::TxOpt::first_hop(&opt, daddr);
+        let rt = self.route(hop, saddr, oif)?;
         // Linux ping_v4_sendmsg's do_confirm (len is never 0); then
         // ip_append_data sends nothing for a probe
         if flags & MSG_PROBE != 0 {
             if flags & MSG_CONFIRM != 0 {
-                route::confirm_neigh(&rt, daddr);
+                route::confirm_neigh(&rt, hop);
             }
             return Ok(len);
         }
