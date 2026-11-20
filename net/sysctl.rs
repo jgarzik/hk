@@ -67,6 +67,8 @@ pub struct NetSysctl {
     pub tcp_frto: AtomicU8,
     /// tcp_min_rtt_wlen: the windowed minimum RTT's window, s
     pub tcp_min_rtt_wlen: AtomicI32,
+    /// tcp_slow_start_after_idle (RFC 2861 window validation)
+    pub tcp_slow_start_after_idle: AtomicU8,
     /// Default congestion control (index into tcp::cong::ALGOS)
     pub tcp_ca: AtomicU8,
     pub somaxconn: AtomicI32,
@@ -112,6 +114,7 @@ impl Default for NetSysctl {
             tcp_keepalive_probes: AtomicU8::new(9),
             tcp_frto: AtomicU8::new(2),
             tcp_min_rtt_wlen: AtomicI32::new(300),
+            tcp_slow_start_after_idle: AtomicU8::new(1),
             tcp_ca: AtomicU8::new(crate::net::tcp::cong::DEFAULT as u8),
             somaxconn: AtomicI32::new(4096),
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
@@ -604,6 +607,14 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_i32(n, |s| &s.tcp_min_rtt_wlen),
         store: |n, v| set_int(n, |s| &s.tcp_min_rtt_wlen, v, 0, 86400),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_slow_start_after_idle",
+        mode: 0o644,
+        global: false,
+        show: |n| get_u8(n, |s| &s.tcp_slow_start_after_idle),
+        store: |n, v| set_u8(n, |s| &s.tcp_slow_start_after_idle, v),
         text: None,
     },
     NetCtl {

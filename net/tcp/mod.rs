@@ -317,6 +317,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         keepcnt: u32::from(s.tcp_keepalive_probes.load(Ordering::Relaxed)),
         frto: s.tcp_frto.load(Ordering::Relaxed),
         min_rtt_wlen: s.tcp_min_rtt_wlen.load(Ordering::Relaxed).max(0) as u32,
+        slow_start_after_idle: s.tcp_slow_start_after_idle.load(Ordering::Relaxed) != 0,
     }
 }
 

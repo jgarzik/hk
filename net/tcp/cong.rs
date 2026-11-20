@@ -237,6 +237,11 @@ pub struct Cong {
     limited: bool,
     max_packets_out: u32,
     usage_seq: u32,
+    /// Linux snd_cwnd_used: the most packets out while the window was
+    /// not the limit; snd_cwnd_stamp: when the window was last used or
+    /// changed (jiffies)
+    pub(super) used: u32,
+    pub(super) stamp: u32,
     /// The algorithm (Linux icsk_ca_ops: index into [`ALGOS`]), whether
     /// its init ran (icsk_ca_initialized), its private state
     algo: usize,
@@ -271,6 +276,8 @@ impl Cong {
             limited: false,
             max_packets_out: 0,
             usage_seq: 0,
+            used: 0,
+            stamp: 0,
             algo: DEFAULT,
             initialized: false,
             ca: CaPriv::default(),
@@ -424,6 +431,7 @@ impl TcpCb {
         } else {
             self.cong.set_cwnd(INIT_CWND);
         }
+        self.cong.stamp = self.jiffies32();
         if !self.cong.initialized {
             self.init_cc();
         }
@@ -471,12 +479,15 @@ impl TcpCb {
     /// Linux tcp_cong_avoid
     pub(super) fn cong_avoid(&mut self, ack: u32, acked: u32) {
         self.ca_ops().cong_avoid(self, ack, acked);
+        self.cong.stamp = self.jiffies32();
     }
 
     /// After a transmit pass with `limited` if cwnd stopped it (Linux
-    /// tcp_cwnd_validate): one sample per window
+    /// tcp_cwnd_validate): one sample per window; a window not used for
+    /// an RTO shrinks towards what was (RFC 2861 spirit)
     pub(super) fn cwnd_validate(&mut self, limited: bool) {
         let out = self.packets_out;
+        let now = self.jiffies32();
         let c = &mut self.cong;
         if !before(self.snd_una, c.usage_seq) || limited || (!c.limited && out > c.max_packets_out)
         {
@@ -484,13 +495,54 @@ impl TcpCb {
             c.max_packets_out = out;
             c.usage_seq = self.snd_nxt;
         }
+        if c.cwnd_limited() {
+            // The network is fed fully
+            c.used = 0;
+            c.stamp = now;
+            return;
+        }
+        // The network starves
+        c.used = c.used.max(out);
+        let idle = now.wrapping_sub(c.stamp) as i32;
+        if self.cfg.slow_start_after_idle && i64::from(idle) >= self.rto_cur() as i64 {
+            self.cwnd_application_limited();
+        }
+    }
+
+    /// Linux tcp_cwnd_application_limited: limited by the application
+    /// or the receiver's window (not by a full send buffer), the window
+    /// goes half way down to what was used, at least the initial window
+    fn cwnd_application_limited(&mut self) {
+        if self.ca_state == CaState::Open && !self.orphan && !self.nospace {
+            let used = self.cong.used.max(INIT_CWND);
+            if used < self.cong.snd_cwnd() {
+                let ss = self.current_ssthresh();
+                self.cong.set_ssthresh(ss);
+                let w = (self.cong.snd_cwnd() + used) >> 1;
+                self.cong.set_cwnd(w);
+            }
+            self.cong.used = 0;
+        }
+        self.cong.stamp = self.jiffies32();
+    }
+
+    /// Linux tcp_slow_start_after_idle_check: about to send with nothing
+    /// out after an RTO of quiet, the window restarts
+    pub(super) fn slow_start_after_idle_check(&mut self, now: u64) {
+        if !self.cfg.slow_start_after_idle || self.packets_out != 0 {
+            return;
+        }
+        let delta = now.saturating_sub(self.lsndtime);
+        if delta > self.rto_cur() {
+            self.cwnd_restart(delta);
+        }
     }
 
     /// Sending again after `delta` ms with nothing in flight (Linux
     /// tcp_cwnd_restart): halve per RTO idle, not below the initial
     /// window
     pub(super) fn cwnd_restart(&mut self, delta: u64) {
-        let rto = self.live.rto.get();
+        let rto = self.rto_cur();
         let mut cwnd = self.cong.snd_cwnd();
         let restart = INIT_CWND.min(cwnd);
         self.ca_event(CaEvent::CwndRestart);
@@ -502,6 +554,8 @@ impl TcpCb {
             left -= rto as i64;
         }
         self.cong.set_cwnd(cwnd.max(restart));
+        self.cong.stamp = self.jiffies32();
+        self.cong.used = 0;
     }
 }
 
@@ -598,6 +652,58 @@ mod tests {
         tp.cong.set_cwnd(40);
         tp.cwnd_restart(0);
         assert_eq!(tp.cong.snd_ssthresh(), 30);
+    }
+
+    /// A window idle an RTO with 5 packets used, of 40 (ssthresh 8)
+    fn idle_window(f: impl FnOnce(&mut TcpCb)) -> TcpCb {
+        let mut tp = cb(0);
+        tp.cong.set_cwnd(40);
+        tp.cong.set_ssthresh(8);
+        tp.live.rto.set(200);
+        f(&mut tp);
+        tp.packets_out = 5;
+        tp.tick(300);
+        tp.cwnd_validate(false);
+        tp
+    }
+
+    /// Linux tcp_cwnd_validate / tcp_cwnd_application_limited: half way
+    /// down to max(used, IW), ssthresh tcp_current_ssthresh
+    #[test]
+    fn application_limited_shrinks() {
+        let tp = idle_window(|_| {});
+        assert_eq!(tp.cong.snd_cwnd(), (40 + INIT_CWND) >> 1);
+        assert_eq!(tp.cong.snd_ssthresh(), (40 >> 1) + (40 >> 2));
+        assert_eq!((tp.cong.used, tp.cong.stamp), (0, 300));
+        // A full send buffer, not the application, limited it
+        let tp = idle_window(|tp| tp.nospace = true);
+        assert_eq!(tp.cong.snd_cwnd(), 40);
+        assert_eq!((tp.cong.used, tp.cong.stamp), (5, 300));
+        // tcp_slow_start_after_idle 0
+        let tp = idle_window(|tp| tp.cfg.slow_start_after_idle = false);
+        assert_eq!(tp.cong.snd_cwnd(), 40);
+        assert_eq!(tp.cong.used, 5);
+    }
+
+    /// Linux tcp_slow_start_after_idle_check: nothing out and an RTO
+    /// quiet restarts the window, unless the sysctl is off
+    #[test]
+    fn restart_needs_idle_and_sysctl() {
+        let mut tp = cb(0);
+        tp.cong.set_cwnd(80);
+        tp.live.rto.set(200);
+        tp.slow_start_after_idle_check(150);
+        assert_eq!(tp.cong.snd_cwnd(), 80);
+        tp.cfg.slow_start_after_idle = false;
+        tp.slow_start_after_idle_check(450);
+        assert_eq!(tp.cong.snd_cwnd(), 80);
+        tp.cfg.slow_start_after_idle = true;
+        tp.packets_out = 1;
+        tp.slow_start_after_idle_check(450);
+        assert_eq!(tp.cong.snd_cwnd(), 80);
+        tp.packets_out = 0;
+        tp.slow_start_after_idle_check(450);
+        assert_eq!(tp.cong.snd_cwnd(), 20);
     }
 
     #[test]

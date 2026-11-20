@@ -555,6 +555,10 @@ impl TcpCb {
         self.ack_update_rtt(s, flg, &mut st);
         self.ca_acked(&st);
         self.mem_settle();
+        // Linux tcp_check_space -> sk_stream_write_space
+        if self.nospace && self.writable() {
+            self.nospace = false;
+        }
         self.rack_update_reo_wnd(st.prior_delivered);
         self.process_tlp_ack(ack, flg);
         if self.ack_is_dubious(flg) {

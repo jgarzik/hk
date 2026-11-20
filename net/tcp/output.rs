@@ -342,12 +342,10 @@ impl TcpCb {
         }
         // Linux tcp_event_data_sent: nothing was in flight
         let tx_start = self.in_flight() == 0;
+        // Idle longer than an RTO: the window restarts
+        self.slow_start_after_idle_check(now);
         if !self.send_new(n, fl, out) {
             return None;
-        }
-        if !in_flight && now.saturating_sub(self.lsndtime) > self.live.rto.get() {
-            // Idle longer than an RTO: restart from the initial window
-            self.cwnd_restart(now - self.lsndtime);
         }
         let next = seq.wrapping_add(n + u32::from(fin));
         if n < mss {

@@ -380,6 +380,7 @@ impl TcpCb {
         }
         self.cong.set_cwnd(self.in_flight() + 1);
         self.cong.reset_cnt();
+        self.cong.stamp = self.jiffies32();
         // Many duplicate ACKs, then a timeout: reordering overestimated
         if self.ca_state <= CaState::Disorder && self.sacked_out >= self.cfg.reordering {
             self.reordering = self.reordering.min(self.cfg.reordering);
@@ -477,6 +478,7 @@ impl TcpCb {
                 self.cong.set_ssthresh(self.prior_ssthresh);
             }
         }
+        self.cong.stamp = self.jiffies32();
         self.undo_marker = None;
         // Force RACK to examine the losses again
         self.rack.advanced = true;
@@ -647,6 +649,7 @@ impl TcpCb {
         let ss = self.cong.snd_ssthresh();
         if ss < INFINITE_SSTHRESH && (self.ca_state == CaState::Cwr || self.undo_marker.is_some()) {
             self.cong.set_cwnd(ss);
+            self.cong.stamp = self.jiffies32();
         }
         self.ca_event(CaEvent::CompleteCwr);
     }

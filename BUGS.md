@@ -95,9 +95,7 @@ reordering window), RACK checks every skb of the retransmit queue
 SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
-TCPAckCompressed: hk ACKs each at once), no cwnd validation of an
-application-limited sender (tcp_cwnd_application_limited,
-snd_cwnd_used) and no tcp_slow_start_after_idle sysctl (always on), no CUBIC module parameters
+TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
 (/sys/module/tcp_cubic/parameters: Linux's defaults are constants), no
 receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
 tcp_sndbuf_expand, so past the TCP memory hard limit a sender's

@@ -224,6 +224,9 @@ pub struct Cfg {
     pub frto: u8,
     /// tcp_min_rtt_wlen: the minimum RTT's window, s
     pub min_rtt_wlen: u32,
+    /// tcp_slow_start_after_idle: restart and validate the window after
+    /// idle (RFC 2861)
+    pub slow_start_after_idle: bool,
 }
 
 impl Default for Cfg {
@@ -248,6 +251,7 @@ impl Default for Cfg {
             keepcnt: 9,
             frto: 2,
             min_rtt_wlen: 300,
+            slow_start_after_idle: true,
         }
     }
 }
@@ -931,6 +935,9 @@ pub struct TcpCb {
     /// The ACK being processed echoed this TSval (Linux
     /// rx_opt.saw_tstamp and rcv_tsecr)
     pub(super) rcv_tsecr: Option<u32>,
+    /// A writer found the send buffer full (Linux SOCK_NOSPACE), until
+    /// ACKs make it writable again (sk_stream_write_space)
+    pub(super) nospace: bool,
     /// The windowed minimum RTT, us (Linux rtt_min)
     pub(super) rtt_min: crate::util::win_minmax::Minmax,
     /// Delayed ACK state
@@ -1068,6 +1075,7 @@ impl TcpCb {
             recv_sack_cache: [(0, 0); NUM_SACKS],
             is_sack_reneg: false,
             rcv_tsecr: None,
+            nospace: false,
             rtt_min: min_rtt_none(),
             dack: Default::default(),
             orphan: Default::default(),
@@ -1269,6 +1277,10 @@ impl TcpCb {
         mut fill: impl FnMut(&mut [u8]) -> Result<usize, KernelError>,
     ) -> Result<usize, KernelError> {
         let n = self.wmem_schedule(max.min(self.snd_space()));
+        // Linux sk_stream_wait_memory: a writer found no room
+        if n < max {
+            self.nospace = true;
+        }
         let (mut done, mut err, mut short) = (0, None, false);
         while done < n {
             let Some(mut skb) = self.wq_tail() else {
