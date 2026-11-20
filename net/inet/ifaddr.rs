@@ -471,10 +471,14 @@ pub fn inet_replace_ifa(
     };
     let secondary = x.flags() & IFA_F_SECONDARY;
     x.set_flags((new.flags() & !(IFA_F_SECONDARY | IPV6ONLY_FLAGS)) | secondary);
-    x.set_rt_priority(new.rt_priority());
+    // Its prefix route moves to the new metric (Linux
+    // fib_modify_prefix_metric); nothing else is re-added
+    if x.rt_priority() != new.rt_priority() {
+        fib::fib_modify_prefix_metric(rtnl, net, dev, &x, new.rt_priority());
+        x.set_rt_priority(new.rt_priority());
+    }
     x.set_proto(new.proto());
     rtnetlink::notify_addr(net, dev, &x, rtnetlink::RTM_NEWADDR, nl);
-    fib::fib_add_ifaddr(rtnl, net, dev, &x);
 }
 
 /// Device came up (Linux inetdev_event/fib_netdev_event NETDEV_UP): `lo`

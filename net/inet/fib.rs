@@ -786,6 +786,45 @@ pub fn fib_add_ifaddr(rtnl: &RtnlGuard, net: &NetNamespace, dev: &NetDevice, ifa
     }
 }
 
+/// An address's metric changes (Linux fib_modify_prefix_metric, from
+/// inet_rtm_newaddr's NLM_F_REPLACE): its prefix route is added at
+/// `new_metric`, then the one at its old metric deleted
+pub fn fib_modify_prefix_metric(
+    rtnl: &RtnlGuard,
+    net: &NetNamespace,
+    dev: &NetDevice,
+    ifa: &InIfaddr,
+    new_metric: u32,
+) {
+    let prefix = ifa.prefix();
+    if !dev.is_up()
+        || ifa.is_secondary()
+        || ifa.flags() & IFA_F_NOPREFIXROUTE != 0
+        || zeronet(prefix)
+        || (prefix == ifa.local && ifa.prefixlen == 32)
+    {
+        return;
+    }
+    let t = if dev.is_loopback() {
+        RouteType::Local
+    } else {
+        RouteType::Unicast
+    };
+    let (len, prim) = (ifa.prefixlen, ifa.local);
+    fib_magic(rtnl, net, true, t, prefix, len, dev, prim, new_metric);
+    fib_magic(
+        rtnl,
+        net,
+        false,
+        t,
+        prefix,
+        len,
+        dev,
+        prim,
+        ifa.rt_priority(),
+    );
+}
+
 /// Which of a deleted address's routes another address of the device
 /// still implies (Linux fib_del_ifaddr's `ok` bits)
 const LOCAL_OK: u32 = 1;
