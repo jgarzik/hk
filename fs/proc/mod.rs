@@ -2895,8 +2895,23 @@ fn procfs_mount(
 static PROC_DENTRY_OPS: crate::fs::dentry::DentryOps = crate::fs::dentry::DentryOps {
     d_compare: Some(proc_sysctl::compare),
     d_revalidate: Some(proc_revalidate),
+    d_delete: Some(proc_d_delete),
     ..crate::fs::dentry::DentryOps::NONE
 };
+
+/// procfs's d_delete at a dentry's last put: a negative one never
+/// stays (Linux: procfs lookups instantiate none, an ENOENT leaves no
+/// dentry), nor a /proc/sys/net entry of a namespace that is going
+/// (Linux proc_sys_delete: the header unregistering); the namespace is
+/// looked at with the inode data's lock released
+fn proc_d_delete(d: &Dentry) -> bool {
+    let Some(inode) = d.get_inode() else {
+        return true;
+    };
+    with_data(&inode, sysctl_live)
+        .flatten()
+        .is_some_and(|l| !l.live())
+}
 
 /// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that
 /// is gone, or of an fd no longer open, is invalid, and so is a

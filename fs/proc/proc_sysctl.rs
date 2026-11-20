@@ -225,15 +225,16 @@ fn fill_cache(
 /// procfs's d_compare: a cached child of a namespace's sysctl tree is
 /// the one a lookup wants only when the looking-up task is in that
 /// namespace (Linux proc_sys_compare: sysctl_is_seen, net's is_seen);
-/// the rest by their bytes
+/// a negative one never (proc_sys_compare: no inode, 1; procfs keeps
+/// none, `delete`); the rest by their bytes
 pub(super) fn compare(c: &Dentry, stored: &[u8], name: &[u8]) -> bool {
     if stored != name {
         return false;
     }
     let g = crate::sync::rcu::read_lock();
-    let net = c
-        .d_inode_rcu(&g)
-        .and_then(super::proc_rcu)
-        .and_then(|r| r.net);
+    let Some(inode) = c.d_inode_rcu(&g) else {
+        return false;
+    };
+    let net = super::proc_rcu(inode).and_then(|r| r.net);
     net.is_none_or(|id| id == current_net_id())
 }

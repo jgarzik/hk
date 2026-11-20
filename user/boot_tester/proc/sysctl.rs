@@ -377,14 +377,17 @@ fn test_netns_bind() {
 
 /// tcp_mem and mem_pcpu_rsv are in the initial namespace's tree only
 /// (Linux ipv4_table, net_core_table: register_net_sysctl(&init_net));
-/// an fd opened there still reads from another namespace
+/// an fd opened there still reads from another namespace, and the
+/// failed lookup there leaves nothing that hides tcp_mem from the
+/// initial namespace (proc_sys_compare: no negative dentry matches)
 fn test_netns_init_only() {
     const TCP_MEM: &[u8] = b"/proc/sys/net/ipv4/tcp_mem\0";
     const RSV: &[u8] = b"/proc/sys/net/core/mem_pcpu_rsv\0";
     in_child(b"SYSCTL_NETNS_INIT_ONLY", || {
+        let init = sys_open(b"/proc/self/ns/net\0".as_ptr(), O_RDONLY, 0);
         let fd = sys_open(TCP_MEM.as_ptr(), O_RDONLY, 0);
         let rsv = sys_open(RSV.as_ptr(), O_RDONLY, 0);
-        if fd < 0 || rsv < 0 {
+        if init < 0 || fd < 0 || rsv < 0 {
             return 10;
         }
         sys_close(rsv as u64);
@@ -403,6 +406,15 @@ fn test_netns_init_only() {
         if sys_pread64(fd as i32, buf.as_mut_ptr(), buf.len() as u64, 0) <= 0 {
             return 13;
         }
+        // Back in the initial namespace the path finds tcp_mem again
+        if sys_setns(init as i32, CLONE_NEWNET as i32) != 0 {
+            return 14;
+        }
+        let f = sys_open(TCP_MEM.as_ptr(), O_RDONLY, 0);
+        if f < 0 {
+            return 15;
+        }
+        sys_close(f as u64);
         0
     });
 }

@@ -3336,9 +3336,11 @@ stores to the dentry's lock word.
 
 A dentry is held through `DentryRef` (Linux dget/dput on d_lockref):
 the tree's two references, each child's `d_parent`, and every
-holder's. The last holder's put of a hashed negative dentry whose
-filesystem keeps none unused (`DentryOps::d_delete`: ramfs, tmpfs,
-devtmpfs; Linux retain_dentry and always_delete_dentry) first takes
+holder's. The last holder's put of a hashed dentry its filesystem
+keeps no unused copy of (`DentryOps::d_delete`, Linux retain_dentry:
+a negative one of ramfs, tmpfs, devtmpfs, tracefs, procfs; a procfs
+/proc/sys/net entry of a namespace that is going, proc_sys_delete,
+checked with no d_lock held) first takes
 it out of the tree as the shrinker does (`d_delete_unused` ->
 `prune_one`: the parent's d_lock, then its own, both written; the
 tree's references put after them), so no reference to a hashed dentry

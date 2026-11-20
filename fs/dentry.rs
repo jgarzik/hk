@@ -177,10 +177,12 @@ pub struct DentryOps {
     /// mode.
     pub d_revalidate: Option<RevalidateFn>,
     /// A dentry no one holds any more is killed, not kept cached (Linux
-    /// d_delete, asked by retain_dentry at the last dput: ramfs's
-    /// always_delete_dentry). Asked only of a negative one: every
-    /// filesystem here with one pins its positive dentries
-    /// (`SuperOps::d_persistent`, Linux d_make_persistent's reference)
+    /// d_delete, asked by retain_dentry at the last dput of any hashed
+    /// dentry: ramfs's always_delete_dentry, proc_sys_delete). A
+    /// filesystem that keeps its positive dentries
+    /// (`SuperOps::d_persistent`, Linux d_make_persistent's reference,
+    /// which keeps them from ever reaching d_delete) answers false for
+    /// a positive one.
     pub d_delete: Option<fn(&Dentry) -> bool>,
     /// Called as the dentry is killed, before its memory's grace period
     /// starts (Linux d_prune): no reference is left or can be taken
@@ -1507,23 +1509,23 @@ unsafe impl RefPtr for DentryRef {
 }
 
 impl Dentry {
-    /// Negative, and its filesystem keeps no unused one (Linux
-    /// retain_dentry false: d_op->d_delete)
+    /// Its filesystem keeps no unused copy of it (Linux retain_dentry
+    /// false: d_op->d_delete)
     fn unretained(&self) -> bool {
-        self.is_negative() && self.d_op.and_then(|o| o.d_delete).is_some_and(|f| f(self))
+        self.d_op.and_then(|o| o.d_delete).is_some_and(|f| f(self))
     }
 }
 
 /// The caller is the last holder of `d`, hashed, which its filesystem
 /// keeps no unused copy of (`Dentry::unretained`): it leaves the tree
-/// if it is still unused and negative, decided under its parent's
+/// if it is still unused, decided under its parent's
 /// d_lock and its own (`prune_one`, Linux dput -> lock_for_kill ->
 /// __dentry_kill), the tree's references put after the locks; the
 /// caller's put then kills it. A DentryRef of a hashed dentry is never
 /// put under a d_lock.
 fn d_delete_unused(d: &DentryRef) {
     if let Some(parent) = d.get_parent() {
-        prune_one(&parent, d, true);
+        prune_one(&parent, d, false);
     }
 }
 

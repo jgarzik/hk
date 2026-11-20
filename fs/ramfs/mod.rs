@@ -1234,10 +1234,11 @@ static SIMPLE_DENTRY_OPS: super::dentry::DentryOps = super::dentry::DentryOps {
     ..super::dentry::DentryOps::NONE
 };
 
-/// Linux always_delete_dentry: a negative dentry goes at its last put
-/// (the positive ones are pinned, `d_persistent`)
-fn always_delete_dentry(_: &Dentry) -> bool {
-    true
+/// Linux always_delete_dentry: a dentry goes at its last put; the
+/// positive ones are pinned (`d_persistent`, Linux d_make_persistent's
+/// reference: they never reach it), so only a negative one does
+fn always_delete_dentry(d: &Dentry) -> bool {
+    d.is_negative()
 }
 
 /// Give a new superblock its root directory (Linux ramfs_fill_super,
