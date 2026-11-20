@@ -167,6 +167,9 @@ pub struct Sock {
     /// In its namespace's INUSE_ALL: `INUSE_*` (`inuse_start`,
     /// `inuse_end`)
     inuse: AtomicU8,
+    /// SO_PEEK_OFF: where the next MSG_PEEK reads from, -1 when off
+    /// (Linux sk_peek_off; READ_ONCE/WRITE_ONCE, no lock)
+    pub peek_off: AtomicI32,
 }
 
 /// `Sock.inuse`: not counted yet, counted, counted no more (for good)
@@ -249,6 +252,7 @@ impl Sock {
             fasync: FasyncList::new(),
             wq_flags: AtomicU32::new(0),
             inuse: AtomicU8::new(INUSE_NOT_YET),
+            peek_off: AtomicI32::new(-1),
         }
     }
 
@@ -270,6 +274,8 @@ impl Sock {
         s.linger
             .store(p.linger.load(Ordering::Relaxed), Ordering::Relaxed);
         s.bound_dev_if.store(p.bound_dev_if(), Ordering::Relaxed);
+        s.peek_off
+            .store(p.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
         s
     }
 
@@ -285,6 +291,38 @@ impl Sock {
         } else {
             self.flags.fetch_and(!f, Ordering::AcqRel);
         }
+    }
+
+    // --- peek offset (SO_PEEK_OFF) ---------------------------------------
+
+    /// Linux sk_set_peek_off
+    pub fn set_peek_off(&self, val: i32) {
+        self.peek_off.store(val, Ordering::Relaxed);
+    }
+
+    /// Where a read with `flags` starts (Linux sk_peek_offset): the
+    /// peek offset for MSG_PEEK (-1 when off), else 0
+    pub fn peek_offset(&self, flags: i32) -> i32 {
+        if flags & crate::net::msg::MSG_PEEK != 0 {
+            return self.peek_off.load(Ordering::Relaxed);
+        }
+        0
+    }
+
+    /// `n` bytes were consumed: an enabled offset moves back by them,
+    /// not below 0 (Linux sk_peek_offset_bwd)
+    pub fn peek_offset_bwd(&self, n: i32) {
+        let off = self.peek_off.load(Ordering::Relaxed);
+        if off >= 0 {
+            self.peek_off
+                .store(off.wrapping_sub(n).max(0), Ordering::Relaxed);
+        }
+    }
+
+    /// `n` bytes were peeked: an enabled offset moves past them (Linux
+    /// sk_peek_offset_fwd)
+    pub fn peek_offset_fwd(&self, n: i32) {
+        self.peek_offset_bwd(n.wrapping_neg());
     }
 
     // --- errors ----------------------------------------------------------

@@ -161,6 +161,16 @@ pub trait ProtoOps: Send + Sync {
     fn sigpipe(&self) -> bool {
         true
     }
+    /// SO_PEEK_OFF write (Linux proto_ops.set_peek_off); None: the
+    /// protocol has none, and SO_PEEK_OFF is EOPNOTSUPP both ways
+    fn set_peek_off(&self, _val: i32) -> Option<Result<(), KernelError>> {
+        None
+    }
+    /// The protocol has a `set_peek_off` (Linux: proto_ops.set_peek_off
+    /// is not NULL), so getsockopt(SO_PEEK_OFF) reads `Sock.peek_off`
+    fn has_set_peek_off(&self) -> bool {
+        false
+    }
 }
 
 /// Inode private data: the protocol socket (Linux SOCKET_I)
@@ -521,8 +531,12 @@ pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), Kerne
             sk.mark.store(val as u32, Ordering::Release);
         }
         SO_BINDTOIFINDEX => bind_ifindex(sk, val)?,
-        // Datagram peek offsets are not implemented (BUGS.md)
-        SO_PEEK_OFF => return Err(KernelError::OperationNotSupported),
+        // Linux sock_setsockopt: the protocol's set_peek_off
+        SO_PEEK_OFF => {
+            return s
+                .set_peek_off(val)
+                .unwrap_or(Err(KernelError::OperationNotSupported));
+        }
         o => {
             let f = bool_opt(o).ok_or(KernelError::NoProtocolOption)?;
             sk.set_flag(f, val != 0);
@@ -619,6 +633,9 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_RCVLOWAT => int(sk.rcvlowat()),
         SO_SNDLOWAT => int(1),
         SO_BINDTOIFINDEX => int(sk.bound_dev_if() as i32),
+        // Linux sock_getsockopt: only with a set_peek_off
+        SO_PEEK_OFF if s.has_set_peek_off() => int(sk.peek_off.load(Ordering::Relaxed)),
+        SO_PEEK_OFF => Err(KernelError::OperationNotSupported),
         SO_COOKIE => Ok(OptOut::Bytes(
             sk.ino.load(Ordering::Acquire).to_ne_bytes().to_vec(),
         )),
