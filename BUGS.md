@@ -333,10 +333,6 @@ segmentation (longer than gso_size) is EINVAL where Linux segments it,
 and a NEEDS_CSUM checksum is completed in software before transmit
 where Linux leaves it CHECKSUM_PARTIAL on lo (the bytes on the wire
 differ from Linux lo, not from a device without offload).
-Transmitted frames keep no skb->protocol: packet sockets tapping them
-report the frame's EtherType, where Linux reports the sender's
-sll_protocol / spkt_protocol (0 for a SOCK_PACKET send with a 16-byte
-address).
 Ring blocks are physically contiguous (`mm::shared::PgVec`): a
 tp_block_size past the buddy allocator's largest order is ENOMEM where
 Linux alloc_one_pg_vec_page falls back to vzalloc.

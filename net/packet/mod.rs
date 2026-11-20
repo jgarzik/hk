@@ -459,6 +459,21 @@ impl PacketSock {
         Ok(())
     }
 
+    /// skb->protocol of a frame sent with protocol `proto` (Linux 6.8
+    /// packet_snd / tpacket_fill_skb: the sockaddr's or the bound
+    /// protocol; packet_parse_headers takes a SOCK_RAW frame's own
+    /// EtherType for 0 or ETH_P_ALL, dev_parse_header_protocol)
+    fn tx_protocol(&self, proto: u16, frame: &[u8]) -> crate::net::ethernet::EtherType {
+        let p = if (proto == 0 || proto == ETH_P_ALL) && self.sk.stype == SOCK_RAW {
+            frame
+                .get(12..14)
+                .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]))
+        } else {
+            proto
+        };
+        crate::net::ethernet::EtherType::from_be(p)
+    }
+
     /// PACKET_VNET_HDR's header size, 0 without
     fn vnet_hdr_len(&self) -> usize {
         self.vnet_hdr_sz.load(Ordering::Acquire) as usize
@@ -777,6 +792,7 @@ impl ProtoOps for PacketSock {
             vnet::to_frame(&hdr, &mut data)?;
         }
         let mut skb = self.build(&dev, proto, addr, &data)?;
+        skb.protocol = self.tx_protocol(proto, skb.data());
         skb.dev = Some(dev);
         skb.owner = self.id();
         crate::net::dev::dev_queue_xmit(skb)?;

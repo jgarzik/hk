@@ -54,6 +54,7 @@ pub fn run_tests() {
     test_lo_all(lo);
     test_lo_dgram(lo);
     test_send(lo);
+    test_tx_protocol(lo);
     test_trunc(lo);
     test_peek(lo);
     test_rcvbuf(lo);
@@ -889,4 +890,57 @@ fn test_dhcp(eth: i32) {
     close(all);
     close(rx);
     t.done();
+}
+
+/// Transmitted frames carry the sender's protocol (Linux skb->protocol
+/// from packet_snd: the bound protocol, else the frame's EtherType for
+/// SOCK_RAW with ETH_P_ALL), seen by an ETH_P_ALL socket on the
+/// outgoing copy; the received copy has the frame's (eth_type_trans)
+fn test_tx_protocol(lo: i32) {
+    let mut t = T::new(b"PACKET_TX_PROTOCOL");
+    let all = bound(SOCK_RAW, ETH_P_ALL, lo);
+    let tx = bound(SOCK_RAW, ETH_P_TEST, lo);
+    let mut f = [0u8; 64];
+    test_frame(&mut f, 0x5c, 60);
+    // An EtherType other than the socket's protocol
+    frame_retype(&mut f, 0x88b6);
+    t.eq(b"send", send(tx, &f[..60], 0), 60);
+    let mut buf = [0u8; 128];
+    let ours = |b: &[u8], _: &Sll| b.len() == 60 && b[14] == 0x5c && b[12..14] == [0x88, 0xb6];
+    let out = find(all, &mut buf, 3000, &ours);
+    t.ok(
+        b"outgoing first",
+        out.is_some_and(|(_, a)| a.pkttype == PACKET_OUTGOING),
+        0,
+    );
+    t.eq(
+        b"outgoing protocol",
+        out.map_or(0, |(_, a)| a.protocol) as i64,
+        ETH_P_TEST as i64,
+    );
+    let inc = find(all, &mut buf, 3000, &ours);
+    t.eq(
+        b"incoming protocol",
+        inc.map_or(0, |(_, a)| a.protocol) as i64,
+        0x88b6,
+    );
+    let any = psock(SOCK_RAW, 0);
+    let tagged = test_frame(&mut f, 0x5d, 60);
+    sendto_ll(any, tagged, &Sll::new(ETH_P_ALL, lo), 20);
+    let mine = |b: &[u8], _: &Sll| b.len() == 60 && b[14] == 0x5d;
+    let out = find(all, &mut buf, 3000, &mine);
+    t.eq(
+        b"ETH_P_ALL: the frame's",
+        out.map_or(0, |(_, a)| a.protocol) as i64,
+        ETH_P_TEST as i64,
+    );
+    close(any);
+    close(tx);
+    close(all);
+    t.done();
+}
+
+/// Set a test frame's EtherType
+fn frame_retype(f: &mut [u8], ty: u16) {
+    f[12..14].copy_from_slice(&ty.to_be_bytes());
 }

@@ -87,6 +87,9 @@ pub struct Tap<'a> {
     pub owner: usize,
     /// `SkBuff::csum_partial` (Linux skb->ip_summed == CHECKSUM_PARTIAL)
     pub csum_partial: bool,
+    /// skb->protocol of a frame a packet socket sent (it may differ
+    /// from the frame's EtherType, or be 0); None: the frame's
+    pub protocol: Option<u16>,
 }
 
 /// Tap handler (Linux ptype_all, for AF_PACKET): sees every frame
@@ -670,6 +673,7 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
             pkt_type: skb.pkt_type,
             owner: 0,
             csum_partial: skb.csum_partial,
+            protocol: None,
         });
     }
 
@@ -699,6 +703,7 @@ pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), crate::util::error::Kernel
             pkt_type: PktType::Outgoing,
             owner: skb.owner,
             csum_partial: skb.csum_partial,
+            protocol: (skb.owner != 0).then(|| skb.protocol.to_be()),
         });
     }
     dev.xmit(skb)

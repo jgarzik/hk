@@ -441,7 +441,9 @@ pub fn tap(t: &Tap<'_>) {
     let Some(net) = t.dev.net() else {
         return;
     };
-    let proto = eth_proto(t.frame);
+    // Linux skb->protocol: eth_type_trans's on receive, the sender's
+    // on a packet socket's transmit
+    let proto = t.protocol.unwrap_or_else(|| eth_proto(t.frame));
     net.packet.for_each(|s| {
         if s.wants(t, proto) {
             s.rcv(t, proto);

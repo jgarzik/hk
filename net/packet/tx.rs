@@ -135,6 +135,7 @@ impl PacketSock {
             super::vnet::to_frame(h, &mut data)?;
         }
         let mut skb = self.build(&d.dev, d.proto, d.addr, &data)?;
+        skb.protocol = self.tx_protocol(d.proto, skb.data());
         let reserve = if raw { ETH_HLEN } else { 0 };
         if tp_len > d.dev.mtu() as usize + reserve
             && vnet == 0

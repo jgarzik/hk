@@ -117,14 +117,20 @@ impl PacketSock {
     }
 
     /// Linux packet_sendmsg_spkt: a whole frame to the device named in
-    /// the struct sockaddr_pkt (ENOTCONN without one); its spkt_protocol
-    /// is Linux's skb->protocol, which hk's transmit does not keep
+    /// the struct sockaddr_pkt (ENOTCONN without one), its
+    /// spkt_protocol the skb's protocol
     pub(super) fn sendmsg_spkt(&self, m: &mut SendMsg<'_>) -> Result<usize, KernelError> {
         let a = m.addr.as_ref().ok_or(KernelError::NotConnected)?;
         if a.len() < SA_LEN {
             return Err(KernelError::InvalidArgument);
         }
         // spkt_device's last byte forced to NUL
+        // skb->protocol only from a whole struct sockaddr_pkt
+        let proto = if a.len() == SPKT_LEN {
+            u16::from_be_bytes([a[16], a[17]])
+        } else {
+            0
+        };
         let name = name_of(&a[2..2 + DEV_LEN - 1]);
         let dev = self.sk.net.get_device(name).ok_or(KernelError::NoDevice)?;
         if !dev.is_up() {
@@ -146,6 +152,7 @@ impl PacketSock {
         let mut skb = SkBuff::alloc(NET_SKB_PAD, len, crate::mm::page_alloc::Gfp::KERNEL)
             .ok_or(KernelError::NoBufferSpace)?;
         skb.put_slice(&data).ok_or(KernelError::NoBufferSpace)?;
+        skb.protocol = crate::net::ethernet::EtherType::from_be(proto);
         skb.dev = Some(Arc::clone(&dev));
         skb.owner = self.id();
         crate::net::dev::dev_queue_xmit(skb)?;
