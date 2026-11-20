@@ -364,8 +364,7 @@ const SNMP4_NET_LIST: [(&str, usize); 135] = [
 /// `/proc/net/sockstat` of `net` (Linux sockstat_seq_show): sockets
 /// alive, TCP's hashed, orphaned (every namespace's), TIME_WAIT, alive
 /// (every namespace's) and memory in pages, UDP's and RAW's hashed,
-/// reassembly queues and bytes. No UDPLITE line (hk has no UDP-Lite,
-/// which Linux retired); UDP memory is 0: UDP memory is not accounted
+/// reassembly queues and bytes
 pub fn proc_net_sockstat(net: &crate::net::NetNamespace) -> Vec<u8> {
     use crate::net::mib::{INUSE_ALL, INUSE_RAW, INUSE_TCP, INUSE_TW, INUSE_UDP};
     use crate::net::tcp::mem;
@@ -382,7 +381,12 @@ pub fn proc_net_sockstat(net: &crate::net::NetNamespace) -> Vec<u8> {
             mem::sockets(),
             mem::allocated()
         );
-        let _ = writeln!(s, "UDP: inuse {} mem 0", m.inuse_get(INUSE_UDP));
+        let _ = writeln!(
+            s,
+            "UDP: inuse {} mem {}",
+            m.inuse_get(INUSE_UDP),
+            crate::net::udp::mem::allocated()
+        );
         let _ = writeln!(s, "RAW: inuse {}", m.inuse_get(INUSE_RAW));
         let _ = writeln!(s, "FRAG: inuse {} memory {}", frags, frag_mem);
     })

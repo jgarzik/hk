@@ -135,10 +135,10 @@ Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. UDP
-memory is not accounted (Linux udp_memory_allocated, udp_mem): a
-socket is bounded by SO_RCVBUF only, and /proc/net/sockstat's UDP mem
-is 0. No tcp_can_ingest: a segment is not refused for taking
+IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
+socket has one receive queue (`net/udp/rxq.rs`), not Linux's
+per-node producer lists (udp_prod_queue) feeding sk_receive_queue
+and a reader_queue spliced from it. No tcp_can_ingest: a segment is not refused for taking
 receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
 MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
 prediction (TCPHPHits, TCPHPAcks; without the fast path every pure

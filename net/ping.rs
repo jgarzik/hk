@@ -304,7 +304,7 @@ impl ProtoOps for PingSock {
     }
 
     fn poll(&self) -> u16 {
-        dgram::poll(&self.sk, &self.rxq)
+        dgram::poll(&self.sk, self.rxq.readable())
     }
 
     fn shutdown(&self, how: i32) -> Result<(), KernelError> {

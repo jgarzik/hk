@@ -22,9 +22,17 @@
 //! drop takes no sleeping lock. No lock is held across a sleep or a
 //! transmit.
 
+pub mod mem;
+mod rxq;
 mod table;
+use rxq::UdpRxq;
 use table::Key;
-pub use table::init;
+
+/// Size the table and udp_mem (Linux udp_init)
+pub fn init() {
+    table::init();
+    mem::init();
+}
 
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::INUSE_UDP;
@@ -41,7 +49,7 @@ use crate::util::hlist_nulls::NullsLink;
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
 };
-use crate::net::dgram::{self, RxQueue};
+use crate::net::dgram;
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::port::{BindInfo, Flow};
 use crate::net::inet::route;
@@ -71,7 +79,7 @@ pub struct UdpSock {
     op: crate::sync::Mutex<()>,
     /// Connected (Linux TCP_ESTABLISHED state for datagram sockets)
     connected: AtomicBool,
-    rxq: RxQueue,
+    rxq: UdpRxq,
     /// Link on its port's hash slot (Linux sk_node)
     link: NullsLink,
     /// Link on its (address, port) hash2 slot (Linux udp_portaddr_node)
@@ -94,7 +102,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
         inet: Inet::default(),
         op: crate::sync::Mutex::new(()),
         connected: AtomicBool::new(false),
-        rxq: RxQueue::default(),
+        rxq: UdpRxq::default(),
         link: NullsLink::new(),
         link2: NullsLink::new(),
         portaddr_hash: AtomicU32::new(0),
@@ -458,7 +466,7 @@ impl ProtoOps for UdpSock {
 
     /// Linux udp_poll / datagram_poll
     fn poll(&self) -> u16 {
-        dgram::poll(&self.sk, &self.rxq)
+        dgram::poll(&self.sk, self.rxq.readable())
     }
 
     fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, KernelError> {
@@ -571,7 +579,8 @@ impl ProtoOps for UdpSock {
         if flags & MSG_ERRQUEUE != 0 {
             return af_inet::ip_recv_error(&self.sk, &self.inet, m);
         }
-        let Some(d) = self.rxq.recv(&self.sk, flags)? else {
+        let mut off = self.sk.peek_offset(flags);
+        let Some(d) = self.rxq.recv(&self.sk, flags, &mut off)? else {
             return Ok(0);
         };
         let r = dgram::deliver(&self.sk, &self.inet, m, &d, flags);
@@ -644,7 +653,8 @@ pub fn udp_rcv(mut skb: SkBuff) {
 /// Queue a datagram to `s`, counting a drop (Linux __udp_queue_rcv_skb:
 /// a full buffer is RcvbufErrors, no memory MemErrors, both InErrors)
 fn queue_rcv(net: &crate::net::NetNamespace, s: &UdpSock, skb: SkBuff) {
-    let Err(e) = s.rxq.enqueue(&s.sk, skb) else {
+    let rmem_min = net.sysctl.udp_rmem_min.load(Ordering::Relaxed) as usize;
+    let Err(e) = s.rxq.enqueue(&s.sk, rmem_min, skb) else {
         return;
     };
     let udp = &net.mib.udp;

@@ -302,7 +302,7 @@ impl ProtoOps for RawSock {
     }
 
     fn poll(&self) -> u16 {
-        dgram::poll(&self.sk, &self.rxq)
+        dgram::poll(&self.sk, self.rxq.readable())
     }
 
     fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, KernelError> {

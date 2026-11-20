@@ -79,7 +79,7 @@ pub fn limit(i: usize) -> usize {
     LIMITS[i].load(Ordering::Relaxed)
 }
 
-fn rsv() -> isize {
+pub fn rsv() -> isize {
     PCPU_RSV.load(Ordering::Relaxed) as isize
 }
 

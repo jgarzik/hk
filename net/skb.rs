@@ -115,6 +115,9 @@ pub struct SkBuff {
     /// The receiving socket's drop count when it was queued (Linux
     /// SOCK_SKB_CB(skb)->dropcount, for SO_RXQ_OVFL)
     pub dropcount: u32,
+    /// A zero-length datagram was peeked at an offset (Linux
+    /// skb->peeked, skb_set_peeked): later offset peeks skip it
+    pub peeked: core::sync::atomic::AtomicBool,
     /// Per-layer data of a queued skb (Linux skb->cb)
     pub cb: SkbCb,
 }
@@ -421,6 +424,7 @@ impl SkBuff {
             nh: self.nh,
             tstamp: self.tstamp,
             dropcount: self.dropcount,
+            peeked: core::sync::atomic::AtomicBool::new(false),
             cb: self.cb.dup(),
         })
     }

@@ -683,6 +683,17 @@ impl<A: Adapter> PtrList<A, Arc<A::Item>> {
         // SAFETY: the reference just taken, of an Arc allocation
         Some(unsafe { Arc::from_raw(p) })
     }
+
+    /// A new reference to the first entry `f` accepts, left on the list
+    /// (Linux skb_queue_walk + a get under the list's lock)
+    pub fn find_arc(&self, mut f: impl FnMut(&A::Item) -> bool) -> Option<Arc<A::Item>> {
+        let p = core::ptr::from_ref(self.iter().find(|x| f(x))?);
+        // SAFETY: an entry of the list, which owns a strong reference to
+        // it from Arc::into_raw (type invariant)
+        unsafe { Arc::increment_strong_count(p) };
+        // SAFETY: the reference just taken, of an Arc allocation
+        Some(unsafe { Arc::from_raw(p) })
+    }
 }
 
 impl<A: Adapter, P: ListPtr<Target = A::Item>> Default for PtrList<A, P> {

@@ -30,4 +30,5 @@ pub mod tcp_synrecv;
 pub mod tcp_xfer;
 pub mod udp;
 pub mod udp_hash;
+pub mod udp_mem;
 pub mod unix;

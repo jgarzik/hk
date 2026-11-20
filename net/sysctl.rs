@@ -81,6 +81,11 @@ pub struct NetSysctl {
     pub frag_time: AtomicI32,
     /// net.unix.max_dgram_qlen (queue limit of new AF_UNIX sockets)
     pub unix_max_dgram_qlen: AtomicI32,
+    /// udp_rmem_min: bytes a UDP socket may queue past udp_mem[0]
+    pub udp_rmem_min: AtomicI32,
+    /// udp_wmem_min (Linux uses it for SK_MEM_SEND charges, which UDP
+    /// never makes)
+    pub udp_wmem_min: AtomicI32,
 }
 
 impl Default for NetSysctl {
@@ -125,6 +130,9 @@ impl Default for NetSysctl {
             frag_low: AtomicUsize::new(3 * 1024 * 1024),
             frag_time: AtomicI32::new(30),
             unix_max_dgram_qlen: AtomicI32::new(10),
+            // Linux udp_sysctl_init: PAGE_SIZE
+            udp_rmem_min: AtomicI32::new(4096),
+            udp_wmem_min: AtomicI32::new(4096),
         }
     }
 }
@@ -678,6 +686,22 @@ pub static CTLS: &[NetCtl] = &[
         }),
     },
     NetCtl {
+        path: "net/ipv4/udp_rmem_min",
+        mode: 0o644,
+        global: false,
+        show: |n| get_i32(n, |s| &s.udp_rmem_min),
+        store: |n, v| set_int(n, |s| &s.udp_rmem_min, v, 1, INT_MAX),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/udp_wmem_min",
+        mode: 0o644,
+        global: false,
+        show: |n| get_i32(n, |s| &s.udp_wmem_min),
+        store: |n, v| set_int(n, |s| &s.udp_wmem_min, v, 1, INT_MAX),
+        text: None,
+    },
+    NetCtl {
         path: "net/ipv4/ip_forward",
         mode: 0o444,
         global: false,
@@ -736,6 +760,14 @@ pub static INIT_CTLS: &[NetCtl] = &[
         global: false,
         show: |_| crate::net::tcp::mem::sysctl_show(),
         store: |_, v| crate::net::tcp::mem::sysctl_store(v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/udp_mem",
+        mode: 0o644,
+        global: false,
+        show: |_| crate::net::udp::mem::sysctl_show(),
+        store: |_, v| crate::net::udp::mem::sysctl_store(v),
         text: None,
     },
     NetCtl {
