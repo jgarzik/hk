@@ -441,12 +441,13 @@ fn test_netns_init_only() {
 /// sysctl_perm on every call)
 fn test_perm_call() {
     in_child(b"SYSCTL_PERM_CALL", || {
-        let r = sys_open(b"/proc/sys/fs/protected_symlinks\0".as_ptr(), O_RDONLY, 0);
+        // Root-only readable (0600 in Linux kern_table and hk)
+        let r = sys_open(b"/proc/sys/kernel/cad_pid\0".as_ptr(), O_RDONLY, 0);
         let w = sys_open(SYN.as_ptr(), O_WRONLY, 0);
         if r < 0 || w < 0 {
             return 10;
         }
-        if !fd_reads(r, b"1\n") && !fd_reads(r, b"0\n") {
+        if !fd_reads(r, b"1\n") {
             return 11;
         }
         if sys_setresuid(65534, 65534, 65534) != 0 {
