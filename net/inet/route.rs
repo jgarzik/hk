@@ -85,7 +85,7 @@ pub fn input_fwd(net: &NetNamespace, daddr: Ipv4Addr) -> Option<Arc<NetDevice>> 
         daddr,
         oif: 0,
         scope: crate::net::inet::ifaddr::RT_SCOPE_UNIVERSE,
-        tos: 0,
+        ..Default::default()
     };
     let e = net.fib.lookup(&key).ok()?;
     if e.rtype != RouteType::Unicast {
@@ -93,6 +93,10 @@ pub fn input_fwd(net: &NetNamespace, daddr: Ipv4Addr) -> Option<Arc<NetDevice>> 
     }
     e.dev.clone()
 }
+
+/// lo's index (Linux LOOPBACK_IFINDEX): the input interface of an
+/// output lookup
+pub const LOOPBACK_IFINDEX: u32 = 1;
 
 fn zeronet(a: Ipv4Addr) -> bool {
     (a.0 >> 24) == 0
@@ -180,7 +184,9 @@ fn output_fib(
     }
     let key = FlowKey {
         daddr,
+        saddr,
         oif,
+        iif: LOOPBACK_IFINDEX,
         ..Default::default()
     };
     let res = match net.fib.lookup(&key) {

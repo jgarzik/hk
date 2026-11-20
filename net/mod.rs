@@ -59,6 +59,8 @@ pub mod device;
 pub mod devioctl;
 pub mod dgram;
 pub mod ethernet;
+#[path = "core/fib_rules.rs"]
+pub mod fib_rules;
 #[path = "core/filter.rs"]
 pub mod filter;
 pub mod icmp;

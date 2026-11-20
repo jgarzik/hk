@@ -384,6 +384,9 @@ impl NetNamespace {
         // Linux inetdev_init from the NETDEV_REGISTER notifier
         dev.in_dev().init(self, dev.name());
         self.devices.push_back(dev.clone());
+        // NETDEV_REGISTER: rules naming it take its index (Linux
+        // fib_rules_event's attach_rules)
+        self.fib.rules.attach(&dev);
         // Sleeping sysfs work
         crate::net::sysfs::netdev_register_kobject(&dev);
     }

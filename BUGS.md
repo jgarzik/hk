@@ -715,10 +715,15 @@ Attribute policies are checked as attributes are read, not all at
 parse time (Linux nla_parse validates every one first, so with several
 bad attributes another may be named), and extended ACKs never carry
 NLMSGERR_ATTR_POLICY (Linux netlink_policy_dump_write_attr).
-Routing rules are Linux's three IPv4 defaults, fixed: RTM_NEWRULE and
-RTM_DELRULE are EOPNOTSUPP, lookups walk tables local then main and never
-default (no rule engine), and rule dumps of other families are
-EAFNOSUPPORT (Linux lists the IPv6 and multicast-routing defaults).
+Routing rules (`net/core/fib_rules.rs`): route lookups know only the
+destination, the source, the output interface and lo as input (Linux
+flowi4 also carries the socket's mark, uid, TOS, protocol and ports,
+and `ip route get` passes RTA_MARK/RTA_UID/RTA_IP_PROTO/ports): rules on
+fwmark, uidrange, tos/dscp, ipproto or ports see zeros. Rule dumps of
+other families are EAFNOSUPPORT (Linux lists the IPv6 and IPv4/IPv6
+multicast-routing defaults; hk registers no rules for them). Rule
+changes take RTNL (current Linux: RTNL only for the first custom rule,
+ops->lock after). No FIB notifier chain (call_fib_rule_notifiers).
 RTM_NEWLINK/RTM_SETLINK apply MTU and flags only; the rest is refused
 with the errno Linux gives a device or driver lacking it, never ignored:
 moving a device to another namespace (IFLA_NET_NS_PID/FD; EOPNOTSUPP, lo

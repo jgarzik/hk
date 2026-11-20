@@ -146,6 +146,8 @@ fn netdev_unregister_notify(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetD
     // (Linux fib_netdev_event -> fib_disable_ip -> arp_ifdown)
     ifaddr::inetdev_destroy(rtnl, net, dev);
     crate::net::packet::netdev_unregister(rtnl, net, dev);
+    // Rules naming it detach (Linux fib_rules_event's detach_rules)
+    net.fib.rules.detach(dev);
 }
 
 /// References an unregistered device keeps once every holder let it

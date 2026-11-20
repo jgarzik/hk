@@ -25,7 +25,6 @@ use crate::net::inet::fib::{
     self, FibConfig, FibEntry, FlowKey, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, RT_TABLE_MAIN,
     RTNH_F_DEAD, RTNH_F_LINKDOWN, RouteType,
 };
-use crate::net::inet::fib_rules::{self, FibRule};
 use crate::net::inet::ifaddr::{
     self, IFA_F_PERMANENT, IFNAMSIZ, INFINITY_LIFE_TIME, IfaLabel, InIfaddr,
 };
@@ -50,7 +49,7 @@ pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 pub use crate::net::neigh_nl::{RTM_DELNEIGH, RTM_NEWNEIGH};
 pub const RTM_GETNEIGH: u16 = 30;
-pub const RTM_NEWRULE: u16 = 32;
+pub use crate::net::fib_rules::{RTM_DELRULE, RTM_NEWRULE};
 pub const RTM_GETRULE: u16 = 34;
 const RTM_MAX: u16 = 123;
 
@@ -165,17 +164,10 @@ const RTM_F_CLONED: u32 = 0x200;
 const RTM_F_FIB_MATCH: u32 = 0x2000;
 const RT_TABLE_COMPAT: u8 = 252;
 
-// FRA_*
-const FRA_PRIORITY: u16 = 6;
-const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
-const FRA_TABLE: u16 = 15;
-const FRA_PROTOCOL: u16 = 21;
-
 /// Family header sizes
 const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
 const RTMSG_LEN: usize = 12;
-const FIB_RULE_HDR_LEN: usize = 12;
 
 /// Largest dump datagram
 pub const DUMP_SIZE: usize = 8192;
@@ -383,6 +375,15 @@ fn rcv_msg(
             reply(sk, neigh_nl::getneigh(sk, h.seq, p, ext)?);
             Ok(Done::Ok)
         }
+        RTM_NEWRULE | RTM_DELRULE => {
+            let r = rtnl::lock();
+            let net = sk.net();
+            match h.ty {
+                RTM_NEWRULE => crate::net::fib_rules::newrule(&r, net, h.flags, p, nl, ext)?,
+                _ => crate::net::fib_rules::delrule(&r, net, p, nl, ext)?,
+            }
+            Ok(Done::Ok)
+        }
         RTM_NEWLINK => newlink(sk, h, p, nl, ext),
         RTM_SETLINK => setlink(sk, p, nl, ext),
         RTM_GETLINK => getlink(sk, h, p, ext),
@@ -446,7 +447,7 @@ impl RtDump {
             RTM_GETADDR if inet => addr_dump_kind(sk.net(), p, strict, &mut flags),
             RTM_GETROUTE if inet => route_dump_kind(p, strict, &mut flags),
             RTM_GETNEIGH if inet => neigh_dump_kind(p, strict, &mut flags),
-            RTM_GETRULE => rule_dump_kind(p, family, strict),
+            RTM_GETRULE => rule_dump_kind(sk.net(), p, strict),
             _ => DumpKind::Empty,
         };
         Self {
@@ -552,9 +553,12 @@ impl DumpCb for RtDump {
                 })
             }
             DumpKind::Rule => {
+                // Linux dump_rules: the list walked under RCU
+                let g = crate::sync::rcu::read_lock();
+                let rules = &net.fib.rules;
                 let mut nb = NlBuf::new(buf, DUMP_SIZE);
-                self.take_nl(&mut nb, fib_rules::RULES.iter(), |nb, r| {
-                    fill_rule(nb, r, RTM_NEWRULE, f, seq, pid)
+                self.take_nl(&mut nb, rules.iter(&g), |nb, r| {
+                    crate::net::fib_rules::fill_rule(nb, rules, &g, r, RTM_NEWRULE, f, seq, pid)
                 })
             }
         }
@@ -585,58 +589,12 @@ fn neigh_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
 // Rules
 // ============================================================================
 
-/// Rule dump request (Linux fib_nl_dumprule): AF_UNSPEC lists every
-/// family's rules, which here are IPv4's; a family without rules is
-/// EAFNOSUPPORT. Strict: a zeroed fib_rule_hdr but the family, no
-/// attributes (fib_valid_dumprule_req).
-fn rule_dump_kind(p: &[u8], family: u8, strict: bool) -> DumpKind {
-    if strict && (p.len() != FIB_RULE_HDR_LEN || p[1..].iter().any(|&b| b != 0)) {
-        return DumpKind::Bad(KernelError::InvalidArgument, None);
+/// Rule dump request (Linux fib_nl_dumprule)
+fn rule_dump_kind(net: &NetNamespace, p: &[u8], strict: bool) -> DumpKind {
+    match crate::net::fib_rules::dump_req(net, p, strict) {
+        Ok(()) => DumpKind::Rule,
+        Err((e, m)) => DumpKind::Bad(e, m),
     }
-    match family {
-        AF_UNSPEC | AF_INET => DumpKind::Rule,
-        _ => DumpKind::Bad(KernelError::AddressFamilyNotSupported, None),
-    }
-}
-
-/// An RTM_NEWRULE message for `r` in `nb` (Linux fib_nl_fill_rule and
-/// fib4_rule_fill): EMSGSIZE, nothing left behind, if it does not fit
-fn fill_rule(
-    nb: &mut NlBuf<'_>,
-    r: &FibRule,
-    ty: u16,
-    flags: u16,
-    seq: u32,
-    pid: u32,
-) -> Result<(), KernelError> {
-    // struct fib_rule_hdr: family, dst_len, src_len, tos, table, res1,
-    // res2, action, flags
-    let mut h = [0u8; FIB_RULE_HDR_LEN];
-    h[0] = AF_INET;
-    h[4] = u8::try_from(r.table).unwrap_or(RT_TABLE_COMPAT);
-    h[7] = r.action;
-    let m = nb.msg_put(ty, flags, seq, pid, &h)?;
-    match rule_attrs(nb, r) {
-        Ok(()) => {
-            nb.msg_end(m);
-            Ok(())
-        }
-        Err(err) => {
-            nb.msg_cancel(m);
-            Err(err)
-        }
-    }
-}
-
-/// A rule's attributes, in Linux's order
-fn rule_attrs(nb: &mut NlBuf<'_>, r: &FibRule) -> Result<(), KernelError> {
-    nb.put_u32(FRA_TABLE, r.table)?;
-    nb.put(FRA_SUPPRESS_PREFIXLEN, &r.suppress_prefixlen.to_ne_bytes())?;
-    nb.put(FRA_PROTOCOL, &[r.proto])?;
-    if r.pref != 0 {
-        nb.put_u32(FRA_PRIORITY, r.pref)?;
-    }
-    Ok(())
 }
 
 // ============================================================================

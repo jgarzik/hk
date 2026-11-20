@@ -277,6 +277,10 @@ pub struct NetDevice {
     /// Number of carrier transitions (IFLA_CARRIER_CHANGES)
     carrier_changes: AtomicU32,
 
+    /// Device group (IFLA_GROUP; Linux dev->group): set under RTNL,
+    /// read without it
+    group: AtomicU32,
+
     /// Promiscuity and allmulti users (AF_PACKET memberships; Linux
     /// dev->promiscuity / allmulti); changed under RTNL
     promiscuity: AtomicU32,
@@ -320,6 +324,7 @@ impl NetDevice {
             carrier: AtomicBool::new(true),
             running: AtomicBool::new(false),
             carrier_changes: AtomicU32::new(0),
+            group: AtomicU32::new(0),
             promiscuity: AtomicU32::new(0),
             allmulti: AtomicU32::new(0),
             parent: spin::Once::new(),
@@ -385,6 +390,11 @@ impl NetDevice {
     /// Number of carrier transitions
     pub fn carrier_changes(&self) -> u32 {
         self.carrier_changes.load(Ordering::Relaxed)
+    }
+
+    /// Device group (IFLA_GROUP)
+    pub fn group(&self) -> u32 {
+        self.group.load(Ordering::Relaxed)
     }
 
     /// Get interface name

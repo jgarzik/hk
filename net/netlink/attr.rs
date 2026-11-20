@@ -258,6 +258,13 @@ impl<'a> NlBuf<'a> {
         self.put(ty, &v.to_ne_bytes())
     }
 
+    /// Overwrite bytes already written at `at` (a family header
+    /// completed after its attributes, Linux writing through
+    /// nlmsg_data)
+    pub fn patch(&mut self, at: usize, data: &[u8]) {
+        self.buf[at..at + data.len()].copy_from_slice(data);
+    }
+
     /// Finish message `m`: its nlmsg_len (Linux nlmsg_end)
     pub fn msg_end(&mut self, m: NlMsg) {
         let len = u32::try_from(self.buf.len() - m.0).unwrap_or(u32::MAX);
