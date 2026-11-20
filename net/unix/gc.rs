@@ -643,6 +643,14 @@ fn gc_work() -> Option<Arc<IrqSpinlock<Work>>> {
 /// send of sockets by `user` with more than `INFLIGHT_SANE_USER` files
 /// in flight, which then waits for the run while cyclic components
 /// exist. Sleeps; no lock held.
+///
+/// Deviation: a release queues another run even while one is in
+/// progress (Linux skips it while gc_in_progress). That run's walk may
+/// have checked a component before this release, or the last user
+/// descriptor of one of its sockets, made it dead, and nothing else
+/// would run the collector for it; the work item queues at most one
+/// run behind the current one. A send still skips it, as Linux: it
+/// adds edges, so it makes nothing collectable.
 pub fn schedule(user: Option<&UcountsRef>) {
     if STATE.load(Ordering::Acquire) == NOT_CYCLIC {
         return;
@@ -655,7 +663,7 @@ pub fn schedule(user: Option<&UcountsRef>) {
     let Some(w) = gc_work() else {
         return;
     };
-    if !IN_PROGRESS.load(Ordering::SeqCst) {
+    if user.is_none() || !IN_PROGRESS.load(Ordering::SeqCst) {
         SYSTEM_WQ.queue_work(w.clone());
     }
     if user.is_some() && CYCLIC_SCCS.load(Ordering::Acquire) != 0 {
