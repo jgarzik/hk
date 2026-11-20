@@ -247,8 +247,6 @@ impl Inet {
             return Ok(());
         }
         match opt {
-            // Linux do_ip_setsockopt: turning it on needs CAP_NET_RAW or
-            // CAP_NET_ADMIN
             // Linux do_ip_setsockopt: at most 40 bytes, ip_options_get
             IP_OPTIONS => {
                 if v.len > crate::net::inet::options::MAX_OPTLEN {
@@ -258,6 +256,8 @@ impl Inet {
                 let o = options_get(&sk.net, &user)?;
                 *self.opt.lock() = Some(o);
             }
+            // Linux do_ip_setsockopt: turning it on needs CAP_NET_RAW or
+            // CAP_NET_ADMIN
             IP_TRANSPARENT => {
                 let on = v.int_or_byte()? != 0;
                 if on

@@ -1335,10 +1335,12 @@ impl NeighTable {
     /// reference) finds it dead, its queue gone, NOARP if its address
     /// was valid, else NONE. RTM_DELNEIGH reports that state.
     fn flush_one(&self, o: &mut TblLocked, nht: &NeighHash, n: &Arc<Neighbour>) {
-        let stray = !Self::unused(o, n, 1);
         let mut i = n.inner.lock();
+        // A pending timer holds a reference: off first (Linux
+        // neigh_del_timer before the refcount check)
         n.timer.stop();
         i.st.timer = None;
+        let stray = !Self::unused(o, n, 1);
         let q = if stray {
             i.st.state = if i.st.state & nud::VALID != 0 {
                 nud::NOARP
@@ -1639,11 +1641,12 @@ mod tests {
     #[test]
     fn delay_confirmed_returns_to_reachable() {
         let mut s = fresh();
-        s.update(&P, Some(MAC), nud::STALE, upd::OVERRIDE, 100_000);
+        s.update(&P, Some(MAC), nud::STALE, upd::OVERRIDE, 100_000)
+            .unwrap();
         s.event_send(&P, 100_000);
         assert_eq!(s.state, nud::DELAY);
         // A reply confirms within the delay window
-        s.update(&P, Some(MAC), nud::REACHABLE, 0, 102_000);
+        s.update(&P, Some(MAC), nud::REACHABLE, 0, 102_000).unwrap();
         assert_eq!(s.state, nud::REACHABLE);
         assert!(s.timer.is_some());
     }
@@ -1651,21 +1654,24 @@ mod tests {
     #[test]
     fn address_change_needs_override() {
         let mut s = fresh();
-        s.update(&P, Some(MAC), nud::REACHABLE, upd::OVERRIDE, 100_000);
+        s.update(&P, Some(MAC), nud::REACHABLE, upd::OVERRIDE, 100_000)
+            .unwrap();
         let other = [2, 0, 0, 0, 0, 9];
         assert_eq!(
             s.update(&P, Some(other), nud::REACHABLE, 0, 100_100),
             Ok((Act::None, false))
         );
         assert_eq!(s.ha, MAC);
-        s.update(&P, Some(other), nud::REACHABLE, upd::OVERRIDE, 100_200);
+        s.update(&P, Some(other), nud::REACHABLE, upd::OVERRIDE, 100_200)
+            .unwrap();
         assert_eq!(s.ha, other);
     }
 
     #[test]
     fn permanent_is_sticky() {
         let mut s = fresh();
-        s.update(&P, Some(MAC), nud::PERMANENT, upd::ADMIN | upd::OVERRIDE, 1);
+        s.update(&P, Some(MAC), nud::PERMANENT, upd::ADMIN | upd::OVERRIDE, 1)
+            .unwrap();
         assert_eq!(
             s.update(&P, Some([1; 6]), nud::REACHABLE, upd::OVERRIDE, 2),
             Err(KernelError::NotPermitted)
@@ -1727,7 +1733,8 @@ mod tests {
     #[test]
     fn gc_rules() {
         let mut s = fresh();
-        s.update(&P, Some(MAC), nud::STALE, upd::OVERRIDE, 100_000);
+        s.update(&P, Some(MAC), nud::STALE, upd::OVERRIDE, 100_000)
+            .unwrap();
         assert!(!s.stale_gc(&P, 120_000));
         assert!(s.stale_gc(&P, 100_000 + P.gc_stale));
         assert!(!s.forced_gc(101_000));
