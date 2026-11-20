@@ -1,4 +1,5 @@
-//! AF_PACKET sockets: socket(AF_PACKET, SOCK_RAW | SOCK_DGRAM, proto)
+//! AF_PACKET sockets: socket(AF_PACKET, SOCK_RAW | SOCK_DGRAM, proto),
+//! and the obsolete SOCK_PACKET (`spkt`)
 //! (Linux net/packet/af_packet.c; the mmap rings in `ring`)
 //!
 //! Need CAP_NET_RAW (EPERM). A socket bound to a protocol (htons
@@ -43,6 +44,7 @@ mod fanout;
 mod opts;
 mod rcv;
 mod ring;
+mod spkt;
 mod tx;
 mod v3;
 mod vnet;
@@ -219,8 +221,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     if !crate::task::capable(crate::task::CAP_NET_RAW) {
         return Err(KernelError::NotPermitted);
     }
-    if stype != SOCK_RAW && stype != SOCK_DGRAM {
-        // SOCK_PACKET (obsolete) is not supported
+    if stype != SOCK_RAW && stype != SOCK_DGRAM && stype != spkt::SOCK_PACKET {
         return Err(KernelError::SocketTypeNotSupported);
     }
     let proto = u16::from_be(protocol as u16);
@@ -613,6 +614,9 @@ impl ProtoOps for PacketSock {
 
     /// Linux packet_bind: a sockaddr_ll
     fn bind(&self, a: &[u8]) -> Result<(), KernelError> {
+        if self.spkt() {
+            return self.bind_spkt(a);
+        }
         if a.len() < SLL_LEN || u16::from_ne_bytes([a[0], a[1]]) != AF_PACKET {
             return Err(KernelError::InvalidArgument);
         }
@@ -622,6 +626,9 @@ impl ProtoOps for PacketSock {
 
     /// Linux packet_getname: no peer; the bound device's address
     fn getname(&self, peer: bool) -> Result<Vec<u8>, KernelError> {
+        if self.spkt() {
+            return self.getname_spkt(peer);
+        }
         if peer {
             return Err(KernelError::OperationNotSupported);
         }
@@ -653,8 +660,11 @@ impl ProtoOps for PacketSock {
         mask
     }
 
-    /// Linux packet_mmap
+    /// Linux packet_mmap (SOCK_PACKET: sock_no_mmap)
     fn mmap(&self) -> Result<(), KernelError> {
+        if self.spkt() {
+            return Err(KernelError::NoDevice);
+        }
         Ok(())
     }
 
@@ -691,20 +701,34 @@ impl ProtoOps for PacketSock {
         self.rxq.inq()
     }
 
+    /// SOCK_PACKET has no setsockopt/getsockopt (Linux: EOPNOTSUPP
+    /// past SOL_SOCKET)
     fn setsockopt(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<(), KernelError>> {
+        if self.spkt() && level != crate::net::socket::SOL_SOCKET {
+            return Some(Err(KernelError::OperationNotSupported));
+        }
         opts::set(self, level, opt, v)
     }
 
     fn getsockopt(&self, level: i32, opt: i32) -> Option<Result<OptOut, KernelError>> {
+        if self.spkt() && level != crate::net::socket::SOL_SOCKET {
+            return Some(Err(KernelError::OperationNotSupported));
+        }
         opts::get(self, level, opt, None)
     }
 
     fn getsockopt_in(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<OptOut, KernelError>> {
+        if self.spkt() && level != crate::net::socket::SOL_SOCKET {
+            return Some(Err(KernelError::OperationNotSupported));
+        }
         opts::get(self, level, opt, Some(v))
     }
 
     /// Linux packet_snd
     fn sendmsg(&self, m: &mut SendMsg<'_>, _flags: i32) -> Result<usize, KernelError> {
+        if self.spkt() {
+            return self.sendmsg_spkt(m);
+        }
         // Linux packet_sendmsg: a transmit ring sends its frames
         // (checked again under pg_vec_lock)
         if self.tx.lock().ring.is_some() {

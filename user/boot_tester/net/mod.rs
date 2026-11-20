@@ -15,6 +15,7 @@ pub mod nl;
 pub mod packet;
 pub mod packet_fanout;
 pub mod packet_ring;
+pub mod packet_spkt;
 pub mod packet_vnet;
 pub mod raw;
 pub mod rtnl_link;

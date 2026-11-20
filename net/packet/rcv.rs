@@ -75,9 +75,26 @@ pub struct PktCb {
     net_off: u16,
     /// tp_status checksum bits (`csum_status`)
     csum: u32,
+    /// SOCK_PACKET: the device's name (sockaddr_pkt.spkt_device)
+    dev_name: [u8; 14],
 }
 
 impl PktCb {
+    /// A SOCK_PACKET frame (Linux packet_rcv_spkt's sockaddr_pkt: the
+    /// device type, name and frame protocol)
+    pub(super) fn spkt(hatype: u16, proto: u16, dev_name: [u8; 14], len: usize) -> Self {
+        Self {
+            origlen: len,
+            sll: Sll {
+                protocol: proto,
+                hatype,
+                ..Sll::default()
+            },
+            dev_name,
+            ..Self::default()
+        }
+    }
+
     /// A whole copy queued beside a ring frame too small for it (Linux
     /// tpacket_rcv's copy_skb: its PACKET_SKB_CB zeroed, so recvmsg
     /// reports no device, no address and origlen 0)
@@ -232,7 +249,16 @@ pub fn deliver(
         m.flags |= MSG_TRUNC;
     }
     if m.want_name {
-        m.name = Some(cb.sll.bytes()[..SLL_LEN].to_vec());
+        m.name = Some(if s.spkt() {
+            // struct sockaddr_pkt: spkt_family is the device type
+            let mut b = alloc::vec![0u8; super::spkt::SPKT_LEN];
+            b[0..2].copy_from_slice(&cb.sll.hatype.to_ne_bytes());
+            b[2..16].copy_from_slice(&cb.dev_name);
+            b[16..18].copy_from_slice(&cb.sll.protocol.to_be_bytes());
+            b
+        } else {
+            cb.sll.bytes()[..SLL_LEN].to_vec()
+        });
     }
     crate::net::dgram::sock_cmsgs(&s.sk, m, skb.tstamp, skb.dropcount);
     if s.flag(pf::AUXDATA) {
@@ -339,6 +365,9 @@ impl PacketSock {
     /// Queue a copy of a tapped frame (Linux packet_rcv), or put it in
     /// the receive ring (tpacket_rcv)
     pub(super) fn rcv(&self, t: &Tap<'_>, proto: u16) {
+        if self.spkt() {
+            return self.rcv_spkt(t, proto);
+        }
         let raw = self.sk.stype == SOCK_RAW;
         let data = if raw { t.frame } else { &t.frame[ETH_HLEN..] };
         let mut snap = data.len();
@@ -375,6 +404,7 @@ impl PacketSock {
             sll,
             net_off: if raw { ETH_HLEN as u16 } else { 0 },
             csum: csum_status(t),
+            dev_name: [0; 14],
         };
         // No memory for the copy: dropped and counted (Linux packet_rcv's
         // failed skb_clone(GFP_ATOMIC) goes to drop_n_acct)
