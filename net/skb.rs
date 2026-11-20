@@ -103,6 +103,11 @@ pub struct SkBuff {
     /// as an id, 0 if none): its own outgoing tap skips it (Linux
     /// skb_loop_sk)
     pub owner: usize,
+    /// The transport checksum is left to the device (Linux ip_summed
+    /// CHECKSUM_PARTIAL: a UDP datagram out through lo, whose
+    /// NETIF_F_HW_CSUM Linux uses; hk computes it anyway); seen by the
+    /// packet taps (TP_STATUS_CSUMNOTREADY), kept as lo loops it back
+    pub csum_partial: bool,
     /// Start of the MAC header in the buffer (None until received)
     mac: Option<usize>,
     /// Start of the IP header of a received packet (None until marked)
@@ -346,6 +351,7 @@ impl SkBuff {
         self.pkt_type = PktType::Host;
         self.ip_bcast = false;
         self.owner = 0;
+        self.csum_partial = false;
         self.mac = None;
         self.nh = None;
         self.tstamp = 0;
@@ -420,6 +426,7 @@ impl SkBuff {
             ip_ttl: self.ip_ttl,
             ip_tos: self.ip_tos,
             owner: self.owner,
+            csum_partial: self.csum_partial,
             mac: self.mac,
             nh: self.nh,
             tstamp: self.tstamp,

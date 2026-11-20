@@ -26,7 +26,7 @@ use crate::util::error::KernelError;
 pub const SOL_PACKET: i32 = 263;
 /// PACKET_AUXDATA (option and control message type)
 pub const PACKET_AUXDATA: i32 = 8;
-use super::ring::{TP_STATUS_CSUM_VALID, TP_STATUS_USER};
+use super::ring::{TP_STATUS_CSUMNOTREADY, TP_STATUS_USER};
 
 /// A frame's flow hash (Linux skb_get_hash; with `symmetric` the two
 /// directions of a flow hash alike, __skb_get_hash_symmetric): IPv4
@@ -111,11 +111,13 @@ impl PktCb {
 }
 
 /// tp_status checksum bits of a tapped frame (Linux tpacket_rcv and
-/// packet_recvmsg from skb->ip_summed)
+/// packet_recvmsg from skb->ip_summed): CHECKSUM_PARTIAL is
+/// TP_STATUS_CSUMNOTREADY, in both directions. TP_STATUS_CSUM_VALID
+/// (CHECKSUM_UNNECESSARY, a device's receive checksum offload) never:
+/// hk's drivers verify no checksums, and lo keeps what was sent.
 pub(super) fn csum_status(t: &Tap<'_>) -> u32 {
-    if t.dev.is_loopback() && t.pkt_type != PktType::Outgoing {
-        // Linux loopback marks received packets CHECKSUM_UNNECESSARY
-        TP_STATUS_CSUM_VALID
+    if t.csum_partial {
+        TP_STATUS_CSUMNOTREADY
     } else {
         0
     }

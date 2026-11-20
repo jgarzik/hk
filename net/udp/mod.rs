@@ -572,6 +572,11 @@ impl UdpSock {
         let saddr = rt.saddr;
         let csum = udp_checksum(saddr, rt.daddr, skb.data());
         skb.data_mut()[6..8].copy_from_slice(&csum.to_be_bytes());
+        // Linux __ip_append_data: CHECKSUM_PARTIAL on a device with
+        // NETIF_F_HW_CSUM (lo) for an unfragmented datagram with a
+        // checksum (udp_send_skb: none with SO_NO_CHECK); fragments are
+        // new skbs, without it
+        skb.csum_partial = rt.dev.is_loopback() && !self.sk.flag(sf::NO_CHECK);
         skb.saddr = Some(saddr);
         skb.daddr = Some(rt.daddr);
         // Linux udp_send_skb: what ip_send_skb failed with

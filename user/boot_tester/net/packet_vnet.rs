@@ -9,7 +9,10 @@ use hk_syscall::{SOCK_DGRAM, SOCK_RAW, sys_sendto, sys_setsockopt};
 
 use crate::harness::T;
 use crate::helpers::println;
-use crate::net::packet::{ETH_P_TEST, SOL_PACKET, Sll, ifindex, pbind, psock, test_frame};
+use crate::net::packet::{
+    ETH_P_ALL, ETH_P_IP, ETH_P_TEST, PACKET_AUXDATA, SOL_PACKET, Sll, find, ifindex, pbind, psock,
+    test_frame,
+};
 use crate::net::packet_ring::{
     PACKET_RX_RING, PACKET_VERSION, TP_STATUS_USER, TPACKET_V2, map, rd8, rd16, rd32, ring_req,
 };
@@ -26,6 +29,7 @@ pub fn run_tests() {
     test_opts();
     test_snd(lo);
     test_rcv(lo);
+    test_csum(lo);
 }
 
 /// struct virtio_net_hdr
@@ -213,6 +217,7 @@ fn test_rcv(lo: i32) {
     let mut buf = [0u8; 256];
     let n = recv(rx, &mut buf, MSG_DONTWAIT);
     t.eq(b"header + frame", n, 70);
+    t.eq(b"no csum flags", buf[0] as i64, 0);
     t.eq(b"gso none", buf[1] as i64, 0);
     t.eq(b"hdr_len", u16::from_le_bytes([buf[2], buf[3]]) as i64, 0);
     t.eq(b"tag", buf[10 + 15] as i64, 0xb1);
@@ -251,5 +256,95 @@ fn test_rcv(lo: i32) {
     }
     close(tx);
     close(rx);
+    t.done();
+}
+
+/// tpacket_auxdata.tp_status of the next frame on `fd` within 2 s that
+/// `pred` picks
+fn aux_status(fd: i32, pred: &dyn Fn(&[u8]) -> bool) -> Option<u32> {
+    let end = now_ms() + 2000;
+    let mut buf = [0u8; 256];
+    let mut ctl = [0u8; 128];
+    while now_ms() < end {
+        poll1(fd, 1, 200);
+        let (n, _, clen) = recv_msg(fd, &mut buf, &mut ctl, MSG_DONTWAIT);
+        if n > 0 && pred(&buf[..n as usize]) {
+            let aux = cmsg_find(&ctl, clen, SOL_PACKET, PACKET_AUXDATA)?;
+            return Some(u32::from_ne_bytes([aux[0], aux[1], aux[2], aux[3]]));
+        }
+    }
+    None
+}
+
+/// Checksum state as Linux reports it over lo: a UDP datagram is
+/// CHECKSUM_PARTIAL (lo offloads it), TP_STATUS_CSUMNOTREADY both ways
+/// and NEEDS_CSUM in a virtio_net_hdr with the UDP checksum's place; a
+/// packet socket's frame has neither CSUMNOTREADY nor CSUM_VALID
+fn test_csum(lo: i32) {
+    let mut t = T::new(b"PACKET_CSUM_STATUS");
+    let all = psock(SOCK_RAW, ETH_P_ALL);
+    pbind(all, ETH_P_ALL, lo);
+    t.eq(b"auxdata", setint(all, SOL_PACKET, PACKET_AUXDATA, 1), 0);
+    let v = psock(SOCK_RAW, ETH_P_IP);
+    pbind(v, ETH_P_IP, lo);
+    t.eq(b"vnet", setint(v, SOL_PACKET, PACKET_VNET_HDR, 1), 0);
+    let (u, port) = udp_lo();
+    t.eq(b"udp send", send_to(u, b"csum", LO, port, 0), 4);
+    let is_udp = |f: &[u8]| {
+        f.len() >= 46
+            && f[12..14] == ETH_P_IP.to_be_bytes()
+            && f[23] == 17
+            && f[36..38] == port.to_be_bytes()
+    };
+    let out = aux_status(all, &is_udp);
+    t.ok(
+        b"udp outgoing notready",
+        out.is_some_and(|s| s & 8 != 0),
+        out.unwrap_or(0) as i64,
+    );
+    let inc = aux_status(all, &is_udp);
+    t.ok(
+        b"udp incoming notready",
+        inc.is_some_and(|s| s & 8 != 0),
+        inc.unwrap_or(0) as i64,
+    );
+    t.ok(
+        b"udp not valid",
+        inc.is_some_and(|s| s & 0x80 == 0),
+        inc.unwrap_or(0) as i64,
+    );
+    let mut buf = [0u8; 256];
+    let hit = find(v, &mut buf, 2000, &|f: &[u8], _: &Sll| {
+        f.len() >= 56 && f[10 + 23] == 17 && f[10 + 36..10 + 38] == port.to_be_bytes()
+    });
+    t.ok(b"vnet udp", hit.is_some(), 0);
+    if hit.is_some() {
+        t.eq(b"needs csum", buf[0] as i64, 1);
+        t.eq(
+            b"csum_start",
+            u16::from_le_bytes([buf[6], buf[7]]) as i64,
+            34,
+        );
+        t.eq(
+            b"csum_offset",
+            u16::from_le_bytes([buf[8], buf[9]]) as i64,
+            6,
+        );
+    }
+    let tx = psock(SOCK_RAW, 0);
+    let mut f = [0u8; 64];
+    let fr = test_frame(&mut f, 0xd1, 60);
+    let a = Sll::new(ETH_P_TEST, lo).bytes();
+    sys_sendto(tx, fr.as_ptr(), fr.len(), 0, a.as_ptr(), 20);
+    let st = aux_status(all, &|f: &[u8]| f.len() == 60 && f[14] == 0xd1);
+    t.ok(
+        b"frame no csum bits",
+        st.is_some_and(|s| s & 0x88 == 0),
+        st.unwrap_or(0) as i64,
+    );
+    close(tx);
+    close(u);
+    close(v);
+    close(all);
     t.done();
 }
