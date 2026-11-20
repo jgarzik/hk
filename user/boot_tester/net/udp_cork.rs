@@ -7,6 +7,8 @@
 //!   datagram when it is cleared; close drops a corked datagram.
 //! - UDP_CORK_EMSGSIZE: an append past the largest datagram fails and
 //!   drops everything corked.
+//! - UDP_CORK_EFAULT: an append from a bad buffer fails and drops
+//!   everything corked (do_append_data's udp_flush_pending_frames).
 //! - UDP_SEGMENT: a send with a segment size arrives as datagrams of
 //!   that size (software GSO on hk, segmented at the receiver on
 //!   Linux's lo); too many segments is EINVAL.
@@ -28,6 +30,7 @@ pub fn run_tests() {
     test_msg_more();
     test_cork();
     test_cork_emsgsize();
+    test_cork_efault();
     test_cork_disconnect();
     test_segment();
     test_sol_opts();
@@ -108,6 +111,23 @@ fn test_cork_emsgsize() {
     let mut buf = [0u8; 16];
     let n = recv_wait(b, &mut buf);
     t.ok(b"only the new one", n == 1 && buf[0] == b'z', n);
+    close(a);
+    close(b);
+    t.done();
+}
+
+fn test_cork_efault() {
+    let mut t = T::new(b"UDP_CORK_EFAULT");
+    let (a, _) = udp_lo();
+    let (b, pb) = udp_lo();
+    t.eq(b"first", send_to(a, b"ab", LO, pb, MSG_MORE), 2);
+    let bad = hk_syscall::sys_sendto(a, 1 as *const u8, 4, MSG_MORE, core::ptr::null(), 0);
+    t.eq(b"bad buffer", bad, EFAULT);
+    t.eq(b"after", send_to(a, b"z", LO, pb, 0), 1);
+    let mut buf = [0u8; 16];
+    let n = recv_wait(b, &mut buf);
+    t.ok(b"only the new one", n == 1 && buf[0] == b'z', n);
+    t.ok(b"no more", quiet(b), 0);
     close(a);
     close(b);
     t.done();

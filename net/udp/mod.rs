@@ -839,7 +839,15 @@ impl ProtoOps for UdpSock {
         if self.pending.load(Ordering::Relaxed) {
             let mut g = self.op.lock();
             if g.is_some() {
-                let data = m.data.take(len)?;
+                // Linux do_append_data: any ip_append_data error (a
+                // fault copying the data included) drops the cork
+                let data = match m.data.take(len) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.flush(&mut g);
+                        return Err(e);
+                    }
+                };
                 self.append(&mut g, &data, len, corkreq)?;
                 return Ok(len);
             }
