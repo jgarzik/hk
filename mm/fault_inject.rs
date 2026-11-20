@@ -6,8 +6,9 @@
 //! reaching an Nth allocation), so every ENOMEM path of it runs.
 //!
 //! The fallible allocation paths ask [`should_fail`]: `kalloc::try_box`,
-//! `try_arc`, `try_arc_cyclic` and `kmem`'s growth. The `*_nofail`
-//! forms never fail (Linux __GFP_NOFAIL).
+//! `try_arc`, `try_arc_cyclic`, `kmem`'s growth and coherent DMA memory
+//! (`hw::dma`; Linux fail_page_alloc with ignore-gfp-wait off). The
+//! `*_nofail` forms never fail (Linux __GFP_NOFAIL).
 
 use core::sync::atomic::Ordering::Relaxed;
 
