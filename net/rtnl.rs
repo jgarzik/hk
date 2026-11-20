@@ -141,8 +141,9 @@ pub fn unregister_netdevice(rtnl: &RtnlGuard, dev: &Arc<NetDevice>) {
 /// (packet_notifier). Repeatable: the todo wait sends it again to
 /// holders that took a reference meanwhile.
 fn netdev_unregister_notify(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    // inetdev_destroy's fib_disable_ip flushes its ARP entries too
+    // (Linux fib_netdev_event -> fib_disable_ip -> arp_ifdown)
     ifaddr::inetdev_destroy(rtnl, net, dev);
-    crate::net::arp::arp_tbl().flush_dev(dev);
     crate::net::packet::netdev_unregister(rtnl, net, dev);
 }
 
