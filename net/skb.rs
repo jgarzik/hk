@@ -440,43 +440,59 @@ crate::rb_adapter!(pub SkbRb, SkBuff, rb);
 /// TCP's out-of-order queue and retransmit queue)
 pub type SkbTree = RbRoot<SkbRb, Box<SkBuff>>;
 
-/// TCP's per-skb state (Linux struct tcp_skb_cb): the sequence space
-/// the skb covers and the header fields it was received with or is to
-/// be sent with
+/// TCP's per-skb state (Linux struct tcp_skb_cb, its fields only): the
+/// sequence space the skb covers, its flags, scoreboard tags, segment
+/// count and the rate sample's delivery state at its transmission. A
+/// segment's header (window, options, SACK blocks) is not kept here:
+/// it is in the skb's data until TCP processes it, or written there
+/// when it is sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpSkbCb {
+    /// The connection's delivered count when it went out, and a
+    /// nonzero us stamp until a SACK counted its delivery (Linux
+    /// tx.delivered, tx.delivered_mstamp; its send time is the skb's
+    /// `tstamp`, Linux skb_mstamp_ns)
+    pub tx_delivered_mstamp: u64,
+    pub tx_delivered: u32,
     pub seq: u32,
     /// `seq` + data length + SYN + FIN
     pub end_seq: u32,
-    pub ack: u32,
-    pub flags: u8,
-    pub wnd: u16,
-    /// MSS and window scale options (SYN and SYN-ACK)
-    pub mss: Option<u16>,
-    pub ws: Option<u8>,
-    /// Timestamps option (TSval, TSecr)
-    pub ts: Option<(u32, u32)>,
-    /// SACK-permitted option (SYN and SYN-ACK)
-    pub sack_perm: bool,
-    /// SACK option blocks, received or to send (Linux keeps the
-    /// option's offset in TCP_SKB_CB(skb)->sacked and reads the header)
-    pub sack: Sacks,
-    /// A sent skb's scoreboard tags (Linux TCP_SKB_CB(skb)->sacked:
-    /// TCPCB_SACKED_ACKED, _SACKED_RETRANS, _LOST, _EVER_RETRANS)
-    pub sacked: u8,
+    /// The ACK field of a received segment (Linux ack_seq)
+    pub ack_seq: u32,
     /// Segments a sent skb counts as, and their size when more than
-    /// one (Linux tcp_skb_pcount, tcp_gso_size)
-    pub pcount: u32,
-    pub gso_size: u32,
-    /// The connection's delivered count when it went out, and a
-    /// nonzero µs stamp until a SACK counted its delivery (Linux
-    /// tx.delivered, tx.delivered_mstamp; its send time is the skb's
-    /// `tstamp`, Linux skb_mstamp_ns)
-    pub tx_delivered: u32,
-    pub tx_delivered_mstamp: u64,
-    /// The ports of a received segment (its header is pulled)
-    pub sport: u16,
-    pub dport: u16,
+    /// one (Linux tcp_gso_segs, tcp_gso_size)
+    gso_segs: u16,
+    gso_size: u16,
+    /// TCP header flags (Linux tcp_flags)
+    pub flags: u8,
+    /// A sent skb's scoreboard tags (Linux sacked: TCPCB_SACKED_ACKED,
+    /// _SACKED_RETRANS, _LOST, _EVER_RETRANS)
+    pub sacked: u8,
+}
+
+impl TcpSkbCb {
+    pub fn has(&self, f: u8) -> bool {
+        self.flags & f != 0
+    }
+
+    /// Linux tcp_skb_pcount
+    pub fn pcount(&self) -> u32 {
+        u32::from(self.gso_segs)
+    }
+
+    /// Linux tcp_skb_pcount_set
+    pub fn set_pcount(&mut self, n: u32) {
+        self.gso_segs = n.min(u32::from(u16::MAX)) as u16;
+    }
+
+    /// Linux tcp_skb_mss's tcp_gso_size
+    pub fn gso_size(&self) -> u32 {
+        u32::from(self.gso_size)
+    }
+
+    pub fn set_gso_size(&mut self, n: u32) {
+        self.gso_size = n.min(u32::from(u16::MAX)) as u16;
+    }
 }
 
 /// Most SACK blocks an option carries (Linux TCP_NUM_SACKS)
@@ -821,5 +837,15 @@ mod tests {
         assert_eq!(Arc::strong_count(&a), 2);
         drop(q);
         assert_eq!(Arc::strong_count(&a), 1);
+    }
+}
+
+#[cfg(test)]
+mod tcp_cb_tests {
+    /// TCP's per-skb state fits Linux's 48-byte skb->cb, which every
+    /// skb of every protocol carries
+    #[test]
+    fn tcp_cb_fits_linux_cb() {
+        assert!(core::mem::size_of::<super::TcpSkbCb>() <= 48);
     }
 }

@@ -10,7 +10,7 @@
 //! (`connect`, `send`, `recv`, `close`, ...), segments (`input`, which
 //! takes the received skb) and timer expiry (`on_timer`) only change
 //! state and append what must happen to an [`Out`]: segments to send
-//! (skbs, their header fields in `skb.tcp`), wakeups, errors, shutdown
+//! (skbs, their TCP header on, but for ports and checksum), wakeups, errors, shutdown
 //! bits, "done" (leave the tables) and timer changes (`next_timer`).
 //! The socket glue (`tcp/mod.rs`) transmits them under the socket
 //! lock and wakes after it; host unit tests (`tcp/tests.rs`) drive two control
@@ -280,11 +280,32 @@ pub struct Open {
     pub mss: u32,
 }
 
-/// A segment's header fields and the sequence space it covers (Linux
-/// struct tcp_skb_cb): the control block of every skb TCP queues,
-/// receives or sends; addresses and ports of a segment to send are the
-/// connection's
-pub use crate::net::skb::TcpSkbCb as Seg;
+/// A segment's header (Linux struct tcphdr and the options
+/// tcp_parse_options reads) and the sequence space it covers: parsed
+/// from a received skb's data when TCP processes it, written into a
+/// sent one's (`output::put_seg`); ports 0 in a segment the control
+/// block builds (the socket's are put on as it is sent)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seg {
+    pub seq: u32,
+    /// `seq` + data length + SYN + FIN
+    pub end_seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub wnd: u16,
+    /// MSS and window scale options (SYN and SYN-ACK)
+    pub mss: Option<u16>,
+    pub ws: Option<u8>,
+    /// Timestamps option (TSval, TSecr)
+    pub ts: Option<(u32, u32)>,
+    /// SACK-permitted option (SYN and SYN-ACK)
+    pub sack_perm: bool,
+    /// SACK option blocks
+    pub sack: Sacks,
+    pub sport: u16,
+    pub dport: u16,
+}
+
 /// A received segment's header, checksummed and parsed (its payload is
 /// the skb's data)
 pub type SegIn = Seg;
@@ -314,9 +335,10 @@ impl Seg {
 
 /// What a call into the control block asks the caller to do
 pub struct Out {
-    /// Segments to transmit, in order: skbs holding the payload with
-    /// headroom for every header, the TCP header fields in `skb.tcp`
-    /// (Linux: tcp_transmit_skb builds the header on the clone)
+    /// Segments to transmit, in order: skbs holding the TCP header and
+    /// payload with headroom for the rest, the ports and checksum left
+    /// to the socket (Linux: tcp_transmit_skb builds the header on the
+    /// clone)
     pub segs: SkbHead<Box<SkBuff>>,
     /// The GFP segment buffers are allocated with (Linux passes it down
     /// to tcp_transmit_skb: GFP_ATOMIC from tcp_write_xmit, ACKs and
@@ -366,7 +388,9 @@ impl Out {
             return false;
         };
         h.set_len(0);
-        skb.set_tcp(h);
+        if super::output::put_seg(&mut skb, &h).is_none() {
+            return false;
+        }
         self.segs.push_back(skb);
         true
     }
@@ -1269,12 +1293,10 @@ impl TcpCb {
             self.wq.push_back(t);
         }
         let mut skb = SkBuff::alloc_tx(self.live.mss.get() as usize, Gfp::KERNEL)?;
-        skb.set_tcp(Seg {
-            seq: self.write_seq,
-            end_seq: self.write_seq,
-            flags: flags::ACK,
-            ..Default::default()
-        });
+        let t = skb.tcp_mut();
+        t.seq = self.write_seq;
+        t.end_seq = self.write_seq;
+        t.flags = flags::ACK;
         Some(skb)
     }
 

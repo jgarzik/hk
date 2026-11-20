@@ -646,7 +646,7 @@ impl TcpCb {
             let acked_pcount;
             let mut fully = true;
             if after(t.end_seq, self.snd_una) {
-                if t.pcount == 1 || !after(self.snd_una, t.seq) {
+                if t.pcount() == 1 || !after(self.snd_una, t.seq) {
                     break;
                 }
                 acked_pcount = self.rtx_trim_head(t.seq, self.snd_una.wrapping_sub(t.seq) as usize);
@@ -655,7 +655,7 @@ impl TcpCb {
                 }
                 fully = false;
             } else {
-                acked_pcount = t.pcount;
+                acked_pcount = t.pcount();
             }
             if t.sacked & tag::RETRANS != 0 {
                 if t.sacked & tag::SACKED_RETRANS != 0 {

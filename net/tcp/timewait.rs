@@ -327,7 +327,7 @@ impl TimeWait {
     /// which the caller gives to a listener, then [`kill`]s the entry,
     /// or, with no listener, answers with [`syn_ack`].
     pub fn rcv(self: &Arc<Self>, skb: Box<SkBuff>, now: u64) -> Option<Box<SkBuff>> {
-        let s = skb.tcp();
+        let (s, _) = super::output::parse(skb.data())?;
         let rfc1337 = self.net.sysctl.tcp_rfc1337.load(Ordering::Relaxed) != 0;
         let mut g = self.inner.lock();
         let st = g.0.rcv(&s, now, rfc1337, Some(&self.net.mib));

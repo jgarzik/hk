@@ -372,7 +372,7 @@ fn send(net: &NetNamespace, t: &Tuple, skb: Box<SkBuff>, p: IpParams, oif: u32) 
 /// with ip_queue_xmit), each header put on its payload skb
 pub(super) fn send_segs(net: &NetNamespace, t: &Tuple, out: &mut Out, p: IpParams, oif: u32) {
     while let Some(mut skb) = out.segs.pop_front() {
-        if output::push_hdr(&mut skb, t).is_some() && !send(net, t, skb, p, oif) {
+        if output::finish_hdr(&mut skb, t).is_some() && !send(net, t, skb, p, oif) {
             // Linux __ip_queue_xmit's no_route
             net.mib.ip.inc(crate::net::mib::IPSTATS_MIB_OUTNOROUTES);
         }
@@ -806,8 +806,13 @@ impl TcpSock {
     /// (Linux tcp_v4_do_rcv): a listener's goes to `listen_rcv`; a
     /// connection's is dropped if the socket left the tuple `t` it was
     /// found by between the lookup and taking its lock
-    fn do_rcv(&self, g: &mut Inner, skb: Box<SkBuff>, t: Tuple, now: u64, out: &mut Out) {
-        let s = &skb.tcp().clone();
+    fn do_rcv(&self, g: &mut Inner, mut skb: Box<SkBuff>, t: Tuple, now: u64, out: &mut Out) {
+        // The header, then the payload alone (Linux __skb_pull)
+        let Some((s, doff)) = output::parse(skb.data()) else {
+            return;
+        };
+        let _ = skb.pull(doff);
+        let s = &s;
         if g.cb.state == TcpState::Listen {
             return self.conn_request(s, t, now);
         }
@@ -893,7 +898,9 @@ impl TcpSock {
             drop(self.rcv(skb, t));
             return;
         }
-        let s = skb.tcp();
+        let Some(s) = seg_of(&skb) else {
+            return;
+        };
         drop(skb);
         self.conn_request(&s, t, now_ms());
     }
@@ -1366,7 +1373,7 @@ impl SockHooks<Inner> for TcpSock {
     /// A segment that waited for the owner (Linux sk_backlog_rcv ->
     /// tcp_v4_do_rcv; its checksum was checked on arrival)
     fn backlog_rcv(&self, g: &mut Inner, skb: Box<SkBuff>) {
-        let Some(t) = tuple_of(&skb) else {
+        let Some(t) = seg_of(&skb).and_then(|s| tuple_of(&skb, &s)) else {
             return;
         };
         let mut out = Out::default();
@@ -1404,15 +1411,20 @@ impl SockHooks<Inner> for TcpSock {
 // Segment demux (Linux tcp_v4_rcv)
 // ============================================================================
 
-/// The tuple (local first) of a received segment, its header parsed
-/// into `skb.tcp`
-fn tuple_of(skb: &SkBuff) -> Option<Tuple> {
+/// The tuple (local first) of a received segment with header `s`
+fn tuple_of(skb: &SkBuff, s: &Seg) -> Option<Tuple> {
     Some(Tuple {
         laddr: skb.daddr?,
-        lport: skb.tcp().dport,
+        lport: s.dport,
         raddr: skb.saddr?,
-        rport: skb.tcp().sport,
+        rport: s.sport,
     })
+}
+
+/// The header of a received segment, still at its data (Linux
+/// tcp_hdr and tcp_parse_options; it was checked by `tcp_rcv`)
+fn seg_of(skb: &SkBuff) -> Option<Seg> {
+    output::parse(skb.data()).map(|(s, _)| s)
 }
 
 /// Receive a TCP segment (softnet or an inline loopback flush; thread
@@ -1441,14 +1453,17 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
         tcp.inc(TCP_MIB_INERRS);
         return;
     }
-    // The header into the control block, the payload left (Linux
-    // tcp_v4_fill_cb + __skb_pull)
-    let Some((s, doff)) = output::parse(skb.data()) else {
+    // The control block from the header, which stays until TCP
+    // processes the segment (Linux tcp_v4_fill_cb)
+    let Some((s, _)) = output::parse(skb.data()) else {
         return;
     };
-    let _ = skb.pull(doff);
-    skb.set_tcp(s);
-    let Some(t) = tuple_of(&skb) else {
+    let cb = skb.tcp_mut();
+    cb.seq = s.seq;
+    cb.end_seq = s.end_seq;
+    cb.ack_seq = s.ack;
+    cb.flags = s.flags;
+    let Some(t) = tuple_of(&skb, &s) else {
         return;
     };
     // The device reference is not needed past here: it goes after the

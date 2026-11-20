@@ -130,10 +130,10 @@ pub(super) fn tso_segs(len: usize, mss: u32) -> (u32, u32) {
 
 /// Bytes per segment of `skb` (Linux tcp_skb_seglen / tcp_skb_mss)
 pub(super) fn seglen(skb: &SkBuff) -> u32 {
-    if skb.tcp().pcount <= 1 {
+    if skb.tcp().pcount() <= 1 {
         skb.len() as u32
     } else {
-        skb.tcp().gso_size
+        skb.tcp().gso_size()
     }
 }
 
@@ -303,7 +303,7 @@ impl TcpCb {
     /// Linux tcp_mark_skb_lost: the skb at `seq` is lost (a lost
     /// retransmission too: it may go again)
     pub(super) fn mark_skb_lost(&mut self, seq: u32) {
-        let Some((sacked, pc)) = self.rtx_with(seq, |s| (s.tcp().sacked, s.tcp().pcount)) else {
+        let Some((sacked, pc)) = self.rtx_with(seq, |s| (s.tcp().sacked, s.tcp().pcount())) else {
             return;
         };
         if sacked & tag::SACKED_ACKED != 0 {
@@ -750,7 +750,7 @@ impl TcpCb {
             return;
         };
         let Some((sacked, pc, len, mss)) = self.rtx_with(head, |s| {
-            (s.tcp().sacked, s.tcp().pcount, s.len(), seglen(s))
+            (s.tcp().sacked, s.tcp().pcount(), s.len(), seglen(s))
         }) else {
             return;
         };
@@ -1179,7 +1179,7 @@ impl TcpCb {
         let Some(last) = self
             .rtx
             .last()
-            .map(|s| (s.tcp().seq, s.tcp().pcount, s.len()))
+            .map(|s| (s.tcp().seq, s.tcp().pcount(), s.len()))
         else {
             return false;
         };

@@ -50,11 +50,23 @@ struct SegIn<'a> {
 }
 
 impl SegIn<'_> {
-    /// Its header (Linux TCP_SKB_CB) and an skb holding its payload
+    /// An skb holding its payload, its control block filled (Linux
+    /// tcp_v4_fill_cb)
     fn skb(&self) -> Box<SkBuff> {
+        let h = self.hdr();
         let mut skb = SkBuff::alloc_tx(self.data.len(), Gfp::KERNEL).unwrap();
         skb.put_slice(self.data).unwrap();
-        skb.set_tcp(super::cb::Seg {
+        let t = skb.tcp_mut();
+        t.seq = h.seq;
+        t.end_seq = h.end_seq;
+        t.ack_seq = h.ack;
+        t.flags = h.flags;
+        skb
+    }
+
+    /// Its header as parsed
+    fn hdr(&self) -> super::cb::Seg {
+        let mut h = super::cb::Seg {
             seq: self.seq,
             ack: self.ack,
             flags: self.flags,
@@ -65,13 +77,9 @@ impl SegIn<'_> {
             sack_perm: self.sack_perm,
             sack: self.sack,
             ..Default::default()
-        });
-        skb.tcp_mut().set_len(self.data.len() as u32);
-        skb
-    }
-
-    fn hdr(&self) -> super::cb::Seg {
-        self.skb().tcp()
+        };
+        h.set_len(self.data.len() as u32);
+        h
     }
 }
 
@@ -86,12 +94,10 @@ impl Feed for TcpCb {
     /// socket layer does with a listener that has room
     /// (`TcpSock::syn_recv_sock`): made a full socket, fed again
     fn feed(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
-        let skb = s.skb();
-        let h = skb.tcp();
-        self.input(&h, skb, now, out);
+        let h = s.hdr();
+        self.input(&h, s.skb(), now, out);
         if let Some(skb) = out.req_ack.take() {
             self.req_full = true;
-            let h = skb.tcp();
             self.input(&h, skb, now, out);
         }
     }
@@ -105,17 +111,20 @@ impl Feed for TcpCb {
 fn wire(out: &Out) -> Vec<Seg> {
     out.segs
         .iter()
-        .map(|skb| Seg {
-            seq: skb.tcp().seq,
-            ack: skb.tcp().ack,
-            flags: skb.tcp().flags,
-            wnd: skb.tcp().wnd,
-            mss: skb.tcp().mss,
-            ws: skb.tcp().ws,
-            ts: skb.tcp().ts,
-            sack_perm: skb.tcp().sack_perm,
-            sack: skb.tcp().sack,
-            data: skb.data().to_vec(),
+        .map(|skb| {
+            let (h, doff) = super::output::parse(skb.data()).unwrap();
+            Seg {
+                seq: h.seq,
+                ack: h.ack,
+                flags: h.flags,
+                wnd: h.wnd,
+                mss: h.mss,
+                ws: h.ws,
+                ts: h.ts,
+                sack_perm: h.sack_perm,
+                sack: h.sack,
+                data: skb.data()[doff..].to_vec(),
+            }
         })
         .collect()
 }

@@ -381,7 +381,7 @@ impl TcpCb {
     fn match_skb_to_sack(&mut self, seq: u32, start: u32, end: u32) -> i32 {
         let Some((sseq, send, pc, len, mss)) = self.rtx_with(seq, |s| {
             let t = s.tcp();
-            (t.seq, t.end_seq, t.pcount, s.len() as u32, t.gso_size)
+            (t.seq, t.end_seq, t.pcount(), s.len() as u32, t.gso_size())
         }) else {
             return 0;
         };
@@ -524,7 +524,8 @@ impl TcpCb {
         mss: u32,
         dup_sack: bool,
     ) -> Option<bool> {
-        let (room, ppc, plen) = self.rtx_with(prev, |p| (p.tailroom(), p.tcp().pcount, p.len()))?;
+        let (room, ppc, plen) =
+            self.rtx_with(prev, |p| (p.tailroom(), p.tcp().pcount(), p.len()))?;
         if room < len as usize || plen + len as usize >= 65535 * 8 || ppc + pcount > 65535 {
             return None;
         }
@@ -548,9 +549,9 @@ impl TcpCb {
             let _ = p.put_slice(&s.data()[..len as usize]);
             let pt = p.tcp_mut();
             pt.end_seq = pt.end_seq.wrapping_add(len);
-            pt.pcount += pcount;
-            if pt.gso_size == 0 {
-                pt.gso_size = mss;
+            pt.set_pcount(pt.pcount() + pcount);
+            if pt.gso_size() == 0 {
+                pt.set_gso_size(mss);
             }
             pt.sacked |= t.sacked & tag::EVER_RETRANS;
         });
@@ -559,9 +560,9 @@ impl TcpCb {
         if !s.is_empty() {
             let st_ = s.tcp_mut();
             st_.seq = new_seq;
-            st_.pcount -= pcount.min(st_.pcount);
-            if st_.pcount <= 1 {
-                st_.gso_size = 0;
+            st_.set_pcount(st_.pcount() - pcount.min(st_.pcount()));
+            if st_.pcount() <= 1 {
+                st_.set_gso_size(0);
             }
             self.rtx
                 .insert_by(s, |a, b| before(a.tcp().seq, b.tcp().seq));
@@ -639,20 +640,20 @@ impl TcpCb {
         let (len, pcount, mss);
         if in_sack {
             len = slen;
-            pcount = t.pcount;
+            pcount = t.pcount();
             mss = sseglen;
             if mss != pseglen {
                 return fallback(self);
             }
         } else {
-            if !after(t.end_seq, start) || t.pcount <= 1 {
+            if !after(t.end_seq, start) || t.pcount() <= 1 {
                 return Shift::Noop;
             }
             if after(start, t.seq) {
                 return fallback(self);
             }
             let l = end.wrapping_sub(t.seq);
-            mss = t.gso_size;
+            mss = t.gso_size();
             if mss != pseglen {
                 return fallback(self);
             }
@@ -680,7 +681,7 @@ impl TcpCb {
             return Shift::Moved(prev);
         };
         let Some((ns, nlen, npc, nseglen)) = self.rtx_with(next, |s| {
-            (s.tcp().sacked, s.len() as u32, s.tcp().pcount, seglen(s))
+            (s.tcp().sacked, s.len() as u32, s.tcp().pcount(), seglen(s))
         }) else {
             return Shift::Moved(prev);
         };
@@ -735,7 +736,7 @@ impl TcpCb {
                 let Some((t, tx)) = self.rtx_with(cur, |s| (s.tcp(), skb_mstamp_us(s))) else {
                     break;
                 };
-                let sacked = self.sacktag_one(st, t.sacked, t.seq, t.end_seq, dup, t.pcount, tx);
+                let sacked = self.sacktag_one(st, t.sacked, t.seq, t.end_seq, dup, t.pcount(), tx);
                 self.rtx_with(cur, |s| s.tcp_mut().sacked = sacked);
                 self.rate_skb_delivered(st, cur);
                 if !before(t.seq, self.highest_sack_seq()) {
