@@ -1023,6 +1023,11 @@ its no-writeback skip, before it relies on sync.
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
   fixed at probe.
+- `VirtioDevice::reset` (`hw/virtio/pci.rs`) spins a bounded number
+  of status reads and fails, where Linux vp_reset sleeps (msleep(1))
+  until the status reads 0 (vp_modern_set_status, then the wait): a
+  reset that does not complete makes `del_vqs` leak the rings, and
+  virtio-net's remove (`virtnet_del_vqs`) its buffer pools too.
 - virtio-pci remove leaves the BAR mappings (common, notify, ISR,
   device config): `IoMem` windows are copyable and never unmapped, so
   each transport rebind leaks the ioremap space of one device (Linux
