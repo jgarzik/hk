@@ -970,8 +970,7 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
 /// running user code end at their next syscall or fault (P7: IRQ
 /// return).
 fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
-    use crate::sync::waitqueue::WaitEntry;
-    use crate::task::percpu::{SleepState, schedule};
+    use crate::task::percpu::{SleepState, schedule, set_current_state};
 
     let Some(sig) = crate::signal::get_task_signal_struct(me) else {
         return Ok(());
@@ -981,10 +980,12 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
             return Err(KernelError::WouldBlock);
         }
         crate::signal::zap_group_others(me);
-        let wq = &crate::task::proc::CHILD_EXIT_WQ;
-        let w = core::pin::pin!(WaitEntry::new());
+        // Woken by each release of one of its threads and by its
+        // leader's exit (Linux de_thread: TASK_KILLABLE until
+        // notify_count drops, wake_up_process(sig->group_exec_task)
+        // from __exit_signal and exit_notify: `exit::wake_exec`)
         let r = loop {
-            wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
+            set_current_state(SleepState::Killable);
             if !exec_waits(me) {
                 break Ok(());
             }
@@ -993,18 +994,12 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
             }
             schedule();
         };
-        wq.finish_wait(w.as_ref());
+        set_current_state(SleepState::Running);
         sig.end_exec(me);
         r?;
     }
-    // Released after TASKLIST: the old leader and exited threads; a
-    // tracer waiting for the old leader rechecks (Linux de_thread:
-    // __wake_up_parent before its silent release)
-    let gone = take_leadership(me);
-    if !gone.is_empty() {
-        drop(gone);
-        crate::task::proc::CHILD_EXIT_WQ.wake_all();
-    }
+    // Released after TASKLIST: the old leader and exited threads
+    drop(take_leadership(me));
     Ok(())
 }
 
@@ -1560,6 +1555,15 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
     // a pid in any role): the leader's pid may be the group's or the
     // session's, which a removed thread still names
     let removed = gone.len();
+    // A tracer or parent waiting for the old leader rechecks (Linux
+    // de_thread: __wake_up_parent(leader, leader->parent) under
+    // tasklist_lock, before its silent release)
+    if let Some(l) = &old
+        && let Some(v) = table.view(l)
+        && let Some(p) = v.tracer().or_else(|| v.real_parent())
+    {
+        crate::signal::notify::wake_up_parent(p);
+    }
     for z in zombies.drain(..) {
         table.unhash(&z, false);
         gone.push(z);

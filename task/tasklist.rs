@@ -829,7 +829,8 @@ impl GlobalTaskTable {
     /// (Linux detach_pid -> free_pid when every pid type's list is empty)
     fn release_unused(&self, p: &crate::task::pid::Pid) {
         if !p.has_task() && p.pgrp.is_empty() && p.session.is_empty() {
-            p.release_numbers();
+            let zap = p.release_numbers();
+            p.wake_reapers(self, zap);
         }
     }
 

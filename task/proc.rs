@@ -20,12 +20,6 @@ pub fn sys_sched_yield() {
     super::percpu::yield_now();
 }
 
-/// Wait queue for parents in wait4/waitid: woken whenever a task exits
-/// (Linux signal->wait_chldexit, simplified to one global queue; waiters
-/// re-check for their own zombies)
-pub static CHILD_EXIT_WQ: crate::sync::waitqueue::WaitQueue =
-    crate::sync::waitqueue::WaitQueue::new();
-
 /// sys_exit - terminate the calling process
 ///
 /// # Arguments
@@ -227,10 +221,16 @@ pub fn sys_wait4(
     use super::percpu::{SleepState, schedule};
     use crate::sync::waitqueue::{WaitEntry, signal_pending};
 
-    // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
+    // Sleep on the group's wait_chldexit until a matching child is
+    // reportable (Linux do_wait)
+    let sig = super::percpu::current()
+        .cpu_group()
+        .cloned()
+        .ok_or(KernelError::NoChild)?;
+    let wq = &sig.wait_chldexit;
     let w = core::pin::pin!(WaitEntry::new());
     let result = loop {
-        CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
+        wq.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
         // A tracee's ptrace stop: (code << 8) | 0x7f (Linux
         // wait_task_stopped)
@@ -280,7 +280,7 @@ pub fn sys_wait4(
         }
         schedule();
     };
-    CHILD_EXIT_WQ.finish_wait(w.as_ref());
+    wq.finish_wait(w.as_ref());
     result
 }
 
@@ -427,10 +427,16 @@ pub fn sys_waitid(
     use super::percpu::{SleepState, schedule};
     use crate::sync::waitqueue::{WaitEntry, signal_pending};
 
-    // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
+    // Sleep on the group's wait_chldexit until a matching child is
+    // reportable (Linux do_wait)
+    let sig = super::percpu::current()
+        .cpu_group()
+        .cloned()
+        .ok_or(KernelError::NoChild)?;
+    let wq = &sig.wait_chldexit;
     let w = core::pin::pin!(WaitEntry::new());
     let result = loop {
-        CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
+        wq.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
         // A tracee's ptrace stop (CLD_TRAPPED)
         let wnowait = options & super::wait_options::WNOWAIT != 0;
@@ -512,7 +518,7 @@ pub fn sys_waitid(
         }
         schedule();
     };
-    CHILD_EXIT_WQ.finish_wait(w.as_ref());
+    wq.finish_wait(w.as_ref());
     result
 }
 

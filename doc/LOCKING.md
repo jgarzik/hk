@@ -1450,8 +1450,11 @@ NS_ADDING (pids may be made; cleared when its init dies) and NS_INIT
 section; until then only 1 may be made: EINVAL).
 `alloc_pid` admits a new `Pid` under PIDMAP_LOCK before it is built
 (ENOMEM once NS_ADDING is clear) and `release_numbers` uncounts it; a
-dying namespace down to its init's pids wakes CHILD_EXIT_WQ after
-PIDMAP_LOCK is dropped (any lock may be held: a wakeup).
+dying namespace down to its init's pids wakes its reaper after
+PIDMAP_LOCK is dropped (`Pid::wake_reapers`, Linux free_pid:
+wake_up_process(child_reaper)), under the TASKLIST hold of the release
+(`release_unused`) or, for a pid never attached (`NewPid`, a failed
+`alloc_pid_nr`), taking TASKLIST's read lock for it.
 `PidNamespace.reaper` (a `Weak<Task>`, Linux child_reaper) and
 `reboot` (Linux pid_ns->reboot: set by reboot(2) inside before it
 SIGKILLs the reaper, read by the zap) are TASKLIST's (`TableCell`):
@@ -1462,8 +1465,8 @@ An exiting task that is its namespace's reaper hands it to another
 live thread of its group in one write section; with none left
 (`find_child_reaper`) it disables allocation, collects the
 namespace's other live tasks under TASKLIST's read lock (room made
-before it), SIGKILLs them with no lock held, then sleeps on
-CHILD_EXIT_WQ (uninterruptible, no lock held) reaping its children
+before it), SIGKILLs them with no lock held, then sleeps on its
+group's `wait_chldexit` (uninterruptible, no lock held) reaping its children
 until it has none and only its group's pids are left, all before its
 own children are handed on and it becomes a zombie, so its parent
 sees it exit only once the namespace is empty.
@@ -1830,7 +1833,7 @@ stop is `TaskSignalState.jobctl` (`jobctl::TRACED`, `PTRACE_FROZEN`),
 The tracee checks it is traced under TASKLIST's read lock (`ptrace`
 is written under the write lock, so a detach cannot slip between) and
 sets the stop under its siglock inside it, drops the siglock, wakes
-`CHILD_EXIT_WQ` and signals its tracer still inside that read hold
+its tracer's `wait_chldexit` and signals its tracer still inside that read hold
 (Linux ptrace_stop: do_notify_parent_cldstop under tasklist_lock, so
 a tracer that detached first gets no CLD_TRAPPED), drops TASKLIST,
 then sleeps `Killable` until
@@ -5227,11 +5230,13 @@ de_thread, exit_group does not.
   woken in the same section (Linux __group_send_sig_info,
   complete_signal under siglock inside tasklist_lock). After the
   lock: the autoreaped Task released.
-- de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
-  on CHILD_EXIT_WQ (killable) until every other thread is released and
-  the leader is a zombie (`exec_waits`, Linux notify_count: a traced
-  zombie thread waits for its tracer's reap, whose release wakes the
-  queue); it holds no spinlock. A thread blocked on that cred_guard (its own exec, or an
+- de_thread (exec) holds cred_guard (sleeping, outermost) while it
+  sleeps killable until every other thread is released and the leader
+  is a zombie (`exec_waits`, Linux notify_count: a traced zombie thread
+  waits for its tracer's reap); each thread's release and each exit in
+  the group wakes it directly (`exit::wake_exec` after TASKLIST, a
+  read hold to find it: Linux wake_up_process(group_exec_task)); it
+  holds no spinlock. A thread blocked on that cred_guard (its own exec, or an
   attach to the group) sleeps interruptibly, so the SIGKILL de_thread
   sends ends it. The old leader and exited threads are removed under
   TASKLIST and released after it.
@@ -6107,6 +6112,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `SignalStruct.posix_timers` | signal/mod.rs, time/posix_timer.rs | spin Mutex | the thread group's timer_create timers (Linux signal->posix_timers and their posix_timers_hashtable entries): an `RbTree` id -> timer whose nodes are reserved before the lock and freed after it, so nothing allocates or frees under it. timer_create (Linux do_timer_create) takes an id with a placeholder (None, skipped by every lookup) in one hold, makes the timer and copies the id out with the lock dropped, then publishes the timer in a second hold or removes the placeholder on an error; clock_nanosleep's hidden CPU timer is made with its node before the lock and inserted in one hold. Thread context, never under TASKLIST; cpu_timer holds it around arming the group's CPU-timer state and its whole expiry pass (`PosixTimer.inner` of the registry's timers and of the CPU itimers, and `SignalStruct.rlim`, inside); deleted at exec and at the group's last exit (`exec_timers`, `exit_itimers`: timers stopped after the lock) or with the SignalStruct (`drop_timers`, from its Drop: exclusive access, no lock or siglock) |
 | `SignalStruct.itimers` | signal/mod.rs, time/posix_timer.rs | embedded `PosixTimer`s (their `inner` IrqSpinlocks) | ITIMER_REAL, ITIMER_VIRTUAL and ITIMER_PROF (Linux signal->real_timer, signal->it[]), made with the SignalStruct (fork fails ENOMEM there, setitimer cannot fail); no registry lock: each is reached through the SignalStruct and its state is under its own `inner`. ITIMER_REAL's SOFT hrtimer callback (`it_real_fn`, `ktimers/N`) reaches the SignalStruct by address, so it is cancelled at the group's last exit (`exit_itimers`) and waited out by the SignalStruct's Drop; it takes `inner`, drops it, then takes a reference to `leader_pid` under RCU and sends SIGALRM with nothing held. The CPU itimers are checked by cpu_timer's expiry pass under `posix_timers`, after the registry's timers |
 | `SignalStruct.leader_pid` | signal/mod.rs | `RcuLockedArc` owned by TASKLIST | the group leader's struct pid (Linux signal->pids[PIDTYPE_TGID]), ITIMER_REAL's target and a parent's number for getppid and /proc (`Task::tgid_nr_ns`): set under the write lock when the group's first task is attached (`install_fork_signal`, `init_task_signal`), cleared there when its leader is released (`detach_group_pids`, Linux __unhash_process detach_pid(PIDTYPE_TGID)), the old reference dropped a grace period later (`put_rcu`); an exec by another thread keeps it (that thread takes the leader's struct pid, exchange_tids); read under RCU (`it_real_fn` takes a reference in its read section and sends after it) |
+| `SignalStruct.wait_chldexit` | signal/mod.rs, signal/notify.rs, task/proc.rs | `WaitQueue` (IrqSpinlock head) | the process's threads in wait4/waitid and a dying namespace init's reap (Linux signal->wait_chldexit): they sleep on it with no lock held, rechecking under TASKLIST's read lock; a child's or tracee's exit, stop or continue notice wakes the receiver's (`notify::wake_up_parent`, Linux __wake_up_parent) inside the TASKLIST hold that made it reportable (`notify` under the write lock, `notify_parent_cldstop` under the read lock), as do de_thread's release of an old leader (its tracer or parent's) and, after TASKLIST, an autoreaped child's release (its parent's: the child stays listed until then); the head is a leaf under TASKLIST |
 | `PosixTimer.inner` | time/posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it, at settime and at signal delivery (`deliver_locked`): a sample may take TASKLIST and the target's rq lock (task_sched_runtime) |
 | `PosixTimer.sigq` | time/posix_timer.rs | spin Mutex | a timer_create timer's preallocated signal entry while it is not queued (Linux SIGQUEUE_PREALLOC); leaf, never in hardirq, never with `inner`; taken under a siglock (`posix_timer::sig_ignore`, `sig_unignore`). The entry is taken out to be queued by `signal::send_timer_sigqueue` with no lock held, put back under the receiver's siglock when its signal is ignored, and put back when its signal is dequeued (`posix_timer::deliver`, which rearms an interval timer under `inner`), flushed or refused (`reclaim`). A flushed set is dropped wherever its send ran: kill_fasync's F_SETSIG stop signal or SIGCONT drops it under `Fasync.fa` / `FOwner.st` (interrupts off), RCU and the caller's spin locks, so `reclaim` takes `sigq` there as a leaf and puts the timer reference it upgraded through `put_rcu` (Linux posixtimer_putref: kfree_rcu): a timer deleted meanwhile is torn down in `rcuc/N`, its hrtimer idle, never under those locks |
 | CPU-timer state (`time/cpu_timer.rs`): `SignalStruct.cputimer`, `Task.cpu_next` | time/cpu_timer.rs | atomics | the group's running CPU totals (utime, stime, sum_exec_runtime: Linux cputime_atomic, RMWs from every thread's CPU) and expiry hints per PROF/VIRT/SCHED sample, a thread's hints; written by the tick's samples and runtime charges (rq lock, interrupts off) and by `run` in task context. The group totals start (arming a process timer, `arm_group`) and stop (`run` finding nothing armed) only under `posix_timers`; sampling never starts them (Linux cpu_clock_sample_group with start=false for gettime). `run` (TIF_NOTIFY_RESUME on the way to user mode) takes `posix_timers` -> `PosixTimer.inner`, then `SignalStruct.rlim`, and sends signals after dropping them: expired timers go on a local firing list through their embedded `PosixTimer.elist` (Linux collect_timerqueue, no allocation), marked `collected` and `firing` under `inner`; after the lock each is unlinked, `collected` cleared under `inner`, and fired if `firing` is still set (settime and delete clear it). A timer still `collected` is skipped by another thread's pass, so it is never linked twice. The itimers' and RLIMIT_CPU's process signals are kept in locals (one each) |

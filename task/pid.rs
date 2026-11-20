@@ -467,7 +467,7 @@ impl NewPid {
 impl Drop for NewPid {
     fn drop(&mut self) {
         if let Some(p) = self.0.take() {
-            p.release_numbers();
+            p.release_unlocked();
         }
     }
 }
@@ -714,18 +714,20 @@ impl Pid {
     /// the struct lives on for its holders (a pidfd, a timer, an F_SETOWN
     /// owner, a tty's session), naming no task. Once. The hash's
     /// reference is dropped a grace period later (Linux delayed_put_pid):
-    /// an RCU walker may still be on it.
-    pub fn release_numbers(&self) {
-        let mut zapping = false;
+    /// an RCU walker may still be on it. Returns the levels whose dying
+    /// namespace is down to its init's pids, for [`Pid::wake_reapers`].
+    #[must_use]
+    pub fn release_numbers(&self) -> u64 {
+        let mut zapping = 0u64;
         let hash_ref;
         {
             let _g = PIDMAP_LOCK.lock();
             if !self.hashed.swap(false, Ordering::Relaxed) {
-                return;
+                return 0;
             }
             hash_ref = self.hash_ref.swap(false, Ordering::Relaxed);
-            for u in self.numbers.iter() {
-                zapping |= uncount(&u.ns);
+            for (l, u) in self.numbers.iter().enumerate() {
+                zapping |= u64::from(uncount(&u.ns)) << l;
                 let b = bucket(&u.ns, u.nr);
                 let me = core::ptr::from_ref::<UPid>(u).cast_mut();
                 let mut link = b;
@@ -748,15 +750,34 @@ impl Pid {
         }
         // Linux free_pid: ns_ref_active_put(pid->numbers[level].ns)
         self.ns().active_put();
-        // A dying namespace's init waits for its last pids
-        // (zap_pid_ns_processes; Linux free_pid wakes child_reaper)
-        if zapping {
-            crate::task::proc::CHILD_EXIT_WQ.wake_all();
-        }
         if hash_ref {
             // SAFETY: the hash's reference (`alloc_pid_nr`: the
             // `Arc::into_raw` of this Pid), taken back once here
             crate::sync::rcu::put_rcu(unsafe { Arc::from_raw(core::ptr::from_ref(self)) });
+        }
+        zapping
+    }
+
+    /// A dying namespace's init waits for its last pids
+    /// (zap_pid_ns_processes): the reaper of each level in `zap`, from
+    /// [`Pid::release_numbers`], rechecks (Linux free_pid:
+    /// wake_up_process(ns->child_reaper)). Under TASKLIST.
+    pub fn wake_reapers(&self, table: &crate::task::tasklist::GlobalTaskTable, zap: u64) {
+        for (l, u) in self.numbers.iter().enumerate() {
+            if zap & (1 << l) != 0
+                && let Some(r) = crate::task::pidns::child_reaper(table, &u.ns)
+            {
+                crate::task::percpu::try_to_wake_up(&r, crate::task::percpu::WakeMode::Any);
+            }
+        }
+    }
+
+    /// [`Pid::release_numbers`] with no TASKLIST held: the lock taken
+    /// for the reaper wakeup only if one is due
+    fn release_unlocked(&self) {
+        let zap = self.release_numbers();
+        if zap != 0 {
+            self.wake_reapers(&crate::task::tasklist::TASKLIST.read(), zap);
         }
     }
 }
@@ -767,7 +788,7 @@ impl Drop for Pid {
     /// dropped only after `release_numbers`, the hash holding a
     /// reference until then
     fn drop(&mut self) {
-        self.release_numbers();
+        self.release_unlocked();
     }
 }
 
@@ -798,7 +819,7 @@ mod tests {
         let p = alloc_pid(ns).unwrap();
         let nr = p.nr();
         assert!(find_pid(ns, nr).is_some());
-        p.release_numbers();
+        assert_eq!(p.release_numbers(), 0);
         assert!(find_pid(ns, nr).is_none());
         assert_eq!(ns.map.take(nr), Ok(true));
         drop(p);

@@ -1053,10 +1053,6 @@ Designs that grew one commit at a time. Tag = roadmap phase
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
-- **One global child-exit wait queue** (C): CHILD_EXIT_WQ wakes every
-  waiting parent on every exit (Linux signal->wait_chldexit, woken by
-  __wake_up_parent).
-- **Globals where per-CPU fits** (I/C/E): CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf map ids, mqueue ids, which wrap with no collision check) move
   onto `util/ida.rs` (or an IDR), as sd, virtio-blk, virtio and

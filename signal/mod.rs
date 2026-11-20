@@ -2767,6 +2767,11 @@ pub struct SignalStruct {
         crate::task::pid::Pid,
         crate::task::tasklist::GlobalTaskTable,
     >,
+    /// Its threads waiting in wait4/waitid (Linux
+    /// signal->wait_chldexit): woken by a child's or tracee's exit,
+    /// stop or continue notice (`notify::wake_up_parent`, Linux
+    /// __wake_up_parent), under TASKLIST as Linux holds tasklist_lock
+    pub wait_chldexit: crate::sync::waitqueue::WaitQueue,
     /// Threads not yet exiting (Linux signal->live): +1 at each
     /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
     /// takes it to 0 is the group's last (group_dead)
@@ -2990,6 +2995,7 @@ impl SignalStruct {
             leader_pid: crate::sync::rcu::RcuLockedArc::none(),
             pgrp: crate::sync::rcu::RcuLockedArc::none(),
             session: crate::sync::rcu::RcuLockedArc::none(),
+            wait_chldexit: crate::sync::waitqueue::WaitQueue::new(),
             live: AtomicU32::new(1),
             dead_times: [const { AtomicU64::new(0) }; 3],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],

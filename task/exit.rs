@@ -544,6 +544,23 @@ fn exit_notify(tid: Tid, status: i32) {
     if let Some(done) = done {
         done.finish();
     }
+    // An exec in its group waits for it to leave or, as the leader, to
+    // be a zombie (Linux exit_notify: notify_count < 0 ->
+    // wake_up_process(group_exec_task))
+    if let Some(s) = current().cpu_group() {
+        wake_exec(s);
+    }
+}
+
+/// The thread of `sig`'s group whose exec waits for the others
+/// (de_thread) rechecks (Linux wake_up_process(sig->group_exec_task)
+/// from __exit_signal and exit_notify). TASKLIST not held.
+fn wake_exec(sig: &crate::signal::SignalStruct) {
+    if let crate::signal::GroupExit::Exec(tid) = sig.group_exit()
+        && let Some(t) = TASKLIST.read().task(tid)
+    {
+        crate::task::percpu::try_to_wake_up(&t, crate::task::percpu::WakeMode::Any);
+    }
 }
 
 /// [`exit_notify`]'s TASKLIST write section for task `tid`
@@ -592,12 +609,14 @@ struct Unhashed {
 
 impl Unhashed {
     /// Release what the section took and wake whoever waits (TASKLIST
-    /// not held): a tracer or an exec (de_thread) waiting for the thread
+    /// not held): an exec (de_thread) waiting for the thread
     fn finish(self) {
         if let Some((t, pid)) = self.thread {
             crate::fs::proc::proc_flush_pid(&t, pid);
+            if let Some(s) = t.cpu_group() {
+                wake_exec(s);
+            }
             drop(t);
-            crate::task::proc::CHILD_EXIT_WQ.wake_all();
         }
         if let Some(t) = self.told {
             t.finish();
@@ -749,6 +768,8 @@ fn leader_waits(table: &GlobalTaskTable, pid: Pid) -> bool {
 /// under TASKLIST (Linux EXIT_DEAD, then release_task after the lock)
 struct Reaped {
     t: TaskRef,
+    /// Its parent, which rechecks once it is gone
+    parent: Option<TaskRef>,
     /// Its struct pid, pinned for proc_flush_pid
     pid: Option<Arc<crate::task::pid::Pid>>,
     ucounts: crate::task::UcountsRef,
@@ -756,25 +777,41 @@ struct Reaped {
 
 /// Take zombie `tid` out of the task list for [`release`]
 fn reap_locked(table: &mut GlobalTaskTable, tid: Tid) -> Option<Reaped> {
-    let (ucounts, pid) = match table.get(tid) {
-        Some(t) if matches!(t.state, TaskState::Zombie(_)) => (t.ucounts(), t.thread_pid()),
+    let (ucounts, pid, parent) = match table.get(tid) {
+        Some(t) if matches!(t.state, TaskState::Zombie(_)) => {
+            (t.ucounts(), t.thread_pid(), t.real_parent().map(task_ref))
+        }
         _ => return None,
     };
-    table.remove(tid).map(|t| Reaped { t, pid, ucounts })
+    table.remove(tid).map(|t| Reaped {
+        t,
+        parent,
+        pid,
+        ucounts,
+    })
 }
 
 /// Release a zombie leader [`reap_locked`] took (Linux release_task of
-/// an autoreaped child): its RLIMIT_NPROC charge dropped, a waiting
-/// parent rechecks; its run queue keeps it if it still runs. TASKLIST
-/// not held.
+/// an autoreaped child): its RLIMIT_NPROC charge dropped, its parent's
+/// waiters recheck (it was their child until now: Linux marks it
+/// EXIT_DEAD, which wait skips, in the section that notified them); its
+/// run queue keeps it if it still runs. TASKLIST not held.
 fn release(gone: Option<Reaped>) {
-    let Some(Reaped { t, pid, ucounts }) = gone else {
+    let Some(Reaped {
+        t,
+        parent,
+        pid,
+        ucounts,
+    }) = gone
+    else {
         return;
     };
     crate::fs::proc::proc_flush_pid(&t, pid);
     ucounts.dec(crate::task::Ucount::Nproc, 1);
     drop(t);
-    crate::task::proc::CHILD_EXIT_WQ.wake_all();
+    if let Some(p) = parent {
+        crate::signal::notify::wake_up_parent(&p);
+    }
 }
 
 /// Exit the current task and switch to another
@@ -913,9 +950,6 @@ pub fn exit_current(status: Option<i32>) -> ! {
     if let Some(st) = status {
         exit_notify(tid, st);
     }
-
-    // Let a parent sleeping in wait4/waitid re-check for zombies
-    crate::task::proc::CHILD_EXIT_WQ.wake_all();
 
     do_task_dead(dead_mm)
 }

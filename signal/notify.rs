@@ -100,8 +100,15 @@ pub fn notify_parent_cldstop(
             &mut gone,
         );
     }
-    // Linux __wake_up_parent
-    crate::task::proc::CHILD_EXIT_WQ.wake_all();
+    wake_up_parent(&parent);
+}
+
+/// `parent`'s threads waiting for a child rechecks (Linux
+/// __wake_up_parent: its group's wait_chldexit)
+pub fn wake_up_parent(parent: &Task) {
+    if let Some(s) = parent.cpu_group() {
+        s.wait_chldexit.wake_all();
+    }
 }
 
 /// si_code and si_status of wait status `status` (Linux
@@ -280,6 +287,8 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
         let info = SendInfo::Notice(info.with_sig(sig));
         let _ = super::send_task_in(&r.to, sig, info, super::PidType::Tgid, false, &mut gone);
     }
+    // Linux do_notify_parent: __wake_up_parent, autoreap or not
+    wake_up_parent(&r.to);
     Told {
         autoreap,
         gone,
