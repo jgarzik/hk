@@ -12,6 +12,7 @@
 use super::cb::{TcpCb, before};
 use super::cong::{AckSample, CaEvent, CongOps, reno_undo_cwnd};
 use super::recovery::CaState;
+use super::timer::usecs_to_jiffies;
 use crate::net::mib::*;
 
 /// Linux BICTCP_BETA_SCALE
@@ -124,7 +125,7 @@ impl Bictcp {
         }
         // t in 2^-BICTCP_HZ s, the minimum delay ahead
         let mut t = i64::from(now.wrapping_sub(self.epoch_start) as i32) as u64;
-        t = t.wrapping_add(u64::from(usecs_to_jiffies(self.delay_min)));
+        t = t.wrapping_add(usecs_to_jiffies(u64::from(self.delay_min)));
         t <<= BICTCP_HZ;
         t /= u64::from(HZ);
         let k = u64::from(self.bic_k);
@@ -193,11 +194,6 @@ impl Bictcp {
             }
         }
     }
-}
-
-/// Linux usecs_to_jiffies with HZ 1000: rounded up
-fn usecs_to_jiffies(us: u32) -> u32 {
-    us.div_ceil(1000)
 }
 
 /// Linux fls64

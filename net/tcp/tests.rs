@@ -3229,3 +3229,25 @@ fn delivered_counts_packets() {
     assert_eq!(transfer(&mut p, &data, 100), data);
     assert_eq!(p.a.delivered, 4);
 }
+
+/// What is left of the RTO becomes timer ms rounded up (Linux
+/// tcp_rearm_rto / tcp_schedule_loss_probe: usecs_to_jiffies)
+#[test]
+fn rto_delta_rounds_up() {
+    use super::cb::Tmr;
+    let (mut p, _) = sack_pair(1000);
+    p.filter = drop_all;
+    p.now = 100;
+    p.send_a(&pattern(2000));
+    let head = p.a.rtx.first().map(super::cb::skb_mstamp_us).unwrap();
+    let rto = p.a.rto_cur();
+    // Half a ms after the head went out
+    p.a.tcp_mstamp = head + 500;
+    p.a.live.tmr.set(Some((Tmr::LossProbe, 0)));
+    p.a.rearm_rto(100);
+    assert_eq!(p.a.live.tmr.get(), Some((Tmr::Rtx, 100 + rto)));
+    // A probe due after the RTO is pulled in to it
+    p.a.srtt_us = 8 * 1_000_000;
+    assert!(p.a.schedule_loss_probe(100, false));
+    assert_eq!(p.a.live.tmr.get(), Some((Tmr::LossProbe, 100 + rto)));
+}

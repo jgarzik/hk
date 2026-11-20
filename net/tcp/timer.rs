@@ -35,6 +35,11 @@ use super::recovery::CaState;
 use crate::net::mib::*;
 use crate::util::error::KernelError;
 
+/// Linux usecs_to_jiffies with HZ 1000 (the timers' ms): rounded up
+pub(super) fn usecs_to_jiffies(us: u64) -> u64 {
+    us.div_ceil(1000)
+}
+
 impl Live {
     /// Current timeout: the base RTO backed off, at most RTO_MAX (Linux
     /// icsk_rto)
@@ -188,7 +193,7 @@ impl TcpCb {
     /// rttvar, in ms rounded up, at most TCP_RTO_MAX
     pub(super) fn set_rto(&mut self) {
         let us = u64::from(self.srtt_us >> 3) + u64::from(self.rttvar_us);
-        self.live.rto.set(us.div_ceil(1000).min(RTO_MAX));
+        self.live.rto.set(usecs_to_jiffies(us).min(RTO_MAX));
     }
 
     /// No RTT from the handshake (Linux tcp_init_metrics, RFC 6298 5.7):

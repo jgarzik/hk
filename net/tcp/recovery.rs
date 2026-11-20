@@ -18,6 +18,7 @@
 
 use super::cb::{RTO_INIT, RTO_MIN, TcpCb, TcpState, Tmr, after, before, skb_mstamp_us};
 use super::cong::{CaEvent, INFINITE_SSTHRESH};
+use super::timer::usecs_to_jiffies;
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
 
@@ -946,7 +947,7 @@ impl TcpCb {
         }
         let pending = self.live.tmr.get().map(|t| t.0);
         if matches!(pending, Some(Tmr::Reo) | Some(Tmr::LossProbe)) {
-            let delta = self.rto_delta(now).max(1) as u64;
+            let delta = usecs_to_jiffies(self.rto_delta_us().max(1) as u64);
             self.live.tmr.set(Some((Tmr::Rtx, now + delta)));
         } else {
             self.arm_rtx(now);
@@ -954,11 +955,10 @@ impl TcpCb {
     }
 
     /// Linux tcp_rto_delta_us: how far in the future the RTO of the
-    /// head's last transmission is (ms here: the timers' unit)
-    pub(super) fn rto_delta(&self, _now: u64) -> i64 {
+    /// head's last transmission is (us)
+    pub(super) fn rto_delta_us(&self) -> i64 {
         let sent = self.rtx.first().map_or(self.tcp_mstamp, skb_mstamp_us);
-        let delta = (self.rto_cur() * 1000) as i64 - self.tcp_mstamp.saturating_sub(sent) as i64;
-        delta / 1000
+        (self.rto_cur() * 1000) as i64 - self.tcp_mstamp.saturating_sub(sent) as i64
     }
 
     /// Linux tcp_check_sack_reneging: SND.UNA advanced onto a SACKed
@@ -967,7 +967,7 @@ impl TcpCb {
     /// before the RTO clears the scoreboard
     fn check_sack_reneging(&mut self, flg: &mut u32) -> bool {
         if *flg & flag::SACK_RENEGING != 0 && *flg & flag::SND_UNA_ADVANCED != 0 {
-            let delay = u64::from(self.srtt_us >> 4).div_ceil(1000).max(10);
+            let delay = usecs_to_jiffies(u64::from(self.srtt_us >> 4)).max(10);
             self.live.tmr.set(Some((Tmr::Rtx, self.clock + delay)));
             *flg &= !flag::SET_XMIT_TIMER;
             return true;
@@ -1075,7 +1075,7 @@ impl TcpCb {
         let wait = self.rack_detect_loss();
         if wait != 0 {
             // usecs_to_jiffies, then TCP_TIMEOUT_MIN
-            let at = self.clock + (wait.div_ceil(1000) + TIMEOUT_MIN).min(self.rto_cur().max(1));
+            let at = self.clock + (usecs_to_jiffies(wait) + TIMEOUT_MIN).min(self.rto_cur().max(1));
             self.live.tmr.set(Some((Tmr::Reo, at)));
         }
         wait != 0
@@ -1143,22 +1143,23 @@ impl TcpCb {
             return false;
         }
         let mut timeout = if self.srtt_us != 0 {
-            let t = u64::from(self.srtt_us >> 2).div_ceil(1000);
+            let mut t = u64::from(self.srtt_us >> 2);
             if self.packets_out == 1 {
-                t + RTO_MIN
+                t += RTO_MIN * 1000;
             } else {
-                t + TIMEOUT_MIN
+                t += TIMEOUT_MIN * 1000;
             }
+            usecs_to_jiffies(t)
         } else {
             RTO_INIT
         };
-        let rto_delta = if advancing_rto {
-            self.rto_cur() as i64
+        let rto_delta_us = if advancing_rto {
+            (self.rto_cur() * 1000) as i64
         } else {
-            self.rto_delta(now)
+            self.rto_delta_us()
         };
-        if rto_delta > 0 {
-            timeout = timeout.min(rto_delta as u64);
+        if rto_delta_us > 0 {
+            timeout = timeout.min(usecs_to_jiffies(rto_delta_us as u64));
         }
         self.live.tmr.set(Some((Tmr::LossProbe, now + timeout)));
         true

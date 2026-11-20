@@ -151,7 +151,7 @@ impl TcpCb {
                 max = DELACK_MAX;
             }
             if self.srtt_us != 0 {
-                let rtt = u64::from(self.srtt_us >> 3).div_ceil(1000);
+                let rtt = super::timer::usecs_to_jiffies(u64::from(self.srtt_us >> 3));
                 max = max.min(rtt.max(ATO_MIN));
             }
             ato = ato.min(max);
