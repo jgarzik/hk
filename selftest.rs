@@ -192,22 +192,20 @@ fn selftest_thread(_arg: usize) {
             }
             // The last active reference goes: the namespace's teardown
             // unregisters its devices (Linux cleanup_net)
-            if let Some(lo) = net.loopback() {
+            // No reference held across the teardown: unregister waits
+            // for every holder to let go (Linux netdev_wait_allrefs)
+            if let Some(lo) = net.loopback().map(|l| alloc::sync::Arc::downgrade(&l)) {
                 drop(net);
-                // Unregistered, and nothing else holds it: its neighbour
-                // entries, addresses and routes went with it
-                let done = || lo.is_gone() && alloc::sync::Arc::strong_count(&lo) == 1;
+                // Unregistered and freed: its neighbour entries, addresses
+                // and routes went with it, then its owner's reference
+                let done = || lo.strong_count() == 0;
                 for _ in 0..100 {
                     if done() {
                         break;
                     }
                     sleep_ms(20);
                 }
-                check(
-                    "netns_cleanup",
-                    done(),
-                    alloc::sync::Arc::strong_count(&lo) as u64,
-                );
+                check("netns_cleanup", done(), lo.strong_count() as u64);
             }
         }
         Err(e) => check("netns_new", false, e.errno() as u64),
