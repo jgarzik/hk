@@ -140,10 +140,7 @@ NIC removal: e1000 leaves the function's bus mastering and memory
 space on (no pci_disable_device) and its BAR mapped (no iounmap); an
 unregistered `NetDevice` lives on while queued skbs reference it
 (no netdev_wait_allrefs; it is down and driverless).
-FIB: removing every route through a device (`net/inet/fib.rs`,
-`remove_first` per route) restarts from the list head each time, under
-the table's leaf lock; Linux fib_table_flush is one walk. Path MTU
-exceptions (`route::NhExceptions`) have no generation id (Linux
+Path MTU exceptions (`route::NhExceptions`) have no generation id (Linux
 fnhe_genid), so they are not flushed when a device goes down.
 
 ## Memory management gaps

@@ -13,7 +13,7 @@
 //! Adding an address installs its FIB routes (`fib_add_ifaddr`): a local
 //! /32 in table local always, and while the device is up the subnet
 //! broadcast (local) and the prefix route (main, scope link). Deleting it
-//! removes them again (`fib_del_ifaddr`); deleting a primary also deletes
+//! removes them again (`fib_inetaddr_down`); deleting a primary also deletes
 //! its secondaries (Linux default, promote_secondaries=0).
 //!
 //! ## Locking
@@ -418,7 +418,7 @@ fn inet_unlink_ifa(
         return false;
     };
     rtnetlink::notify_addr(net, dev, gone.ifa(), rtnetlink::RTM_DELADDR, nl);
-    fib::fib_del_ifaddr(rtnl, net, dev, gone.ifa());
+    fib::fib_inetaddr_down(rtnl, net, dev, gone.ifa());
     gone.free();
     true
 }
@@ -493,10 +493,9 @@ pub fn inetdev_up(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
 }
 
 /// Device went down (Linux fib_netdev_event NETDEV_DOWN): routes through
-/// it go, except host-scope (local) ones
+/// it go, except host-scope (local) ones, and its ARP entries
 pub fn inetdev_down(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
-    fib::fib_disable_dev(rtnl, net, dev, false);
-    crate::net::arp::arp_tbl().flush_dev(dev);
+    fib::fib_disable_ip(rtnl, net, dev, false);
 }
 
 /// Device unregistered (Linux inetdev_event NETDEV_UNREGISTER ->
@@ -506,7 +505,7 @@ pub fn inetdev_destroy(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice
     while let Some(ifa) = dev.in_dev().ifa_list.find(|_| true) {
         inet_del_ifa(rtnl, net, dev, &ifa, NlInfo::default());
     }
-    fib::fib_disable_dev(rtnl, net, dev, true);
+    fib::fib_disable_ip(rtnl, net, dev, true);
 }
 
 /// Type of `addr` in the namespace (Linux inet_addr_type)

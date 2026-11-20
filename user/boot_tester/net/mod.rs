@@ -2,6 +2,7 @@
 
 pub mod bpf;
 pub mod fasync_tap;
+pub mod fib_flush;
 pub mod fib_rules;
 pub mod icmp;
 pub mod icmp_ts;

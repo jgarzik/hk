@@ -406,6 +406,7 @@ pub fn run_all_tests() {
     process::pgrp_links::run_tests();
     isolated(b"SETPGID", process::setpgid::run_tests);
     net::netlink::run_tests();
+    net::fib_flush::run_tests();
     net::fib_rules::run_tests();
     net::netdev_ioctl::run_tests();
     net::netdev::run_tests();

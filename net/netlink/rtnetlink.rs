@@ -23,7 +23,7 @@ use crate::net::NetNamespace;
 use crate::net::device::{NetDevice, flags as dflags};
 use crate::net::inet::fib::{
     self, FibConfig, FibEntry, FlowKey, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, RT_TABLE_MAIN,
-    RTNH_F_LINKDOWN, RouteType,
+    RTNH_F_DEAD, RTNH_F_LINKDOWN, RouteType,
 };
 use crate::net::inet::fib_rules::{self, FibRule};
 use crate::net::inet::ifaddr::{
@@ -1003,6 +1003,9 @@ pub fn fill_route(
     pid: u32,
 ) -> Result<(), KernelError> {
     let mut rflags = e.flags;
+    if e.dead() {
+        rflags |= RTNH_F_DEAD;
+    }
     if e.dev.as_ref().is_some_and(|d| !d.carrier_ok()) && e.rtype == RouteType::Unicast {
         rflags |= RTNH_F_LINKDOWN;
     }
