@@ -302,6 +302,9 @@ pub struct Opts {
     /// TCP_WINDOW_CLAMP as set (0: none), for the next connection and
     /// a listener's children (Linux tp->window_clamp, copied to them)
     pub window_clamp: u32,
+    /// TCP_FASTOPEN_NO_COOKIE: Fast Open without cookies (Linux
+    /// tp->fastopen_no_cookie)
+    pub tfo_no_cookie: bool,
     /// TCP_CONGESTION (index into `cong::ALGOS`), and whether it was
     /// set (Linux icsk_ca_setsockopt)
     pub ca: usize,
@@ -953,6 +956,9 @@ pub struct TcpCb {
     /// A listener's Fast Open child still in SYN_RECEIVED (Linux
     /// tp->fastopen_rsk): already accepted, it may send and receive
     pub tfo: bool,
+    /// The Fast Open child left SYN_RECEIVED by a valid RST (Linux
+    /// reqsk_fastopen_remove's reset)
+    pub(super) tfo_reset: bool,
     /// The cookie its first SYN-ACK carries (Linux tcp_conn_request's
     /// foc; retransmissions carry none)
     pub(super) synack_foc: Option<Foc>,
@@ -1155,6 +1161,7 @@ impl TcpCb {
             req_acked: false,
             pred_flags: 0,
             tfo: false,
+            tfo_reset: false,
             synack_foc: None,
             rtx_stamp: Default::default(),
             probes_tstamp: None,

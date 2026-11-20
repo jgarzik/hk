@@ -2494,6 +2494,45 @@ fn header_prediction_trusts_window() {
     assert_eq!(p.b.rcv_nxt, nxt.wrapping_add(100));
 }
 
+/// A Fast Open child runs tcp_check_req's fastopen rules: a new SYN in
+/// window is answered by a RST but the child stays; a valid RST resets
+/// it (ECONNRESET), marked for the listener's RST queue
+#[test]
+fn fastopen_child_check_req() {
+    let mut a = TcpCb::new(cfg(), Default::default());
+    let mut out = Out::default();
+    a.connect(open(1000, 1460), 0, &mut out);
+    let syn = wire(&out).remove(0);
+    let mut b = TcpCb::new(cfg(), Default::default());
+    let mut out = Out::default();
+    b.fastopen_open(
+        &seg_in(&syn).hdr(),
+        seg_in(&syn).skb(),
+        open(5000, 1460),
+        0,
+        &mut out,
+    );
+    let bad = SegIn {
+        seq: 1005,
+        flags: flags::SYN,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    b.feed(&bad, 0, &mut out);
+    assert!(wire(&out).iter().any(|s| s.has(flags::RST)));
+    assert_eq!(b.state, TcpState::SynReceived);
+    let rst = SegIn {
+        seq: 1001,
+        flags: flags::RST,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    b.feed(&rst, 0, &mut out);
+    assert_eq!(b.state, TcpState::Closed);
+    assert_eq!(out.err, Some(KernelError::ConnectionReset));
+    assert!(b.tfo_reset);
+}
+
 // ============================================================================
 // Review findings (reproduce first)
 // ============================================================================

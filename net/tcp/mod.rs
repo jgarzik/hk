@@ -52,6 +52,7 @@ pub mod cb;
 pub mod collapse;
 pub mod cong;
 pub mod cubic;
+pub mod fastopen;
 pub mod info;
 pub mod input;
 pub mod mem;
@@ -131,6 +132,8 @@ pub const TCP_CONGESTION: i32 = 13;
 pub const TCP_USER_TIMEOUT: i32 = 18;
 pub const TCP_FASTOPEN: i32 = 23;
 pub const TCP_NOTSENT_LOWAT: i32 = 25;
+pub const TCP_FASTOPEN_KEY: i32 = 33;
+pub const TCP_FASTOPEN_NO_COOKIE: i32 = 34;
 /// Linux TCP_FIN_TIMEOUT_MAX (s): the largest TCP_LINGER2
 const FIN_TIMEOUT_MAX: i32 = 120;
 /// net.ipv4.tcp_fastopen server bits (Linux TFO_SERVER_ENABLE,
@@ -201,8 +204,13 @@ struct Accept {
     syn: OwnedList<AcceptLink>,
     /// Established, not yet accepted
     ready: OwnedList<AcceptLink>,
-    /// Fast Open children still in SYN_RECEIVED (Linux fastopenq.qlen)
+    /// Fast Open children still in SYN_RECEIVED (Linux fastopenq.qlen),
+    /// counting the reset ones waiting on `tfo_rst`
     tfo_qlen: u32,
+    /// When each accepted Fast Open child that a RST ended stops
+    /// counting, ms (Linux fastopenq.rskq_rst_head: kept 60 s against
+    /// spoofed RSTs)
+    tfo_rst: alloc::collections::VecDeque<u64>,
 }
 
 crate::owned_adapter!(AcceptLink, TcpSock, accept_link, accept_owner);
@@ -307,6 +315,9 @@ pub struct TcpSock {
     /// The SYN flood warning was printed (Linux
     /// queue->synflood_warned, once per socket)
     synflood_warned: AtomicBool,
+    /// Its own Fast Open keys (TCP_FASTOPEN_KEY; Linux fastopenq.ctx);
+    /// leaf
+    fastopen_ctx: Mutex<Option<fastopen::Ctx>>,
     me: Weak<TcpSock>,
 }
 
@@ -493,6 +504,7 @@ impl TcpSock {
             listen_opts: Mutex::new(cb::Opts::default()),
             synq_overflow_ts: AtomicU32::new(0),
             synflood_warned: AtomicBool::new(false),
+            fastopen_ctx: Mutex::new(None),
             me: me.clone(),
         })
     }
@@ -601,6 +613,17 @@ impl TcpSock {
             if let Some(p) = g.tfo_parent.take().and_then(|w| w.upgrade()) {
                 if let Some(q) = p.queue.lock().as_mut() {
                     q.tfo_qlen = q.tfo_qlen.saturating_sub(1);
+                    // An accepted child a RST ended keeps counting for
+                    // 60 s (allocated GFP_ATOMIC; without memory it
+                    // stops at once)
+                    let accepted = !q.ready.contains(self);
+                    if g.cb.tfo_reset
+                        && accepted
+                        && with_gfp(Gfp::ATOMIC, || q.tfo_rst.try_reserve(1)).is_ok()
+                    {
+                        q.tfo_rst.push_back(now_ms() + 60_000);
+                        q.tfo_qlen += 1;
+                    }
                 }
                 put_listener(p);
             }
@@ -1100,8 +1123,8 @@ impl TcpSock {
         if want_cookie {
             return self.cookie_synack(s, t, &opts, caps, now);
         }
-        let (tfo, foc) = self.try_fastopen(s, &t);
-        if tfo && self.fastopen_child(s, skb, t, opts, caps, now) {
+        let (tfo, foc) = self.try_fastopen(s, &t, &opts);
+        if tfo && self.fastopen_child(s, skb, t, opts, caps, foc, now) {
             return;
         }
         self.child(s, t, opts, caps, now, isn, foc);
@@ -1114,7 +1137,7 @@ impl TcpSock {
     /// TFO_SERVER_COOKIE_NOT_REQD) makes a Fast Open child (true); an
     /// invalid one TCPFastOpenPassiveFail and the valid cookie. Returns
     /// that and the cookie the SYN-ACK carries
-    fn try_fastopen(&self, s: &SegIn, t: &Tuple) -> (bool, Option<cb::Foc>) {
+    fn try_fastopen(&self, s: &SegIn, t: &Tuple, opts: &cb::Opts) -> (bool, Option<cb::Foc>) {
         let net = &self.sk.net;
         if s.foc.is_some_and(|f| f.len == 0) {
             net.mib.net.inc(LINUX_MIB_TCPFASTOPENCOOKIEREQD);
@@ -1124,23 +1147,34 @@ impl TcpSock {
         if tfo & TFO_SERVER_ENABLE == 0 || !(syn_data || s.foc.is_some()) || !self.fastopen_room() {
             return (false, None);
         }
-        if tfo & TFO_SERVER_COOKIE_NOT_REQD != 0 {
+        // tcp_fastopen_no_cookie (hk has no RTAX_FASTOPEN_NO_COOKIE
+        // route metric)
+        if tfo & TFO_SERVER_COOKIE_NOT_REQD != 0 || opts.tfo_no_cookie {
             return (true, None);
         }
         let Some(f) = s.foc else {
             return (false, None);
         };
-        let mut valid = net.tcp.fastopen_cookie(t);
-        valid.exp = f.exp;
+        // The listener's keys, else its namespace's (tcp_fastopen_get_ctx)
+        let ctx = (*self.fastopen_ctx.lock()).or_else(|| net.tcp.fastopen_ctx());
+        let valid = ctx.map(|c| cb::Foc {
+            exp: f.exp,
+            ..fastopen::cookie(&c.key[0], t)
+        });
         if f.len == 0 {
-            return (false, Some(valid));
+            return (false, valid);
         }
-        let n = usize::from(valid.len);
-        if f.len == valid.len && f.val[..n] == valid.val[..n] {
-            return (true, None);
+        match ctx.map_or(0, |c| c.check(t, &f)) {
+            1 => (true, None),
+            2 => {
+                net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEALTKEY);
+                (true, valid)
+            }
+            _ => {
+                net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
+                (false, valid)
+            }
         }
-        net.mib.net.inc(LINUX_MIB_TCPFASTOPENPASSIVEFAIL);
-        (false, Some(valid))
     }
 
     /// Linux tcp_fastopen_queue_check: TCP_FASTOPEN set and fewer Fast
@@ -1150,7 +1184,19 @@ impl TcpSock {
         if max == 0 {
             return false;
         }
-        let full = self.queue.lock().as_ref().is_none_or(|q| q.tfo_qlen >= max);
+        let now = now_ms();
+        let full = self.queue.lock().as_mut().is_none_or(|q| {
+            if q.tfo_qlen < max {
+                return false;
+            }
+            // The oldest reset child's 60 s are over: its slot goes
+            if q.tfo_rst.front().is_some_and(|&at| at <= now) {
+                q.tfo_rst.pop_front();
+                q.tfo_qlen -= 1;
+                return false;
+            }
+            true
+        });
         if full {
             self.sk.net.mib.net.inc(LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
         }
@@ -1164,6 +1210,7 @@ impl TcpSock {
     /// inet_csk_reqsk_queue_add queues it and the listener is woken).
     /// False if it could not be made (TCPFastOpenPassiveFail: a plain
     /// request follows)
+    #[allow(clippy::too_many_arguments)]
     fn fastopen_child(
         &self,
         s: &SegIn,
@@ -1171,6 +1218,7 @@ impl TcpSock {
         t: Tuple,
         opts: cb::Opts,
         caps: (u32, u32, u8),
+        foc: Option<cb::Foc>,
         now: u64,
     ) -> bool {
         let net = &self.sk.net;
@@ -1188,6 +1236,8 @@ impl TcpSock {
         let mut out = Out::default();
         let o = open(net, &t, self.oif());
         let mut cb = self.child_cb(&c, opts, caps);
+        // A backup key's cookie: the SYN-ACK carries the primary's
+        cb.synack_foc = foc;
         cb.fastopen_open(s, skb, o, now, &mut out);
         g.cb = cb;
         if !net.tcp.hash(t, &eh, &c) {
@@ -2596,6 +2646,7 @@ impl ProtoOps for TcpSock {
             syn: OwnedList::new(),
             ready: OwnedList::new(),
             tfo_qlen: 0,
+            tfo_rst: alloc::collections::VecDeque::new(),
         });
         // Linux inet_listen: TFO_SERVER_WO_SOCKOPT1 gives a listener
         // without TCP_FASTOPEN a queue of its backlog
@@ -2605,6 +2656,7 @@ impl ProtoOps for TcpSock {
             && g.cb.live.fastopen.get() == 0
         {
             g.cb.live.fastopen.set(backlog);
+            self.sk.net.tcp.fastopen_init_key_once();
         }
         g.cb.state = TcpState::Listen;
         self.sk.set_flag(sf::ACCEPTCONN, true);
@@ -2815,6 +2867,9 @@ impl TcpSock {
         if opt == TCP_CONGESTION {
             return self.set_congestion(v);
         }
+        if opt == TCP_FASTOPEN_KEY {
+            return self.set_fastopen_key(v);
+        }
         let val = v.int()?;
         let bad = || Err(KernelError::InvalidArgument);
         let now = now_ms();
@@ -2861,9 +2916,18 @@ impl TcpSock {
                     if val < 0 || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen) {
                         return bad();
                     }
+                    self.sk.net.tcp.fastopen_init_key_once();
                     g.cb.live
                         .fastopen
                         .set((val as u32).min(self.sk.net.sysctl.somaxconn()));
+                }
+                TCP_FASTOPEN_NO_COOKIE => {
+                    if !(0..=1).contains(&val)
+                        || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen)
+                    {
+                        return bad();
+                    }
+                    g.cb.opts.tfo_no_cookie = val != 0;
                 }
                 TCP_NOTSENT_LOWAT => {
                     g.cb.opts.notsent_lowat = val as u32;
@@ -2873,6 +2937,21 @@ impl TcpSock {
             }
             Ok(())
         })
+    }
+
+    /// TCP_FASTOPEN_KEY: a primary key, or a primary and a backup
+    /// (Linux tcp_fastopen_reset_cipher on the socket)
+    fn set_fastopen_key(&self, v: OptIn) -> Result<(), KernelError> {
+        if v.len != fastopen::KEY_LEN && v.len != fastopen::KEY_BUF_LEN {
+            return Err(KernelError::InvalidArgument);
+        }
+        let b = v.bytes(fastopen::KEY_BUF_LEN)?;
+        let k = |i: usize| -> [u8; fastopen::KEY_LEN] {
+            b[i..i + fastopen::KEY_LEN].try_into().unwrap_or_default()
+        };
+        let backup = (b.len() == fastopen::KEY_BUF_LEN).then(|| k(fastopen::KEY_LEN));
+        *self.fastopen_ctx.lock() = Some(fastopen::Ctx::new(&k(0), backup.as_ref()));
+        Ok(())
     }
 
     /// TCP_CONGESTION: a NUL-terminated name of a built-in algorithm
@@ -2933,6 +3012,13 @@ impl TcpSock {
             TCP_USER_TIMEOUT => o.user_timeout,
             TCP_DEFER_ACCEPT => info::retrans_to_secs(o.defer_accept),
             TCP_FASTOPEN => g.cb.live.fastopen.get(),
+            TCP_FASTOPEN_NO_COOKIE => u32::from(o.tfo_no_cookie),
+            TCP_FASTOPEN_KEY => {
+                // Linux tcp_fastopen_get_cipher: the socket's keys, else
+                // its namespace's
+                let c = (*self.fastopen_ctx.lock()).or_else(|| self.sk.net.tcp.fastopen_ctx());
+                return Ok(OptOut::Bytes(c.map_or_else(Vec::new, |c| c.bytes())));
+            }
             TCP_NOTSENT_LOWAT => o.notsent_lowat,
             TCP_WINDOW_CLAMP => g.cb.window_clamp(),
             // Linux: the sysctl's when unset, -1 when negative

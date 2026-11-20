@@ -115,12 +115,9 @@ TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
 (/sys/module/tcp_cubic/parameters: Linux's defaults are constants), and
 Fast Open is server-side only: no client (MSG_FASTOPEN,
 TCP_FASTOPEN_CONNECT, the per-destination cookie cache Linux keeps in
-tcp_metrics, TCPFastOpenActive*, blackhole detection), no
-TCP_FASTOPEN_KEY / TCP_FASTOPEN_NO_COOKIE / net.ipv4.tcp_fastopen_key
-(one random key per namespace, no backup key: TCPFastOpenPassiveAltKey
-stays 0), and a reset Fast Open child frees its queue slot at once
-(Linux keeps it on fastopenq.rskq_rst_head for a timeout against RST
-floods). A request's SYN-ACK retries
+tcp_metrics, TCPFastOpenActive*, blackhole detection); no route
+metric RTAX_FASTOPEN_NO_COOKIE (hk routes carry no metrics). A
+request's SYN-ACK retries
 are not cut while old requests clog the SYN queue (reqsk_timer_handler
 lowers max_syn_ack_retries when qlen * 2 exceeds max(8, backlog) and
 young requests are few: hk keeps no young count), and a connecting

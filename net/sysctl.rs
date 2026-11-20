@@ -527,6 +527,21 @@ pub static CTLS: &[NetCtl] = &[
         text: None,
     },
     NetCtl {
+        path: "net/ipv4/tcp_fastopen_key",
+        mode: 0o600,
+        global: false,
+        show: no_ints,
+        store: ro,
+        text: Some(NetText {
+            show: |n| crate::net::tcp::fastopen::key_show(n.tcp.fastopen_ctx().as_ref()),
+            store: |n, s| {
+                n.tcp
+                    .fastopen_reset(crate::net::tcp::fastopen::key_store(s)?);
+                Ok(())
+            },
+        }),
+    },
+    NetCtl {
         path: "net/ipv4/tcp_retries2",
         mode: 0o644,
         global: false,

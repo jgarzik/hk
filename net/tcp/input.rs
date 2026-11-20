@@ -368,9 +368,9 @@ impl TcpCb {
         } else {
             skb
         };
-        // A Fast Open child is a full socket (Linux tcp_rcv_state_process,
-        // not tcp_check_req)
-        let req = self.passive && self.state == TcpState::SynReceived && !self.tfo;
+        // A request, or a Fast Open child (Linux tcp_rcv_state_process
+        // runs tcp_check_req with fastopen for it too)
+        let req = self.passive && self.state == TcpState::SynReceived;
         if req
             && s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)
@@ -422,6 +422,12 @@ impl TcpCb {
         if s.has(flags::RST) {
             if s.seq != self.rcv_nxt {
                 self.challenge_ack(out); // RFC 5961 3.2
+            } else if req && self.tfo {
+                // Linux tcp_check_req embryonic_reset for Fast Open:
+                // reqsk_fastopen_remove(reset), then tcp_reset
+                self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
+                self.tfo_reset = true;
+                self.on_reset(out);
             } else if req {
                 // Linux tcp_check_req: the request dies (embryonic_reset)
                 self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
@@ -446,13 +452,17 @@ impl TcpCb {
         if s.has(flags::SYN) && !cross {
             if req {
                 // A new SYN in window: reset, drop the request (Linux
-                // tcp_check_req embryonic_reset)
+                // tcp_check_req embryonic_reset); a Fast Open child
+                // only answers it ("try not to reset the local
+                // connection")
                 self.tcp_stat(TCP_MIB_ATTEMPTFAILS);
                 if let Some(r) = super::output::reset_for(s) {
                     self.reset_seg(r, out);
                 }
-                self.net_stat(LINUX_MIB_EMBRYONICRSTS);
-                self.set_closed(out);
+                if !self.tfo {
+                    self.net_stat(LINUX_MIB_EMBRYONICRSTS);
+                    self.set_closed(out);
+                }
             } else {
                 self.syn_challenge(out); // RFC 5961 4.2
             }

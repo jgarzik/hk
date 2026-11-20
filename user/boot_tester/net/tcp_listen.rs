@@ -28,9 +28,14 @@
 //!   cookie gets the SYN only acknowledged and the right cookie
 //!   (TCPFastOpenCookieReqd, TCPFastOpenPassive, TCPFastOpenPassiveFail;
 //!   Linux tcp_try_fastopen)
+//! - TCP_FASTOPEN_KEYS: TCP_FASTOPEN_KEY takes a primary and backup key
+//!   and returns them; net.ipv4.tcp_fastopen_key reads back as
+//!   "%08x-%08x-%08x-%08x" words (tcp_fastopen_reset_cipher,
+//!   proc_tcp_fastopen_key)
 
 use hk_syscall::{
-    AF_INET, SOCK_NONBLOCK, SOCK_STREAM, sys_accept, sys_listen, sys_setsockopt, sys_socket,
+    AF_INET, SOCK_NONBLOCK, SOCK_STREAM, sys_accept, sys_getsockopt, sys_listen, sys_setsockopt,
+    sys_socket,
 };
 
 use crate::harness::T;
@@ -52,6 +57,7 @@ pub fn run_tests() {
     test_max_syn_backlog();
     test_defer_accept();
     test_fastopen_server();
+    test_fastopen_keys();
 }
 
 /// SYN options: MSS 1460, SACK permitted, timestamps (`tsval`, 0),
@@ -400,5 +406,39 @@ fn test_fastopen_server() {
     abort(a);
     close(l);
     write_file(TFO, &old[..n as usize - 1]);
+    t.done();
+}
+
+fn test_fastopen_keys() {
+    const KEY: &[u8] = b"/proc/sys/net/ipv4/tcp_fastopen_key\0";
+    const TCP_FASTOPEN_KEY: i32 = 33;
+    let mut t = T::new(b"TCP_FASTOPEN_KEYS");
+    let s = tcp();
+    let mut k = [0u8; 32];
+    for (i, b) in k.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    let r = sys_setsockopt(s, IPPROTO_TCP, TCP_FASTOPEN_KEY, k.as_ptr(), 32);
+    t.eq(b"set", r, 0);
+    t.eq(
+        b"bad len",
+        sys_setsockopt(s, IPPROTO_TCP, TCP_FASTOPEN_KEY, k.as_ptr(), 20),
+        EINVAL,
+    );
+    let mut g = [0u8; 40];
+    let mut len = g.len() as u32;
+    let r = sys_getsockopt(s, IPPROTO_TCP, TCP_FASTOPEN_KEY, g.as_mut_ptr(), &mut len);
+    t.ok(b"get", r == 0 && len == 32 && g[..32] == k, i64::from(len));
+    close(s);
+    let mut old = [0u8; 128];
+    let n = read_file(KEY, &mut old);
+    t.ok(b"read", n > 0, n);
+    t.eq(b"write", write_file(KEY, b"1-2-3-4,a-b-c-d"), 15);
+    let want = b"00000001-00000002-00000003-00000004,0000000a-0000000b-0000000c-0000000d\n";
+    t.ok(b"format", reads(KEY, want), 0);
+    t.ok(b"bad key", write_file(KEY, b"1-2-3") < 0, 0);
+    if n > 0 {
+        write_file(KEY, &old[..n as usize - 1]);
+    }
     t.done();
 }
