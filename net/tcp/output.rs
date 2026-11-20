@@ -29,7 +29,7 @@ use super::recovery::{CaState, tag, tso_segs};
 use crate::mm::page_alloc::Gfp;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::mib::*;
-use crate::net::skb::{Sacks, SkBuff};
+use crate::net::skb::{Sacks, SkBuff, TX_HEADROOM};
 
 /// TCP header without options
 pub const HLEN: usize = 20;
@@ -81,14 +81,30 @@ fn clone_data(skb: &SkBuff, gfp: Gfp) -> Option<Box<SkBuff>> {
     Some(c)
 }
 
+/// Truesize of a send queue skb before its payload (Linux
+/// tcp_stream_alloc_skb: SKB_TRUESIZE of the linear header room; the
+/// payload is charged as it is copied in or moved)
+pub(super) const HEAD_TRUESIZE: usize = TX_HEADROOM + core::mem::size_of::<SkBuff>();
+
+/// An skb for up to `len` bytes of send queue payload, charged as its
+/// head only (Linux tcp_stream_alloc_skb, before sk_wmem_schedule)
+pub(super) fn stream_alloc(len: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
+    let mut s = SkBuff::alloc_tx(len, gfp)?;
+    s.set_truesize(HEAD_TRUESIZE);
+    Some(s)
+}
+
 /// Cut `skb` after `at` payload bytes (Linux tcp_fragment): the rest
-/// moves to a new skb, which takes the FIN and PSH flags; None without
-/// memory (`skb` unchanged)
+/// moves to a new skb, which takes the FIN and PSH flags and the
+/// rest's truesize, on top of its own head (the caller charges that);
+/// None without memory (`skb` unchanged)
 fn fragment(skb: &mut SkBuff, at: usize, gfp: Gfp) -> Option<Box<SkBuff>> {
     let rest = skb.len().checked_sub(at)?;
-    let mut n = SkBuff::alloc_tx(rest, gfp)?;
+    let mut n = stream_alloc(rest, gfp)?;
     n.put_slice(&skb.data()[at..])?;
     skb.trim(rest)?;
+    n.set_truesize(HEAD_TRUESIZE + rest);
+    skb.set_truesize(skb.truesize().saturating_sub(rest));
     n.set_tcp(skb.tcp());
     n.tstamp = skb.tstamp;
     n.tcp_mut().seq = skb.tcp().seq.wrapping_add(at as u32);
@@ -389,7 +405,7 @@ impl TcpCb {
         let (mut skb, new) = match self.wq.pop_front() {
             Some(s) => (s, false),
             None => {
-                let Some(mut s) = SkBuff::alloc_tx(0, out.gfp) else {
+                let Some(mut s) = stream_alloc(0, out.gfp) else {
                     return false;
                 };
                 s.tcp_mut().seq = self.write_seq;
@@ -403,7 +419,8 @@ impl TcpCb {
                 return false;
             };
             // Linux tcp_fragment: sk_wmem_queued_add(buff->truesize)
-            self.wmem_queued += rest.truesize();
+            // before the rest's payload moves over
+            self.wmem_queued += HEAD_TRUESIZE;
             self.wq.push_front(rest);
         }
         if !self.transmit(&skb, skb.tcp().seq, fl, out) {
@@ -479,20 +496,22 @@ impl TcpCb {
         if diff != 0 && !before(self.snd_max, rest.tcp().end_seq) {
             self.adjust_pcount(tags, diff);
         }
-        self.wmem_queued += rest.truesize();
+        self.wmem_queued += HEAD_TRUESIZE;
         self.rtx
             .insert_by(rest, |a, b| before(a.tcp().seq, b.tcp().seq));
         true
     }
 
     /// Drop the first `n` bytes of the sent skb at `seq` (Linux
-    /// tcp_trim_head): its seq moves, the references to it follow, an
-    /// skb of several segments is segmented again; returns the packets
-    /// it no longer counts (its caller accounts for them)
+    /// tcp_trim_head): its seq moves, its truesize and the queue's
+    /// shrink by them, the references to it follow, an skb of several
+    /// segments is segmented again; returns the packets it no longer
+    /// counts (its caller accounts for them)
     pub(super) fn rtx_trim_head(&mut self, seq: u32, n: usize) -> u32 {
-        let Some((new, diff)) = self.rtx_with(seq, |s| {
+        let Some((new, diff, k)) = self.rtx_with(seq, |s| {
             let k = n.min(s.len());
             let _ = s.pull(k);
+            s.set_truesize(s.truesize().saturating_sub(k));
             let old = s.tcp().pcount();
             if old > 1 {
                 let (p, g) = tso_segs(s.len(), s.tcp().gso_size());
@@ -501,10 +520,11 @@ impl TcpCb {
             }
             let t = s.tcp_mut();
             t.seq = t.seq.wrapping_add(k as u32);
-            (t.seq, old - t.pcount())
+            (t.seq, old - t.pcount(), k)
         }) else {
             return 0;
         };
+        self.wmem_queued = self.wmem_queued.saturating_sub(k);
         if self.highest_sack == Some(seq) {
             self.highest_sack = Some(new);
         }
@@ -515,12 +535,13 @@ impl TcpCb {
     }
 
     /// Merge the skb after the one at `seq` into it (Linux
-    /// tcp_collapse_retrans): its data, FIN and PSH move over and it
-    /// goes, one packet less out; false if the data does not fit
+    /// tcp_collapse_retrans): its data with their truesize (skb_shift),
+    /// FIN and PSH move over and it goes, one packet less out; false if
+    /// the data does not fit
     fn collapse_retrans(&mut self, seq: u32) -> bool {
         let mut c = self.rtx.cursor_floor_mut(|s| !after(s.tcp().seq, seq));
         c.move_next();
-        let Some(next) = c.remove_current() else {
+        let Some(mut next) = c.remove_current() else {
             return false;
         };
         let fits = self.rtx_with(seq, |h| h.tailroom() >= next.len()) == Some(true);
@@ -530,8 +551,10 @@ impl TcpCb {
             return false;
         }
         let nt = next.tcp();
+        let len = next.len();
         self.rtx_with(seq, |h| {
             let _ = h.put_slice(next.data());
+            h.set_truesize(h.truesize() + len);
             let t = h.tcp_mut();
             t.end_seq = nt.end_seq;
             t.flags |= nt.flags & (flags::FIN | flags::PSH);
@@ -544,6 +567,7 @@ impl TcpCb {
             self.rtx_hint = Some(seq);
         }
         self.adjust_pcount(nt.sacked, nt.pcount() as i32);
+        next.set_truesize(next.truesize().saturating_sub(len));
         self.wmem_free(next);
         true
     }

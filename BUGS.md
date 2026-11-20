@@ -123,6 +123,16 @@ skb_clone shares it). No GSO/TSO: one segment per transmission, a
 retransmission resends one MSS (`tcp_retransmit_skb`'s segs is 1;
 Linux sends a multi-segment skb as one GSO packet), and pcount above 1
 only arises when the MSS shrinks under queued skbs.
+A TCP send skb's buffer is a whole MSS (up to 64 KiB on loopback)
+from the start, while it is charged its head and the payload copied
+in, as Linux charges page frags (tcp_stream_alloc_skb,
+skb_copy_to_page_nocache): skbs sent with little payload (small
+TCP_NODELAY writes) hold far more memory than sk_wmem_queued and
+tcp_mem count. The send MSS is not bounded by half the peer's
+largest window (Linux tcp_bound_to_half_wnd in tcp_sync_mss and
+tcp_xmit_size_goal): against a small window hk fills skbs to the
+path MSS (65483 on loopback), so a write queue tail takes up to that
+much past SO_SNDBUF where Linux's takes about half the window.
 An skb holds no reference to its socket (Linux skb->sk with
 sk_wmem_alloc, released by sock_wfree): a closed socket's sent frames
 still queued on a device do not delay its __sk_free, so "sockets:

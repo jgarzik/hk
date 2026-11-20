@@ -509,10 +509,10 @@ impl TcpCb {
 
     /// Move `len` bytes, `pcount` segments, from the head of the skb at
     /// `skb` to the end of the one at `prev` (Linux tcp_skb_shift:
-    /// skb_shift moves pages; hk's skbs are linear, so the bytes are
-    /// copied into `prev`'s tailroom, false if it lacks the room), then
-    /// account for them (tcp_shifted_skb). Returns true if `skb` was
-    /// eaten whole; None if nothing moved.
+    /// skb_shift moves pages and their truesize; hk's skbs are linear,
+    /// so the bytes are copied into `prev`'s tailroom, false if it lacks
+    /// the room), then account for them (tcp_shifted_skb). Returns true
+    /// if `skb` was eaten whole; None if nothing moved.
     #[expect(clippy::too_many_arguments)]
     fn shift(
         &mut self,
@@ -547,6 +547,7 @@ impl TcpCb {
         let fin = s.tcp().has(flags::FIN);
         self.rtx_with(prev, |p| {
             let _ = p.put_slice(&s.data()[..len as usize]);
+            p.set_truesize(p.truesize() + len as usize);
             let pt = p.tcp_mut();
             pt.end_seq = pt.end_seq.wrapping_add(len);
             pt.set_pcount(pt.pcount() + pcount);
@@ -556,6 +557,7 @@ impl TcpCb {
             pt.sacked |= t.sacked & tag::EVER_RETRANS;
         });
         let _ = s.pull(len as usize);
+        s.set_truesize(s.truesize().saturating_sub(len as usize));
         let new_seq = t.seq.wrapping_add(len);
         if !s.is_empty() {
             let st_ = s.tcp_mut();

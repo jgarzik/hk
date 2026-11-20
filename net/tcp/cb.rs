@@ -803,7 +803,7 @@ pub struct TcpCb {
     /// SO_SNDBUF, grown by tcp_sndbuf_expand)
     pub sndbuf: u32,
     /// Truesize of the write and retransmit queues' skbs (Linux
-    /// sk_wmem_queued)
+    /// sk_wmem_queued): each skb's head and its payload
     pub(super) wmem_queued: usize,
     /// The user closed the sending side: a FIN follows the queued data
     pub(super) fin_queued: bool,
@@ -1317,10 +1317,12 @@ impl TcpCb {
     /// (Linux tcp_sendmsg_locked; the caller calls `output`): into the
     /// tail skb of the write queue while it has room, then into new ones
     /// of one MSS (tcp_stream_alloc_skb with sk_allocation: socket calls
-    /// own the socket, nothing atomic). `fill` gets each skb's new tail
-    /// and returns the bytes it stored there, short or Err after a
-    /// fault. Returns the bytes queued (0: no room or no memory), Err if
-    /// a fault left none; what `fill` did not store is taken back.
+    /// own the socket, nothing atomic), each copy covered first
+    /// (tcp_wmem_schedule) and charged as it lands. `fill` gets each
+    /// skb's new tail and returns the bytes it stored there, short or
+    /// Err after a fault. Returns the bytes queued (0: no room or no
+    /// memory), Err if a fault left none; what `fill` did not store is
+    /// taken back.
     pub fn send_with(
         &mut self,
         max: usize,
@@ -1332,7 +1334,7 @@ impl TcpCb {
             let Some(mut skb) = self.wq_tail() else {
                 break;
             };
-            let k = (n - done).min(skb.tailroom());
+            let k = self.wmem_schedule((n - done).min(skb.tailroom()));
             let got = match skb.put(k).map(&mut fill) {
                 Some(Ok(g)) => g.min(k),
                 Some(Err(e)) => {
@@ -1344,6 +1346,10 @@ impl TcpCb {
             if got < k {
                 let _ = skb.trim(k - got);
             }
+            // Linux skb_copy_to_page_nocache: the copy joins the skb's
+            // truesize and sk_wmem_queued
+            skb.set_truesize(skb.truesize() + got);
+            self.wmem_queued += got;
             skb.tcp_mut().end_seq = skb.tcp().end_seq.wrapping_add(got as u32);
             self.write_seq = self.write_seq.wrapping_add(got as u32);
             done += got;
@@ -1351,6 +1357,9 @@ impl TcpCb {
                 self.wmem_free(skb);
             } else {
                 self.wq.push_back(skb);
+            }
+            if k == 0 {
+                break;
             }
             if got < k {
                 short = true;
@@ -1371,9 +1380,8 @@ impl TcpCb {
     /// The skb new data goes into: the write queue's tail while it has
     /// room, else, with the buffer not full (Linux tcp_sendmsg_locked's
     /// sk_stream_memory_free before a new segment), a new one of one
-    /// MSS charged its truesize (tcp_stream_alloc_skb: forced into
-    /// empty queues, else sk_wmem_schedule); None without room or
-    /// memory
+    /// MSS charged its head (tcp_stream_alloc_skb: forced into empty
+    /// queues, else sk_wmem_schedule); None without room or memory
     fn wq_tail(&mut self) -> Option<Box<SkBuff>> {
         if let Some(t) = self.wq.pop_back() {
             if t.tailroom() > 0 {
@@ -1384,7 +1392,8 @@ impl TcpCb {
         if !self.memory_free() {
             return None;
         }
-        let Some(mut skb) = SkBuff::alloc_tx(self.live.mss.get() as usize, Gfp::KERNEL) else {
+        let Some(mut skb) = super::output::stream_alloc(self.live.mss.get() as usize, Gfp::KERNEL)
+        else {
             // Linux tcp_stream_alloc_skb: enter_memory_pressure,
             // sk_stream_moderate_sndbuf
             if mem::enter_pressure() {
@@ -1418,6 +1427,22 @@ impl TcpCb {
             Ok(b.len())
         })
         .unwrap_or(0)
+    }
+
+    /// Cover `copy` more bytes of payload (Linux tcp_wmem_schedule):
+    /// refused, what tcp_wmem[0] leaves above the queued truesize is
+    /// forced, so a connection with little queued progresses, and the
+    /// copy shrinks to what the held quanta cover (sk_forward_alloc)
+    fn wmem_schedule(&mut self, copy: usize) -> usize {
+        if self.mem_schedule(copy, MemKind::Send) {
+            return copy;
+        }
+        let left = (self.cfg.wmem_min as usize).saturating_sub(self.wmem_queued);
+        if left > 0 {
+            self.mem_force(left.min(copy));
+        }
+        let fwd = (self.held.get() * mem::QUANTUM).saturating_sub(self.mem_used());
+        copy.min(fwd)
     }
 
     /// An skb leaves the send queues for good (Linux

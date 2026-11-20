@@ -55,6 +55,10 @@ pub const NET_SKB_PAD: usize = 64;
 /// Largest buffer: a 64 KB IP datagram plus headroom (loopback MTU)
 pub const MAX_SKB_SIZE: usize = 65536 + 512;
 
+/// Headroom of a transmitted skb: Ethernet (14) + IP (20-60) + TCP
+/// (20-60) headers
+pub const TX_HEADROOM: usize = 14 + 60 + 60;
+
 /// Network buffer - equivalent to Linux sk_buff
 ///
 /// # Invariants
@@ -76,6 +80,10 @@ pub struct SkBuff {
     data: usize,
     /// End of the packet data (moves with put/trim)
     tail: usize,
+    /// Bytes charged to a socket buffer for it (Linux skb->truesize):
+    /// the buffer and the skb itself as allocated; TCP's send skbs
+    /// count their header room, then the payload copied in
+    truesize: usize,
 
     // Protocol information
     /// EtherType (set by eth_type_trans)
@@ -209,6 +217,7 @@ impl SkBuff {
         with_gfp(gfp, || {
             let buf = crate::util::kmem::try_vec(total_size, 0u8).ok()?;
             try_box(Self {
+                truesize: buf.capacity() + core::mem::size_of::<Self>(),
                 buf,
                 data: headroom,
                 tail: headroom,
@@ -221,9 +230,7 @@ impl SkBuff {
     /// Allocate an skb for transmitting `data_len` bytes, with headroom
     /// for every header below them (Ethernet + IP + TCP)
     pub fn alloc_tx(data_len: usize, gfp: Gfp) -> Option<Box<Self>> {
-        // Reserve space for: Ethernet (14) + IP (20-60) + TCP (20-60)
-        let headroom = 14 + 60 + 60;
-        Self::alloc(headroom, data_len, gfp)
+        Self::alloc(TX_HEADROOM, data_len, gfp)
     }
 
     /// Get current data length
@@ -398,10 +405,17 @@ impl SkBuff {
         self.buf.get(self.nh?..self.tail)
     }
 
-    /// Bytes charged to a socket buffer for it (Linux skb->truesize:
-    /// the buffer and the skb itself)
+    /// Bytes charged to a socket buffer for it (Linux skb->truesize)
     pub fn truesize(&self) -> usize {
-        self.buf.capacity() + core::mem::size_of::<Self>()
+        self.truesize
+    }
+
+    /// Change what it is charged as (Linux skb->truesize written by
+    /// TCP: tcp_stream_alloc_skb, the payload copied in or moved by
+    /// tcp_fragment, skb_shift, tcp_trim_head); only while uncharged,
+    /// or with the charge adjusted alike
+    pub fn set_truesize(&mut self, n: usize) {
+        self.truesize = n;
     }
 
     /// An skb whose data is `v`, taken over without a copy (a netlink
@@ -410,6 +424,7 @@ impl SkBuff {
     pub fn from_vec(v: Vec<u8>) -> Self {
         Self {
             tail: v.len(),
+            truesize: v.capacity() + core::mem::size_of::<Self>(),
             buf: v,
             ..Default::default()
         }
@@ -433,6 +448,7 @@ impl SkBuff {
             buf,
             data: self.data,
             tail: self.tail,
+            truesize: self.truesize,
             protocol: self.protocol,
             ip_protocol: self.ip_protocol,
             dev: self.dev.clone(),

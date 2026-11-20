@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use super::cb::{
     Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, TIMEWAIT_LEN, TcpCb, TcpState, flags, wake,
 };
+use super::output::HEAD_TRUESIZE;
 use super::timewait::{TwCb, TwStatus};
 use crate::mm::page_alloc::Gfp;
 use crate::net::skb::{Sacks, SkBuff};
@@ -454,6 +455,16 @@ fn lossy(_: &Pair, to_b: bool, s: &Seg, i: usize) -> Fate {
     }
 }
 
+/// The send queues' truesize (Linux sk_wmem_queued); each skb's is its
+/// head and its payload, however it was split, merged or trimmed
+fn queued_truesize(c: &TcpCb) -> usize {
+    for s in c.wq.iter().chain(c.rtx.iter()) {
+        assert_eq!(s.truesize(), HEAD_TRUESIZE + s.len());
+    }
+    c.wq.iter().map(|s| s.truesize()).sum::<usize>()
+        + c.rtx.iter().map(|s| s.truesize()).sum::<usize>()
+}
+
 #[test]
 fn loss_recovers() {
     let mut p = Pair::new(1000);
@@ -739,6 +750,7 @@ fn shrunk_window_reopen_resends_rest() {
     let mut out = Out::default();
     let now = p.now;
     p.a.feed(&ack(&p, head, 60_000), now, &mut out);
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
     assert!(
         wire(&out)
             .iter()
@@ -2769,8 +2781,10 @@ fn sacked_skbs_merge() {
     }
     assert_eq!(m.net.fold(LINUX_MIB_SACKSHIFTFALLBACK), 1);
     assert_eq!(m.net.fold(LINUX_MIB_SACKMERGED), 4);
-    // One SACKed skb of five segments behind the lost one
+    // One SACKed skb of five segments behind the lost one, the
+    // truesize moved with the data (Linux skb_shift)
     assert_eq!(p.a.rtx.len(), 2);
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
     assert_eq!((p.a.packets_out, p.a.sacked_out), (6, 5));
     // The lost one went again; its ACK clears everything
     let w = wire(&out);
@@ -2787,6 +2801,38 @@ fn sacked_skbs_merge() {
         (0, 0, 0, 0)
     );
     assert!(p.a.rtx.is_empty());
+    assert_eq!(p.a.wmem_queued, 0);
+}
+
+/// Small skbs lost together are merged as the head is retransmitted
+/// (Linux tcp_retrans_try_collapse): the data take their truesize
+/// along (skb_shift), the merged skbs' heads leave the queue
+#[test]
+fn retrans_collapse_moves_truesize() {
+    let mut p = Pair::new(1000);
+    p.a.opts.nodelay = true;
+    p.filter = |_, to_b, s, _| {
+        if to_b && !s.data.is_empty() {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    };
+    for i in 0..3u8 {
+        p.send_a(&[i; 100]);
+    }
+    assert_eq!(p.a.rtx.len(), 3);
+    assert_eq!(p.a.wmem_queued, 3 * (HEAD_TRUESIZE + 100));
+    // The loss probe, then the RTO
+    for _ in 0..2 {
+        let t = p.a.next_timer().expect("armed");
+        p.now = t;
+        let mut out = Out::default();
+        p.a.on_timer(t, &mut out);
+        assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+    }
+    assert_eq!(p.a.rtx.len(), 1);
+    assert_eq!(p.a.wmem_queued, HEAD_TRUESIZE + 300);
 }
 
 /// A lost tail has nothing after it to be SACKed: the loss probe

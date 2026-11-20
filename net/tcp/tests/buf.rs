@@ -467,12 +467,6 @@ fn backlog_counts_in_space() {
     assert_eq!(p.b.window_now(), 0);
 }
 
-/// The send queues' truesize (Linux sk_wmem_queued)
-fn queued_truesize(c: &TcpCb) -> usize {
-    c.wq.iter().map(|s| s.truesize()).sum::<usize>()
-        + c.rtx.iter().map(|s| s.truesize()).sum::<usize>()
-}
-
 /// Send memory is skb truesize against all of SO_SNDBUF (Linux
 /// sk_wmem_queued, sk_stream_memory_free): charged as skbs are queued
 /// or split, released as they are acknowledged or merged, through
@@ -510,6 +504,48 @@ fn send_memory_is_truesize() {
     }
     assert_eq!(p.a.snd_una, p.a.snd_max);
     assert_eq!(p.a.wmem_queued, 0);
+}
+
+/// 1 KiB writes into `p.a` with SO_SNDBUF 4096 (8192) until one is
+/// short: the bytes taken
+fn fill_sndbuf(p: &mut Pair) -> usize {
+    p.a.sndbuf = 8192;
+    let mut n = 0;
+    while n < 1 << 16 {
+        let k = p.send_a(&[0x5a; 1024]);
+        n += k;
+        if k < 1024 {
+            break;
+        }
+    }
+    assert_eq!(p.a.wmem_queued, queued_truesize(&p.a));
+    assert!(!p.a.memory_free());
+    n
+}
+
+/// Send memory grows with the payload copied in (Linux
+/// tcp_stream_alloc_skb charges an skb its header room, each copy adds
+/// its bytes: skb_copy_to_page_nocache): on a 64 KiB-MSS path
+/// (loopback) with nothing acknowledged, 1 KiB writes each go out in
+/// an skb of their own and the buffer takes them until heads and
+/// payload reach it, not one write per MSS. Against a zero window the
+/// skbs fill to the MSS, about 7 KiB in all.
+#[test]
+fn send_memory_grows_with_payload() {
+    let mut p = Pair::with_cap(65_483, 1 << 20);
+    p.a.opts.nodelay = true;
+    p.filter = drop_all;
+    let n = fill_sndbuf(&mut p);
+    let skb = HEAD_TRUESIZE + 1024;
+    assert_eq!(n, 8192_usize.div_ceil(skb) * 1024);
+    assert_eq!(p.a.wmem_queued, 8192_usize.div_ceil(skb) * skb);
+    let mut p = Pair::with_cap(1460, 1 << 20);
+    p.a.snd_wnd = 0;
+    let n = fill_sndbuf(&mut p);
+    let mss = p.a.live.mss.get() as usize;
+    let k = 8192_usize.div_ceil(HEAD_TRUESIZE + mss);
+    assert_eq!((n, p.a.wq.len()), (k * mss, k));
+    assert!(n > 6 * 1024 && n < 8 * 1024, "{n}");
 }
 
 /// TCP_LINGER2 (Linux tp->linger2, tcp_fin_time): a positive value is
