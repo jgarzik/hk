@@ -455,6 +455,59 @@ pub struct PingNet {
     rover: AtomicU16,
 }
 
+/// `/proc/net/icmp` of `net` (Linux ping_v4_seq_show /
+/// ping_v4_format_sock): its bound ping sockets by chain, the echo
+/// identifier as the local port, addresses as raw network-order hex,
+/// state ESTABLISHED (1) when connected, else CLOSE (7), lines padded
+/// to 127 columns; the pointer column 0 (kptr_restrict); generated
+/// under RCU into a buffer that never grows
+pub fn proc_net_icmp(net: &NetNamespace) -> Vec<u8> {
+    use core::fmt::Write;
+    crate::fs::proc::seq::generate(|m| {
+        m.setwidth(127);
+        let _ = write!(
+            m,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
+        );
+        m.pad('\n');
+        let raw = |a: crate::net::Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
+        let g = crate::sync::rcu::read_lock();
+        for (i, head) in PING_TABLE.hash.iter().enumerate() {
+            for s in head.iter(&g).filter(|s| s.sk.net.id == net.id) {
+                let a = s.inet.get();
+                let st = if s.connected.load(Ordering::Acquire) {
+                    1
+                } else {
+                    7
+                };
+                m.setwidth(127);
+                let _ = write!(
+                    m,
+                    "{:5}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {}",
+                    i,
+                    raw(a.rcv_saddr),
+                    a.sport,
+                    raw(a.daddr),
+                    a.dport,
+                    st,
+                    0,
+                    s.rxq.rmem(),
+                    0,
+                    0,
+                    0,
+                    s.sk.cred.euid,
+                    0,
+                    s.sk.ino.load(Ordering::Relaxed),
+                    2,
+                    0,
+                    s.sk.drops.load(Ordering::Relaxed)
+                );
+                m.pad('\n');
+            }
+        }
+    })
+}
+
 /// Linux ping_hashslot: the identifier plus the namespace's random mix
 fn slot(net: &NetNamespace, ident: u16) -> &'static RcuHList<PingNode, PingLocked> {
     let mix = net.hash_mix as usize;

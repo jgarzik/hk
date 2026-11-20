@@ -180,7 +180,7 @@ neighbour sysctls (`net/core/neigh_sysctl.rs`) anycast_delay,
 interval_probe_time_ms and gc_interval are kept only.
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
+IP_TRANSPARENT. A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
 and a reader_queue spliced from it.

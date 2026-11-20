@@ -355,6 +355,7 @@ pub fn run_ping_tests() {
     test_ping_rebind();
     test_ping_netns_exit();
     test_ping_errors();
+    test_ping_proc();
     match net_setup_eth0() {
         Ok(_) => {
             test_ping_eth0();
@@ -395,6 +396,34 @@ fn test_ping_group() {
 
 /// Echo to 127.0.0.1: the kernel sets the identifier to the bound
 /// "port" and the reply comes back with it
+/// /proc/net/icmp (Linux ping_v4_seq_show): lines padded to 127
+/// columns, a bound socket with its identifier as its local port
+fn test_ping_proc() {
+    let mut t = T::new(b"PING_PROC");
+    let fd = ping_socket();
+    t.eq(b"bind", bind(fd, LO, 0x4321), 0);
+    let mut buf = [0u8; 4096];
+    let n = crate::proc::sysctl::read_file(b"/proc/net/icmp\0", &mut buf);
+    t.ok(b"read", n >= 256, n);
+    let text = &buf[..n.max(0) as usize];
+    t.ok(
+        b"header",
+        text.starts_with(b"  sl  local_address rem_address   st tx_queue rx_queue")
+            && text.len() >= 128
+            && text[127] == b'\n',
+        0,
+    );
+    let found = text.chunks(128).any(|l| {
+        l.len() == 128
+            && l[127] == b'\n'
+            && l.windows(30)
+                .any(|w| w == b": 0100007F:4321 00000000:0000 ")
+    });
+    t.ok(b"line", found, 0);
+    close(fd);
+    t.done();
+}
+
 fn test_ping_lo() {
     let mut t = T::new(b"PING_LO");
     let fd = ping_socket();

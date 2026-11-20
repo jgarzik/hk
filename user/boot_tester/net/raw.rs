@@ -29,6 +29,43 @@ pub fn run_tests() {
     test_peek();
     test_frag_overlap();
     test_frag_expire();
+    test_proc();
+}
+
+fn has(h: &[u8], n: &[u8]) -> bool {
+    h.windows(n.len()).any(|w| w == n)
+}
+
+/// /proc/net/raw (Linux raw_seq_show): a line per socket, the protocol
+/// as its local port, CLOSE (07) until connected, then ESTABLISHED
+fn test_proc() {
+    let mut t = T::new(b"RAW_PROC");
+    let fd = raw(253);
+    t.eq(b"bind", bind(fd, LO, 0), 0);
+    let mut buf = [0u8; 4096];
+    let n = crate::proc::sysctl::read_file(b"/proc/net/raw\0", &mut buf);
+    t.ok(b"read", n > 0, n);
+    let text = &buf[..n.max(0) as usize];
+    t.ok(
+        b"header",
+        text.starts_with(
+            b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+        ),
+        0,
+    );
+    t.ok(b"bound", has(text, b": 0100007F:00FD 00000000:0000 07 "), 0);
+    t.eq(b"connect", connect(fd, LO, 0), 0);
+    let n = crate::proc::sysctl::read_file(b"/proc/net/raw\0", &mut buf);
+    let text = &buf[..n.max(0) as usize];
+    t.ok(
+        b"connected",
+        has(text, b": 0100007F:00FD 0100007F:0000 01 "),
+        0,
+    );
+    close(fd);
+    let n = crate::proc::sysctl::read_file(b"/proc/net/raw\0", &mut buf);
+    t.ok(b"gone", !has(&buf[..n.max(0) as usize], b":00FD "), 0);
+    t.done();
 }
 
 /// MSG_PEEK leaves the packet (IP header included) queued; a short

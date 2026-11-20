@@ -515,6 +515,54 @@ fn slot(net: &NetNamespace, proto: u16) -> &'static RcuHList<RawNode, RawLocked>
     &RAW_TABLE.hash[h as usize]
 }
 
+/// `/proc/net/raw` of `net` (Linux raw_seq_show / raw_sock_seq_show):
+/// its sockets by chain, the protocol as the local port, addresses as
+/// raw network-order hex, state ESTABLISHED (1) when connected, else
+/// CLOSE (7); the pointer column 0 (kptr_restrict); generated under
+/// RCU into a buffer that never grows
+pub fn proc_net_raw(net: &NetNamespace) -> Vec<u8> {
+    use core::fmt::Write;
+    crate::fs::proc::seq::generate(|m| {
+        let _ = writeln!(
+            m,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
+        );
+        let raw = |a: Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
+        let g = crate::sync::rcu::read_lock();
+        for (i, head) in RAW_TABLE.hash.iter().enumerate() {
+            for s in head.iter(&g).filter(|s| s.sk.net.id == net.id) {
+                let a = s.inet.get();
+                let st = if s.connected.load(Ordering::Acquire) {
+                    1
+                } else {
+                    7
+                };
+                let _ = writeln!(
+                    m,
+                    "{:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {}",
+                    i,
+                    raw(a.rcv_saddr),
+                    s.num,
+                    raw(a.daddr),
+                    0,
+                    st,
+                    0,
+                    s.rxq.rmem(),
+                    0,
+                    0,
+                    0,
+                    s.sk.cred.euid,
+                    0,
+                    s.sk.ino.load(Ordering::Relaxed),
+                    2,
+                    0,
+                    s.sk.drops.load(Ordering::Relaxed)
+                );
+            }
+        }
+    })
+}
+
 /// Linux raw_hash_sk
 fn raw_hash_sk(s: &Arc<RawSock>) {
     slot(&s.sk.net, s.num).add_head(s.clone(), &mut RAW_TABLE.lock.lock());
