@@ -446,6 +446,7 @@ pub fn run_all_tests() {
     time::timer_rt::run_tests();
     signal::ptrace_stop::run_tests();
     signal::ptrace_exit::run_tests();
+    signal::ptrace_event::run_tests();
     signal::jobctl::run_tests();
     signal::ptrace_listen::run_tests();
     process::wake_storm::run_tests();

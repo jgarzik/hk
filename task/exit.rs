@@ -831,6 +831,12 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
+        // A tracer that asked sees the exit first, the exit code its
+        // message (Linux do_exit: ptrace_event(PTRACE_EVENT_EXIT))
+        crate::task::ptrace::ptrace_event(
+            crate::task::ptrace::PTRACE_EVENT_EXIT,
+            u64::from(status.unwrap_or(0) as u32),
+        );
         // Its io_uring requests end first, so none outlives the task
         // (Linux do_exit: io_uring_files_cancel, which runs the task's
         // callbacks as it waits)

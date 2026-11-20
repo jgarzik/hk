@@ -628,14 +628,13 @@ clock_gettime and friends. On arm64 a page holding only the signal
 return trampoline stands in for the vDSO's sigtramp, shown as
 [sigpage] in /proc/<pid>/maps (Linux: [vdso], [vvar]).
 
-## ptrace stop gaps
+## ptrace request gaps
 
-**Location**: `task/ptrace.rs`, `task/exec.rs`,
-`signal/mod.rs`
+**Location**: `task/ptrace.rs`
 
-Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
-clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
-PTRACE_EVENT_FORK..PTRACE_EVENT_EXIT).
+PTRACE_PEEKUSER/POKEUSER, PTRACE_GETFPREGS/SETFPREGS and
+PTRACE_GETREGSET/SETREGSET are EINVAL (Linux arch_ptrace: gdb reads
+debug registers and FP state through them).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 
@@ -1038,7 +1037,7 @@ or discards the range).
 Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
-- **Syscalls that do not deliver** (H/C): inotify queues only
+- **Syscalls that do not deliver** (H): inotify queues only
   IN_DELETE_SELF, IN_UNMOUNT, IN_IGNORED and IN_Q_OVERFLOW, fanotify
   nothing (the other events have no fsnotify hooks in the VFS
   operations); rename has no

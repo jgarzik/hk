@@ -498,7 +498,14 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> util::error::KernelError {
         return e;
     }
     let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
-    match task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc) {
+    // From the kernel: no syscall in its frame (Linux kernel_execve)
+    match task::exec::do_execve(
+        path.as_bytes().to_vec(),
+        argv,
+        envp,
+        u64::MAX,
+        &mut frame_alloc,
+    ) {
         Ok(never) => match never {},
         Err(e) => e,
     }

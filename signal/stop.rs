@@ -544,6 +544,28 @@ pub fn attach_stopped(t: &Task) {
     }
 }
 
+/// A new child traced from its fork (Linux ptrace_init_task, under
+/// tasklist_lock, before it first runs): a seized tracer's gets a STOP
+/// trap pending, an attached one's SIGSTOP pending, so it stops before
+/// its first instruction
+pub fn ptrace_init_child(t: &Task, seized: bool) {
+    let Some(sig_struct) = t.cpu_group() else {
+        return;
+    };
+    let rcu = crate::sync::rcu::read_lock();
+    let Some(sg) = super::lock_task_sighand(t, &rcu) else {
+        return;
+    };
+    let _g = sig_struct.jobctl(&sg);
+    let mut s = sig_of(t, &sg);
+    if seized {
+        set_pending(t, &mut s, TRAP_STOP);
+    } else {
+        s.pending.signal.add(super::SIGSTOP);
+    }
+    t.set_sigpending(true);
+}
+
 /// `t` is in the middle of an attach's re-trap (JOBCTL_TRAPPING)
 pub fn trapping(t: &Task) -> bool {
     jobctl_of(t) & TRAPPING != 0

@@ -803,6 +803,11 @@ pub struct Task {
     pub flags: AtomicU32,
     /// Linux TIF_* ([`tif`])
     pub thread_flags: AtomicU32,
+    /// An exec's ptrace report, due on its first return to user mode,
+    /// once the new image's registers are in place: `EXEC_EVENT` | the
+    /// old thread id as its tracer numbers it (`ptrace::exec_event_*`;
+    /// Linux exec_binprm's ptrace_event(PTRACE_EVENT_EXEC, old_vpid))
+    pub exec_event: AtomicU64,
     /// CPU whose run queue owns this task (Linux task_cpu): changed by
     /// `set_task_cpu` only
     pub cpu: AtomicU32,
@@ -1651,6 +1656,7 @@ impl Task {
             // No CPU's registers hold its user state (Linux copy_thread:
             // fpsimd_flush_task_state)
             thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
+            exec_event: AtomicU64::new(0),
             cpu: AtomicU32::new(cpu),
             wake_cpu: AtomicU32::new(cpu),
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
@@ -1725,6 +1731,7 @@ impl Task {
             // Its registers hold no user state (Linux init_task:
             // _TIF_FOREIGN_FPSTATE)
             thread_flags: AtomicU32::new(tif::FOREIGN_FPSTATE),
+            exec_event: AtomicU64::new(0),
             cpu: AtomicU32::new(0),
             wake_cpu: AtomicU32::new(0),
             cpus_mask: crate::util::cpumask::CpuMask::new(),

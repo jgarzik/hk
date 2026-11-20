@@ -207,8 +207,8 @@ impl Arch for X86_64Arch {
 // ============================================================================
 
 impl UserModeOps for X86_64Arch {
-    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> ! {
-        unsafe { entry::enter_user(entry, user_stack, kernel_stack) }
+    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64, syscall_nr: u64) -> ! {
+        unsafe { entry::enter_user(entry, user_stack, kernel_stack, syscall_nr) }
     }
 }
 

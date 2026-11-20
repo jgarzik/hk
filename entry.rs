@@ -40,6 +40,17 @@ const SIGNAL_WORK: u32 = tif::SIGPENDING | tif::RESTORE_SIGMASK | tif::NOTIFY_SI
 /// exit_to_user_mode_prepare / exit_to_user_mode_loop). Interrupts are
 /// off on entry and on return; `regs` is the current task's pt_regs.
 pub fn exit_to_user_mode(regs: &UserFrame) {
+    // An exec's ptrace report, once its new registers are in the frame
+    // a tracer reads (rare: one load otherwise)
+    if crate::task::percpu::current()
+        .exec_event
+        .load(Ordering::Relaxed)
+        != 0
+    {
+        CurrentArch::enable_interrupts();
+        crate::task::ptrace::exec_event_end();
+        CurrentArch::disable_interrupts();
+    }
     loop {
         let flags = &crate::task::percpu::current().thread_flags;
         let work = flags.load(Ordering::Acquire) & EXIT_WORK;

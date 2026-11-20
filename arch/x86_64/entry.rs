@@ -478,7 +478,7 @@ pub unsafe extern "C" fn irq_return() {
 /// # Safety
 /// The current task's address space is loaded and maps `entry` and `sp`;
 /// `kstack_top` is its kernel stack.
-pub unsafe fn enter_user(entry: u64, sp: u64, kstack_top: u64) -> ! {
+pub unsafe fn enter_user(entry: u64, sp: u64, kstack_top: u64, syscall_nr: u64) -> ! {
     let regs = (kstack_top - core::mem::size_of::<PtRegs>() as u64) as *mut PtRegs;
     // SAFETY: the top of this task's kernel stack, below the caller's
     // frames only if the caller runs on another stack (init)
@@ -489,7 +489,7 @@ pub unsafe fn enter_user(entry: u64, sp: u64, kstack_top: u64) -> ! {
             rflags: 0x202, // IF + reserved bit 1
             rsp: sp,
             ss: u64::from(USER_DATA_SELECTOR),
-            orig_rax: u64::MAX,
+            orig_rax: syscall_nr,
             ..Default::default()
         });
     }

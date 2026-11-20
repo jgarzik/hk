@@ -11,21 +11,20 @@ phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |
 |---|-------|----------|
-| 1 | C — ptrace event stops, reboot CAD | strace -f, gdb; init's Ctrl-Alt-Del |
-| 2 | Y — tty and console core | prerequisite of devpts (3) and VT (6) |
-| 3 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
-| 4 | I — Debian networking | DEB_NET |
-| 5 | T — device topology | SCSI midlayer for AHCI, USB hubs |
-| 6 | V — virtual terminals | console, keyboard, logind/Xorg ABI |
-| 7 | J — reclaim and OOM | long Debian runs |
-| 8 | N — credentials and login | DEB_LOGIN, DEB_SU; check-debian joins the gate |
-| 9 | M4 — DMA and MMIO | typed DMA for the real-hardware drivers |
-| 10 | D — Dell OptiPlex 3020 bring-up | interrupt routing, xHCI, AHCI, UEFI, NIC |
-| 11 | M3 — rest of the bus/DT cleanup | after the drivers settle |
-| 12 | M5 — split functions over 150 lines | pure moves |
-| 13 | S1 — idioms | small, wide |
-| 14 | S2 — docs | last: describes the final code |
-| 15 | E — eBPF attach points, then a JIT | the engine (`bpf/`) is now specified and tested; README wishlist; not Debian-blocking |
+| 1 | Y — tty and console core | prerequisite of devpts (2) and VT (5) |
+| 2 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
+| 3 | I — Debian networking | DEB_NET |
+| 4 | T — device topology | SCSI midlayer for AHCI, USB hubs |
+| 5 | V — virtual terminals | console, keyboard, logind/Xorg ABI |
+| 6 | J — reclaim and OOM | long Debian runs |
+| 7 | N — credentials and login | DEB_LOGIN, DEB_SU; check-debian joins the gate |
+| 8 | M4 — DMA and MMIO | typed DMA for the real-hardware drivers |
+| 9 | D — Dell OptiPlex 3020 bring-up | interrupt routing, xHCI, AHCI, UEFI, NIC |
+| 10 | M3 — rest of the bus/DT cleanup | after the drivers settle |
+| 11 | M5 — split functions over 150 lines | pure moves |
+| 12 | S1 — idioms | small, wide |
+| 13 | S2 — docs | last: describes the final code |
+| 14 | E — eBPF attach points, then a JIT | the engine (`bpf/`) is now specified and tested; README wishlist; not Debian-blocking |
 
 Not scheduled: HADL proper (`doc/ideas/HADL-driver-architecture-research.md`:
 typed register vocabulary, Ethernet engine, chip descriptions, signed
@@ -33,14 +32,7 @@ driver packages and loader, native escape modules). Only its
 preparatory items are in the phases above (M4, D's firmware
 loading); HADL itself waits for the owner's go-ahead.
 
-## 1. C — ptrace event stops, reboot CAD
-
-ptrace exec, fork, clone and exit event stops (PTRACE_O_TRACEEXEC and
-friends, PTRACE_EVENT_FORK..PTRACE_EVENT_EXIT; BUGS.md "ptrace stop
-gaps"); reboot CAD_ON/CAD_OFF (C_A_D, cad_pid; EINVAL today). Tests
-PTRACE_EVENT, REBOOT_CAD.
-
-## 2. Y — tty and console core
+## 1. Y — tty and console core
 
 - TtyDriver ops (install, ioctl fall-through, resize, init_termios)
   on the serial drivers.
@@ -56,7 +48,7 @@ PTRACE_EVENT, REBOOT_CAD.
   exit and port removal hang up already).
 - `-vga std` pinned in run-qemu.sh and linux-boot-tester.sh.
 
-## 3. H — Debian kernel interfaces
+## 2. H — Debian kernel interfaces
 
 devpts and ptys (ptmx, TIOCGPTN/TIOCSPTLCK/TIOCGPTPEER, newinstance);
 /proc: cmdline, stat, uptime, loadavg, filesystems, cpuinfo, swaps,
@@ -67,14 +59,14 @@ in Linux form; harness `tools/debian-root.sh` (apt-get download,
 dpkg-deb -x, fakeroot cpio) and `check-debian{,-arm}`, cached by input
 hash. Tests PTY_BASIC, PROC_BASICS, DEB_SH, DEB_RCS.
 
-## 4. I — Debian networking
+## 3. I — Debian networking
 
 ifupdown with dhclient (AF_PACKET and raw paths);
 /proc/sys/net/ipv4/{conf,neigh}/*, /proc/net/{raw,icmp}; SIOCETHTOOL
 where dhclient or ifup need it; Linux errnos where AF_INET6 is tried.
 Test DEB_NET (DHCP on QEMU slirp, ip addr, ping, TCP fetch, DNS).
 
-## 5. T — device topology
+## 4. T — device topology
 
 Missing intermediate subsystems, built in Linux's shape (no faked
 paths):
@@ -91,7 +83,7 @@ paths):
 - x86 ttyS0 below the ACPI PNP0501 device waits for ACPI namespace
   enumeration (D).
 
-## 6. V — virtual terminals
+## 5. V — virtual terminals
 
 Linux drivers/tty/vt equivalence:
 - P1 VT core and dummycon: tty1..63 and tty0, con_write C0 controls
@@ -115,20 +107,20 @@ Linux drivers/tty/vt equivalence:
   KIOCSOUND/KDMKTONE.
 - P9 virtio-gpu 2D (checked in check-gfx).
 
-## 7. J — reclaim and OOM
+## 6. J — reclaim and OOM
 
 kswapd, priority reclaim, the slab shrinker API, the OOM killer with
 oom_score_adj; shmem/tmpfs pages swap out (Linux shmem_writeout). Test: 1000 fork+exec of a dynamic binary with slab flat;
 OOM kill semantics.
 
-## 8. N — credentials and login
+## 7. N — credentials and login
 
 setuid/setgid exec and file capabilities (NOSUID honored),
 PR_CAPBSET_*, ambient capabilities, securebits; interactive login on a
 pty. Tests DEB_LOGIN (agetty autologin, bash job control), DEB_SU.
 `check-debian{,-arm}` joins `make gate`.
 
-## 9. M4 — DMA and MMIO
+## 8. M4 — DMA and MMIO
 
 The streaming DMA API kept and typed (no raw physical addresses, unmap
 on completion), `DmaAddr` with a private constructor, `DmaRing<T: Pod>`
@@ -137,7 +129,7 @@ the DMA API, ordered IoMem writes plus `_relaxed` variants, PL011/
 PL031 registers on IoMem, xHCI quirks as bitflags; releases the
 matching BUGS.md "unsafe not yet wrapped" items.
 
-## 10. D — Dell OptiPlex 3020 bring-up
+## 9. D — Dell OptiPlex 3020 bring-up
 
 In the Dell order: IOAPIC with ACPI _PRT routing, MSI and MSI-X (x86
 LAPIC messages; arm64 GICv3 ITS/GICv2m on QEMU virt), ACPI namespace
@@ -145,7 +137,7 @@ enumeration enough for PNP devices; request_firmware (Linux
 firmware_class paths); xHCI on Lynx Point; AHCI 8c02 through libata
 and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 
-## 11–14. M3, M5, S1, S2
+## 10–13. M3, M5, S1, S2
 
 - M3 aarch64 DT information in its own type, not AcpiInfo; remaining
   "(stub for now)" banners.
@@ -162,7 +154,7 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
   history and speculative comments rewritten to the current state;
   `TODO(unsafe)` lines kept.
 
-## 15. E — eBPF attach points, then a JIT
+## 14. E — eBPF attach points, then a JIT
 
 hk's single BPF engine (`bpf/`: RFC 9669 interpreter over checked
 regions, iterative verifier, Linux's classic converter) runs seccomp

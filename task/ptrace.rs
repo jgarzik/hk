@@ -20,6 +20,7 @@ use crate::task::tasklist::TaskRef;
 use crate::task::{CAP_SYS_PTRACE, Pid, Task, TaskState, capable};
 use crate::uaccess::{UserPtr, copy_to_user};
 use crate::util::error::{KernelError, KernelResult};
+use core::sync::atomic::Ordering;
 
 // =============================================================================
 // Ptrace request codes (from Linux include/uapi/linux/ptrace.h)
@@ -1005,6 +1006,125 @@ pub fn ptrace_do_notify(signr: u32, exit_code: u32, why: Why) -> Option<Signal> 
         crate::task::current_cred().uid,
     );
     ptrace_stop_why(exit_code, why, Some(info)).0
+}
+
+/// A ptrace event (Linux ptrace_event): with its option set
+/// (PTRACE_O_TRACE*, bit `event`), an event stop reported as
+/// `(event << 8) | SIGTRAP`, the message `msg` left for
+/// PTRACE_GETEVENTMSG (Linux ptrace_notify: a signal the tracer leaves
+/// is not delivered); without it, an exec under PTRACE_ATTACH (not
+/// PTRACE_SEIZE) still gets the legacy SIGTRAP
+pub fn ptrace_event(event: u32, msg: u64) {
+    let me = percpu::current();
+    // Untraced: nothing to report, no lock (Linux ptrace_event reads
+    // current->ptrace racily; only the task itself and its tracer
+    // under TASKLIST's write lock change it, and a tracer that attaches
+    // meanwhile sees the task as untraced until then)
+    if me.ptrace() == 0 {
+        return;
+    }
+    let (stop, legacy) = {
+        let mut table = TASKLIST.write();
+        let Some(mut t) = table.view_mut(&me) else {
+            return;
+        };
+        let pt = t.task.ptrace();
+        if pt == 0 {
+            return;
+        }
+        let stop = t.ptrace_options & (1 << event) != 0;
+        if stop {
+            t.ptrace_message = msg;
+        }
+        let legacy = event == PTRACE_EVENT_EXEC && pt & (PT_PTRACED | PT_SEIZED) == PT_PTRACED;
+        (stop, legacy)
+    };
+    if stop {
+        let _ = ptrace_do_notify(SIGTRAP.nr(), (event << 8) | SIGTRAP.nr(), Why::Trapped);
+    } else if legacy {
+        // Linux send_sig(SIGTRAP, current, 0): SEND_SIG_NOINFO, SI_USER
+        let _ = signal::send_sig_info(&me, SIGTRAP, signal::SendInfo::User);
+    }
+}
+
+/// `Task.exec_event`: an exec report is due
+const EXEC_EVENT: u64 = 1 << 63;
+
+/// An exec of the current task, before its other threads end (Linux
+/// exec_binprm reads old_vpid before de_thread): if traced, the report
+/// its success makes, with the thread's id as its tracer numbers it,
+/// for [`exec_event_arm`]; 0 if untraced
+#[must_use]
+pub fn exec_event_begin() -> u64 {
+    let me = percpu::current();
+    if me.ptrace() == 0 {
+        return 0;
+    }
+    let table = TASKLIST.read();
+    let Some(t) = table.view(&me) else {
+        return 0;
+    };
+    if t.task.ptrace() == 0 {
+        return 0;
+    }
+    let msg = match (t.tracer(), t.thread_pid_ref()) {
+        (Some(tr), Some(p)) => p.nr_ns(tr.pid_ns()),
+        _ => 0,
+    };
+    EXEC_EVENT | u64::from(msg)
+}
+
+/// The exec can no longer fail (its new image is about to run): the
+/// report [`exec_event_begin`] made is due on the return to it (Linux
+/// exec_binprm reports only a successful exec)
+pub fn exec_event_arm(ev: u64) {
+    if ev != 0 {
+        percpu::current().exec_event.store(ev, Ordering::Relaxed);
+    }
+}
+
+/// The return to user mode after an exec, its registers in place (the
+/// generic `entry::exit_to_user_mode`, interrupts on): the EXEC event
+/// or the legacy SIGTRAP, then, as execve returns there, the
+/// PTRACE_SYSCALL exit stop (Linux: exec_binprm's ptrace_event, then
+/// syscall_exit_work)
+pub fn exec_event_end() {
+    let me = percpu::current();
+    let ev = me.exec_event.swap(0, Ordering::Relaxed);
+    if ev & EXEC_EVENT == 0 {
+        return;
+    }
+    ptrace_event(PTRACE_EVENT_EXEC, ev & !EXEC_EVENT);
+    if me.has_tif(crate::task::tif::SYSCALL_TRACE) {
+        ptrace_report_syscall(false);
+    }
+}
+
+/// The event `event` is reported (its option set) for the current task
+/// (Linux ptrace_event_enabled)
+pub fn ptrace_event_enabled(event: u32) -> bool {
+    let me = percpu::current();
+    if me.ptrace() == 0 {
+        return false;
+    }
+    let table = TASKLIST.read();
+    table
+        .view(&me)
+        .is_some_and(|t| t.task.ptrace() != 0 && t.ptrace_options & (1 << event) != 0)
+}
+
+/// [`ptrace_event`] whose message is `pid` as the tracer's pid
+/// namespace numbers it, 0 if it cannot (Linux ptrace_event_pid)
+pub fn ptrace_event_pid(event: u32, pid: &crate::task::pid::Pid) {
+    let msg = {
+        let me = percpu::current();
+        let table = TASKLIST.read();
+        table
+            .view(&me)
+            .and_then(|t| t.tracer())
+            .map_or(0, |tr| pid.nr_ns(tr.pid_ns()))
+    };
+    ptrace_event(event, u64::from(msg));
 }
 
 /// The current task is in a ptrace stop, and its tracer inside a

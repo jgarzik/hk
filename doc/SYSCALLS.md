@@ -414,7 +414,7 @@ Extended attributes:
 
 13. Debugging, perf, BPF
 
-- [x] ptrace (subset)
+- [x] ptrace (subset: event stops; no PEEKUSER/REGSET/FPREGS)
 - [x] perf_event_open (stub: EOPNOTSUPP)
 - [x] bpf (HASH/ARRAY maps, SOCKET_FILTER; not attachable)
 - [x] membarrier

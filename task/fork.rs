@@ -140,8 +140,29 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     frame_alloc: &mut FA,
 ) -> KernelResult<Tid> {
     use crate::task::clone_flags::*;
+    use crate::task::ptrace::{self, PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK};
 
-    let (child_task, child_tid) = copy_process(&config, frame_alloc)?;
+    // The event a tracer asked to see for this kind of child, which it
+    // then traces from birth (Linux kernel_clone: a thread's exit
+    // signal is 0, not SIGCHLD, so it is a CLONE)
+    let trace = if config.flags & CLONE_UNTRACED != 0 {
+        0
+    } else {
+        let ev = if config.flags & CLONE_VFORK != 0 {
+            PTRACE_EVENT_VFORK
+        } else if config.exit_signal != crate::signal::ExitSignal::SIGCHLD {
+            PTRACE_EVENT_CLONE
+        } else {
+            PTRACE_EVENT_FORK
+        };
+        if ptrace::ptrace_event_enabled(ev) {
+            ev
+        } else {
+            0
+        }
+    };
+
+    let (child_task, child_tid) = copy_process(&config, trace, frame_alloc)?;
 
     // The child's number as the caller sees it, for the return value
     // and CLONE_PARENT_SETTID, taken before it can run and be reaped
@@ -165,15 +186,37 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             .store((&raw const vfork).cast_mut(), Ordering::Release);
     }
 
+    // Its struct pid for the tracer's events, taken before it can run,
+    // exit and be reaped (Linux kernel_clone: get_task_pid first)
+    let pid = (trace != 0 || config.flags & CLONE_VFORK != 0)
+        .then(|| {
+            TASKLIST
+                .read()
+                .view(&child_task)
+                .and_then(|v| v.thread_pid())
+        })
+        .flatten();
+
     // Only a fully set up child becomes runnable (Linux: wake_up_new_task
     // at the end of kernel_clone)
     wake_up_new_task(&child_task);
 
+    // Forked and running: the tracer hears of it (Linux kernel_clone)
+    if trace != 0
+        && let Some(p) = &pid
+    {
+        ptrace::ptrace_event_pid(trace, p);
+    }
+
     // CLONE_VFORK: parent sleeps until the child exec()s or _exit()s
     // (Linux wait_for_vfork_done; uninterruptible here, so the
-    // completion on this stack outlives the child's use of it)
+    // completion on this stack outlives the child's use of it), then
+    // the tracer hears it is done
     if config.flags & CLONE_VFORK != 0 {
         vfork.wait();
+        if let Some(p) = &pid {
+            ptrace::ptrace_event_pid(ptrace::PTRACE_EVENT_VFORK_DONE, p);
+        }
     }
 
     // The child's pid (a new process's pid is its tid), as the caller
@@ -518,6 +561,7 @@ fn fork_pid(
 /// and its tid.
 fn copy_process<FA: FrameAlloc<PhysAddr = u64>>(
     config: &CloneConfig,
+    trace: u32,
     frame_alloc: &mut FA,
 ) -> KernelResult<(TaskRef, Tid)> {
     use crate::task::clone_flags::*;
@@ -649,19 +693,31 @@ fn copy_process<FA: FrameAlloc<PhysAddr = u64>>(
         // Its handlers and group state, in the section that lists it
         // (Linux copy_process: visible with its sighand and signal)
         crate::signal::install_fork_signal(&mut table, &child_task, child_signal, delay);
-        // CLONE_PTRACE: traced as the caller is now, by its tracer
-        // (Linux ptrace_init_task under tasklist_lock: never a tracer
-        // that has detached its tracees on its way out)
-        if config.flags & (CLONE_PTRACE | CLONE_UNTRACED) == CLONE_PTRACE {
+        // CLONE_PTRACE, or a fork event its tracer asked for: traced as
+        // the caller is now, with its options, by its tracer, and
+        // stopped before it first runs (Linux ptrace_init_task under
+        // tasklist_lock: never a tracer that has detached its tracees on
+        // its way out); syscall tracing and single-stepping are the
+        // caller's own (Linux: thread flags, not inherited)
+        if config.flags & (CLONE_PTRACE | CLONE_UNTRACED) == CLONE_PTRACE || trace != 0 {
+            use crate::task::ptrace::{PT_SEIZED, PT_SINGLESTEP, PT_SYSCALL_TRACE};
             let cur = table
                 .view(&me)
                 .filter(|v| v.task.ptrace() != 0)
-                .and_then(|v| Some((v.task.ptrace(), task_ref(v.tracer()?))));
-            if let Some((pt, tr)) = cur
+                .and_then(|v| Some((v.task.ptrace(), v.ptrace_options, task_ref(v.tracer()?))));
+            let seized = if let Some((pt, opts, tr)) = cur
                 && let Some(mut c) = table.view_mut(&child_task)
             {
+                let pt = pt & !(PT_SYSCALL_TRACE | PT_SINGLESTEP);
                 c.set_ptrace(pt);
+                c.ptrace_options = opts;
                 c.set_tracer(Some(&tr));
+                Some(pt & PT_SEIZED != 0)
+            } else {
+                None
+            };
+            if let Some(seized) = seized {
+                crate::signal::stop::ptrace_init_child(&child_task, seized);
             }
         }
         // A new thread joins a group stop in progress or in effect

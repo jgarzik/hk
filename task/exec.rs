@@ -1029,9 +1029,18 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     path: Vec<u8>,
     argv: ArgStrings,
     envp: ArgStrings,
+    syscall_nr: u64,
     frame_alloc: &mut FA,
 ) -> KernelResult<Infallible> {
-    exec_file(path, kernel_open_exec, false, argv, envp, frame_alloc)
+    exec_file(
+        path,
+        kernel_open_exec,
+        false,
+        argv,
+        envp,
+        syscall_nr,
+        frame_alloc,
+    )
 }
 
 /// do_execve with the file opened by `open` from the name (Linux
@@ -1043,6 +1052,7 @@ fn exec_file<FA, F>(
     path_inaccessible: bool,
     argv: ArgStrings,
     envp: ArgStrings,
+    syscall_nr: u64,
     frame_alloc: &mut FA,
 ) -> KernelResult<Infallible>
 where
@@ -1198,6 +1208,10 @@ where
     // point_of_no_return before de_thread): from here a failure kills
     // the process instead of returning to the old image
 
+    // A tracer's report of the exec, due on the new image's first
+    // return to user mode, names the thread as it was (Linux
+    // exec_binprm: old_vpid before de_thread)
+    let exec_event = crate::task::ptrace::exec_event_begin();
     // The other threads end before the new image starts (Linux
     // begin_new_exec -> de_thread)
     if let Err(e) = de_thread(&percpu::current()) {
@@ -1290,7 +1304,8 @@ where
     drop(path);
 
     // Switch to the new address space and jump to user mode
-    exec_replace_image(mm, entry_point, user_sp, ident, guard);
+    crate::task::ptrace::exec_event_arm(exec_event);
+    exec_replace_image(mm, entry_point, user_sp, ident, guard, syscall_nr);
 }
 
 /// sys_execve - execute a program
@@ -1310,7 +1325,8 @@ pub fn sys_execve(
     let path = crate::fs::namei::getname(pathname, false)?;
     let (argv, envp) = copy_args(&path, argv, envp)?;
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    match do_execve(path, argv, envp, &mut frame_alloc)? {}
+    let nr = percpu::current_pt_regs().syscall_nr();
+    match do_execve(path, argv, envp, nr, &mut frame_alloc)? {}
 }
 
 /// sys_execveat - execute a program relative to a directory file descriptor
@@ -1348,7 +1364,8 @@ pub fn sys_execveat(
             != 0;
     let open = |_: &[u8]| exec_lookup(dirfd, &path, flags).and_then(crate::fs::open_exec);
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    match exec_file(name, open, inaccessible, argv, envp, &mut frame_alloc)? {}
+    let nr = percpu::current_pt_regs().syscall_nr();
+    match exec_file(name, open, inaccessible, argv, envp, nr, &mut frame_alloc)? {}
 }
 
 /// bprm->filename for execveat: the path itself when absolute or from
@@ -1615,12 +1632,15 @@ pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
 /// * `mm` - The new address space (its top-level table is loaded)
 /// * `entry_point` - The entry point address in the new program
 /// * `user_sp` - The initial user stack pointer
+/// * `syscall_nr` - The exec syscall's number, kept in the new frame
+///   (Linux start_thread), u64::MAX for an exec from the kernel
 pub fn exec_replace_image(
     mm: crate::mm::MmRef,
     entry_point: u64,
     user_sp: u64,
     ident: crate::task::exec::ExecIdentity,
     guard: crate::signal::CredGuard,
+    syscall_nr: u64,
 ) -> ! {
     let me = current();
     let new = mm.arc().clone();
@@ -1668,6 +1688,6 @@ pub fn exec_replace_image(
     // Jump to user mode at the new entry point
     // This function never returns
     unsafe {
-        CurrentArch::jump_to_user(entry_point, user_sp, kstack_top);
+        CurrentArch::jump_to_user(entry_point, user_sp, kstack_top, syscall_nr);
     }
 }
