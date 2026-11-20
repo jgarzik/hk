@@ -659,6 +659,6 @@ pub fn schedule(user: Option<&UcountsRef>) {
         SYSTEM_WQ.queue_work(w.clone());
     }
     if user.is_some() && CYCLIC_SCCS.load(Ordering::Acquire) != 0 {
-        SYSTEM_WQ.flush_work(&w);
+        crate::task::workqueue::flush_work(&w);
     }
 }

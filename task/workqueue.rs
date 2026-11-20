@@ -50,10 +50,20 @@
 //! `inner` holding an item's lock.
 //!
 //! `flush_work` (Linux flush_work) links a barrier item behind the
-//! work's last queueing, under `inner` (then the items' locks): right
-//! after it while it is pending, first while it runs, and sleeps on the
-//! barrier's `Completion` with no lock held. A work item records the
-//! workqueue it was last queued on (`Work.wq`, an identity only).
+//! work's last queueing, under that workqueue's `inner` (then the
+//! items' locks): right after it while it is pending (marking it
+//! WORK_LINKED), first on the workqueue running it while it runs (Linux
+//! find_worker_executing_work: the barrier goes first on that worker's
+//! scheduled list), and sleeps on the barrier's `Completion` with no
+//! lock held. A work item records the workqueue it was last queued on
+//! (`Work.wq`, Linux the pwq in work->data) and the one running it
+//! (`Work.run_wq`, Linux the executing worker's pool). An item a worker
+//! takes off its list while it runs elsewhere is marked to run again
+//! there, and the barriers linked behind it move to the front of that
+//! workqueue's list (Linux process_one_work's collision:
+//! move_linked_works to the colliding worker's scheduled list), so a
+//! flush returns only after that run. Moving them takes the other
+//! workqueue's `inner` after this one's is released: never two at once.
 
 extern crate alloc;
 
@@ -81,6 +91,9 @@ pub mod work_flags {
     /// Queued again (on any workqueue) while running: the running
     /// worker runs it once more
     pub const WORK_RERUN: u32 = 1 << 2;
+    /// A flush barrier is linked right after it on its pending list
+    /// (Linux WORK_STRUCT_LINKED): it moves with the item
+    pub const WORK_LINKED: u32 = 1 << 3;
 }
 
 // ============================================================================
@@ -115,13 +128,16 @@ pub type WorkFn = Box<dyn FnMut() + Send + 'static>;
 pub struct Work {
     /// Callback function to execute
     func: Option<WorkFn>,
-    /// WORK_PENDING, WORK_RUNNING
+    /// WORK_PENDING, WORK_RUNNING, WORK_RERUN, WORK_LINKED
     state: u32,
     /// The next item on the pending list it is on (Linux entry)
     next: Option<Item>,
-    /// The workqueue it was last queued on, as an identity (Linux the
-    /// pool_workqueue in work->data), for `flush_work`
-    wq: usize,
+    /// The workqueue it was last queued on (Linux the pool_workqueue in
+    /// work->data), for `flush_work`
+    wq: Option<&'static Workqueue>,
+    /// The workqueue running it, while WORK_RUNNING (Linux the pool
+    /// find_worker_executing_work searches)
+    run_wq: Option<&'static Workqueue>,
 }
 
 impl Work {
@@ -133,7 +149,8 @@ impl Work {
             func: Some(box_nofail(func)),
             state: 0,
             next: None,
-            wq: 0,
+            wq: None,
+            run_wq: None,
         }
     }
 
@@ -160,14 +177,27 @@ impl Work {
     /// already: work is non-reentrant across workqueues (Linux
     /// find_worker_executing_work sends it to the worker running it),
     /// and that worker runs it once more
-    fn begin_run(&mut self) -> Option<WorkFn> {
+    fn begin_run(&mut self, wq: &'static Workqueue) -> Option<WorkFn> {
         self.clear_pending();
-        if self.state & work_flags::WORK_RUNNING != 0 {
+        self.state &= !work_flags::WORK_LINKED;
+        if self.is_running() {
             self.state |= work_flags::WORK_RERUN;
             return None;
         }
         self.state |= work_flags::WORK_RUNNING;
+        self.run_wq = Some(wq);
         self.func.take()
+    }
+
+    fn is_running(&self) -> bool {
+        self.state & work_flags::WORK_RUNNING != 0
+    }
+
+    /// Take the WORK_LINKED mark
+    fn take_linked(&mut self) -> bool {
+        let l = self.state & work_flags::WORK_LINKED != 0;
+        self.state &= !work_flags::WORK_LINKED;
+        l
     }
 
     /// Finish one run started with `begin_run`: true if it was queued
@@ -183,13 +213,14 @@ impl Work {
             self.func = func.take();
         }
         self.state &= !work_flags::WORK_RUNNING;
+        self.run_wq = None;
         false
     }
 
-    /// Run the callback of `work` without holding its lock during the
-    /// call, again for each queueing during it
-    fn run(work: &IrqSpinlock<Work>) {
-        let mut func = work.lock().begin_run();
+    /// Run the callback of `work` on `wq` without holding its lock
+    /// during the call, again for each queueing during it
+    fn run(work: &IrqSpinlock<Work>, wq: &'static Workqueue) {
+        let mut func = work.lock().begin_run(wq);
         if func.is_none() {
             return;
         }
@@ -206,14 +237,14 @@ impl Work {
     /// Run a promoted delayed work item without holding its lock during
     /// the call; nothing if it was re-timed or cancelled after it was
     /// promoted (Linux: try_to_grab_pending stole it off the worklist)
-    fn run_delayed(dw: &IrqSpinlock<DelayedWork>) {
+    fn run_delayed(dw: &IrqSpinlock<DelayedWork>, wq: &'static Workqueue) {
         let mut func = {
             let mut g = dw.lock();
             g.on_pending = false;
             if g.seq != g.queued_seq {
                 return;
             }
-            g.work.begin_run()
+            g.work.begin_run(wq)
         };
         if func.is_none() {
             return;
@@ -318,10 +349,18 @@ impl Item {
         matches!(self, Self::Work(x) if Arc::ptr_eq(x, w))
     }
 
-    fn run(&self) {
+    fn run(&self, wq: &'static Workqueue) {
         match self {
-            Self::Work(w) => Work::run(w),
-            Self::Delayed(d) => Work::run_delayed(d),
+            Self::Work(w) => Work::run(w, wq),
+            Self::Delayed(d) => Work::run_delayed(d, wq),
+        }
+    }
+
+    /// Take the WORK_LINKED mark of a work item
+    fn take_linked(&self) -> bool {
+        match self {
+            Self::Work(w) => w.lock().take_linked(),
+            Self::Delayed(_) => false,
         }
     }
 }
@@ -377,6 +416,19 @@ impl PendList {
             cur = c.peek_next();
         }
         false
+    }
+
+    /// Put the items of `other` first, in their order (Linux
+    /// move_linked_works to a worker's scheduled list)
+    fn prepend(&mut self, mut other: PendList) {
+        let Some(t) = other.tail.take() else {
+            return;
+        };
+        t.set_next(self.head.take());
+        if self.tail.is_none() {
+            self.tail = Some(t);
+        }
+        self.head = other.head.take();
     }
 
     fn pop(&mut self) -> Option<Item> {
@@ -489,14 +541,14 @@ impl Workqueue {
     /// Queue work for immediate execution
     ///
     /// Returns true if the work was queued, false if it was already pending.
-    pub fn queue_work(&self, work: Arc<IrqSpinlock<Work>>) -> bool {
+    pub fn queue_work(&'static self, work: Arc<IrqSpinlock<Work>>) -> bool {
         // Try to mark as pending
         {
             let mut w = work.lock();
             if !w.try_set_pending() {
                 return false; // Already pending
             }
-            w.wq = self.id();
+            w.wq = Some(self);
         }
 
         // Add to pending queue
@@ -627,79 +679,96 @@ impl Workqueue {
         next
     }
 
-    /// Identity of this workqueue (for `Work.wq`)
-    fn id(&self) -> usize {
-        core::ptr::from_ref::<Self>(self) as usize
-    }
-
-    /// Wait for the last queueing of `work` on this workqueue to finish
-    /// running (Linux flush_work): a barrier item is linked right after
-    /// it while it is pending, or first while it runs (or was just
-    /// taken to run), and the caller sleeps until the barrier ran
-    /// (Linux insert_wq_barrier + wait_for_completion). False, at once,
-    /// if it is idle or was last queued elsewhere. Sleeps; no lock
-    /// held. Without a worker the caller runs items up to the barrier.
-    pub fn flush_work(&self, work: &Arc<IrqSpinlock<Work>>) -> bool {
-        crate::sync::might_sleep();
-        // Like Linux's on-stack barrier, it cannot fail to be made
-        let done = arc_nofail(Completion::new());
-        let d = done.clone();
-        let barrier = arc_nofail(IrqSpinlock::new(Work::new(move || d.complete_all())));
-        if !self.insert_barrier(work, &barrier) {
-            return false;
-        }
-        self.wait.wake_one();
-        if self.is_initialized() {
-            done.wait();
-        } else {
-            while !done.is_done() && self.process_one() {}
-        }
-        true
-    }
-
-    /// Link `barrier` behind `work`'s last queueing here (Linux
-    /// start_flush_work's insert_wq_barrier); false if there is none
+    /// Link `barrier` behind the queueing of `work` on this workqueue
+    /// (Linux start_flush_work's insert_wq_barrier): right after it
+    /// while it is listed here, first while it is about to run or runs
+    /// here. False if it is neither pending here nor running here.
     fn insert_barrier(
         &self,
         work: &Arc<IrqSpinlock<Work>>,
         barrier: &Arc<IrqSpinlock<Work>>,
     ) -> bool {
+        let mine = |q: Option<&'static Workqueue>| q.is_some_and(|q| core::ptr::eq(q, self));
         let mut inner = self.inner.lock();
-        let (pending, running) = {
+        let (pending, linked) = {
             let w = work.lock();
-            if w.wq != self.id() {
+            if w.is_pending() && mine(w.wq) {
+                (true, w.state & work_flags::WORK_LINKED != 0)
+            } else if !w.is_pending() && w.is_running() && mine(w.run_wq) {
+                (false, false)
+            } else {
                 return false;
             }
-            (w.is_pending(), w.state & work_flags::WORK_RUNNING != 0)
         };
         barrier.lock().try_set_pending();
         let b = Item::Work(barrier.clone());
-        // Pending but not listed: the worker took it and is about to
-        // run it, so the barrier goes first, as for a running one
-        if !(pending && inner.pending.insert_after(work, b.clone())) {
-            if !pending && !running {
-                barrier.lock().clear_pending();
-                return false;
+        if pending && inner.pending.insert_after(work, b.clone()) {
+            // Linux insert_wq_barrier: the barrier inherits the link
+            if linked {
+                barrier.lock().state |= work_flags::WORK_LINKED;
             }
+            work.lock().state |= work_flags::WORK_LINKED;
+        } else {
+            // Running, or pending but not listed: the worker took it and
+            // is about to run it, so the barrier goes first
             inner.pending.push_front(b);
         }
         inner.has_work = true;
         true
     }
 
-    /// Run the first pending item, if any (a caller without a worker)
-    fn process_one(&self) -> bool {
-        let it = {
-            let mut inner = self.inner.lock();
-            let it = inner.pending.pop();
-            if inner.pending.head.is_none() {
-                inner.has_work = false;
+    /// Take the first item to run, if any. One that runs on another
+    /// workqueue (queued here while it ran there) is marked to run
+    /// again there, and the barriers linked behind it go first on that
+    /// workqueue (Linux process_one_work's collision with
+    /// find_worker_executing_work: move_linked_works to that worker's
+    /// scheduled list); it is not run here.
+    fn take(&'static self) -> Option<Item> {
+        loop {
+            let (it, to, chain) = {
+                let mut inner = self.inner.lock();
+                let it = inner.pending.pop();
+                if inner.pending.head.is_none() {
+                    inner.has_work = false;
+                }
+                let it = it?;
+                let Some(to) = self.collide(&it) else {
+                    return Some(it);
+                };
+                let chain = take_linked(&mut inner, &it);
+                (it, to, chain)
+            };
+            {
+                let mut inner = to.inner.lock();
+                inner.pending.prepend(chain);
+                inner.has_work = true;
             }
-            it
+            to.wait.wake_one();
+            // This list's reference, dropped with no lock held
+            drop(it);
+        }
+    }
+
+    /// Under `inner`: if work item `it` runs on another workqueue, mark
+    /// it to run again there and return that workqueue
+    fn collide(&'static self, it: &Item) -> Option<&'static Workqueue> {
+        let Item::Work(w) = it else {
+            return None;
         };
-        match it {
+        let mut g = w.lock();
+        let to = g
+            .run_wq
+            .filter(|q| g.is_running() && !core::ptr::eq(*q, self))?;
+        g.clear_pending();
+        g.state |= work_flags::WORK_RERUN;
+        Some(to)
+    }
+
+    /// Run the first pending item, if any (a caller without a worker)
+    fn process_one(&'static self) -> bool {
+        match self.take() {
             Some(it) => {
-                it.run();
+                it.run(self);
                 true
             }
             None => false,
@@ -709,25 +778,10 @@ impl Workqueue {
     /// Process pending work items (called by worker thread)
     ///
     /// Returns the number of work items processed.
-    fn process_pending(&self) -> usize {
+    fn process_pending(&'static self) -> usize {
         let mut processed = 0;
-        loop {
-            // Pop one work item
-            let it = {
-                let mut inner = self.inner.lock();
-                let it = inner.pending.pop();
-                if it.is_none() {
-                    inner.has_work = false;
-                }
-                it
-            };
-            match it {
-                Some(it) => {
-                    it.run();
-                    processed += 1;
-                }
-                None => break,
-            }
+        while self.process_one() {
+            processed += 1;
         }
         processed
     }
@@ -815,6 +869,69 @@ fn worker_thread_fn(arg: usize) {
     }
 }
 
+/// Under a workqueue's `inner`: the barriers linked behind `it` (just
+/// taken off its list), off the list in their order
+fn take_linked(inner: &mut WorkqueueInner, it: &Item) -> PendList {
+    let mut chain = PendList::new();
+    let mut linked = it.take_linked();
+    while linked {
+        let Some(b) = inner.pending.pop() else {
+            break;
+        };
+        linked = b.take_linked();
+        chain.push(b);
+    }
+    if inner.pending.head.is_none() {
+        inner.has_work = false;
+    }
+    chain
+}
+
+/// Start flushing `work` (Linux start_flush_work): a barrier linked
+/// behind its last queueing, or first on the workqueue running it;
+/// that workqueue and the barrier's completion, or None if it is idle
+fn start_flush(work: &Arc<IrqSpinlock<Work>>) -> Option<(&'static Workqueue, Arc<Completion>)> {
+    // Like Linux's on-stack barrier, it cannot fail to be made
+    let done = arc_nofail(Completion::new());
+    let d = done.clone();
+    let barrier = arc_nofail(IrqSpinlock::new(Work::new(move || d.complete_all())));
+    loop {
+        // Where it is (Linux get_work_pool), checked again under that
+        // workqueue's lock: it may have moved meanwhile
+        let wq = {
+            let w = work.lock();
+            if w.is_pending() {
+                w.wq
+            } else if w.is_running() {
+                w.run_wq
+            } else {
+                None
+            }
+        }?;
+        if wq.insert_barrier(work, &barrier) {
+            wq.wait.wake_one();
+            return Some((wq, done));
+        }
+    }
+}
+
+/// Wait for the last queueing of `work` to finish running, wherever it
+/// runs (Linux flush_work): true if it had to wait, false at once if
+/// it was idle. Sleeps; no lock held. Without a worker the caller runs
+/// that workqueue's items up to the barrier.
+pub fn flush_work(work: &Arc<IrqSpinlock<Work>>) -> bool {
+    crate::sync::might_sleep();
+    let Some((wq, done)) = start_flush(work) else {
+        return false;
+    };
+    if wq.is_initialized() {
+        done.wait();
+    } else {
+        while !done.is_done() && wq.process_one() {}
+    }
+    true
+}
+
 /// Initialize the workqueue subsystem: start the system workqueue's worker
 ///
 /// Call after the schedulers are up (main.rs, before user space).
@@ -832,7 +949,7 @@ pub fn init() {
 ///
 /// Waits for all currently pending work items to complete (runs them
 /// synchronously in the caller if the queue has no worker).
-pub fn flush_workqueue(wq: &Workqueue) {
+pub fn flush_workqueue(wq: &'static Workqueue) {
     while wq.has_pending() {
         wq.process_pending();
     }
@@ -874,14 +991,17 @@ mod tests {
             Arc::new(IrqSpinlock::new(Work::new(|| {
                 if RUNS.fetch_add(1, Ordering::Relaxed) == 0 {
                     // Queued again, elsewhere, while running: that
-                    // queue's worker finds it running
+                    // queue's worker finds it running and hands it back
+                    // (runs nothing)
                     let me = ME.get().unwrap().clone();
                     assert!(OTHER.queue_work(me));
-                    assert_eq!(OTHER.process_pending(), 1);
+                    assert_eq!(OTHER.process_pending(), 0);
+                    assert!(!OTHER.has_pending());
                 }
             })))
         });
-        let wq = Workqueue::new("test2", 0);
+        static WQ: Workqueue = Workqueue::new("test2", 0);
+        let wq = &WQ;
         assert!(wq.queue_work(w.clone()));
         wq.process_pending();
         assert_eq!(RUNS.load(Ordering::Relaxed), 2);
@@ -899,32 +1019,82 @@ mod tests {
         use core::sync::atomic::AtomicU32;
         static A: AtomicU32 = AtomicU32::new(0);
         static B: AtomicU32 = AtomicU32::new(0);
-        let wq = Workqueue::new("flush", 0);
+        static WQ: Workqueue = Workqueue::new("flush", 0);
+        let wq = &WQ;
         let a = Arc::new(IrqSpinlock::new(Work::new(|| {
             A.fetch_add(1, Ordering::Relaxed);
         })));
         let b = Arc::new(IrqSpinlock::new(Work::new(|| {
             B.fetch_add(1, Ordering::Relaxed);
         })));
-        assert!(!wq.flush_work(&a));
+        assert!(!flush_work(&a));
         assert!(wq.queue_work(a.clone()));
         assert!(wq.queue_work(b.clone()));
-        assert!(wq.flush_work(&a));
+        assert!(flush_work(&a));
         assert_eq!(A.load(Ordering::Relaxed), 1);
         assert_eq!(B.load(Ordering::Relaxed), 0);
         assert!(b.lock().is_pending());
         // b was queued here: flushing it runs it
-        assert!(wq.flush_work(&b));
+        assert!(flush_work(&b));
         assert_eq!(B.load(Ordering::Relaxed), 1);
         assert!(!wq.has_pending());
-        assert!(!wq.flush_work(&a));
-        // Last queued on another workqueue: not flushed here
-        let other = Workqueue::new("flush2", 0);
-        assert!(other.queue_work(a.clone()));
-        assert!(!wq.flush_work(&a));
-        other.process_pending();
+        assert!(!flush_work(&a));
+        // Last queued on another workqueue: flushed there
+        static OTHER: Workqueue = Workqueue::new("flush2", 0);
+        assert!(OTHER.queue_work(a.clone()));
+        assert!(flush_work(&a));
         assert_eq!(A.load(Ordering::Relaxed), 2);
+        assert!(!OTHER.has_pending());
         assert_eq!(Arc::strong_count(&a), 1);
+    }
+
+    /// Queued on another workqueue while it runs, then flushed: the
+    /// flush returns only after the run the running workqueue makes for
+    /// that queueing, whether the barrier was linked behind it before
+    /// the other workqueue took it (it moves along, Linux
+    /// move_linked_works) or after (it goes on the running one, Linux
+    /// find_worker_executing_work)
+    #[test]
+    fn flush_rerun_elsewhere() {
+        use core::sync::atomic::AtomicU32;
+        static RUNS: AtomicU32 = AtomicU32::new(0);
+        static RUNQ: Workqueue = Workqueue::new("run", 0);
+        static OTHER: Workqueue = Workqueue::new("other3", 0);
+        static ME: spin::Once<Arc<IrqSpinlock<Work>>> = spin::Once::new();
+        static DONE: Mutex<Vec<Arc<Completion>>> = Mutex::new(Vec::new());
+        let w = ME.call_once(|| {
+            Arc::new(IrqSpinlock::new(Work::new(|| {
+                if RUNS.fetch_add(1, Ordering::Relaxed) != 0 {
+                    return;
+                }
+                let me = ME.get().unwrap();
+                // Linked behind the queueing on OTHER, which then finds
+                // the item running here
+                assert!(OTHER.queue_work(me.clone()));
+                let (q, linked) = start_flush(me).unwrap();
+                assert!(core::ptr::eq(q, &OTHER));
+                OTHER.process_pending();
+                assert!(!linked.is_done());
+                assert!(!OTHER.has_pending());
+                // Flushed after: the barrier goes on this workqueue
+                let (q, after) = start_flush(me).unwrap();
+                assert!(core::ptr::eq(q, &RUNQ));
+                OTHER.process_pending();
+                assert!(!after.is_done());
+                DONE.lock().extend([linked, after]);
+            })))
+        });
+        assert!(RUNQ.queue_work(w.clone()));
+        RUNQ.process_one();
+        // The run again for OTHER's queueing came first, then both
+        // barriers
+        assert_eq!(RUNS.load(Ordering::Relaxed), 2);
+        let done = core::mem::take(&mut *DONE.lock());
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|d| !d.is_done()));
+        RUNQ.process_pending();
+        assert!(done.iter().all(|d| d.is_done()));
+        assert!(!flush_work(w));
     }
 
     /// The intrusive lists in one test (they share LOG): FIFO order, no
@@ -932,7 +1102,8 @@ mod tests {
     /// items promoted, re-timed and cancelled
     #[test]
     fn intrusive_lists() {
-        let wq = Workqueue::new("test", 0);
+        static WQ: Workqueue = Workqueue::new("test", 0);
+        let wq = &WQ;
         let (a, b, c) = (work(1), work(2), work(3));
         assert!(wq.queue_work(a.clone()));
         assert!(wq.queue_work(b.clone()));
