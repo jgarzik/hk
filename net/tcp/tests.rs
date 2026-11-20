@@ -710,6 +710,21 @@ fn shrunk_window_reopen_resends_rest() {
     assert_eq!(out.err, None);
 }
 
+/// A control block made over a socket's lockless fields (a reconnect)
+/// starts with no timeouts counted (Linux tcp_disconnect clears
+/// icsk_retransmits with icsk_backoff and icsk_probes_out)
+#[test]
+fn new_control_block_clears_timeout_counts() {
+    let live: alloc::sync::Arc<super::cb::Live> = Default::default();
+    live.retransmits.set(7);
+    live.backoff.set(7);
+    live.probes.set(7);
+    let cb = TcpCb::new(cfg(), live);
+    assert_eq!(cb.live.retransmits.get(), 0);
+    assert_eq!(cb.live.backoff.get(), 0);
+    assert_eq!(cb.live.probes.get(), 0);
+}
+
 #[test]
 fn window_edge_never_moves_left() {
     let mut p = Pair::with_cap(1000, 8000);

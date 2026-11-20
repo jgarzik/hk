@@ -452,6 +452,7 @@ impl Live {
         self.keep_at.set(None);
         self.rto.set(RTO_INIT);
         self.backoff.set(0);
+        self.retransmits.set(0);
         self.probes.set(0);
         self.mss.set(MSS_DEFAULT);
         self.quick.set(0);
