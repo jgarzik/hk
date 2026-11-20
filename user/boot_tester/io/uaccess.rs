@@ -5,6 +5,9 @@
 //! semantics) instead of faulting in the kernel. The address comes from an
 //! mmap'd-then-munmap'd page so it is unmapped on both hk and Linux.
 //!
+//! READV_EMPTY_KERNEL_SEG_EFAULT: an empty segment based in the kernel
+//! half fails the vector too (every segment is checked).
+//!
 //! UACCESS_UNALIGNED: an int read and written through a misaligned user
 //! pointer (getsockopt's optlen, FIONREAD's result) works, as Linux's
 //! get_user/put_user on x86-64 and arm64.
@@ -31,6 +34,7 @@ pub fn run_tests() {
     test_readv_bad_base(bad);
     test_writev_bad_base(bad);
     test_readv_bad_iov_array(bad);
+    test_readv_empty_kernel_seg();
     test_vmsplice_bad_base(bad);
     test_mincore_bad_vec();
     test_unaligned();
@@ -216,6 +220,31 @@ fn test_readv_bad_iov_array(bad: u64) {
     let r = sys_readv(fds[0] as u64, bad as *const IoVec, 1);
     close_pipe(fds);
     report(b"READV_BAD_IOV_ARRAY_EFAULT", r);
+}
+
+/// readv whose second segment is empty but based in the kernel half:
+/// every segment of a vector is checked, empty ones too (Linux
+/// __import_iovec: access_ok(iov_base, len) per segment)
+fn test_readv_empty_kernel_seg() {
+    let Some(fds) = pipe() else {
+        println(b"READV_EMPTY_KERNEL_SEG_EFAULT:FAIL pipe");
+        return;
+    };
+    sys_write(fds[1] as u64, b"data".as_ptr(), 4);
+    let mut buf = [0u8; 4];
+    let iov = [
+        IoVec {
+            iov_base: buf.as_mut_ptr(),
+            iov_len: 4,
+        },
+        IoVec {
+            iov_base: 0xffff_8000_0000_0000u64 as *const u8,
+            iov_len: 0,
+        },
+    ];
+    let r = sys_readv(fds[0] as u64, iov.as_ptr(), 2);
+    close_pipe(fds);
+    report(b"READV_EMPTY_KERNEL_SEG_EFAULT", r);
 }
 
 /// vmsplice from an unmapped iov_base into a pipe

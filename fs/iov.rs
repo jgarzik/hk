@@ -78,7 +78,8 @@ pub fn import_iovec(uvec: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<Vec<IoVec
         if single {
             len = len.min(MAX_RW_COUNT);
         }
-        if len != 0 && !access_ok(v.iov_base, len) {
+        // Every segment, an empty one too (Linux access_ok(base, 0))
+        if !access_ok(v.iov_base, len) {
             return Err(KernelError::BadAddress);
         }
         len = len.min(MAX_RW_COUNT - total);
