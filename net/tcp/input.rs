@@ -84,8 +84,9 @@ impl TcpCb {
         }
         let prior_snd_una = self.snd_una;
         self.snd_una = s.ack;
-        // Linux tcp_clean_rtx_queue acknowledges the SYN (FLAG_SYN_ACKED
-        // clears retrans_stamp)
+        // Linux tcp_clean_rtx_queue acknowledges the SYN, a packet
+        // delivered (FLAG_SYN_ACKED clears retrans_stamp)
+        self.count_delivered(1);
         self.net_stat(LINUX_MIB_TCPDELIVERED);
         self.syn_unacked = false;
         self.rtx_stamp = None;
@@ -332,6 +333,8 @@ impl TcpCb {
             self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
             self.snd_una = s.ack;
             self.syn_unacked = false;
+            // SYN-ACK delivery, which tcp_ack does not track
+            self.count_delivered(1);
             self.established(s, now, out);
             // Linux tcp_rcv_state_process scales the completing
             // segment's window, a SYN-ACK's too

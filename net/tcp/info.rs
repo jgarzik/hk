@@ -5,8 +5,8 @@
 //! bytes, the current Linux size; getsockopt truncates to the caller's
 //! length like Linux). Fields hk has no counterpart for (pacing,
 //! delivery rate, ECN) are 0, or ~0 for the pacing rates as Linux
-//! reports without pacing. cwnd and ssthresh, which hk keeps in bytes,
-//! are bytes / MSS.
+//! reports without pacing. cwnd, ssthresh and delivered are packets,
+//! as Linux keeps them.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -51,11 +51,6 @@ pub fn retrans_to_secs(retrans: u8) -> u32 {
         period += timeout;
     }
     period
-}
-
-/// Packets for `bytes` of segments of `mss`
-fn pkts(bytes: u32, mss: u32) -> u32 {
-    bytes.div_ceil(mss.max(1))
 }
 
 /// Little helper writing native-endian fields in order
@@ -143,7 +138,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     for _ in 0..3 {
         b.u64(0); // busy_time, rwnd_limited, sndbuf_limited
     }
-    b.u32(pkts(st.bytes_acked.min(u64::from(u32::MAX)) as u32, mss)); // delivered
+    b.u32(cb.delivered);
     b.u32(0); // delivered_ce
     b.u64(st.bytes_sent);
     b.u64(st.bytes_retrans);
@@ -381,5 +376,15 @@ mod tests {
         let b = tcp_info(&cb, 0);
         assert_eq!(b.len(), INFO_LEN);
         assert_eq!(b[0], TcpState::Closed.linux());
+    }
+
+    /// tcpi_delivered is tp->delivered, a packet count (offset 192)
+    #[test]
+    fn info_delivered_packets() {
+        let mut cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
+        cb.delivered = 7;
+        cb.stats.bytes_acked = 100_000;
+        let b = tcp_info(&cb, 0);
+        assert_eq!(u32::from_ne_bytes(b[192..196].try_into().unwrap()), 7);
     }
 }

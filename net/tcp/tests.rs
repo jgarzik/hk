@@ -3215,3 +3215,17 @@ fn retransmission_is_data_sent() {
     assert!(p.a.stats.total_retrans > 0 || p.a.tlp_high_seq.is_some());
     assert_eq!(p.a.lsndtime, p.now);
 }
+
+/// The handshake delivers one packet each way (Linux: the SYN acked
+/// in tcp_clean_rtx_queue, the SYN-ACK in tcp_rcv_state_process
+/// SYN_RECV), then every data packet acked counts (tp->delivered, as
+/// tcpi_delivered reports it)
+#[test]
+fn delivered_counts_packets() {
+    let mut p = Pair::new(1000);
+    assert_eq!((p.a.delivered, p.b.delivered), (1, 1));
+    let mss = p.a.live.mss.get() as usize;
+    let data = pattern(3 * mss);
+    assert_eq!(transfer(&mut p, &data, 100), data);
+    assert_eq!(p.a.delivered, 4);
+}
