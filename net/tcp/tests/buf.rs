@@ -378,3 +378,21 @@ fn challenge_ack_budget() {
     // A new second, a new budget
     assert!(challenges(&net, 8, 7000) >= 1);
 }
+
+/// Linux inet_twsk_alloc's tcp_max_tw_buckets: refused once as many
+/// entries are scheduled; a negative limit compares as a huge one
+#[test]
+fn tw_buckets_limit() {
+    let net = crate::net::tcp::netns::TcpNet::default();
+    net.set_max_tw_buckets(2).unwrap();
+    assert!(!net.tw_full());
+    net.tw_add();
+    net.tw_add();
+    assert!(net.tw_full());
+    net.tw_sub();
+    assert!(!net.tw_full());
+    net.set_max_tw_buckets(0).unwrap();
+    assert!(net.tw_full());
+    net.set_max_tw_buckets(-1).unwrap();
+    assert!(!net.tw_full());
+}

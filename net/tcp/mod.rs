@@ -620,8 +620,13 @@ impl TcpSock {
         bind.addr = self.inet.get().rcv_saddr;
         bind.tw = true;
         bind.listen = false;
-        // GFP_ATOMIC under the socket lock (Linux inet_twsk_alloc)
+        // GFP_ATOMIC under the socket lock (Linux inet_twsk_alloc: none
+        // past tcp_max_tw_buckets)
+        let full = self.sk.net.tcp_net.tw_full();
         let tw = with_gfp(Gfp::ATOMIC, || {
+            if full {
+                return Err(KernelError::NoBufferSpace);
+            }
             TimeWait::new(
                 Arc::clone(self.sk.net.passive()),
                 t,
@@ -638,8 +643,9 @@ impl TcpSock {
             Ok((tw, eh))
         });
         let Ok((tw, tw_eh)) = tw else {
-            // Out of memory: close without TIME_WAIT (Linux tcp_time_wait
-            // falls back to tcp_done); `post` leaves the tables
+            // Too many or out of memory: close without TIME_WAIT (Linux
+            // tcp_time_wait falls back to tcp_done); `post` leaves the
+            // tables
             self.sk.net.mib.net.inc(LINUX_MIB_TCPTIMEWAITOVERFLOW);
             g.tuple = Some(t);
             g.cb.tw_done(out);

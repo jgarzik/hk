@@ -615,6 +615,14 @@ pub static CTLS: &[NetCtl] = &[
         text: None,
     },
     NetCtl {
+        path: "net/ipv4/tcp_max_tw_buckets",
+        mode: 0o644,
+        global: false,
+        show: |n| vec![i64::from(n.tcp_net.max_tw_buckets())],
+        store: |n, v| n.tcp_net.set_max_tw_buckets(v[0]),
+        text: None,
+    },
+    NetCtl {
         path: "net/ipv4/tcp_challenge_ack_limit",
         mode: 0o644,
         global: false,

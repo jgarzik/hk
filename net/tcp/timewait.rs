@@ -237,6 +237,9 @@ pub struct TimeWait {
     /// is never armed again (Linux timer_shutdown in
     /// inet_twsk_deschedule_put); set under `inner`
     killed: AtomicBool,
+    /// Counted in its namespace's TIME_WAIT entries (`start`, until
+    /// `unhash`)
+    started: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
     rcu_puts: RcuPuts,
     me: Weak<TimeWait>,
@@ -267,6 +270,7 @@ impl TimeWait {
             bind_link: Link::new(),
             by_bind,
             killed: AtomicBool::new(false),
+            started: AtomicBool::new(false),
             rcu_puts: RcuPuts::new(),
             me: me.clone(),
         })
@@ -277,9 +281,13 @@ impl TimeWait {
         *self.eh.lock() = Some(eh);
     }
 
-    /// Leave the tables (once: the entry is taken)
+    /// Leave the tables (once: the entry is taken), no longer counted
+    /// (Linux inet_twsk_kill)
     fn unhash(self: &Arc<Self>) {
         let eh = self.eh.lock().take();
+        if eh.is_some() && self.started.swap(false, Ordering::Relaxed) {
+            self.net.tcp_net.tw_sub();
+        }
         self.net.tcp.tw_unhash(self, eh);
     }
 
@@ -293,8 +301,11 @@ impl TimeWait {
         self.inner.lock().0.expires().saturating_sub(now)
     }
 
-    /// Arm the 2MSL timer
+    /// Arm the 2MSL timer; counted in its namespace until it ends
+    /// (Linux __inet_twsk_schedule)
     pub fn start(&self) {
+        self.started.store(true, Ordering::Relaxed);
+        self.net.tcp_net.tw_add();
         let mut g = self.inner.lock();
         self.sync(&mut g, false);
     }

@@ -19,6 +19,9 @@
 //!   (tcp_out_of_resources, TCPAbortOnMemory).
 //! - TCP_CHALLENGE_ACK_LIMIT: net.ipv4.tcp_challenge_ack_limit is
 //!   INT_MAX (no global budget, Linux 6.0 on) and per namespace.
+//! - TCP_MAX_TW_BUCKETS: net.ipv4.tcp_max_tw_buckets is positive and
+//!   per namespace; at 0 a connection closing first skips TIME_WAIT
+//!   (inet_twsk_alloc refuses, TCPTimeWaitOverflow).
 
 use hk_syscall::{sys_exit, sys_fork, sys_getsockopt};
 
@@ -40,6 +43,7 @@ pub fn run_tests() {
     test_sndbuf();
     test_max_orphans();
     test_challenge_limit();
+    test_max_tw();
 }
 
 /// A connected pair over lo: (client, server, listener)
@@ -286,5 +290,53 @@ fn test_challenge_limit() {
     }
     t.eq(b"netns", wait_child(child) as i64, 0);
     t.eq(b"init unchanged", sysctl_ints(CHALLENGE)[0], 2147483647);
+    t.done();
+}
+
+const MAX_TW: &[u8] = b"/proc/sys/net/ipv4/tcp_max_tw_buckets\0";
+
+/// In a new namespace with tcp_max_tw_buckets 0: an active close's
+/// TIME_WAIT is refused (exit status 0 if so)
+fn tw_refused() -> u64 {
+    crate::helpers::loopback_up();
+    if write_file(MAX_TW, b"0\n") < 0 {
+        return 1;
+    }
+    let ovf = || {
+        Mib::read(b"/proc/net/netstat\0").map_or(-1, |m| m.val(b"TcpExt", b"TCPTimeWaitOverflow"))
+    };
+    let before = ovf();
+    let (l, p) = listener(4);
+    let c = tcp();
+    if connect(c, LO, p) != 0 {
+        return 2;
+    }
+    let s = accept(l);
+    close(c);
+    crate::helpers::msleep(50);
+    close(s);
+    for _ in 0..100 {
+        if ovf() > before {
+            close(l);
+            return 0;
+        }
+        crate::helpers::msleep(20);
+    }
+    3
+}
+
+fn test_max_tw() {
+    let mut t = T::new(b"TCP_MAX_TW_BUCKETS");
+    let max = sysctl_ints(MAX_TW)[0];
+    t.ok(b"default", max > 0, max);
+    let child = sys_fork();
+    if child == 0 {
+        if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+            sys_exit(9);
+        }
+        sys_exit(tw_refused());
+    }
+    t.eq(b"refused", wait_child(child) as i64, 0);
+    t.eq(b"init unchanged", sysctl_ints(MAX_TW)[0], max);
     t.done();
 }
