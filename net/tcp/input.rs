@@ -92,6 +92,11 @@ impl TcpCb {
         self.net_stat(LINUX_MIB_TCPDELIVERED);
         self.syn_unacked = false;
         self.rtx_stamp = None;
+        if self.packets_out != 0 {
+            // The SYN's data, acknowledged with it or not
+            let mut st = SackState::default();
+            self.clean_rtx_queue(prior_snd_una, prior_snd_una, &mut st);
+        }
         // Linux tcp_ack of the SYN-ACK: a timed-out SYN left CA_Loss
         // (tcp_fastretrans_alert), before tcp_finish_connect
         let mut flg = flag::SND_UNA_ADVANCED | flag::SYN_ACKED;
@@ -107,6 +112,17 @@ impl TcpCb {
         } else {
             self.pred_flags = 0;
         }
+        if self.syn_fastopen || self.syn_data {
+            if self.rcv_fastopen_synack(s, skb, out) {
+                // The SYN's data went unacknowledged: resent at once
+                self.output(now, out);
+                return;
+            }
+        } else {
+            // Linux: the SYN-ACK's data is dropped (only Fast Open
+            // takes it); the ACK covers the SYN alone
+            drop(skb);
+        }
         if self.opts.defer_accept != 0 || self.live.pingpong.get() {
             // Linux: "Save one ACK" for the data expected soon: the
             // ACK owed, quickack mode, the delayed ACK timer at
@@ -116,11 +132,75 @@ impl TcpCb {
             self.dack.at = Some(now + super::ack::DELACK_MAX);
             return;
         }
-        // Linux: the SYN-ACK's data is dropped (only Fast Open takes it,
-        // tcp_rcv_fastopen_synack); the ACK covers the SYN alone
-        drop(skb);
         self.ack_now = true;
         self.output(now, out);
+    }
+
+    /// Linux tcp_rcv_fastopen_synack: teach the cookie cache what the
+    /// SYN-ACK says (its MSS, its cookie; a lost SYN; another option
+    /// format to try); data in the SYN it did not acknowledge is marked
+    /// lost and resent (TCPFastOpenActiveFail, true); else acknowledged
+    /// data counts TCPFastOpenActive and the SYN-ACK's own data is
+    /// queued (tcp_fastopen_add_skb)
+    fn rcv_fastopen_synack(&mut self, s: &SegIn, mut skb: Box<SkBuff>, out: &mut Out) -> bool {
+        let data = self.syn_data.then(|| self.rtx_head()).flatten();
+        let mss = s.mss.unwrap_or(0);
+        let mut cookie = s.foc.filter(|c| c.len > 0);
+        let (mut syn_lost, mut try_exp) = (false, 0);
+        if !self.syn_fastopen {
+            // Ignore an unsolicited cookie
+            cookie = None;
+        } else if self.stats.total_retrans != 0 {
+            syn_lost = cookie.is_none() && data.is_some();
+        } else if cookie.is_none() && !self.syn_data {
+            try_exp = if self.syn_fastopen_exp { 2 } else { 1 };
+        }
+        out.fo_cache = Some(super::cb::FoCache {
+            mss,
+            cookie,
+            syn_lost,
+            try_exp,
+        });
+        if let Some(head) = data {
+            let seqs: alloc::vec::Vec<u32> = self
+                .rtx
+                .iter()
+                .map(|x| x.tcp().seq)
+                .filter(|&q| !before(q, head))
+                .collect();
+            for q in seqs {
+                self.mark_skb_lost(q);
+            }
+            self.xmit_retransmit_queue(out);
+            self.net_stat(LINUX_MIB_TCPFASTOPENACTIVEFAIL);
+            return true;
+        }
+        self.syn_data_acked = self.syn_data;
+        if self.syn_data_acked {
+            self.net_stat(LINUX_MIB_TCPFASTOPENACTIVE);
+            // SYN-data is counted as two packets in tcp_ack
+            if self.delivered > 1 {
+                self.delivered -= 1;
+            }
+        }
+        let len = skb.len();
+        if len != 0 {
+            skb.dev = None;
+            let c = skb.tcp_mut();
+            c.seq = self.rcv_nxt;
+            c.end_seq = self.rcv_nxt.wrapping_add(len as u32);
+            c.flags &= !flags::SYN;
+            // sk_forced_mem_schedule, skb_set_owner_r
+            let ts = skb.truesize();
+            self.mem_force(ts);
+            self.rcvq_truesize += ts;
+            self.stats.bytes_received = len as u64;
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(len as u32);
+            self.rcv_bytes += len;
+            self.rcvq.push_back(skb);
+            out.wake |= wake::DATA;
+        }
+        false
     }
 
     /// A SYN-ACK's echo must lie between our SYN's TSval and now (Linux
@@ -421,6 +501,14 @@ impl TcpCb {
         }
         if s.has(flags::RST) {
             if s.seq != self.rcv_nxt {
+                // Linux tcp_validate_incoming: an out-of-order RST before
+                // any data on an active Fast Open connection
+                if self.syn_fastopen
+                    && self.stats.data_segs_in == 0
+                    && self.state == TcpState::Established
+                {
+                    out.tfo_disable = true;
+                }
                 self.challenge_ack(out); // RFC 5961 3.2
             } else if req && self.tfo {
                 // Linux tcp_check_req embryonic_reset for Fast Open:
@@ -1083,7 +1171,9 @@ impl TcpCb {
             self.ack_now = true;
         }
         if len != 0 && self.rcv_shut && self.state != TcpState::Established {
-            // Data for a closed reader (Linux: abort on data in FIN_WAIT)
+            // Data for a closed reader (Linux: abort on data in FIN_WAIT;
+            // with a FIN on a Fast Open connection, pause Fast Open)
+            out.tfo_disable |= self.syn_fastopen && s.has(flags::FIN);
             self.net_stat(LINUX_MIB_TCPABORTONDATA);
             self.abort(out);
             out.err = Some(KernelError::ConnectionReset);

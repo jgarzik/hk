@@ -112,11 +112,11 @@ SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
-(/sys/module/tcp_cubic/parameters: Linux's defaults are constants), and
-Fast Open is server-side only: no client (MSG_FASTOPEN,
-TCP_FASTOPEN_CONNECT, the per-destination cookie cache Linux keeps in
-tcp_metrics, TCPFastOpenActive*, blackhole detection); no route
-metric RTAX_FASTOPEN_NO_COOKIE (hk routes carry no metrics). A
+(/sys/module/tcp_cubic/parameters: Linux's defaults are constants).
+Fast Open lacks the route metric RTAX_FASTOPEN_NO_COOKIE (hk routes
+carry no metrics), TCP_INFO's tcpi_fastopen_client_fail, and a
+connecting socket's SYN data is bounded by one segment (Linux sends up
+to the path MTU less the option space even past a small cached MSS). A
 request's SYN-ACK retries
 are not cut while old requests clog the SYN queue (reqsk_timer_handler
 lowers max_syn_ack_retries when qlen * 2 exceeds max(8, backlog) and
@@ -158,8 +158,9 @@ out-of-order queue (tcp_data_queue_ofo's tcp_ooo_try_coalesce with
 the skb before or ooo_last_skb). Header prediction compares a
 segment's flags without ECE and CWR (hk's header parse drops them;
 Linux's pred_flags word includes them).
-No tcp_metrics (Linux tcp_metrics.c: the per-destination cache of
-RTT, cwnd and reordering, the TCP_METRICS genetlink family): new
+tcp_metrics keeps only Fast Open's cookie cache (`net/tcp/metrics.rs`):
+no per-destination RTT, cwnd and reordering, no TCP_METRICS genetlink
+family, no tcp_metrics timeout refresh from route metrics: new
 connections start from defaults (tcp_init_metrics), and no peer is
 proven for tcp_conn_request's last quarter of tcp_max_syn_backlog
 without SYN cookies (tcp_peer_is_proven), so it drops every new
@@ -172,8 +173,8 @@ IP_TRANSPARENT. /proc/net/raw and /proc/net/icmp do not exist. A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's
 per-node producer lists (udp_prod_queue) feeding sk_receive_queue
 and a reader_queue spliced from it.
-MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: Fast Open's
-client side, MD5/AO, forwarding and
+MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: MD5/AO,
+forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP sends are not charged to SO_SNDBUF (Linux sk_wmem_alloc through
 sock_alloc_send_skb, which blocks or fails a send past it; corked

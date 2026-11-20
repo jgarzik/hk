@@ -151,10 +151,76 @@ impl TcpCb {
             ws: self.wscale_ok.then_some(self.rcv_wscale),
             ts,
             sack_perm: self.sack_ok != 0,
-            foc: if synack { self.synack_foc.take() } else { None },
+            foc: self.syn_option(synack),
             ..Default::default()
         };
         out.ctl(h)
+    }
+
+    /// The Fast Open option of the first SYN or SYN-ACK; a SYN's marks
+    /// the connection a Fast Open one (Linux tcp_syn_options)
+    fn syn_option(&mut self, synack: bool) -> Option<Foc> {
+        if synack {
+            return self.synack_foc.take();
+        }
+        let f = self.syn_foc.take()?;
+        self.syn_fastopen = true;
+        self.syn_fastopen_exp = f.exp;
+        Some(f)
+    }
+
+    /// Linux tcp_send_syn_data's transmit: the SYN carrying the head of
+    /// the write queue and the cookie; the data then sits on the
+    /// retransmit queue as sent at ISS + 1 (ACK|PSH), TCPOrigDataSent.
+    /// False without memory (nothing sent: the plain SYN follows)
+    pub(super) fn syn_data_send(&mut self, out: &mut Out) -> bool {
+        let Some(mut skb) = self.wq.pop_front() else {
+            return false;
+        };
+        let len = skb.len() as u32;
+        let Some(mut c) = clone_data(&skb, out.gfp) else {
+            self.wq.push_front(skb);
+            return false;
+        };
+        self.syn_mstamp = self.tcp_mstamp;
+        let mut h = Seg {
+            seq: self.iss,
+            flags: flags::SYN,
+            wnd: self.syn_window(),
+            mss: Some(self.adv_mss.min(u32::from(u16::MAX)) as u16),
+            ws: self.wscale_ok.then_some(self.rcv_wscale),
+            ts: self.ts_ok.then(|| (self.tsval(), 0)),
+            sack_perm: self.sack_ok != 0,
+            foc: self.syn_option(false),
+            ..Default::default()
+        };
+        h.set_len(len);
+        if put_seg(&mut c, &h).is_none() {
+            self.wq.push_front(skb);
+            return false;
+        }
+        out.segs.push_back(c);
+        let t = skb.tcp_mut();
+        t.flags = flags::ACK | flags::PSH;
+        t.sacked = 0;
+        t.set_pcount(1);
+        t.set_gso_size(0);
+        t.tx_delivered = self.delivered;
+        t.tx_delivered_mstamp = self.tcp_mstamp.max(1);
+        skb.tstamp = self.tcp_clock_cache as i64;
+        self.packets_out += 1;
+        self.rtx
+            .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
+        let next = self.snd_nxt.wrapping_add(len);
+        self.snd_nxt = next;
+        self.snd_max = next;
+        self.syn_data = len > 0;
+        self.stats.bytes_sent += u64::from(len);
+        self.stats.segs_out = self.stats.segs_out.wrapping_add(1);
+        self.stats.data_segs_out = self.stats.data_segs_out.wrapping_add(1);
+        self.event_data_sent();
+        self.net_stat(LINUX_MIB_TCPORIGDATASENT);
+        true
     }
 
     /// A SYN or SYN-ACK again (Linux __tcp_retransmit_skb /

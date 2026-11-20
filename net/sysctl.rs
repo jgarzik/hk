@@ -45,6 +45,9 @@ pub struct NetSysctl {
     /// Fast Open bits (Linux TFO_CLIENT_ENABLE 1, TFO_SERVER_ENABLE 2,
     /// TFO_SERVER_COOKIE_NOT_REQD 0x200, TFO_SERVER_WO_SOCKOPT1 0x400)
     pub tcp_fastopen: AtomicI32,
+    /// Active Fast Open's first pause after a suspected blackhole, s
+    /// (0: never paused; Linux sysctl_tcp_fastopen_blackhole_timeout)
+    pub tcp_fastopen_blackhole_timeout: AtomicI32,
     pub tcp_retries2: AtomicU8,
     /// tcp_fin_timeout in seconds
     pub tcp_fin_timeout: AtomicI32,
@@ -122,6 +125,8 @@ impl Default for NetSysctl {
             tcp_max_syn_backlog: AtomicI32::new(crate::net::tcp::table::max_syn_backlog()),
             // Linux tcp_sk_init: TFO_CLIENT_ENABLE
             tcp_fastopen: AtomicI32::new(1),
+            // Linux tcp_sk_init (since 5.14)
+            tcp_fastopen_blackhole_timeout: AtomicI32::new(0),
             tcp_retries2: AtomicU8::new(15),
             tcp_fin_timeout: AtomicI32::new(60),
             tcp_window_scaling: AtomicU8::new(1),
@@ -524,6 +529,20 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_i32(n, |s| &s.tcp_fastopen),
         store: |n, v| set_int(n, |s| &s.tcp_fastopen, v, INT_MIN, INT_MAX),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_fastopen_blackhole_timeout_sec",
+        mode: 0o644,
+        global: false,
+        show: |n| get_i32(n, |s| &s.tcp_fastopen_blackhole_timeout),
+        // Linux proc_tfo_blackhole_detect_timeout: a write restarts the
+        // pauses
+        store: |n, v| {
+            set_int(n, |s| &s.tcp_fastopen_blackhole_timeout, v, 0, INT_MAX)?;
+            n.tcp.tfo_disable_times.store(0, Ordering::Relaxed);
+            Ok(())
+        },
         text: None,
     },
     NetCtl {

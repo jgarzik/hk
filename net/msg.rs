@@ -140,6 +140,8 @@ pub const MSG_CONFIRM: i32 = 0x800;
 pub const MSG_ERRQUEUE: i32 = 0x2000;
 pub const MSG_NOSIGNAL: i32 = 0x4000;
 pub const MSG_MORE: i32 = 0x8000;
+/// Send data in the SYN (TCP Fast Open)
+pub const MSG_FASTOPEN: i32 = 0x2000_0000;
 pub const MSG_WAITFORONE: i32 = 0x10000;
 pub const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 

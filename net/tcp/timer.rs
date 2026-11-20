@@ -149,6 +149,16 @@ impl TcpCb {
             let ut = u64::from(self.opts.user_timeout);
             expired = self.retransmits_timed_out(retry_until, ut, now);
         }
+        // Linux tcp_fastopen_active_detect_blackhole: the third
+        // consecutive timeout (or giving up before it) of an active
+        // Fast Open connection pauses Fast Open
+        let timeouts = self.live.retransmits.get();
+        if (self.syn_fastopen || self.syn_data || self.syn_data_acked)
+            && (timeouts == 2 || (timeouts < 2 && expired))
+        {
+            out.tfo_disable = true;
+            self.net_stat(LINUX_MIB_TCPFASTOPENACTIVEFAIL);
+        }
         if expired {
             self.timed_out(out);
         }

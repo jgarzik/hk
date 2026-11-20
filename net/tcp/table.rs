@@ -178,6 +178,8 @@ pub fn init() {
         lhash: NullsHead::table(LHASH).expect("tcp: lhash"),
         bhash: bhash.into_boxed_slice(),
     });
+    // Linux tcp_metrics_init
+    super::metrics::init();
     // Linux tcp_sk_init(init_net) -> tcp_set_hashinfo, after tcp_init
     // sized the table: the initial namespace was made before it
     crate::ns::net::init_net_ns()
@@ -267,6 +269,10 @@ pub struct TcpTables {
     /// The namespace's Fast Open keys (Linux net->ipv4.tcp_fastopen_ctx,
     /// replaced whole: tcp_fastopen_reset_cipher); leaf
     fastopen_ctx: Mutex<Option<super::fastopen::Ctx>>,
+    /// Active Fast Open paused (Linux tfo_active_disable_stamp, ms, and
+    /// tfo_active_disable_times)
+    pub tfo_disable_stamp: core::sync::atomic::AtomicU64,
+    pub tfo_disable_times: core::sync::atomic::AtomicU32,
 }
 
 impl TcpTables {

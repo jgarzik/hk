@@ -56,6 +56,7 @@ pub mod fastopen;
 pub mod info;
 pub mod input;
 pub mod mem;
+pub mod metrics;
 pub mod netns;
 pub mod output;
 pub mod recovery;
@@ -97,8 +98,8 @@ use crate::net::inet::route;
 use crate::net::ipv4::{self, IPPROTO_TCP, IpParams, Ipv4Addr};
 use crate::net::mib::*;
 use crate::net::msg::{
-    MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, RecvMsg,
-    SendMsg,
+    MSG_DONTWAIT, MSG_ERRQUEUE, MSG_FASTOPEN, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL,
+    RecvMsg, SendMsg,
 };
 use crate::net::skb::SkBuff;
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
@@ -132,6 +133,7 @@ pub const TCP_CONGESTION: i32 = 13;
 pub const TCP_USER_TIMEOUT: i32 = 18;
 pub const TCP_FASTOPEN: i32 = 23;
 pub const TCP_NOTSENT_LOWAT: i32 = 25;
+pub const TCP_FASTOPEN_CONNECT: i32 = 30;
 pub const TCP_FASTOPEN_KEY: i32 = 33;
 pub const TCP_FASTOPEN_NO_COOKIE: i32 = 34;
 /// Linux TCP_FIN_TIMEOUT_MAX (s): the largest TCP_LINGER2
@@ -139,6 +141,9 @@ const FIN_TIMEOUT_MAX: i32 = 120;
 /// net.ipv4.tcp_fastopen server bits (Linux TFO_SERVER_ENABLE,
 /// TFO_SERVER_COOKIE_NOT_REQD, TFO_SERVER_WO_SOCKOPT1)
 const TFO_SERVER_ENABLE: i32 = 2;
+/// Client bits (Linux TFO_CLIENT_ENABLE, TFO_CLIENT_NO_COOKIE)
+const TFO_CLIENT_ENABLE: i32 = 1;
+const TFO_CLIENT_NO_COOKIE: i32 = 4;
 const TFO_SERVER_COOKIE_NOT_REQD: i32 = 0x200;
 const TFO_SERVER_WO_SOCKOPT1: i32 = 0x400;
 /// Linux MAX_TCP_KEEPIDLE / KEEPINTVL / KEEPCNT, MAX_TCP_SYNCNT
@@ -186,6 +191,8 @@ struct Inner {
     /// A non-blocking connect is in progress (Linux sock->state
     /// SS_CONNECTING, under lock_sock)
     connecting: bool,
+    /// A Fast Open sendmsg is connecting (Linux tp->fastopen_req)
+    fastopen_req: bool,
     /// Counted as an orphan (`cb.orphan`) until destroyed
     orphan: Option<mem::Orphan>,
     /// The socket's SO_RCVBUF / SO_SNDBUF as `sync_caps` gave them to
@@ -250,6 +257,9 @@ struct Snap {
     /// A Fast Open child in SYN_RECEIVED (Linux tp->fastopen_rsk, which
     /// tcp_poll reads)
     tfo: AtomicBool,
+    /// TCP_FASTOPEN_CONNECT deferred the SYN (Linux DEFER_CONNECT,
+    /// which tcp_poll reads)
+    defer: AtomicBool,
 }
 
 impl Snap {
@@ -263,6 +273,7 @@ impl Snap {
         self.snd_una.store(c.snd_una, Ordering::Release);
         self.snd_max.store(c.snd_max, Ordering::Release);
         self.tfo.store(c.tfo, Ordering::Release);
+        self.defer.store(c.defer_connect, Ordering::Release);
         self.state.store(c.state.linux(), Ordering::Release);
     }
 }
@@ -482,6 +493,7 @@ impl TcpSock {
                 armed: [None; 3],
                 connecting: false,
                 bufs: (0, 0),
+                fastopen_req: false,
             }),
             queue: Mutex::new(None),
             ack_backlog: AtomicU32::new(0),
@@ -606,6 +618,15 @@ impl TcpSock {
             // listener (`syn_recv_sock`): wake it (Linux
             // tcp_child_process -> sk_data_ready)
             ready = w.upgrade();
+        }
+        if let Some(f) = out.fo_cache.take() {
+            self.fastopen_cache_set(&f);
+        }
+        if core::mem::take(&mut out.tfo_disable) {
+            fastopen::active_disable(&self.sk.net, now_ms());
+        }
+        if out.done {
+            self.fastopen_ofo_check(g);
         }
         if g.tfo_parent.is_some() && !(g.cb.tfo && g.cb.state == TcpState::SynReceived) {
             // Linux reqsk_fastopen_remove: the handshake completed or the
@@ -1582,16 +1603,10 @@ impl TcpSock {
 
     // --- user calls -----------------------------------------------------------
 
-    /// Linux tcp_v4_connect: route, local address and port, ISN, SYN
-    /// Begin a connection to `daddr:dport` (Linux tcp_v4_connect), the
-    /// socket locked
-    fn start_connect(
-        &self,
-        g: &mut Inner,
-        out: &mut Out,
-        daddr: Ipv4Addr,
-        dport: u16,
-    ) -> Result<(), KernelError> {
+    /// Begin a connection to `daddr:dport`, the socket locked (Linux
+    /// tcp_v4_connect: route, local address and port, ISN, SYN_SENT;
+    /// the SYN follows from `connect_syn` or a Fast Open sendmsg)
+    fn start_connect(&self, g: &mut Inner, daddr: Ipv4Addr, dport: u16) -> Result<(), KernelError> {
         let me = self.arc();
         {
             if g.cb.state != TcpState::Closed {
@@ -1651,12 +1666,195 @@ impl TcpSock {
                 ts_off: ts_off(&t),
                 mss: rt.mtu.saturating_sub(cb::HDRS),
             };
-            // The SYN is allocated with sk_allocation (Linux tcp_connect)
-            out.gfp = Gfp::KERNEL;
-            g.cb.connect(o, now_ms(), out);
-            out.gfp = Gfp::ATOMIC;
+            g.cb.connect_init(o, now_ms());
             Ok(())
         }
+    }
+
+    /// The rest of Linux tcp_v4_connect once SYN_SENT: TCP_FASTOPEN_CONNECT
+    /// with a usable cookie defers the SYN to the first write
+    /// (tcp_fastopen_defer_connect: true), without one the SYN asks for a
+    /// cookie; else the plain SYN (tcp_connect)
+    fn connect_syn(&self, g: &mut Inner, out: &mut Out) -> bool {
+        let mut fo = None;
+        if g.cb.opts.tfo_connect && !g.fastopen_req {
+            let f = self.fastopen_cookie_check(g);
+            if f.ok {
+                g.cb.defer_connect = true;
+                return true;
+            }
+            fo = Some(f);
+        }
+        // The SYN is allocated with sk_allocation (Linux tcp_connect)
+        out.gfp = Gfp::KERNEL;
+        g.cb.connect_send(fo, now_ms(), out);
+        out.gfp = Gfp::ATOMIC;
+        false
+    }
+
+    /// Linux tcp_fastopen_cookie_check: the destination's cached cookie
+    /// and MSS (tcp_fastopen_cache_get); none while active Fast Open is
+    /// paused; usable without one in no-cookie mode (TFO_CLIENT_NO_COOKIE,
+    /// TCP_FASTOPEN_NO_COOKIE), else only with one
+    fn fastopen_cookie_check(&self, g: &mut Inner) -> cb::FoReq {
+        let net = &self.sk.net;
+        let now = now_ms();
+        let a = self.inet.get();
+        let (mss, cookie) = metrics::cache_get(metrics::Key::of(net), a.saddr, a.daddr, now);
+        let (pause, check) = fastopen::active_should_disable(net, now);
+        g.cb.syn_fastopen_ch |= check;
+        if pause {
+            return cb::FoReq {
+                ok: false,
+                cookie: None,
+                mss,
+            };
+        }
+        let tfo = net.sysctl.tcp_fastopen.load(Ordering::Relaxed);
+        if tfo & TFO_CLIENT_NO_COOKIE != 0 || g.cb.opts.tfo_no_cookie {
+            return cb::FoReq {
+                ok: true,
+                cookie: None,
+                mss,
+            };
+        }
+        cb::FoReq {
+            ok: cookie.len > 0,
+            cookie: Some(cookie),
+            mss,
+        }
+    }
+
+    /// Linux tcp_fastopen_cache_set for this connection's addresses
+    fn fastopen_cache_set(&self, f: &cb::FoCache) {
+        let a = self.inet.get();
+        let net = &self.sk.net;
+        let k = metrics::Key::of(net);
+        metrics::cache_set(
+            k,
+            a.saddr,
+            a.daddr,
+            f.mss,
+            f.cookie,
+            f.syn_lost,
+            f.try_exp,
+            now_ms(),
+        );
+    }
+
+    /// Linux tcp_fastopen_active_disable_ofo_check, as the connection
+    /// ends: no data received and only a FIN out of order pauses active
+    /// Fast Open; data received on a checked connection not over
+    /// loopback ends the pauses
+    fn fastopen_ofo_check(&self, g: &Inner) {
+        let c = &g.cb;
+        if !c.syn_fastopen {
+            return;
+        }
+        let net = &self.sk.net;
+        if c.stats.data_segs_in == 0 {
+            if c.ooo_fin_only() {
+                fastopen::active_disable(net, now_ms());
+            }
+        } else if c.syn_fastopen_ch && net.tcp.tfo_disable_times.load(Ordering::Relaxed) != 0 {
+            let a = self.inet.get();
+            let lo = route::output(net, a.daddr, a.saddr, self.oif())
+                .is_ok_and(|rt| rt.dev.is_loopback());
+            if !lo {
+                net.tcp.tfo_disable_times.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Linux tcp_sendmsg_fastopen: with TFO_CLIENT_ENABLE, connect
+    /// carrying the first bytes of `m` in the SYN (or send the SYN a
+    /// TCP_FASTOPEN_CONNECT connect deferred), then wait for the
+    /// connection unless non-blocking (__inet_stream_connect with
+    /// is_sendmsg). Returns the bytes the SYN took and the connect's
+    /// result
+    fn sendmsg_fastopen(
+        &self,
+        g: &mut Guard<'_>,
+        m: &mut SendMsg<'_>,
+        flags: i32,
+    ) -> (usize, Result<(), KernelError>) {
+        let tfo = self.sk.net.sysctl.tcp_fastopen.load(Ordering::Relaxed);
+        let unspec = m
+            .addr
+            .as_deref()
+            .is_some_and(|a| af_inet::sa_family(a).is_ok_and(|f| f == AF_UNSPEC));
+        if tfo & TFO_CLIENT_ENABLE == 0 || unspec {
+            return (0, Err(KernelError::OperationNotSupported));
+        }
+        if g.fastopen_req {
+            return (0, Err(KernelError::AlreadyInProgress));
+        }
+        g.fastopen_req = true;
+        let mut out = Out::default();
+        let mut copied = 0;
+        let r = if g.cb.defer_connect {
+            copied = self.syn_data(g, &mut out, m);
+            Err(KernelError::InProgress)
+        } else {
+            match g.cb.state {
+                TcpState::Closed if !g.connecting => {
+                    let r = m
+                        .addr
+                        .as_deref()
+                        .map_or(Err(KernelError::InvalidArgument), |a| {
+                            af_inet::sin_parse(a, false)
+                        });
+                    match r.and_then(|(d, p)| self.start_connect(g, d, p)) {
+                        Ok(()) => {
+                            copied = self.syn_data(g, &mut out, m);
+                            Err(KernelError::InProgress)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                TcpState::SynSent | TcpState::SynReceived => Err(KernelError::AlreadyInProgress),
+                _ => Err(KernelError::AlreadyConnected),
+            }
+        };
+        self.finish(g, &mut out);
+        let r = match r {
+            Err(KernelError::InProgress) if flags & MSG_DONTWAIT == 0 => {
+                let w = self.wait_connect(g);
+                g.connecting = false;
+                w
+            }
+            Err(KernelError::InProgress) => {
+                g.connecting = true;
+                Err(KernelError::InProgress)
+            }
+            r => r,
+        };
+        g.fastopen_req = false;
+        g.cb.defer_connect = false;
+        (copied, r)
+    }
+
+    /// Linux tcp_connect with a Fast Open request: the data the SYN can
+    /// carry copied from `m` (only with a usable cookie,
+    /// tcp_send_syn_data), then the SYN
+    fn syn_data(&self, g: &mut Inner, out: &mut Out, m: &mut SendMsg<'_>) -> usize {
+        let f = self.fastopen_cookie_check(g);
+        let mut copied = 0;
+        if f.ok {
+            let space = g.cb.fastopen_prep(f.mss, m.data.len());
+            let mut at = 0;
+            copied =
+                g.cb.send_with(space, |b| {
+                    let k = m.data.copy_at(at, b)?;
+                    at += k;
+                    Ok(k)
+                })
+                .unwrap_or(0);
+        }
+        out.gfp = Gfp::KERNEL;
+        g.cb.connect_send(Some(f), now_ms(), out);
+        out.gfp = Gfp::ATOMIC;
+        copied
     }
 
     /// __inet_stream_connect's part as the owner: the result now, or
@@ -1669,6 +1867,10 @@ impl TcpSock {
         nonblock: bool,
     ) -> Option<Result<(), KernelError>> {
         let state = g.cb.state;
+        if g.cb.defer_connect {
+            // SS_CONNECTING with DEFER_CONNECT: EISCONN
+            return Some(Err(KernelError::AlreadyConnected));
+        }
         if matches!(state, TcpState::SynSent | TcpState::SynReceived) {
             return nonblock.then_some(Err(KernelError::AlreadyInProgress));
         }
@@ -1686,9 +1888,15 @@ impl TcpSock {
             return Some(Err(KernelError::AlreadyConnected));
         }
         let r = af_inet::sin_parse(a, false)
-            .and_then(|(daddr, dport)| self.start_connect(g, out, daddr, dport));
+            .and_then(|(daddr, dport)| self.start_connect(g, daddr, dport));
         match r {
             Err(e) => Some(Err(e)),
+            // Deferred: connected as far as the caller sees (Linux
+            // __inet_stream_connect: DEFER_CONNECT returns 0)
+            Ok(()) if self.connect_syn(g, out) => {
+                g.connecting = true;
+                Some(Ok(()))
+            }
             Ok(()) if nonblock => {
                 g.connecting = true;
                 Some(Err(KernelError::InProgress))
@@ -1792,6 +2000,7 @@ impl TcpSock {
                 self.listen_stop(q);
             }
         }
+        self.fastopen_ofo_check(g);
         g.cb.disconnect(out);
         out.shut = 0;
         self.sk.clear_shutdown();
@@ -2461,10 +2670,22 @@ fn sendmsg_locked(
     m: &mut SendMsg<'_>,
     flags: i32,
 ) -> Result<usize, KernelError> {
-    let mut timeo = s.sk.snd_timeo(flags & MSG_DONTWAIT != 0);
-    wait_connected(s, g, &mut timeo)?;
-    let total = m.data.len();
     let mut sent = 0;
+    if flags & MSG_FASTOPEN != 0 || g.cb.defer_connect {
+        // Linux tcp_sendmsg_locked: the SYN's bytes count; still
+        // connecting (non-blocking) they are the result
+        let (n, r) = s.sendmsg_fastopen(g, m, flags);
+        match r {
+            Err(KernelError::InProgress) if n > 0 => return Ok(n),
+            Err(e) => return Err(e),
+            Ok(()) => sent = n,
+        }
+    }
+    let mut timeo = s.sk.snd_timeo(flags & MSG_DONTWAIT != 0);
+    if let Err(e) = wait_connected(s, g, &mut timeo) {
+        return if sent > 0 { Ok(sent) } else { Err(e) };
+    }
+    let total = m.data.len();
     let r = loop {
         if sent == total {
             break Ok(());
@@ -2763,6 +2984,12 @@ impl ProtoOps for TcpSock {
                 }
             }
         }
+        if state == TcpState::SynSent && self.snap.defer.load(Ordering::Acquire) {
+            // Linux tcp_poll: "Active TCP fastopen socket with
+            // defer_connect: Return EPOLLOUT so application can call
+            // write() in order for kernel to generate SYN+data"
+            mask |= POLLOUT | POLLWRNORM;
+        }
         if self.sk.err_pending() {
             mask |= POLLERR;
         }
@@ -2924,6 +3151,19 @@ impl TcpSock {
                         .fastopen
                         .set((val as u32).min(self.sk.net.sysctl.somaxconn()));
                 }
+                TCP_FASTOPEN_CONNECT => {
+                    if !(0..=1).contains(&val) {
+                        return bad();
+                    }
+                    let tfo = self.sk.net.sysctl.tcp_fastopen.load(Ordering::Relaxed);
+                    if tfo & TFO_CLIENT_ENABLE == 0 {
+                        return Err(KernelError::OperationNotSupported);
+                    }
+                    if g.cb.state != TcpState::Closed {
+                        return bad();
+                    }
+                    g.cb.opts.tfo_connect = val != 0;
+                }
                 TCP_FASTOPEN_NO_COOKIE => {
                     if !(0..=1).contains(&val)
                         || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen)
@@ -3016,6 +3256,7 @@ impl TcpSock {
             TCP_DEFER_ACCEPT => info::retrans_to_secs(o.defer_accept),
             TCP_FASTOPEN => g.cb.live.fastopen.get(),
             TCP_FASTOPEN_NO_COOKIE => u32::from(o.tfo_no_cookie),
+            TCP_FASTOPEN_CONNECT => u32::from(o.tfo_connect),
             TCP_FASTOPEN_KEY => {
                 // Linux tcp_fastopen_get_cipher with the socket: its own
                 // keys only (the namespace's go to the 0600 sysctl alone)

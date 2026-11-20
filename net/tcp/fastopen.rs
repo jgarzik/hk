@@ -91,6 +91,51 @@ pub fn cookie(key: &[u64; 2], t: &Tuple) -> Foc {
     f
 }
 
+/// Linux tcp_fastopen_active_disable: pause active Fast Open in the
+/// namespace (unless tcp_fastopen_blackhole_timeout_sec is 0),
+/// TCPFastOpenBlackhole
+pub fn active_disable(net: &crate::net::NetNamespace, now: u64) {
+    use core::sync::atomic::Ordering;
+    if net
+        .sysctl
+        .tcp_fastopen_blackhole_timeout
+        .load(Ordering::Relaxed)
+        == 0
+    {
+        return;
+    }
+    net.tcp.tfo_disable_stamp.store(now, Ordering::Relaxed);
+    // Release: the stamp before the count (smp_mb__before_atomic)
+    net.tcp.tfo_disable_times.fetch_add(1, Ordering::Release);
+    net.mib
+        .net
+        .inc(crate::net::mib::LINUX_MIB_TCPFASTOPENBLACKHOLE);
+}
+
+/// Linux tcp_fastopen_active_should_disable: still within the pause,
+/// the timeout doubling with each (up to 2^6 times); past it, Some(())
+/// asks the connection to check for success (syn_fastopen_ch)
+pub fn active_should_disable(net: &crate::net::NetNamespace, now: u64) -> (bool, bool) {
+    use core::sync::atomic::Ordering;
+    let t = net
+        .sysctl
+        .tcp_fastopen_blackhole_timeout
+        .load(Ordering::Relaxed);
+    if t <= 0 {
+        return (false, false);
+    }
+    let times = net.tcp.tfo_disable_times.load(Ordering::Acquire);
+    if times == 0 {
+        return (false, false);
+    }
+    let mult = 1u64 << (times - 1).min(6);
+    let until = net.tcp.tfo_disable_stamp.load(Ordering::Relaxed) + mult * t as u64 * 1000;
+    if now < until {
+        return (true, false);
+    }
+    (false, true)
+}
+
 /// net.ipv4.tcp_fastopen_key as Linux prints it: each key as four
 /// 32-bit words "%08x-%08x-%08x-%08x" (little-endian words of its
 /// bytes), keys separated by commas; zeros without a context

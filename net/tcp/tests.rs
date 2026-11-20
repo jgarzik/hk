@@ -2533,6 +2533,131 @@ fn fastopen_child_check_req() {
     assert!(b.tfo_reset);
 }
 
+/// Active Fast Open with a cookie: the SYN carries it and the data; a
+/// Fast Open listener's child takes the data and acknowledges it in its
+/// SYN-ACK (Linux tcp_send_syn_data, tcp_rcv_fastopen_synack:
+/// TCPFastOpenActive)
+#[test]
+fn fastopen_client_syn_data() {
+    use super::cb::{FoReq, Foc};
+    use crate::net::mib::*;
+    let mib = NetMib::new().unwrap();
+    let mut a = TcpCb::new(cfg(), Default::default());
+    a.mib = Some(mib.clone());
+    a.connect_init(open(1000, 1460), 0);
+    let data = b"syn data";
+    let space = a.fastopen_prep(1460, data.len());
+    assert_eq!(space, data.len());
+    assert_eq!(a.send(data), data.len());
+    let mut c = Foc {
+        len: 8,
+        ..Foc::default()
+    };
+    c.val[0] = 3;
+    let mut out = Out::default();
+    a.connect_send(
+        Some(FoReq {
+            ok: true,
+            cookie: Some(c),
+            mss: 1460,
+        }),
+        0,
+        &mut out,
+    );
+    let syn = wire(&out).remove(0);
+    assert!(syn.has(flags::SYN) && syn.data == data);
+    assert!(a.syn_fastopen && a.syn_data);
+    let mut b = TcpCb::new(cfg(), Default::default());
+    let mut out = Out::default();
+    b.fastopen_open(
+        &seg_in(&syn).hdr(),
+        seg_in(&syn).skb(),
+        open(5000, 1460),
+        0,
+        &mut out,
+    );
+    let synack = wire(&out).remove(0);
+    assert_eq!(synack.ack, 1001 + data.len() as u32);
+    let mut out = Out::default();
+    a.feed(&seg_in(&synack), 10, &mut out);
+    assert_eq!(a.state, TcpState::Established);
+    assert!(a.syn_data_acked);
+    assert_eq!(a.packets_out, 0);
+    assert_eq!(mib.net.fold(LINUX_MIB_TCPFASTOPENACTIVE), 1);
+    assert!(out.fo_cache.is_some());
+    // A SYN retry carries no option
+    assert!(a.syn_foc.is_none());
+}
+
+/// SYN data the SYN-ACK does not acknowledge is resent at once
+/// (TCPFastOpenActiveFail); a cookie request's SYN-ACK cookie goes to
+/// the cache
+#[test]
+fn fastopen_client_fallbacks() {
+    use super::cb::{FoReq, Foc};
+    use crate::net::mib::*;
+    let mib = NetMib::new().unwrap();
+    let mut a = TcpCb::new(cfg(), Default::default());
+    a.mib = Some(mib.clone());
+    a.connect_init(open(1000, 1460), 0);
+    a.fastopen_prep(1460, 4);
+    a.send(b"data");
+    let c = Foc {
+        len: 8,
+        ..Foc::default()
+    };
+    let mut out = Out::default();
+    let fo = FoReq {
+        ok: true,
+        cookie: Some(c),
+        mss: 0,
+    };
+    a.connect_send(Some(fo), 0, &mut out);
+    let synack = SegIn {
+        seq: 7000,
+        ack: 1001,
+        flags: flags::SYN | flags::ACK,
+        wnd: 5000,
+        mss: Some(1460),
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    a.feed(&synack, 10, &mut out);
+    assert_eq!(a.state, TcpState::Established);
+    let w = wire(&out);
+    assert!(
+        w.iter()
+            .any(|s| s.seq == 1001 && s.data == b"data" && s.ack == 7001)
+    );
+    assert_eq!(mib.net.fold(LINUX_MIB_TCPFASTOPENACTIVEFAIL), 1);
+    // A cookie request
+    let mut a = TcpCb::new(cfg(), Default::default());
+    a.connect_init(open(1000, 1460), 0);
+    let mut out = Out::default();
+    let fo = FoReq {
+        ok: false,
+        cookie: Some(Foc::default()),
+        mss: 0,
+    };
+    a.connect_send(Some(fo), 0, &mut out);
+    let syn = wire(&out).remove(0);
+    assert_eq!(syn.data.len(), 0);
+    let mut sa = SegIn {
+        seq: 7000,
+        ack: 1001,
+        flags: flags::SYN | flags::ACK,
+        wnd: 5000,
+        ..Default::default()
+    }
+    .hdr();
+    sa.foc = Some(Foc { len: 8, ..c });
+    let skb = SkBuff::alloc_tx(0, Gfp::KERNEL).unwrap();
+    let mut out = Out::default();
+    a.input(&sa, skb, 10, &mut out);
+    let f = out.fo_cache.unwrap();
+    assert_eq!(f.cookie.map(|c| c.len), Some(8));
+}
+
 // ============================================================================
 // Review findings (reproduce first)
 // ============================================================================

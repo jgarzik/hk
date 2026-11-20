@@ -32,6 +32,12 @@
 //!   and returns them; net.ipv4.tcp_fastopen_key reads back as
 //!   "%08x-%08x-%08x-%08x" words (tcp_fastopen_reset_cipher,
 //!   proc_tcp_fastopen_key)
+//! - TCP_FASTOPEN_CLIENT: over loopback, a first MSG_FASTOPEN sendto
+//!   asks for a cookie and sends its data after the handshake; the next
+//!   carries the data in the SYN (TCPFastOpenActive, the server's
+//!   TCPFastOpenPassive); TCP_FASTOPEN_CONNECT defers the SYN to the
+//!   first write, polling writable meanwhile (tcp_sendmsg_fastopen,
+//!   tcp_fastopen_defer_connect, the cookie cache)
 
 use hk_syscall::{
     AF_INET, SOCK_NONBLOCK, SOCK_STREAM, sys_accept, sys_getsockopt, sys_listen, sys_setsockopt,
@@ -58,6 +64,7 @@ pub fn run_tests() {
     test_defer_accept();
     test_fastopen_server();
     test_fastopen_keys();
+    test_fastopen_client();
 }
 
 /// SYN options: MSS 1460, SACK permitted, timestamps (`tsval`, 0),
@@ -447,5 +454,80 @@ fn test_fastopen_keys() {
     if n > 0 {
         write_file(KEY, &old[..n as usize - 1]);
     }
+    t.done();
+}
+
+fn test_fastopen_client() {
+    const TFO: &[u8] = b"/proc/sys/net/ipv4/tcp_fastopen\0";
+    const MSG_FASTOPEN: i32 = 0x2000_0000;
+    const TCP_FASTOPEN_CONNECT: i32 = 30;
+    let mut t = T::new(b"TCP_FASTOPEN_CLIENT");
+    t.ok(
+        b"blackhole default",
+        reads(
+            b"/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec\0",
+            b"0\n",
+        ),
+        0,
+    );
+    let mut old = [0u8; 16];
+    let n = read_file(TFO, &mut old);
+    if !t.ok(b"read", n > 0, n) {
+        return t.done();
+    }
+    t.eq(b"enable", write_file(TFO, b"3"), 1);
+    let names: [&[u8]; 3] = [
+        b"TCPFastOpenCookieReqd",
+        b"TCPFastOpenActive",
+        b"TCPFastOpenPassive",
+    ];
+    let l = tcp();
+    bind(l, LO, 0);
+    let pl = port(l);
+    setint(l, IPPROTO_TCP, TCP_FASTOPEN, 5);
+    sys_listen(l, 8);
+    let mut b = [0u8; 8];
+    // First: a cookie request, the data after the handshake
+    let before = names.map(tcpext);
+    let c = tcp();
+    t.eq(b"sendto 1", send_to(c, b"hello", LO, pl, MSG_FASTOPEN), 5);
+    let a = accept_in(l, 1000);
+    t.ok(b"accept 1", a >= 0, i64::from(a));
+    t.eq(b"recv 1", recv(a, &mut b, 0), 5);
+    let mid = names.map(tcpext);
+    t.eq(b"cookie requested", mid[0] - before[0], 1);
+    t.eq(b"no active yet", mid[1] - before[1], 0);
+    close(a);
+    close(c);
+    // Second: the data in the SYN
+    let c = tcp();
+    t.eq(b"sendto 2", send_to(c, b"world", LO, pl, MSG_FASTOPEN), 5);
+    let a = accept_in(l, 1000);
+    t.ok(b"accept 2", a >= 0, i64::from(a));
+    t.eq(b"recv 2", recv(a, &mut b, 0), 5);
+    t.ok(b"bytes 2", &b[..5] == b"world", 0);
+    let after = names.map(tcpext);
+    t.eq(b"active", after[1] - mid[1], 1);
+    t.eq(b"passive", after[2] - mid[2], 1);
+    close(a);
+    close(c);
+    // TCP_FASTOPEN_CONNECT: connect returns at once, the write sends
+    // the SYN with its data
+    let c = tcp();
+    t.eq(
+        b"fastopen_connect",
+        setint(c, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1),
+        0,
+    );
+    t.eq(b"connect", connect(c, LO, pl), 0);
+    t.ok(b"writable", poll1(c, 4, 0).1 & 4 != 0, 0);
+    t.eq(b"write", send(c, b"x", 0), 1);
+    let a = accept_in(l, 1000);
+    t.eq(b"recv 3", recv(a, &mut b, 0), 1);
+    t.eq(b"active 3", tcpext(b"TCPFastOpenActive") - after[1], 1);
+    close(a);
+    close(c);
+    close(l);
+    write_file(TFO, &old[..n as usize - 1]);
     t.done();
 }

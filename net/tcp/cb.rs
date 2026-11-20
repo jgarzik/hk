@@ -305,6 +305,9 @@ pub struct Opts {
     /// TCP_FASTOPEN_NO_COOKIE: Fast Open without cookies (Linux
     /// tp->fastopen_no_cookie)
     pub tfo_no_cookie: bool,
+    /// TCP_FASTOPEN_CONNECT: connect() defers the SYN to the first
+    /// write when a cookie is known (Linux tp->fastopen_connect)
+    pub tfo_connect: bool,
     /// TCP_CONGESTION (index into `cong::ALGOS`), and whether it was
     /// set (Linux icsk_ca_setsockopt)
     pub ca: usize,
@@ -413,6 +416,32 @@ pub struct Out {
     /// and feeds it again (Linux tcp_v4_syn_recv_sock,
     /// inet_csk_complete_hashdance, tcp_child_process)
     pub req_ack: Option<Box<SkBuff>>,
+    /// A Fast Open SYN-ACK's lesson for the destination's cookie cache
+    /// (Linux tcp_fastopen_cache_set from tcp_rcv_fastopen_synack)
+    pub fo_cache: Option<FoCache>,
+    /// Pause active Fast Open in the namespace (Linux
+    /// tcp_fastopen_active_disable: a middlebox seems to black-hole it)
+    pub tfo_disable: bool,
+}
+
+/// What tcp_rcv_fastopen_synack teaches the cookie cache
+#[derive(Clone, Copy, Debug)]
+pub struct FoCache {
+    pub mss: u16,
+    pub cookie: Option<Foc>,
+    pub syn_lost: bool,
+    pub try_exp: u16,
+}
+
+/// A connecting socket's Fast Open decision (Linux
+/// tcp_fastopen_cookie_check): `ok` to send data in the SYN with
+/// `cookie` (None: without one), else a cookie request with it; the
+/// cached MSS (0: none)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FoReq {
+    pub ok: bool,
+    pub cookie: Option<Foc>,
+    pub mss: u16,
 }
 
 impl Default for Out {
@@ -427,6 +456,8 @@ impl Default for Out {
             timewait: false,
             established: false,
             req_ack: None,
+            fo_cache: None,
+            tfo_disable: false,
         }
     }
 }
@@ -962,6 +993,21 @@ pub struct TcpCb {
     /// The cookie its first SYN-ACK carries (Linux tcp_conn_request's
     /// foc; retransmissions carry none)
     pub(super) synack_foc: Option<Foc>,
+    /// The Fast Open option of a connecting socket's first SYN (Linux
+    /// fastopen_req->cookie, -1 after it: SYN retries carry none)
+    pub(super) syn_foc: Option<Foc>,
+    /// Active Fast Open: the SYN carried the option (and in the
+    /// experimental format), data, the SYN-ACK acknowledged it, the
+    /// blackhole check is armed (Linux syn_fastopen, syn_fastopen_exp,
+    /// syn_data, syn_data_acked, syn_fastopen_ch)
+    pub syn_fastopen: bool,
+    pub(super) syn_fastopen_exp: bool,
+    pub syn_data: bool,
+    pub syn_data_acked: bool,
+    pub syn_fastopen_ch: bool,
+    /// TCP_FASTOPEN_CONNECT deferred the SYN to the first write (Linux
+    /// inet DEFER_CONNECT)
+    pub defer_connect: bool,
     /// Header prediction (Linux pred_flags): the header length, flags
     /// (ACK only, PSH ignored) and window field word of the segment the
     /// fast path takes, 0 when off
@@ -1163,6 +1209,13 @@ impl TcpCb {
             tfo: false,
             tfo_reset: false,
             synack_foc: None,
+            syn_foc: None,
+            syn_fastopen: false,
+            syn_fastopen_exp: false,
+            syn_data: false,
+            syn_data_acked: false,
+            syn_fastopen_ch: false,
+            defer_connect: false,
             rtx_stamp: Default::default(),
             probes_tstamp: None,
             rcv_tstamp: Default::default(),
@@ -1246,6 +1299,13 @@ impl TcpCb {
     /// Active open (Linux tcp_connect): send SYN with our MSS, window
     /// scale and timestamp options as the sysctls allow
     pub fn connect(&mut self, o: Open, now: u64, out: &mut Out) {
+        self.connect_init(o, now);
+        self.connect_send(None, now, out);
+    }
+
+    /// Linux tcp_connect_init: SYN_SENT with our options, nothing sent
+    /// yet (a Fast Open connect may defer the SYN to the first write)
+    pub fn connect_init(&mut self, o: Open, now: u64) {
         self.open(&o, now);
         self.wscale_ok = self.cfg.wscale;
         // Linux tcp_connect_init: no TS.Recent yet, the whole MSS
@@ -1254,11 +1314,58 @@ impl TcpCb {
         self.ts_ok = self.cfg.ts != 0;
         self.sack_ok = if self.cfg.sack { SACK_SEEN } else { 0 };
         self.set_state(TcpState::SynSent);
-        if self.syn_seg(out) {
+    }
+
+    /// Linux tcp_connect's transmit: the SYN, or with a Fast Open
+    /// request `fo` tcp_send_syn_data: with a usable cookie the SYN
+    /// carries it and the data queued (`fastopen_prep`), else it asks
+    /// for a cookie; the SYN's retries carry no option
+    pub fn connect_send(&mut self, fo: Option<FoReq>, now: u64, out: &mut Out) {
+        self.tick(now);
+        self.defer_connect = false;
+        let sent = match fo {
+            Some(f) if f.ok => {
+                self.syn_foc = f.cookie;
+                self.wq.front().is_some() && self.syn_data_send(out)
+            }
+            Some(f) => {
+                // fallback: "a regular SYN with Fast Open cookie request"
+                self.syn_foc = f.cookie.map(|c| Foc { len: 0, ..c });
+                false
+            }
+            None => false,
+        };
+        if sent || self.syn_seg(out) {
             self.tcp_stat(TCP_MIB_OUTSEGS);
         }
+        self.syn_foc = None;
         self.tcp_stat(TCP_MIB_ACTIVEOPENS);
         self.arm_rtx(now);
+    }
+
+    /// Nothing received out of order but a FIN (Linux: the ofo queue
+    /// holds one skb, a FIN)
+    pub fn ooo_fin_only(&self) -> bool {
+        self.ooo.is_empty() && self.ooo_fin.is_some_and(|f| after(f, self.rcv_nxt))
+    }
+
+    /// Linux tcp_send_syn_data's sizing: the SYN's MSS is the cached one
+    /// (TCP_MAXSEG clamping it); the data it may carry, at most `size`
+    /// bytes: the path's segment less the largest option space
+    /// (MAX_TCP_OPTION_SPACE), within one segment
+    pub fn fastopen_prep(&mut self, mss: u16, size: usize) -> usize {
+        let mut m = if mss != 0 {
+            u32::from(mss)
+        } else {
+            self.adv_mss
+        };
+        if self.opts.user_mss != 0 {
+            m = m.min(self.opts.user_mss);
+        }
+        self.peer_mss = m.max(64);
+        self.update_mss();
+        let space = self.path_mss.saturating_sub(40) as usize;
+        space.min(size).min(self.live.mss.get() as usize)
     }
 
     /// Passive open: become a listener's child for its SYN `syn`, in
