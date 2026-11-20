@@ -93,12 +93,20 @@ mod uf {
 }
 
 /// A corked datagram (Linux up->pending, up->len, inet->cork and the
-/// sk_write_queue it fills): where it goes, how, and its payload
+/// sk_write_queue it fills): where it goes (the route and destination
+/// port of inet->cork.fl), what the cork fixed, and its payload. The
+/// source port, TTL without IP_TTL cmsg, PMTU mode and IP ID are the
+/// socket's when it is sent, as Linux udp_send_skb and __ip_make_skb
+/// read them.
 struct Cork {
     rt: route::Rtable,
-    sport: u16,
     dport: u16,
-    p: IpParams,
+    /// Linux cork->tos (the socket's or the IP_TOS cmsg's)
+    tos: u8,
+    /// Linux cork->ttl (an IP_TTL cmsg's; None: the socket's at send)
+    ttl: Option<u8>,
+    /// Linux cork->fragsize: the MTU when corked
+    fragsize: usize,
     gso: u16,
     /// Bytes appended, the UDP header counted (Linux up->len)
     len: usize,
@@ -427,10 +435,14 @@ impl UdpSock {
         };
         // Linux __ip_append_data: a GSO cork may reach IP_MAX_MTU, else
         // the MTU unless fragmenting is allowed
-        let mtu = if c.gso != 0 { 0xffff } else { c.p.mtu(&c.rt) };
-        let max = if c.p.may_frag() { 0xffff } else { mtu };
+        let mtu = if c.gso != 0 { 0xffff } else { c.fragsize };
+        let now = IpParams {
+            pmtudisc: self.inet.pmtudisc(),
+            ..Default::default()
+        };
+        let max = if now.may_frag() { 0xffff } else { mtu };
         if c.len + ulen > max - ipv4::IP_HLEN_MIN {
-            let (daddr, mtu) = (c.rt.daddr, c.p.mtu(&c.rt));
+            let daddr = c.rt.daddr;
             self.flush(g);
             let e = KernelError::MessageTooLong;
             let dport = self.inet.get().dport;
@@ -450,13 +462,18 @@ impl UdpSock {
         self.push(g)
     }
 
-    /// Send the corked datagram (Linux udp_push_pending_frames)
+    /// Send the corked datagram (Linux udp_push_pending_frames): from
+    /// the socket's port now, which a disconnect may have cleared
     fn push(&self, g: &mut Option<Cork>) -> Result<(), KernelError> {
         let Some(c) = g.take() else {
             return Ok(());
         };
         self.pending.store(false, Ordering::Relaxed);
-        self.send_out(&c.rt, c.sport, c.dport, &c.data, c.p, c.gso)
+        let mut p = self.inet.params();
+        p.tos = c.tos;
+        p.ttl = c.ttl.unwrap_or(p.ttl);
+        let sport = self.inet.get().sport;
+        self.send_out(&c.rt, sport, c.dport, &c.data, p, c.gso)
     }
 
     /// Drop the corked datagram (Linux udp_flush_pending_frames)
@@ -843,27 +860,34 @@ impl ProtoOps for UdpSock {
             c.saddr
         };
         let rt = self.route(daddr, saddr, oif)?;
-        let mut p = self.inet.params();
-        p.tos = c.tos.unwrap_or(p.tos);
-        p.ttl = c.ttl.unwrap_or(p.ttl);
-        // Linux sock_alloc_send_pskb: a pending (ICMP) error first
+        // Linux sock_alloc_send_pskb, for the datagram's first skb (a
+        // corked one's later appends allocate with no error check,
+        // __ip_append_data with transhdrlen 0): a pending error first
         if let Some(e) = self.sk.take_err() {
             return Err(e);
         }
         if !corkreq {
+            let mut p = self.inet.params();
+            p.tos = c.tos.unwrap_or(p.tos);
+            p.ttl = c.ttl.unwrap_or(p.ttl);
             self.send_out(&rt, a.sport, dport, &data, p, gso)?;
             return Ok(len);
         }
+        let now = IpParams {
+            pmtudisc: self.inet.pmtudisc(),
+            ..Default::default()
+        };
         let mut g = self.op.lock();
         if g.is_some() {
             // Linux: "socket already corked" by a racing send
             return Err(KernelError::InvalidArgument);
         }
         *g = Some(Cork {
+            fragsize: now.mtu(&rt),
             rt,
-            sport: a.sport,
             dport,
-            p,
+            tos: c.tos.unwrap_or(self.inet.tos()),
+            ttl: c.ttl,
             gso,
             len: 0,
             data: Vec::new(),

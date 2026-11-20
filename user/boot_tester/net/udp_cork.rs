@@ -28,6 +28,7 @@ pub fn run_tests() {
     test_msg_more();
     test_cork();
     test_cork_emsgsize();
+    test_cork_disconnect();
     test_segment();
     test_sol_opts();
 }
@@ -107,6 +108,35 @@ fn test_cork_emsgsize() {
     let mut buf = [0u8; 16];
     let n = recv_wait(b, &mut buf);
     t.ok(b"only the new one", n == 1 && buf[0] == b'z', n);
+    close(a);
+    close(b);
+    t.done();
+}
+
+/// A datagram corked on an autobound connected socket, then a
+/// disconnect (the port released), then the send that ends it: it goes
+/// to the corked destination from the socket's port as it is then, 0
+/// (Linux udp_disconnect keeps the cork, udp_send_skb reads
+/// inet_sport)
+fn test_cork_disconnect() {
+    let mut t = T::new(b"UDP_CORK_DISCONNECT");
+    let (b, pb) = udp_lo();
+    let a = udp();
+    t.eq(b"connect", connect(a, LO, pb), 0);
+    t.eq(b"more", send(a, b"ab", MSG_MORE), 2);
+    let unspec = hk_syscall::SockAddrIn::new(0, 0, 0);
+    t.eq(
+        b"disconnect",
+        hk_syscall::sys_connect(a, sa(&unspec), 16),
+        0,
+    );
+    t.eq(b"port released", i64::from(port(a)), 0);
+    t.eq(b"last", send_to(a, b"cd", LO, pb, 0), 2);
+    let mut buf = [0u8; 16];
+    t.ok(b"waited", poll1(b, 1, 1000).0 == 1, 0);
+    let (n, ip, p) = recv_from(b, &mut buf, MSG_DONTWAIT);
+    t.ok(b"one datagram", n == 4 && &buf[..4] == b"abcd", n);
+    t.ok(b"from port 0", ip == LO && p == 0, i64::from(p));
     close(a);
     close(b);
     t.done();
