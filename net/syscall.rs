@@ -199,7 +199,11 @@ pub fn sys_getsockopt(
     if len < 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let out = match s.getsockopt(level, opt) {
+    let v = OptIn {
+        ptr: val.addr(),
+        len: len as usize,
+    };
+    let out = match s.getsockopt_in(level, opt, v) {
         Some(r) => r?,
         None if level == SOL_SOCKET => sock_getsockopt(&*s, opt)?,
         None => return Err(KernelError::NoProtocolOption),

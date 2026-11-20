@@ -2095,6 +2095,12 @@ pub struct Zone {
   takes shm_nattch to 0 on a SHM_DEST segment marks it deleted there;
   either then takes it out of the table (`IpcIds.inner`, after the
   perm lock is released) and destroys it, exactly once.
+- A driver mapping's hold (`mm::vma::VmHold`, Linux vm_ops open/close,
+  from `FileOps::mmap_hold`, which do_mmap calls with the mm lock held
+  for writing before linking the VMA: mm lock -> the driver's lock, as
+  Linux mmap_lock -> po->pg_vec_lock in packet_mmap) is cloned and
+  dropped with the VMA, possibly under the mm lock: open/close only
+  count (atomics), taking no lock. Such VMAs never merge.
 - The page-fault path (`mm/fault.rs`, `handle_mm_fault`, shared by
   both arches) holds the mm lock for reading from the VMA lookup through
   the PTE update (Linux lock_mm_and_find_vma: a stack that must grow

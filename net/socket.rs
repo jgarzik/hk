@@ -149,6 +149,41 @@ pub trait ProtoOps: Send + Sync {
     fn getsockopt(&self, _level: i32, _opt: i32) -> Option<Result<OptOut, KernelError>> {
         None
     }
+    /// getsockopt with the caller's buffer `v` (its length, read as
+    /// input by options such as PACKET_HDRLEN; Linux passes optval to
+    /// getsockopt). Default: `getsockopt`.
+    fn getsockopt_in(
+        &self,
+        level: i32,
+        opt: i32,
+        _v: OptIn,
+    ) -> Option<Result<OptOut, KernelError>> {
+        self.getsockopt(level, opt)
+    }
+    /// mmap of the socket file (Linux proto_ops->mmap; sock_no_mmap's
+    /// ENODEV by default); its pages are inserted by `map_page`
+    fn mmap(&self) -> Result<(), KernelError> {
+        Err(KernelError::NoDevice)
+    }
+    /// May a mapping start at byte `off` (Linux: vm_pgoff checked by
+    /// proto_ops->mmap)? Default: any offset.
+    fn mmap_offset(&self, _off: u64) -> Result<(), KernelError> {
+        Ok(())
+    }
+    /// A mapping of `len` bytes is about to be linked (`FileOps::mmap_hold`)
+    fn mmap_hold(&self, _len: u64) -> Result<Option<crate::mm::vma::VmHold>, KernelError> {
+        Ok(None)
+    }
+    /// Page `idx` of a mapping (`FileOps::map_page`)
+    ///
+    /// # Safety
+    /// As `FileOps::map_page`: the caller maps the page with the
+    /// reference taken here and drops it with the mapping; the
+    /// implementor returns a RAM frame that stays allocated while the
+    /// reference is held and holds only what user space may access.
+    unsafe fn map_page(&self, _idx: u64) -> Option<u64> {
+        None
+    }
     /// `flags` includes MSG_DONTWAIT for non-blocking files
     fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError>;
     fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError>;
@@ -366,6 +401,44 @@ impl FileOps for SockFile {
             s.release();
         }
         Ok(())
+    }
+
+    /// Linux sock_mmap: the protocol's mmap
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
+        sock_of(file).ok_or(KernelError::NotSocket)?.mmap()
+    }
+
+    fn mmap_offset(&self, file: &File, off: u64) -> Result<(), KernelError> {
+        sock_of(file)
+            .ok_or(KernelError::NotSocket)?
+            .mmap_offset(off)
+    }
+
+    fn mmap_hold(
+        &self,
+        file: &File,
+        len: u64,
+    ) -> Result<Option<crate::mm::vma::VmHold>, KernelError> {
+        match sock_of(file) {
+            Some(s) => s.mmap_hold(len),
+            None => Ok(None),
+        }
+    }
+
+    fn maps_driver_pages(&self, file: &File) -> bool {
+        sock_of(file).is_some_and(|s| s.mmap().is_ok())
+    }
+
+    // SAFETY: the protocol's `map_page` has the same contract
+    unsafe fn map_page(
+        &self,
+        file: &File,
+        _off: u64,
+        idx: u64,
+    ) -> Option<Result<u64, KernelError>> {
+        let s = sock_of(file)?;
+        // SAFETY: the caller's obligations are passed on unchanged
+        unsafe { s.map_page(idx) }.map(Ok)
     }
 
     /// Linux sock_fasync: the socket's list; an allocation failure is

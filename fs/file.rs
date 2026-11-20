@@ -367,6 +367,19 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
+    /// The new mapping of `len` bytes, its offset accepted, is about to
+    /// be linked, the mmap_lock held for writing (Linux f_op->mmap with
+    /// the VMA built, as packet_mmap checking the size and counting the
+    /// mapping): refuse it, or give the VMA a hold that counts it
+    /// (cloned and dropped with the VMA). Default: any size, no hold.
+    fn mmap_hold(
+        &self,
+        _file: &File,
+        _len: u64,
+    ) -> Result<Option<crate::mm::vma::VmHold>, KernelError> {
+        Ok(None)
+    }
+
     /// A mapping of the file in address space `mm` moved to `start`,
     /// `len` bytes, by mremap (Linux vm_ops->mremap, which has the vma's
     /// vm_mm), before its entries move, the mmap_lock held for writing;

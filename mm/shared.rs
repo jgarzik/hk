@@ -9,7 +9,8 @@
 //! makes a Rust reference to its bytes: words it shares with user space
 //! are atomics, and records are copied in and out with volatile
 //! accesses, each field read exactly once into the copy (doc/UNSAFE.md
-//! rule 8).
+//! rule 8). A [`PgVec`] is several such regions mapped back to back
+//! (AF_PACKET rings).
 
 use core::sync::atomic::AtomicU32;
 
@@ -105,6 +106,95 @@ impl SharedRegion {
         // SAFETY: in bounds and aligned (checked), the region's frames,
         // to which no Rust reference exists (module docs)
         unsafe { p.write_volatile(v) }
+    }
+
+    /// Copy `src` to byte `off` (in bounds: asserted), byte by byte
+    /// volatile (Linux skb_copy_bits into a ring frame)
+    pub fn copy_in(&self, off: usize, src: &[u8]) {
+        let p = self.ptr(off, src.len(), 1);
+        for (i, b) in src.iter().enumerate() {
+            // SAFETY: byte `i` of the `src.len()` bytes checked in
+            // bounds, the region's frames, never referenced (module docs)
+            unsafe { p.add(i).write_volatile(*b) };
+        }
+    }
+
+    /// Copy `dst.len()` bytes at `off` (in bounds: asserted) out, each
+    /// read once (Linux tpacket_fill_skb taking a TX ring frame)
+    pub fn copy_out(&self, off: usize, dst: &mut [u8]) {
+        let p = self.ptr(off, dst.len(), 1);
+        for (i, b) in dst.iter_mut().enumerate() {
+            // SAFETY: as in `copy_in`; any byte is a valid u8
+            *b = unsafe { p.add(i).read_volatile() };
+        }
+    }
+
+    /// Zero `len` bytes at `off` (in bounds: asserted)
+    pub fn zero(&self, off: usize, len: usize) {
+        let p = self.ptr(off, len, 1);
+        for i in 0..len {
+            // SAFETY: as in `copy_in`
+            unsafe { p.add(i).write_volatile(0) };
+        }
+    }
+}
+
+/// Equal blocks shared with user space, each physically contiguous,
+/// the blocks not contiguous with each other (Linux af_packet's pg_vec
+/// from alloc_pg_vec: tp_block_nr blocks of tp_block_size bytes, which
+/// packet_mmap maps back to back)
+pub struct PgVec {
+    blocks: alloc::vec::Vec<SharedRegion>,
+    /// Pages per block (Linux pg_vec_pages)
+    block_pages: usize,
+}
+
+impl PgVec {
+    /// `nr` zeroed blocks of `block_size` bytes (a non-zero multiple of
+    /// the page size: asserted); ENOMEM (Linux alloc_pg_vec)
+    pub fn new(nr: usize, block_size: usize) -> Result<Self, KernelError> {
+        assert!(
+            block_size != 0 && block_size.is_multiple_of(PAGE_SIZE as usize),
+            "pg_vec block size"
+        );
+        let mut blocks = crate::util::kmem::KVec::try_with_capacity(nr)?;
+        for _ in 0..nr {
+            blocks.try_push(SharedRegion::new(block_size)?)?;
+        }
+        Ok(Self {
+            blocks: blocks.into_vec(),
+            block_pages: block_size / PAGE_SIZE as usize,
+        })
+    }
+
+    /// Block `i` (panics past the end)
+    pub fn block(&self, i: usize) -> &SharedRegion {
+        &self.blocks[i]
+    }
+
+    /// Number of blocks (Linux pg_vec_len)
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// No blocks
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// Size in pages, all blocks
+    pub fn pages(&self) -> usize {
+        self.blocks.len() * self.block_pages
+    }
+
+    /// Page `i` of the blocks laid back to back, with a reference taken
+    /// for its PTE (Linux packet_mmap's vm_insert_page loop); None past
+    /// the end
+    pub fn map_page(&self, i: u64) -> Option<u64> {
+        let b = self
+            .blocks
+            .get(usize::try_from(i).ok()? / self.block_pages)?;
+        b.map_page(i % self.block_pages as u64)
     }
 }
 
