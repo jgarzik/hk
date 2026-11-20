@@ -262,8 +262,9 @@ impl Default for InDevice {
 
 impl InDevice {
     /// Registration of `dev` (this device) in `net` (Linux
-    /// inetdev_init): the namespace's default configuration and ARP's
-    /// default parameters (neigh_parms_alloc), state bits included, and
+    /// inetdev_init): the namespace's default configuration, state
+    /// bits included, ARP's default parameters without theirs
+    /// (neigh_parms_alloc), and
     /// its sysctl directories (devinet_sysctl_register)
     pub fn init(&self, net: &crate::net::NetNamespace, name: &str) {
         self.cnf.copy_from(&net.devconf_dflt);
@@ -542,10 +543,24 @@ pub fn inet_replace_ifa(
     rtnetlink::notify_addr(net, dev, &x, rtnetlink::RTM_NEWADDR, nl);
 }
 
+/// Every devconf attribute and ARP parameter of `dev` marked as its
+/// own, so "default" no longer reaches them: a device given an address
+/// by the user or lo coming up (Linux ipv4_devconf_setall and
+/// neigh_parms_data_state_setall in rtm_to_ifa, inet_set_ifa and
+/// inetdev_event NETDEV_UP)
+pub fn devconf_setall(dev: &NetDevice) {
+    dev.in_dev().cnf.setall();
+    dev.in_dev().arp_parms.setall();
+}
+
 /// Device came up (Linux inetdev_event/fib_netdev_event NETDEV_UP): `lo`
-/// gets 127.0.0.1/8 if it has no address; every address's routes are
+/// has its settings marked its own (`devconf_setall`) and gets
+/// 127.0.0.1/8 if it has no address; every address's routes are
 /// (re)installed
 pub fn inetdev_up(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    if dev.is_loopback() {
+        devconf_setall(dev);
+    }
     if dev.is_loopback() && !dev.in_dev().has_addrs() {
         let mut ifa = InIfaddr::new(Ipv4Addr::new(127, 0, 0, 1), 8, dev.name());
         ifa.scope = RT_SCOPE_HOST;

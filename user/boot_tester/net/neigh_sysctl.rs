@@ -145,7 +145,10 @@ fn test_neigh_defaults() {
 }
 
 /// A device inherits "default" until its own value is written (Linux
-/// data_state, neigh_copy_dflt_parms)
+/// data_state, neigh_copy_dflt_parms) or it gets an address or, for lo,
+/// comes up (rtm_to_ifa, inetdev_event NETDEV_UP:
+/// neigh_parms_data_state_setall): eth0 and lo keep theirs. A new
+/// namespace's lo copies "default" as it is then (neigh_parms_alloc).
 fn test_neigh_inherit() {
     let mut t = T::new(b"NEIGH_SYSCTL_INHERIT");
     let (d, e, l) = (
@@ -153,16 +156,43 @@ fn test_neigh_inherit() {
         neigh(b"eth0", b"ucast_solicit"),
         neigh(b"lo", b"ucast_solicit"),
     );
-    t.eq(b"own", put(&e, 7), 1);
-    t.eq(b"own read", val(&e), 7);
-    t.eq(b"default kept", val(&d), 3);
     t.eq(b"dflt", put(&d, 5), 1);
-    t.eq(b"lo inherits", val(&l), 5);
-    t.eq(b"eth0 keeps", val(&e), 7);
+    t.eq(b"eth0 keeps", val(&e), 3);
+    t.eq(b"lo keeps", val(&l), 3);
+    let st = in_netns(|| {
+        if val(&neigh(b"lo", b"ucast_solicit")) != 5 {
+            return 10;
+        }
+        0
+    });
     t.eq(b"restore", put(&d, 3), 1);
-    t.eq(b"lo back", val(&l), 3);
-    t.eq(b"eth0 restore", put(&e, 3), 1);
-    t.done();
+    if !netns_skip(st, b"NEIGH_SYSCTL_INHERIT") {
+        t.eq(b"netns lo copies", st, 0);
+        t.done();
+    }
+}
+
+/// Run `f` in a child in a new network namespace: its wait status
+fn in_netns(f: fn() -> u64) -> i64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        sys_exit(f());
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    i64::from(st)
+}
+
+/// A host without CLONE_NEWNET for us: the test skipped
+fn netns_skip(st: i64, name: &[u8]) -> bool {
+    if st == 2 << 8 && crate::helpers::host_mode() {
+        crate::helpers::skip(name, b"unshare(CLONE_NEWNET) not permitted");
+        return true;
+    }
+    false
 }
 
 /// Units and bounds: ms and seconds of one value, USER_HZ ticks,
@@ -238,8 +268,11 @@ fn test_conf_defaults() {
     t.done();
 }
 
-/// "default" reaches devices whose value was never written; disable_*
-/// and promote_secondaries are not carried (Linux devinet_conf_proc)
+/// "default" reaches devices whose value was never written, not one
+/// given an address nor lo once up (Linux devinet_copy_dflt_conf;
+/// rtm_to_ifa, inetdev_event NETDEV_UP: ipv4_devconf_setall): a new
+/// namespace's lo follows until it is up; disable_* and
+/// promote_secondaries are not carried (Linux devinet_conf_proc)
 fn test_conf_inherit() {
     let mut t = T::new(b"CONF_SYSCTL_INHERIT");
     let (d, e, l) = (
@@ -247,13 +280,26 @@ fn test_conf_inherit() {
         conf(b"eth0", b"arp_ignore"),
         conf(b"lo", b"arp_ignore"),
     );
-    t.eq(b"own", put(&e, 2), 1);
     t.eq(b"dflt", put(&d, 1), 1);
-    t.eq(b"lo inherits", val(&l), 1);
-    t.eq(b"eth0 keeps", val(&e), 2);
+    t.eq(b"eth0 keeps", val(&e), 0);
+    t.eq(b"lo keeps", val(&l), 0);
     t.eq(b"restore", put(&d, 0), 1);
-    t.eq(b"lo back", val(&l), 0);
-    t.eq(b"eth0 restore", put(&e, 0), 1);
+    let st = in_netns(|| {
+        // Not arp_ignore: written above, its state bit came along with
+        // "default" (devinet_init_net) and lo's copy (inetdev_init)
+        let (d, l) = (conf(b"default", b"arp_filter"), conf(b"lo", b"arp_filter"));
+        if put(&d, 1) != 1 || val(&l) != 1 {
+            return 10;
+        }
+        crate::helpers::loopback_up();
+        if put(&d, 2) != 1 || val(&l) != 1 {
+            return 11;
+        }
+        0
+    });
+    if !netns_skip(st, b"CONF_SYSCTL_INHERIT") {
+        t.eq(b"netns lo", st, 0);
+    }
     let (dp, ep) = (
         conf(b"default", b"promote_secondaries"),
         conf(b"eth0", b"promote_secondaries"),
@@ -305,25 +351,16 @@ fn test_netns() {
     let mut t = T::new(b"CONF_SYSCTL_NETNS");
     let d = conf(b"default", b"arp_announce");
     t.eq(b"set", put(&d, 2), 1);
-    let pid = sys_fork();
-    if pid == 0 {
-        sys_exit(netns_child());
-    }
-    let mut st = 0;
-    sys_wait4(pid, &mut st, 0, 0);
+    let st = in_netns(netns_child);
     t.eq(b"restore", put(&d, 0), 1);
-    if st == 2 << 8 && crate::helpers::host_mode() {
-        crate::helpers::skip(b"CONF_SYSCTL_NETNS", b"unshare(CLONE_NEWNET) not permitted");
+    if netns_skip(st, b"CONF_SYSCTL_NETNS") {
         return;
     }
-    t.eq(b"child", st as i64, 0);
+    t.eq(b"child", st, 0);
     t.done();
 }
 
 fn netns_child() -> u64 {
-    if sys_unshare(CLONE_NEWNET) != 0 {
-        return 2;
-    }
     if val(&conf(b"default", b"arp_announce")) != 2 {
         return 10;
     }

@@ -214,20 +214,14 @@ impl NeighParms {
         p
     }
 
-    /// A device's set, a copy of `dflt` with its state (Linux
-    /// neigh_parms_alloc: kmemdup of tbl->parms)
-    pub fn alloc(dflt: &Self) -> Self {
-        let p = Self::arp_default();
-        p.copy_from(dflt);
-        p
-    }
-
-    /// Become a copy of `src`, state included (re-registration)
+    /// Become a device's copy of the defaults `src`'s values, none
+    /// marked written (Linux neigh_parms_alloc: kmemdup of tbl->parms,
+    /// then neigh_parms_data_state_cleanall)
     pub fn copy_from(&self, src: &Self) {
         for (d, s) in self.data.iter().zip(&src.data) {
             d.store(s.load(Relaxed), Relaxed);
         }
-        self.data_state.store(src.data_state.load(Relaxed), Relaxed);
+        self.data_state.store(0, Relaxed);
         self.set_reach_time();
     }
 
@@ -249,6 +243,11 @@ impl NeighParms {
     /// Mark value `i` written (Linux set_bit data_state)
     pub fn mark(&self, i: usize) {
         self.data_state.fetch_or(1 << i, Relaxed);
+    }
+
+    /// Every value as written (Linux neigh_parms_data_state_setall)
+    pub fn setall(&self) {
+        self.data_state.store((1 << var::DATA_MAX) - 1, Relaxed);
     }
 
     /// Draw a new reachable time (Linux neigh_set_reach_time)

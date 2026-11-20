@@ -1379,6 +1379,7 @@ fn newaddr(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo, ext: &ExtAck) -> Result<D
         ext.msg("ipv4: Device not found");
         return Err(KernelError::NoDevice);
     };
+    ifaddr::devconf_setall(&dev);
     let mut ifa = InIfaddr::new(local, ifm.prefixlen, dev.name());
     ifa.address = at.address.unwrap_or(local);
     ifa.set_flags(at.flags.unwrap_or(u32::from(ifm.flags)) | IFA_F_PERMANENT);

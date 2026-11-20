@@ -142,6 +142,12 @@ impl DevConf {
         self.put(i, v);
     }
 
+    /// Every attribute as written: "default" reaches it no more (Linux
+    /// ipv4_devconf_setall)
+    pub fn setall(&self) {
+        self.state.store((1 << ci::MAX) - 1, Relaxed);
+    }
+
     /// Become a copy of `src`, state included (Linux inetdev_init's
     /// memcpy of devconf_dflt; devinet_init_net's copy of init_net's)
     pub fn copy_from(&self, src: &Self) {
