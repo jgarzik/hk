@@ -1289,29 +1289,47 @@ fn piece(seq: u32, len: usize, v: u8) -> Box<SkBuff> {
 /// covers; partial overlaps are trimmed as they reach RCV.NXT
 #[test]
 fn ooo_insert_and_take() {
-    use super::cb::Ooo;
+    use super::cb::{Ins, Ooo};
+    use super::sack::Dsack;
     let mut o = Ooo::default();
-    assert!(o.insert(piece(110, 10, 1)));
-    assert!(o.insert(piece(130, 10, 3)));
-    assert!(!o.insert(piece(112, 4, 9)), "covered");
-    assert!(o.insert(piece(118, 14, 2)));
+    let q = |o: &mut Ooo, s| o.insert(s, None).0;
+    assert_eq!(q(&mut o, piece(110, 10, 1)), Ins::Queued);
+    assert_eq!(q(&mut o, piece(130, 10, 3)), Ins::Queued);
+    // Covered: dropped, its bytes D-SACKed
+    let mut d = Dsack::default();
+    assert_eq!(o.insert(piece(112, 4, 9), Some(&mut d)), (Ins::Covered, 1));
+    assert_eq!((d.on, d.blk), (true, (112, 116)));
+    // A partial overlap with the one before (and the one after)
+    let mut d = Dsack::default();
+    assert_eq!(o.insert(piece(118, 14, 2), Some(&mut d)), (Ins::Queued, 1));
+    assert_eq!(d.blk, (118, 120));
     assert_eq!((o.pieces(), o.bytes()), (3, 34));
-    assert!(o.take(100).is_none());
-    let a = o.take(110).unwrap();
+    assert!(o.take(100, 100, None).0.is_none());
+    let a = o.take(110, 110, None).0.unwrap();
     assert_eq!((a.tcp().seq, a.data()), (110, &[1u8; 10][..]));
-    let b = o.take(120).unwrap();
+    // Bytes RCV.NXT passed before the walk are D-SACKed
+    let mut d = Dsack::default();
+    let (b, n) = o.take(120, 120, Some(&mut d));
+    let b = b.unwrap();
     assert_eq!((b.tcp().seq, b.data()), (120, &[2u8; 12][..]));
-    let c = o.take(132).unwrap();
+    assert_eq!((n, d.blk), (1, (118, 120)));
+    let c = o.take(132, 132, None).0.unwrap();
     assert_eq!((c.tcp().seq, c.data()), (132, &[3u8; 8][..]));
     assert!(o.is_empty() && o.bytes() == 0);
     // Same start, longer: replaces and swallows what it covers
-    o.insert(piece(200, 5, 1));
-    o.insert(piece(210, 5, 2));
-    o.insert(piece(220, 5, 3));
-    assert!(o.insert(piece(200, 22, 7)));
+    q(&mut o, piece(200, 5, 1));
+    q(&mut o, piece(210, 5, 2));
+    q(&mut o, piece(220, 5, 3));
+    let mut d = Dsack::default();
+    assert_eq!(o.insert(piece(200, 22, 7), Some(&mut d)), (Ins::Queued, 1));
+    assert_eq!(
+        d.blk,
+        (200, 205),
+        "only blocks touching the first extend it"
+    );
     assert_eq!((o.pieces(), o.bytes()), (2, 27));
     // An skb RCV.NXT already passed is dropped on the way
-    assert_eq!(o.take(230).map(|s| s.tcp().seq), None);
+    assert_eq!(o.take(230, 230, None).0.map(|s| s.tcp().seq), None);
     assert!(o.is_empty());
 }
 
@@ -1319,8 +1337,8 @@ fn ooo_insert_and_take() {
 fn ooo_prune_from_the_top() {
     use super::cb::Ooo;
     let mut o = Ooo::default();
-    o.insert(piece(110, 10, 1));
-    o.insert(piece(130, 10, 3));
+    o.insert(piece(110, 10, 1), None);
+    o.insert(piece(130, 10, 3), None);
     // Only skbs beyond the incoming segment go, highest first
     assert!(o.prune_after(120));
     assert_eq!(o.bytes(), 10);
@@ -1511,16 +1529,19 @@ fn ooo_pieces_bounded() {
     let mut o = Ooo::default();
     // Many tiny scattered segments: bounded pieces, charged overhead
     for i in 0..2000u32 {
-        o.insert(piece(10 + i * 3, 1, 1));
+        o.insert(piece(10 + i * 3, 1, 1), None);
     }
     assert_eq!(o.pieces(), OOO_MAX);
     assert_eq!(o.truesize(), OOO_MAX * (1 + super::cb::OOO_OVERHEAD));
     // Sequence numbers wrap
     let mut o = Ooo::default();
-    o.insert(piece(0xffff_fffc, 8, 4));
-    o.insert(piece(10, 4, 5));
-    assert_eq!(o.take(0xffff_fffe).unwrap().data(), &[4u8; 6][..]);
-    assert_eq!(o.take(10).unwrap().data(), &[5u8; 4][..]);
+    o.insert(piece(0xffff_fffc, 8, 4), None);
+    o.insert(piece(10, 4, 5), None);
+    assert_eq!(
+        o.take(0xffff_fffe, 0xffff_fffe, None).0.unwrap().data(),
+        &[4u8; 6][..]
+    );
+    assert_eq!(o.take(10, 10, None).0.unwrap().data(), &[5u8; 4][..]);
 }
 
 // ============================================================================
@@ -2280,4 +2301,107 @@ fn sack_negotiation() {
     let p = Pair::with_cfgs(1460, 64 * 1024, off, cfg());
     assert!(!p.log[0].2.sack_perm && !p.log[1].2.sack_perm);
     assert!(p.a.sack_ok == 0 && p.b.sack_ok == 0);
+}
+
+/// Segments queued for b, taken off the wire undelivered
+fn take_to_b(p: &mut Pair) -> Vec<Seg> {
+    let mut v = Vec::new();
+    while let Some((to_b, s)) = p.wire.pop_front() {
+        assert!(to_b);
+        v.push(s);
+    }
+    v
+}
+
+/// Feed `s` to b; what b sends back
+fn feed_b(p: &mut Pair, s: &Seg) -> Vec<Seg> {
+    let mut out = Out::default();
+    p.b.feed(&seg_in(s), p.now, &mut out);
+    wire(&out)
+}
+
+/// Out-of-order data is reported newest block first, merged as holes
+/// fill, three blocks beside the timestamp (Linux
+/// tcp_sack_new_ofo_skb, tcp_sack_remove, tcp_established_options)
+#[test]
+fn sack_blocks_for_out_of_order_data() {
+    let mut p = Pair::new(1000);
+    let mss = p.a.live.mss.get();
+    p.send_a(&pattern(10 * mss as usize));
+    let segs = take_to_b(&mut p);
+    assert_eq!(segs.len(), 10);
+    let base = segs[0].seq;
+    let blk = |i: u32, j: u32| (base + i * mss, base + j * mss);
+    // 1, 3, 5, 7 lost: each arrival beyond a hole is SACKed at once
+    let mut acks = Vec::new();
+    for i in [0, 2, 4, 6, 8, 9] {
+        acks.extend(feed_b(&mut p, &segs[i]));
+    }
+    let last = acks.last().unwrap();
+    assert_eq!(last.ack, blk(1, 1).0);
+    assert_eq!(last.sack.blocks(), &[blk(8, 10), blk(6, 7), blk(4, 5)]);
+    // Filling hole 3 merges two blocks; the oldest reappears
+    let a = feed_b(&mut p, &segs[3]);
+    assert_eq!(a[0].sack.blocks(), &[blk(2, 5), blk(8, 10), blk(6, 7)]);
+    // Filling hole 1 moves RCV.NXT past a block
+    let a = feed_b(&mut p, &segs[1]);
+    assert_eq!(a[0].ack, blk(5, 5).0);
+    assert_eq!(a[0].sack.blocks(), &[blk(8, 10), blk(6, 7)]);
+    feed_b(&mut p, &segs[5]);
+    let a = feed_b(&mut p, &segs[7]);
+    assert_eq!((a[0].ack, a[0].sack.n), (blk(10, 10).0, 0));
+    // Without SACK no blocks
+    let mut p = Pair::with_cfgs(
+        1000,
+        64 * 1024,
+        Cfg {
+            sack: false,
+            ..cfg()
+        },
+        cfg(),
+    );
+    p.send_a(&pattern(3000));
+    let segs = take_to_b(&mut p);
+    let a = feed_b(&mut p, &segs[2]);
+    assert_eq!(a[0].sack.n, 0);
+}
+
+/// A duplicate is reported once in a D-SACK block ahead of the SACK
+/// blocks (Linux tcp_dsack_set, TCPDSACKOldSent / TCPDSACKOfoSent)
+#[test]
+fn dsack_reports_duplicates() {
+    let mut p = Pair::new(1000);
+    let mib = crate::net::mib::NetMib::new().unwrap();
+    p.b.mib = Some(mib.clone());
+    let mss = p.a.live.mss.get();
+    p.send_a(&pattern(3 * mss as usize));
+    let segs = take_to_b(&mut p);
+    feed_b(&mut p, &segs[0]);
+    // An old duplicate: D-SACK of it, nothing else
+    let a = feed_b(&mut p, &segs[0]);
+    assert_eq!(a[0].sack.blocks(), &[(segs[0].seq, segs[1].seq)]);
+    // ... sent once
+    let a = feed_b(&mut p, &segs[2]);
+    let ofo = (segs[2].seq, segs[2].seq + mss);
+    assert_eq!(a[0].sack.blocks(), &[ofo]);
+    // An out-of-order duplicate: D-SACK first, then the block
+    let a = feed_b(&mut p, &segs[2]);
+    assert_eq!(a[0].sack.blocks(), &[ofo, ofo]);
+    use crate::net::mib::*;
+    assert_eq!(mib.net.fold(LINUX_MIB_TCPDSACKOLDSENT), 1);
+    assert_eq!(mib.net.fold(LINUX_MIB_TCPDSACKOFOSENT), 1);
+    // tcp_dsack=0: none
+    let mut p = Pair::with_cfgs(
+        1000,
+        64 * 1024,
+        cfg(),
+        Cfg {
+            dsack: false,
+            ..cfg()
+        },
+    );
+    p.send_a(&pattern(1000));
+    let segs = take_to_b(&mut p);
+    feed_b(&mut p, &segs[0]);
+    assert_eq!(feed_b(&mut p, &segs[0])[0].sack.n, 0);
 }

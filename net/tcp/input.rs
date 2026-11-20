@@ -16,7 +16,7 @@
 //! goes out, or the delayed ACK timer is armed (`ack.rs`).
 
 use super::cb::{
-    MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb,
+    Ins, MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb,
     TcpState, Tmr, after, before, between, flags, wake,
 };
 use crate::net::mib::*;
@@ -386,9 +386,16 @@ impl TcpCb {
     /// tcp_send_dupack: duplicated data means our ACK was lost, so stop
     /// delaying ACKs for a while)
     fn dupack(&mut self, s: &SegIn, out: &mut Out) {
-        if s.data_len() != 0 && before(s.seq, self.rcv_nxt) {
+        if s.seq_len() != 0 && before(s.seq, self.rcv_nxt) {
             self.net_stat(LINUX_MIB_DELAYEDACKLOST);
             self.enter_quickack();
+            let end = s.seq.wrapping_add(s.seq_len());
+            let end = if after(end, self.rcv_nxt) {
+                self.rcv_nxt
+            } else {
+                end
+            };
+            self.dsack_set(s.seq, end);
         }
         self.send_ack(out);
     }
@@ -557,6 +564,10 @@ impl TcpCb {
         let mut seq = s.seq.wrapping_add(u32::from(s.has(flags::SYN)));
         let mut len = skb.len();
         let mut fin = s.has(flags::FIN);
+        if len != 0 || fin {
+            // Linux tcp_data_queue: a D-SACK is for this segment only
+            self.dsack.on = false;
+        }
         if before(seq, self.rcv_nxt) {
             // Old bytes: acknowledge again, keep only what is new
             let skip = self.rcv_nxt.wrapping_sub(seq) as usize;
@@ -566,9 +577,13 @@ impl TcpCb {
                     self.net_stat(LINUX_MIB_DELAYEDACKLOST);
                     self.enter_quickack();
                 }
+                let end = seq.wrapping_add(len as u32 + u32::from(fin));
+                self.dsack_set(seq, end);
                 self.ack_now = true;
                 return;
             }
+            // Partly old (Linux tcp_data_queue: D-SACK its head)
+            self.dsack_set(seq, self.rcv_nxt);
             self.ack_now = true;
             let _ = skb.pull(skip);
             len -= skip;
@@ -681,6 +696,10 @@ impl TcpCb {
             if !self.ooo.prune_after(seq) {
                 break false;
             }
+            // Linux tcp_prune_ofo_queue: the blocks are stale now
+            if self.is_sack() {
+                self.sack_reset();
+            }
             // Each pass that freed some (Linux tcp_prune_ofo_queue)
             self.net_stat(LINUX_MIB_OFOPRUNED);
         };
@@ -714,7 +733,20 @@ impl TcpCb {
         self.stats.bytes_received += len as u64;
         skb.dev = None;
         if skb.tcp().seq != self.rcv_nxt {
-            self.ooo.insert(skb);
+            let (seq, end) = (skb.tcp().seq, skb.tcp().seq.wrapping_add(len as u32));
+            let first = self.ooo.is_empty();
+            let d = self.dsack_on().then_some(&mut self.dsack);
+            let (ins, sets) = self.ooo.insert(skb, d);
+            self.net_add(LINUX_MIB_TCPDSACKOFOSENT, sets);
+            if self.is_sack() && ins != Ins::Full {
+                if first {
+                    // Linux tcp_data_queue_ofo: the first one, one block
+                    self.selective_acks.n = 1;
+                    self.selective_acks.b[0] = (seq, end);
+                } else {
+                    self.sack_new_ofo_skb(seq, end);
+                }
+            }
             let m = core::mem::take(&mut self.ooo.merged);
             self.net_add(LINUX_MIB_TCPOFOMERGE, m);
             self.ack_now = true;
@@ -723,8 +755,20 @@ impl TcpCb {
         }
         let had_ooo = !self.ooo.is_empty();
         self.rcv_queue(skb);
-        while let Some(d) = self.ooo.take(self.rcv_nxt) {
-            self.rcv_queue(d);
+        // Linux tcp_ofo_queue: bytes below RCV.NXT as it starts are
+        // D-SACKed
+        let high = self.rcv_nxt;
+        loop {
+            let d = self.dsack_on().then_some(&mut self.dsack);
+            let (next, sets) = self.ooo.take(self.rcv_nxt, high, d);
+            self.net_add(LINUX_MIB_TCPDSACKOLDSENT, sets);
+            let Some(next) = next else {
+                break;
+            };
+            self.rcv_queue(next);
+        }
+        if self.selective_acks.n != 0 {
+            self.sack_remove();
         }
         self.data_recv(len as u32, now);
         if had_ooo {
@@ -745,6 +789,10 @@ impl TcpCb {
     /// The peer's FIN is in sequence (RFC 9293 eighth check)
     fn rcv_fin(&mut self, out: &mut Out) {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+        // Linux tcp_fin: nothing beyond the FIN is held
+        if self.is_sack() {
+            self.sack_reset();
+        }
         self.ack_now = true;
         out.shut |= RCV_SHUTDOWN;
         out.wake |= wake::STATE | wake::FIN;

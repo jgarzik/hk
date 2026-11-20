@@ -34,9 +34,10 @@ use alloc::sync::Arc;
 use super::ack::Dack;
 use super::cong::Cong;
 use super::mem;
+use super::sack::Dsack;
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::*;
-use crate::net::skb::{SkBuff, SkbHead, SkbTree};
+use crate::net::skb::{Sacks, SkBuff, SkbHead, SkbTree};
 use crate::sync::{SoleCell, Word};
 use crate::util::error::KernelError;
 
@@ -173,6 +174,8 @@ pub struct Cfg {
     pub ts: u8,
     /// tcp_sack: offer and accept SACK
     pub sack: bool,
+    /// tcp_dsack: report duplicate segments in D-SACK blocks
+    pub dsack: bool,
     /// tcp_rmem[0]: receive bytes a connection may always hold below
     /// the hard memory limit
     pub rmem_min: u32,
@@ -194,6 +197,7 @@ impl Default for Cfg {
             wscale: true,
             ts: 1,
             sack: true,
+            dsack: true,
             rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
             keepidle: 7_200_000,
@@ -517,50 +521,85 @@ impl Ooo {
         self.tree.is_empty()
     }
 
-    /// Queue `skb` (payload at `skb.tcp.seq`, beyond RCV.NXT): false if
-    /// it was dropped (covered already, or the queue is full)
-    pub fn insert(&mut self, skb: Box<SkBuff>) -> bool {
+    /// Queue `skb` (payload at `skb.tcp.seq`, beyond RCV.NXT; Linux
+    /// tcp_data_queue_ofo). Duplicate bytes go into `d` (Linux
+    /// tcp_dsack_set / tcp_dsack_extend: wholly covered, a partial
+    /// overlap with the one before, the ones it covers); returns what
+    /// became of it and how many D-SACK blocks were started (each a
+    /// TCPDSACKOfoSent)
+    pub fn insert(&mut self, skb: Box<SkBuff>, mut d: Option<&mut Dsack>) -> (Ins, u64) {
         let (seq, end) = (skb.tcp().seq, data_end(&skb));
+        let mut sets = 0;
         let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp().seq, seq));
         if let Some(prev) = c.current() {
-            if !after(end, data_end(prev)) {
-                // Wholly inside one held (Linux: DSACK, drop)
+            let pend = data_end(prev);
+            if !after(end, pend) {
+                // Wholly inside one held: drop
                 self.merged += 1;
-                return false;
+                if let Some(d) = d.as_deref_mut() {
+                    d.on = false;
+                    sets += u64::from(d.extend(seq, end));
+                }
+                return (Ins::Covered, sets);
             }
             if prev.tcp().seq == seq {
                 // It covers `prev` (Linux rb_replace_node)
+                let pseq = prev.tcp().seq;
                 let len = skb.len();
                 let old = c.replace_current(skb);
                 self.bytes = self.bytes + len - old.len();
                 self.merged += 1;
-                self.drop_covered(seq, end);
-                return true;
+                if let Some(d) = d.as_deref_mut() {
+                    sets += u64::from(d.extend(pseq, pend));
+                }
+                sets += self.drop_covered(seq, end, d);
+                return (Ins::Queued, sets);
+            }
+            if before(seq, pend) {
+                // Partial overlap with the one before
+                if let Some(d) = d.as_deref_mut() {
+                    d.on = false;
+                    sets += u64::from(d.extend(seq, pend));
+                }
             }
         }
         if self.tree.len() >= OOO_MAX {
-            return false;
+            return (Ins::Full, sets);
         }
         self.bytes += skb.len();
         self.tree
             .insert_by(skb, |a, b| before(a.tcp().seq, b.tcp().seq));
-        self.drop_covered(seq, end);
-        true
+        sets += self.drop_covered(seq, end, d);
+        (Ins::Queued, sets)
     }
 
-    /// Remove the skbs after the one at `seq` that [`seq`, `end`) covers
-    fn drop_covered(&mut self, seq: u32, end: u32) {
+    /// Remove the skbs after the one at `seq` that [`seq`, `end`)
+    /// covers, their bytes D-SACKed, and D-SACK the overlap with the
+    /// first it does not cover (Linux tcp_data_queue_ofo merge_right)
+    fn drop_covered(&mut self, seq: u32, end: u32, mut d: Option<&mut Dsack>) -> u64 {
+        let mut sets = 0;
         let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp().seq, seq));
         c.move_next();
         while let Some(n) = c.current() {
-            if after(data_end(n), end) {
+            let (nseq, nend) = (n.tcp().seq, data_end(n));
+            if !after(end, nseq) {
+                break;
+            }
+            if after(nend, end) {
+                if let Some(d) = d.as_deref_mut() {
+                    sets += u64::from(d.extend(nseq, end));
+                }
                 break;
             }
             if let Some(gone) = c.remove_current() {
                 self.bytes -= gone.len();
                 self.merged += 1;
             }
+            if let Some(d) = d.as_deref_mut() {
+                sets += u64::from(d.extend(nseq, nend));
+            }
         }
+        sets
     }
 
     /// Drop the last skb if it lies after `seq`: true if one went
@@ -579,23 +618,51 @@ impl Ooo {
 
     /// The first skb that reaches `nxt`, its payload trimmed to start
     /// there; skbs `nxt` already passed are dropped on the way (Linux
-    /// tcp_ofo_queue)
-    pub fn take(&mut self, nxt: u32) -> Option<Box<SkBuff>> {
+    /// tcp_ofo_queue). Bytes of each below `high` (RCV.NXT before the
+    /// walk) are D-SACKed into `d`; returns how many blocks that started
+    pub fn take(
+        &mut self,
+        nxt: u32,
+        high: u32,
+        mut d: Option<&mut Dsack>,
+    ) -> (Option<Box<SkBuff>>, u64) {
+        let mut sets = 0;
         loop {
-            let first = self.tree.first()?;
+            let Some(first) = self.tree.first() else {
+                return (None, sets);
+            };
             if after(first.tcp().seq, nxt) {
-                return None;
+                return (None, sets);
             }
-            let mut skb = self.tree.pop_first()?;
+            let Some(mut skb) = self.tree.pop_first() else {
+                return (None, sets);
+            };
             self.bytes -= skb.len();
-            if after(data_end(&skb), nxt) {
-                let skip = nxt.wrapping_sub(skb.tcp().seq) as usize;
+            let (seq, end) = (skb.tcp().seq, data_end(&skb));
+            if before(seq, high)
+                && let Some(d) = d.as_deref_mut()
+            {
+                let e = if before(end, high) { end } else { high };
+                sets += u64::from(d.extend(seq, e));
+            }
+            if after(end, nxt) {
+                let skip = nxt.wrapping_sub(seq) as usize;
                 let _ = skb.pull(skip);
                 skb.tcp_mut().seq = nxt;
-                return Some(skb);
+                return (Some(skb), sets);
             }
         }
     }
+}
+
+/// What became of an skb offered to the out-of-order queue
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ins {
+    Queued,
+    /// Its bytes were all held already
+    Covered,
+    /// Dropped: `OOO_MAX` pieces held
+    Full,
 }
 
 /// The control block
@@ -669,6 +736,11 @@ pub struct TcpCb {
     /// `DSACK_SEEN` once the peer sent a D-SACK); before the handshake
     /// completes, whether we offer or accept it
     pub sack_ok: u8,
+    /// Out-of-order data reported to the peer, the newest block first
+    /// (Linux selective_acks, rx_opt.num_sacks)
+    pub(super) selective_acks: Sacks,
+    /// A duplicate to report once (Linux rx_opt.dsack, duplicate_sack)
+    pub(super) dsack: Dsack,
     /// TSval = clock + ts_off
     pub(super) ts_off: u32,
     /// TS.Recent and the clock when it was stored
@@ -794,6 +866,8 @@ impl TcpCb {
             wscale_ok: Default::default(),
             ts_ok: Default::default(),
             sack_ok: Default::default(),
+            selective_acks: Default::default(),
+            dsack: Default::default(),
             ts_off: Default::default(),
             ts_recent: Default::default(),
             ts_stamp: Default::default(),

@@ -53,6 +53,7 @@ pub mod info;
 pub mod input;
 pub mod mem;
 pub mod output;
+pub mod sack;
 pub mod table;
 #[cfg(test)]
 mod tests;
@@ -302,6 +303,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         wscale: s.tcp_window_scaling.load(Ordering::Relaxed) != 0,
         ts: s.tcp_timestamps.load(Ordering::Relaxed),
         sack: s.tcp_sack.load(Ordering::Relaxed) != 0,
+        dsack: s.tcp_dsack.load(Ordering::Relaxed) != 0,
         rmem_min: s.tcp_rmem[0].load(Ordering::Relaxed).max(1) as u32,
         rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
         keepidle: secs(&s.tcp_keepalive_time),

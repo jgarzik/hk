@@ -123,6 +123,12 @@ impl TcpCb {
             0
         };
         let ts = self.ts_ok.then(|| (self.tsval(), self.ts_recent));
+        // Linux tcp_established_options / tcp_options_write: the blocks
+        // that fit, a pending D-SACK sent once
+        let sack = self.sack_blocks();
+        if sack.n != 0 {
+            self.dsack.on = false;
+        }
         if fl & flags::ACK != 0 {
             self.ack_sent();
         }
@@ -144,6 +150,7 @@ impl TcpCb {
             flags: fl,
             wnd,
             ts,
+            sack,
             ..Default::default()
         };
         h.set_len(len);
@@ -287,7 +294,8 @@ impl TcpCb {
         }
         let avail = self.write_seq.wrapping_sub(self.snd_nxt);
         let (room, cwnd_bound) = self.room();
-        let n = self.len_at_nxt().min(self.live.mss.get()).min(room);
+        let mss = self.cur_mss();
+        let n = self.len_at_nxt().min(mss).min(room);
         let rexmit = before(self.snd_nxt, self.snd_max);
         let fin = self.fin_queued && self.snd_nxt.wrapping_add(n) == self.write_seq && room > n;
         if n == 0 && !fin {
@@ -297,7 +305,7 @@ impl TcpCb {
         let in_flight = self.snd_nxt != self.snd_una;
         // Retransmissions are never held (Linux tcp_retransmit_skb
         // ignores Nagle and cork)
-        if n < self.live.mss.get() && !fin && push != Push::Force && !rexmit {
+        if n < mss && !fin && push != Push::Force && !rexmit {
             // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in
             // flight, wait for a full segment unless this ends the queue
             if n < avail && in_flight && n < self.max_wnd / 2 {
@@ -338,7 +346,7 @@ impl TcpCb {
         if self.snd_nxt == self.snd_max && self.rtt_seq.is_none() {
             self.rtt_seq = Some((next, now));
         }
-        if n < self.live.mss.get() {
+        if n < mss {
             self.snd_sml = next;
         }
         if new && n > 0 {
@@ -467,9 +475,9 @@ impl TcpCb {
             return;
         };
         let (seq, len) = (head.tcp().seq, head.len());
-        let mss = self.live.mss.get() as usize;
+        let mss = self.cur_mss() as usize;
         if len > mss {
-            if !self.send_rtx_at(seq, self.live.mss.get(), flags::ACK, out) {
+            if !self.send_rtx_at(seq, mss as u32, flags::ACK, out) {
                 self.net_stat(LINUX_MIB_TCPRETRANSFAIL);
                 return;
             }
@@ -511,7 +519,7 @@ impl TcpCb {
     /// tcp_retrans_try_collapse / tcp_collapse_retrans: the next skb's
     /// data and FIN move into it)
     fn collapse_head(&mut self) {
-        let mss = self.live.mss.get() as usize;
+        let mss = self.cur_mss() as usize;
         loop {
             let mut c = self.rtx.cursor_front_mut();
             let (Some(h), Some(n)) = (c.current(), c.peek_next()) else {

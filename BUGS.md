@@ -88,8 +88,11 @@ Planned fix:
 
 **Location**: `net/`
 
-Listed because real traffic reaches them: TCP has no SACK (never
-advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
+Listed because real traffic reaches them: TCP's sender ignores SACK
+blocks (no scoreboard; NewReno recovery only), no SACK compression
+(Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
+after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
+TCPAckCompressed: hk ACKs each at once), no CUBIC (only "reno"; Linux defaults to cubic), no
 receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
 tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
 SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf; no rcv_ssthresh,
