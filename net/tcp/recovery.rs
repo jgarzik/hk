@@ -414,7 +414,14 @@ impl TcpCb {
         if self.is_reno() {
             self.limit_reno_sacked();
         }
-        // Linux tcp_non_congestion_loss_retransmit
+        self.non_congestion_loss_retransmit(out);
+    }
+
+    /// Linux tcp_non_congestion_loss_retransmit: packets marked lost
+    /// for no congestion (a path MTU cut, Fast Open SYN data not
+    /// acknowledged) are resent in CA_Loss without a window reduction;
+    /// its end clears the retransmission stamp
+    pub(super) fn non_congestion_loss_retransmit(&mut self, out: &mut super::cb::Out) {
         if self.ca_state != CaState::Loss {
             self.high_seq = self.snd_max;
             let ss = self.current_ssthresh();

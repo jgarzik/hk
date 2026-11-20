@@ -171,7 +171,7 @@ impl TcpCb {
             for q in seqs {
                 self.mark_skb_lost(q);
             }
-            self.xmit_retransmit_queue(out);
+            self.non_congestion_loss_retransmit(out);
             self.net_stat(LINUX_MIB_TCPFASTOPENACTIVEFAIL);
             return true;
         }

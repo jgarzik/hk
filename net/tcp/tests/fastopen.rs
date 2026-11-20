@@ -150,3 +150,58 @@ fn syn_data_keeps_synack_window() {
     };
     assert_eq!(wnd(&[7; 100]), wnd(b""));
 }
+
+/// SYN data the SYN-ACK did not acknowledge is resent as a
+/// non-congestion loss (Linux tcp_rcv_fastopen_synack ->
+/// tcp_non_congestion_loss_retransmit, since 5dfe9d273932): in CA_Loss
+/// the ACK of the resent data clears the retransmission stamp (here a
+/// Reno peer: tcp_is_non_sack_preventing_reopen holds the state until
+/// something above high_seq is acked, the stamp cleared with nothing
+/// retransmitted left), so no stale stamp cuts a later RTO short
+#[test]
+fn active_syn_data_resend_clears_stamp() {
+    use super::super::cb::{FoReq, Foc};
+    use super::super::recovery::CaState;
+    let mut a = TcpCb::new(cfg(), Default::default());
+    a.connect_init(open(1000, 1460), 0);
+    a.fastopen_prep(1460, 4);
+    a.send(b"data");
+    let fo = FoReq {
+        ok: true,
+        cookie: Some(Foc {
+            len: 8,
+            ..Foc::default()
+        }),
+        mss: 0,
+    };
+    let mut out = Out::default();
+    a.connect_send(Some(fo), 0, &mut out);
+    let synack = SegIn {
+        seq: 7000,
+        ack: 1001,
+        flags: flags::SYN | flags::ACK,
+        wnd: 5000,
+        mss: Some(1460),
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    a.feed(&synack, 10, &mut out);
+    assert!(
+        wire(&out)
+            .iter()
+            .any(|s| s.seq == 1001 && s.data == b"data")
+    );
+    assert_eq!(a.ca_state, CaState::Loss);
+    let ack = SegIn {
+        seq: 7001,
+        ack: 1005,
+        flags: flags::ACK,
+        wnd: 5000,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    a.feed(&ack, 20, &mut out);
+    assert_eq!(a.packets_out, 0);
+    assert!(a.rtx_stamp.is_none());
+    assert_eq!(a.ca_state, CaState::Loss);
+}
