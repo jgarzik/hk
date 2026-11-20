@@ -121,8 +121,8 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32(cb.cong.snd_cwnd());
     b.u32(cb.adv_mss);
     b.u32(cb.reordering);
-    b.u32(0); // rcv_rtt
-    b.u32(cb.full_space()); // rcv_space
+    b.u32(cb.rcv_rtt.rtt_us >> 3);
+    b.u32(cb.rcvq_space.space);
     b.u32(st.total_retrans);
     b.u64(u64::MAX); // pacing_rate
     b.u64(u64::MAX); // max_pacing_rate

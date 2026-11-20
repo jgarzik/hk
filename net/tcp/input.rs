@@ -359,6 +359,10 @@ impl TcpCb {
         if !self.after_ack(now, out) {
             return;
         }
+        if self.state == TcpState::Established && !out.established {
+            // Linux tcp_rcv_established, after tcp_ack
+            self.rcv_rtt_measure_ts(s.seq_len());
+        }
         self.rcv_text(s, skb, now, out);
         self.output(now, out);
     }

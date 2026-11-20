@@ -77,6 +77,7 @@ impl TcpCb {
         } else {
             self.dack.pushed = true;
         }
+        self.rcv_rtt_measure();
         let ato = self.live.ato.get();
         let rto = self.live.rto.get();
         if ato == 0 {

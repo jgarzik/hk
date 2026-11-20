@@ -62,6 +62,8 @@ pub struct NetSysctl {
     pub tcp_rmem: [AtomicI32; 3],
     /// tcp_app_win: 1/2^n of the window kept for the application
     pub tcp_app_win: AtomicU8,
+    /// tcp_moderate_rcvbuf: receive buffer autotuning
+    pub tcp_moderate_rcvbuf: AtomicU8,
     /// tcp_keepalive_time / _intvl in seconds
     pub tcp_keepalive_time: AtomicI32,
     pub tcp_keepalive_intvl: AtomicI32,
@@ -121,6 +123,7 @@ impl Default for NetSysctl {
                 AtomicI32::new(6_291_456),
             ],
             tcp_app_win: AtomicU8::new(31),
+            tcp_moderate_rcvbuf: AtomicU8::new(1),
             tcp_keepalive_time: AtomicI32::new(7200),
             tcp_keepalive_intvl: AtomicI32::new(75),
             tcp_keepalive_probes: AtomicU8::new(9),
@@ -595,6 +598,14 @@ pub static CTLS: &[NetCtl] = &[
             n.sysctl.tcp_app_win.store(v[0] as u8, Ordering::Relaxed);
             Ok(())
         },
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_moderate_rcvbuf",
+        mode: 0o644,
+        global: false,
+        show: |n| get_u8(n, |s| &s.tcp_moderate_rcvbuf),
+        store: |n, v| set_u8(n, |s| &s.tcp_moderate_rcvbuf, v),
         text: None,
     },
     NetCtl {

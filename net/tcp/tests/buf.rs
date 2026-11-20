@@ -170,3 +170,77 @@ fn rcvbuf_limit_prunes() {
     assert_eq!(p.b.rcvq_len(), n as usize);
     assert_eq!(segs.last().map(|s| s.wnd), Some(0));
 }
+
+/// Push `data` from a to b, b reading what arrived every `step` ms of
+/// the virtual clock (a receive RTT for tcp_rcv_space_adjust)
+fn paced(p: &mut Pair, data: &[u8], step: u64) -> usize {
+    let (mut sent, mut got) = (0, 0);
+    for _ in 0..100_000 {
+        if sent < data.len() {
+            sent += p.send_a(&data[sent..]);
+        }
+        p.run();
+        got += p.read_b(1 << 20).len();
+        p.run();
+        if got >= data.len() {
+            break;
+        }
+        p.now += step;
+        if p.wire.is_empty() {
+            p.tick();
+        }
+    }
+    got
+}
+
+/// Dynamic right-sizing (Linux tcp_rcv_space_adjust): a reader taking
+/// more each receive RTT gets a buffer for it, up to tcp_rmem[2], and
+/// the window clamp follows; TCP_INFO reports the receive RTT and the
+/// space. A fixed SO_RCVBUF or tcp_moderate_rcvbuf 0 leaves the buffer
+#[test]
+fn rcvbuf_autotuning() {
+    let data = pattern(3 << 20);
+    let mut p = Pair::with_cap(1460, 131_072);
+    let clamp = p.b.window_clamp();
+    assert_eq!(paced(&mut p, &data, 1), data.len());
+    assert!(p.b.rcvbuf > 131_072, "{}", p.b.rcvbuf);
+    assert!(p.b.rcvbuf <= p.b.cfg.rmem_max);
+    assert!(p.b.window_clamp() > clamp);
+    assert_eq!(
+        p.b.window_clamp(),
+        p.b.win_from_space(i64::from(p.b.rcvbuf)) as u32
+    );
+    let info = super::super::info::tcp_info(&p.b, p.now);
+    let at = |o: usize| u32::from_ne_bytes(info[o..o + 4].try_into().unwrap());
+    assert!(at(92) > 0, "rcv_rtt");
+    assert_eq!(at(96), p.b.rcvq_space.space);
+    assert!(at(96) > 0);
+    // SO_RCVBUF set
+    let mut p = Pair::with_cap(1460, 131_072);
+    p.b.userlocks = crate::net::tcp::buf::RCVBUF_LOCK;
+    assert_eq!(paced(&mut p, &data, 1), data.len());
+    assert_eq!(p.b.rcvbuf, 131_072);
+    // tcp_moderate_rcvbuf 0
+    let mut c = cfg();
+    c.moderate_rcvbuf = false;
+    let mut p = Pair::with_cfgs(1460, 131_072, cfg(), c);
+    assert_eq!(paced(&mut p, &data, 1), data.len());
+    assert_eq!(p.b.rcvbuf, 131_072);
+}
+
+/// SO_RCVLOWAT on TCP (Linux tcp_set_rcvlowat): at most half of
+/// tcp_rmem[2] (of a fixed buffer), and an unfixed buffer grows to
+/// offer it as window, the clamp with it
+#[test]
+fn rcvlowat_grows_buffer() {
+    let mut c = TcpCb::new(cfg(), Default::default());
+    c.rcvbuf = 131_072;
+    assert_eq!(c.set_rcvlowat(i32::MAX), (6 * 1024 * 1024) / 2);
+    let mut c = TcpCb::new(cfg(), Default::default());
+    c.rcvbuf = 131_072;
+    assert_eq!(c.set_rcvlowat(100_000), 100_000);
+    assert_eq!(c.rcvbuf, c.space_from_win(100_000) as u32);
+    assert_eq!(c.window_clamp(), 100_000);
+    c.userlocks = crate::net::tcp::buf::RCVBUF_LOCK;
+    assert_eq!(c.set_rcvlowat(i32::MAX), c.rcvbuf as i32 / 2);
+}

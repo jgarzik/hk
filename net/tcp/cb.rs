@@ -221,6 +221,8 @@ pub struct Cfg {
     /// tcp_app_win: 1/2^app_win of the window is the application's
     /// buffer (0: none)
     pub app_win: u8,
+    /// tcp_moderate_rcvbuf: tune the receive buffer to the reader
+    pub moderate_rcvbuf: bool,
     /// tcp_keepalive_time / _intvl (ms), tcp_keepalive_probes
     pub keepidle: u64,
     pub keepintvl: u64,
@@ -254,6 +256,7 @@ impl Default for Cfg {
             rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
             app_win: 31,
+            moderate_rcvbuf: true,
             keepidle: 7_200_000,
             keepintvl: 75_000,
             keepcnt: 9,
@@ -830,6 +833,11 @@ pub struct TcpCb {
     pub(super) rcv_ssthresh: u32,
     /// Linux window_clamp: the largest window offered
     pub(super) window_clamp: u32,
+    /// Receive-side RTT estimate (Linux rcv_rtt_est, `buf::RcvRtt`)
+    pub(super) rcv_rtt: super::buf::RcvRtt,
+    /// What the reader copied in the last RTT (Linux rcvq_space,
+    /// `buf::RcvqSpace`)
+    pub(super) rcvq_space: super::buf::RcvqSpace,
     /// No more data will be read (close or SHUT_RD): new data in
     /// FIN_WAIT_1/2 resets the connection (Linux tcp_rcv_state_process)
     pub rcv_shut: bool,
@@ -1045,6 +1053,8 @@ impl TcpCb {
             scaling_ratio: super::buf::DEFAULT_SCALING_RATIO,
             rcv_ssthresh: 0,
             window_clamp: 0,
+            rcv_rtt: Default::default(),
+            rcvq_space: Default::default(),
             rcv_shut: Default::default(),
             snd_wscale: Default::default(),
             rcv_wscale: Default::default(),
@@ -1480,6 +1490,7 @@ impl TcpCb {
         }
         if take && done > 0 {
             self.consume(done);
+            self.rcv_space_adjust();
             self.cleanup_rbuf(out);
         }
         match err {

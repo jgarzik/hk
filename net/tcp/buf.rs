@@ -13,7 +13,7 @@
 //! segments with little overhead raise towards `window_clamp`
 //! (tcp_grow_window); memory pressure pulls it back.
 
-use super::cb::{MAX_WINDOW, MAX_WSCALE, TcpCb};
+use super::cb::{MAX_WINDOW, MAX_WSCALE, TcpCb, before};
 use super::mem;
 use crate::util::error::KernelError;
 
@@ -33,12 +33,40 @@ pub const DEFAULT_SCALING_RATIO: u8 = ((1200 << RMEM_TO_WIN_SCALE) / SKB_TRUESIZ
 const MIN_WINDOW_CLAMP: u32 = crate::net::sock::MIN_RCVBUF / 2;
 /// Linux tcp_grow_window's segments: shorter ones do not grow it
 const GROW_MIN_LEN: u32 = 128;
+/// Linux TCP_INIT_CWND
+const INIT_CWND: u32 = super::cong::INIT_CWND;
+
+/// Linux rcv_rtt_est: the RTT as the receiver sees it (a window's
+/// worth of data from the sender, or a timestamp echo), 8 x us; the
+/// sequence and time a measurement started
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RcvRtt {
+    pub rtt_us: u32,
+    seq: u32,
+    time: u64,
+    /// The TSecr last sampled (Linux rcv_rtt_last_tsecr)
+    last_tsecr: u32,
+}
+
+/// Linux rcvq_space: bytes the reader copied in the last receive RTT
+/// (`space`), counted from `seq` (copied_seq) since `time` (us)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RcvqSpace {
+    pub space: u32,
+    seq: u32,
+    time: u64,
+}
 
 impl TcpCb {
     /// Linux tcp_win_from_space: the window `space` bytes of buffer
     /// hold (negative for an overcommitted buffer)
     pub(super) fn win_from_space(&self, space: i64) -> i64 {
         (space * i64::from(self.scaling_ratio)) >> RMEM_TO_WIN_SCALE
+    }
+
+    /// Linux tcp_space_from_win: the buffer a window of `win` takes
+    pub(super) fn space_from_win(&self, win: u64) -> u64 {
+        (win << RMEM_TO_WIN_SCALE) / u64::from(self.scaling_ratio.max(1))
     }
 
     /// Truesize received and queued (Linux sk_rmem_alloc)
@@ -138,6 +166,103 @@ impl TcpCb {
             self.window_clamp = (2 * advmss).max(maxwin.saturating_sub(advmss));
         }
         self.rcv_ssthresh = self.rcv_ssthresh.min(self.window_clamp);
+        self.rcvq_space = RcvqSpace {
+            space: self
+                .rcv_ssthresh
+                .min(self.rcv_wnd_adv())
+                .min(INIT_CWND * advmss),
+            seq: self.copied_seq,
+            time: self.tcp_mstamp,
+        };
+    }
+
+    /// Linux tcp_rcv_rtt_update: `sample` us into the estimate; a
+    /// window-based one (`win_dep`) only lowers it
+    fn rcv_rtt_update(&mut self, sample: u32, win_dep: bool) {
+        let mut new = self.rcv_rtt.rtt_us;
+        let m = i64::from(sample);
+        if new != 0 {
+            if !win_dep {
+                new = (i64::from(new) + m - i64::from(new >> 3)) as u32;
+            } else if ((m << 3) as u32) < new {
+                new = (m << 3) as u32;
+            }
+        } else {
+            new = (m << 3) as u32;
+        }
+        self.rcv_rtt.rtt_us = new;
+    }
+
+    /// Linux tcp_rcv_rtt_measure (tcp_event_data_recv): a window's
+    /// worth of data since the last measurement took one RTT
+    pub(super) fn rcv_rtt_measure(&mut self) {
+        if self.rcv_rtt.time != 0 {
+            if before(self.rcv_nxt, self.rcv_rtt.seq) {
+                return;
+            }
+            let d = self.tcp_mstamp.saturating_sub(self.rcv_rtt.time).max(1);
+            self.rcv_rtt_update(d.min(u64::from(u32::MAX)) as u32, true);
+        }
+        self.rcv_rtt.seq = self.rcv_nxt.wrapping_add(self.rcv_wnd_adv());
+        self.rcv_rtt.time = self.tcp_mstamp;
+    }
+
+    /// Linux tcp_rcv_rtt_measure_ts (tcp_rcv_established, after
+    /// tcp_ack): a segment of at least the MSS estimate echoing a new
+    /// TSval samples the time since we sent it
+    pub(super) fn rcv_rtt_measure_ts(&mut self, seq_len: u32) {
+        let Some(tsecr) = self.rcv_tsecr else {
+            return;
+        };
+        if tsecr == self.rcv_rtt.last_tsecr {
+            return;
+        }
+        self.rcv_rtt.last_tsecr = tsecr;
+        if seq_len >= self.dack.rcv_mss {
+            // Linux tcp_rtt_tsopt_us: ms timestamps
+            let delta = self.tsval().wrapping_sub(tsecr);
+            if delta < i32::MAX as u32 / 1000 {
+                self.rcv_rtt_update(delta.max(1) * 1000, false);
+            }
+        }
+    }
+
+    /// Linux tcp_rcv_space_adjust (after the reader copied): once per
+    /// receive RTT, a reader that took more than last time gets a
+    /// buffer for twice that plus sixteen segments, grown with the
+    /// sender's rate (tcp_moderate_rcvbuf, no fixed SO_RCVBUF, at most
+    /// tcp_rmem[2]); the clamp follows
+    pub(super) fn rcv_space_adjust(&mut self) {
+        self.tick(self.clock);
+        let time = self.tcp_mstamp.saturating_sub(self.rcvq_space.time);
+        let rtt = self.rcv_rtt.rtt_us;
+        if time < u64::from(rtt >> 3) || rtt == 0 {
+            return;
+        }
+        let copied = self.copied_seq.wrapping_sub(self.rcvq_space.seq);
+        if copied > self.rcvq_space.space {
+            if self.cfg.moderate_rcvbuf && self.userlocks & RCVBUF_LOCK == 0 {
+                self.rcvbuf_grow(copied);
+            }
+            self.rcvq_space.space = copied;
+        }
+        self.rcvq_space.seq = self.copied_seq;
+        self.rcvq_space.time = self.tcp_mstamp;
+    }
+
+    /// tcp_rcv_space_adjust's growth for `copied` bytes in an RTT
+    fn rcvbuf_grow(&mut self, copied: u32) {
+        let space = u64::from(self.rcvq_space.space.max(1));
+        let mut rcvwin = (u64::from(copied) << 1) + 16 * u64::from(self.adv_mss);
+        let grow = rcvwin * (u64::from(copied) - space) / space;
+        rcvwin += grow << 1;
+        let rcvbuf = self
+            .space_from_win(rcvwin)
+            .min(u64::from(self.cfg.rmem_max)) as u32;
+        if rcvbuf > self.rcvbuf {
+            self.rcvbuf = rcvbuf;
+            self.window_clamp = self.win_from_space(i64::from(rcvbuf)).max(0) as u32;
+        }
     }
 
     /// Linux tcp_grow_window: an in-order or out-of-order skb of `len`
@@ -251,6 +376,27 @@ impl TcpCb {
         }
         self.opts.window_clamp = self.window_clamp;
         Ok(())
+    }
+
+    /// SO_RCVLOWAT's value for TCP (Linux tcp_set_rcvlowat): at most
+    /// half the buffer (a fixed one, else tcp_rmem[2]); an unfixed
+    /// buffer grows to hold it as window, which the clamp becomes
+    pub fn set_rcvlowat(&mut self, val: i32) -> i32 {
+        let locked = self.userlocks & RCVBUF_LOCK != 0;
+        let cap = if locked {
+            self.rcvbuf
+        } else {
+            self.cfg.rmem_max
+        } >> 1;
+        let val = val.min(cap.min(i32::MAX as u32) as i32);
+        if !locked {
+            let space = self.space_from_win(val.max(0) as u64);
+            if space > u64::from(self.rcvbuf) {
+                self.rcvbuf = space.min(u64::from(u32::MAX)) as u32;
+                self.window_clamp = val as u32;
+            }
+        }
+        val
     }
 
     /// TCP_WINDOW_CLAMP's value (Linux tp->window_clamp)

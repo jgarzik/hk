@@ -322,6 +322,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         rmem_min: s.tcp_rmem[0].load(Ordering::Relaxed).max(1) as u32,
         rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
         app_win: s.tcp_app_win.load(Ordering::Relaxed),
+        moderate_rcvbuf: s.tcp_moderate_rcvbuf.load(Ordering::Relaxed) != 0,
         keepidle: secs(&s.tcp_keepalive_time),
         keepintvl: secs(&s.tcp_keepalive_intvl),
         keepcnt: u32::from(s.tcp_keepalive_probes.load(Ordering::Relaxed)),
@@ -2474,10 +2475,16 @@ impl TcpSock {
         Ok(())
     }
 
-    /// Readers may have enough now (Linux tcp_set_rcvlowat:
-    /// tcp_data_ready)
+    /// SO_RCVLOWAT (Linux sock_setsockopt: negative is INT_MAX, then
+    /// tcp_set_rcvlowat): at most half the buffer it may have, which
+    /// grows to hold it; readers may have enough now (tcp_data_ready)
     fn set_rcvlowat(&self, v: OptIn) -> Result<(), KernelError> {
-        crate::net::socket::sock_setsockopt(self, SO_RCVLOWAT, v)?;
+        let val = v.int()?;
+        let val = if val < 0 { i32::MAX } else { val };
+        self.step(|g, _| {
+            let val = g.cb.set_rcvlowat(val);
+            self.sk.set_rcvlowat(val);
+        });
         self.sk.data_ready();
         Ok(())
     }
