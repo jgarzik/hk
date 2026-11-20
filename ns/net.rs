@@ -103,6 +103,9 @@ pub struct NetNamespace {
     /// IPv4 reassembly queues
     pub frags: crate::net::inet::frag::FragTable,
 
+    /// Remote addresses' long-lived state (Linux net->ipv4.peers)
+    pub peers: crate::net::inet::peer::InetPeerBase,
+
     /// ICMP rate-limit state
     pub icmp: crate::net::icmp::IcmpRate,
 
@@ -252,6 +255,7 @@ impl NetNamespace {
             devconf_dflt: crate::net::inet::devconf::DevConf::dflt(),
             sysctls: try_arc(Default::default())?,
             frags: Default::default(),
+            peers: Default::default(),
             icmp: Default::default(),
             ping: Default::default(),
             unix: Default::default(),

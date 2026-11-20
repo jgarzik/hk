@@ -103,6 +103,9 @@ pub struct NetSysctl {
     pub frag_low: AtomicUsize,
     /// ipfrag_time in seconds
     pub frag_time: AtomicI32,
+    /// ipfrag_max_dist: fragments from one source another datagram's
+    /// may fall behind before its queue restarts (0: no check)
+    pub frag_max_dist: AtomicI32,
     /// net.unix.max_dgram_qlen (queue limit of new AF_UNIX sockets)
     pub unix_max_dgram_qlen: AtomicI32,
     /// udp_rmem_min: bytes a UDP socket may queue past udp_mem[0]
@@ -167,6 +170,7 @@ impl Default for NetSysctl {
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
             frag_low: AtomicUsize::new(3 * 1024 * 1024),
             frag_time: AtomicI32::new(30),
+            frag_max_dist: AtomicI32::new(64),
             unix_max_dgram_qlen: AtomicI32::new(10),
             // Linux udp_sysctl_init: PAGE_SIZE
             udp_rmem_min: AtomicI32::new(4096),
@@ -1040,6 +1044,15 @@ pub static CTLS: &[NetCtl] = &[
         global: false,
         show: |n| get_i32(n, |s| &s.frag_time),
         store: |n, v| set_int(n, |s| &s.frag_time, v, 1, INT_MAX),
+        text: None,
+    },
+    // Linux ip4_frags_ns_ctl_table: proc_dointvec_minmax, at least 0
+    NetCtl {
+        path: "net/ipv4/ipfrag_max_dist",
+        mode: 0o644,
+        global: false,
+        show: |n| get_i32(n, |s| &s.frag_max_dist),
+        store: |n, v| set_int(n, |s| &s.frag_max_dist, v, 0, INT_MAX),
         text: None,
     },
     NetCtl {

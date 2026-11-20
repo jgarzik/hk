@@ -178,7 +178,7 @@ drop_*, disable_xfrm / disable_policy, promote_secondaries), and a
 change sends no RTM_NEWNETCONF (hk has no netconf messages). Of the
 neighbour sysctls (`net/core/neigh_sysctl.rs`) anycast_delay,
 interval_probe_time_ms and gc_interval are kept only.
-IP: no ipfrag_max_dist, no IP options on output (received options are
+IP: no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
 IP_TRANSPARENT. A UDP
 socket has one receive queue (`net/udp/rxq.rs`), not Linux's

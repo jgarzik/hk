@@ -8,5 +8,6 @@ pub mod fib;
 pub mod fib_rules;
 pub mod frag;
 pub mod ifaddr;
+pub mod peer;
 pub mod port;
 pub mod route;
