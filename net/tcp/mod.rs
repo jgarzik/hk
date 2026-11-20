@@ -2374,7 +2374,7 @@ impl TcpSock {
         if i != Some(g.cb.cong.algo()) {
             let i = i.ok_or(KernelError::NotFound)?;
             if !cong::allowed(i) && !crate::task::capable(crate::task::CAP_NET_ADMIN) {
-                return Err(KernelError::PermissionDenied);
+                return Err(KernelError::NotPermitted);
             }
             g.cb.opts.ca = i;
             g.cb.set_cc(i);
