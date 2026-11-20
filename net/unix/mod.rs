@@ -798,16 +798,23 @@ impl UnixSock {
         // The path taken under the state lock as Linux (off its bucket
         // now, so no lookup reads it), put last (unix_release_sock's
         // path_put)
-        let (state, peer, path) = {
+        // The out-of-band skb is let go under `st` and `rq`, the only
+        // way `oob` changes (Linux clears u->oob_skb just after
+        // unix_state_unlock, the socket dead, so no queue_oob sets it);
+        // our reference is dropped with no lock held
+        let (state, peer, path, oob) = {
             let mut st = self.st.lock();
             self.dead.store(true, Ordering::Release);
             self.sk.or_shutdown(SHUTDOWN_MASK);
             let path = self.path.lock().take();
             let state = self.state();
             self.set_state(CLOSE);
-            (state, st.take(), path)
+            let oob = {
+                let _q = self.rq.lock();
+                self.oob.lock().take()
+            };
+            (state, st.take(), path, oob)
         };
-        let oob = self.oob.lock().take();
         drop(oob);
         self.sk.state_change();
         self.peer_wait.wake_all();
