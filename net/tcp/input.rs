@@ -321,7 +321,8 @@ impl TcpCb {
             return None;
         }
         // Linux: truesize past sk_forward_alloc takes the slow path's
-        // steps 5 on
+        // steps 5 on; the window is not checked ("Predicted packet is in
+        // window by definition")
         let truesize = skb.truesize();
         if !self.rmem_fits(truesize) {
             return Some(skb);

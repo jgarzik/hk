@@ -2468,6 +2468,32 @@ fn synack_data_dropped_without_fastopen() {
     assert_eq!(mib.net.fold(LINUX_MIB_TCPZEROWINDOWDROP), 0);
 }
 
+/// The fast path takes predicted in-order data whatever the window
+/// (Linux tcp_rcv_established checks only sk_forward_alloc there)
+#[test]
+fn header_prediction_trusts_window() {
+    let mut p = Pair::new(1460);
+    let data = pattern(3000);
+    assert_eq!(transfer(&mut p, &data, 50), data);
+    assert_ne!(p.b.pred_flags, 0);
+    // A window of 10 bytes advertised, memory for more held
+    p.b.rcv_adv = p.b.rcv_nxt.wrapping_add(10);
+    assert!(p.b.mem_schedule(200, super::cb::MemKind::Recv));
+    let seg = SegIn {
+        seq: p.b.rcv_nxt,
+        ack: p.b.snd_max,
+        flags: flags::ACK,
+        wnd: p.b.pred_flags as u16,
+        ts: Some((p.b.ts_recent.wrapping_add(1), p.b.tsval())),
+        data: &[7; 100],
+        ..Default::default()
+    };
+    let nxt = p.b.rcv_nxt;
+    let mut out = Out::default();
+    p.b.feed(&seg, p.now, &mut out);
+    assert_eq!(p.b.rcv_nxt, nxt.wrapping_add(100));
+}
+
 // ============================================================================
 // Review findings (reproduce first)
 // ============================================================================
