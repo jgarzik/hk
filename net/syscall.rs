@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::fs::file::File;
 use crate::fs::io::fget;
+use crate::fs::syscall::UIO_MAXIOV;
 use crate::net::msg::{
     self, Dst, Iov, MMsgHdr, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_WAITFORONE, MsgHdr,
     RecvMsg, SendMsg, Src, UserMsgHdr, addr_in, addr_out,
@@ -309,7 +310,7 @@ pub fn sys_recvmsg(fd: i32, msg: UserPtr<UserMsgHdr>, flags: i32) -> KernelResul
 pub fn sys_sendmmsg(fd: i32, vec: UserPtr<MMsgHdr>, vlen: u32, flags: i32) -> KernelResult<usize> {
     let (file, s) = sockfd(fd)?;
     let mut n = 0;
-    for i in 0..(vlen as usize).min(msg::UIO_MAXIOV) {
+    for i in 0..(vlen as usize).min(UIO_MAXIOV) {
         let at = MMsgHdr::at(vec, i);
         match sendmsg_one(&file, &*s, MMsgHdr::hdr(at), flags) {
             Ok(k) => {
@@ -337,7 +338,7 @@ pub fn sys_recvmmsg(
     let deadline = mmsg_deadline(timeout)?;
     let mut flags = flags;
     let mut n = 0;
-    for i in 0..(vlen as usize).min(msg::UIO_MAXIOV) {
+    for i in 0..(vlen as usize).min(UIO_MAXIOV) {
         let at = MMsgHdr::at(vec, i);
         match recvmsg_one(&file, &*s, MMsgHdr::hdr(at), flags) {
             Ok(k) => {

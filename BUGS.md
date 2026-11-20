@@ -1044,9 +1044,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **Copied helpers** (J, or as touched): `current_time` in cgroupfs,
   perm, procfs and ramfs, `current_time_secs` in ipc msg/sem/shm;
   user-timespec readers each validating (futex `read_user_timeout`,
-  poll `read_ts`, mqueue, posix_timer...; Linux get_timespec64);
-  iovec structs (`fs/iov.rs` `IoVec`, `net/msg.rs` `IoVec`/`Iov`) and
-  importer beside `import_iovec` (`net/msg.rs` `Iov::import`); Timespec
+  poll `read_ts`, mqueue, posix_timer...; Linux get_timespec64); Timespec
   types `time::Timespec`, `LinuxTimespec` (time_syscall), `SemTimespec`
   (ipc/sem); Timeval types in task/misc and time_syscall, plus
   `TimexTimeval`.
