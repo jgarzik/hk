@@ -1,11 +1,16 @@
 //! /proc/sys/net (hk and Linux): defaults, writes with validation,
-//! wiring (ip_local_port_range -> ephemeral ports, somaxconn), and
-//! permissions (non-root cannot open for writing).
+//! wiring (ip_local_port_range -> ephemeral ports, somaxconn),
+//! permissions (non-root cannot open for writing), and network
+//! namespaces: a file acts on the namespace it was opened in, whoever
+//! reads it (SYSCTL_NETNS_BIND), and the machine-wide tcp_mem and
+//! mem_pcpu_rsv exist in the initial namespace only
+//! (SYSCTL_NETNS_INIT_ONLY).
 
 use hk_syscall::{
-    _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, O_RDONLY, O_WRONLY, PR_SET_KEEPCAPS,
-    sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_open, sys_prctl, sys_read,
-    sys_setresuid, sys_wait4, sys_write,
+    _LINUX_CAPABILITY_VERSION_3, CLONE_NEWNET, CapUserData, CapUserHeader, O_DIRECTORY, O_RDONLY,
+    O_RDWR, O_WRONLY, PR_SET_KEEPCAPS, sys_capget, sys_capset, sys_close, sys_exit, sys_fork,
+    sys_open, sys_openat, sys_prctl, sys_pread64, sys_pwrite64, sys_read, sys_setns, sys_setresuid,
+    sys_unshare, sys_wait4, sys_write,
 };
 
 use crate::harness::T;
@@ -19,6 +24,8 @@ pub fn run_tests() {
     test_perm();
     test_perm_net_admin();
     test_proc_net_udp();
+    test_netns_bind();
+    test_netns_init_only();
 }
 
 /// Read a NUL-terminated path into `buf`; returns the length or -errno
@@ -299,4 +306,103 @@ fn test_proc_net_udp() {
     let gone = !text.windows(13).any(|w| w == &key[..]);
     t.ok(b"gone after close", gone, 0);
     t.done();
+}
+
+const ENOENT: i64 = -2;
+
+/// Run `f` in a child, PASS on exit 0; exit 2 is an unshare refused
+/// on a host (SKIP)
+fn in_child(name: &'static [u8], f: fn() -> u64) {
+    let mut t = T::new(name);
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(f());
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st == 2 << 8 && crate::helpers::host_mode() {
+        crate::helpers::skip(name, b"unshare(CLONE_NEWNET) not permitted");
+        return;
+    }
+    t.eq(b"child", st as i64, 0);
+    t.done();
+}
+
+/// The value read through `fd` from offset 0 is `want`
+fn fd_reads(fd: i64, want: &[u8]) -> bool {
+    let mut buf = [0u8; 32];
+    let n = sys_pread64(fd as i32, buf.as_mut_ptr(), buf.len() as u64, 0);
+    n >= 0 && &buf[..n as usize] == want
+}
+
+/// An fd opened in namespace A reads and writes A after the opener
+/// moved to B, and a directory opened in A finds A's files from B
+/// (Linux: the file's ctl_table_header is A's net->sysctls)
+fn test_netns_bind() {
+    in_child(b"SYSCTL_NETNS_BIND", || {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            return 2;
+        }
+        let a = sys_open(b"/proc/self/ns/net\0".as_ptr(), O_RDONLY, 0);
+        let fd = sys_open(SYN.as_ptr(), O_RDWR, 0);
+        let dir = sys_open(b"/proc/sys/net/ipv4\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+        if a < 0 || fd < 0 || dir < 0 {
+            return 10;
+        }
+        if sys_pwrite64(fd as i32, b"3".as_ptr(), 1, 0) != 1 {
+            return 11;
+        }
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            return 12;
+        }
+        // B's own value, A's through the fd
+        if !reads(SYN, b"6\n") || !fd_reads(fd, b"3\n") {
+            return 13;
+        }
+        if sys_pwrite64(fd as i32, b"4".as_ptr(), 1, 0) != 1 || !reads(SYN, b"6\n") {
+            return 14;
+        }
+        let f = sys_openat(dir as i32, b"tcp_syn_retries\0".as_ptr(), O_RDONLY, 0);
+        if f < 0 || !fd_reads(f, b"4\n") {
+            return 15;
+        }
+        sys_close(f as u64);
+        // Back in A, its path shows what the fd wrote
+        if sys_setns(a as i32, CLONE_NEWNET as i32) != 0 || !reads(SYN, b"4\n") {
+            return 16;
+        }
+        0
+    });
+}
+
+/// tcp_mem and mem_pcpu_rsv are in the initial namespace's tree only
+/// (Linux ipv4_table, net_core_table: register_net_sysctl(&init_net));
+/// an fd opened there still reads from another namespace
+fn test_netns_init_only() {
+    const TCP_MEM: &[u8] = b"/proc/sys/net/ipv4/tcp_mem\0";
+    const RSV: &[u8] = b"/proc/sys/net/core/mem_pcpu_rsv\0";
+    in_child(b"SYSCTL_NETNS_INIT_ONLY", || {
+        let fd = sys_open(TCP_MEM.as_ptr(), O_RDONLY, 0);
+        let rsv = sys_open(RSV.as_ptr(), O_RDONLY, 0);
+        if fd < 0 || rsv < 0 {
+            return 10;
+        }
+        sys_close(rsv as u64);
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            return 2;
+        }
+        if sys_open(TCP_MEM.as_ptr(), O_RDONLY, 0) != ENOENT
+            || sys_open(RSV.as_ptr(), O_RDONLY, 0) != ENOENT
+        {
+            return 11;
+        }
+        let mut buf = [0u8; 96];
+        if read_file(SOMAX, &mut buf) <= 0 {
+            return 12;
+        }
+        if sys_pread64(fd as i32, buf.as_mut_ptr(), buf.len() as u64, 0) <= 0 {
+            return 13;
+        }
+        0
+    });
 }
