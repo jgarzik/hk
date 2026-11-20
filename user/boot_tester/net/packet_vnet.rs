@@ -5,7 +5,7 @@
 //! bounds, GSO types), receives with one (recvmsg and the ring's
 //! frame layout), PACKET_QDISC_BYPASS.
 
-use hk_syscall::{SOCK_DGRAM, SOCK_RAW, sys_sendto, sys_setsockopt};
+use hk_syscall::{SOCK_DGRAM, SOCK_RAW, sys_sendto, sys_setsockopt, sys_write};
 
 use crate::harness::T;
 use crate::helpers::println;
@@ -196,6 +196,15 @@ fn test_snd(lo: i32) {
     poll1(rx, 1, 2000);
     let n = recv(rx, &mut buf, MSG_DONTWAIT);
     t.ok(b"sz 12 frame", n == 60 && buf[15] == 0xa3, n);
+    // write(2) on a bound socket skips the whole 12-byte header too
+    // (Linux iov_iter_advance past num_buffers)
+    t.eq(b"bind", pbind(tx, 0, lo), 0);
+    let mut w = [0u8; 72];
+    w[12..].copy_from_slice(udp_frame(&mut f, 0xa4));
+    t.eq(b"sz 12 write", sys_write(tx as u64, w.as_ptr(), 72), 72);
+    poll1(rx, 1, 2000);
+    let n = recv(rx, &mut buf, MSG_DONTWAIT);
+    t.ok(b"sz 12 write frame", n == 60 && buf[..60] == w[12..], n);
     close(tx);
     close(rx);
     t.done();

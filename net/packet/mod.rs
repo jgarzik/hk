@@ -771,7 +771,10 @@ impl ProtoOps for PacketSock {
             if total < vnet {
                 return Err(KernelError::InvalidArgument);
             }
-            hdr = vnet::VnetHdr::parse(&m.data.take(vnet::VNET_HDR_LEN)?);
+            // The whole vnet_hdr_sz is consumed, the header from its
+            // first bytes (Linux packet_snd_vnet_parse, then
+            // iov_iter_advance past the rest)
+            hdr = vnet::VnetHdr::parse(&m.data.take(vnet)?[..vnet::VNET_HDR_LEN]);
             vnet::snd_parse(&mut hdr, total - vnet)?;
         }
         let len = total - vnet;
