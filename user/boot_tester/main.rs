@@ -337,6 +337,7 @@ pub fn run_all_tests() {
     net::udp::run_tests();
     net::udp_hash::run_tests();
     net::udp_mem::run_tests();
+    net::udp_cork::run_tests();
     mm::frag::run_tests();
     proc::sysctl::run_tests();
     net::sockopts::run_tests();

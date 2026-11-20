@@ -146,7 +146,12 @@ ACK counts TCPPureAcks, where Linux's fast path skips it), receive
 coalescing and collapse, RcvPruned (no tcp_can_ingest),
 Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
-UDP_CORK/MSG_MORE are not implemented (each send is one datagram).
+UDP sends are not charged to SO_SNDBUF (Linux sk_wmem_alloc through
+sock_alloc_send_skb, which blocks or fails a send past it; corked
+data included), and SIOCOUTQ is 0. UDP_SEGMENT is segmented in
+software at send (Linux hands a GSO skb to the device); UDP_GRO is
+stored only (no GRO: no coalesced receive, no UDP_GRO cmsg); UDP_ENCAP
+takes 0 and L2TP only (UDP_ENCAP_ESPINUDP needs XFRM, which hk lacks).
 TCP has no SO_PEEK_OFF (EOPNOTSUPP; Linux inet_stream_ops sets
 sk_set_peek_off and tcp_recvmsg peeks at the offset).
 A device MTU change leaves path MTU exceptions (`route::NhExceptions`)

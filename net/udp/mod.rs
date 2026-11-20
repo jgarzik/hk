@@ -19,8 +19,9 @@
 //! reading each candidate's `Inet.addr`, and queue under the guard with
 //! GFP_ATOMIC. A socket's table references are released a grace period
 //! after it leaves (Linux SOCK_RCU_FREE), possibly in `rcuc/N`: its
-//! drop takes no sleeping lock. No lock is held across a sleep or a
-//! transmit.
+//! drop takes no sleeping lock. Only `op` is held across a sleep or a
+//! transmit: a corked datagram (UDP_CORK, MSG_MORE) is appended to and
+//! sent under it, as Linux under lock_sock.
 
 pub mod mem;
 mod rxq;
@@ -40,7 +41,7 @@ use crate::util::kalloc::try_arc_cyclic;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use crate::net::sock_reuseport::{self, ReuseCb};
 use crate::sync::rcu::RcuPuts;
@@ -55,7 +56,7 @@ use crate::net::inet::port::{BindInfo, Flow};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
 use crate::net::mib::*;
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, RecvMsg, SendMsg, cmsgs};
+use crate::net::msg::{MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, RecvMsg, SendMsg, cmsgs};
 use crate::net::skb::SkBuff;
 use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
@@ -70,13 +71,56 @@ pub const UDP_HLEN: usize = 8;
 pub const UDP_MAX: usize = 65507;
 /// Socket level of UDP options
 pub const SOL_UDP: i32 = 17;
+/// SOL_UDP options (Linux include/uapi/linux/udp.h)
+const UDP_CORK: i32 = 1;
+const UDP_ENCAP: i32 = 100;
+const UDP_NO_CHECK6_TX: i32 = 101;
+const UDP_NO_CHECK6_RX: i32 = 102;
+const UDP_SEGMENT: i32 = 103;
+const UDP_GRO: i32 = 104;
+/// UDP_ENCAP types taken without XFRM: none, L2TP (Linux
+/// udp_lib_setsockopt; UDP_ENCAP_ESPINUDP needs CONFIG_XFRM)
+const UDP_ENCAP_L2TPINUDP: i32 = 3;
+/// Linux UDP_MAX_SEGMENTS
+const UDP_MAX_SEGMENTS: usize = 1 << 7;
+
+/// `UdpSock.uflags` bits (Linux UDP_FLAGS_*)
+mod uf {
+    pub const CORK: u32 = 1 << 0;
+    pub const NO_CHECK6_TX: u32 = 1 << 1;
+    pub const NO_CHECK6_RX: u32 = 1 << 2;
+    pub const GRO_ENABLED: u32 = 1 << 3;
+}
+
+/// A corked datagram (Linux up->pending, up->len, inet->cork and the
+/// sk_write_queue it fills): where it goes, how, and its payload
+struct Cork {
+    rt: route::Rtable,
+    sport: u16,
+    dport: u16,
+    p: IpParams,
+    gso: u16,
+    /// Bytes appended, the UDP header counted (Linux up->len)
+    len: usize,
+    data: Vec<u8>,
+}
 /// A UDP socket
 pub struct UdpSock {
     sk: Sock,
     pub inet: Inet,
-    /// Socket lock: bind/connect/disconnect/autobind (Linux lock_sock,
-    /// which sleeps)
-    op: crate::sync::Mutex<()>,
+    /// Socket lock (Linux lock_sock, which sleeps): bind, connect,
+    /// disconnect, autobind, and the datagram being corked (Linux
+    /// up->pending with inet->cork and sk_write_queue)
+    op: crate::sync::Mutex<Option<Cork>>,
+    /// A datagram is corked (Linux up->pending): set and cleared under
+    /// `op`, read without it by sends choosing a path
+    pending: AtomicBool,
+    /// UDP_CORK, UDP_NO_CHECK6_*, UDP_GRO (Linux udp_flags)
+    uflags: AtomicU32,
+    /// UDP_SEGMENT (Linux gso_size)
+    gso_size: AtomicU16,
+    /// UDP_ENCAP (Linux encap_type)
+    encap_type: AtomicU16,
     /// Connected (Linux TCP_ESTABLISHED state for datagram sockets)
     connected: AtomicBool,
     /// SO_PEEK_OFF is set (Linux peeking_with_offset)
@@ -102,7 +146,11 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     Ok(try_arc_cyclic(|me| UdpSock {
         sk: Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_UDP),
         inet: Inet::default(),
-        op: crate::sync::Mutex::new(()),
+        op: crate::sync::Mutex::new(None),
+        pending: AtomicBool::new(false),
+        uflags: AtomicU32::new(0),
+        gso_size: AtomicU16::new(0),
+        encap_type: AtomicU16::new(0),
         connected: AtomicBool::new(false),
         peeking_with_offset: AtomicBool::new(false),
         rxq: UdpRxq::default(),
@@ -282,6 +330,202 @@ impl UdpSock {
         })
     }
 
+    fn uflag(&self, f: u32) -> bool {
+        self.uflags.load(Ordering::Relaxed) & f != 0
+    }
+
+    fn set_uflag(&self, f: u32, on: bool) {
+        if on {
+            self.uflags.fetch_or(f, Ordering::Relaxed);
+        } else {
+            self.uflags.fetch_and(!f, Ordering::Relaxed);
+        }
+    }
+
+    /// Send `data` as a datagram, or with `gso` as datagrams of `gso`
+    /// bytes (Linux udp_send_skb, segmented in software as
+    /// __udp_gso_segment: hk has no GSO), counting it once; EMSGSIZE
+    /// past the MTU also queued with IP_RECVERR (Linux __ip_append_data)
+    fn send_out(
+        &self,
+        rt: &route::Rtable,
+        sport: u16,
+        dport: u16,
+        data: &[u8],
+        p: IpParams,
+        gso: u16,
+    ) -> Result<(), KernelError> {
+        let gso = usize::from(gso);
+        if gso != 0 {
+            let hlen = ipv4::IP_HLEN_MIN + UDP_HLEN;
+            if hlen + data.len().min(gso) > p.mtu(rt) {
+                return Err(KernelError::MessageTooLong);
+            }
+            if data.len() > gso * UDP_MAX_SEGMENTS {
+                return Err(KernelError::InvalidArgument);
+            }
+        }
+        let mib = &self.sk.net.mib;
+        let r = if gso != 0 && data.len() > gso {
+            let mut sent = true;
+            let mut r = Ok(true);
+            for chunk in data.chunks(gso) {
+                match self.xmit(rt, sport, dport, chunk, p) {
+                    Ok(s) => sent &= s,
+                    Err(e) => {
+                        r = Err(e);
+                        break;
+                    }
+                }
+            }
+            r.map(|_| sent)
+        } else {
+            self.xmit(rt, sport, dport, data, p)
+        };
+        match r {
+            // Linux udp_send_skb
+            Ok(sent) => {
+                if sent {
+                    mib.udp.inc(UDP_MIB_OUTDATAGRAMS);
+                }
+                Ok(())
+            }
+            Err(KernelError::MessageTooLong) => {
+                // Linux __ip_append_data: IP_RECVERR also queues it
+                // (msg_name port: the connected one)
+                let e = KernelError::MessageTooLong;
+                let a = self.inet.get();
+                af_inet::ip_local_error(&self.sk, &self.inet, e, rt.daddr, a.dport, rt.mtu);
+                Err(e)
+            }
+            Err(e) => {
+                // Linux udp_sendmsg's out: no kernel memory (the
+                // discard counted where it failed)
+                if e == KernelError::NoBufferSpace {
+                    mib.udp.inc(UDP_MIB_SNDBUFERRORS);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Append `data` (`ulen` bytes counted: the header too for the
+    /// first) to the corked datagram, sending it unless `more` (Linux
+    /// udp_sendmsg's do_append_data with ip_append_data): past the
+    /// largest datagram the socket may send, everything corked is
+    /// dropped (udp_flush_pending_frames) and EMSGSIZE also queued
+    /// with IP_RECVERR
+    fn append(
+        &self,
+        g: &mut Option<Cork>,
+        data: &[u8],
+        ulen: usize,
+        more: bool,
+    ) -> Result<(), KernelError> {
+        let Some(c) = g.as_mut() else {
+            return Err(KernelError::InvalidArgument);
+        };
+        // Linux __ip_append_data: a GSO cork may reach IP_MAX_MTU, else
+        // the MTU unless fragmenting is allowed
+        let mtu = if c.gso != 0 { 0xffff } else { c.p.mtu(&c.rt) };
+        let max = if c.p.may_frag() { 0xffff } else { mtu };
+        if c.len + ulen > max - ipv4::IP_HLEN_MIN {
+            let (daddr, mtu) = (c.rt.daddr, c.p.mtu(&c.rt));
+            self.flush(g);
+            let e = KernelError::MessageTooLong;
+            let dport = self.inet.get().dport;
+            af_inet::ip_local_error(&self.sk, &self.inet, e, daddr, dport, mtu as u32);
+            return Err(e);
+        }
+        if c.data.try_reserve(data.len()).is_err() {
+            self.sk.net.mib.out_discard();
+            self.flush(g);
+            return Err(KernelError::NoBufferSpace);
+        }
+        c.len += ulen;
+        c.data.extend_from_slice(data);
+        if more {
+            return Ok(());
+        }
+        self.push(g)
+    }
+
+    /// Send the corked datagram (Linux udp_push_pending_frames)
+    fn push(&self, g: &mut Option<Cork>) -> Result<(), KernelError> {
+        let Some(c) = g.take() else {
+            return Ok(());
+        };
+        self.pending.store(false, Ordering::Relaxed);
+        self.send_out(&c.rt, c.sport, c.dport, &c.data, c.p, c.gso)
+    }
+
+    /// Drop the corked datagram (Linux udp_flush_pending_frames)
+    fn flush(&self, g: &mut Option<Cork>) {
+        *g = None;
+        self.pending.store(false, Ordering::Relaxed);
+    }
+
+    /// The UDP_SEGMENT size of a send (Linux udp_cmsg_send): a SOL_UDP
+    /// message may only be UDP_SEGMENT (a u16)
+    fn cmsg_gso(&self, control: &[u8]) -> Result<u16, KernelError> {
+        let mut gso = self.gso_size.load(Ordering::Relaxed);
+        for r in cmsgs(control) {
+            let (level, ty, d) = r?;
+            if level != SOL_UDP {
+                continue;
+            }
+            if ty != UDP_SEGMENT || d.len() != 2 {
+                return Err(KernelError::InvalidArgument);
+            }
+            gso = u16::from_ne_bytes([d[0], d[1]]);
+        }
+        Ok(gso)
+    }
+
+    /// Linux udp_lib_setsockopt for SOL_UDP
+    fn udp_setsockopt(&self, opt: i32, v: OptIn) -> Result<(), KernelError> {
+        let val = v.int()?;
+        match opt {
+            UDP_CORK => {
+                self.set_uflag(uf::CORK, val != 0);
+                if val == 0 {
+                    let mut g = self.op.lock();
+                    // Linux ignores udp_push_pending_frames' result here
+                    let _ = self.push(&mut g);
+                }
+            }
+            UDP_ENCAP => match val {
+                0 | UDP_ENCAP_L2TPINUDP => self.encap_type.store(val as u16, Ordering::Relaxed),
+                _ => return Err(KernelError::NoProtocolOption),
+            },
+            UDP_NO_CHECK6_TX => self.set_uflag(uf::NO_CHECK6_TX, val != 0),
+            UDP_NO_CHECK6_RX => self.set_uflag(uf::NO_CHECK6_RX, val != 0),
+            UDP_SEGMENT => {
+                if !(0..=i32::from(u16::MAX)).contains(&val) {
+                    return Err(KernelError::InvalidArgument);
+                }
+                self.gso_size.store(val as u16, Ordering::Relaxed);
+            }
+            UDP_GRO => self.set_uflag(uf::GRO_ENABLED, val != 0),
+            _ => return Err(KernelError::NoProtocolOption),
+        }
+        Ok(())
+    }
+
+    /// Linux udp_lib_getsockopt
+    fn udp_getsockopt(&self, opt: i32) -> Result<OptOut, KernelError> {
+        let v = match opt {
+            UDP_CORK => i32::from(self.uflag(uf::CORK)),
+            UDP_ENCAP => i32::from(self.encap_type.load(Ordering::Relaxed)),
+            UDP_NO_CHECK6_TX => i32::from(self.uflag(uf::NO_CHECK6_TX)),
+            UDP_NO_CHECK6_RX => i32::from(self.uflag(uf::NO_CHECK6_RX)),
+            UDP_SEGMENT => i32::from(self.gso_size.load(Ordering::Relaxed)),
+            UDP_GRO => i32::from(self.uflag(uf::GRO_ENABLED)),
+            _ => return Err(KernelError::NoProtocolOption),
+        };
+        Ok(OptOut::Int(v))
+    }
+
     /// Build and send one datagram: whether it went out, false if the
     /// send's ENOBUFS was swallowed (`send_err`)
     fn xmit(
@@ -408,6 +652,8 @@ impl ProtoOps for UdpSock {
     }
 
     fn release(&self) {
+        // Linux udp_destroy_sock: udp_flush_pending_frames
+        self.flush(&mut self.op.lock());
         self.unhash();
         self.sk.set_shutdown(SHUTDOWN_MASK);
         self.rxq.clear();
@@ -540,6 +786,7 @@ impl ProtoOps for UdpSock {
         match level {
             SOL_SOCKET => None,
             SOL_IP => Some(self.inet.setsockopt(&self.sk, opt, v)),
+            SOL_UDP => Some(self.udp_setsockopt(opt, v)),
             _ => Some(Err(KernelError::NoProtocolOption)),
         }
     }
@@ -549,22 +796,38 @@ impl ProtoOps for UdpSock {
             SOL_SOCKET => None,
             SOL_IP if opt == af_inet::IP_MTU => Some(self.mtu().map(OptOut::Int)),
             SOL_IP => Some(self.inet.getsockopt(opt)),
-            SOL_UDP => Some(Err(KernelError::NoProtocolOption)),
+            SOL_UDP => Some(self.udp_getsockopt(opt)),
             // Linux do_ip_getsockopt: other levels are EOPNOTSUPP
             _ => Some(Err(KernelError::OperationNotSupported)),
         }
     }
 
-    /// Linux udp_sendmsg
+    /// Linux udp_sendmsg: with UDP_CORK or MSG_MORE the data is corked
+    /// (appended to a datagram sent when a send without either comes,
+    /// or UDP_CORK is cleared); a send to a corked socket appends,
+    /// whatever its address and control messages
     fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
+        let len = m.data.len();
+        if len > 0xffff {
+            return Err(KernelError::MessageTooLong);
+        }
         if flags & MSG_OOB != 0 {
             return Err(KernelError::OperationNotSupported);
         }
-        let len = m.data.len();
+        let corkreq = self.uflag(uf::CORK) || flags & MSG_MORE != 0;
+        if self.pending.load(Ordering::Relaxed) {
+            let mut g = self.op.lock();
+            if g.is_some() {
+                let data = m.data.take(len)?;
+                self.append(&mut g, &data, len, corkreq)?;
+                return Ok(len);
+            }
+        }
         if len > UDP_MAX {
             return Err(KernelError::MessageTooLong);
         }
         let (daddr, dport, _connected) = self.dest(m)?;
+        let gso = self.cmsg_gso(&m.control)?;
         let c = tx_cmsgs(&m.control)?;
         let data = m.data.take(len)?;
         self.autobind()?;
@@ -587,31 +850,27 @@ impl ProtoOps for UdpSock {
         if let Some(e) = self.sk.take_err() {
             return Err(e);
         }
-        let mib = &self.sk.net.mib;
-        match self.xmit(&rt, a.sport, dport, &data, p) {
-            Ok(sent) => {
-                // Linux udp_send_skb
-                if sent {
-                    mib.udp.inc(UDP_MIB_OUTDATAGRAMS);
-                }
-                Ok(len)
-            }
-            Err(KernelError::MessageTooLong) => {
-                // Linux __ip_append_data: IP_RECVERR also queues it
-                // (msg_name port: the connected one)
-                let e = KernelError::MessageTooLong;
-                af_inet::ip_local_error(&self.sk, &self.inet, e, daddr, a.dport, rt.mtu);
-                Err(e)
-            }
-            Err(e) => {
-                // Linux udp_sendmsg's out: no kernel memory (the
-                // discard counted where it failed)
-                if e == KernelError::NoBufferSpace {
-                    mib.udp.inc(UDP_MIB_SNDBUFERRORS);
-                }
-                Err(e)
-            }
+        if !corkreq {
+            self.send_out(&rt, a.sport, dport, &data, p, gso)?;
+            return Ok(len);
         }
+        let mut g = self.op.lock();
+        if g.is_some() {
+            // Linux: "socket already corked" by a racing send
+            return Err(KernelError::InvalidArgument);
+        }
+        *g = Some(Cork {
+            rt,
+            sport: a.sport,
+            dport,
+            p,
+            gso,
+            len: 0,
+            data: Vec::new(),
+        });
+        self.pending.store(true, Ordering::Relaxed);
+        self.append(&mut g, &data, len + UDP_HLEN, corkreq)?;
+        Ok(len)
     }
 
     /// Linux udp_recvmsg
