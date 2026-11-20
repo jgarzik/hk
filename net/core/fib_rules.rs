@@ -858,7 +858,9 @@ pub fn delrule(
     Ok(())
 }
 
-/// Largest rule message (Linux fib_rule_nlmsg_size)
+/// Largest rule message (Linux fib_rule_nlmsg_size, which leaves out
+/// FRA_GOTO and FRA_L3MDEV and relies on skb slack; an hk buffer has
+/// none, so every attribute fill_rule writes is counted)
 fn rule_nlmsg_size(ops: &RulesOps<crate::net::inet::fib_rules::Fib4Rule>) -> usize {
     msg_size(
         FIB_RULE_HDR_LEN
@@ -866,7 +868,7 @@ fn rule_nlmsg_size(ops: &RulesOps<crate::net::inet::fib_rules::Fib4Rule>) -> usi
             + 7 * attr_size(4)
             + attr_size(8)
             + attr_size(8)
-            + 2 * attr_size(1)
+            + 3 * attr_size(1)
             + 2 * attr_size(4)
             + 2 * attr_size(2)
             + ops.payload,
@@ -1117,6 +1119,31 @@ mod tests {
         a.flags = FIB_RULE_INVERT;
         let r = rules(&[a, rule(20, FR_ACT_TO_TBL, 0)]);
         assert_eq!(walk(&r, &[]), Ok(20));
+    }
+
+    /// A rule with every attribute set fits the size its notification
+    /// is allocated with (Linux fib_rule_nlmsg_size)
+    #[test]
+    fn full_rule_fits() {
+        let mut r = rule(10, FR_ACT_GOTO, 30);
+        r.table = 100;
+        r.iifname = [b'i'; IFNAMSIZ];
+        r.iifname[IFNAMSIZ - 1] = 0;
+        r.oifname = [b'o'; IFNAMSIZ];
+        r.oifname[IFNAMSIZ - 1] = 0;
+        (r.mark, r.mark_mask, r.tun_id, r.l3mdev) = (1, 1, 1, 1);
+        (r.uid_range, r.ip_proto) = ((1, 2), 6);
+        r.sport = PortRange { start: 1, end: 2 };
+        r.dport = PortRange { start: 1, end: 2 };
+        (r.sport_mask, r.dport_mask, r.suppress_ifgroup) = (1, 1, 1);
+        let a = &mut r.af;
+        (a.dst_len, a.src_len, a.dscp_full, a.dscp, a.tclassid) = (8, 8, true, 4, 1);
+        let rs = rules(&[]);
+        let size = rule_nlmsg_size(rs.ops);
+        let mut v = nlmsg_new(size).unwrap();
+        let g = crate::sync::rcu::read_lock();
+        let mut nb = NlBuf::new(&mut v, size);
+        assert!(fill_rule(&mut nb, &rs, &g, &r, RTM_NEWRULE, 0, 0, 0).is_ok());
     }
 
     /// Port ranges and masks (Linux fib_rule_port_match)
