@@ -12,7 +12,6 @@
 //! cache, there is no cached route to expire (Linux rt_genid).
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
@@ -450,22 +449,10 @@ pub fn fnhe_genid_bump(net: &NetNamespace) {
 /// net.ipv4.route.flush: any write flushes the route cache (Linux
 /// ipv4_sysctl_rtcache_flush: rt_cache_flush, which has nothing to do
 /// without one, then fnhe_genid_bump); write-only
-fn rtcache_flush(_: &str) -> Result<(), KernelError> {
-    fnhe_genid_bump(&crate::net::current_net_ns());
+pub fn rtcache_flush(net: &NetNamespace, _: &str) -> Result<(), KernelError> {
+    fnhe_genid_bump(net);
     Ok(())
 }
-
-/// The /proc/sys/net/ipv4/route files (Linux ipv4_route_table subset)
-pub static ROUTE_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
-    path: "net/ipv4/route/flush",
-    mode: 0o200,
-    show: alloc::vec::Vec::new,
-    store: |_| Ok(()),
-    text: Some(crate::sysctl::Text {
-        show: String::new,
-        store: rtcache_flush,
-    }),
-}];
 
 /// Input routing decision for a received IPv4 packet
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

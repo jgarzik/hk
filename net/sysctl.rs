@@ -491,6 +491,18 @@ pub static CTLS: &[NetCtl] = &[
             store: ro_text,
         }),
     },
+    // Linux ipv4_route_netns_table: a write bumps the namespace's route
+    // cache generation (ipv4_sysctl_rtcache_flush)
+    NetCtl {
+        path: "net/ipv4/route/flush",
+        mode: 0o200,
+        show: no_ints,
+        store: ro,
+        text: Some(NetText {
+            show: |_| String::new(),
+            store: crate::net::inet::route::rtcache_flush,
+        }),
+    },
     NetCtl {
         path: "net/ipv4/ip_forward",
         mode: 0o444,

@@ -221,7 +221,6 @@ pub fn tables() -> &'static [&'static [Ctl]] {
         crate::io::inotify::INOTIFY_CTLS,
         crate::io::aio::AIO_CTLS,
         crate::power::CAD_CTLS,
-        crate::net::inet::route::ROUTE_CTLS,
     ];
     TABLES
 }
