@@ -701,10 +701,9 @@ fn active_close_and_time_wait() {
     assert!(p.a_out.timewait);
     assert_eq!(p.b.state, TcpState::Closed);
     assert!(p.b_out.done);
-    // 2MSL later the entry ends
-    let t = p.now;
-    p.until(|p| p.a.state == TcpState::Closed, 10);
-    assert_eq!(p.now - t, TIMEWAIT_LEN);
+    // Handed to its timewait entry, which owns 2MSL: the control block
+    // keeps no timer (Linux tcp_time_wait)
+    assert_eq!(p.a.next_timer(), None);
 }
 
 /// a's control block taken to TIME_WAIT by an orderly close (a closes

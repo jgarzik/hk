@@ -1388,13 +1388,14 @@ impl TcpCb {
         out.done = true;
     }
 
-    /// Entering TIME_WAIT (2MSL); the glue hands it to a timewait entry
-    pub(super) fn time_wait(&mut self, now: u64, out: &mut Out) {
+    /// Entering TIME_WAIT: the glue hands it to a timewait entry at once,
+    /// which owns the 2MSL timer and every later segment (Linux
+    /// tcp_time_wait: a full socket never processes one in TIME_WAIT)
+    pub(super) fn time_wait(&mut self, out: &mut Out) {
         self.set_state(TcpState::TimeWait);
         self.stop_timers();
         self.purge_wq();
         self.mem_settle();
-        self.live.wait_at.set(Some(now + TIMEWAIT_LEN));
         out.timewait = true;
         out.wake |= wake::STATE;
     }

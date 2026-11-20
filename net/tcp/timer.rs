@@ -134,11 +134,9 @@ impl TcpCb {
         self.tick(now);
         if self.live.wait_at.get().is_some_and(|t| t <= now) {
             self.live.wait_at.set(None);
-            match self.state {
-                TcpState::TimeWait => self.set_closed(out),
-                // Orphan in FIN_WAIT_2 too long (Linux tcp_keepalive_timer)
-                TcpState::FinWait2 => self.abort(out),
-                _ => {}
+            // Orphan in FIN_WAIT_2 too long (Linux tcp_keepalive_timer)
+            if self.state == TcpState::FinWait2 {
+                self.abort(out);
             }
             return;
         }

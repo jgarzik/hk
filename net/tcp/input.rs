@@ -16,8 +16,8 @@
 //! goes out, or the delayed ACK timer is armed (`ack.rs`).
 
 use super::cb::{
-    MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN,
-    TcpCb, TcpState, Tmr, after, before, between, flags, wake,
+    MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TcpCb,
+    TcpState, Tmr, after, before, between, flags, wake,
 };
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
@@ -217,23 +217,13 @@ impl TcpCb {
                 self.syn_challenge(out);
                 return;
             }
-            if self.state != TcpState::TimeWait
-                && s.has(flags::ACK)
-                && s.seq_len() == 0
-                && before(s.seq, self.rcv_nxt)
-            {
+            if s.has(flags::ACK) && s.seq_len() == 0 && before(s.seq, self.rcv_nxt) {
                 // An old pure ACK is just dropped (Linux
-                // tcp_disordered_ack_check TCP_RFC7323_PAWS_ACK; a
-                // TIME_WAIT socket rejects it as any other,
-                // tcp_timewait_state_process)
+                // tcp_disordered_ack_check TCP_RFC7323_PAWS_ACK)
                 self.net_stat(LINUX_MIB_PAWS_OLD_ACK);
                 return;
             }
-            self.net_stat(if self.state == TcpState::TimeWait {
-                LINUX_MIB_PAWS_TW_REJECTED
-            } else {
-                LINUX_MIB_PAWSESTABREJECTED
-            });
+            self.net_stat(LINUX_MIB_PAWSESTABREJECTED);
             if !self.oow_limited(s, LINUX_MIB_TCPACKSKIPPEDPAWS) {
                 self.send_ack(out); // dupack
             }
@@ -357,8 +347,7 @@ impl TcpCb {
 
     /// Linux tcp_oow_rate_limited: data segments are never limited
     /// (they are not part of an ACK loop), pure ones and SYNs are; a
-    /// skipped ACK counts in `mib` (TIME_WAIT's own entry in that
-    /// state)
+    /// skipped ACK counts in `mib`
     fn oow_limited(&mut self, s: &SegIn, mib: usize) -> bool {
         if s.data_len() != 0 && !s.has(flags::SYN) {
             return false;
@@ -366,11 +355,7 @@ impl TcpCb {
         if !self.oow_recent() {
             return false;
         }
-        self.net_stat(if self.state == TcpState::TimeWait {
-            LINUX_MIB_TCPACKSKIPPEDTIMEWAIT
-        } else {
-            mib
-        });
+        self.net_stat(mib);
         true
     }
 
@@ -420,7 +405,7 @@ impl TcpCb {
                 true
             }
             TcpState::Closing => {
-                self.time_wait(now, out);
+                self.time_wait(out);
                 false
             }
             TcpState::LastAck => {
@@ -577,9 +562,6 @@ impl TcpCb {
                     self.enter_quickack();
                 }
                 self.ack_now = true;
-                if fin && self.state == TcpState::TimeWait {
-                    self.live.wait_at.set(Some(now + TIMEWAIT_LEN));
-                }
                 return;
             }
             self.ack_now = true;
@@ -654,7 +636,7 @@ impl TcpCb {
         }
         if self.ooo_fin == Some(self.rcv_nxt) && self.ooo.is_empty() {
             self.ooo_fin = None;
-            self.rcv_fin(now, out);
+            self.rcv_fin(out);
         }
     }
 
@@ -756,16 +738,16 @@ impl TcpCb {
     }
 
     /// The peer's FIN is in sequence (RFC 9293 eighth check)
-    fn rcv_fin(&mut self, now: u64, out: &mut Out) {
+    fn rcv_fin(&mut self, out: &mut Out) {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
         self.ack_now = true;
         out.shut |= RCV_SHUTDOWN;
         out.wake |= wake::STATE | wake::FIN;
         match self.state {
             TcpState::Established => self.set_state(TcpState::CloseWait),
-            TcpState::FinWait1 if self.fin_acked() => self.time_wait(now, out),
+            TcpState::FinWait1 if self.fin_acked() => self.time_wait(out),
             TcpState::FinWait1 => self.set_state(TcpState::Closing),
-            TcpState::FinWait2 => self.time_wait(now, out),
+            TcpState::FinWait2 => self.time_wait(out),
             _ => {}
         }
     }
