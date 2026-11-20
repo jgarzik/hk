@@ -519,6 +519,8 @@ impl TcpCb {
         if st.sack_delivered != 0 {
             self.count_delivered(st.sack_delivered);
         }
+        // Something worked: the soft error log goes (Linux tcp_ack)
+        self.soft_err = None;
         self.live.probes.set(0);
         self.rcv_tstamp = now;
         let acked = ack.wrapping_sub(prior_snd_una);

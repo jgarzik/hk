@@ -957,7 +957,8 @@ pub struct TcpCb {
     // --- misc -------------------------------------------------------------
     /// Closed by the user (no file refers to it any more)
     pub orphan: bool,
-    /// Last ICMP error, reported if the connection times out
+    /// Last ICMP error (Linux sk_err_soft), reported if the connection
+    /// times out; an acceptable ACK clears it
     pub soft_err: Option<KernelError>,
     /// An ACK must go out now (pure ACK if no data segment carries it)
     pub(super) ack_now: bool,

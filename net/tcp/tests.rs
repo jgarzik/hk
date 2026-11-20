@@ -3174,3 +3174,29 @@ fn dup_ack_does_not_shrink_window() {
     p.a.feed(&zero, p.now, &mut Out::default());
     assert_eq!(p.a.snd_wnd, 0);
 }
+
+/// Any acceptable ACK, even a duplicate, clears the soft error (Linux
+/// tcp_ack: sk_err_soft = 0); an old one does not
+#[test]
+fn ack_clears_soft_error() {
+    let mut p = Pair::new(1000);
+    p.send_a(&pattern(3000));
+    p.run();
+    let dup = SegIn {
+        seq: p.a.rcv_nxt,
+        ack: p.a.snd_una,
+        flags: flags::ACK,
+        wnd: (p.a.snd_wnd >> p.a.snd_wscale) as u16,
+        ts: Some((p.a.ts_recent, 0)),
+        ..Default::default()
+    };
+    let old = SegIn {
+        ack: p.a.snd_una.wrapping_sub(500),
+        ..dup
+    };
+    p.a.soft_err = Some(KernelError::HostUnreachable);
+    p.a.feed(&old, p.now, &mut Out::default());
+    assert_eq!(p.a.soft_err, Some(KernelError::HostUnreachable));
+    p.a.feed(&dup, p.now, &mut Out::default());
+    assert_eq!(p.a.soft_err, None);
+}
