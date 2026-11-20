@@ -900,14 +900,6 @@ QEMU's xHCI hides all of them.
   bus or ttyUSB0 tty device, no baud rate or modem control requests,
   the bulk IN endpoint is never read.
 
-## Driver probe failure leaks
-
-**Location**: `hw/net/virtio_net.rs` (`setup_queues`, `probe`)
-
-A probe that fails part-way does not undo what it set up (Linux the
-probe's goto unwind): virtio-net's virtqueues and buffer pools leak
-when the second queue or a pool fails.
-
 ## No DMA for 32-bit devices with RAM above 4GB
 
 **Location**: `hw/dma.rs`, `mm/frame_alloc.rs`,

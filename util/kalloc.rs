@@ -173,6 +173,18 @@ pub fn try_arc_uninit<T>() -> Result<Arc<core::mem::MaybeUninit<T>>, KernelError
     reserved(arc_layout::<T>(), Arc::new_uninit)
 }
 
+/// `v` moved into `a`, an unshared block from [`try_arc_uninit`]: an
+/// object allocated before the resources it will hold (Linux
+/// alloc_etherdev before a probe sets up its queues), so a failed
+/// allocation leaves nothing to undo. Panics if `a` is shared.
+pub fn arc_write<T>(mut a: Arc<core::mem::MaybeUninit<T>>, v: T) -> Arc<T> {
+    Arc::get_mut(&mut a)
+        .expect("arc_write: an unshared block")
+        .write(v);
+    // SAFETY: the value was written just above
+    unsafe { a.assume_init() }
+}
+
 /// `Box::new([f(); N])` made item by item in the heap block, or ENOMEM:
 /// for a large array (Linux kzalloc), which `try_box([..; N])` builds
 /// on the stack first in builds that do not optimize the copy away
