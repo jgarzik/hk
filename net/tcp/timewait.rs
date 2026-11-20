@@ -221,23 +221,19 @@ impl TimeWait {
         self.unhash();
     }
 
-    /// 2MSL passed (`ktimers/N`; Linux tw_timer_handler): the entry
-    /// leaves the tables; the timer's reference goes with `tw`
+    /// 2MSL passed (`ktimers/N`; Linux tw_timer_handler ->
+    /// inet_twsk_kill): the entry leaves the tables; the timer's
+    /// reference goes with `tw`. Nothing is allocated.
     fn tw_timer(tw: Arc<TimeWait>) {
-        let mut out = Out::default();
-        // As `rcv`; with no memory the entry ends now (Linux skips
-        // TIME_WAIT when it cannot allocate one)
-        let Ok(live) = try_arc_gfp(Live::default(), Gfp::ATOMIC) else {
-            tw.kill();
-            return;
-        };
         let mut g = tw.inner.lock();
-        let mut cb = g.0.cb(super::cfg(&tw.net), live);
-        cb.on_timer(now_ms(), &mut out);
-        g.0 = TwCb::from_cb(&cb);
-        tw.post(&mut g, &out);
-        tw.send(&mut out);
+        // Rescheduled as this run started (Linux's mod_timer moves a
+        // pending timer instead): wait for the new deadline
+        if g.0.next_timer().is_some_and(|at| at > now_ms()) {
+            tw.sync(&mut g, false);
+            return;
+        }
+        tw.sync(&mut g, true);
         drop(g);
-        drop(cb);
+        tw.unhash();
     }
 }
