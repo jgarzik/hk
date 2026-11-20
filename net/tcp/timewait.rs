@@ -317,6 +317,9 @@ pub struct TimeWait {
     /// is never armed again (Linux timer_shutdown in
     /// inet_twsk_deschedule_put); set under `inner`
     killed: AtomicBool,
+    /// Counted in its namespace's TIME_WAIT entries (from allocation to
+    /// `uncount`)
+    counted: AtomicBool,
     /// The tables' references, dropped a grace period after unhashing
     rcu_puts: RcuPuts,
     me: Weak<TimeWait>,
@@ -325,10 +328,10 @@ pub struct TimeWait {
 crate::rcu_puts!(TimeWait, rcu_puts);
 
 impl Drop for TimeWait {
-    /// No longer counted in its namespace (Linux tw_refcount's
-    /// decrement, inet_twsk_kill: once per entry)
+    /// One never killed (its hand-over failed after it was allocated)
+    /// stops being counted here
     fn drop(&mut self) {
-        self.net.tcp_net.tw_sub();
+        self.uncount();
     }
 }
 
@@ -344,7 +347,7 @@ impl TimeWait {
         cb: TwCb,
     ) -> Result<Arc<Self>, KernelError> {
         // Linux inet_twsk_alloc: none past tcp_max_tw_buckets; counted
-        // from here to its drop (`Drop`)
+        // from here until it is killed (`unhash`, Linux inet_twsk_kill)
         let tn = Arc::clone(&net.tcp_net);
         if tn.tw_full() {
             return Err(KernelError::NoBufferSpace);
@@ -362,6 +365,7 @@ impl TimeWait {
             bind_link: Link::new(),
             by_bind,
             killed: AtomicBool::new(false),
+            counted: AtomicBool::new(true),
             rcu_puts: RcuPuts::new(),
             me: me.clone(),
         });
@@ -380,6 +384,16 @@ impl TimeWait {
     fn unhash(self: &Arc<Self>) {
         let eh = self.eh.lock().take();
         self.net.tcp.tw_unhash(self, eh);
+        self.uncount();
+    }
+
+    /// No longer counted in its namespace's TIME_WAIT entries (Linux
+    /// inet_twsk_kill's tw_refcount decrement): once, whichever of the
+    /// kill and the drop comes first
+    fn uncount(&self) {
+        if self.counted.swap(false, Ordering::AcqRel) {
+            self.net.tcp_net.tw_sub();
+        }
     }
 
     /// Its namespace
