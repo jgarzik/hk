@@ -105,12 +105,13 @@ whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
 a group's pick at once (with no connected members), before scoring
 the rest of the hash2 chain.
 
-A TIME_WAIT segment other than a takeover SYN rebuilds a full control
-block from the entry (`TwCb::cb`), whose lockless fields (`Live`) it
-allocates GFP_ATOMIC per segment: a flood of segments to TIME_WAIT
-tuples allocates per segment, and an allocation failure drops the
-segment. Linux
-tcp_timewait_state_process works on the tw itself.
+TIME_WAIT (`net/tcp/timewait.rs`) lacks three Linux parts: an
+orphan's FIN_WAIT_2 stays a full socket (Linux tcp_close hands it to
+a timewait sock with tw_substate FIN_WAIT2 when tcp_fin_timeout is
+at most TCP_TIMEWAIT_LEN; tcp_timewait_state_process's FIN_WAIT2
+branch); a takeover SYN's connection gets a fresh ISN, not the
+entry's SND.NXT + 65537 (Linux TCP_SKB_CB tcp_tw_isn); and there is
+no tcp_max_tw_buckets (inet_twsk_alloc's limit, TCPTimeWaitOverflow).
 
 A socket on RCU lists (ping, raw, UDP, packet, netlink) leaves "sockets: used" a grace
 period after its close: the chain's `Arc` is released by

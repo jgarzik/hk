@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use super::cb::{
     Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, TIMEWAIT_LEN, TcpCb, TcpState, flags, wake,
 };
+use super::timewait::{TwCb, TwStatus};
 use crate::mm::page_alloc::Gfp;
 use crate::net::skb::SkBuff;
 use crate::util::error::KernelError;
@@ -706,9 +707,16 @@ fn active_close_and_time_wait() {
     assert_eq!(p.now - t, TIMEWAIT_LEN);
 }
 
-#[test]
-fn time_wait_reacks_fin_and_restarts() {
+/// a's control block taken to TIME_WAIT by an orderly close (a closes
+/// first): its entry's fields and b's FIN
+fn tw_pair() -> (Pair, TwCb, Seg) {
     let mut p = Pair::new(1460);
+    let (tw, fin) = tw_close(&mut p);
+    (p, tw, fin)
+}
+
+/// `tw_pair` on an established `p`
+fn tw_close(p: &mut Pair) -> (TwCb, Seg) {
     let mut out = Out::default();
     p.a.close(false, p.now, &mut out);
     p.take(true, out);
@@ -720,14 +728,75 @@ fn time_wait_reacks_fin_and_restarts() {
     let fin = p.wire.back().unwrap().1.clone();
     p.run();
     assert_eq!(p.a.state, TcpState::TimeWait);
+    let tw = TwCb::from_cb(&p.a);
+    assert!(tw.expires() <= p.now + TIMEWAIT_LEN);
+    (tw, fin)
+}
+
+/// A bare TIME_WAIT header
+fn tw_seg(seq: u32, fl: u8, ts: Option<(u32, u32)>) -> super::cb::Seg {
+    SegIn {
+        seq,
+        flags: fl,
+        ts,
+        ..Default::default()
+    }
+    .hdr()
+}
+
+/// A retransmitted FIN is ACKed at once and restarts 2MSL (Linux
+/// tcp_timewait_state_process: out of window, reschedule and ACK)
+#[test]
+fn time_wait_reacks_fin_and_restarts() {
+    let (mut p, mut tw, fin) = tw_pair();
     p.now += 30_000;
-    p.log.clear();
-    let mut out = Out::default();
-    p.a.feed(&seg_in(&fin), p.now, &mut out);
-    assert_eq!(wire(&out).len(), 1);
-    assert!(wire(&out)[0].has(flags::ACK));
-    assert_eq!(wire(&out)[0].ack, fin.seq.wrapping_add(1));
-    assert_eq!(p.a.next_timer(), Some(p.now + TIMEWAIT_LEN));
+    let st = tw.rcv(&seg_in(&fin).hdr(), p.now, false, None);
+    assert_eq!(st, TwStatus::Ack);
+    let a = tw.ack(p.now);
+    assert!(a.has(flags::ACK) && !a.has(flags::SYN | flags::FIN | flags::RST));
+    assert_eq!(a.ack, fin.seq.wrapping_add(1));
+    assert_eq!(a.seq, p.a.snd_max);
+    assert!(a.ts.is_some_and(|(_, e)| e == tw.ts_recent));
+    assert_eq!(tw.expires(), p.now + TIMEWAIT_LEN);
+}
+
+/// A bare in-window ACK restarts 2MSL and needs no answer; an
+/// in-window RST ends the entry, unless tcp_rfc1337
+#[test]
+fn time_wait_bare_ack_and_rst() {
+    let (mut p, mut tw, _) = tw_pair();
+    p.now += 1000;
+    let ack = tw_seg(tw.rcv_nxt, flags::ACK, None);
+    assert_eq!(tw.rcv(&ack, p.now, false, None), TwStatus::Success);
+    let at = p.now + TIMEWAIT_LEN;
+    assert_eq!(tw.expires(), at);
+    let rst = tw_seg(tw.rcv_nxt, flags::RST, None);
+    p.now += 1000;
+    // RFC 1337: ignored, no reschedule either
+    assert_eq!(tw.rcv(&rst, p.now, true, None), TwStatus::Success);
+    assert_eq!(tw.expires(), at);
+    assert_eq!(tw.rcv(&rst, p.now, false, None), TwStatus::Kill);
+    // Out of window: dropped, the entry stays
+    let far = tw_seg(tw.rcv_nxt.wrapping_add(1000), flags::RST, None);
+    assert_eq!(tw.rcv(&far, p.now, false, None), TwStatus::Success);
+}
+
+/// Out-of-window ACKs are rate limited (Linux tcp_oow_rate_limited,
+/// TCPACKSkippedTimeWait); a segment with sequence space never is
+#[test]
+fn time_wait_oow_rate_limit() {
+    use crate::net::mib::*;
+    let m = NetMib::new().unwrap();
+    let (mut p, mut tw, fin) = tw_pair();
+    let old = tw_seg(tw.rcv_nxt.wrapping_sub(5), flags::ACK, None);
+    assert_eq!(tw.rcv(&old, p.now, false, Some(&m)), TwStatus::Ack);
+    p.now += 100;
+    assert_eq!(tw.rcv(&old, p.now, false, Some(&m)), TwStatus::Success);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPACKSKIPPEDTIMEWAIT), 1);
+    let fin = seg_in(&fin).hdr();
+    assert_eq!(tw.rcv(&fin, p.now, false, Some(&m)), TwStatus::Ack);
+    p.now += super::cb::OOW_RATELIMIT;
+    assert_eq!(tw.rcv(&old, p.now, false, Some(&m)), TwStatus::Ack);
 }
 
 #[test]
@@ -1801,30 +1870,20 @@ fn zero_window_probes_with_options() {
 
 #[test]
 fn tw_reopens_with_newer_timestamp() {
-    let mut p = Pair::new(1460);
-    let mut out = Out::default();
-    p.a.close(false, p.now, &mut out);
-    p.take(true, out);
-    p.run();
-    let mut out = Out::default();
-    p.b.close(false, p.now, &mut out);
-    p.take(false, out);
-    p.run();
-    assert_eq!(p.a.state, TcpState::TimeWait);
-    let tw = p.a.tw_clone();
-    let syn = |seq: u32, tsv: u32| {
-        SegIn {
-            seq,
-            flags: flags::SYN,
-            ts: Some((tsv, 0)),
-            ..Default::default()
-        }
-        .hdr()
-    };
+    let (p, mut tw, _) = tw_pair();
+    let now = p.now;
     let old = tw.rcv_nxt.wrapping_sub(10);
-    assert!(!tw.tw_syn_ok(&syn(old, tw.ts_recent.wrapping_sub(1))));
-    assert!(tw.tw_syn_ok(&syn(old, tw.ts_recent.wrapping_add(1))));
-    assert!(tw.tw_syn_ok(&syn(tw.rcv_nxt.wrapping_add(1), 0)));
+    let (r, next) = (tw.ts_recent, tw.rcv_nxt.wrapping_add(1));
+    // An old SYN with an older timestamp fails PAWS: ACKed, no takeover
+    let s = tw_seg(old, flags::SYN, Some((r.wrapping_sub(1), 0)));
+    assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Ack);
+    let s = tw_seg(old, flags::SYN, Some((r.wrapping_add(1), 0)));
+    assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Syn);
+    let s = tw_seg(next, flags::SYN, None);
+    assert_eq!(tw.rcv(&s, now, false, None), TwStatus::Syn);
+    // Not with ACK
+    let s = tw_seg(next, flags::SYN | flags::ACK, None);
+    assert_ne!(tw.rcv(&s, now, false, None), TwStatus::Syn);
 }
 
 // ============================================================================
@@ -2024,19 +2083,11 @@ fn mib_open_close() {
 fn mib_timewait_paws_rejects() {
     use crate::net::mib::*;
     let (mut p, m) = mib_pair();
-    let mut out = Out::default();
-    p.a.close(false, p.now, &mut out);
-    p.take(true, out);
-    p.run();
-    let mut out = Out::default();
-    p.b.close(false, p.now, &mut out);
-    p.take(false, out);
-    p.run();
-    assert_eq!(p.a.state, TcpState::TimeWait);
+    let (mut tw, _) = tw_close(&mut p);
     let last = p.log.iter().rev().find(|l| !l.1).unwrap().2.clone();
     let (tsv, tse) = last.ts.unwrap();
     let old = Seg {
-        seq: p.a.rcv_nxt.wrapping_sub(1),
+        seq: tw.rcv_nxt.wrapping_sub(1),
         ack: last.ack,
         flags: flags::ACK,
         wnd: last.wnd,
@@ -2044,11 +2095,24 @@ fn mib_timewait_paws_rejects() {
         ..Default::default()
     };
     p.now += 10;
-    let mut out = Out::default();
-    p.a.feed(&seg_in(&old), p.now, &mut out);
+    let st = tw.rcv(&seg_in(&old).hdr(), p.now, false, Some(&m));
     assert_eq!(m.net.fold(LINUX_MIB_PAWS_TW_REJECTED), 1);
     assert_eq!(m.net.fold(LINUX_MIB_PAWS_OLD_ACK), 0);
-    assert_eq!(wire(&out).len(), 1);
+    assert_eq!(st, TwStatus::Ack);
+    assert_eq!(tw.expires(), p.now + TIMEWAIT_LEN);
+    // An in-window RST with an old timestamp is rejected until
+    // TS.Recent is PAWS_MSL (60 s) old (Linux tcp_paws_reject)
+    let rst = Seg {
+        seq: tw.rcv_nxt,
+        flags: flags::RST,
+        ts: Some((tsv.wrapping_sub(1000), 0)),
+        ..Default::default()
+    };
+    let rst = seg_in(&rst).hdr();
+    assert_eq!(tw.rcv(&rst, p.now, false, Some(&m)), TwStatus::Success);
+    assert_eq!(m.net.fold(LINUX_MIB_PAWS_TW_REJECTED), 2);
+    let st = tw.rcv(&rst, p.now + 61_000, false, Some(&m));
+    assert_eq!(st, TwStatus::Kill);
 }
 
 /// An abort resets both ends: EstabResets on each, one OutRst

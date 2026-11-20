@@ -74,7 +74,7 @@ use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;
 use self::table::Ent;
 use self::timer::now_ms;
-use self::timewait::TimeWait;
+use self::timewait::{TimeWait, TwCb};
 use crate::io::fasync::{POLL_HUP, POLL_IN, POLL_OUT};
 use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -552,7 +552,7 @@ impl TcpSock {
                 self.by_bind.load(Ordering::Relaxed),
                 self.inet.params(),
                 self.oif(),
-                g.cb.tw_clone(),
+                TwCb::from_cb(&g.cb),
             )
         });
         // Its ehash entry, GFP_ATOMIC with it
@@ -1434,9 +1434,20 @@ pub fn tcp_rcv(mut skb: Box<SkBuff>) {
                 Some(again) => skb = again,
                 None => return,
             },
-            // A TIME_WAIT entry consumes it unless it is a new SYN
+            // A TIME_WAIT entry consumes it unless it is a new SYN: a
+            // listener takes the tuple over, else the entry ACKs it
+            // (Linux do_time_wait TCP_TW_SYN)
             Some(Ent::Tw(tw)) => match tw.rcv(skb, now) {
-                Some(skb) => break skb,
+                Some(skb) => match net.tcp.listener(daddr, t.lport, dif) {
+                    Some(l) => {
+                        tw.kill();
+                        return l.listen_rcv(skb, t);
+                    }
+                    None => {
+                        tw.syn_ack(now);
+                        return;
+                    }
+                },
                 None => return,
             },
             None => break skb,
