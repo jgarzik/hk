@@ -13,6 +13,7 @@ use crate::fs::KernelError;
 use crate::ksysfs::UEVENT_SEQNUM;
 use crate::mm::page_alloc::Gfp;
 use crate::net::netlink::{self, NETLINK_KOBJECT_UEVENT};
+use crate::net::unix::scm::Creds;
 
 /// Linux enum kobject_action
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -118,9 +119,16 @@ static UEVENT_SOCK_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 /// Messages a user sends to port 0 of NETLINK_KOBJECT_UEVENT (Linux
 /// uevent_net_rcv): each request is rebroadcast in the sender's
 /// namespace (`uevent_net_rcv_skb`)
-pub fn uevent_net_rcv(sk: &alloc::sync::Arc<netlink::NlSock>, data: &[u8], explicit: bool) {
+pub fn uevent_net_rcv(
+    sk: &alloc::sync::Arc<netlink::NlSock>,
+    data: &[u8],
+    explicit: bool,
+    creds: &Creds,
+) {
     let _g = UEVENT_SOCK_MUTEX.lock();
-    netlink::rcv_skb(sk, data, |_, _| uevent_net_rcv_skb(sk, data, explicit));
+    netlink::rcv_skb(sk, data, |_, _| {
+        uevent_net_rcv_skb(sk, data, explicit, creds)
+    });
 }
 
 /// Linux uevent_net_rcv_skb: CAP_SYS_ADMIN by netlink_ns_capable (the
@@ -128,11 +136,13 @@ pub fn uevent_net_rcv(sk: &alloc::sync::Arc<netlink::NlSock>, data: &[u8], expli
 /// namespace's owner, hk's capabilities being global), then uevent_net_broadcast: the
 /// sender's whole message, its first header taken off and the next
 /// SEQNUM appended, on group 1 from port 0 (the kernel) to every
-/// listener of the namespace; EINVAL past UEVENT_BUFFER_SIZE
+/// listener of the namespace, still carrying the sender's credentials
+/// (skb_copy_expand keeps NETLINK_CB); EINVAL past UEVENT_BUFFER_SIZE
 fn uevent_net_rcv_skb(
     sk: &netlink::NlSock,
     data: &[u8],
     explicit: bool,
+    creds: &Creds,
 ) -> Result<(), KernelError> {
     if !sk.net_capable(crate::task::CAP_SYS_ADMIN, explicit) {
         return Err(KernelError::NotPermitted);
@@ -153,7 +163,14 @@ fn uevent_net_rcv_skb(
     netlink::broadcast(
         &sk.sk.net,
         NETLINK_KOBJECT_UEVENT,
-        netlink::kernel_skb(msg, 1),
+        netlink::nl_skb(
+            msg,
+            netlink::NlCb {
+                portid: 0,
+                group: 1,
+                creds: creds.clone(),
+            },
+        ),
         0,
         Gfp::KERNEL,
     );

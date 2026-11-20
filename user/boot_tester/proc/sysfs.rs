@@ -376,7 +376,8 @@ fn uevent_send(payload: &[u8]) -> i64 {
 
 /// NETLINK_KOBJECT_UEVENT kernel input (Linux uevent_net_rcv): a
 /// CAP_SYS_ADMIN sender's message to port 0 is rebroadcast on group 1
-/// from the kernel, its header off and a SEQNUM appended, and ACKed;
+/// from the kernel, its header off and a SEQNUM appended, the sender's
+/// credentials kept (skb_copy_expand copies NETLINK_CB), and ACKed;
 /// an unprivileged sender's is refused (EPERM)
 fn test_uevent_input() {
     const N: &[u8] = b"UEVENT_INPUT";
@@ -396,8 +397,8 @@ fn test_uevent_input() {
     if exact_vars(&buf[..n], &[b"ACTION=add"]).is_none() {
         return fail_why(N, b"vars", n as i64);
     }
-    if c.0 != 0 {
-        return fail_why(N, b"from kernel", i64::from(c.0));
+    if c != (hk_syscall::sys_getpid() as i32, 0, 0) {
+        return fail_why(N, b"sender creds", i64::from(c.0));
     }
     let pid = hk_syscall::sys_fork();
     if pid == 0 {

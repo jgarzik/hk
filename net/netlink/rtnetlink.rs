@@ -185,7 +185,7 @@ enum Done {
 
 /// Process a buffer of requests sent to the kernel (Linux
 /// netlink_rcv_skb + rtnetlink_rcv_msg)
-pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool) {
+pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool, _creds: &Creds) {
     while data.len() >= NLMSG_HDRLEN {
         let h = Hdr::parse(data).unwrap();
         let len = h.len as usize;

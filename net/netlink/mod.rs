@@ -227,8 +227,9 @@ pub fn nl_cb(skb: &SkBuff) -> NlCb {
 }
 
 /// Kernel receiver of messages sent to port 0 (`explicit`: the sender
-/// named the destination)
-pub type NlInput = fn(&Arc<NlSock>, &[u8], bool);
+/// named the destination) with the sender's credentials (Linux
+/// NETLINK_CB(skb).creds)
+pub type NlInput = fn(&Arc<NlSock>, &[u8], bool, &Creds);
 
 /// A netlink protocol (Linux netlink_kernel_cfg)
 pub struct NlProto {
@@ -810,7 +811,7 @@ impl NlSock {
             if group == 0
                 && let Some(input) = self.proto.input
             {
-                input(self, data, explicit);
+                input(self, data, explicit, &creds);
             }
             return Ok(data.len());
         }
