@@ -12,6 +12,7 @@ use hk_syscall::{
 };
 
 use crate::harness::T;
+use crate::net::netlink::drop_caps;
 use crate::net::nl::{self, Nl, Req};
 use crate::net::sk::*;
 use crate::net::tcp_xfer::{accept, listener, recv_pat, send_pat, set_timeo, wait_child};
@@ -37,6 +38,7 @@ const TCP_FASTOPEN: i32 = 23;
 const TCP_NOTSENT_LOWAT: i32 = 25;
 const MSG_MORE: i32 = 0x8000;
 const ENOENT: i64 = -2;
+const EPERM: i64 = -1;
 const ETIMEDOUT: i64 = -110;
 /// tcpi_options bits
 const TCPI_OPT_TIMESTAMPS: u8 = 1;
@@ -50,6 +52,7 @@ pub fn run_tests() {
     crate::helpers::println(b"=== TCP Option Tests ===");
     test_opts();
     test_congestion();
+    test_congestion_allowed();
     test_lo_4mb_info();
     test_maxseg_conn();
     test_cork_more();
@@ -241,32 +244,79 @@ fn test_opts() {
     t.done();
 }
 
-/// TCP_CONGESTION: "reno" is always there; unknown names are ENOENT
-fn test_congestion() {
-    let mut t = T::new(b"TCP_CONGESTION");
-    let fd = tcp();
+/// TCP_CONGESTION of `fd` as its NUL-padded 16 bytes
+fn get_ca(fd: i32) -> (i64, [u8; 16], u32) {
     let mut b = [0xffu8; 16];
     let mut len = 16u32;
     let r = sys_getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, b.as_mut_ptr(), &mut len);
+    (r, b, len)
+}
+
+fn set_ca(fd: i32, name: &[u8]) -> i64 {
+    sys_setsockopt(
+        fd,
+        IPPROTO_TCP,
+        TCP_CONGESTION,
+        name.as_ptr(),
+        name.len() as u32,
+    )
+}
+
+/// TCP_CONGESTION: a new socket has the default, cubic; reno and cubic
+/// are selectable; unknown names are ENOENT
+fn test_congestion() {
+    let mut t = T::new(b"TCP_CONGESTION");
+    let fd = tcp();
+    let (r, b, len) = get_ca(fd);
     t.eq(b"get", r, 0);
     t.eq(b"len", len as i64, 16);
-    t.ok(b"has a name", b[0].is_ascii_lowercase(), b[0] as i64);
-    let set = |name: &[u8]| {
-        sys_setsockopt(
-            fd,
-            IPPROTO_TCP,
-            TCP_CONGESTION,
-            name.as_ptr(),
-            name.len() as u32,
-        )
-    };
-    t.eq(b"reno", set(b"reno"), 0);
-    let mut b = [0xffu8; 16];
-    let mut len = 16u32;
-    sys_getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, b.as_mut_ptr(), &mut len);
-    t.ok(b"reno back", &b[..5] == b"reno\0", 0);
-    t.eq(b"unknown", set(b"nosuchcc"), ENOENT);
+    t.ok(b"cubic default", &b[..6] == b"cubic\0", b[0] as i64);
+    t.eq(b"reno", set_ca(fd, b"reno"), 0);
+    t.ok(b"reno back", &get_ca(fd).1[..5] == b"reno\0", 0);
+    t.eq(b"cubic", set_ca(fd, b"cubic"), 0);
+    t.ok(b"cubic back", &get_ca(fd).1[..6] == b"cubic\0", 0);
+    t.eq(b"unknown", set_ca(fd, b"nosuchcc"), ENOENT);
     close(fd);
+    t.done();
+}
+
+const ALLOWED: &[u8] = b"/proc/sys/net/ipv4/tcp_allowed_congestion_control\0";
+
+/// tcp_allowed_congestion_control: a restricted algorithm needs
+/// CAP_NET_ADMIN (Linux tcp_set_congestion_control), the current one
+/// does not; unknown names are ENOENT
+fn test_congestion_allowed() {
+    let mut t = T::new(b"TCP_CONGESTION_ALLOWED");
+    t.eq(b"restrict", write_file(ALLOWED, b"reno"), 4);
+    let mut b = [0u8; 64];
+    let n = read_file(ALLOWED, &mut b);
+    t.ok(b"reno only", n == 5 && &b[..5] == b"reno\n", n);
+    t.ok(b"unknown", write_file(ALLOWED, b"reno nosuchcc") < 0, 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        let fd = tcp();
+        if !drop_caps() {
+            sys_exit(1);
+        }
+        if set_ca(fd, b"reno") != 0 {
+            sys_exit(2);
+        }
+        if set_ca(fd, b"cubic") != EPERM {
+            sys_exit(3);
+        }
+        if set_ca(fd, b"reno") != 0 {
+            sys_exit(4);
+        }
+        sys_exit(0);
+    }
+    t.eq(b"unprivileged", wait_child(pid) as i64, 0);
+    // Privileged: restricted ones too
+    let fd = tcp();
+    t.eq(b"cap_net_admin", set_ca(fd, b"cubic"), 0);
+    close(fd);
+    t.eq(b"restore", write_file(ALLOWED, b"reno cubic"), 10);
+    let n = read_file(ALLOWED, &mut b);
+    t.ok(b"restored", n == 11 && &b[..11] == b"reno cubic\n", n);
     t.done();
 }
 
@@ -468,23 +518,14 @@ fn test_proc_net_tcp() {
 fn test_sysctls() {
     let mut t = T::new(b"TCP_SYSCTLS");
     let mut b = [0u8; 128];
-    let n = read_file(
-        b"/proc/sys/net/ipv4/tcp_available_congestion_control\0",
-        &mut b,
-    );
-    t.ok(
-        b"available has reno",
-        n > 0 && has_line(&b[..n as usize], &[b"reno"]),
-        n,
-    );
-    let n = read_file(b"/proc/sys/net/ipv4/tcp_congestion_control\0", &mut b);
-    t.ok(
-        b"default",
-        n > 1 && b[0].is_ascii_lowercase() && b[n as usize - 1] == b'\n',
-        n,
-    );
     for (path, want) in [
-        (&b"/proc/sys/net/ipv4/tcp_window_scaling\0"[..], &b"1\n"[..]),
+        (
+            &b"/proc/sys/net/ipv4/tcp_available_congestion_control\0"[..],
+            &b"reno cubic\n"[..],
+        ),
+        (ALLOWED, b"reno cubic\n"),
+        (b"/proc/sys/net/ipv4/tcp_congestion_control\0", b"cubic\n"),
+        (b"/proc/sys/net/ipv4/tcp_window_scaling\0", b"1\n"),
         (b"/proc/sys/net/ipv4/tcp_timestamps\0", b"1\n"),
         (b"/proc/sys/net/ipv4/tcp_keepalive_time\0", b"7200\n"),
         (b"/proc/sys/net/ipv4/tcp_keepalive_intvl\0", b"75\n"),

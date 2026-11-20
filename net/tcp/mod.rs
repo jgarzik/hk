@@ -49,6 +49,7 @@
 pub mod ack;
 pub mod cb;
 pub mod cong;
+pub mod cubic;
 pub mod info;
 pub mod input;
 pub mod mem;
@@ -983,6 +984,11 @@ impl TcpSock {
         let mut cb = TcpCb::new(kc, Arc::clone(&c.live));
         cb.mib = Some(Arc::clone(&self.sk.net.mib));
         cb.opts = opts;
+        // Linux tcp_ca_openreq_child: the namespace's default unless the
+        // listener chose one (icsk_ca_setsockopt)
+        if !cb.opts.ca_set {
+            cb.opts.ca = self.sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
+        }
         (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = caps;
         cb.passive(s, o, now, &mut out);
         g.cb = cb;
@@ -2330,7 +2336,9 @@ impl TcpSock {
     }
 
     /// TCP_CONGESTION: a NUL-terminated name of a built-in algorithm
-    /// (Linux tcp_set_congestion_control: ENOENT when none matches)
+    /// (Linux tcp_set_congestion_control: the current one is no change;
+    /// ENOENT when none matches, EPERM for a restricted one without
+    /// CAP_NET_ADMIN)
     fn set_congestion(&self, v: OptIn) -> Result<(), KernelError> {
         if v.len < 1 {
             return Err(KernelError::InvalidArgument);
@@ -2338,10 +2346,17 @@ impl TcpSock {
         let b = v.bytes(cong::NAME_MAX - 1)?;
         let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
         let name = core::str::from_utf8(&b[..n]).map_err(|_| KernelError::NotFound)?;
-        let i = cong::find(name).ok_or(KernelError::NotFound)?;
+        let i = cong::find(name);
         let mut g = self.lock_sock();
-        g.cb.opts.ca = i;
-        g.cb.set_cc(i);
+        if i != Some(g.cb.cong.algo()) {
+            let i = i.ok_or(KernelError::NotFound)?;
+            if !cong::allowed(i) && !crate::task::capable(crate::task::CAP_NET_ADMIN) {
+                return Err(KernelError::PermissionDenied);
+            }
+            g.cb.opts.ca = i;
+            g.cb.set_cc(i);
+        }
+        g.cb.opts.ca_set = true;
         Ok(())
     }
 

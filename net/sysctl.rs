@@ -109,7 +109,7 @@ impl Default for NetSysctl {
             tcp_keepalive_intvl: AtomicI32::new(75),
             tcp_keepalive_probes: AtomicU8::new(9),
             tcp_frto: AtomicU8::new(2),
-            tcp_ca: AtomicU8::new(0),
+            tcp_ca: AtomicU8::new(crate::net::tcp::cong::DEFAULT as u8),
             somaxconn: AtomicI32::new(4096),
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
             frag_low: AtomicUsize::new(3 * 1024 * 1024),
@@ -329,10 +329,13 @@ fn ca_show(n: &NetNamespace) -> String {
     String::from(crate::net::tcp::cong::ALGOS[i].name())
 }
 
-/// tcp_congestion_control: a built-in algorithm (Linux: ENOENT when
-/// no module provides it)
+/// tcp_congestion_control: a built-in algorithm (Linux
+/// tcp_set_default_congestion_control: ENOENT when no module provides
+/// it, EPERM for a restricted one outside the initial namespace)
 fn ca_store(n: &NetNamespace, name: &str) -> Result<(), KernelError> {
-    let i = crate::net::tcp::cong::find(name).ok_or(KernelError::NotFound)?;
+    use crate::net::tcp::cong;
+    let i = cong::find(name).ok_or(KernelError::NotFound)?;
+    cong::set_default(is_init(n), i)?;
     n.sysctl.tcp_ca.store(i as u8, Ordering::Relaxed);
     Ok(())
 }
@@ -568,6 +571,17 @@ pub static CTLS: &[NetCtl] = &[
         text: Some(NetText {
             show: |_| crate::net::tcp::cong::names(),
             store: ro_text,
+        }),
+    },
+    // Linux ipv4_net_table, its data global (tcp_cong_list's flags)
+    NetCtl {
+        path: "net/ipv4/tcp_allowed_congestion_control",
+        mode: 0o644,
+        show: no_ints,
+        store: ro,
+        text: Some(NetText {
+            show: |_| crate::net::tcp::cong::allowed_names(),
+            store: |_, s| crate::net::tcp::cong::set_allowed(s),
         }),
     },
     // Linux ipv4_route_netns_table: a write bumps the namespace's route

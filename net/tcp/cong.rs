@@ -16,14 +16,20 @@
 //! tcp_cwnd_restart); the CA state machine, PRR, undo and F-RTO that
 //! call the hooks are tcp_input.c's, in `recovery.rs`.
 //!
-//! Algorithms are built in (no modules, so no key or reference count).
+//! Algorithms are built in (no modules, so no key or reference count):
+//! Reno here, CUBIC (the default) in `cubic.rs`.
 //! ECN, TSO and pacing do not exist, so neither do the ECN events, the
 //! in_ack_event, min_tso_segs, sndbuf_expand and cong_control hooks.
 
 use super::cb::{TcpCb, TcpState, before};
+use super::cubic::{Bictcp, Cubic};
 use super::recovery::CaState;
+use crate::util::error::KernelError;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Largest name of an algorithm with its NUL (Linux TCP_CA_NAME_MAX)
 pub const NAME_MAX: usize = 16;
@@ -137,11 +143,26 @@ pub fn reno_undo_cwnd(tp: &mut TcpCb) -> u32 {
 }
 
 /// Built-in algorithms in registration order (what
-/// tcp_available_congestion_control lists)
-pub static ALGOS: &[&dyn CongOps] = &[&Reno];
+/// tcp_available_congestion_control lists: Linux registers tcp_reno in
+/// tcp_init, then cubic at its initcall)
+pub static ALGOS: &[&dyn CongOps] = &[&Reno, &Cubic];
 
-/// The boot default (Linux CONFIG_DEFAULT_TCP_CONG)
-pub const DEFAULT: usize = 0;
+/// The boot default (Linux CONFIG_DEFAULT_TCP_CONG "cubic")
+pub const DEFAULT: usize = 1;
+
+/// The algorithms unprivileged users may select (Linux
+/// TCP_CONG_NON_RESTRICTED in each ops' flags, changed under
+/// tcp_cong_list_lock, read under RCU): bit i for `ALGOS[i]`. One word,
+/// so a reader sees a whole list; writers store whole lists
+/// (tcp_allowed_congestion_control) or add one (a new default). At boot
+/// those registered with the flag, and the default
+/// (tcp_set_default_congestion_control sets it).
+static ALLOWED: AtomicU32 = AtomicU32::new(boot_allowed());
+
+const fn boot_allowed() -> u32 {
+    // Reno is registered with TCP_CONG_NON_RESTRICTED; cubic is not
+    (1 << 0) | (1 << DEFAULT)
+}
 
 /// Index of algorithm `name` (Linux tcp_ca_find)
 pub fn find(name: &str) -> Option<usize> {
@@ -150,15 +171,56 @@ pub fn find(name: &str) -> Option<usize> {
 
 /// Names of the built-in algorithms, space separated (Linux
 /// tcp_get_available_congestion_control)
-pub fn names() -> alloc::string::String {
-    let v: alloc::vec::Vec<&str> = ALGOS.iter().map(|a| a.name()).collect();
+pub fn names() -> String {
+    let v: Vec<&str> = ALGOS.iter().map(|a| a.name()).collect();
     v.join(" ")
 }
 
+/// `ALGOS[i]` is TCP_CONG_NON_RESTRICTED
+pub fn allowed(i: usize) -> bool {
+    ALLOWED.load(Ordering::Relaxed) & (1 << i) != 0
+}
+
+/// Names of the unrestricted algorithms (Linux
+/// tcp_get_allowed_congestion_control)
+pub fn allowed_names() -> String {
+    let v: Vec<&str> = (0..ALGOS.len())
+        .filter(|&i| allowed(i))
+        .map(|i| ALGOS[i].name())
+        .collect();
+    v.join(" ")
+}
+
+/// Replace the unrestricted list with the space separated `names`
+/// (Linux tcp_set_allowed_congestion_control: the list ends at an empty
+/// name; ENOENT, changing nothing, for an unknown one)
+pub fn set_allowed(names: &str) -> Result<(), KernelError> {
+    let mut mask = 0;
+    for n in names.split(' ').take_while(|n| !n.is_empty()) {
+        mask |= 1 << find(n).ok_or(KernelError::NotFound)?;
+    }
+    ALLOWED.store(mask, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `i` becomes a namespace's default (Linux
+/// tcp_set_default_congestion_control): only the initial namespace may
+/// pick a restricted one (EPERM); the default is unrestricted from then
+pub fn set_default(init: bool, i: usize) -> Result<(), KernelError> {
+    if !init && !allowed(i) {
+        return Err(KernelError::PermissionDenied);
+    }
+    ALLOWED.fetch_or(1 << i, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Per-connection private state of the algorithms (Linux icsk_ca_priv:
-/// zeroed whenever an algorithm is assigned). Reno keeps none.
+/// zeroed whenever an algorithm is assigned). One area per built-in
+/// algorithm with state; Reno keeps none.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct CaPriv {}
+pub struct CaPriv {
+    pub cubic: Bictcp,
+}
 
 /// A connection's window and algorithm (Linux tcp_sock's snd_cwnd,
 /// snd_ssthresh, snd_cwnd_cnt, snd_cwnd_clamp, is_cwnd_limited...;
@@ -303,6 +365,16 @@ impl Cong {
 impl TcpCb {
     fn ca_ops(&self) -> &'static dyn CongOps {
         self.cong.ops()
+    }
+
+    /// Linux tcp_jiffies32: hk's jiffies are its ms clock (HZ 1000)
+    pub(super) fn jiffies32(&self) -> u32 {
+        self.clock as u32
+    }
+
+    /// Linux tcp_mstamp in us: the ms clock in us
+    pub(super) fn mstamp_us(&self) -> u32 {
+        self.clock.wrapping_mul(1000) as u32
     }
 
     /// Linux tcp_assign_congestion_control / the algorithm switch of
@@ -531,8 +603,47 @@ mod tests {
     #[test]
     fn registry() {
         assert_eq!(find("reno"), Some(0));
+        assert_eq!(find("cubic"), Some(1));
         assert_eq!(find("nosuch"), None);
-        assert_eq!(names(), "reno");
+        assert_eq!(names(), "reno cubic");
+        assert_eq!(
+            TcpCb::new(Cfg::default(), Arc::default()).cong.name(),
+            "cubic"
+        );
         assert_eq!(cb(0).cong.name(), "reno");
+        // Boot: reno by its flags, cubic as the default
+        let flagged = ALGOS.iter().enumerate();
+        let want = flagged
+            .filter(|(i, a)| a.flags() & NON_RESTRICTED != 0 || *i == DEFAULT)
+            .fold(0, |m, (i, _)| m | 1 << i);
+        assert_eq!(boot_allowed(), want);
+    }
+
+    #[test]
+    fn allowed_list() {
+        let saved = ALLOWED.load(Ordering::Relaxed);
+        assert_eq!(set_allowed("cubic nosuch"), Err(KernelError::NotFound));
+        assert_eq!(ALLOWED.load(Ordering::Relaxed), saved);
+        set_allowed("cubic").unwrap();
+        assert_eq!(allowed_names(), "cubic");
+        assert_eq!(set_default(false, 0), Err(KernelError::PermissionDenied));
+        set_default(true, 0).unwrap();
+        assert_eq!(allowed_names(), "reno cubic");
+        set_allowed("").unwrap();
+        assert_eq!(allowed_names(), "");
+        set_allowed("reno  cubic").unwrap();
+        assert_eq!(allowed_names(), "reno");
+        ALLOWED.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn switch_on_a_connection_inits() {
+        let mut tp = cb(0);
+        tp.cong.set_cwnd(30);
+        tp.set_cc(1);
+        assert_eq!(tp.cong.name(), "cubic");
+        // cubictcp_init's HyStart round; the window carries over
+        assert_eq!(tp.cong.ca.cubic.curr_rtt, !0);
+        assert_eq!(tp.cong.snd_cwnd(), 30);
     }
 }

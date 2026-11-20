@@ -185,7 +185,14 @@ impl NetNamespace {
         let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
         let nodes = super::tree::Nodes::new()?;
         let common = super::NsCommon::new(super::inum::Inum::alloc()?);
-        let ns = try_arc(Self::fresh(common, user_ns.clone())?)?;
+        let ns = Self::fresh(common, user_ns.clone())?;
+        // Linux tcp_sk_init: init_net's default congestion control
+        let ca = crate::net::INIT_NET_NS
+            .sysctl
+            .tcp_ca
+            .load(Ordering::Relaxed);
+        ns.sysctl.tcp_ca.store(ca, Ordering::Relaxed);
+        let ns = try_arc(ns)?;
         Ok(Self::attach(ns, lo, nodes))
     }
 

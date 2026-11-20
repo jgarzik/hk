@@ -247,8 +247,10 @@ pub struct Opts {
     pub notsent_lowat: u32,
     /// TCP_DEFER_ACCEPT (retransmissions; stored only)
     pub defer_accept: u8,
-    /// TCP_CONGESTION (index into `cong::ALGOS`)
+    /// TCP_CONGESTION (index into `cong::ALGOS`), and whether it was
+    /// set (Linux icsk_ca_setsockopt)
     pub ca: usize,
+    pub ca_set: bool,
 }
 
 /// Per-connection values for opening (ISN, timestamp offset, our MSS)
