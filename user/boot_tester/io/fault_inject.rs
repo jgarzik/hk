@@ -317,7 +317,13 @@ fn knobs() {
             if mounted {
                 sys_umount2(DEBUGFS.as_ptr(), 0);
             }
-            return skip(N, b"no fault-injection debugfs knobs");
+            // A host kernel may lack CONFIG_FAILSLAB / FAIL_PAGE_ALLOC;
+            // hk always has them
+            if crate::helpers::host_mode() {
+                return skip(N, b"no fault-injection debugfs knobs");
+            }
+            why = Some((b"knob missing", i as i64));
+            break;
         }
         if &b[..n as usize] != *want && why.is_none() {
             why = Some((b"default", i as i64));

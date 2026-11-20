@@ -450,8 +450,8 @@ static DEBUGFS_DOPS: DentryOps = DentryOps {
     ..DentryOps::NONE
 };
 
-fn always_delete(_: &Dentry) -> bool {
-    true
+fn always_delete(d: &Dentry) -> bool {
+    d.is_negative()
 }
 
 /// Linux debugfs_fill_super: simple_fill_super's root directory (inode
