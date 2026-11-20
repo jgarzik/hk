@@ -244,3 +244,80 @@ fn rcvlowat_grows_buffer() {
     c.userlocks = crate::net::tcp::buf::RCVBUF_LOCK;
     assert_eq!(c.set_rcvlowat(i32::MAX), c.rcvbuf as i32 / 2);
 }
+
+/// A pair whose a starts from tcp_wmem[1]'s 16 KiB send buffer, with
+/// `locks`
+fn snd_pair(locks: u8) -> Pair {
+    let mut p = Pair::bare();
+    p.a.sndbuf = 16_384;
+    p.a.userlocks = locks;
+    let mut out = Out::default();
+    p.a.connect(open(1000, 1460), p.now, &mut out);
+    p.take(true, out);
+    let (_, syn) = p.wire.pop_front().unwrap();
+    let mut out = Out::default();
+    p.b.rcvbuf = 1 << 22;
+    p.b.passive_in(&seg_in(&syn), open(5000, 1460), p.now, &mut out);
+    p.take(false, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::Established);
+    p
+}
+
+/// Linux tcp_sndbuf_expand when established (tcp_init_buffer_space):
+/// twice the initial window of worst-case skbs, each
+/// roundup_pow_of_two(MSS + MAX_TCP_HEADER + shinfo) + sk_buff; as the
+/// window grows, an ACK freeing space for a sender that found the
+/// buffer full expands it again (tcp_new_space); never a set SO_SNDBUF
+#[test]
+fn sndbuf_expand() {
+    use core::sync::atomic::Ordering;
+    let mut p = snd_pair(0);
+    assert_eq!(p.a.sndbuf, 2 * 10 * (4096 + 256));
+    let data = pattern(2 << 20);
+    let (mut sent, mut got) = (0, 0);
+    for _ in 0..10_000 {
+        if sent < data.len() {
+            let n = p.send_a(&data[sent..]);
+            sent += n;
+            if sent < data.len() {
+                // The sender found the buffer full (sk_stream_wait_memory)
+                p.a.live.nospace.store(true, Ordering::Release);
+            }
+        }
+        p.run();
+        got += p.read_b(1 << 22).len();
+        if got == data.len() {
+            break;
+        }
+        if p.wire.is_empty() {
+            p.tick();
+        }
+    }
+    assert_eq!(got, data.len());
+    // Expanded for a window of more than ten segments, a whole number
+    // of worst-case skbs
+    assert!(p.a.sndbuf > 2 * 10 * (4096 + 256), "{}", p.a.sndbuf);
+    assert_eq!(p.a.sndbuf % (2 * (4096 + 256)), 0);
+    let p = snd_pair(crate::net::tcp::buf::SNDBUF_LOCK);
+    assert_eq!(p.a.sndbuf, 16_384);
+}
+
+/// Linux sk_stream_moderate_sndbuf: half of what is queued (Linux's
+/// sk_wmem_queued, twice hk's send bytes), at least SOCK_MIN_SNDBUF;
+/// a set SO_SNDBUF stays
+#[test]
+fn sndbuf_moderate() {
+    let mut p = snd_pair(0);
+    p.filter = drop_all;
+    let sent = p.send_a(&pattern(30_000));
+    assert_eq!(sent, 30_000);
+    p.a.moderate_sndbuf();
+    assert_eq!(p.a.sndbuf, 30_000);
+    let mut p = snd_pair(0);
+    p.a.moderate_sndbuf();
+    assert_eq!(p.a.sndbuf, crate::net::sock::MIN_SNDBUF);
+    let mut p = snd_pair(crate::net::tcp::buf::SNDBUF_LOCK);
+    p.a.moderate_sndbuf();
+    assert_eq!(p.a.sndbuf, 16_384);
+}

@@ -35,6 +35,12 @@ const MIN_WINDOW_CLAMP: u32 = crate::net::sock::MIN_RCVBUF / 2;
 const GROW_MIN_LEN: u32 = 128;
 /// Linux TCP_INIT_CWND
 const INIT_CWND: u32 = super::cong::INIT_CWND;
+/// Linux MAX_TCP_HEADER (x86-64: L1_CACHE_ALIGN(128 + MAX_HEADER)),
+/// SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) and of struct
+/// sk_buff: tcp_sndbuf_expand's worst case per segment
+const MAX_TCP_HEADER: u32 = 320;
+const SHINFO: u32 = 320;
+const SKB: u32 = 256;
 
 /// Linux rcv_rtt_est: the RTT as the receiver sees it (a window's
 /// worth of data from the sender, or a timestamp echo), 8 x us; the
@@ -152,6 +158,9 @@ impl TcpCb {
     /// fits the buffer, less 1/2^tcp_app_win of it for the application
     /// and one segment held back; `rcv_ssthresh` within it
     pub(super) fn init_buffer_space(&mut self) {
+        if self.userlocks & SNDBUF_LOCK == 0 {
+            self.sndbuf_expand();
+        }
         let app_win = u32::from(self.cfg.app_win);
         let advmss = self.adv_mss;
         let maxwin = self.full_space();
@@ -376,6 +385,60 @@ impl TcpCb {
         }
         self.opts.window_clamp = self.window_clamp;
         Ok(())
+    }
+
+    /// Linux tcp_sndbuf_expand: room for twice the segments the window
+    /// (at least the initial one, the reordering degree) may hold, each
+    /// taking its worst-case skb (a power-of-two head), up to
+    /// tcp_wmem[2] (CUBIC and Reno have no sndbuf_expand hook: 2)
+    pub(super) fn sndbuf_expand(&mut self) {
+        let mss = self.peer_mss.max(self.live.mss.get());
+        let per_mss = (mss + MAX_TCP_HEADER + SHINFO).next_power_of_two() + SKB;
+        let nr_segs = INIT_CWND.max(self.cong.snd_cwnd()).max(self.reordering + 1);
+        let sndmem = 2u64 * u64::from(nr_segs) * u64::from(per_mss);
+        if u64::from(self.sndbuf) < sndmem {
+            self.sndbuf = sndmem.min(u64::from(self.cfg.wmem_max)) as u32;
+        }
+    }
+
+    /// Linux tcp_should_expand_sndbuf: not a set SO_SNDBUF, not under
+    /// memory pressure or past tcp_mem[0], not with the window full
+    fn should_expand_sndbuf(&self) -> bool {
+        self.userlocks & SNDBUF_LOCK == 0
+            && !mem::under_pressure()
+            && mem::allocated() < mem::limit(0)
+            && self.in_flight() < self.cong.snd_cwnd()
+    }
+
+    /// Linux tcp_check_space -> tcp_new_space (an ACK freed send
+    /// space): a sender that found the buffer full may get a larger
+    /// one; writers are told when it is writable
+    /// (sk_stream_write_space clears SOCK_NOSPACE)
+    pub(super) fn check_space(&mut self) {
+        use core::sync::atomic::Ordering;
+        if !self.live.nospace.load(Ordering::Acquire) {
+            return;
+        }
+        if self.should_expand_sndbuf() {
+            self.sndbuf_expand();
+            self.cong.stamp = self.jiffies32();
+        }
+        if self.writable() {
+            self.live.nospace.store(false, Ordering::Release);
+        }
+    }
+
+    /// Linux sk_stream_moderate_sndbuf (memory refused a sender): the
+    /// buffer shrinks to half what is queued, at least SOCK_MIN_SNDBUF,
+    /// unless SO_SNDBUF was set (hk's send byte counts are half of
+    /// Linux's truesize, sk_wmem_queued)
+    pub(super) fn moderate_sndbuf(&mut self) {
+        if self.userlocks & SNDBUF_LOCK != 0 {
+            return;
+        }
+        let queued = (2 * self.sndq_len()).min(u32::MAX as usize) as u32;
+        let val = self.sndbuf.min(queued >> 1);
+        self.sndbuf = val.max(crate::net::sock::MIN_SNDBUF);
     }
 
     /// SO_RCVLOWAT's value for TCP (Linux tcp_set_rcvlowat): at most

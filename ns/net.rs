@@ -192,6 +192,16 @@ impl NetNamespace {
             .tcp_ca
             .load(Ordering::Relaxed);
         ns.sysctl.tcp_ca.store(ca, Ordering::Relaxed);
+        // ... and its tcp_rmem / tcp_wmem
+        let init = &crate::net::INIT_NET_NS.sysctl;
+        for (d, s) in [
+            (&ns.sysctl.tcp_rmem, &init.tcp_rmem),
+            (&ns.sysctl.tcp_wmem, &init.tcp_wmem),
+        ] {
+            for (d, s) in d.iter().zip(s) {
+                d.store(s.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
         let ns = try_arc(ns)?;
         Ok(Self::attach(ns, lo, nodes))
     }

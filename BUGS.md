@@ -103,10 +103,9 @@ SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no CUBIC module parameters
-(/sys/module/tcp_cubic/parameters: Linux's defaults are constants), no
-send buffer autotuning (no tcp_sndbuf_expand, so past the TCP memory
-hard limit a sender's SO_SNDBUF is not shrunk,
-sk_stream_moderate_sndbuf), the receive
+(/sys/module/tcp_cubic/parameters: Linux's defaults are constants), the
+send side counts payload bytes against half of SO_SNDBUF (Linux:
+skb truesize, sk_wmem_queued, against all of it), the receive
 window's free space does not count the socket's backlog (Linux
 tcp_space subtracts sk_backlog.len), no orphan count limit
 (tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns

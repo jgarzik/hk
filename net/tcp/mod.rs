@@ -296,9 +296,10 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
         SOCK_STREAM,
         PROTO_TCP,
     );
-    // Linux tcp_init_sock: tcp_rmem[1]
+    // Linux tcp_init_sock: tcp_rmem[1], tcp_wmem[1]
     let rmem = sk.net.sysctl.tcp_rmem[1].load(Ordering::Relaxed).max(1) as u32;
-    sk.init_bufs(rmem, sk.sndbuf());
+    let wmem = sk.net.sysctl.tcp_wmem[1].load(Ordering::Relaxed).max(1) as u32;
+    sk.init_bufs(rmem, wmem);
     Ok(TcpSock::new(sk)?)
 }
 
@@ -323,6 +324,8 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
         app_win: s.tcp_app_win.load(Ordering::Relaxed),
         moderate_rcvbuf: s.tcp_moderate_rcvbuf.load(Ordering::Relaxed) != 0,
+        wmem_min: s.tcp_wmem[0].load(Ordering::Relaxed).max(1) as u32,
+        wmem_max: s.tcp_wmem[2].load(Ordering::Relaxed).max(1) as u32,
         keepidle: secs(&s.tcp_keepalive_time),
         keepintvl: secs(&s.tcp_keepalive_intvl),
         keepcnt: u32::from(s.tcp_keepalive_probes.load(Ordering::Relaxed)),

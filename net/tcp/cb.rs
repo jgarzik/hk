@@ -175,12 +175,6 @@ pub const OOW_RATELIMIT: u64 = 500;
 /// than this (ms) is not trusted
 pub const PAWS_WRAP: u64 = (i32::MAX as u64 / 1_000_000) * 1000;
 
-/// Linux tcp_wmem[0] (4096) in hk's byte counts, which leave out
-/// truesize overhead (half, as SO_SNDBUF): the send bytes a connection
-/// may queue whatever the memory (tcp_wmem_schedule) and below the hard
-/// limit (__sk_mem_raise_allocated)
-const WMEM_MIN: usize = 2048;
-
 /// Which queue a charge is for (Linux SK_MEM_SEND / SK_MEM_RECV)
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum MemKind {
@@ -223,6 +217,11 @@ pub struct Cfg {
     pub app_win: u8,
     /// tcp_moderate_rcvbuf: tune the receive buffer to the reader
     pub moderate_rcvbuf: bool,
+    /// tcp_wmem[0]: send bytes a connection may always queue below
+    /// the hard memory limit; tcp_wmem[2]: the send buffer
+    /// tcp_sndbuf_expand may reach
+    pub wmem_min: u32,
+    pub wmem_max: u32,
     /// tcp_keepalive_time / _intvl (ms), tcp_keepalive_probes
     pub keepidle: u64,
     pub keepintvl: u64,
@@ -257,6 +256,8 @@ impl Default for Cfg {
             rmem_max: 6 * 1024 * 1024,
             app_win: 31,
             moderate_rcvbuf: true,
+            wmem_min: 4096,
+            wmem_max: 4 * 1024 * 1024,
             keepidle: 7_200_000,
             keepintvl: 75_000,
             keepcnt: 9,
@@ -1353,7 +1354,15 @@ impl TcpCb {
             }
             self.wq.push_back(t);
         }
-        let mut skb = SkBuff::alloc_tx(self.live.mss.get() as usize, Gfp::KERNEL)?;
+        let Some(mut skb) = SkBuff::alloc_tx(self.live.mss.get() as usize, Gfp::KERNEL) else {
+            // Linux tcp_stream_alloc_skb: enter_memory_pressure,
+            // sk_stream_moderate_sndbuf
+            if mem::enter_pressure() {
+                self.net_stat(LINUX_MIB_TCPMEMORYPRESSURES);
+            }
+            self.moderate_sndbuf();
+            return None;
+        };
         let t = skb.tcp_mut();
         t.seq = self.write_seq;
         t.end_seq = self.write_seq;
@@ -1382,7 +1391,7 @@ impl TcpCb {
         if n == 0 || self.mem_schedule(n, MemKind::Send) {
             return n;
         }
-        let left = WMEM_MIN.saturating_sub(self.sndq_len());
+        let left = self.wmem_min().saturating_sub(self.sndq_len());
         if left > 0 {
             self.mem_force(left.min(n));
         }
@@ -1946,8 +1955,9 @@ impl TcpCb {
     /// SOCK_STREAM: it cannot wait for memory it is not using). Between,
     /// when not under pressure, or for a connection under its
     /// tcp_rmem[0] / tcp_wmem[0] floor or using less than an even share
-    /// of [2].
-    fn mem_raise(&self, allocated: usize, size: usize, kind: MemKind) -> bool {
+    /// of [2]. A sender refused has its buffer moderated
+    /// (sk_stream_moderate_sndbuf).
+    fn mem_raise(&mut self, allocated: usize, size: usize, kind: MemKind) -> bool {
         if allocated <= mem::limit(0) {
             if let Some(ms) = mem::leave_pressure() {
                 self.net_add(LINUX_MIB_TCPMEMORYPRESSURESCHRONO, ms);
@@ -1960,7 +1970,7 @@ impl TcpCb {
         if allocated <= mem::limit(2) {
             let floor = match kind {
                 MemKind::Recv => self.rmem_alloc() < self.cfg.rmem_min as usize,
-                MemKind::Send => self.sndq_len() < WMEM_MIN,
+                MemKind::Send => self.sndq_len() < self.wmem_min(),
             };
             if floor {
                 return true;
@@ -1969,7 +1979,20 @@ impl TcpCb {
                 return true;
             }
         }
-        kind == MemKind::Send && self.sndq_len() + size >= self.snd_cap()
+        // suppress_allocation
+        if kind != MemKind::Send {
+            return false;
+        }
+        self.moderate_sndbuf();
+        self.sndq_len() + size >= self.snd_cap()
+    }
+
+    /// tcp_wmem[0] in hk's send byte counts, which leave out truesize
+    /// overhead (half, as SO_SNDBUF): what a connection may queue
+    /// whatever the memory (tcp_wmem_schedule) and below the hard
+    /// limit (__sk_mem_raise_allocated)
+    fn wmem_min(&self) -> usize {
+        self.cfg.wmem_min as usize / 2
     }
 
     /// Charge `size` more bytes without a limit (Linux

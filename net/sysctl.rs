@@ -60,6 +60,9 @@ pub struct NetSysctl {
     /// tcp_rmem min / default / max (a connection's floor, initial
     /// SO_RCVBUF, autotuning's bound)
     pub tcp_rmem: [AtomicI32; 3],
+    /// tcp_wmem min / default / max (a connection's floor, initial
+    /// SO_SNDBUF, tcp_sndbuf_expand's bound)
+    pub tcp_wmem: [AtomicI32; 3],
     /// tcp_app_win: 1/2^n of the window kept for the application
     pub tcp_app_win: AtomicU8,
     /// tcp_moderate_rcvbuf: receive buffer autotuning
@@ -121,6 +124,11 @@ impl Default for NetSysctl {
                 AtomicI32::new(4096),
                 AtomicI32::new(131_072),
                 AtomicI32::new(6_291_456),
+            ],
+            tcp_wmem: [
+                AtomicI32::new(4096),
+                AtomicI32::new(16_384),
+                AtomicI32::new(4_194_304),
             ],
             tcp_app_win: AtomicU8::new(31),
             tcp_moderate_rcvbuf: AtomicU8::new(1),
@@ -345,21 +353,19 @@ fn frag_store(n: &NetNamespace, high: bool, v: &[i64]) -> Result<(), KernelError
     Ok(())
 }
 
-fn rmem_show(n: &NetNamespace) -> Vec<i64> {
-    let s = &n.sysctl;
-    s.tcp_rmem
-        .iter()
+fn mem3_show(m: &[AtomicI32; 3]) -> Vec<i64> {
+    m.iter()
         .map(|v| i64::from(v.load(Ordering::Relaxed)))
         .collect()
 }
 
-/// tcp_rmem: three integers, each at least 1
-fn rmem_store(n: &NetNamespace, v: &[i64]) -> Result<(), KernelError> {
+/// tcp_rmem / tcp_wmem: three integers, each at least 1 (Linux
+/// proc_dointvec_minmax, extra1 SYSCTL_ONE)
+fn mem3_store(m: &[AtomicI32; 3], v: &[i64]) -> Result<(), KernelError> {
     for &x in v {
         range(x, 1, INT_MAX)?;
     }
-    let s = &n.sysctl;
-    for (a, &x) in s.tcp_rmem.iter().zip(v) {
+    for (a, &x) in m.iter().zip(v) {
         a.store(x as i32, Ordering::Relaxed);
     }
     Ok(())
@@ -584,8 +590,16 @@ pub static CTLS: &[NetCtl] = &[
         path: "net/ipv4/tcp_rmem",
         mode: 0o644,
         global: false,
-        show: rmem_show,
-        store: rmem_store,
+        show: |n| mem3_show(&n.sysctl.tcp_rmem),
+        store: |n, v| mem3_store(&n.sysctl.tcp_rmem, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_wmem",
+        mode: 0o644,
+        global: false,
+        show: |n| mem3_show(&n.sysctl.tcp_wmem),
+        store: |n, v| mem3_store(&n.sysctl.tcp_wmem, v),
         text: None,
     },
     NetCtl {

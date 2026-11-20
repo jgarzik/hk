@@ -9,6 +9,10 @@
 //!   reader taking 4 MB over lo has it grown (tcp_rcv_space_adjust,
 //!   tcp_moderate_rcvbuf 1) within tcp_rmem[2] and reports
 //!   tcpi_rcv_space; one with SO_RCVBUF set keeps it.
+//! - TCP_SNDBUF_EXPAND: a new socket's SO_SNDBUF is tcp_wmem[1]; once
+//!   connected it is expanded for the initial window
+//!   (tcp_sndbuf_expand), within tcp_wmem[2]; one with SO_SNDBUF set
+//!   keeps it.
 
 use hk_syscall::{sys_exit, sys_fork, sys_getsockopt};
 
@@ -26,6 +30,7 @@ pub fn run_tests() {
     test_window_clamp();
     test_rcv_ssthresh();
     test_autotune();
+    test_sndbuf();
 }
 
 /// A connected pair over lo: (client, server, listener)
@@ -159,5 +164,30 @@ fn test_autotune() {
     // SO_RCVBUF 65536 (doubled) on the listener, inherited
     let (fixed, _) = bulk(&mut t, 65536);
     t.eq(b"fixed", fixed, 131072);
+    t.done();
+}
+
+fn test_sndbuf() {
+    let mut t = T::new(b"TCP_SNDBUF_EXPAND");
+    let [min, def, max] = sysctl_ints(b"/proc/sys/net/ipv4/tcp_wmem\0");
+    t.ok(b"tcp_wmem", min > 0 && def >= min && max >= def, def);
+    let fd = tcp();
+    t.eq(b"initial", getint(fd, SOL_SOCKET, SO_SNDBUF).1 as i64, def);
+    close(fd);
+    let (c, s, l) = pair();
+    let grown = getint(c, SOL_SOCKET, SO_SNDBUF).1 as i64;
+    t.ok(b"expanded", grown > def && grown <= max, grown);
+    close(c);
+    close(s);
+    close(l);
+    let (l, p) = listener(4);
+    let c = tcp();
+    setint(c, SOL_SOCKET, SO_SNDBUF, 20000);
+    connect(c, LO, p);
+    let s = accept(l);
+    t.eq(b"fixed", getint(c, SOL_SOCKET, SO_SNDBUF).1 as i64, 40000);
+    close(c);
+    close(s);
+    close(l);
     t.done();
 }
