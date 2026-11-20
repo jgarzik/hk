@@ -131,6 +131,15 @@ branch); a takeover SYN's connection gets a fresh ISN, not the
 entry's SND.NXT + 65537 (Linux TCP_SKB_CB tcp_tw_isn); and there is
 no tcp_max_tw_buckets (inet_twsk_alloc's limit, TCPTimeWaitOverflow).
 
+skbs are linear (no paged frags, skb_shinfo frags): TCP's SACK
+shifting (`sack.rs` shift, Linux tcp_shift_skb_data / skb_shift moving
+page references) copies the bytes into the previous skb's tailroom and
+gives up without room, retransmit collapsing copies too, and every
+retransmission or transmit clone copies the payload (Linux
+skb_clone shares it). No GSO/TSO: one segment per transmission, a
+retransmission resends one MSS (`tcp_retransmit_skb`'s segs is 1;
+Linux sends a multi-segment skb as one GSO packet), and pcount above 1
+only arises when the MSS shrinks under queued skbs.
 An skb holds no reference to its socket (Linux skb->sk with
 sk_wmem_alloc, released by sock_wfree): a closed socket's sent frames
 still queued on a device do not delay its __sk_free, so "sockets:
