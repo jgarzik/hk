@@ -741,6 +741,23 @@ impl PciDevice {
         );
     }
 
+    /// Stop the function's DMA: bus mastering off (Linux
+    /// pci_disable_device -> do_pci_disable_device; memory space stays
+    /// on, as there). The driver's remove and its failed probe call it
+    /// once the device no longer needs the bus.
+    pub fn disable_device(&self) {
+        let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
+        if cmd & command::BUS_MASTER != 0 {
+            pci_write16(
+                self.bus,
+                self.device,
+                self.function,
+                offset::COMMAND,
+                cmd & !command::BUS_MASTER,
+            );
+        }
+    }
+
     /// Read a config space byte of this function
     pub fn cfg_read8(&self, off: u8) -> u8 {
         pci_read8(self.bus, self.device, self.function, off)
