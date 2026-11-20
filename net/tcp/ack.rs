@@ -150,8 +150,9 @@ impl TcpCb {
             if self.live.pingpong.get() || self.dack.pushed {
                 max = DELACK_MAX;
             }
-            if self.srtt8 != 0 {
-                max = max.min((self.srtt8 / 8).max(ATO_MIN));
+            if self.srtt_us != 0 {
+                let rtt = u64::from(self.srtt_us >> 3).div_ceil(1000);
+                max = max.min(rtt.max(ATO_MIN));
             }
             ato = ato.min(max);
         }

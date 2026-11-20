@@ -102,6 +102,7 @@ impl TcpCb {
     /// options; false without memory
     pub(super) fn syn_seg(&mut self, out: &mut Out) -> bool {
         let synack = self.state != TcpState::SynSent;
+        self.syn_mstamp = self.tcp_mstamp;
         let ts = if !self.ts_ok {
             None
         } else if synack {
@@ -349,9 +350,6 @@ impl TcpCb {
             self.cwnd_restart(now - self.lsndtime);
         }
         let next = seq.wrapping_add(n + u32::from(fin));
-        if self.rtt_seq.is_none() {
-            self.rtt_seq = Some((next, now));
-        }
         if n < mss {
             self.snd_sml = next;
         }
@@ -679,8 +677,6 @@ impl TcpCb {
             self.undo_retrans = 0;
         }
         self.undo_retrans += pc as i32;
-        // Karn: no RTT sample from a retransmitted range
-        self.rtt_seq = None;
         r
     }
 

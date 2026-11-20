@@ -964,7 +964,7 @@ impl TcpCb {
     /// before the RTO clears the scoreboard
     fn check_sack_reneging(&mut self, flg: &mut u32) -> bool {
         if *flg & flag::SACK_RENEGING != 0 && *flg & flag::SND_UNA_ADVANCED != 0 {
-            let delay = (self.srtt8 / 16).max(10);
+            let delay = u64::from(self.srtt_us >> 4).div_ceil(1000).max(10);
             self.live.tmr.set(Some((Tmr::Rtx, self.clock + delay)));
             *flg &= !flag::SET_XMIT_TIMER;
             return true;
@@ -1002,7 +1002,7 @@ impl TcpCb {
                 return 0;
             }
         }
-        let srtt_us = self.srtt8 / 8 * 1000;
+        let srtt_us = u64::from(self.srtt_us >> 3);
         ((self.min_rtt() >> 2) * u64::from(self.rack.reo_wnd_steps)).min(srtt_us)
     }
 
@@ -1139,8 +1139,8 @@ impl TcpCb {
         {
             return false;
         }
-        let mut timeout = if self.srtt8 != 0 {
-            let t = self.srtt8 / 4;
+        let mut timeout = if self.srtt_us != 0 {
+            let t = u64::from(self.srtt_us >> 2).div_ceil(1000);
             if self.packets_out == 1 {
                 t + RTO_MIN
             } else {

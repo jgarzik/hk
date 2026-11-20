@@ -120,8 +120,8 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32(cb.path_mss + super::cb::HDRS); // pmtu
     b.u32(cb.full_space()); // rcv_ssthresh
     let (srtt, var) = cb.rtt();
-    b.u32((srtt * 1000) as u32);
-    b.u32((var * 1000) as u32);
+    b.u32(srtt);
+    b.u32(var);
     b.u32(cb.cong.snd_ssthresh().min(INFINITE_SSTHRESH));
     b.u32(cb.cong.snd_cwnd());
     b.u32(cb.adv_mss);

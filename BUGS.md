@@ -91,11 +91,7 @@ Planned fix:
 Listed because real traffic reaches them: TCP has no delivery rate sampling (Linux
 tcp_rate.c; only the rate sample's prior_delivered, for RACK's
 reordering window), RACK checks every skb of the retransmit queue
-(Linux walks tsorted_sent_queue in send order and stops early), the
-RTO estimator takes its
-samples in ms from the timestamp echo or the timed segment (Linux
-tcp_ack_update_rtt feeds it the us RTT of the acked skbs' send times
-first), no
+(Linux walks tsorted_sent_queue in send order and stops early), no
 SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,

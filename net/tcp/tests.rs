@@ -518,18 +518,21 @@ fn rto_backoff_and_give_up() {
     let t0 = p.now;
     p.until(|p| p.a.state == TcpState::Closed, 100);
     let times: Vec<u64> = p.log.iter().filter(|l| l.1).map(|l| l.0 - t0).collect();
-    // RTT 0 measured in the handshake: first the tail loss probe after
-    // 2 RTT + RTO_MIN (Linux tcp_schedule_loss_probe, a lone packet),
-    // the RTO restarting from it; RTO = 200 ms (RTO_MIN), doubling up
-    // to 120 s; given up once tcp_retries2's model time, (2^10 - 1) *
-    // 200 ms + 6 * 120 s, passed since the first retransmission (Linux
-    // retransmits_timed_out): 16 retransmissions
-    assert_eq!(times.len(), 18);
+    // The simulated handshake's RTT is 1 us: srtt_us 8, rttvar_us
+    // TCP_RTO_MIN, so RTO = 1 + 200000 us, 201 ms rounded up (Linux
+    // __tcp_set_rto). First the tail loss probe after 2 RTT + RTO_MIN
+    // (Linux tcp_schedule_loss_probe, a lone packet), the RTO
+    // restarting from it, doubling up to 120 s; given up once
+    // tcp_retries2's model time, (2^10 - 1) * 200 ms + 6 * 120 s,
+    // passed since the first retransmission (Linux
+    // retransmits_timed_out): 15 retransmissions
+    assert_eq!((p.a.srtt_us, p.a.rttvar_us), (8, 200_000));
+    assert_eq!(times.len(), 17);
     let gaps: Vec<u64> = times.windows(2).map(|w| w[1] - w[0]).collect();
     let model = 1023 * 200 + 6 * RTO_MAX;
     let last = times[times.len() - 1] - times[2];
     assert!(last < model && last + RTO_MAX >= model, "{last}");
-    assert_eq!(&gaps[..7], &[200, 200, 400, 800, 1600, 3200, 6400]);
+    assert_eq!(&gaps[..7], &[201, 201, 402, 804, 1608, 3216, 6432]);
     assert!(gaps.iter().all(|&g| g <= RTO_MAX));
     assert_eq!(*gaps.last().unwrap(), RTO_MAX);
     assert_eq!(p.a_out.err, Some(KernelError::TimedOut));
@@ -543,7 +546,7 @@ fn karn_and_rtt_estimate() {
     p.now += 100;
     p.run();
     let (srtt, var) = p.a.rtt();
-    assert!(srtt > 0 && srtt <= 100, "srtt {}", srtt);
+    assert!(srtt > 0 && srtt <= 100_000, "srtt {}", srtt);
     assert!(var > 0);
     let rto = p.a.rto_cur();
     assert!((200..=1000).contains(&rto), "rto {}", rto);
@@ -1676,10 +1679,12 @@ fn timestamps_echo_and_rtt() {
     p.run();
     let ack = p.log.last().unwrap().2.clone();
     assert_eq!(ack.ts.unwrap().1, v, "ACK echoes the data's TSval");
-    // SRTT 0 from the handshake, then a 100 ms sample: 100 / 8
-    assert_eq!(p.a.rtt().0, 12);
-    // The handshake's 0 us counts as one jiffy (us)
-    assert_eq!(p.a.min_rtt(), 1000);
+    // SRTT about 0 from the handshake, then the data's 100 ms (its send
+    // time, not the echo: Linux prefers seq_rtt_us): about 100 / 8
+    assert!((12_500..=12_501).contains(&p.a.rtt().0), "{}", p.a.rtt().0);
+    let s1 = p.a.srtt_us;
+    // The minimum: the handshake's 1 us on the simulated wire
+    assert_eq!(p.a.min_rtt(), 1);
     // A retransmission is timed too (Karn would skip it)
     p.filter = drop_all;
     p.send_a(b"lost");
@@ -1691,8 +1696,10 @@ fn timestamps_echo_and_rtt() {
     let rexmit = p.log.iter().rev().find(|l| l.1).unwrap().2.clone();
     p.wire.push_back((true, rexmit));
     p.run();
-    // The retransmission's echo gives a sample of 50 ms: srtt8 100 + 38
-    assert_eq!(p.a.rtt().0, 17);
+    // The retransmission's echo gives a sample of 50 ms (Karn: no send
+    // time sample; Linux tcp_rtt_tsopt_us), by tcp_rtt_estimator
+    let want = (s1 as i64 + (50_000 - i64::from(s1 >> 3))) as u32;
+    assert_eq!(p.a.srtt_us, want);
 }
 
 #[test]
@@ -2004,11 +2011,11 @@ fn user_timeout_bounds_retransmission() {
     p.until(|p| p.a.state == TcpState::Closed, 100);
     assert_eq!(p.a_out.err, Some(KernelError::TimedOut));
     // Gave up 5 s after the first retransmission (the loss probe at
-    // 200 ms, the RTO at 400 ms; Linux retransmits_timed_out from
+    // 201 ms, the RTO at 402 ms; Linux retransmits_timed_out from
     // retrans_stamp, the timer clamped to it), not after 15
     // retransmissions
     let dt = p.now - t0;
-    assert_eq!(dt, 5400, "gave up after {} ms", dt);
+    assert_eq!(dt, 5402, "gave up after {} ms", dt);
 }
 
 #[test]
@@ -2803,7 +2810,7 @@ fn rack_reordering_timer_marks_loss() {
     let (mut p, m) = sack_pair(1000);
     // A 100 ms path: reordering window min_rtt/4 = 25 ms
     p.a.rtt_min.reset(0, 100_000);
-    p.a.srtt8 = 800;
+    p.a.srtt_us = 100_000 << 3;
     p.now = 1000;
     p.a.cong.set_cwnd(20);
     p.send_a(&pattern(4 * 988));
@@ -3006,4 +3013,42 @@ fn min_rtt_windowed() {
     assert_eq!(a.min_rtt(), 200_000);
     a.update_rtt_min(0, 0);
     assert_eq!(a.min_rtt(), 1000);
+}
+
+/// Linux tcp_rtt_estimator / tcp_set_rto, step by step (us)
+#[test]
+fn rtt_estimator_as_linux() {
+    let mut a = TcpCb::new(cfg(), Default::default());
+    a.snd_una = 0;
+    a.snd_nxt = 1000;
+    // First: srtt 8m, mdev 2m, rttvar max(mdev, TCP_RTO_MIN)
+    a.rtt_estimator(100_000);
+    a.set_rto();
+    assert_eq!(
+        (a.srtt_us, a.mdev_us, a.mdev_max_us, a.rttvar_us),
+        (800_000, 200_000, 200_000, 200_000)
+    );
+    assert_eq!((a.rtt_seq, a.live.rto.get()), (1000, 300));
+    // Falling: the error less mdev / 4 is 0, so mdev holds
+    a.rtt_estimator(50_000);
+    a.set_rto();
+    assert_eq!(
+        (a.srtt_us, a.mdev_us, a.rttvar_us),
+        (750_000, 200_000, 200_000)
+    );
+    assert_eq!(a.live.rto.get(), 294);
+    // Rising past the round's end: rttvar follows the new maximum, the
+    // round restarts at TCP_RTO_MIN
+    a.snd_una = 1001;
+    a.snd_nxt = 2000;
+    a.rtt_estimator(200_000);
+    a.set_rto();
+    assert_eq!(
+        (a.srtt_us, a.mdev_us, a.rttvar_us),
+        (856_250, 256_250, 256_250)
+    );
+    assert_eq!(
+        (a.mdev_max_us, a.rtt_seq, a.live.rto.get()),
+        (200_000, 2000, 364)
+    );
 }

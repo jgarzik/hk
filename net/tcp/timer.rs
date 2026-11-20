@@ -138,36 +138,71 @@ impl TcpCb {
         expired
     }
 
-    /// RFC 6298 2.2/2.3 for a measured round trip `r` ms (srtt8 = 8 *
-    /// SRTT, rttvar4 = 4 * RTTVAR); a valid sample ends the backoff
-    pub(super) fn rtt_sample(&mut self, r: u64) {
-        let r = r.min(RTO_MAX);
-        if self.srtt8 == 0 {
-            self.srtt8 = (r * 8).max(1);
-            self.rttvar4 = r * 2;
+    /// Linux tcp_rtt_estimator (Jacobson, SIGCOMM '88, with Linux's
+    /// finer gain for a falling RTT): `mrtt_us` into srtt_us (8 x SRTT),
+    /// mdev_us (4 x mean deviation), mdev_max_us and rttvar_us, the
+    /// latter decaying towards the round's maximum deviation once per
+    /// round (rtt_seq), never below TCP_RTO_MIN
+    pub(super) fn rtt_estimator(&mut self, mrtt_us: i64) {
+        let mut m = mrtt_us;
+        let mut srtt = self.srtt_us;
+        let rto_min_us = (RTO_MIN * 1000) as u32;
+        if srtt != 0 {
+            m -= i64::from(srtt >> 3);
+            srtt = (i64::from(srtt) + m) as u32;
+            if m < 0 {
+                m = -m;
+                m -= i64::from(self.mdev_us >> 2);
+                if m > 0 {
+                    m >>= 3;
+                }
+            } else {
+                m -= i64::from(self.mdev_us >> 2);
+            }
+            self.mdev_us = (i64::from(self.mdev_us) + m) as u32;
+            if self.mdev_us > self.mdev_max_us {
+                self.mdev_max_us = self.mdev_us;
+                if self.mdev_max_us > self.rttvar_us {
+                    self.rttvar_us = self.mdev_max_us;
+                }
+            }
+            if super::cb::after(self.snd_una, self.rtt_seq) {
+                if self.mdev_max_us < self.rttvar_us {
+                    self.rttvar_us -= (self.rttvar_us - self.mdev_max_us) >> 2;
+                }
+                self.rtt_seq = self.snd_nxt;
+                self.mdev_max_us = rto_min_us;
+            }
         } else {
-            let srtt = (self.srtt8 / 8) as i64;
-            let delta = r as i64 - srtt;
-            self.srtt8 = (self.srtt8 as i64 + delta).max(1) as u64;
-            let var = (self.rttvar4 / 4) as i64;
-            self.rttvar4 = (self.rttvar4 as i64 + delta.abs() - var).max(0) as u64;
+            srtt = (m << 3) as u32;
+            self.mdev_us = (m << 1) as u32;
+            self.rttvar_us = self.mdev_us.max(rto_min_us);
+            self.mdev_max_us = self.rttvar_us;
+            self.rtt_seq = self.snd_nxt;
         }
-        self.live
-            .rto
-            .set((self.srtt8 / 8 + self.rttvar4.max(1)).clamp(RTO_MIN, RTO_MAX));
-        self.live.backoff.set(0);
+        self.srtt_us = srtt.max(1);
     }
 
-    /// RFC 6298 5.7: SYN retransmitted and no RTT measured
+    /// Linux tcp_set_rto / __tcp_set_rto / tcp_bound_rto: SRTT plus
+    /// rttvar, in ms rounded up, at most TCP_RTO_MAX
+    pub(super) fn set_rto(&mut self) {
+        let us = u64::from(self.srtt_us >> 3) + u64::from(self.rttvar_us);
+        self.live.rto.set(us.div_ceil(1000).min(RTO_MAX));
+    }
+
+    /// No RTT from the handshake (Linux tcp_init_metrics, RFC 6298 5.7):
+    /// TCP_TIMEOUT_FALLBACK
     pub(super) fn set_rto_fallback(&mut self) {
-        if self.srtt8 == 0 {
-            self.live.rto.set(RTO_FALLBACK);
-        }
+        self.rttvar_us = (RTO_FALLBACK * 1000) as u32;
+        self.mdev_us = self.rttvar_us;
+        self.mdev_max_us = self.rttvar_us;
+        self.live.rto.set(RTO_FALLBACK);
     }
 
-    /// Smoothed RTT and its variance in ms (TCP_INFO)
-    pub fn rtt(&self) -> (u64, u64) {
-        (self.srtt8 / 8, self.rttvar4 / 4)
+    /// Smoothed RTT and its variance in us (TCP_INFO tcpi_rtt,
+    /// tcpi_rttvar: srtt_us >> 3, mdev_us >> 2)
+    pub fn rtt(&self) -> (u32, u32) {
+        (self.srtt_us >> 3, self.mdev_us >> 2)
     }
 
     /// Handshake retransmissions allowed (Linux tcp_write_timeout's
@@ -269,7 +304,6 @@ impl TcpCb {
         if !(self.passive && self.state == TcpState::SynReceived) {
             self.enter_loss();
         }
-        self.rtt_seq = None;
         // Linux tcp_update_rto_stats
         self.live.retransmits.set(self.live.retransmits.get() + 1);
         self.stats.rto_count = self.stats.rto_count.wrapping_add(1);

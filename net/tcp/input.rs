@@ -127,16 +127,21 @@ impl TcpCb {
         self.max_wnd = self.max_wnd.max(self.snd_wnd);
         self.snd_wl1 = s.seq;
         self.snd_wl2 = s.ack;
-        let timed = self.rtt_seq.filter(|&(seq, _)| !before(s.ack, seq));
-        if let Some(r) = self.ts_rtt(s).or(timed.map(|(_, t)| now.saturating_sub(t))) {
-            self.rtt_sample(r);
-            // Linux tcp_synack_rtt_meas -> tcp_ack_update_rtt: the
-            // handshake's RTT is the first minimum
-            self.update_rtt_min(r * 1000, flag::SYN_ACKED);
-        } else if self.syn_rtx {
+        // The handshake's RTT (Linux tcp_ack of the SYN-ACK,
+        // tcp_synack_rtt_meas): our SYN's or SYN-ACK's unless it was
+        // resent (Karn), else the timestamp echo; none: RFC 6298 5.7's
+        // 3 s (tcp_init_metrics)
+        let rtt = if self.syn_rtx {
+            -1
+        } else {
+            self.tcp_mstamp.saturating_sub(self.syn_mstamp) as i64
+        };
+        let mut st = SackState::default();
+        (st.seq_rtt_us, st.ca_rtt_us) = (rtt, rtt);
+        self.ack_update_rtt(s, flag::SYN_ACKED, &mut st);
+        if self.srtt_us == 0 {
             self.set_rto_fallback();
         }
-        self.rtt_seq = None;
         self.live.backoff.set(0);
         self.rtx_stamp = None;
         self.live.tmr.set(None);
@@ -201,15 +206,15 @@ impl TcpCb {
         }
     }
 
-    /// RTT from the timestamp echo of a segment acknowledging new data
-    /// (RFC 7323 4; valid for retransmitted data too)
+    /// RTT in us from the timestamp echo of a segment acknowledging new
+    /// data (RFC 7323 4; Linux tcp_rtt_tsopt_us: ms in us, at least 1)
     fn ts_rtt(&self, s: &SegIn) -> Option<u64> {
         let (_, e) = s.ts?;
         if !self.ts_ok || e == 0 {
             return None;
         }
         let d = self.tsval().wrapping_sub(e) as i32;
-        (d >= 0).then_some(d as u64)
+        (d >= 0).then_some((d as u64 * 1000).max(1))
     }
 
     /// Synchronized states and SYN_RECEIVED
@@ -531,7 +536,6 @@ impl TcpCb {
             if before(self.snd_nxt, ack) {
                 self.snd_nxt = ack;
             }
-            self.ack_rtt(s, now);
             out.wake |= wake::SPACE;
         }
         if prior_packets == 0 {
@@ -597,34 +601,25 @@ impl TcpCb {
         }
     }
 
-    /// An RTT sample for the RTO from an ACK of new data: the timestamp
-    /// echo, else the timed segment (Karn)
-    fn ack_rtt(&mut self, s: &SegIn, now: u64) {
-        let timed = self.rtt_seq.filter(|&(seq, _)| !before(s.ack, seq));
-        let rtt = self.ts_rtt(s).or(timed.map(|(_, t)| now.saturating_sub(t)));
-        if let Some(r) = rtt {
-            self.rtt_sample(r);
-        }
-        if timed.is_some() {
-            self.rtt_seq = None;
-        }
-    }
-
-    /// Linux tcp_ack_update_rtt's us part: the RTT of the packets acked
-    /// or SACKed, else of the timestamp echo, feeds the minimum RTT and
-    /// the congestion sample (rs->rtt_us)
+    /// Linux tcp_ack_update_rtt: the RTT of the packets acked or SACKed
+    /// (none if retransmitted data was acked: Karn), else of the
+    /// timestamp echo, feeds the congestion sample (rs->rtt_us), the
+    /// minimum RTT and the RTO estimator; a valid sample ends the backoff
     fn ack_update_rtt(&mut self, s: &SegIn, flg: u32, st: &mut SackState) {
         if st.seq_rtt_us < 0
             && flg & flag::ACKED != 0
             && let Some(r) = self.ts_rtt(s)
         {
-            // tcp_rtt_tsopt_us: the echo's ms in us
-            st.seq_rtt_us = (r * 1000) as i64;
+            st.seq_rtt_us = r as i64;
             st.ca_rtt_us = st.seq_rtt_us;
         }
-        if st.seq_rtt_us >= 0 && st.ca_rtt_us >= 0 {
-            self.update_rtt_min(st.ca_rtt_us as u64, flg);
+        if st.seq_rtt_us < 0 {
+            return;
         }
+        self.update_rtt_min(st.ca_rtt_us.max(0) as u64, flg);
+        self.rtt_estimator(st.seq_rtt_us);
+        self.set_rto();
+        self.live.backoff.set(0);
     }
 
     /// The algorithm's accounting of the ACK (Linux tcp_clean_rtx_queue

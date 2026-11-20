@@ -841,10 +841,17 @@ pub struct TcpCb {
     pub adv_mss: u32,
 
     // --- timers and RTT (RFC 6298) ----------------------------------------
-    pub(super) srtt8: u64,
-    pub(super) rttvar4: u64,
-    /// Karn: (sequence that must be acknowledged, send time)
-    pub(super) rtt_seq: Option<(u32, u64)>,
+    /// Linux srtt_us (8 x SRTT), mdev_us (4 x mean deviation),
+    /// mdev_max_us (the round's maximum), rttvar_us, us; rtt_seq: the
+    /// SND.NXT that ends the round
+    pub(super) srtt_us: u32,
+    pub(super) mdev_us: u32,
+    pub(super) mdev_max_us: u32,
+    pub(super) rttvar_us: u32,
+    pub(super) rtt_seq: u32,
+    /// When our SYN or SYN-ACK last went out, us (Linux: the SYN skb's
+    /// skb_mstamp_ns, the request's snt_synack)
+    pub(super) syn_mstamp: u64,
     pub(super) syn_rtx: bool,
     /// Our SYN is not yet acknowledged (Linux: the SYN skb heads the
     /// retransmit queue): a retransmission resends the SYN or SYN-ACK,
@@ -1020,9 +1027,12 @@ impl TcpCb {
             peer_mss: MSS_DEFAULT,
             path_mss: 65495,
             adv_mss: MSS_DEFAULT,
-            srtt8: Default::default(),
-            rttvar4: Default::default(),
-            rtt_seq: Default::default(),
+            srtt_us: 0,
+            mdev_us: 0,
+            mdev_max_us: 0,
+            rttvar_us: 0,
+            rtt_seq: 0,
+            syn_mstamp: 0,
             syn_rtx: Default::default(),
             syn_unacked: Default::default(),
             passive: Default::default(),
@@ -1100,7 +1110,6 @@ impl TcpCb {
         self.ts_off = if self.cfg.ts == 1 { o.ts_off } else { 0 };
         self.assign_cc(self.opts.ca);
         self.set_adv_mss(o.mss);
-        self.rtt_seq = Some((self.snd_nxt, now));
         self.rcv_tstamp = now;
         self.lsndtime = now;
     }
