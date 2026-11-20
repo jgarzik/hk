@@ -654,6 +654,18 @@ pub struct Ooo {
     pub(super) merged: u64,
 }
 
+/// A contiguous range of the out-of-order queue (Linux
+/// tcp_collapse_ofo_queue's head, start, end, range_truesize)
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OooRange {
+    /// Its first skb's sequence number
+    pub head: u32,
+    pub start: u32,
+    pub end: u32,
+    pub head_truesize: usize,
+    pub truesize: usize,
+}
+
 /// `skb`'s payload end (its `end_seq` less a FIN)
 fn data_end(skb: &SkBuff) -> u32 {
     skb.tcp().seq.wrapping_add(skb.len() as u32)
@@ -758,18 +770,67 @@ impl Ooo {
         sets
     }
 
-    /// Every skb, in sequence order, the queue left empty (collapsing)
-    pub(super) fn take_all(&mut self) -> SkbHead<Box<SkBuff>> {
+    /// The range of contiguous or overlapping skbs that starts with the
+    /// first skb after `from` (None: the first skb), read in place
+    /// (Linux tcp_collapse_ofo_queue's walk)
+    pub(super) fn range_after(&mut self, from: Option<u32>) -> Option<OooRange> {
+        let mut c = match from {
+            None => self.tree.cursor_front_mut(),
+            Some(f) => {
+                let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp().seq, f));
+                if c.current().is_some() {
+                    c.move_next();
+                } else {
+                    c = self.tree.cursor_front_mut();
+                }
+                c
+            }
+        };
+        let head = c.current()?;
+        let mut r = OooRange {
+            head: head.tcp().seq,
+            start: head.tcp().seq,
+            end: data_end(head),
+            head_truesize: head.truesize(),
+            truesize: head.truesize(),
+        };
+        while let Some(n) = c.peek_next() {
+            let (seq, end) = (n.tcp().seq, data_end(n));
+            if after(seq, r.end) || before(end, r.start) {
+                break;
+            }
+            r.truesize += n.truesize();
+            if before(seq, r.start) {
+                r.start = seq;
+            }
+            if after(end, r.end) {
+                r.end = end;
+            }
+            c.move_next();
+        }
+        Some(r)
+    }
+
+    /// Unlink the skbs of range `r` (from its head up to its end), in
+    /// sequence order, leaving the rest of the tree as it is
+    pub(super) fn take_range(&mut self, r: &OooRange) -> SkbHead<Box<SkBuff>> {
         let mut q = SkbHead::new();
-        while let Some(s) = self.tree.pop_first() {
+        let mut c = self.tree.cursor_floor_mut(|x| !after(x.tcp().seq, r.head));
+        while let Some(s) = c.current() {
+            if after(s.tcp().seq, r.end) {
+                break;
+            }
+            let Some(s) = c.remove_current() else {
+                break;
+            };
+            self.bytes -= s.len();
+            self.truesize -= s.truesize();
             q.push_back(s);
         }
-        self.bytes = 0;
-        self.truesize = 0;
         q
     }
 
-    /// Queue the skbs of `q` (as `take_all` gave them, collapsed)
+    /// Queue the skbs of `q` (a range `take_range` gave, collapsed)
     pub(super) fn put_all(&mut self, mut q: SkbHead<Box<SkBuff>>) {
         while let Some(s) = q.pop_front() {
             self.bytes += s.len();

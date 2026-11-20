@@ -13,7 +13,7 @@
 use alloc::boxed::Box;
 
 use super::buf::win_from_space;
-use super::cb::{TcpCb, after, before, flags};
+use super::cb::{TcpCb, before, flags};
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::LINUX_MIB_TCPRCVCOLLAPSED;
 use crate::net::skb::{SkBuff, SkbHead};
@@ -40,19 +40,19 @@ fn syn_fin(skb: &SkBuff) -> bool {
 
 /// Linux tcp_collapse over `q` (skbs in sequence order, the bytes
 /// [`start`, `end`) wanted), the result appended to `keep` in order;
-/// returns the skbs freed. `ratio`: the connection's scaling ratio
-/// (tcp_win_from_space)
-fn collapse(q: &mut Queue, mut start: u32, end: u32, keep: &mut Queue, ratio: u8) -> u64 {
-    let mut freed = 0;
+/// returns the skbs freed and the truesize gone and made. `ratio`: the
+/// connection's scaling ratio (tcp_win_from_space). Skbs it does not
+/// copy are moved as they are, never reallocated.
+fn collapse(q: &mut Queue, mut start: u32, end: u32, keep: &mut Queue, ratio: u8) -> Collapsed {
+    let mut c = Collapsed::default();
     // First, the point where collapsing can be useful
     loop {
         let Some(skb) = q.front() else {
-            return freed;
+            return c;
         };
         if !before(start, data_end(skb)) {
             // No new bits
-            drop(q.pop_front());
-            freed += 1;
+            c.drop(q.pop_front());
             continue;
         }
         let next_gap = q
@@ -74,7 +74,7 @@ fn collapse(q: &mut Queue, mut start: u32, end: u32, keep: &mut Queue, ratio: u8
         while let Some(s) = q.pop_front() {
             keep.push_back(s);
         }
-        return freed;
+        return c;
     }
     'copy: while before(start, end) {
         let Some(head) = q.front() else {
@@ -84,10 +84,11 @@ fn collapse(q: &mut Queue, mut start: u32, end: u32, keep: &mut Queue, ratio: u8
         let Some(mut nskb) = SkBuff::alloc(0, copy, Gfp::ATOMIC) else {
             break;
         };
-        let mut cb = head.tcp();
-        cb.seq = start;
-        cb.end_seq = start;
-        *nskb.tcp_mut() = cb;
+        let mut t = head.tcp();
+        t.seq = start;
+        t.end_seq = start;
+        *nskb.tcp_mut() = t;
+        c.made += nskb.truesize();
         while copy > 0 {
             let Some(skb) = q.front() else {
                 break;
@@ -105,8 +106,7 @@ fn collapse(q: &mut Queue, mut start: u32, end: u32, keep: &mut Queue, ratio: u8
                 start = start.wrapping_add(size as u32);
             }
             if !before(start, data_end(skb)) {
-                drop(q.pop_front());
-                freed += 1;
+                c.drop(q.pop_front());
                 if q.front().is_none_or(syn_fin) {
                     keep.push_back(nskb);
                     break 'copy;
@@ -118,7 +118,25 @@ fn collapse(q: &mut Queue, mut start: u32, end: u32, keep: &mut Queue, ratio: u8
     while let Some(s) = q.pop_front() {
         keep.push_back(s);
     }
-    freed
+    c
+}
+
+/// What a collapse did: skbs freed, their truesize, the new skbs'
+#[derive(Default)]
+struct Collapsed {
+    freed: u64,
+    gone: usize,
+    made: usize,
+}
+
+impl Collapsed {
+    /// An skb freed (Linux tcp_collapse_one)
+    fn drop(&mut self, s: Option<Box<SkBuff>>) {
+        if let Some(s) = s {
+            self.freed += 1;
+            self.gone += s.truesize();
+        }
+    }
 }
 
 impl TcpCb {
@@ -127,7 +145,7 @@ impl TcpCb {
     pub(super) fn collapse_rcvq(&mut self) {
         let mut q = core::mem::take(&mut self.rcvq);
         let mut keep = Queue::new();
-        let n = collapse(
+        let c = collapse(
             &mut q,
             self.copied_seq,
             self.rcv_nxt,
@@ -135,58 +153,35 @@ impl TcpCb {
             self.scaling_ratio,
         );
         // sk_rmem_alloc follows the skbs freed and made
-        self.rcvq_truesize = keep.iter().map(|s| s.truesize()).sum();
+        self.rcvq_truesize = self.rcvq_truesize - c.gone + c.made;
         self.rcvq = keep;
-        self.net_add(LINUX_MIB_TCPRCVCOLLAPSED, n);
+        self.net_add(LINUX_MIB_TCPRCVCOLLAPSED, c.freed);
     }
 
-    /// Linux tcp_collapse_ofo_queue: each contiguous (or overlapping)
-    /// range of the out-of-order queue is collapsed, unless it is one
-    /// skb shorter than a page; tiny ranges stop the walk once they add
-    /// up to an eighth of the receive buffer
+    /// Linux tcp_collapse_ofo_queue: walk the out-of-order queue in
+    /// place range by range; a range of more than one skb, or of at
+    /// least a page, is collapsed (only its own nodes replaced); a tiny
+    /// one is left, and once the tiny ones add up to an eighth of the
+    /// receive buffer the walk stops, the rest of the tree untouched
     pub(super) fn collapse_ofo(&mut self) {
-        let mut all = self.ooo.take_all();
-        let mut keep = Queue::new();
         let rcvbuf = self.rcvbuf as usize;
-        let mut sum_tiny = 0;
-        let mut freed = 0;
-        while let Some(first) = all.pop_front() {
-            let (mut start, mut end) = (first.tcp().seq, data_end(&first));
-            let head_true = first.truesize();
-            let mut range_true = head_true;
-            let mut range = Queue::new();
-            range.push_back(first);
-            while let Some(n) = all.front() {
-                if after(n.tcp().seq, end) || before(data_end(n), start) {
-                    break;
-                }
-                range_true += n.truesize();
-                if before(n.tcp().seq, start) {
-                    start = n.tcp().seq;
-                }
-                if after(data_end(n), end) {
-                    end = data_end(n);
-                }
-                if let Some(n) = all.pop_front() {
-                    range.push_back(n);
-                }
-            }
-            if range_true != head_true || end.wrapping_sub(start) >= PAGE_WITH_OVERHEAD {
-                freed += collapse(&mut range, start, end, &mut keep, self.scaling_ratio);
+        let ratio = self.scaling_ratio;
+        let (mut sum_tiny, mut freed) = (0, 0);
+        let mut from = None;
+        while let Some(r) = self.ooo.range_after(from) {
+            if r.truesize != r.head_truesize || r.end.wrapping_sub(r.start) >= PAGE_WITH_OVERHEAD {
+                let mut range = self.ooo.take_range(&r);
+                let mut keep = Queue::new();
+                freed += collapse(&mut range, r.start, r.end, &mut keep, ratio).freed;
+                self.ooo.put_all(keep);
             } else {
-                while let Some(s) = range.pop_front() {
-                    keep.push_back(s);
-                }
-                sum_tiny += range_true;
+                sum_tiny += r.truesize;
                 if sum_tiny > rcvbuf >> 3 {
                     break;
                 }
             }
+            from = Some(r.end);
         }
-        while let Some(s) = all.pop_front() {
-            keep.push_back(s);
-        }
-        self.ooo.put_all(keep);
         self.net_add(LINUX_MIB_TCPRCVCOLLAPSED, freed);
     }
 }
@@ -222,7 +217,7 @@ mod tests {
     fn collapse_bloated() {
         let mut q = queue([skb(100, 10, 2000), skb(110, 10, 2000), skb(120, 10, 2000)]);
         let mut keep = Queue::new();
-        let n = collapse(&mut q, 105, 130, &mut keep, RATIO);
+        let n = collapse(&mut q, 105, 130, &mut keep, RATIO).freed;
         assert_eq!(n, 3);
         let v: alloc::vec::Vec<_> = keep.iter().map(|s| (s.tcp().seq, s.len())).collect();
         assert_eq!(v, [(105, 25)]);
@@ -233,7 +228,7 @@ mod tests {
         fin.tcp_mut().flags = flags::FIN;
         let mut q = queue([skb(120, 10, 2000), fin]);
         let mut keep = Queue::new();
-        assert_eq!(collapse(&mut q, 120, 140, &mut keep, RATIO), 1);
+        assert_eq!(collapse(&mut q, 120, 140, &mut keep, RATIO).freed, 1);
         let v: alloc::vec::Vec<_> = keep.iter().map(|s| (s.tcp().seq, s.len())).collect();
         assert_eq!(v, [(120, 10), (130, 10)]);
     }
@@ -258,12 +253,57 @@ mod tests {
         assert_eq!(cb.ooo.pieces(), 2);
         assert_eq!(cb.ooo.bytes(), bytes);
         assert_eq!(mib.net.fold(LINUX_MIB_TCPRCVCOLLAPSED), 8);
-        cb.rcvq.push_back(skb(980, 10, 1500));
-        cb.rcvq.push_back(skb(990, 10, 1500));
+        for q in [skb(980, 10, 1500), skb(990, 10, 1500)] {
+            cb.rcvq_truesize += q.truesize();
+            cb.rcvq.push_back(q);
+        }
         cb.collapse_rcvq();
         assert_eq!(cb.rcvq.len(), 1);
         let f = cb.rcvq.front().unwrap();
         assert_eq!((f.tcp().seq, f.len()), (990, 10));
+        assert_eq!(cb.rcvq_truesize, f.truesize());
+    }
+
+    /// The walk stops once tiny ranges reach an eighth of the buffer:
+    /// a collapsible range after that point is left as it was, its
+    /// skbs the same allocations (Linux tcp_collapse_ofo_queue's early
+    /// return), while one before it is collapsed
+    #[test]
+    fn collapse_ofo_stops_early() {
+        let mut cb = TcpCb::new(super::super::cb::Cfg::default(), Default::default());
+        cb.rcvbuf = 64 * 1024;
+        cb.rcv_nxt = 1000;
+        cb.copied_seq = 1000;
+        // A collapsible range, then tiny lone skbs past the budget,
+        // then another collapsible range
+        for i in 0..4 {
+            cb.ooo.insert(skb(2000 + i * 10, 10, 1500), None);
+        }
+        let mut seq = 10_000;
+        for _ in 0..64 {
+            cb.ooo.insert(skb(seq, 10, 1500), None);
+            seq += 100;
+        }
+        let tail: alloc::vec::Vec<u32> = (0..4).map(|i| seq + 1000 + i * 10).collect();
+        for &t in &tail {
+            cb.ooo.insert(skb(t, 10, 1500), None);
+        }
+        let ids = |cb: &mut TcpCb| -> alloc::vec::Vec<(u32, usize)> {
+            let r = cb.ooo.range_after(Some(seq)).unwrap();
+            let q = cb.ooo.take_range(&r);
+            let v = q
+                .iter()
+                .map(|s| (s.tcp().seq, core::ptr::from_ref(s).addr()))
+                .collect();
+            cb.ooo.put_all(q);
+            v
+        };
+        let before = ids(&mut cb);
+        let pieces = cb.ooo.pieces();
+        cb.collapse_ofo();
+        // The first range became one skb; the last is untouched
+        assert_eq!(cb.ooo.pieces(), pieces - 3);
+        assert_eq!(ids(&mut cb), before);
     }
 
     /// Compact skbs are left alone
@@ -271,7 +311,7 @@ mod tests {
     fn collapse_compact_untouched() {
         let mut q = queue([skb(100, 1000, 0), skb(1100, 1000, 0)]);
         let mut keep = Queue::new();
-        assert_eq!(collapse(&mut q, 100, 2100, &mut keep, RATIO), 0);
+        assert_eq!(collapse(&mut q, 100, 2100, &mut keep, RATIO).freed, 0);
         assert_eq!(keep.len(), 2);
     }
 }
