@@ -73,6 +73,12 @@ pub struct NetNamespace {
     /// IPv4 routing tables
     pub fib: Fib,
 
+    /// Generation of path MTU exceptions (Linux net->fnhe_genid): one
+    /// learned under an older generation counts as reset. Bumped by a
+    /// write to net.ipv4.route.flush (`route::fnhe_genid_bump`), read by
+    /// route lookups; a lock-free counter, like Linux's atomic_t
+    pub fnhe_genid: AtomicU32,
+
     /// netlink sockets bound in this namespace
     pub nl: NlNet,
 
@@ -206,6 +212,7 @@ impl NetNamespace {
             devices: RcuList::new(),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new()?,
+            fnhe_genid: AtomicU32::new(0),
             nl: Default::default(),
             tcp: Default::default(),
             port_range: PortRange::default(),

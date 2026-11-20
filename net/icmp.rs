@@ -637,7 +637,7 @@ fn update_pmtu(net: &NetNamespace, e: &IcmpErr<'_>) {
         return;
     }
     if let Ok(rt) = route::output(net, e.inner_daddr(), Ipv4Addr(0), 0) {
-        route::update_pmtu(&rt, e.info);
+        route::update_pmtu(net, &rt, e.info);
     }
 }
 

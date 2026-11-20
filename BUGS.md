@@ -140,8 +140,9 @@ NIC removal: e1000 leaves the function's bus mastering and memory
 space on (no pci_disable_device) and its BAR mapped (no iounmap); an
 unregistered `NetDevice` lives on while queued skbs reference it
 (no netdev_wait_allrefs; it is down and driverless).
-Path MTU exceptions (`route::NhExceptions`) have no generation id (Linux
-fnhe_genid), so they are not flushed when a device goes down.
+A device MTU change leaves path MTU exceptions (`route::NhExceptions`)
+as they are (Linux NETDEV_CHANGEMTU fib_sync_mtu lowers them with it and
+raises those equal to the old MTU).
 
 ## Memory management gaps
 

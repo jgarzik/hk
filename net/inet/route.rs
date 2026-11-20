@@ -6,9 +6,13 @@
 //! classifies a received one (Linux ip_route_input_slow, no forwarding).
 //! Learned path MTUs are exceptions on the route's nexthop (Linux
 //! fib_nh_exception): chains per nexthop read under RCU, written under
-//! the leaf spin lock `FNHE_LOCK`.
+//! the leaf spin lock `FNHE_LOCK`. A write to net.ipv4.route.flush
+//! starts a new exception generation (Linux fnhe_genid): an exception
+//! of an older one counts as reset when next found. With no route
+//! cache, there is no cached route to expire (Linux rt_genid).
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
@@ -64,9 +68,14 @@ pub fn output(
     oif: u32,
 ) -> Result<Rtable, KernelError> {
     let mut rt = output_fib(net, daddr, saddr, oif)?;
-    // Linux __mkroute_output: find_exception on the nexthop
+    // Linux __mkroute_output: find_exception on the nexthop, then
+    // rt_bind_exception
+    let genid = fnhe_genid(net);
     if rt.rtype == RouteType::Unicast
-        && let Some(m) = rt.fi.as_ref().and_then(|fi| fi.exceptions.find(rt.daddr))
+        && let Some(m) = rt
+            .fi
+            .as_ref()
+            .and_then(|fi| fi.exceptions.find(rt.daddr, genid))
     {
         rt.mtu = rt.mtu.min(m);
     }
@@ -242,9 +251,11 @@ static FNHE_LOCK: crate::sync::spin::Mutex<FnheLock> = crate::sync::spin::Mutex:
 /// needed), so bounded per chain; it expires after 10 minutes.
 pub struct FibNhException {
     daddr: Ipv4Addr,
-    /// Path MTU (Linux fnhe_pmtu, READ_ONCE by readers)
+    /// Generation it was learned in (Linux fnhe_genid), under FNHE_LOCK
+    genid: AtomicU32,
+    /// Path MTU, 0 = none (Linux fnhe_pmtu, READ_ONCE by readers)
     pmtu: AtomicU32,
-    /// Expiry, ms (fnhe_expires)
+    /// Expiry, ms; 0 = never (fnhe_expires)
     expires: AtomicU64,
     /// Last update, ms, to pick the oldest (fnhe_stamp)
     stamp: AtomicU64,
@@ -294,23 +305,45 @@ impl NhExceptions {
         Some(self.0.call_once(|| h))
     }
 
-    /// The valid path MTU learned towards `daddr`, if any (Linux
-    /// find_exception: an expired one is deleted)
-    pub fn find(&self, daddr: Ipv4Addr) -> Option<u32> {
+    /// The valid path MTU learned towards `daddr` in generation
+    /// `genid`, if any: an expired exception is deleted (Linux
+    /// find_exception), one of an older generation reset
+    /// (rt_bind_exception)
+    pub fn find(&self, daddr: Ipv4Addr, genid: u32) -> Option<u32> {
         let chain = self.chain(daddr)?;
         let now = crate::net::neigh::now_ms();
-        let expired = {
+        {
             let g = crate::sync::rcu::read_lock();
             let e = chain.iter(&g).find(|e| e.daddr == daddr)?;
-            if e.expires.load(Relaxed) >= now {
-                return Some(e.pmtu.load(Relaxed));
+            let exp = e.expires.load(Relaxed);
+            if exp == 0 || exp >= now {
+                if e.genid.load(Relaxed) == genid {
+                    return Some(e.pmtu.load(Relaxed)).filter(|&m| m != 0);
+                }
+                drop(g);
+                self.reset_stale(daddr, genid);
+                return None;
             }
-            true
-        };
-        if expired {
-            self.del(daddr);
         }
+        self.del(daddr);
         None
+    }
+
+    /// Reset the exception for `daddr` if it is of a generation other
+    /// than `genid` (Linux rt_bind_exception under fnhe_lock: no path
+    /// MTU, no expiry, the current generation)
+    fn reset_stale(&self, daddr: Ipv4Addr, genid: u32) {
+        let Some(chain) = self.chain(daddr) else {
+            return;
+        };
+        let o = FNHE_LOCK.lock();
+        if let Some(e) = chain.iter_locked(&o).find(|e| e.daddr == daddr)
+            && e.genid.load(Relaxed) != genid
+        {
+            e.genid.store(genid, Relaxed);
+            e.pmtu.store(0, Relaxed);
+            e.expires.store(0, Relaxed);
+        }
     }
 
     /// Delete the exception for `daddr` (Linux ip_del_fnhe)
@@ -324,12 +357,12 @@ impl NhExceptions {
         }
     }
 
-    /// Record path MTU `pmtu` towards `daddr` until `expires` (Linux
-    /// update_or_create_fnhe): an existing exception is updated in
-    /// place; a new one is allocated GFP_ATOMIC under the lock, the
-    /// oldest of a chain past its (randomized) depth removed first. No
-    /// memory: nothing is learned.
-    fn update(&self, daddr: Ipv4Addr, pmtu: u32, expires: u64) {
+    /// Record path MTU `pmtu` towards `daddr` until `expires`, in
+    /// generation `genid` (Linux update_or_create_fnhe): an existing
+    /// exception is updated in place; a new one is allocated GFP_ATOMIC
+    /// under the lock, the oldest of a chain past its (randomized)
+    /// depth removed first. No memory: nothing is learned.
+    fn update(&self, daddr: Ipv4Addr, pmtu: u32, expires: u64, genid: u32) {
         let now = crate::net::neigh::now_ms();
         let mut o = FNHE_LOCK.lock();
         let Some(chains) = self.chains(&o) else {
@@ -342,6 +375,7 @@ impl NhExceptions {
             .inspect(|_| depth += 1)
             .find(|e| e.daddr == daddr)
         {
+            e.genid.store(genid, Relaxed);
             e.pmtu.store(pmtu, Relaxed);
             e.expires.store(expires.max(1), Relaxed);
             e.stamp.store(now, Relaxed);
@@ -356,6 +390,7 @@ impl NhExceptions {
         }
         let e = FibNhException {
             daddr,
+            genid: AtomicU32::new(genid),
             pmtu: AtomicU32::new(pmtu),
             expires: AtomicU64::new(expires.max(1)),
             stamp: AtomicU64::new(now),
@@ -385,7 +420,7 @@ fn fnhe_remove_oldest(chain: &FnheChain, o: &mut FnheLock) {
 /// ICMP frag needed said `mtu` on the path of `rt`: lower its path MTU,
 /// never below ip_rt_min_pmtu, as an exception on its nexthop (Linux
 /// __ip_rt_update_pmtu -> update_or_create_fnhe)
-pub fn update_pmtu(rt: &Rtable, mtu: u32) {
+pub fn update_pmtu(net: &NetNamespace, rt: &Rtable, mtu: u32) {
     let cur = rt.mtu;
     if mtu >= cur {
         return;
@@ -397,9 +432,40 @@ pub fn update_pmtu(rt: &Rtable, mtu: u32) {
     };
     if let Some(fi) = &rt.fi {
         let expires = crate::net::neigh::now_ms() + PMTU_EXPIRES;
-        fi.exceptions.update(rt.daddr, mtu, expires);
+        fi.exceptions
+            .update(rt.daddr, mtu, expires, fnhe_genid(net));
     }
 }
+
+/// The current exception generation (Linux fnhe_genid)
+fn fnhe_genid(net: &NetNamespace) -> u32 {
+    net.fnhe_genid.load(Relaxed)
+}
+
+/// Start a new exception generation (Linux fnhe_genid_bump)
+pub fn fnhe_genid_bump(net: &NetNamespace) {
+    net.fnhe_genid.fetch_add(1, Relaxed);
+}
+
+/// net.ipv4.route.flush: any write flushes the route cache (Linux
+/// ipv4_sysctl_rtcache_flush: rt_cache_flush, which has nothing to do
+/// without one, then fnhe_genid_bump); write-only
+fn rtcache_flush(_: &str) -> Result<(), KernelError> {
+    fnhe_genid_bump(&crate::net::current_net_ns());
+    Ok(())
+}
+
+/// The /proc/sys/net/ipv4/route files (Linux ipv4_route_table subset)
+pub static ROUTE_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
+    path: "net/ipv4/route/flush",
+    mode: 0o200,
+    show: alloc::vec::Vec::new,
+    store: |_| Ok(()),
+    text: Some(crate::sysctl::Text {
+        show: String::new,
+        store: rtcache_flush,
+    }),
+}];
 
 /// Input routing decision for a received IPv4 packet
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -609,15 +675,15 @@ mod tests {
     fn exceptions() {
         let nh = NhExceptions::default();
         let d = ip(192, 0, 2, 1);
-        assert_eq!(nh.find(d), None);
+        assert_eq!(nh.find(d, 0), None);
         let later = crate::net::neigh::now_ms() + 60_000;
-        nh.update(d, 1400, later);
-        assert_eq!(nh.find(d), Some(1400));
-        nh.update(d, 1300, later);
-        assert_eq!(nh.find(d), Some(1300));
+        nh.update(d, 1400, later, 0);
+        assert_eq!(nh.find(d, 0), Some(1400));
+        nh.update(d, 1300, later, 0);
+        assert_eq!(nh.find(d, 0), Some(1300));
         // Deleted (as an expired one is)
         nh.del(d);
-        assert_eq!(nh.find(d), None);
+        assert_eq!(nh.find(d, 0), None);
         // Destinations on one chain (same hash) reuse the oldest
         let h = fnhe_hashfun(d);
         let same: alloc::vec::Vec<Ipv4Addr> = (0..u32::MAX)
@@ -626,12 +692,31 @@ mod tests {
             .take(3 * FNHE_RECLAIM_DEPTH)
             .collect();
         for a in &same {
-            nh.update(*a, 1000, later);
+            nh.update(*a, 1000, later, 0);
         }
         let g = crate::sync::rcu::read_lock();
         let depth = nh.chain(d).unwrap().iter(&g).count();
         assert!(depth <= 2 * FNHE_RECLAIM_DEPTH, "depth {depth}");
         drop(g);
-        assert_eq!(nh.find(*same.last().unwrap()), Some(1000));
+        assert_eq!(nh.find(*same.last().unwrap(), 0), Some(1000));
+    }
+
+    /// After a flush (a new generation) an exception counts as reset:
+    /// no path MTU, also for the old generation, until learned again
+    #[test]
+    fn exception_generations() {
+        let nh = NhExceptions::default();
+        let d = ip(198, 51, 100, 9);
+        let later = crate::net::neigh::now_ms() + 60_000;
+        nh.update(d, 1280, later, 4);
+        assert_eq!(nh.find(d, 4), Some(1280));
+        assert_eq!(nh.find(d, 5), None);
+        assert_eq!(nh.find(d, 5), None);
+        assert_eq!(nh.find(d, 4), None);
+        let g = crate::sync::rcu::read_lock();
+        assert_eq!(nh.chain(d).unwrap().iter(&g).count(), 1);
+        drop(g);
+        nh.update(d, 1300, later, 5);
+        assert_eq!(nh.find(d, 5), Some(1300));
     }
 }
