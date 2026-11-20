@@ -88,9 +88,7 @@ Planned fix:
 
 **Location**: `net/`
 
-Listed because real traffic reaches them: TCP has no tail loss probe
-(Linux tcp_schedule_loss_probe / tcp_send_loss_probe, TLP of RFC 8985:
-a lost tail waits for the RTO), no delivery rate sampling (Linux
+Listed because real traffic reaches them: TCP has no delivery rate sampling (Linux
 tcp_rate.c; only the rate sample's prior_delivered, for RACK's
 reordering window), RACK checks every skb of the retransmit queue
 (Linux walks tsorted_sent_queue in send order and stops early), no
@@ -139,7 +137,7 @@ MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
 prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
 ACK counts TCPPureAcks, where Linux's fast path skips it), receive
 coalescing and collapse, F-RTO (TCPSpuriousRTOs), RcvPruned (no tcp_can_ingest),
-TLP, Fast Open, syncookies, MD5/AO, forwarding and
+Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.

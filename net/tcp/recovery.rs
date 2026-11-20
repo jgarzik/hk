@@ -16,7 +16,7 @@
 //! 6937), after a timeout it slow-starts from one packet (CA_Loss).
 //! Reductions found spurious (timestamps, D-SACKs) are undone.
 
-use super::cb::{TcpCb, TcpState, Tmr, after, before};
+use super::cb::{RTO_INIT, RTO_MIN, TcpCb, TcpState, Tmr, after, before};
 use super::cong::INFINITE_SSTHRESH;
 use crate::net::mib::*;
 use crate::net::skb::SkBuff;
@@ -281,7 +281,11 @@ impl TcpCb {
     /// Linux tcp_init_undo
     fn init_undo(&mut self) {
         self.undo_marker = Some(self.snd_una);
+        // Retransmissions in flight may come back D-SACKed, a probe's too
         self.undo_retrans = self.retrans_out as i32;
+        if self.tlp_high_seq.is_some() && self.tlp_retrans {
+            self.undo_retrans += 1;
+        }
         if self.undo_retrans == 0 {
             self.undo_retrans = -1;
         }
@@ -1051,8 +1055,121 @@ impl TcpCb {
         }
     }
 
-    /// Linux tcp_set_xmit_timer
+    /// Linux tcp_set_xmit_timer: a loss probe if one may go, else the
+    /// RTO
     pub(super) fn set_xmit_timer(&mut self, now: u64) {
+        if self.packets_out == 0 || !self.schedule_loss_probe(now, true) {
+            self.rearm_rto(now);
+        }
+    }
+
+    // --- tail loss probe (Linux tcp_output.c, RFC 8985 TLP) -----------------
+
+    /// Linux tcp_schedule_loss_probe: in Open or CWR with SACK, probe
+    /// after 2 RTT (plus the minimum RTO for a lone packet, the delayed
+    /// ACK), 1 s without an RTT, never later than the RTO
+    pub(super) fn schedule_loss_probe(&mut self, now: u64, advancing_rto: bool) -> bool {
+        if !matches!(self.cfg.early_retrans, 3 | 4)
+            || !self.is_sack()
+            || !matches!(self.ca_state, CaState::Open | CaState::Cwr)
+        {
+            return false;
+        }
+        let mut timeout = if self.srtt8 != 0 {
+            let t = self.srtt8 / 4;
+            if self.packets_out == 1 {
+                t + RTO_MIN
+            } else {
+                t + TIMEOUT_MIN
+            }
+        } else {
+            RTO_INIT
+        };
+        let rto_delta = if advancing_rto {
+            self.rto_cur() as i64
+        } else {
+            self.rto_delta(now)
+        };
+        if rto_delta > 0 {
+            timeout = timeout.min(rto_delta as u64);
+        }
+        self.live.tmr.set(Some((Tmr::LossProbe, now + timeout)));
+        true
+    }
+
+    /// Linux tcp_send_loss_probe: the probe timer fired: send a new
+    /// segment if the window allows, else the last one again; then the
+    /// RTO
+    pub(super) fn send_loss_probe(&mut self, now: u64, out: &mut super::cb::Out) {
+        if self.tlp_high_seq.is_none() && self.loss_probe(now, out) {
+            self.tlp_high_seq = Some(self.snd_max);
+            self.net_stat(LINUX_MIB_TCPLOSSPROBES);
+            // Restart the RTO from now
+            self.live.tmr.set(None);
+        }
         self.rearm_rto(now);
+    }
+
+    /// The probe itself: true if it went out
+    fn loss_probe(&mut self, now: u64, out: &mut super::cb::Out) -> bool {
+        self.tlp_retrans = false;
+        let mss = self.cur_mss();
+        let wnd_end = self.snd_una.wrapping_add(self.snd_wnd);
+        if let Some(head) = self.wq.front() {
+            let len = (head.len() as u32).min(mss);
+            if !after(self.snd_nxt.wrapping_add(len), wnd_end) {
+                let pc = self.packets_out;
+                self.xmit(now, super::output::Push::Tlp, out);
+                return self.packets_out > pc;
+            }
+        }
+        let Some(last) = self
+            .rtx
+            .last()
+            .map(|s| (s.tcp().seq, s.tcp().pcount, s.len()))
+        else {
+            return false;
+        };
+        let (mut seq, pc, len) = last;
+        if pc > 1 && len > ((pc - 1) * mss) as usize {
+            if !self.rtx_fragment(seq, ((pc - 1) * mss) as usize, mss) {
+                return false;
+            }
+            let Some(next) = self.rtx_next(seq) else {
+                return false;
+            };
+            seq = next;
+        }
+        if self.retransmit_raw(seq, 1, now, out).is_none() {
+            return false;
+        }
+        self.tlp_retrans = true;
+        true
+    }
+
+    /// Linux tcp_process_tlp_ack: ACKs during a probe episode; one
+    /// beyond it after a retransmitted probe means a loss repaired by
+    /// the probe: reduce the window once (CWR)
+    pub(super) fn process_tlp_ack(&mut self, ack: u32, f: u32) {
+        let Some(h) = self.tlp_high_seq else {
+            return;
+        };
+        if before(ack, h) {
+            return;
+        }
+        if !self.tlp_retrans || f & flag::DSACK_TLP != 0 {
+            // New data probed, or the original and the probe both
+            // arrived: no loss
+            self.tlp_high_seq = None;
+        } else if after(ack, h) {
+            self.init_cwnd_reduction();
+            self.set_ca_state(CaState::Cwr);
+            self.end_cwnd_reduction();
+            self.try_keep_open();
+            self.net_stat(LINUX_MIB_TCPLOSSPROBERECOVERY);
+        } else if f & (flag::SND_UNA_ADVANCED | flag::NOT_DUP | flag::DATA_SACKED) == 0 {
+            // A pure duplicate: the original and the probe arrived
+            self.tlp_high_seq = None;
+        }
     }
 }

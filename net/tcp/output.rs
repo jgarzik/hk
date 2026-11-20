@@ -55,6 +55,16 @@ pub(super) enum Push {
     More,
     /// Probe timer: one segment regardless (Linux tcp_write_wakeup)
     Force,
+    /// Tail loss probe: one new segment, Nagle off, no probe scheduled
+    /// for it (Linux tcp_write_xmit with push_one 2)
+    Tlp,
+}
+
+impl Push {
+    /// One segment, never held
+    fn one(self) -> bool {
+        matches!(self, Push::Force | Push::Tlp)
+    }
 }
 
 /// A copy of `skb`'s payload with headroom for the headers (Linux
@@ -218,18 +228,26 @@ impl TcpCb {
         self.tick(now);
         let mut sent = false;
         let mut limited = false;
+        let prior_packets = self.packets_out;
         while self.may_send() {
             let Some(fin) = self.next_seg(now, push, &mut limited, out) else {
                 break;
             };
             sent = true;
-            if fin || push == Push::Force {
+            if fin || push.one() {
                 break;
             }
         }
         if sent {
-            if self.live.tmr.get().is_none_or(|t| t.0 != Tmr::Rtx) {
-                self.arm_rtx(now);
+            // Linux tcp_event_new_data_sent: the RTO starts with the
+            // first packet out, or replaces a loss probe
+            let pending = self.live.tmr.get().map(|t| t.0);
+            if prior_packets == 0 || matches!(pending, None | Some(Tmr::LossProbe | Tmr::Probe)) {
+                self.rearm_rto(now);
+            }
+            // Linux tcp_write_xmit: one loss probe per tail episode
+            if push != Push::Tlp {
+                self.schedule_loss_probe(now, false);
             }
             let flight = self.snd_max.wrapping_sub(self.snd_una);
             self.cong
@@ -260,7 +278,7 @@ impl TcpCb {
     /// Hold a partial segment (Linux tcp_nagle_check with Minshall's
     /// rule; cork and MSG_MORE hold all partial segments)
     fn nagle_hold(&self, push: Push) -> bool {
-        if push == Push::Force {
+        if push.one() {
             return false;
         }
         if self.opts.cork || push == Push::More {
@@ -295,7 +313,7 @@ impl TcpCb {
             return None;
         }
         let in_flight = self.snd_nxt != self.snd_una;
-        if n < mss && !fin && push != Push::Force {
+        if n < mss && !fin && !push.one() {
             // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in
             // flight, wait for a full segment unless this ends the queue
             if n < avail && in_flight && n < self.max_wnd / 2 {
@@ -540,7 +558,13 @@ impl TcpCb {
     /// skb beyond a shrunk window waits unless it heads the queue,
     /// longer ones are cut, shorter ones merged with the next). Returns
     /// the seq it went out at, None if nothing did
-    fn retransmit_raw(&mut self, seq: u32, segs: u32, now: u64, out: &mut Out) -> Option<u32> {
+    pub(super) fn retransmit_raw(
+        &mut self,
+        seq: u32,
+        segs: u32,
+        now: u64,
+        out: &mut Out,
+    ) -> Option<u32> {
         let mut seq = seq;
         let (start, end) = self.rtx_with(seq, |s| (s.tcp().seq, s.tcp().end_seq))?;
         if before(start, self.snd_una) {

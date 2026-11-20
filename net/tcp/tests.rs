@@ -509,11 +509,13 @@ fn rto_backoff_and_give_up() {
     let t0 = p.now;
     p.until(|p| p.a.state == TcpState::Closed, 100);
     let times: Vec<u64> = p.log.iter().filter(|l| l.1).map(|l| l.0 - t0).collect();
-    // RTT 0 measured in the handshake: RTO = 200 ms (RTO_MIN), doubling
-    // up to 120 s; retries2 = 15 retransmissions
-    assert_eq!(times.len(), 16);
+    // RTT 0 measured in the handshake: first the tail loss probe after
+    // 2 RTT + RTO_MIN (Linux tcp_schedule_loss_probe, a lone packet),
+    // the RTO restarting from it; RTO = 200 ms (RTO_MIN), doubling up
+    // to 120 s; retries2 = 15 retransmissions
+    assert_eq!(times.len(), 17);
     let gaps: Vec<u64> = times.windows(2).map(|w| w[1] - w[0]).collect();
-    assert_eq!(&gaps[..6], &[200, 400, 800, 1600, 3200, 6400]);
+    assert_eq!(&gaps[..7], &[200, 200, 400, 800, 1600, 3200, 6400]);
     assert!(gaps.iter().all(|&g| g <= RTO_MAX));
     assert_eq!(*gaps.last().unwrap(), RTO_MAX);
     assert_eq!(p.a_out.err, Some(KernelError::TimedOut));
@@ -630,6 +632,13 @@ fn shrunk_window_retransmits_probe_head() {
     let now = p.now;
     p.a.feed(&shut(&p), now, &mut out);
     assert_eq!(p.a.snd_wnd, 0);
+    // The tail loss probe finds no window for the tail (Linux
+    // __tcp_retransmit_skb -EAGAIN) and gives way to the RTO
+    let t = p.a.next_timer().expect("loss probe armed");
+    p.now = t;
+    let mut out = Out::default();
+    p.a.on_timer(t, &mut out);
+    assert!(wire(&out).is_empty());
     // Answered probes: past retries2, never a timeout
     for i in 0..(cfg().retries2 + 5) {
         let t = p.a.next_timer().expect("retransmit timer armed");
@@ -1487,11 +1496,22 @@ fn fin_wait1_resends_unacked_synack() {
     let mut out = Out::default();
     p.a.close(false, p.now, &mut out);
     p.take(true, out);
-    // The timeout resends the SYN-ACK alone (Linux: the head of the
-    // retransmit queue, still in FIN_WAIT_1), then the FIN once it is
-    // acknowledged
+    // The tail loss probe resends the FIN (Linux tcp_send_loss_probe:
+    // the last skb), then the timeout resends the SYN-ACK alone (Linux:
+    // the head of the retransmit queue, still in FIN_WAIT_1), then the
+    // FIN once it is acknowledged
     let n = p.log.len();
     assert!(p.tick());
+    let probe: Vec<&Seg> = p.log[n..].iter().filter(|l| l.1).map(|l| &l.2).collect();
+    assert_eq!(probe.len(), 1);
+    assert_eq!(
+        (probe[0].flags, probe[0].seq),
+        (flags::FIN | flags::ACK, 101)
+    );
+    let n2 = p.log.len();
+    assert!(p.tick());
+    assert!(n2 > n);
+    let n = n2;
     let w: Vec<Seg> = p.log[n..]
         .iter()
         .filter(|(_, to_b, _)| *to_b)
@@ -1502,7 +1522,7 @@ fn fin_wait1_resends_unacked_synack() {
     assert_eq!((w[0].seq, w[0].ack), (100, 901));
     assert!(w[0].mss.is_some());
     assert_eq!(p.a.state, TcpState::FinWait1);
-    assert_eq!(p.a.stats.total_retrans, 1);
+    assert_eq!(p.a.stats.total_retrans, 2);
     p.filter = pass;
     let mut out = Out::default();
     let ack = SegIn {
@@ -1517,9 +1537,14 @@ fn fin_wait1_resends_unacked_synack() {
     // timeout looks spurious and is undone (Linux tcp_process_loss ->
     // tcp_try_undo_loss, FLAG_SYN_ACKED): the FIN waits for the timer
     assert!(wire(&out).is_empty());
-    assert_eq!(p.a.ca_state, super::recovery::CaState::Open);
+    // Disorder, not Open: the FIN skb was retransmitted (the probe)
+    assert_eq!(p.a.ca_state, super::recovery::CaState::Disorder);
     let n = p.log.len();
-    assert!(p.tick());
+    p.wire.clear();
+    p.filter = |_, to_b, _, _| if to_b { Fate::Pass } else { Fate::Drop };
+    while !p.log[n..].iter().any(|l| l.1) {
+        assert!(p.tick());
+    }
     let w: Vec<Seg> = p.log[n..]
         .iter()
         .filter(|(_, to_b, _)| *to_b)
@@ -2264,7 +2289,9 @@ fn mib_retransmit() {
     p.run();
     p.filter = pass;
     p.until(|p| p.b.rcvq_len() == 4, 10);
-    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 1);
+    // A tail loss probe repairs it before the RTO (Linux TLP)
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 0);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSPROBES), 1);
     assert_eq!(m.tcp.fold(TCP_MIB_RETRANSSEGS), 1);
     // The data once, b's ACK of the retransmission
     assert_eq!(m.tcp.fold(TCP_MIB_OUTSEGS), segs + 2);
@@ -2528,8 +2555,9 @@ fn sack_pair(mss: u32) -> (Pair, alloc::sync::Arc<crate::net::mib::NetMib>) {
     (p, m)
 }
 
-/// Drop the first transmission of data at the seqs `p.a` lists in
-/// `DROP` (a filter's state lives in a static: filters are fn pointers)
+/// Drop the first transmission of data at the seqs listed in `DROP`
+/// (a filter's state lives in a static: filters are fn pointers; one
+/// test uses it)
 fn drop_listed(_: &Pair, to_b: bool, s: &Seg, _: usize) -> Fate {
     use core::sync::atomic::Ordering::Relaxed;
     if !to_b || s.data.is_empty() {
@@ -2701,4 +2729,83 @@ fn sacked_skbs_merge() {
         (0, 0, 0, 0)
     );
     assert!(p.a.rtx.is_empty());
+}
+
+/// A lost tail has nothing after it to be SACKed: the loss probe
+/// resends the last segment after 2 RTT and repairs it without a
+/// timeout; an ACK beyond the probe's episode then reduces the window
+/// once (Linux tcp_schedule_loss_probe, tcp_send_loss_probe,
+/// tcp_process_tlp_ack: TCPLossProbes, TCPLossProbeRecovery)
+#[test]
+fn tail_loss_probe_repairs_lost_tail() {
+    use super::recovery::CaState;
+    use crate::net::mib::*;
+    use core::sync::atomic::Ordering::Relaxed;
+    static TAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    fn drop_tail(_: &Pair, to_b: bool, s: &Seg, _: usize) -> Fate {
+        if to_b && !s.data.is_empty() && TAIL.compare_exchange(s.seq, 0, Relaxed, Relaxed).is_ok() {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    }
+    let (mut p, m) = sack_pair(1000);
+    let mss = p.a.live.mss.get();
+    TAIL.store(p.a.snd_nxt + 4 * mss, Relaxed);
+    p.filter = drop_tail;
+    p.send_a(&pattern(5 * mss as usize));
+    p.run();
+    assert_eq!(p.b.rcvq_len(), 4 * mss as usize);
+    assert!(matches!(
+        p.a.live.tmr.get(),
+        Some((super::cb::Tmr::LossProbe, _))
+    ));
+    assert!(p.tick());
+    p.run();
+    assert_eq!(p.b.rcvq_len(), 5 * mss as usize);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSPROBES), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPTIMEOUTS), 0);
+    assert_eq!(p.a.tlp_high_seq, Some(p.a.snd_max));
+    let cwnd = p.a.cong.snd_cwnd();
+    p.send_a(&pattern(mss as usize));
+    p.run();
+    assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSPROBERECOVERY), 1);
+    assert_eq!(p.a.tlp_high_seq, None);
+    assert!(p.a.cong.snd_cwnd() < cwnd);
+    assert_ne!(p.a.ca_state, CaState::Loss);
+}
+
+/// A segment not yet past RTT + the reordering window waits on the
+/// RACK reordering timer, which then marks it lost and starts recovery
+/// (Linux tcp_rack_mark_lost, ICSK_TIME_REO_TIMEOUT,
+/// tcp_rack_reo_timeout)
+#[test]
+fn rack_reordering_timer_marks_loss() {
+    use super::cb::Tmr;
+    use super::recovery::CaState;
+    use crate::net::mib::*;
+    let (mut p, m) = sack_pair(1000);
+    // A 100 ms path: reordering window min_rtt/4 = 25 ms
+    p.a.stats.min_rtt = Some(100);
+    p.a.srtt8 = 800;
+    p.now = 1000;
+    p.a.cong.set_snd_cwnd(20);
+    p.send_a(&pattern(4 * 988));
+    let segs = take_to_b(&mut p);
+    p.now = 1100;
+    let acks = feed_b(&mut p, &segs[1]);
+    let mut out = Out::default();
+    p.a.feed(&seg_in(&acks[0]), p.now, &mut out);
+    assert!(wire(&out).is_empty());
+    assert_eq!(p.a.live.tmr.get(), Some((Tmr::Reo, 1100 + 25 + 2)));
+    assert_eq!(p.a.ca_state, CaState::Disorder);
+    p.now = 1127;
+    let mut out = Out::default();
+    p.a.on_timer(p.now, &mut out);
+    let w = wire(&out);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].seq, segs[0].seq);
+    assert_eq!(p.a.ca_state, CaState::Recovery);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPSACKRECOVERY), 1);
+    assert!(matches!(p.a.live.tmr.get(), Some((Tmr::Rtx, _))));
 }

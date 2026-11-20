@@ -53,6 +53,8 @@ pub struct NetSysctl {
     /// RACK option bits (1 loss detection, 2 static reordering window,
     /// 4 no dupthresh)
     pub tcp_recovery: AtomicU8,
+    /// Tail loss probes when 3 or 4
+    pub tcp_early_retrans: AtomicU8,
     /// Nonzero: a TIME_WAIT entry ignores an in-window RST (RFC 1337)
     pub tcp_rfc1337: AtomicU8,
     /// tcp_rmem min / default / max (only max is used: window scale)
@@ -94,6 +96,7 @@ impl Default for NetSysctl {
             tcp_reordering: AtomicI32::new(3),
             tcp_max_reordering: AtomicI32::new(300),
             tcp_recovery: AtomicU8::new(1),
+            tcp_early_retrans: AtomicU8::new(3),
             tcp_rfc1337: AtomicU8::new(0),
             tcp_rmem: [
                 AtomicI32::new(4096),
@@ -487,6 +490,19 @@ pub static CTLS: &[NetCtl] = &[
         mode: 0o644,
         show: |n| get_u8(n, |s| &s.tcp_recovery),
         store: |n, v| set_u8(n, |s| &s.tcp_recovery, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_early_retrans",
+        mode: 0o644,
+        show: |n| get_u8(n, |s| &s.tcp_early_retrans),
+        store: |n, v| {
+            range(v[0], 0, 4)?;
+            n.sysctl
+                .tcp_early_retrans
+                .store(v[0] as u8, Ordering::Relaxed);
+            Ok(())
+        },
         text: None,
     },
     NetCtl {

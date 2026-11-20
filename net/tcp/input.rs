@@ -530,12 +530,14 @@ impl TcpCb {
             if flg & flag::SET_XMIT_TIMER != 0 {
                 self.set_xmit_timer(now);
             }
+            self.process_tlp_ack(ack, flg);
             self.mem_settle();
             return true;
         }
         flg |= self.clean_rtx_queue(prior_fack, &mut st);
         self.mem_settle();
         self.rack_update_reo_wnd(st.prior_delivered);
+        self.process_tlp_ack(ack, flg);
         if self.ack_is_dubious(flg) {
             let num_dupack =
                 u32::from(flg & (flag::SND_UNA_ADVANCED | flag::NOT_DUP | flag::DSACKING_ACK) == 0);

@@ -308,6 +308,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         reordering: s.tcp_reordering.load(Ordering::Relaxed).max(1) as u32,
         max_reordering: s.tcp_max_reordering.load(Ordering::Relaxed).max(1) as u32,
         recovery: s.tcp_recovery.load(Ordering::Relaxed),
+        early_retrans: s.tcp_early_retrans.load(Ordering::Relaxed),
         rmem_min: s.tcp_rmem[0].load(Ordering::Relaxed).max(1) as u32,
         rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
         keepidle: secs(&s.tcp_keepalive_time),

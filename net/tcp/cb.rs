@@ -183,6 +183,8 @@ pub struct Cfg {
     pub max_reordering: u32,
     /// tcp_recovery: RACK option bits (`recovery::RACK_*`)
     pub recovery: u8,
+    /// tcp_early_retrans: 3 or 4 enable tail loss probes
+    pub early_retrans: u8,
     /// tcp_rmem[0]: receive bytes a connection may always hold below
     /// the hard memory limit
     pub rmem_min: u32,
@@ -208,6 +210,7 @@ impl Default for Cfg {
             reordering: 3,
             max_reordering: 300,
             recovery: 1,
+            early_retrans: 3,
             rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
             keepidle: 7_200_000,
@@ -837,8 +840,10 @@ pub struct TcpCb {
     /// RACK loss detection state (Linux rack)
     pub(super) rack: Rack,
     /// SND.NXT after a loss probe went out, until its episode ends
-    /// (Linux tlp_high_seq, None for 0)
+    /// (Linux tlp_high_seq, None for 0); the probe was a retransmission
+    /// (tlp_retrans)
     pub(super) tlp_high_seq: Option<u32>,
+    pub(super) tlp_retrans: bool,
     /// Data transmissions so far: the send order of each (`tx_order`)
     pub(super) tx_count: u64,
     /// Duplicates the peer D-SACKed (Linux dsack_dups)
@@ -977,6 +982,7 @@ impl TcpCb {
             highest_sack: None,
             rack: Rack::default(),
             tlp_high_seq: None,
+            tlp_retrans: false,
             tx_count: 0,
             dsack_dups: 0,
             recv_sack_cache: [(0, 0); NUM_SACKS],
