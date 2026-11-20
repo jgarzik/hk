@@ -245,8 +245,9 @@ impl TcpCb {
             if prior_packets == 0 || matches!(pending, None | Some(Tmr::LossProbe | Tmr::Probe)) {
                 self.rearm_rto(now);
             }
-            // Linux tcp_write_xmit: one loss probe per tail episode
-            if push != Push::Tlp {
+            // Linux tcp_write_xmit: one loss probe per tail episode (not
+            // from the probe itself, nor from tcp_write_wakeup's segment)
+            if !push.one() {
                 self.schedule_loss_probe(now, false);
             }
             let flight = self.snd_max.wrapping_sub(self.snd_una);
