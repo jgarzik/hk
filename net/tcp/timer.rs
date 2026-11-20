@@ -169,6 +169,10 @@ impl TcpCb {
         if !handshake && self.snd_una == self.snd_max {
             return;
         }
+        if !handshake && self.snd_wnd == 0 && !self.orphan {
+            self.rtx_zero_window(now, out);
+            return;
+        }
         // Linux tcp_retransmit_timer / tcp_syn_ack_timeout
         self.net_stat(LINUX_MIB_TCPTIMEOUTS);
         if self.rtx_stamp.is_none() {
@@ -214,6 +218,49 @@ impl TcpCb {
             self.output(now, out);
         }
         self.arm_rtx(now);
+    }
+
+    /// The receiver shrank its window over data in flight (Linux
+    /// tcp_retransmit_timer: "receiver dastardly shrinks window"): the
+    /// retransmissions become zero-window probes of the queue's head,
+    /// which may lie past the window, and never time the connection out
+    /// while the peer answers them ([`Self::rtx_probe0_timed_out`]); an
+    /// orphan takes the ordinary path, so it cannot hang forever
+    fn rtx_zero_window(&mut self, now: u64, out: &mut Out) {
+        if self.rtx_stamp.is_none() {
+            // The head went out about one (backed-off) RTO ago
+            self.rtx_stamp = Some(now.saturating_sub(self.rto_cur()));
+        }
+        if self.rtx_probe0_timed_out(now) {
+            self.timed_out(out);
+            return;
+        }
+        // Linux tcp_enter_loss, then tcp_retransmit_skb of the head
+        let flight = self.snd_max.wrapping_sub(self.snd_una);
+        self.cong.on_rto(flight);
+        self.retransmit_head(out);
+        self.live.backoff.set(self.live.backoff.get() + 1);
+        self.arm_rtx(now);
+    }
+
+    /// A shrunk-window probe sequence gives up (Linux
+    /// tcp_rtx_probe0_timed_out): past TCP_USER_TIMEOUT, else when the
+    /// peer has been silent for longer than twice RTO_MAX (or the user
+    /// timeout, if shorter) and the probes have lasted that long
+    fn rtx_probe0_timed_out(&self, now: u64) -> bool {
+        let rtx_delta = now.saturating_sub(self.rtx_stamp.unwrap_or(now));
+        let mut timeout = 2 * RTO_MAX;
+        let ut = u64::from(self.opts.user_timeout);
+        if ut != 0 {
+            if rtx_delta > ut {
+                return true;
+            }
+            timeout = timeout.min(ut);
+        }
+        if now.saturating_sub(self.rcv_tstamp) <= timeout {
+            return false;
+        }
+        rtx_delta > timeout
     }
 
     /// Resend the SYN-ACK for a retransmitted SYN and restart the

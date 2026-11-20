@@ -585,6 +585,73 @@ fn lost_window_update_recovered_by_probe() {
     assert_eq!(first.len(), 3000);
 }
 
+/// Data in flight is lost while the peer shuts its window (it dropped
+/// what it could not hold, Linux tcp_data_queue under memory pressure):
+/// each retransmission timeout resends the queue's head as a zero-window
+/// probe, beyond tcp_retries2 while the peer keeps answering, and the
+/// connection times out only once the peer has been silent for twice
+/// RTO_MAX (Linux tcp_retransmit_timer's shrunk-window branch,
+/// tcp_rtx_probe0_timed_out)
+#[test]
+fn shrunk_window_retransmits_probe_head() {
+    let mut p = Pair::new(1000);
+    p.filter = |_, to_b, s, _| {
+        if to_b && !s.data.is_empty() {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    };
+    let data = pattern(3000);
+    assert_eq!(p.send_a(&data), 3000);
+    p.run();
+    let una = p.a.snd_una;
+    assert_ne!(una, p.a.snd_max, "data in flight");
+    // The peer's ACK: nothing new, its window shut
+    let shut = |p: &Pair| SegIn {
+        seq: p.a.rcv_nxt,
+        ack: una,
+        flags: flags::ACK,
+        wnd: 0,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    let now = p.now;
+    p.a.feed(&shut(&p), now, &mut out);
+    assert_eq!(p.a.snd_wnd, 0);
+    // Answered probes: past retries2, never a timeout
+    for i in 0..(cfg().retries2 + 5) {
+        let t = p.a.next_timer().expect("retransmit timer armed");
+        p.now = t;
+        let mut out = Out::default();
+        p.a.on_timer(t, &mut out);
+        let segs = wire(&out);
+        assert!(
+            segs.iter().any(|s| s.seq == una && !s.data.is_empty()),
+            "timeout {i}: head resent as a probe"
+        );
+        assert_eq!(p.a.state, TcpState::Established, "timeout {i}");
+        let mut out = Out::default();
+        p.a.feed(&shut(&p), t, &mut out);
+    }
+    // A silent peer: timed out after twice RTO_MAX without an ACK
+    let quiet = p.now;
+    let mut out = Out::default();
+    for _ in 0..100 {
+        let Some(t) = p.a.next_timer() else {
+            break;
+        };
+        p.now = t;
+        p.a.on_timer(t, &mut out);
+        if p.a.state != TcpState::Established {
+            break;
+        }
+    }
+    assert_eq!(p.a.state, TcpState::Closed);
+    assert_eq!(out.err, Some(KernelError::TimedOut));
+    assert!(p.now - quiet > 2 * RTO_MAX);
+}
+
 #[test]
 fn window_edge_never_moves_left() {
     let mut p = Pair::with_cap(1000, 8000);

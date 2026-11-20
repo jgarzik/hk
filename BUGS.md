@@ -1136,19 +1136,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
     prints the children that missed it and their wait statuses (0:
     SIGUSR2 came first, 2: the wait failed).
 
-13. **TCP_MEM_PRESSURE flake** (hk x86, once in four local `check`
-    runs, in a gate): `TCP_MEM_PRESSURE:FAIL pair status got 1024`: a
-    pair's reader got less than 128 KiB before its 20 s receive
-    timeout (`user/boot_tester/net/tcp_mem.rs` `pair`, exit 4) with
-    every tcp_mem limit at 4 pages. The receive side forces the charge
-    for an empty queue and drops into a non-empty one with a zero
-    window ACK (`TcpCb::rmem_ok`, Linux tcp_data_queue), the send side
-    keeps its tcp_wmem[0] floor (`wmem_schedule`), as Linux; what
-    restarts a stalled sender (the window update when the reader
-    drains, the probe or retransmit timer and its backoff) is not
-    ruled out. A stalled pair now prints its byte count, the last recv
-    result, /proc/net/tcp and the TcpExt and Tcp counters.
-
 14. **FD_ALLOC_SCALE flake on Linux** (`check-linux`, under host load):
     `FD_ALLOC_SCALE:FAIL 5`: the batch of dup()s at ~33000 descriptors
     took 4x or more the batch at ~2000 on the reference Linux; uncached
