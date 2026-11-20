@@ -171,7 +171,10 @@ impl TcpCb {
                 self.window_clamp = (maxwin - w).max(4 * advmss);
             }
         }
-        if app_win != 0 && self.window_clamp > 2 * advmss && self.window_clamp + advmss > maxwin {
+        if app_win != 0 && self.window_clamp > 2 * advmss
+            // u32 as Linux: a huge TCP_WINDOW_CLAMP wraps
+            && self.window_clamp.wrapping_add(advmss) > maxwin
+        {
             self.window_clamp = (2 * advmss).max(maxwin.saturating_sub(advmss));
         }
         self.rcv_ssthresh = self.rcv_ssthresh.min(self.window_clamp);
@@ -260,11 +263,12 @@ impl TcpCb {
     }
 
     /// tcp_rcv_space_adjust's growth for `copied` bytes in an RTT
-    fn rcvbuf_grow(&mut self, copied: u32) {
+    pub(super) fn rcvbuf_grow(&mut self, copied: u32) {
         let space = u64::from(self.rcvq_space.space.max(1));
         let mut rcvwin = (u64::from(copied) << 1) + 16 * u64::from(self.adv_mss);
-        let grow = rcvwin * (u64::from(copied) - space) / space;
-        rcvwin += grow << 1;
+        // Linux's u64 arithmetic, which wraps on a huge `copied`
+        let grow = rcvwin.wrapping_mul(u64::from(copied) - space) / space;
+        rcvwin = rcvwin.wrapping_add(grow << 1);
         let rcvbuf = self
             .space_from_win(rcvwin)
             .min(u64::from(self.cfg.rmem_max)) as u32;

@@ -321,3 +321,23 @@ fn sndbuf_moderate() {
     p.a.moderate_sndbuf();
     assert_eq!(p.a.sndbuf, 16_384);
 }
+
+/// Remote-sized values wrap where Linux's unsigned C arithmetic
+/// wraps, never panicking: tcp_rcv_space_adjust's u64 growth for a
+/// huge copy, tcp_init_buffer_space's u32 sum with a huge clamp
+#[test]
+fn buffer_arithmetic_wraps() {
+    let mut c = TcpCb::new(cfg(), Default::default());
+    c.adv_mss = 1460;
+    c.rcvq_space.space = 1;
+    c.rcvbuf_grow(u32::MAX);
+    assert!(c.rcvbuf <= c.cfg.rmem_max);
+    let mut c = TcpCb::new(cfg(), Default::default());
+    c.adv_mss = 1460;
+    c.rcvbuf = 1 << 20;
+    c.window_clamp = u32::MAX - 100;
+    c.init_buffer_space();
+    assert_eq!(c.window_clamp(), c.full_space() - 1460);
+    c.set_window_clamp(-1).unwrap();
+    c.init_buffer_space();
+}
