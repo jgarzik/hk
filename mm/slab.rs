@@ -773,8 +773,10 @@ pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
         Some(c) => c.alloc(),
         None => {
             let order = large_order(size, align);
+            // NOFAIL as the slab refills: the heap backs infallible
+            // allocations too (fallible callers have failslab)
             crate::FRAME_ALLOCATOR
-                .alloc_pages(order, heap_gfp())
+                .alloc_pages(order, heap_gfp().with(Gfp::NOFAIL))
                 .map_or(core::ptr::null_mut(), crate::arch::phys_to_virt)
         }
     }
