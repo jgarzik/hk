@@ -102,6 +102,11 @@ pub enum OptOut {
     /// Copied only whole: a shorter buffer is ERANGE with the length
     /// needed written back (Linux SO_PEERGROUPS)
     Whole(Vec<u8>),
+    /// A reserved descriptor's number, the file installed there only
+    /// once the number is copied out; on a fault the descriptor is
+    /// released and the file dropped (Linux SO_PEERPIDFD: fd_install,
+    /// or put_unused_fd + fput)
+    Fd(crate::task::fdtable::UnusedFd, crate::fs::FileRef),
 }
 
 /// Protocol operations of a socket (Linux proto_ops + the parts of
@@ -715,6 +720,11 @@ pub fn put_opt(
     len: i32,
 ) -> Result<(), KernelError> {
     let b = match out {
+        OptOut::Fd(fd, file) => {
+            put_opt(OptOut::Int(fd.fd()), val, lenp, len)?;
+            fd.install(file);
+            return Ok(());
+        }
         OptOut::Int(v) => v.to_ne_bytes().to_vec(),
         OptOut::Bytes(b) => b,
         OptOut::Whole(b) if b.len() > len as usize => {

@@ -958,8 +958,8 @@ impl UnixSock {
     fn peerpidfd_opt(&self) -> Result<OptOut, KernelError> {
         let pid = self.peercred.lock().as_ref().and_then(|c| c.pid.clone());
         let pid = pid.ok_or(KernelError::NoData)?;
-        let f = crate::task::pidfd::pidfd_file(pid, 0)?;
-        Ok(OptOut::Int(crate::net::syscall::fd_install(f, true)?))
+        let (fd, f) = crate::task::pidfd::pidfd_prepare(pid)?;
+        Ok(OptOut::Fd(fd, f))
     }
 
     /// SIOCUNIXFILE (Linux unix_open_file): an O_PATH descriptor

@@ -9,10 +9,12 @@
 
 use alloc::vec::Vec;
 
+use crate::fs::FileRef;
 use crate::fs::io::import_ubuf;
 use crate::fs::iov::{IoVec, import_iovec};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::syscall::UIO_MAXIOV;
+use crate::task::fdtable::UnusedFd;
 use crate::uaccess::{UserPtr, copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
 use crate::util::kmem::try_to_vec;
@@ -467,6 +469,11 @@ pub struct Cmsg {
     cap: usize,
     pub buf: Vec<u8>,
     pub trunc: bool,
+    /// Descriptors reserved for the files `buf` names, installed once
+    /// it is copied out (Linux receive_fd and scm_pidfd_recv: the
+    /// number put to user memory, then fd_install); dropped uninstalled
+    /// (put_unused_fd, fput) if the copy faults
+    fds: Vec<(UnusedFd, FileRef)>,
 }
 
 impl Cmsg {
@@ -475,6 +482,30 @@ impl Cmsg {
             cap,
             buf: Vec::new(),
             trunc: false,
+            fds: Vec::new(),
+        }
+    }
+
+    /// Reserve room for `n` more deferred installs
+    pub fn reserve_fds(&mut self, n: usize) -> Result<(), KernelError> {
+        self.fds
+            .try_reserve(n)
+            .map_err(|_| KernelError::OutOfMemory)
+    }
+
+    /// Install `file` at `fd` once the control data is copied out
+    /// (room reserved with `reserve_fds`); its number
+    pub fn defer_install(&mut self, fd: UnusedFd, file: FileRef) -> i32 {
+        let n = fd.fd();
+        self.fds.push((fd, file));
+        n
+    }
+
+    /// The control data reached user memory: install the files (Linux
+    /// fd_install)
+    pub fn install_fds(&mut self) {
+        for (fd, file) in self.fds.drain(..) {
+            fd.install(file);
         }
     }
 

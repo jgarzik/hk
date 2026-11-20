@@ -10,6 +10,7 @@ use hk_syscall::{
     O_RDONLY, SOCK_DGRAM, SOCK_STREAM, sys_exit, sys_fcntl, sys_fork, sys_getpid, sys_open,
     sys_pidfd_send_signal, sys_pipe, sys_read, sys_setsockopt, sys_wait4, sys_write,
 };
+use hk_syscall::{sys_dup, sys_getsockopt};
 
 use crate::harness::T;
 use crate::net::sk::*;
@@ -218,6 +219,15 @@ fn test_pidfd() {
     let (r, fd) = getint(a, SOL_SOCKET, SO_PEERPIDFD);
     t.eq(b"SO_PEERPIDFD", r, 0);
     pidfd_is(&mut t, fd as i64, me);
+    // A fault copying the number out installs nothing (put_unused_fd)
+    let free = sys_dup(0);
+    close(free as i32);
+    let mut len = 4u32;
+    let bad = sys_getsockopt(a, SOL_SOCKET, SO_PEERPIDFD, 1 as *mut u8, &mut len);
+    t.eq(b"SO_PEERPIDFD fault", bad, EFAULT);
+    let next = sys_dup(0);
+    t.eq(b"no fd left", next, free);
+    close(next as i32);
     let u = udp();
     t.eq(b"udp", getint(u, SOL_SOCKET, SO_PEERPIDFD).0, -61);
     for f in [a, b, u] {

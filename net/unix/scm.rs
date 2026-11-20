@@ -392,9 +392,11 @@ fn put_pidfd(m: &mut RecvMsg<'_>, creds: Option<&Creds>) {
     let Some(pid) = creds.and_then(|c| c.pid.clone()) else {
         return;
     };
-    let fd = crate::task::pidfd::pidfd_file(pid, 0)
-        .and_then(|f| crate::net::syscall::fd_install(f, true))
-        .unwrap_or_else(|e| e.to_errno_neg());
+    let fd = m
+        .cmsg
+        .reserve_fds(1)
+        .and_then(|()| crate::task::pidfd::pidfd_prepare(pid))
+        .map_or_else(|e| e.to_errno_neg(), |(fd, f)| m.cmsg.defer_install(fd, f));
     m.cmsg.put(SOL_SOCKET, SCM_PIDFD, &fd.to_ne_bytes());
 }
 
@@ -411,10 +413,19 @@ fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     let files = fpl.take();
     let count = files.len();
     let mut fds = Vec::new();
-    for f in files.iter().take(max) {
-        match crate::net::syscall::fd_install(f.clone(), cloexec) {
-            Ok(fd) => fds.extend_from_slice(&fd.to_ne_bytes()),
-            Err(_) => break,
+    let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
+    let want = count.min(max);
+    if fds.try_reserve(want * 4).is_ok() && m.cmsg.reserve_fds(want).is_ok() {
+        // Linux receive_fd: reserved, its number copied out, then
+        // installed (here once the control data is copied out)
+        for f in files.iter().take(want) {
+            match crate::fs::io::get_unused_fd_flags(fl) {
+                Ok(fd) => {
+                    let n = m.cmsg.defer_install(fd, f.clone());
+                    fds.extend_from_slice(&n.to_ne_bytes());
+                }
+                Err(_) => break,
+            }
         }
     }
     let n = fds.len() / 4;

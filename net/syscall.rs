@@ -282,14 +282,18 @@ fn recvmsg_one(
     let mut m = RecvMsg::new(Dst::User(h.iov()?), !h.name.is_null(), h.controllen);
     m.flags = flags & MSG_CMSG_CLOEXEC;
     let n = s.recvmsg(&mut m, file_nb(file, flags))?;
+    // The control data first, its files installed once it is out
+    // (Linux put_cmsg and fd_install during sock_recvmsg), then the
+    // address (move_addr_to_user)
+    if !m.cmsg.buf.is_empty() {
+        copy_to_user(h.control.addr(), &m.cmsg.buf)?;
+    }
+    m.cmsg.install_fds();
     let mut namelen = 0;
     if let (Some(a), false) = (&m.name, h.name.is_null()) {
         let k = (h.namelen as usize).min(a.len());
         copy_to_user(h.name.addr(), &a[..k])?;
         namelen = a.len() as u32;
-    }
-    if !m.cmsg.buf.is_empty() {
-        copy_to_user(h.control.addr(), &m.cmsg.buf)?;
     }
     let mut fl = m.flags;
     if m.cmsg.trunc {
