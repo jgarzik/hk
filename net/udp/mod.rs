@@ -1,49 +1,49 @@
 //! UDP (Linux net/ipv4/udp.c, datagram.c)
 //!
-//! Sockets live in the UDP table (Linux udp_table: hash slots by
-//! namespace and local port, sized from memory at boot), from
-//! bind/autobind until close (or disconnect of an autobound port).
-//! Binding follows Linux SO_REUSEADDR/SO_REUSEPORT rules
-//! (`inet::port::conflict`); ephemeral ports come from
-//! `ip_local_port_range` at a keyed-hash offset. Receive lookup scores
-//! candidates like Linux compute_score (exact address, connected peer,
-//! bound device), spreads a SO_REUSEPORT group by flow hash, and
-//! delivers broadcasts to every matching socket. The receive queue is
-//! bounded by SO_RCVBUF (drops counted); checksums are verified on
-//! receive.
+//! Sockets live in the UDP table (`table`: Linux udp_table's hash by
+//! port and hash2 by address and port), from bind/autobind until close
+//! (or disconnect of an autobound port). Binding follows Linux
+//! SO_REUSEADDR/SO_REUSEPORT rules (`inet::port::conflict`); ephemeral
+//! ports come from `ip_local_port_range` at a keyed-hash offset.
+//! Receive lookup scores candidates like Linux compute_score, spreads a
+//! SO_REUSEPORT group by flow hash, and delivers broadcasts to every
+//! matching socket. The receive queue is bounded by SO_RCVBUF (drops
+//! counted); checksums are verified on receive.
 //!
 //! ## Locking (thread context only)
 //!
 //! Order: `UdpSock.op` (sleeping `sync::Mutex`, Linux lock_sock:
-//! bind/connect/autobind, socket calls only) -> a hash slot's lock
-//! (spin, Linux hslot->lock; one at a time) -> `REUSEPORT_LOCK` ->
-//! `Inet.addr` (Mutex leaf); `UdpSock.rxq` is a separate leaf. Receive
-//! and ICMP-error lookups walk a slot under RCU (Linux
-//! __udp4_lib_lookup, __udp4_lib_mcast_deliver), reading each
-//! candidate's `Inet.addr`, and queue under the guard with GFP_ATOMIC.
-//! A socket's table reference is released a grace period after it
-//! leaves (Linux SOCK_RCU_FREE), possibly in `rcuc/N`: its drop takes
-//! no sleeping lock. No lock is held across a sleep or a transmit.
+//! bind/connect/disconnect/autobind, socket calls only) -> the table's
+//! slot locks (`table`) -> `Inet.addr` (Mutex leaf); `UdpSock.rxq` is a
+//! separate leaf. Receive and ICMP-error lookups walk slots under RCU,
+//! reading each candidate's `Inet.addr`, and queue under the guard with
+//! GFP_ATOMIC. A socket's table references are released a grace period
+//! after it leaves (Linux SOCK_RCU_FREE), possibly in `rcuc/N`: its
+//! drop takes no sleeping lock. No lock is held across a sleep or a
+//! transmit.
+
+mod table;
+use table::Key;
+pub use table::init;
 
 use crate::mm::page_alloc::Gfp;
 use crate::net::mib::INUSE_UDP;
 use crate::util::kalloc::try_arc_cyclic;
-use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::net::sock_reuseport::{self, ReuseCb};
 use crate::sync::rcu::RcuPuts;
-use crate::util::hlist_nulls::{NullsHead, NullsLink};
+use crate::util::hlist_nulls::NullsLink;
 
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
 };
 use crate::net::dgram::{self, RxQueue};
 use crate::net::inet::fib::RouteType;
-use crate::net::inet::port::{self, BindInfo, Flow, Parity};
+use crate::net::inet::port::{BindInfo, Flow};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
 use crate::net::mib::*;
@@ -74,6 +74,11 @@ pub struct UdpSock {
     rxq: RxQueue,
     /// Link on its port's hash slot (Linux sk_node)
     link: NullsLink,
+    /// Link on its (address, port) hash2 slot (Linux udp_portaddr_node)
+    link2: NullsLink,
+    /// Its hash2 hash (Linux udp_portaddr_hash): set when hashed and
+    /// on rehash, under the socket lock
+    portaddr_hash: AtomicU32,
     /// Its SO_REUSEPORT group (Linux sk_reuseport_cb)
     reuse: ReuseCb<UdpSock>,
     /// The table reference's deferred release (Linux SOCK_RCU_FREE)
@@ -91,6 +96,8 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
         connected: AtomicBool::new(false),
         rxq: RxQueue::default(),
         link: NullsLink::new(),
+        link2: NullsLink::new(),
+        portaddr_hash: AtomicU32::new(0),
         reuse: ReuseCb::new(),
         rcu: RcuPuts::new(),
         me: me.clone(),
@@ -124,7 +131,7 @@ impl UdpSock {
             saddr: addr,
             ..Default::default()
         };
-        let p = udp_lib_get_port(&me, &info, port, flow)?;
+        let p = table::get_port(&me, &info, port, flow)?;
         // Linux udp_lib_get_port
         self.sk.net.mib.inuse_add(INUSE_UDP, true);
         Ok(p)
@@ -149,26 +156,21 @@ impl UdpSock {
         Ok(())
     }
 
-    /// Linux udp_lib_unhash: off its slot and out of its group; the
-    /// table's reference goes after a grace period
+    /// Linux udp_lib_unhash
     fn unhash(&self) {
-        let port = self.inet.get().sport;
-        let mut g = slot(&self.sk.net, port).lock();
-        if !self.reuse.is_none() {
-            self.reuse.detach(self, &mut sock_reuseport::lock());
-        }
-        if let Some(u) = g.del_rcu(self) {
-            drop(g);
-            u.defer();
+        if table::unhash(self) {
             self.sk.net.mib.inuse_add(INUSE_UDP, false);
         }
     }
 
-    /// Linux __udp_disconnect
+    /// Linux __udp_disconnect: the peer and bound device cleared; an
+    /// address bind() did not fix reset (rehashed if the port stays),
+    /// a port it did not fix released
     fn disconnect(&self) {
         let _g = self.op.lock();
         self.connected.store(false, Ordering::Release);
-        let unhash = {
+        self.sk.set_bound_dev_if(0);
+        let (addr_lock, port_lock) = {
             let mut a = self.inet.addr.lock();
             a.daddr = Ipv4Addr::default();
             a.dport = 0;
@@ -176,11 +178,13 @@ impl UdpSock {
                 a.rcv_saddr = Ipv4Addr::default();
                 a.saddr = Ipv4Addr::default();
             }
-            !a.port_lock
+            (a.addr_lock, a.port_lock)
         };
-        if unhash {
+        if !addr_lock && port_lock {
+            table::rehash(self);
+        }
+        if !port_lock {
             self.unhash();
-            self.inet.addr.lock().sport = 0;
         }
     }
 
@@ -413,16 +417,21 @@ impl ProtoOps for UdpSock {
         self.autobind_locked()?;
         let cur = self.inet.get();
         let rt = self.route(daddr, cur.saddr, self.sk.bound_dev_if())?;
+        // Linux __ip4_datagram_connect: addresses before the rehash
         let mut s = self.inet.addr.lock();
+        s.daddr = rt.daddr;
+        s.dport = dport;
         if s.saddr.is_unspecified() {
             s.saddr = rt.saddr;
         }
-        if s.rcv_saddr.is_unspecified() {
+        let rehash = s.rcv_saddr.is_unspecified();
+        if rehash {
             s.rcv_saddr = rt.saddr;
         }
-        s.daddr = rt.daddr;
-        s.dport = dport;
         drop(s);
+        if rehash {
+            table::rehash(self);
+        }
         self.connected.store(true, Ordering::Release);
         // Linux __ip4_datagram_connect: reuseport_has_conns_set
         if !self.reuse.is_none() {
@@ -579,215 +588,6 @@ impl ProtoOps for UdpSock {
     }
 }
 
-// ============================================================================
-// Socket table
-// ============================================================================
-
-crate::nulls_adapter!(UdpHash, UdpSock, link);
-crate::rcu_puts!(UdpSock, rcu);
-
-/// Hash slots of every namespace (Linux udp_table.hash)
-static UDP_TABLE: spin::Once<Box<[NullsHead<UdpHash>]>> = spin::Once::new();
-
-/// Size the table from memory (Linux udp_table_init:
-/// alloc_large_system_hash with one slot per 2 MiB, a power of two
-/// between UDP_HTABLE_SIZE_MIN and 64 Ki slots)
-pub fn init() {
-    let n = (crate::FRAME_ALLOCATOR.buffer_pages() >> 9)
-        .next_power_of_two()
-        .clamp(256, 1 << 16);
-    UDP_TABLE.call_once(|| NullsHead::table(n).expect("udp: hash table"));
-}
-
-fn table() -> &'static [NullsHead<UdpHash>] {
-    UDP_TABLE.get().expect("udp table not initialized")
-}
-
-/// Linux udp_hashfn: the port plus the namespace's random mix, masked
-fn slot_index(net: &crate::net::NetNamespace, port: u16) -> usize {
-    (usize::from(port).wrapping_add(net.hash_mix as usize)) & (table().len() - 1)
-}
-
-fn slot(net: &crate::net::NetNamespace, port: u16) -> &'static NullsHead<UdpHash> {
-    &table()[slot_index(net, port)]
-}
-
-/// Address `s` is bound to (for the bind rules), read under the slot
-/// lock (order: slot -> Inet.addr)
-fn bound_addr(s: &UdpSock) -> Ipv4Addr {
-    s.inet.get().rcv_saddr
-}
-
-/// Another socket of `net` on `port` conflicts with `info` (Linux
-/// udp_lib_lport_inuse), the slot locked
-fn inuse(
-    g: &crate::util::hlist_nulls::NullsGuard<'_, UdpHash>,
-    net: u64,
-    port: u16,
-    info: &BindInfo,
-) -> bool {
-    g.find(|o| {
-        o.sk.net.id == net
-            && o.inet.get().sport == port
-            && port::conflict(info, &o.bind_info(bound_addr(o)), false)
-    })
-    .is_some()
-}
-
-/// Hash `s` on `port` (0 = an ephemeral port) and set the port, all
-/// under the slot's lock, joining or starting a SO_REUSEPORT group
-/// (Linux udp_lib_get_port, udp_reuseport_add_sock): EADDRINUSE on a
-/// conflict, when the range is exhausted, or when the group cannot
-/// grow
-fn udp_lib_get_port(
-    s: &Arc<UdpSock>,
-    info: &BindInfo,
-    port: u16,
-    flow: Flow,
-) -> Result<u16, KernelError> {
-    let net = &*s.sk.net;
-    let take = |p: u16| -> Option<Result<u16, KernelError>> {
-        let mut g = slot(net, p).lock();
-        if inuse(&g, net.id, p, info) {
-            return None;
-        }
-        if s.sk.flag(sf::REUSEPORT) && reuseport_add(&g, s, p, info).is_err() {
-            return Some(Err(KernelError::AddressInUse));
-        }
-        s.inet.addr.lock().sport = p;
-        g.add_head_rcu(s.clone());
-        Some(Ok(p))
-    };
-    if port != 0 {
-        return take(port).unwrap_or(Err(KernelError::AddressInUse));
-    }
-    let mut r = None;
-    let range = net.port_range.get();
-    port::ephemeral(range, flow, Parity::Any, |p| {
-        r = take(p);
-        r.is_some()
-    });
-    r.unwrap_or(Err(KernelError::AddressInUse))
-}
-
-/// Join the group of a socket on `port` with the same owner, device
-/// and address, or start one (Linux udp_reuseport_add_sock)
-fn reuseport_add(
-    g: &crate::util::hlist_nulls::NullsGuard<'_, UdpHash>,
-    s: &Arc<UdpSock>,
-    port: u16,
-    info: &BindInfo,
-) -> Result<(), KernelError> {
-    let net = s.sk.net.id;
-    let peer = g.find(|o| {
-        o.sk.net.id == net
-            && o.inet.get().sport == port
-            && o.sk.flag(sf::REUSEPORT)
-            && o.sk.cred.euid == info.uid
-            && o.sk.bound_dev_if() == info.dev
-            && bound_addr(o) == info.addr
-    });
-    let mut o = sock_reuseport::lock();
-    match peer {
-        Some(p) => s.reuse.add(s, &p.reuse, &mut o),
-        None => s.reuse.alloc(s, &mut o),
-    }
-}
-
-/// A received datagram's addressing
-#[derive(Clone, Copy)]
-struct Key {
-    saddr: Ipv4Addr,
-    sport: u16,
-    daddr: Ipv4Addr,
-    dport: u16,
-    dif: u32,
-}
-
-/// Linux compute_score: -1 = no match
-fn score(s: &UdpSock, k: &Key) -> i32 {
-    let a = s.inet.get();
-    if a.rcv_saddr != k.daddr && !a.rcv_saddr.is_unspecified() {
-        return -1;
-    }
-    let mut sc = 2;
-    if !a.rcv_saddr.is_unspecified() {
-        sc += 4;
-    }
-    if s.connected.load(Ordering::Acquire) {
-        if a.daddr != k.saddr || a.dport != k.sport {
-            return -1;
-        }
-        sc += 8;
-    }
-    let dev = s.sk.bound_dev_if();
-    if dev != 0 {
-        if dev != k.dif {
-            return -1;
-        }
-        sc += 4;
-    }
-    sc
-}
-
-/// Linux udp_ehashfn: a keyed hash of the flow, for a reuseport pick
-fn flow_hash(net: &crate::net::NetNamespace, k: &Key) -> u32 {
-    port::secure_hash(
-        0x7564_7065_6861,
-        &[
-            net.id,
-            (u64::from(k.saddr.0) << 32) | u64::from(k.daddr.0),
-            (u64::from(k.sport) << 16) | u64::from(k.dport),
-        ],
-    ) as u32
-}
-
-/// Best socket for a unicast datagram (Linux udp4_lib_lookup2): each
-/// candidate scored once in a single walk under RCU, so a concurrent
-/// connect() or SO_BINDTODEVICE cannot make a second look disagree. A
-/// new best that is unconnected and in a SO_REUSEPORT group hands over
-/// to the member the flow hash picks; with connected members in the
-/// group, the pick is scored instead (Linux reuseport_has_conns).
-fn lookup(net: &crate::net::NetNamespace, k: &Key) -> Option<Arc<UdpSock>> {
-    let head = slot(net, k.dport);
-    let h = flow_hash(net, k);
-    let g = crate::sync::rcu::read_lock();
-    loop {
-        let mut best: Option<(i32, &UdpSock)> = None;
-        let mut it = head.iter_rcu(&g);
-        for e in it.by_ref() {
-            let s = e.get();
-            if s.sk.net.id != net.id || s.inet.get().sport != k.dport {
-                continue;
-            }
-            let sc = score(s, k);
-            if sc < 0 || best.is_some_and(|b| sc <= b.0) {
-                continue;
-            }
-            best = Some((sc, s));
-            if s.connected.load(Ordering::Acquire) {
-                continue;
-            }
-            if let Some((r, conns)) = s.reuse.select(h, &g) {
-                best = Some((if conns { score(r, k) } else { sc }, r));
-            }
-        }
-        if it.ended_at() == Some(head.nulls()) {
-            return best.filter(|b| b.0 >= 0).and_then(|b| b.1.me.upgrade());
-        }
-    }
-}
-
-/// Linux __udp_is_mcast_sock: broadcast receivers
-fn bcast_match(s: &UdpSock, k: &Key) -> bool {
-    let a = s.inet.get();
-    let conn = s.connected.load(Ordering::Acquire);
-    let dev = s.sk.bound_dev_if();
-    !(conn && (a.daddr != k.saddr || (a.dport != 0 && a.dport != k.sport))
-        || (!a.rcv_saddr.is_unspecified() && a.rcv_saddr != k.daddr)
-        || (dev != 0 && dev != k.dif))
-}
-
 /// Receive a UDP packet (from ip_rcv; thread context; the device's
 /// namespace). The skb itself is queued to the socket, trimmed to the
 /// datagram and pulled to its payload (Linux __udp4_lib_rcv ->
@@ -830,9 +630,9 @@ pub fn udp_rcv(mut skb: SkBuff) {
     }
     dgram::prepare(&mut skb, info, k.sport);
     if skb.ip_bcast || daddr.is_multicast() {
-        return mcast_deliver(&net, skb, &k);
+        return table::mcast_deliver(&net, skb, &k);
     }
-    match lookup(&net, &k) {
+    match table::lookup(&net, &k) {
         Some(s) => queue_rcv(&net, &s, skb),
         None => {
             udp.inc(UDP_MIB_NOPORTS);
@@ -855,40 +655,6 @@ fn queue_rcv(net: &crate::net::NetNamespace, s: &UdpSock, skb: SkBuff) {
     udp.inc(UDP_MIB_INERRORS);
 }
 
-/// A broadcast or multicast datagram to every matching socket (Linux
-/// __udp4_lib_mcast_deliver): each but the first gets a clone made
-/// GFP_ATOMIC (a failed clone counts a drop on that socket), the first
-/// the skb itself
-fn mcast_deliver(net: &crate::net::NetNamespace, skb: SkBuff, k: &Key) {
-    // One walk, never again from the start (that would deliver twice):
-    // a socket moving to another slot meanwhile (disconnect, autobind)
-    // may lead it off this slot's rest, as Linux's hlist walk of the
-    // slot (sk_for_each_entry_offset_rcu) may
-    let g = crate::sync::rcu::read_lock();
-    let mut first: Option<&UdpSock> = None;
-    let socks = slot(net, k.dport).iter_rcu(&g).map(|e| e.get());
-    for s in socks
-        .filter(|s| s.sk.net.id == net.id && s.inet.get().sport == k.dport && bcast_match(s, k))
-    {
-        if first.is_none() {
-            first = Some(s);
-            continue;
-        }
-        match skb.clone_gfp(Gfp::ATOMIC) {
-            Some(c) => queue_rcv(net, s, c),
-            None => {
-                s.sk.drops.fetch_add(1, Ordering::Relaxed);
-                net.mib.udp.inc(UDP_MIB_RCVBUFERRORS);
-                net.mib.udp.inc(UDP_MIB_INERRORS);
-            }
-        }
-    }
-    match first {
-        Some(s) => queue_rcv(net, s, skb),
-        None => net.mib.udp.inc(UDP_MIB_IGNOREDMULTI),
-    }
-}
-
 /// An ICMP error about a datagram we sent (Linux udp_err): the socket
 /// that sent it gets the error queued (IP_RECVERR) and/or as its pending
 /// error; without IP_RECVERR only hard errors on connected sockets count
@@ -905,7 +671,7 @@ pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr<'_>
         dport: sport,
         dif: e.rx.ifindex,
     };
-    let Some(s) = lookup(net, &k) else {
+    let Some(s) = table::lookup(net, &k) else {
         // Linux __udp4_lib_err: no socket for it
         net.mib.icmp.inc(ICMP_MIB_INERRORS);
         return;
@@ -975,8 +741,8 @@ pub fn proc_net_udp(net: &crate::net::NetNamespace) -> Vec<u8> {
         // A socket moving slots meanwhile may be missed or listed
         // twice, as Linux's seq walk of the slots
         let g = crate::sync::rcu::read_lock();
-        for (i, head) in table().iter().enumerate() {
-            for e in head.iter_rcu(&g) {
+        for (i, slot) in table::hash_slots().iter().enumerate() {
+            for e in slot.head.iter_rcu(&g) {
                 let s = e.get();
                 if s.sk.net.id != net.id {
                     continue;

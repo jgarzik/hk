@@ -105,12 +105,9 @@ so memory pressure does not clamp windows), no orphan count limit
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
 
-UDP has the port hash only (Linux udp_table.hash), not the second
-hash by address and port (hash2) Linux looks up in when a slot is
-long, and so walks a whole slot per datagram. Its lookup scores the
-whole slot, a reuseport pick included; Linux udp4_lib_lookup2 returns
-a group's pick at once (with no connected members), before scoring
-the rest of the hash2 chain.
+UDP has no hash4 (Linux udp_table.hash4: connected sockets by
+four-tuple, looked up before hash2), and its compute_score lacks the
+sk_incoming_cpu point (hk does not track a socket's receiving CPU).
 
 TIME_WAIT (`net/tcp/timewait.rs`) lacks three Linux parts: an
 orphan's FIN_WAIT_2 stays a full socket (Linux tcp_close hands it to

@@ -11,6 +11,7 @@ pub mod hlist_bl;
 pub mod hlist_nulls;
 pub mod id_batch;
 pub mod ida;
+pub mod jhash;
 pub mod kalloc;
 pub mod kfifo;
 pub mod klist;

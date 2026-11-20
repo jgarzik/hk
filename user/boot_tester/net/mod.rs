@@ -29,4 +29,5 @@ pub mod tcp_opt;
 pub mod tcp_synrecv;
 pub mod tcp_xfer;
 pub mod udp;
+pub mod udp_hash;
 pub mod unix;

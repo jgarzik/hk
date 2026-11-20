@@ -175,8 +175,8 @@ pub struct NullsHead<A: NullsAdapter> {
     nulls: usize,
     /// Given at the first insert (0: none yet)
     id: AtomicUsize,
-    /// Writers' lock; one lockdep class for every bucket (built here),
-    /// and two are never held at once
+    /// Writers' lock; one lockdep class per table (where `new` or
+    /// `table` was called), and two of a table are never held at once
     lock: Mutex<()>,
     /// It drops `Arc<Item>`s wherever it goes: Send/Sync as Arc's
     _owns: PhantomData<Arc<A::Item>>,
@@ -184,7 +184,8 @@ pub struct NullsHead<A: NullsAdapter> {
 
 impl<A: NullsAdapter> NullsHead<A> {
     /// An empty bucket ending at `nulls` (Linux INIT_HLIST_NULLS_HEAD);
-    /// `nulls` < 2^63
+    /// `nulls` < 2^63. The lock's lockdep class is the caller's.
+    #[track_caller]
     pub const fn new(nulls: usize) -> Self {
         assert!(nulls <= usize::MAX >> 1, "hlist_nulls: value too large");
         Self {
@@ -197,12 +198,17 @@ impl<A: NullsAdapter> NullsHead<A> {
     }
 
     /// `n` empty buckets, each ending at its index (Linux
-    /// inet_ehash_init's loop over INIT_HLIST_NULLS_HEAD(.., i))
+    /// inet_ehash_init's loop over INIT_HLIST_NULLS_HEAD(.., i)); the
+    /// buckets' lockdep class is the caller's (Linux: a table's locks
+    /// share a key), so tables nest
+    #[track_caller]
     pub fn table(n: usize) -> Result<Box<[Self]>, KernelError> {
         let mut v = Vec::new();
         v.try_reserve_exact(n)
             .map_err(|_| KernelError::OutOfMemory)?;
-        v.extend((0..n).map(Self::new));
+        for i in 0..n {
+            v.push(Self::new(i));
+        }
         Ok(v.into_boxed_slice())
     }
 

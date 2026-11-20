@@ -215,15 +215,28 @@ impl<S: HasRcuPuts + Send + Sync> ReuseCb<S> {
     }
 
     /// The member `hash` picks, and whether the group has connected
-    /// members (Linux reuseport_select_sock with no program:
-    /// reciprocal_scale over num_socks); None if in no group or the
-    /// slot is empty mid-leave
-    pub fn select<'a>(&'a self, hash: u32, g: &'a RcuReadGuard) -> Option<(&'a S, bool)> {
+    /// members (Linux reuseport_select_sock with no program,
+    /// reuseport_select_sock_by_hash: from the slot reciprocal_scale
+    /// gives over num_socks, the first member `established` rejects
+    /// not); None if in no group or none qualifies (a slot read empty
+    /// mid-leave is skipped)
+    pub fn select<'a>(
+        &'a self,
+        hash: u32,
+        g: &'a RcuReadGuard,
+        established: impl Fn(&S) -> bool,
+    ) -> Option<(&'a S, bool)> {
         let grp = self.0.read(g)?;
         let m = grp.members.read(g)?;
         let n = m.n.load(Ordering::Acquire).min(m.socks.len());
-        let i = ((u64::from(hash) * n as u64) >> 32) as usize;
-        let s = m.socks.get(i)?.read(g)?;
+        if n == 0 {
+            return None;
+        }
+        let j = ((u64::from(hash) * n as u64) >> 32) as usize;
+        let s = (j..n)
+            .chain(0..j)
+            .filter_map(|i| m.socks[i].read(g))
+            .find(|s| !established(s))?;
         Some((s, grp.has_conns.load(Ordering::Acquire)))
     }
 }
