@@ -543,6 +543,10 @@ impl TcpSock {
     /// Hand TIME_WAIT to a timewait entry (Linux tcp_time_wait)
     fn to_timewait(&self, g: &mut Inner, out: &mut Out) {
         let Some(t) = g.tuple.take() else {
+            // Not hashed: nothing to hand over, so close (Linux
+            // tcp_time_wait without a tw falls back to tcp_done)
+            g.cb.tw_done(out);
+            out.done = true;
             return;
         };
         let mut bind = self.bind_info(t.laddr);
