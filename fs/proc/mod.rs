@@ -2037,14 +2037,15 @@ impl FileOps for ProcfsFileOps {
             return Err(KernelError::OperationNotSupported);
         }
         let pos = at.unwrap_or_else(|| file.get_pos());
-        // A numeric sysctl reads only from offset 0 (Linux
-        // do_proc_dointvec: *ppos on a read is EOF); a text one from
+        // A sysctl read is checked first (Linux proc_sys_call_handler:
+        // sysctl_perm MAY_READ); a numeric one reads only from offset 0
+        // (do_proc_dointvec: *ppos on a read is EOF), a text one from
         // any (proc_dostring)
-        if pos != 0
-            && let Some(inode) = file.get_inode()
-            && sysctl_of(&inode).is_some_and(|c| !c.is_text())
-        {
-            return Ok(0);
+        if let Some(c) = file.get_inode().and_then(|i| sysctl_of(&i)) {
+            crate::sysctl::call_check(&c, false)?;
+            if pos != 0 && !c.is_text() {
+                return Ok(0);
+            }
         }
         let n = match proc_open(file) {
             Some(po) => seq_read(file, &po, to, pos)?,
@@ -2077,11 +2078,7 @@ impl FileOps for ProcfsFileOps {
             return write_fail_nth(&p.task().ok_or(KernelError::NoProcess)?, from);
         }
         let ctl = sysctl_of(&inode).ok_or(KernelError::Io)?;
-        crate::sysctl::permission(
-            ctl.perm(),
-            &crate::task::current_cred(),
-            crate::fs::MAY_WRITE,
-        )?;
+        crate::sysctl::call_check(&ctl, true)?;
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
         // Whole or EFAULT (Linux proc_sys_call_handler)
         from.copy_from_full(&mut buf)?;

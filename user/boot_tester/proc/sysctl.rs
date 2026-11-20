@@ -4,7 +4,8 @@
 //! namespaces: a file acts on the namespace it was opened in, whoever
 //! reads it (SYSCTL_NETNS_BIND), and the machine-wide tcp_mem and
 //! mem_pcpu_rsv exist in the initial namespace only
-//! (SYSCTL_NETNS_INIT_ONLY).
+//! (SYSCTL_NETNS_INIT_ONLY). Every read and write through an open file
+//! checks the caller's permission again (SYSCTL_PERM_CALL).
 
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, CLONE_NEWNET, CapUserData, CapUserHeader, O_DIRECTORY, O_RDONLY,
@@ -26,6 +27,7 @@ pub fn run_tests() {
     test_proc_net_udp();
     test_netns_bind();
     test_netns_init_only();
+    test_perm_call();
 }
 
 /// Read a NUL-terminated path into `buf`; returns the length or -errno
@@ -415,6 +417,33 @@ fn test_netns_init_only() {
             return 15;
         }
         sys_close(f as u64);
+        0
+    });
+}
+
+/// A file opened by root and used after a drop to nobody: its read of
+/// a 0600 sysctl and its write are EPERM (Linux proc_sys_call_handler:
+/// sysctl_perm on every call)
+fn test_perm_call() {
+    in_child(b"SYSCTL_PERM_CALL", || {
+        let r = sys_open(b"/proc/sys/fs/protected_symlinks\0".as_ptr(), O_RDONLY, 0);
+        let w = sys_open(SYN.as_ptr(), O_WRONLY, 0);
+        if r < 0 || w < 0 {
+            return 10;
+        }
+        if !fd_reads(r, b"1\n") && !fd_reads(r, b"0\n") {
+            return 11;
+        }
+        if sys_setresuid(65534, 65534, 65534) != 0 {
+            return 12;
+        }
+        let mut buf = [0u8; 8];
+        if sys_pread64(r as i32, buf.as_mut_ptr(), buf.len() as u64, 0) != EPERM {
+            return 13;
+        }
+        if sys_pwrite64(w as i32, b"6".as_ptr(), 1, 0) != EPERM {
+            return 14;
+        }
         0
     });
 }

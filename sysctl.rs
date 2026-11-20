@@ -172,6 +172,20 @@ pub fn open(e: &Entry) -> Result<(), KernelError> {
     e.grab().map(drop)
 }
 
+/// A read (`write` false) or write of `e` by the current task may go
+/// ahead (Linux proc_sys_call_handler, before the handler: ENOENT once
+/// its namespace is going, then sysctl_perm with MAY_READ / MAY_WRITE
+/// on every call, EPERM)
+pub fn call_check(e: &Entry, write: bool) -> Result<(), KernelError> {
+    let _g = e.grab()?;
+    let mask = if write {
+        crate::fs::MAY_WRITE
+    } else {
+        crate::fs::MAY_READ
+    };
+    permission(e.perm(), &crate::task::current_cred(), mask).map_err(|_| KernelError::NotPermitted)
+}
+
 /// Current text of `e` (Linux proc_sys_call_handler: ENOENT once its
 /// namespace is going)
 pub fn read(e: &Entry) -> Result<Vec<u8>, KernelError> {
