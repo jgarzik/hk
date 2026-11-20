@@ -17,6 +17,7 @@ pub mod exec;
 pub mod fair;
 pub mod fdbits;
 pub use fdbits::FdTable;
+pub mod cred;
 pub mod exit;
 pub mod fdtable;
 pub mod fork;
@@ -404,7 +405,7 @@ pub fn commit_creds(new: Arc<Cred>) {
     if moved {
         new.ucounts.inc(Ucount::Nproc, 1);
     }
-    percpu::commit_creds_impl(new);
+    cred::commit_creds_impl(new);
     if moved {
         old.dec(Ucount::Nproc, 1);
     }
@@ -1023,7 +1024,7 @@ pub struct TaskInner {
     /// is in the task list, zombie included, it holds an active
     /// reference to it (Linux get_cred_namespaces at fork,
     /// exit_cred_namespaces at release_task), moved by
-    /// `percpu::switch_cred_namespaces`. None for kernel threads (the
+    /// `cred::switch_cred_namespaces`. None for kernel threads (the
     /// initial one, always active)
     user_ns: Option<Arc<crate::ns::UserNamespace>>,
     // =========================================================================

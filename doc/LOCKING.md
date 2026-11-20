@@ -1321,7 +1321,7 @@ syscall entry stack top, set at each switch to a user task.
 
 ### 3.1.1 Task Struct and Credentials
 
-**Location:** `task/mod.rs`, `task/percpu.rs`
+**Location:** `task/mod.rs`, `task/percpu.rs`, `task/cred.rs`
 
 A global `TASKLIST: RwLock<GlobalTaskTable>` (Linux tasklist_lock: read
 for lookups and walks, write for any change) protects the task list and
