@@ -193,6 +193,14 @@ impl Frame<'_> {
         fence(Ordering::SeqCst);
     }
 
+    pub fn get32(&self, o: usize) -> u32 {
+        self.r.read::<u32>(self.off + o)
+    }
+
+    pub fn get16(&self, o: usize) -> u16 {
+        self.r.read::<u16>(self.off + o)
+    }
+
     pub fn put32(&self, o: usize, v: u32) {
         self.r.write::<u32>(self.off + o, v);
     }
@@ -292,7 +300,7 @@ impl PacketSock {
     /// A ring of either direction exists (Linux rx_ring.pg_vec ||
     /// tx_ring.pg_vec)
     pub(super) fn has_ring(&self) -> bool {
-        self.rx.lock().ring.is_some()
+        self.rx.lock().ring.is_some() || self.tx.lock().ring.is_some()
     }
 
     /// Frame `idx` from the head free (Linux __tpacket_has_room)
@@ -474,16 +482,18 @@ impl PacketSock {
 /// (Linux packet_set_ring: EBUSY while mapped or when a ring exists;
 /// the socket unhooked across the swap)
 pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<(), KernelError> {
-    if tx {
-        return Err(KernelError::NoProtocolOption);
-    }
     if !closing && s.mapped.get() != 0 {
         return Err(KernelError::Busy);
     }
     let version = s.version();
     let mut new = RxRing::default();
     if req.block_nr != 0 {
-        if s.rx.lock().ring.is_some() {
+        let exists = if tx {
+            s.tx.lock().ring.is_some()
+        } else {
+            s.rx.lock().ring.is_some()
+        };
+        if exists {
             return Err(KernelError::Busy);
         }
         if version == TPACKET_V3 {
@@ -494,7 +504,9 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
         let reserve = s.tp_reserve.load(Ordering::Acquire);
         let fpb = check_req(version, hdrlen, reserve, req)?;
         let pg = PgVec::new(req.block_nr as usize, req.block_size as usize)?;
-        new.owner_map = crate::util::kmem::try_vec((req.frame_nr as usize).div_ceil(64), 0u64)?;
+        if !tx {
+            new.owner_map = crate::util::kmem::try_vec((req.frame_nr as usize).div_ceil(64), 0u64)?;
+        }
         new.ring = Some(crate::util::kalloc::try_arc(PgRing {
             pg,
             frames_per_block: fpb,
@@ -520,12 +532,24 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
     let old = {
         let _pg = s.pg_vec_lock.lock();
         if closing || s.mapped.get() == 0 {
-            let mut rx = s.rx.lock();
-            let old = core::mem::replace(&mut *rx, new);
-            s.set_flag(pf::TPACKET, rx.ring.is_some());
-            drop(rx);
-            s.rxq.clear();
-            Some(old)
+            if tx {
+                let mut t = s.tx.lock();
+                let old = t.ring.take();
+                t.ring = new.ring.take();
+                t.head = 0;
+                drop(t);
+                Some(RxRing {
+                    ring: old,
+                    ..RxRing::default()
+                })
+            } else {
+                let mut rx = s.rx.lock();
+                let old = core::mem::replace(&mut *rx, new);
+                s.set_flag(pf::TPACKET, rx.ring.is_some());
+                drop(rx);
+                s.rxq.clear();
+                Some(old)
+            }
         } else {
             r = Err(KernelError::Busy);
             None
@@ -552,7 +576,8 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
 /// both rings exactly, from offset 0 (checked by `mmap_offset`)
 pub fn mmap_hold(s: &PacketSock, len: u64) -> Result<Option<VmHold>, KernelError> {
     let _pg = s.pg_vec_lock.lock();
-    let pages = s.rx.lock().ring.as_ref().map_or(0, |r| r.pg.pages());
+    let rx = s.rx.lock().ring.as_ref().map_or(0, |r| r.pg.pages());
+    let pages = rx + s.tx.lock().ring.as_ref().map_or(0, |r| r.pg.pages());
     let expected = pages as u64 * PAGE_SIZE;
     if expected == 0 || len != expected {
         return Err(KernelError::InvalidArgument);
@@ -564,8 +589,15 @@ pub fn mmap_hold(s: &PacketSock, len: u64) -> Result<Option<VmHold>, KernelError
 /// Page `idx` of the mapping: the receive ring's pages, then the
 /// transmit ring's (Linux packet_mmap)
 pub fn map_page(s: &PacketSock, idx: u64) -> Option<u64> {
-    let ring = s.rx.lock().ring.clone()?;
-    ring.pg.map_page(idx)
+    let mut idx = idx;
+    if let Some(r) = s.rx.lock().ring.clone() {
+        if idx < r.pg.pages() as u64 {
+            return r.pg.map_page(idx);
+        }
+        idx -= r.pg.pages() as u64;
+    }
+    let r = s.tx.lock().ring.clone()?;
+    r.pg.map_page(idx)
 }
 
 #[cfg(test)]

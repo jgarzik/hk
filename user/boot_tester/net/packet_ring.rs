@@ -8,7 +8,7 @@
 //! and PACKET_COPY_THRESH's queued copy.
 
 use hk_syscall::{
-    MAP_SHARED, POLLIN, PROT_READ, PROT_WRITE, SOCK_DGRAM, SOCK_RAW, sys_exit, sys_fork,
+    MAP_SHARED, POLLIN, POLLOUT, PROT_READ, PROT_WRITE, SOCK_DGRAM, SOCK_RAW, sys_exit, sys_fork,
     sys_getsockopt, sys_mmap, sys_munmap, sys_recvfrom, sys_setsockopt, sys_wait4,
 };
 
@@ -26,6 +26,7 @@ pub const PACKET_COPY_THRESH: i32 = 7;
 pub const PACKET_VERSION: i32 = 10;
 pub const PACKET_HDRLEN: i32 = 11;
 pub const PACKET_RESERVE: i32 = 12;
+pub const PACKET_TX_RING: i32 = 13;
 pub const PACKET_LOSS: i32 = 14;
 pub const PACKET_TIMESTAMP: i32 = 17;
 pub const PACKET_TX_HAS_OFF: i32 = 19;
@@ -36,6 +37,8 @@ pub const TPACKET_V2: i32 = 1;
 pub const TP_STATUS_USER: u64 = 1;
 pub const TP_STATUS_COPY: u64 = 2;
 pub const TP_STATUS_LOSING: u64 = 4;
+pub const TP_STATUS_SEND_REQUEST: u32 = 1;
+pub const TP_STATUS_WRONG_FORMAT: u64 = 4;
 
 pub const EBUSY: i64 = -16;
 pub const ENODEV: i64 = -19;
@@ -52,6 +55,10 @@ pub fn run_tests() {
     test_rx(lo, TPACKET_V2, SOCK_DGRAM, b"PACKET_RING_RX_V2_DGRAM");
     test_full(lo);
     test_copy_thresh(lo);
+    test_tx(lo, TPACKET_V1, b"PACKET_RING_TX_V1");
+    test_tx(lo, TPACKET_V2, b"PACKET_RING_TX_V2");
+    test_tx_rules(lo);
+    test_rx_tx_map(lo);
 }
 
 /// setsockopt(PACKET_RX_RING etc.) with a tpacket_req
@@ -553,5 +560,170 @@ fn test_copy_thresh(lo: i32) {
     sys_munmap(base, 4096);
     close(tx);
     close(rx);
+    t.done();
+}
+
+/// Fill TX frame `f` (data at `off`, tp_len `len`, tag) and request it
+fn tx_fill(f: u64, ver: i32, off: u64, len: usize, tag: u8) {
+    let mut b = [0u8; 2048];
+    let fr = test_frame(&mut b, tag, len);
+    for (i, x) in fr.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((f + off + i as u64) as *mut u8, *x) };
+    }
+    if ver == TPACKET_V1 {
+        wr32(f + 8, len as u32);
+    } else {
+        wr32(f + 4, len as u32);
+    }
+    if ver == TPACKET_V1 {
+        wr64(f, TP_STATUS_SEND_REQUEST as u64);
+    } else {
+        wr32(f, TP_STATUS_SEND_REQUEST);
+    }
+}
+
+/// A TX ring socket on lo with `opts` set first: (fd, ring base)
+fn tx_sock(lo: i32, ver: i32, opts: &[(i32, i32)]) -> (i32, u64) {
+    let tx = psock(SOCK_RAW, 0);
+    pbind(tx, ETH_P_TEST, lo);
+    setint(tx, SOL_PACKET, PACKET_VERSION, ver);
+    for &(o, v) in opts {
+        setint(tx, SOL_PACKET, o, v);
+    }
+    ring_req(tx, PACKET_TX_RING, &[4096, 1, 2048, 2], 16);
+    let m = map(tx, 4096, 0);
+    (tx, if m > 0 { m as u64 } else { 0 })
+}
+
+/// The next frame on `rx` with test tag `tag` within 2 s: its length
+fn rx_tag(rx: i32, tag: u8) -> i64 {
+    let mut buf = [0u8; 2048];
+    let end = now_ms() + 2000;
+    while now_ms() < end {
+        poll1(rx, POLLIN, 200);
+        let n = recv(rx, &mut buf, MSG_DONTWAIT);
+        if n > 14 && buf[14] == tag {
+            return n;
+        }
+    }
+    -1
+}
+
+/// TPACKET_V1/V2 transmit: requested frames go out in order and come
+/// back available; send returns their bytes; nothing requested is 0
+fn test_tx(lo: i32, ver: i32, name: &'static [u8]) {
+    let mut t = T::new(name);
+    let rx = psock(SOCK_RAW, ETH_P_TEST);
+    pbind(rx, ETH_P_TEST, lo);
+    let (tx, base) = tx_sock(lo, ver, &[]);
+    t.ok(b"map", base != 0, 0);
+    if base == 0 {
+        close(tx);
+        close(rx);
+        t.done();
+        return;
+    }
+    // Data right after the header, at tp_hdrlen - sizeof(sockaddr_ll)
+    tx_fill(base, ver, 32, 60, 0x81);
+    tx_fill(base + 2048, ver, 32, 70, 0x82);
+    t.eq(b"send", send(tx, &[], 0), 130);
+    t.eq(b"available 0", status(base, ver) as i64, 0);
+    t.eq(b"available 1", status(base + 2048, ver) as i64, 0);
+    t.eq(b"first", rx_tag(rx, 0x81), 60);
+    t.eq(b"second", rx_tag(rx, 0x82), 70);
+    t.eq(b"nothing", send(tx, &[], 0), 0);
+    t.eq(
+        b"pollout",
+        poll1(tx, POLLOUT, 0).1 as i64 & POLLOUT as i64,
+        POLLOUT as i64,
+    );
+    sys_munmap(base, 4096);
+    close(tx);
+    close(rx);
+    t.done();
+}
+
+/// Malformed TX frames: short of an Ethernet header EINVAL and
+/// TP_STATUS_WRONG_FORMAT, over the frame EMSGSIZE; PACKET_LOSS skips
+/// them; PACKET_TX_HAS_OFF takes the data offset from tp_mac
+fn test_tx_rules(lo: i32) {
+    let mut t = T::new(b"PACKET_RING_TX_RULES");
+    let rx = psock(SOCK_RAW, ETH_P_TEST);
+    pbind(rx, ETH_P_TEST, lo);
+    let (tx, base) = tx_sock(lo, TPACKET_V2, &[]);
+    if base != 0 {
+        tx_fill(base, TPACKET_V2, 32, 60, 0x83);
+        wr32(base + 4, 10);
+        t.eq(b"short", send(tx, &[], 0), EINVAL);
+        t.eq(
+            b"wrong format",
+            status(base, TPACKET_V2) as i64,
+            TP_STATUS_WRONG_FORMAT as i64,
+        );
+        tx_fill(base, TPACKET_V2, 32, 60, 0x83);
+        wr32(base + 4, 2017);
+        t.eq(b"over frame", send(tx, &[], 0), EMSGSIZE);
+        sys_munmap(base, 4096);
+    }
+    close(tx);
+
+    let (tx, base) = tx_sock(lo, TPACKET_V2, &[(PACKET_LOSS, 1)]);
+    if base != 0 {
+        tx_fill(base, TPACKET_V2, 32, 60, 0x84);
+        wr32(base + 4, 10);
+        tx_fill(base + 2048, TPACKET_V2, 32, 60, 0x85);
+        t.eq(b"loss skips", send(tx, &[], 0), 60);
+        t.eq(b"skipped available", status(base, TPACKET_V2) as i64, 0);
+        t.eq(b"after skip", rx_tag(rx, 0x85), 60);
+        sys_munmap(base, 4096);
+    }
+    close(tx);
+
+    let (tx, base) = tx_sock(lo, TPACKET_V2, &[(PACKET_TX_HAS_OFF, 1)]);
+    if base != 0 {
+        tx_fill(base, TPACKET_V2, 100, 60, 0x86);
+        unsafe { core::ptr::write_volatile((base + 12) as *mut u16, 100) };
+        t.eq(b"has_off", send(tx, &[], 0), 60);
+        t.eq(b"has_off frame", rx_tag(rx, 0x86), 60);
+        tx_fill(base + 2048, TPACKET_V2, 32, 60, 0x87);
+        unsafe { core::ptr::write_volatile((base + 2048 + 12) as *mut u16, 16) };
+        t.eq(b"has_off low", send(tx, &[], 0), EINVAL);
+        sys_munmap(base, 4096);
+    }
+    close(tx);
+    close(rx);
+    t.done();
+}
+
+/// Both rings mapped at once: the receive ring first, then the
+/// transmit ring
+fn test_rx_tx_map(lo: i32) {
+    let mut t = T::new(b"PACKET_RING_RXTX");
+    let fd = psock(SOCK_RAW, ETH_P_TEST);
+    pbind(fd, ETH_P_TEST, lo);
+    setint(fd, SOL_PACKET, PACKET_VERSION, TPACKET_V2);
+    t.eq(
+        b"rx",
+        ring_req(fd, PACKET_RX_RING, &[4096, 1, 2048, 2], 16),
+        0,
+    );
+    t.eq(
+        b"tx",
+        ring_req(fd, PACKET_TX_RING, &[4096, 2, 2048, 4], 16),
+        0,
+    );
+    t.eq(b"rx only size", map(fd, 4096, 0), EINVAL);
+    let m = map(fd, 12288, 0);
+    t.ok(b"map both", m > 0, m);
+    if m > 0 {
+        let base = m as u64;
+        tx_fill(base + 4096, TPACKET_V2, 32, 60, 0x88);
+        t.eq(b"send", send(fd, &[], 0), 60);
+        // Its own frame comes back in through lo into the receive ring
+        t.ok(b"looped", wait_user(base, TPACKET_V2, 2000), 0);
+        t.eq(b"tag", rd8(base + 66 + 14) as i64, 0x88);
+        sys_munmap(base, 12288);
+    }
+    close(fd);
     t.done();
 }

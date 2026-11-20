@@ -42,6 +42,7 @@
 mod opts;
 mod rcv;
 mod ring;
+mod tx;
 
 use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
@@ -172,6 +173,8 @@ pub struct PacketSock {
     /// The receive ring (Linux po->rx_ring, under the receive queue
     /// lock)
     rx: crate::sync::spin::Mutex<ring::RxRing>,
+    /// The transmit ring (Linux po->tx_ring)
+    tx: crate::sync::spin::Mutex<tx::TxRing>,
     /// User mappings of the rings (Linux po->mapped)
     mapped: Arc<ring::Mapped>,
     /// PACKET_VERSION, the ring frame header length (Linux
@@ -216,6 +219,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         freeze_q_cnt: AtomicU32::new(0),
         pg_vec_lock: crate::sync::Mutex::new(()),
         rx: crate::sync::spin::Mutex::new(ring::RxRing::default()),
+        tx: crate::sync::spin::Mutex::new(tx::TxRing::default()),
         mapped: try_arc(ring::Mapped::default())?,
         tp_version: AtomicU32::new(ring::TPACKET_V1),
         tp_hdrlen: AtomicU32::new(0),
@@ -494,6 +498,12 @@ fn eth_hard_header(
     Ok(())
 }
 
+/// A frame over the MTU may carry an 802.1Q tag (Linux
+/// packet_extra_vlan_len_allowed, Ethernet devices)
+fn extra_vlan_allowed(frame: &[u8]) -> bool {
+    frame.get(12..14) == Some(&ETH_P_8021Q.to_be_bytes()[..])
+}
+
 /// Largest send (Linux packet_snd: MTU plus the link header for
 /// SOCK_RAW, plus a VLAN tag for tagged frames)
 fn check_len(stype: i32, mtu: usize, data: &[u8]) -> Result<(), KernelError> {
@@ -542,6 +552,9 @@ impl ProtoOps for PacketSock {
             if self.rx.lock().ring.is_some() {
                 let _ = ring::set_ring(self, &ring::Req::default(), true, false);
             }
+            if self.tx.lock().ring.is_some() {
+                let _ = ring::set_ring(self, &ring::Req::default(), true, true);
+            }
         }
         self.rxq.clear();
         self.sk.purge_err();
@@ -583,6 +596,9 @@ impl ProtoOps for PacketSock {
         let mut mask = self.rxq.poll(&self.sk);
         if self.ring_readable() {
             mask |= crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM;
+        }
+        if tx::tx_writable(self) {
+            mask |= crate::io::poll::POLLOUT | crate::io::poll::POLLWRNORM;
         }
         mask
     }
@@ -639,6 +655,11 @@ impl ProtoOps for PacketSock {
 
     /// Linux packet_snd
     fn sendmsg(&self, m: &mut SendMsg<'_>, _flags: i32) -> Result<usize, KernelError> {
+        // Linux packet_sendmsg: a transmit ring sends its frames
+        // (checked again under pg_vec_lock)
+        if self.tx.lock().ring.is_some() {
+            return tx::tpacket_snd(self, m);
+        }
         let Dest { dev, proto, addr } = self.dest(m)?;
         if !dev.is_up() {
             return Err(KernelError::NetworkDown);

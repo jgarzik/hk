@@ -22,6 +22,7 @@ const PACKET_ORIGDEV: i32 = 9;
 const PACKET_VERSION: i32 = 10;
 const PACKET_HDRLEN: i32 = 11;
 const PACKET_RESERVE: i32 = 12;
+const PACKET_TX_RING: i32 = 13;
 const PACKET_LOSS: i32 = 14;
 const PACKET_TIMESTAMP: i32 = 17;
 const PACKET_TX_HAS_OFF: i32 = 19;
@@ -109,7 +110,7 @@ fn set_packet(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
             s.set_flag(pf::IGNORE_OUTGOING, val == 1);
             Ok(())
         }
-        PACKET_RX_RING => set_ring(s, v, false),
+        PACKET_RX_RING | PACKET_TX_RING => set_ring(s, v, opt == PACKET_TX_RING),
         PACKET_COPY_THRESH => {
             s.copy_thresh.store(int_exact(v)? as u32, Ordering::Release);
             Ok(())

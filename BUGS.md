@@ -307,8 +307,7 @@ without it).
 
 **Location**: `net/packet/`
 
-Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), PACKET_TX_RING,
-TPACKET_V3 (PACKET_VERSION 2 is EINVAL), PACKET_FANOUT,
+Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), TPACKET_V3 (PACKET_VERSION 2 is EINVAL), PACKET_FANOUT,
 PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
 (ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
 socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
@@ -318,6 +317,10 @@ no-op on e1000 and virtio-net, which has no control queue: QEMU then
 delivers all frames).
 PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
 lo (hk has no checksum offload states).
+The TX ring copies each frame into an skb and makes it
+TP_STATUS_AVAILABLE once queued; Linux sends the ring pages themselves
+(zero copy) and frees the frame at the skb's completion
+(tpacket_ubuf_complete), a blocking send waiting for pending frames.
 Ring blocks are physically contiguous (`mm::shared::PgVec`): a
 tp_block_size past the buddy allocator's largest order is ENOMEM where
 Linux alloc_one_pg_vec_page falls back to vzalloc.
