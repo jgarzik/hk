@@ -13,6 +13,7 @@ pub mod netdev_ioctl;
 pub mod netlink;
 pub mod nl;
 pub mod packet;
+pub mod packet_ring;
 pub mod raw;
 pub mod rtnl_link;
 pub mod sk;

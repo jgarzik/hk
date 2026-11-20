@@ -1,5 +1,5 @@
 //! AF_PACKET sockets: socket(AF_PACKET, SOCK_RAW | SOCK_DGRAM, proto)
-//! (Linux net/packet/af_packet.c, without the mmap rings and fanout)
+//! (Linux net/packet/af_packet.c; the mmap rings in `ring`)
 //!
 //! Need CAP_NET_RAW (EPERM). A socket bound to a protocol (htons
 //! ETH_P_ALL or an EtherType; from socket() or bind(sockaddr_ll)) and
@@ -41,6 +41,7 @@
 
 mod opts;
 mod rcv;
+mod ring;
 
 use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
@@ -89,6 +90,13 @@ mod pf {
     /// The hook is registered: the tap delivers to the socket (Linux
     /// PACKET_SOCK_RUNNING; changed under `bind_lock`)
     pub const RUNNING: u32 = 1 << 4;
+    /// A receive ring takes the frames (Linux prot_hook.func is
+    /// tpacket_rcv; changed under `PacketSock.rx`)
+    pub const TPACKET: u32 = 1 << 5;
+    /// PACKET_TX_HAS_OFF (Linux PACKET_SOCK_TX_HAS_OFF)
+    pub const TX_HAS_OFF: u32 = 1 << 6;
+    /// PACKET_LOSS (Linux PACKET_SOCK_TP_LOSS)
+    pub const TP_LOSS: u32 = 1 << 7;
 }
 
 /// A link-layer address (struct sockaddr_ll)
@@ -153,9 +161,27 @@ pub struct PacketSock {
     flags: AtomicU32,
     rxq: rcv::PktQueue,
     filter: RwLock<Option<Arc<Filter>>>,
-    /// PACKET_STATISTICS since the last read
+    /// PACKET_STATISTICS since the last read (Linux po->stats,
+    /// po->tp_drops)
     packets: AtomicU32,
     drops: AtomicU32,
+    /// tpacket_stats_v3.tp_freeze_q_cnt
+    freeze_q_cnt: AtomicU32,
+    /// Linux po->pg_vec_lock: ring swaps against mmap
+    pg_vec_lock: crate::sync::Mutex<()>,
+    /// The receive ring (Linux po->rx_ring, under the receive queue
+    /// lock)
+    rx: crate::sync::spin::Mutex<ring::RxRing>,
+    /// User mappings of the rings (Linux po->mapped)
+    mapped: Arc<ring::Mapped>,
+    /// PACKET_VERSION, the ring frame header length (Linux
+    /// po->tp_hdrlen), PACKET_RESERVE, PACKET_TIMESTAMP,
+    /// PACKET_COPY_THRESH
+    tp_version: AtomicU32,
+    tp_hdrlen: AtomicU32,
+    tp_reserve: AtomicU32,
+    tp_tstamp: AtomicU32,
+    copy_thresh: AtomicU32,
     /// PACKET_ADD_MEMBERSHIP entries (changed under RTNL)
     mclist: crate::sync::Mutex<Vec<opts::Mreq>>,
     /// Link on its namespace's list (Linux sk_node)
@@ -187,6 +213,15 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         filter: RwLock::new(None),
         packets: AtomicU32::new(0),
         drops: AtomicU32::new(0),
+        freeze_q_cnt: AtomicU32::new(0),
+        pg_vec_lock: crate::sync::Mutex::new(()),
+        rx: crate::sync::spin::Mutex::new(ring::RxRing::default()),
+        mapped: try_arc(ring::Mapped::default())?,
+        tp_version: AtomicU32::new(ring::TPACKET_V1),
+        tp_hdrlen: AtomicU32::new(0),
+        tp_reserve: AtomicU32::new(0),
+        tp_tstamp: AtomicU32::new(0),
+        copy_thresh: AtomicU32::new(0),
         mclist: crate::sync::Mutex::new(Vec::new()),
         link: crate::util::list::Link::new(),
         rcu: crate::sync::rcu::RcuHead::new(),
@@ -501,6 +536,13 @@ impl ProtoOps for PacketSock {
             self.bind.store(pack(0, ifindex), Ordering::Release);
         }
         opts::flush_mclist(self);
+        {
+            // Linux packet_release: the rings go (closing: even mapped)
+            let _sk = self.sk_lock.lock();
+            if self.rx.lock().ring.is_some() {
+                let _ = ring::set_ring(self, &ring::Req::default(), true, false);
+            }
+        }
         self.rxq.clear();
         self.sk.purge_err();
         // Linux packet_release's sock_put: the last reference
@@ -535,8 +577,37 @@ impl ProtoOps for PacketSock {
         Ok(sll.bytes()[..SLL_ADDR_OFF + sll.halen as usize].to_vec())
     }
 
+    /// Linux packet_poll: datagram_poll, and readable while the ring
+    /// has a filled frame
     fn poll(&self) -> u16 {
-        self.rxq.poll(&self.sk)
+        let mut mask = self.rxq.poll(&self.sk);
+        if self.ring_readable() {
+            mask |= crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM;
+        }
+        mask
+    }
+
+    /// Linux packet_mmap
+    fn mmap(&self) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// Linux packet_mmap: from offset 0 only
+    fn mmap_offset(&self, off: u64) -> Result<(), KernelError> {
+        if off != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    fn mmap_hold(&self, len: u64) -> Result<Option<crate::mm::vma::VmHold>, KernelError> {
+        ring::mmap_hold(self, len)
+    }
+
+    // SAFETY: ring pages, which hold only frames shared with user
+    // space; each handed out with a reference (`PgVec::map_page`)
+    unsafe fn map_page(&self, idx: u64) -> Option<u64> {
+        ring::map_page(self, idx)
     }
 
     /// SIOCINQ: length of the next frame; SIOCOUTQ: nothing is queued
@@ -559,7 +630,11 @@ impl ProtoOps for PacketSock {
     }
 
     fn getsockopt(&self, level: i32, opt: i32) -> Option<Result<OptOut, KernelError>> {
-        opts::get(self, level, opt)
+        opts::get(self, level, opt, None)
+    }
+
+    fn getsockopt_in(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<OptOut, KernelError>> {
+        opts::get(self, level, opt, Some(v))
     }
 
     /// Linux packet_snd

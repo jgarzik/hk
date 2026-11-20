@@ -18,32 +18,32 @@ use crate::helpers::{host_mode, loopback_up, println, skip};
 use crate::net::nl::{Nl, addr as nl_addr, msleep, net_setup_eth0};
 use crate::net::sk::*;
 
-const AF_PACKET: i32 = 17;
-const SOL_PACKET: i32 = 263;
+pub const AF_PACKET: i32 = 17;
+pub const SOL_PACKET: i32 = 263;
 const PACKET_ADD_MEMBERSHIP: i32 = 1;
 const PACKET_DROP_MEMBERSHIP: i32 = 2;
-const PACKET_STATISTICS: i32 = 6;
-const PACKET_AUXDATA: i32 = 8;
+pub const PACKET_STATISTICS: i32 = 6;
+pub const PACKET_AUXDATA: i32 = 8;
 const PACKET_MR_PROMISC: u16 = 1;
 const SO_ATTACH_FILTER: i32 = 26;
 const SO_DETACH_FILTER: i32 = 27;
 const SO_LOCK_FILTER: i32 = 44;
 
-const ETH_P_ALL: u16 = 0x0003;
-const ETH_P_IP: u16 = 0x0800;
+pub const ETH_P_ALL: u16 = 0x0003;
+pub const ETH_P_IP: u16 = 0x0800;
 /// IEEE local experimental EtherType: only our test frames use it
-const ETH_P_TEST: u16 = 0x88b5;
+pub const ETH_P_TEST: u16 = 0x88b5;
 
-const PACKET_HOST: u8 = 0;
+pub const PACKET_HOST: u8 = 0;
 const PACKET_BROADCAST: u8 = 1;
-const PACKET_OUTGOING: u8 = 4;
+pub const PACKET_OUTGOING: u8 = 4;
 const ARPHRD_LOOPBACK: u16 = 772;
 const ARPHRD_ETHER: u16 = 1;
 
-const ENXIO: i64 = -6;
+pub const ENXIO: i64 = -6;
 const ENOENT: i64 = -2;
-const ENODEV: i64 = -19;
-const ENETDOWN: i64 = -100;
+pub const ENODEV: i64 = -19;
+pub const ENETDOWN: i64 = -100;
 
 pub fn run_tests() {
     println(b"=== AF_PACKET Tests ===");
@@ -73,17 +73,17 @@ pub fn run_tests() {
 
 /// struct sockaddr_ll
 #[derive(Clone, Copy, Default)]
-struct Sll {
-    protocol: u16,
-    ifindex: i32,
-    hatype: u16,
-    pkttype: u8,
-    halen: u8,
-    addr: [u8; 8],
+pub struct Sll {
+    pub protocol: u16,
+    pub ifindex: i32,
+    pub hatype: u16,
+    pub pkttype: u8,
+    pub halen: u8,
+    pub addr: [u8; 8],
 }
 
 impl Sll {
-    fn new(protocol: u16, ifindex: i32) -> Self {
+    pub fn new(protocol: u16, ifindex: i32) -> Self {
         Self {
             protocol,
             ifindex,
@@ -91,7 +91,7 @@ impl Sll {
         }
     }
 
-    fn bytes(&self) -> [u8; 20] {
+    pub fn bytes(&self) -> [u8; 20] {
         let mut b = [0u8; 20];
         b[0..2].copy_from_slice(&(AF_PACKET as u16).to_ne_bytes());
         b[2..4].copy_from_slice(&self.protocol.to_be_bytes());
@@ -103,7 +103,7 @@ impl Sll {
         b
     }
 
-    fn parse(b: &[u8; 20]) -> Self {
+    pub fn parse(b: &[u8; 20]) -> Self {
         let mut addr = [0u8; 8];
         addr.copy_from_slice(&b[12..20]);
         Self {
@@ -117,23 +117,23 @@ impl Sll {
     }
 }
 
-fn psock(ty: i32, proto: u16) -> i32 {
+pub fn psock(ty: i32, proto: u16) -> i32 {
     sys_socket(AF_PACKET, ty, proto.to_be() as i32) as i32
 }
 
-fn pbind(fd: i32, proto: u16, ifindex: i32) -> i64 {
+pub fn pbind(fd: i32, proto: u16, ifindex: i32) -> i64 {
     let a = Sll::new(proto, ifindex).bytes();
     sys_bind(fd, a.as_ptr(), 20)
 }
 
 /// A socket bound to `proto` on `ifindex`
-fn bound(ty: i32, proto: u16, ifindex: i32) -> i32 {
+pub fn bound(ty: i32, proto: u16, ifindex: i32) -> i32 {
     let fd = psock(ty, proto);
     pbind(fd, proto, ifindex);
     fd
 }
 
-fn sendto_ll(fd: i32, data: &[u8], a: &Sll, alen: u32) -> i64 {
+pub fn sendto_ll(fd: i32, data: &[u8], a: &Sll, alen: u32) -> i64 {
     let b = a.bytes();
     sys_sendto(fd, data.as_ptr(), data.len(), 0, b.as_ptr(), alen)
 }
@@ -158,7 +158,7 @@ pub fn ifindex(name: &[u8]) -> i32 {
 }
 
 /// Receive one frame within `ms`: (length, source address)
-fn recv_ll(fd: i32, buf: &mut [u8], ms: i32, flags: i32) -> (i64, Sll) {
+pub fn recv_ll(fd: i32, buf: &mut [u8], ms: i32, flags: i32) -> (i64, Sll) {
     let (r, _) = poll1(fd, 1, ms);
     if r != 1 {
         return (EAGAIN, Sll::default());
@@ -177,7 +177,7 @@ fn recv_ll(fd: i32, buf: &mut [u8], ms: i32, flags: i32) -> (i64, Sll) {
 }
 
 /// The next frame within `ms` for which `pred(frame, sll)` holds
-fn find(
+pub fn find(
     fd: i32,
     buf: &mut [u8],
     ms: u64,
@@ -195,7 +195,7 @@ fn find(
 
 /// A test frame: zero (lo's) destination and source, ETH_P_TEST, `tag`
 /// then zero padding to `len`
-fn test_frame(out: &mut [u8], tag: u8, len: usize) -> &[u8] {
+pub fn test_frame(out: &mut [u8], tag: u8, len: usize) -> &[u8] {
     out[..len].fill(0);
     out[12..14].copy_from_slice(&ETH_P_TEST.to_be_bytes());
     out[14] = tag;
@@ -639,7 +639,7 @@ fn test_rcvbuf(lo: i32) {
 }
 
 /// struct sock_fprog for `insns` (code, jt, jf, k)
-fn fprog(insns: &[(u16, u8, u8, u32)], out: &mut [u8; 128]) -> [u8; 16] {
+pub fn fprog(insns: &[(u16, u8, u8, u32)], out: &mut [u8; 128]) -> [u8; 16] {
     for (i, &(code, jt, jf, k)) in insns.iter().enumerate() {
         let o = i * 8;
         out[o..o + 2].copy_from_slice(&code.to_ne_bytes());

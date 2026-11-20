@@ -12,7 +12,7 @@
 //! rule 8). A [`PgVec`] is several such regions mapped back to back
 //! (AF_PACKET rings).
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::FRAME_ALLOCATOR;
 use crate::util::error::KernelError;
@@ -87,6 +87,14 @@ impl SharedRegion {
         // SAFETY: in bounds and aligned (checked); frames of the region,
         // which lives as long as the reference; an atomic tolerates the
         // other side's concurrent accesses
+        unsafe { &*p }
+    }
+
+    /// The 64-bit word at byte `off` (8-aligned, in bounds: asserted),
+    /// shared with user space (an `unsigned long` status word)
+    pub fn word64(&self, off: usize) -> &AtomicU64 {
+        let p = self.ptr(off, 8, 8).cast::<AtomicU64>();
+        // SAFETY: as in `word`
         unsafe { &*p }
     }
 
