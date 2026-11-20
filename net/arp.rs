@@ -16,12 +16,15 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
+use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, ETH_ALEN, ETH_BROADCAST, ETH_HLEN, EtherType, PktType};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr};
 use crate::net::ipv4::{self, Ipv4Addr};
-use crate::net::neigh::{self, HASH_RND, Key, Lladdr, NeighOps, NeighTable, Neighbour, nud, upd};
+use crate::net::neigh::{
+    self, HASH_RND, Key, Lladdr, NeighCb, NeighOps, NeighTable, Neighbour, nud, upd,
+};
 use crate::net::skb::SkBuff;
 
 /// ARP hardware type: Ethernet
@@ -106,15 +109,20 @@ pub enum ArpAction {
     /// Request for one of our addresses: create/update the sender's
     /// entry, reply
     Reply,
+    /// Request for an address we answer for (Linux arp_process's
+    /// forwarding branch: proxy_arp, a proxy entry): create/update the
+    /// sender's entry, reply now or after the proxy delay
+    Proxy,
     /// Anything else: update an existing entry for the sender only
     Update,
 }
 
 /// Decide how to handle an ARP packet from `sip`/`sha` for `tip`
 /// received on a device with MAC `our_mac`. `addr_type` classifies
-/// addresses in the device's namespace. Entries are only *created* for
-/// requests addressed to us, so unsolicited replies and gratuitous ARP
-/// cannot poison the cache.
+/// addresses in the device's namespace; `proxy` says whether a request
+/// for another address is answered for it (`arp_fwd`). Entries are
+/// only *created* for requests addressed to us, so unsolicited replies
+/// and gratuitous ARP cannot poison the cache.
 pub fn classify(
     op: u16,
     sip: Ipv4Addr,
@@ -122,6 +130,7 @@ pub fn classify(
     tip: Ipv4Addr,
     our_mac: &[u8; ETH_ALEN],
     addr_type: impl Fn(Ipv4Addr) -> RouteType,
+    proxy: impl FnOnce() -> bool,
 ) -> ArpAction {
     if op != ARPOP_REQUEST && op != ARPOP_REPLY {
         return ArpAction::Drop("unknown op");
@@ -151,9 +160,59 @@ pub fn classify(
     }
     if op == ARPOP_REQUEST && tip_local {
         ArpAction::Reply
+    } else if op == ARPOP_REQUEST && proxy() {
+        ArpAction::Proxy
     } else {
         ArpAction::Update
     }
+}
+
+/// Linux arp_fwd_proxy: proxy_arp on the receiving device, the route
+/// out another one, and (medium_id set) a different medium there;
+/// `imi`/`omi` the in and out devices' medium_id
+fn fwd_proxy(proxy_arp: bool, same_dev: bool, imi: i32, omi: i32) -> bool {
+    if same_dev || !proxy_arp {
+        return false;
+    }
+    match imi {
+        0 => true,
+        -1 => false,
+        _ => omi != imi && omi != -1,
+    }
+}
+
+/// Linux arp_fwd_pvlan: proxy_arp_pvlan answers back out the same
+/// device (RFC 3069), never for the sender itself
+fn fwd_pvlan(pvlan: bool, same_dev: bool, sip: Ipv4Addr, tip: Ipv4Addr) -> bool {
+    same_dev && sip != tip && pvlan
+}
+
+/// A request for `tip` from `sip` received on `dev` is answered for
+/// it (Linux arp_process's IN_DEV_FORWARD branch: the forwarding
+/// route is unicast, and proxy_arp, proxy_arp_pvlan or a proxy entry
+/// for `tip` holds)
+fn arp_fwd(net: &NetNamespace, dev: &NetDevice, sip: Ipv4Addr, tip: Ipv4Addr) -> bool {
+    use crate::net::inet::devconf::{self, ci};
+    if !devconf::forward(dev) {
+        return false;
+    }
+    let Some(out) = crate::net::inet::route::input_fwd(net, tip) else {
+        return false;
+    };
+    let same = core::ptr::eq(Arc::as_ptr(&out), dev);
+    let cnf = &dev.in_dev().cnf;
+    let omi = out.in_dev().cnf.get(ci::MEDIUM_ID);
+    fwd_proxy(
+        devconf::proxy_arp(net, dev),
+        same,
+        cnf.get(ci::MEDIUM_ID),
+        omi,
+    ) || fwd_pvlan(
+        devconf::orconf(net, cnf, ci::PROXY_ARP_PVLAN),
+        same,
+        sip,
+        tip,
+    ) || (!same && arp_tbl().phash.lookup(net, &neigh::key4(tip), dev))
 }
 
 /// The ARP table hooks
@@ -165,6 +224,8 @@ pub static ARP_OPS: NeighOps = NeighOps {
     output: ipv4::ip_finish_output,
     error_report: ipv4::ip_link_failure,
     parms: |dev| &dev.in_dev().arp_parms,
+    proxy_redo: arp_process,
+    proxy_timer: |_| arp_tbl().proxy_process(),
 };
 
 /// The ARP table (Linux arp_tbl), made by `arp_init`
@@ -201,6 +262,12 @@ fn arp_hash(key: &Key, dev: &NetDevice, rnd: &[u32; HASH_RND]) -> u32 {
 ///
 /// Uses the receiving device's namespace.
 pub fn arp_rcv(skb: alloc::boxed::Box<SkBuff>) {
+    arp_process(skb);
+}
+
+/// Handle a received or proxy-queued ARP packet (Linux arp_process,
+/// parp_redo for a queued one)
+fn arp_process(skb: Box<SkBuff>) {
     if skb.len() < ARP_HLEN {
         return;
     }
@@ -218,18 +285,38 @@ pub fn arp_rcv(skb: alloc::boxed::Box<SkBuff>) {
     };
     let (sip, sha, tip) = (hdr.sender_ip(), hdr.ar_sha, hdr.target_ip());
     let op = hdr.operation();
-    let act = classify(op, sip, &sha, tip, &dev.mac(), |a| ns.fib.addr_type(a));
+    let act = classify(
+        op,
+        sip,
+        &sha,
+        tip,
+        &dev.mac(),
+        |a| ns.fib.addr_type(a),
+        || arp_fwd(&ns, dev, sip, tip),
+    );
     match act {
         ArpAction::Drop(_) => {}
         ArpAction::Conflict => conflict(sip, &sha),
         ArpAction::ProbeReply => send_arp_reply(dev, tip, sip, &sha),
         ArpAction::Reply => {
-            // Linux neigh_event_ns: the requester's entry, STALE
-            let tbl = arp_tbl();
-            if let Ok(n) = tbl.create(dev, &neigh::key4(sip), false) {
-                tbl.update(&n, Some(sha), nud::STALE, upd::OVERRIDE);
-            }
+            neigh_event_ns(dev, sip, sha);
             send_arp_reply(dev, tip, sip, &sha);
+        }
+        ArpAction::Proxy => {
+            neigh_event_ns(dev, sip, sha);
+            // Linux: at once for a request back from the queue, one to
+            // us alone, or without a delay; else after it
+            let p = &dev.in_dev().arp_parms;
+            if NeighCb::locally_enqueued(&skb)
+                || skb.pkt_type == PktType::Host
+                || p.get(neigh::var::PROXY_DELAY) == 0
+            {
+                send_arp_reply(dev, tip, sip, &sha);
+            } else {
+                let dev = dev.clone();
+                drop(ns);
+                arp_tbl().pneigh_enqueue(&dev.in_dev().arp_parms, skb);
+            }
         }
         ArpAction::Update => {
             let tbl = arp_tbl();
@@ -250,6 +337,15 @@ pub fn arp_rcv(skb: alloc::boxed::Box<SkBuff>) {
             };
             tbl.update(&n, Some(sha), state, flags);
         }
+    }
+}
+
+/// The requester's entry, STALE with its address (Linux
+/// neigh_event_ns)
+fn neigh_event_ns(dev: &Arc<NetDevice>, sip: Ipv4Addr, sha: Lladdr) {
+    let tbl = arp_tbl();
+    if let Ok(n) = tbl.create(dev, &neigh::key4(sip), false) {
+        tbl.update(&n, Some(sha), nud::STALE, upd::OVERRIDE);
     }
 }
 
@@ -428,7 +524,51 @@ mod tests {
     }
 
     fn c(op: u16, sip: Ipv4Addr, sha: [u8; 6], tip: Ipv4Addr) -> ArpAction {
-        classify(op, sip, &sha, tip, &OUR, atype)
+        classify(op, sip, &sha, tip, &OUR, atype, || false)
+    }
+
+    /// A request for an address we proxy is answered; nothing else is
+    /// (Linux arp_process: only requests reach the forwarding branch)
+    #[test]
+    fn proxy_requests_only() {
+        let (gw, other) = (ip(10, 0, 2, 2), ip(10, 0, 3, 7));
+        let p = |op| classify(op, gw, &PEER, other, &OUR, atype, || true);
+        assert_eq!(p(ARPOP_REQUEST), ArpAction::Proxy);
+        assert_eq!(p(ARPOP_REPLY), ArpAction::Update);
+        // Our own address is answered as ours, the proxy test not run
+        let me = ip(10, 0, 2, 15);
+        let mine = classify(ARPOP_REQUEST, gw, &PEER, me, &OUR, atype, || {
+            panic!("proxy asked for a local address")
+        });
+        assert_eq!(mine, ArpAction::Reply);
+        // Martian senders never reach it
+        let m = classify(
+            ARPOP_REQUEST,
+            ip(224, 0, 0, 1),
+            &PEER,
+            other,
+            &OUR,
+            atype,
+            || true,
+        );
+        assert!(matches!(m, ArpAction::Drop(_)));
+    }
+
+    /// Linux arp_fwd_proxy and arp_fwd_pvlan
+    #[test]
+    fn proxy_rules() {
+        assert!(fwd_proxy(true, false, 0, 0));
+        assert!(!fwd_proxy(false, false, 0, 0));
+        assert!(!fwd_proxy(true, true, 0, 0));
+        assert!(!fwd_proxy(true, false, -1, 0));
+        assert!(fwd_proxy(true, false, 1, 2));
+        assert!(!fwd_proxy(true, false, 1, 1));
+        assert!(!fwd_proxy(true, false, 1, -1));
+        let (a, b) = (ip(10, 0, 2, 2), ip(10, 0, 2, 9));
+        assert!(fwd_pvlan(true, true, a, b));
+        assert!(!fwd_pvlan(true, false, a, b));
+        assert!(!fwd_pvlan(true, true, a, a));
+        assert!(!fwd_pvlan(false, true, a, b));
     }
 
     #[test]

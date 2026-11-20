@@ -2,14 +2,15 @@
 //! resolution of the gateway (/proc/net/arp, RTM_GETNEIGH), failure of
 //! an unused address after three probes, administrative entries
 //! (RTM_NEWNEIGH / RTM_DELNEIGH errors and PERMANENT state),
-//! confirmation by forward progress (MSG_CONFIRM, MSG_PROBE), and a
-//! table of hundreds: a multipart dump and /proc/net/arp past a page.
+//! confirmation by forward progress (MSG_CONFIRM, MSG_PROBE), proxy
+//! ARP (proxy_arp, proxy_arp_pvlan, forwarding), and a table of
+//! hundreds: a multipart dump and /proc/net/arp past a page.
 
 use crate::harness::T;
 use crate::helpers::skip;
 use crate::net::nl::{
     AF_INET, Msg, NLM_F_CREATE, NLM_F_EXCL, Nl, RTM_GETNEIGH, RTM_NEWNEIGH, Req, each_msg, msleep,
-    net_setup_eth0, rxbuf,
+    net_setup_eth0, route, rxbuf,
 };
 use crate::net::sk::*;
 use crate::proc::sysctl::read_file;
@@ -51,6 +52,7 @@ pub fn run_tests() {
     test_failed(idx);
     test_admin(idx);
     test_confirm(idx);
+    test_proxy(idx);
     test_many(idx);
 }
 
@@ -328,6 +330,90 @@ fn test_confirm(idx: u32) {
     for ip in ips {
         del_neigh(&mut nl, idx, ip);
     }
+    t.done();
+}
+
+const ETH_P_ARP: u16 = 0x0806;
+const IPPROTO_RAW: i32 = 255;
+
+/// Have slirp ask for `ip` (it reflects an echo from that made-up
+/// source to the gateway, so it must resolve it) and wait for a reply
+/// of ours claiming it, seen leaving eth0
+fn proxied(eth: u32, ip: [u8; 4]) -> bool {
+    use crate::net::packet::{bound, find};
+    let ps = bound(SOCK_RAW, ETH_P_ARP, eth as i32);
+    let raw = hk_syscall::sys_socket(2, SOCK_RAW, IPPROTO_RAW) as i32;
+    let mut pkt = [0u8; 28];
+    pkt[..20].copy_from_slice(&[
+        0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0, 0, 0, 0, 0, 0, GW[0], GW[1], GW[2], GW[3],
+    ]);
+    pkt[12..16].copy_from_slice(&ip);
+    pkt[20..28].copy_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1]);
+    let c = crate::net::raw::csum(&pkt[20..28]);
+    pkt[22..24].copy_from_slice(&c.to_be_bytes());
+    let hc = crate::net::raw::csum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&hc.to_be_bytes());
+    let sent = send_to(raw, &pkt, GW, 0, 0) == 28;
+    let mut buf = [0u8; 128];
+    let got = find(ps, &mut buf, 3000, &|f, _| {
+        f.len() >= 42
+            && f[12..14] == [8, 6]
+            && f[20..22] == [0, 2]
+            && f[28..32] == ip
+            && f[38..42] == GW
+    });
+    close(raw);
+    close(ps);
+    sent && got.is_some()
+}
+
+fn conf_put(dev: &[u8], name: &[u8], v: &[u8]) -> i64 {
+    let mut p = [0u8; 96];
+    let mut n = 0;
+    for part in [b"/proc/sys/net/ipv4/conf/" as &[u8], dev, b"/", name, b"\0"] {
+        p[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    crate::proc::sysctl::write_file(&p[..n], v)
+}
+
+/// Proxy ARP (Linux arp_process's IN_DEV_FORWARD branch): with
+/// forwarding on, a request for an address routed out another device
+/// is answered with proxy_arp, one routed back out eth0 with
+/// proxy_arp_pvlan, each after a random part of proxy_delay (the
+/// request is a broadcast); without forwarding none is
+fn test_proxy(idx: u32) {
+    let mut t = T::new(b"NEIGH_PROXY");
+    let Some(mut nl) = Nl::open() else {
+        t.ok(b"netlink", false, 0);
+        return t.done();
+    };
+    let lo = crate::net::packet::ifindex(b"lo") as u32;
+    let (a, b, c) = ([10, 0, 2, 200], [10, 0, 2, 201], [10, 0, 2, 202]);
+    let ce = NLM_F_CREATE | NLM_F_EXCL;
+    t.eq(b"forwarding", conf_put(b"all", b"forwarding", b"1"), 1);
+    t.eq(b"proxy_arp", conf_put(b"eth0", b"proxy_arp", b"1"), 1);
+    t.eq(
+        b"route",
+        route(&mut nl, true, a, 32, [0; 4], lo, ce) as i64,
+        0,
+    );
+    t.ok(b"proxy_arp answered", proxied(idx, a), 0);
+    route(&mut nl, false, a, 32, [0; 4], lo, 0);
+    t.eq(b"proxy_arp off", conf_put(b"eth0", b"proxy_arp", b"0"), 1);
+    t.eq(b"pvlan", conf_put(b"eth0", b"proxy_arp_pvlan", b"1"), 1);
+    t.ok(b"pvlan answered", proxied(idx, b), 0);
+    t.eq(b"pvlan off", conf_put(b"eth0", b"proxy_arp_pvlan", b"0"), 1);
+    t.eq(b"forwarding off", conf_put(b"all", b"forwarding", b"0"), 1);
+    t.eq(b"proxy_arp again", conf_put(b"eth0", b"proxy_arp", b"1"), 1);
+    t.eq(
+        b"route c",
+        route(&mut nl, true, c, 32, [0; 4], lo, ce) as i64,
+        0,
+    );
+    t.ok(b"not forwarding", !proxied(idx, c), 0);
+    route(&mut nl, false, c, 32, [0; 4], lo, 0);
+    t.eq(b"restore", conf_put(b"eth0", b"proxy_arp", b"0"), 1);
     t.done();
 }
 

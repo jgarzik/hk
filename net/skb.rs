@@ -163,6 +163,9 @@ pub enum SkbCb {
     /// A TCP segment: the sequence space it covers and its header
     /// fields (Linux TCP_SKB_CB)
     Tcp(TcpSkbCb),
+    /// A request waiting on a neighbour table's proxy queue (Linux
+    /// NEIGH_CB)
+    Neigh(crate::net::neigh::NeighCb),
     /// An AF_UNIX message (Linux UNIXCB and the skb's sock_wfree
     /// destructor); boxed, so every skb stays small (skbs are passed by
     /// value down the receive path)
@@ -182,6 +185,7 @@ impl SkbCb {
             Self::Nl(n) => Self::Nl(n.clone()),
             Self::Frag(f) => Self::Frag(*f),
             Self::Tcp(t) => Self::Tcp(*t),
+            Self::Neigh(n) => Self::Neigh(*n),
         }
     }
 }

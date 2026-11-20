@@ -33,6 +33,12 @@
 //!   forced GC over the gc list when the table passes gc_thresh2/3.
 //! - Dumps and /proc/net/arp walk the table under RCU into
 //!   preallocated buffers (`NlBuf`, `SeqBuf`).
+//! - Proxy entries (`phash`, `net::pneigh`) and the queue of proxied
+//!   requests waiting for proxy_delay (`proxy`, with its `Alarm`;
+//!   Linux tbl->proxy_queue, proxy_timer, pneigh_enqueue).
+//! - Each entry runs on its device's parameters (`NeighParms`, Linux
+//!   n->parms; `NeighOps::parms`); the table's are the defaults new
+//!   devices copy.
 //!
 //! ## Locking (thread context only; see doc/LOCKING.md)
 //!
@@ -56,7 +62,7 @@ use crate::sync::rcu::{self, RcuArc, RcuHead, RcuReadGuard};
 use crate::sync::spin::Mutex;
 use crate::sync::{IrqSpinlock, UniqueOwner};
 use crate::task::workqueue::{DelayedWork, SYSTEM_WQ};
-use crate::time::timer::ArcTimer;
+use crate::time::timer::{Alarm, ArcTimer};
 use crate::util::list::{Link, OwnedList, Owner};
 use crate::util::rcuhlist::{HNode, RcuHList};
 use crate::util::rculist::RcuRef;
@@ -180,6 +186,9 @@ pub struct NeighParms {
     /// was last drawn
     reachable_time: AtomicU64,
     reach_stamp: AtomicU64,
+    /// Requests of its device on the proxy queue (Linux p->qlen),
+    /// changed under the table's `proxy` lock
+    qlen: AtomicI64,
 }
 
 impl NeighParms {
@@ -190,6 +199,7 @@ impl NeighParms {
             data_state: AtomicU32::new(0),
             reachable_time: AtomicU64::new(0),
             reach_stamp: AtomicU64::new(0),
+            qlen: AtomicI64::new(0),
         };
         p.set_reach_time();
         p
@@ -538,6 +548,35 @@ pub struct NeighOps {
     /// The parameters of `dev`'s entries (Linux
     /// neigh_get_dev_parms_rcu: in_dev->arp_parms for ARP)
     pub parms: fn(dev: &NetDevice) -> &NeighParms,
+    /// Process a proxied request again once its delay passed (Linux
+    /// tbl->proxy_redo: parp_redo)
+    pub proxy_redo: fn(skb: Box<SkBuff>),
+    /// The proxy timer's callback: the table's `proxy_process`
+    pub proxy_timer: fn(u64),
+}
+
+/// What a proxied request carries on the proxy queue (Linux struct
+/// neighbour_cb)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NeighCb {
+    /// When to answer it, ms
+    pub sched_next: u64,
+    /// It came back from the queue (Linux LOCALLY_ENQUEUED): answer now
+    pub locally_enqueued: bool,
+}
+
+impl NeighCb {
+    /// `skb` came back from a proxy queue
+    pub fn locally_enqueued(skb: &SkBuff) -> bool {
+        matches!(skb.cb, crate::net::skb::SkbCb::Neigh(c) if c.locally_enqueued)
+    }
+
+    fn sched_next(skb: &SkBuff) -> u64 {
+        match skb.cb {
+            crate::net::skb::SkbCb::Neigh(c) => c.sched_next,
+            _ => 0,
+        }
+    }
 }
 
 /// Entry state + queue (under `Neighbour.inner`, Linux neigh->lock)
@@ -720,6 +759,12 @@ pub struct NeighTable {
     gc_entries: AtomicUsize,
     /// Last forced GC, ms (Linux tbl->last_flush, READ_ONCE)
     last_flush: AtomicU64,
+    /// Proxy entries (Linux tbl->phash_buckets)
+    pub phash: crate::net::pneigh::PneighTable,
+    /// Proxied requests waiting for their delay (Linux tbl->proxy_queue)
+    proxy: Mutex<SkbHead<Box<SkBuff>>>,
+    /// Fires at the earliest one's time (Linux tbl->proxy_timer)
+    proxy_timer: Alarm,
     /// neigh_periodic_work (Linux tbl->gc_work), set by `start`
     gc_work: spin::Once<Arc<IrqSpinlock<DelayedWork>>>,
 }
@@ -771,6 +816,9 @@ impl NeighTable {
             entries: AtomicUsize::new(0),
             gc_entries: AtomicUsize::new(0),
             last_flush: AtomicU64::new(0),
+            phash: crate::net::pneigh::PneighTable::new(ops.key_len),
+            proxy: Mutex::new(SkbHead::new()),
+            proxy_timer: Alarm::new(ops.proxy_timer),
             gc_work: spin::Once::new(),
         }
     }
@@ -1232,14 +1280,98 @@ impl NeighTable {
     }
 
     /// Forget every entry of a device going down, dropping queued
-    /// packets (Linux neigh_ifdown -> neigh_flush_dev)
+    /// packets, its proxy entries and the namespace's queued proxy
+    /// requests (Linux neigh_ifdown -> neigh_flush_dev,
+    /// pneigh_ifdown_and_unlock, pneigh_queue_purge). Sleeps (the proxy
+    /// entries' lock), after the table lock is dropped.
     pub fn flush_dev(&self, dev: &NetDevice) {
-        let mut o = self.lock.lock();
-        let g = rcu::read_lock();
-        let nht = self.nht.read(&g);
-        while let Some(n) = dev.neighbours.access(&o).front() {
-            self.flush_one(&mut o, nht, &n);
+        {
+            let mut o = self.lock.lock();
+            let g = rcu::read_lock();
+            let nht = self.nht.read(&g);
+            while let Some(n) = dev.neighbours.access(&o).front() {
+                self.flush_one(&mut o, nht, &n);
+            }
         }
+        self.phash.ifdown(dev, false);
+        if let Some(net) = dev.net() {
+            self.proxy_purge(&net);
+        }
+    }
+
+    /// Queue a proxied request to be answered after a random part of
+    /// its device's proxy_delay, unless proxy_qlen are queued already
+    /// (Linux pneigh_enqueue)
+    pub fn pneigh_enqueue(&'static self, p: &NeighParms, mut skb: Box<SkBuff>) {
+        let now = now_ms();
+        let delay = p.val(var::PROXY_DELAY);
+        let sched_next = if delay > 0 {
+            now + u64::from(crate::random::get_random_u32()) % delay
+        } else {
+            now
+        };
+        if p.qlen.load(Relaxed) > p.get(var::PROXY_QLEN) {
+            return;
+        }
+        skb.cb = crate::net::skb::SkbCb::Neigh(NeighCb {
+            sched_next,
+            locally_enqueued: true,
+        });
+        let mut q = self.proxy.lock();
+        q.push_back(skb);
+        p.qlen.fetch_add(1, Relaxed);
+        drop(q);
+        self.proxy_timer.arm(sched_next.saturating_mul(1_000_000));
+    }
+
+    /// The proxy timer fired (Linux neigh_proxy_process): the requests
+    /// whose time came are answered, those of a device no longer
+    /// running dropped, the timer re-armed for the next. hk answers
+    /// after the queue's lock is dropped (Linux under it).
+    pub fn proxy_process(&'static self) {
+        self.proxy_timer.fired();
+        let now = now_ms();
+        let mut due = SkbHead::new();
+        let next = {
+            let mut q = self.proxy.lock();
+            q.move_if(&mut due, |s| NeighCb::sched_next(s) <= now);
+            for s in due.iter() {
+                self.proxy_dec(s);
+            }
+            q.iter().map(NeighCb::sched_next).min()
+        };
+        if let Some(t) = next {
+            self.proxy_timer.arm(t.saturating_mul(1_000_000));
+        }
+        while let Some(skb) = due.pop_front() {
+            if skb.dev.as_ref().is_some_and(|d| d.netif_running()) {
+                (self.ops.proxy_redo)(skb);
+            }
+        }
+    }
+
+    /// A queued request of `skb`'s device left the queue (Linux
+    /// neigh_parms_qlen_dec), the queue's lock held
+    fn proxy_dec(&self, skb: &SkBuff) {
+        if let Some(d) = skb.dev.as_deref() {
+            (self.ops.parms)(d).qlen.fetch_sub(1, Relaxed);
+        }
+    }
+
+    /// Drop the queued requests of `net`'s devices (Linux
+    /// pneigh_queue_purge)
+    fn proxy_purge(&self, net: &crate::net::NetNamespace) {
+        let mut gone = SkbHead::new();
+        {
+            let mut q = self.proxy.lock();
+            q.move_if(&mut gone, |s| {
+                s.dev.as_deref().is_some_and(|d| d.net_is(net))
+            });
+            for s in gone.iter() {
+                self.proxy_dec(s);
+            }
+        }
+        drop(gone);
     }
 
     /// Administrative add/replace (RTM_NEWNEIGH with netlink flags

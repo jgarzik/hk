@@ -73,6 +73,8 @@ pub mod neigh_sysctl;
 pub mod netlink;
 pub mod packet;
 pub mod ping;
+#[path = "core/pneigh.rs"]
+pub mod pneigh;
 pub mod proc;
 pub mod raw;
 pub mod rtnl;

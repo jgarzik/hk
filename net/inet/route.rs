@@ -73,6 +73,27 @@ pub fn confirm_neigh(rt: &Rtable, daddr: Ipv4Addr) {
     crate::net::arp::arp_tbl().confirm_key(&rt.dev, &crate::net::neigh::key4(key));
 }
 
+/// The output device of `net`'s forwarding route for `daddr` (Linux
+/// ip_route_input_slow's fib_lookup with forwarding on: an RTN_UNICAST
+/// result's FIB_RES_DEV); None for a martian destination or a route of
+/// another type
+pub fn input_fwd(net: &NetNamespace, daddr: Ipv4Addr) -> Option<Arc<NetDevice>> {
+    if zeronet(daddr) || daddr.is_broadcast() || daddr.is_multicast() || daddr.is_loopback() {
+        return None;
+    }
+    let key = FlowKey {
+        daddr,
+        oif: 0,
+        scope: crate::net::inet::ifaddr::RT_SCOPE_UNIVERSE,
+        tos: 0,
+    };
+    let e = net.fib.lookup(&key).ok()?;
+    if e.rtype != RouteType::Unicast {
+        return None;
+    }
+    e.dev.clone()
+}
+
 fn zeronet(a: Ipv4Addr) -> bool {
     (a.0 >> 24) == 0
 }
