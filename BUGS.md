@@ -1056,6 +1056,10 @@ Designs that grew one commit at a time. Tag = roadmap phase
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
   as old as its first.
+  `fs/proc/mod.rs` `proc_d_delete` keeps the dentries of a dead task
+  cached at their last put (Linux pid_delete_dentry, the d_delete of
+  pid_dentry_operations: proc_inode_is_dead); they go only when
+  `proc_revalidate` or the shrinker finds them.
 - **Stale comments** (as touched): "for now"/TODO markers.
 
 ## Review gaps, by phase
