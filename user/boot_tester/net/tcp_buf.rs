@@ -26,6 +26,8 @@
 //!   TIME_WAIT's length) is a timewait entry (sockstat tw, a 05 line
 //!   with the timewait timer in /proc/net/tcp); data from the peer is
 //!   answered with a reset.
+//! - TCP_LINGER2: reads tcp_fin_timeout until set, then seconds (at
+//!   most TCP_FIN_TIMEOUT_MAX, 120), -1 for any negative value.
 //! - TCP_PEEK_OFF: SO_PEEK_OFF on TCP (Linux 6.10 on: before it,
 //!   EOPNOTSUPP): MSG_PEEK reads from the offset and moves it on, a
 //!   read moves it back.
@@ -53,6 +55,7 @@ pub fn run_tests() {
     test_max_tw();
     test_fin_wait2_tw();
     test_peek_off();
+    test_linger2();
 }
 
 /// A connected pair over lo: (client, server, listener)
@@ -480,5 +483,25 @@ fn test_peek_off() {
     close(c);
     close(s);
     close(l);
+    t.done();
+}
+
+const TCP_LINGER2: i32 = 8;
+
+fn test_linger2() {
+    let mut t = T::new(b"TCP_LINGER2");
+    let fd = tcp();
+    let get = |fd| getint(fd, IPPROTO_TCP, TCP_LINGER2).1 as i64;
+    let fin = sysctl_ints(b"/proc/sys/net/ipv4/tcp_fin_timeout\0")[0];
+    t.eq(b"default", get(fd), fin);
+    t.eq(b"set", setint(fd, IPPROTO_TCP, TCP_LINGER2, 30), 0);
+    t.eq(b"30", get(fd), 30);
+    setint(fd, IPPROTO_TCP, TCP_LINGER2, 1000);
+    t.eq(b"max", get(fd), 120);
+    setint(fd, IPPROTO_TCP, TCP_LINGER2, -5);
+    t.eq(b"negative", get(fd), -1);
+    setint(fd, IPPROTO_TCP, TCP_LINGER2, 0);
+    t.eq(b"unset", get(fd), fin);
+    close(fd);
     t.done();
 }

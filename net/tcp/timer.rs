@@ -244,7 +244,7 @@ impl TcpCb {
             // timewait entry, else it is over
             if self.state == TcpState::FinWait2 && self.orphan {
                 let tmo = self.fin_time().saturating_sub(TIMEWAIT_LEN);
-                if tmo > 0 {
+                if self.opts.linger2 >= 0 && tmo > 0 {
                     self.fw2_time_wait(tmo, out);
                 } else {
                     self.abort(out);

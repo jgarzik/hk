@@ -120,6 +120,7 @@ pub const TCP_KEEPIDLE: i32 = 4;
 pub const TCP_KEEPINTVL: i32 = 5;
 pub const TCP_KEEPCNT: i32 = 6;
 pub const TCP_SYNCNT: i32 = 7;
+pub const TCP_LINGER2: i32 = 8;
 pub const TCP_DEFER_ACCEPT: i32 = 9;
 pub const TCP_WINDOW_CLAMP: i32 = 10;
 pub const TCP_INFO: i32 = 11;
@@ -128,6 +129,8 @@ pub const TCP_CONGESTION: i32 = 13;
 pub const TCP_USER_TIMEOUT: i32 = 18;
 pub const TCP_FASTOPEN: i32 = 23;
 pub const TCP_NOTSENT_LOWAT: i32 = 25;
+/// Linux TCP_FIN_TIMEOUT_MAX (s): the largest TCP_LINGER2
+const FIN_TIMEOUT_MAX: i32 = 120;
 /// Linux MAX_TCP_KEEPIDLE / KEEPINTVL / KEEPCNT, MAX_TCP_SYNCNT
 const MAX_KEEPIDLE: i32 = 32767;
 const MAX_KEEPCNT: i32 = 127;
@@ -2432,6 +2435,13 @@ impl TcpSock {
                 TCP_USER_TIMEOUT => g.cb.opts.user_timeout = val as u32,
                 TCP_DEFER_ACCEPT => g.cb.opts.defer_accept = info::secs_to_retrans(val),
                 TCP_WINDOW_CLAMP => g.cb.set_window_clamp(val)?,
+                TCP_LINGER2 => {
+                    g.cb.opts.linger2 = if val < 0 {
+                        -1
+                    } else {
+                        val.min(FIN_TIMEOUT_MAX) * 1000
+                    };
+                }
                 TCP_FASTOPEN => {
                     if val < 0 || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen) {
                         return bad();
@@ -2510,6 +2520,12 @@ impl TcpSock {
             TCP_FASTOPEN => g.cb.live.fastopen.get(),
             TCP_NOTSENT_LOWAT => o.notsent_lowat,
             TCP_WINDOW_CLAMP => g.cb.window_clamp(),
+            // Linux: the sysctl's when unset, -1 when negative
+            TCP_LINGER2 => match o.linger2 {
+                0 => self.sk.net.sysctl.tcp_fin_timeout.load(Ordering::Relaxed) as u32,
+                l if l < 0 => l as u32,
+                l => l as u32 / 1000,
+            },
             _ => return Err(KernelError::NoProtocolOption),
         };
         Ok(OptOut::Int(v as i32))

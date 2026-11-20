@@ -455,7 +455,20 @@ impl TcpCb {
                 out.wake |= wake::STATE;
                 let fin = s.has(flags::FIN);
                 let end = s.end_seq.wrapping_sub(u32::from(fin));
-                if !self.orphan || (s.seq != s.end_seq && after(end, self.rcv_nxt)) {
+                if !self.orphan {
+                    return true;
+                }
+                if self.opts.linger2 < 0 {
+                    // Linux tcp_done, TCPAbortOnData; the segment is
+                    // answered with a reset (tcp_v4_do_rcv)
+                    if let Some(r) = super::output::reset_for(s) {
+                        self.reset_seg(r, out);
+                    }
+                    self.set_closed(out);
+                    self.net_stat(LINUX_MIB_TCPABORTONDATA);
+                    return false;
+                }
+                if s.seq != s.end_seq && after(end, self.rcv_nxt) {
                     return true;
                 }
                 !self.orphan_fw2(now, fin, out)

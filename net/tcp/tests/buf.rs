@@ -511,3 +511,43 @@ fn send_memory_is_truesize() {
     assert_eq!(p.a.snd_una, p.a.snd_max);
     assert_eq!(p.a.wmem_queued, 0);
 }
+
+/// TCP_LINGER2 (Linux tp->linger2, tcp_fin_time): a positive value is
+/// the orphan's FIN_WAIT_2 lifetime (at least 3.5 RTO); negative, an
+/// orphan reaching FIN_WAIT_2 is done with a reset (TCPAbortOnData),
+/// and one closed in FIN_WAIT_2 is reset (TCPAbortOnLinger)
+#[test]
+fn linger2() {
+    let (mut p, _) = mib_pair_buf(1460, 1 << 20, 0);
+    p.a.opts.linger2 = 5000;
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    assert!(p.a_out.timewait);
+    assert_eq!(TwCb::from_cb(&p.a).expires() - p.a.clock, 5000);
+    // Negative: the ACK of our FIN ends it
+    let (mut p, m) = mib_pair_buf(1460, 1 << 20, 0);
+    p.a.opts.linger2 = -1;
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::Closed);
+    assert!(!p.a_out.timewait);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONDATA), 1);
+    assert!(p.log.iter().any(|l| l.1 && l.2.has(flags::RST)));
+    // Negative, closed in FIN_WAIT_2
+    let (mut p, m) = mib_pair_buf(1460, 1 << 20, 0);
+    p.a.opts.linger2 = -1;
+    let mut out = Out::default();
+    p.a.shutdown_wr(p.now, &mut out);
+    p.take(true, out);
+    p.run();
+    assert_eq!(p.a.state, TcpState::FinWait2);
+    let mut out = Out::default();
+    p.a.close(false, p.now, &mut out);
+    assert!(wire(&out).iter().any(|s| s.has(flags::RST)));
+    assert_eq!(p.a.state, TcpState::Closed);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPABORTONLINGER), 1);
+}

@@ -293,6 +293,9 @@ pub struct Opts {
     pub notsent_lowat: u32,
     /// TCP_DEFER_ACCEPT (retransmissions; stored only)
     pub defer_accept: u8,
+    /// TCP_LINGER2: an orphan's FIN_WAIT_2 lifetime, ms (Linux
+    /// tp->linger2: 0 for tcp_fin_timeout, negative for none: reset)
+    pub linger2: i32,
     /// TCP_WINDOW_CLAMP as set (0: none), for the next connection and
     /// a listener's children (Linux tp->window_clamp, copied to them)
     pub window_clamp: u32,
@@ -1635,7 +1638,12 @@ impl TcpCb {
             }
         }
         // Linux __tcp_close's adjudge_to_death: an orphan's FIN_WAIT_2
-        if self.state == TcpState::FinWait2 && self.orphan_fw2(now, false, out) {
+        // ends at once with TCP_LINGER2 negative
+        if self.state == TcpState::FinWait2 && self.opts.linger2 < 0 {
+            self.send_reset(out);
+            self.set_closed(out);
+            self.net_stat(LINUX_MIB_TCPABORTONLINGER);
+        } else if self.state == TcpState::FinWait2 && self.orphan_fw2(now, false, out) {
             return;
         }
         // Too many orphans or past the memory limit, it goes now
@@ -1781,11 +1789,15 @@ impl TcpCb {
         out.timewait = true;
     }
 
-    /// Linux tcp_fin_time: tcp_fin_timeout (no TCP_LINGER2), at least
+    /// Linux tcp_fin_time: TCP_LINGER2, or tcp_fin_timeout, at least
     /// 3.5 RTO
     pub(super) fn fin_time(&self) -> u64 {
         let rto = self.live.rto.get();
-        self.cfg.fin_timeout.max((rto << 2) - (rto >> 1))
+        let t = match self.opts.linger2 {
+            0 => self.cfg.fin_timeout as i64,
+            l => i64::from(l),
+        };
+        t.max(((rto << 2) - (rto >> 1)) as i64) as u64
     }
 
     /// An orphan in FIN_WAIT_2 (Linux __tcp_close; tcp_rcv_state_process
