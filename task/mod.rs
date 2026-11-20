@@ -17,6 +17,7 @@ pub mod exec;
 pub mod fair;
 pub mod fdbits;
 pub use fdbits::FdTable;
+pub mod exit;
 pub mod fdtable;
 pub mod fork;
 pub mod id;

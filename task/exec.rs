@@ -11,13 +11,15 @@ use alloc::vec::Vec;
 
 use crate::arch::{FrameAlloc, PageFlags, PageTable, phys_to_virt};
 
-use super::percpu;
+use super::percpu::{self, TASKLIST, TaskRef, task_ref};
 use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
+use crate::task::{Task, TaskState};
 use crate::uaccess::UserPtr;
 use crate::util::elf::ElfExecutable;
 use crate::util::error::{KernelError, KernelResult};
 use core::convert::Infallible;
+use core::sync::atomic::Ordering;
 
 pub use super::argstr::ArgStrings;
 
@@ -972,7 +974,7 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
     let Some(sig) = crate::signal::get_task_signal_struct(me) else {
         return Ok(());
     };
-    if percpu::exec_waits(me) {
+    if exec_waits(me) {
         if !sig.start_exec(me) {
             return Err(KernelError::WouldBlock);
         }
@@ -981,7 +983,7 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
         let w = core::pin::pin!(WaitEntry::new());
         let r = loop {
             wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
-            if !percpu::exec_waits(me) {
+            if !exec_waits(me) {
                 break Ok(());
             }
             if crate::signal::fatal_signal_pending() {
@@ -996,7 +998,7 @@ fn de_thread(me: &crate::task::Task) -> KernelResult<()> {
     // Released after TASKLIST: the old leader and exited threads; a
     // tracer waiting for the old leader rechecks (Linux de_thread:
     // __wake_up_parent before its silent release)
-    let gone = percpu::take_leadership(me);
+    let gone = take_leadership(me);
     if !gone.is_empty() {
         drop(gone);
         crate::task::proc::CHILD_EXIT_WQ.wake_all();
@@ -1466,4 +1468,131 @@ mod tests {
         let mut s = [(2 * P, 3 * P), (10 * P, 12 * P)];
         assert_eq!(highest_gap(&mut s, 8 * P, 0), Some(7 * P));
     }
+}
+
+/// A thread of group `tgid` other than `tid` that an exec by `tid`
+/// still waits for (Linux de_thread: notify_count, dropped at each
+/// thread's release_task, then the leader's exit_state): any other
+/// thread still listed, a traced zombie until its tracer releases it,
+/// but the leader once it is a zombie
+pub fn exec_waits(me: &Task) -> bool {
+    TASKLIST.read().threads(me.pid).any(|u| {
+        !core::ptr::eq(u.task, me) && !(u.leader && matches!(u.state, TaskState::Zombie(_)))
+    })
+}
+
+/// After de_thread: `caller` is the only thread of its group left
+/// running and becomes its leader, taking the old leader's place (Linux de_thread:
+/// its parent, exit signal and start time); the exited threads are
+/// removed from the table and returned, to be released by the caller
+/// after TASKLIST
+pub fn take_leadership(caller: &Task) -> Vec<TaskRef> {
+    let (tgid, tid) = (caller.pid, caller.tid());
+    // Room made before the write lock (nothing allocates under
+    // TASKLIST): each thread of the group may be a removed zombie;
+    // again if the group grew
+    let mut room = TASKLIST.read().threads(tgid).count();
+    let (mut zombies, mut gone, mut table) = loop {
+        let zombies: Vec<TaskRef> = Vec::with_capacity(room);
+        let gone: Vec<TaskRef> = Vec::with_capacity(room);
+        let table = TASKLIST.write();
+        let n = table.threads(tgid).count();
+        if n <= room {
+            break (zombies, gone, table);
+        }
+        drop(table);
+        room = n;
+    };
+    let Some(l) = table.get(tgid).filter(|l| l.leader) else {
+        drop(table);
+        return gone;
+    };
+    let ltid = l.task.tid();
+    if ltid == tid {
+        drop(table);
+        return gone;
+    }
+    let (start, ucounts) = (l.task.start_time(), l.ucounts());
+    for t in table.threads(tgid) {
+        if t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)) {
+            zombies.push(task_ref(t.task));
+        }
+    }
+    // exchange_tids first (Linux de_thread: the caller takes the
+    // leader's tid and pid, the old leader its own, then release_task of
+    // the old leader), while both are listed: the leader's pid moves
+    // straight from one task to the other, so an RCU reader of it always
+    // finds one of them
+    let me = table.view(caller).map(|v| task_ref(v.task));
+    let old = zombies.iter().find(|t| t.tid() == ltid).cloned();
+    if let (Some(me), Some(l)) = (&me, &old) {
+        // Each takes the other's struct pid (Linux exchange_tids:
+        // rcu_assign_pointer of thread_pid), the replaced references
+        // dropped a grace period later
+        let (a, b) = (
+            me.thread_pid.get_protected(&table),
+            l.thread_pid.get_protected(&table),
+        );
+        me.thread_pid.replace(b.clone(), &mut table).defer_put();
+        l.thread_pid.replace(a.clone(), &mut table).defer_put();
+        let pids = (b, a);
+        // The pid hash names each by its new number (hlist_replace_rcu)
+        if let Some(p) = &pids.0 {
+            p.set_task(Some(me), &mut table);
+        }
+        if let Some(p) = &pids.1 {
+            p.set_task(Some(l), &mut table);
+        }
+        // Its real parent is the old leader's already: threads share it
+        // (fork copies it, `adopt` moves them all)
+        debug_assert!(core::ptr::eq(me.parent_ptr(), l.parent_ptr()));
+        l.set_tid(tid);
+        me.set_tid(ltid);
+        // The old leader's RLIMIT_NPROC charge goes with it; the caller
+        // keeps its own as the process's
+        ucounts.dec(crate::task::Ucount::Nproc, 1);
+    }
+    // Their numbers go back only once the caller holds the leader's
+    // pid and heads its group and session (Linux de_thread:
+    // exchange_tids and transfer_pid first, free_pid when no task uses
+    // a pid in any role): the leader's pid may be the group's or the
+    // session's, which a removed thread still names
+    let removed = gone.len();
+    for z in zombies.drain(..) {
+        table.unhash(&z, false);
+        gone.push(z);
+    }
+    let Some(me) = me else {
+        for t in &gone[removed..] {
+            table.release_pids(t);
+            table.detach_thread_pid(t);
+        }
+        drop(table);
+        return gone;
+    };
+    if old.is_none() {
+        me.set_tid(ltid);
+    }
+    // The new leader takes the old one's place among its parent's
+    // children (tracer and parent links are task references: nothing
+    // else names the old tid) and leads the group; the zombies left
+    // its thread list as they were unhashed (Linux release_task)
+    table.link_child(&me);
+    if let Some(mut m) = table.get_mut(ltid) {
+        m.leader = true;
+        // Linux de_thread: the new leader's exit signal is SIGCHLD
+        m.exit_signal = crate::signal::ExitSignal::SIGCHLD;
+        m.task.start_time.store(start, Ordering::Relaxed);
+    }
+    // ... and its place on the group's and session's lists (Linux
+    // de_thread: transfer_pid PIDTYPE_PGID, PIDTYPE_SID)
+    table.attach_pids(&me);
+    // Then the removed threads' numbers no task uses go back: the
+    // caller's old one, now the old leader's, and exited threads' own
+    for t in &gone[removed..] {
+        table.release_pids(t);
+        table.detach_thread_pid(t);
+    }
+    drop(table);
+    gone
 }

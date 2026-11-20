@@ -176,7 +176,7 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
             let reparented = traced && real.as_ref().is_none_or(|r| r.pid != parent.pid);
             t.leader()
                 && !reparented
-                && !crate::task::percpu::group_pending(table, t.task.pid, &[tid])
+                && !crate::task::exit::group_pending(table, t.task.pid, &[tid])
         }
         Zombie::Leader(_) | Zombie::Detached(_) => true,
     };
@@ -264,7 +264,7 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie) -> Told {
     // A stop-signal exit signal's flushed entries, freed after TASKLIST
     let mut gone = super::SigPending::new();
     // Its pidfd pollers first (Linux do_notify_parent: do_notify_pidfd)
-    crate::task::percpu::notify_pidfd(table, tid);
+    crate::task::exit::notify_pidfd(table, tid);
     let Some(r) = receiver(table, z) else {
         return Told {
             gone,

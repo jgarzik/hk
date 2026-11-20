@@ -77,7 +77,7 @@ pub fn find_child_reaper(me: &TaskRef) {
         if !is_reaper(&table, ns, me) {
             return;
         }
-        match crate::task::percpu::live_thread(&table, me.pid) {
+        match crate::task::exit::live_thread(&table, me.pid) {
             Some(t) => (false, set_reaper(&mut table, ns, &t)),
             None => (ns.level != 0, None),
         }
@@ -182,7 +182,8 @@ fn ns_tasks(ns: &PidNamespace, pid: crate::task::Pid) -> Vec<TaskRef> {
 /// last pids wake CHILD_EXIT_WQ).
 fn reap_ns(me: &TaskRef, ns: &PidNamespace, init_pids: u32) {
     use crate::sync::waitqueue::WaitEntry;
-    use crate::task::percpu::{SleepState, has_children, reap_zombie_child_times, schedule};
+    use crate::task::exit::{has_children, reap_zombie_child_times};
+    use crate::task::percpu::{SleepState, schedule};
     use crate::task::proc::CHILD_EXIT_WQ;
     use crate::task::wait_options::__WALL;
     let w = core::pin::pin!(WaitEntry::new());

@@ -1081,7 +1081,7 @@ pub(crate) fn ptrace_unlink(t: &mut percpu::TaskViewMut<'_>) {
 
 /// The exiting task's tracees are detached (Linux exit_ptrace), one per
 /// TASKLIST write section: stopped ones go on, and PTRACE_O_EXITKILL
-/// ones are killed; then the zombies ([`percpu::detach_zombies`])
+/// ones are killed; then the zombies ([`crate::task::exit::detach_zombies`])
 pub fn exit_ptrace() {
     let me = percpu::current();
     // Most tasks trace nothing: look under the read lock first
@@ -1093,7 +1093,7 @@ pub fn exit_ptrace() {
         return;
     }
     while detach_live(&me) {}
-    percpu::detach_zombies(&me);
+    crate::task::exit::detach_zombies(&me);
 }
 
 /// [`exit_ptrace`]'s write section for one live tracee of `me`: an

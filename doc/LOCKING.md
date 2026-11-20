@@ -2012,8 +2012,8 @@ pub struct Zone {
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
 **Location:** `mm/mod.rs` (`Mm`, `MmRef`), `mm/memory.rs`
-(`exit_mmap`), `task/percpu.rs` (`exit_current`, `exec_replace_image`),
-`task/fork.rs` (`do_clone`)
+(`exit_mmap`), `task/exit.rs` (`exit_current`), `task/percpu.rs`
+(`exec_replace_image`), `task/fork.rs` (`do_clone`)
 
 - `Mm.users` (`AtomicUsize`, Linux mm_users) counts the tasks running in
   the address space and pinned users (`MmRef`: ptrace PEEK/POKE,
@@ -5333,7 +5333,7 @@ For `futex_requeue()` with two different buckets:
 #### Robust Futex Cleanup
 
 Robust futexes are cleaned up during task exit via `exit_robust_list()`:
-1. Called from task exit path in `task/percpu.rs`
+1. Called from task exit path in `task/exit.rs`
 2. Walks the userspace robust list with a 2048 entry limit
 3. For each entry the task owns, sets `FUTEX_OWNER_DIED` by a user
    cmpxchg against the value read (`uaccess::cmpxchg_user_u32`, Linux

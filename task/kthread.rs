@@ -160,7 +160,7 @@ fn kthread_exit() -> ! {
     // Dropped after TASKLIST (nothing is released under it)
     let me = crate::task::percpu::TASKLIST.write().remove(tid);
     drop(me);
-    crate::task::percpu::exit_current(None)
+    crate::task::exit::exit_current(None)
 }
 
 /// True once `kthread_stop` was called on the current thread

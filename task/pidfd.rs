@@ -75,7 +75,7 @@ impl Pidfd {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.pid.wait_pidfd);
         }
-        match crate::task::percpu::pidfd_exited(&self.pid) {
+        match crate::task::exit::pidfd_exited(&self.pid) {
             None => POLLIN | POLLRDNORM | POLLHUP,
             Some(true) => POLLIN | POLLRDNORM,
             Some(false) => 0,

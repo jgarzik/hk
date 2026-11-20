@@ -50,7 +50,7 @@ pub fn sys_exit_group(status: i32) -> u64 {
 pub fn do_exit(wait_status: i32) -> ! {
     // Release everything, become a zombie carrying the status for
     // wait4/waitid, switch away (never returns)
-    super::percpu::exit_current(Some(wait_status));
+    super::exit::exit_current(Some(wait_status));
 }
 
 /// sys_clone - create a new thread or process
@@ -234,15 +234,14 @@ pub fn sys_wait4(
 
         // A tracee's ptrace stop: (code << 8) | 0x7f (Linux
         // wait_task_stopped)
-        if let Some((tid, code, (utime, stime))) =
-            super::percpu::wait_traced(current_pid, pid, false)
+        if let Some((tid, code, (utime, stime))) = super::exit::wait_traced(current_pid, pid, false)
         {
             let st = ((code as i32) << 8) | 0x7f;
             let r = put_status(wstatus, st).and_then(|()| put_times(rusage, utime, stime));
             break r.map(|()| tid as i64);
         }
         if let Some((child_pid, wait_status, utime, stime)) =
-            super::percpu::reap_zombie_child_times(current_pid, pid, options)
+            super::exit::reap_zombie_child_times(current_pid, pid, options)
         {
             // The zombie holds the Linux wait status word; the child's
             // and its children's CPU time (Linux getrusage(RUSAGE_BOTH))
@@ -254,19 +253,19 @@ pub fn sys_wait4(
         // wait_task_stopped, wait_task_continued: getrusage(p,
         // RUSAGE_BOTH))
         if let Some((tid, r, _, (utime, stime))) =
-            super::percpu::wait_jobctl(current_pid, pid, options)
+            super::exit::wait_jobctl(current_pid, pid, options)
         {
             let st = match r {
-                super::percpu::JobReport::Stopped(code) => ((code as i32) << 8) | 0x7f,
-                super::percpu::JobReport::Continued => 0xffff,
+                super::exit::JobReport::Stopped(code) => ((code as i32) << 8) | 0x7f,
+                super::exit::JobReport::Continued => 0xffff,
             };
             let r = put_status(wstatus, st).and_then(|()| put_times(rusage, utime, stime));
             break r.map(|()| tid as i64);
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, pid, options)
-            && !super::percpu::has_tracees(current_pid, pid)
+        if !super::exit::has_children(current_pid, pid, options)
+            && !super::exit::has_tracees(current_pid, pid)
         {
             break Err(KernelError::NoChild);
         }
@@ -436,7 +435,7 @@ pub fn sys_waitid(
         // A tracee's ptrace stop (CLD_TRAPPED)
         let wnowait = options & super::wait_options::WNOWAIT != 0;
         if let Some((tid, code, (utime, stime))) =
-            super::percpu::wait_traced(current_pid, wait_pid, wnowait)
+            super::exit::wait_traced(current_pid, wait_pid, wnowait)
         {
             let info = chld_info(si_code::CLD_TRAPPED, tid as i32, code as i32);
             let r = put_times(rusage, utime, stime).and_then(|()| put_waitid_info(infop, &info));
@@ -446,7 +445,7 @@ pub fn sys_waitid(
         // Reap a zombie child (with WNOWAIT, only report it); only for
         // WEXITED
         let zombie = if options & WEXITED != 0 {
-            super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
+            super::exit::reap_zombie_child_times(current_pid, wait_pid, options)
         } else {
             None
         };
@@ -469,11 +468,11 @@ pub fn sys_waitid(
         // time (Linux wait_task_stopped / wait_task_continued:
         // getrusage(p, RUSAGE_BOTH))
         if let Some((tid, r, uid, (utime, stime))) =
-            super::percpu::wait_jobctl(current_pid, wait_pid, options)
+            super::exit::wait_jobctl(current_pid, wait_pid, options)
         {
             let (code, status) = match r {
-                super::percpu::JobReport::Stopped(c) => (si_code::CLD_STOPPED, c as i32),
-                super::percpu::JobReport::Continued => {
+                super::exit::JobReport::Stopped(c) => (si_code::CLD_STOPPED, c as i32),
+                super::exit::JobReport::Continued => {
                     (si_code::CLD_CONTINUED, crate::signal::SIGCONT.nr() as i32)
                 }
             };
@@ -490,8 +489,8 @@ pub fn sys_waitid(
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, wait_pid, options)
-            && !super::percpu::has_tracees(current_pid, wait_pid)
+        if !super::exit::has_children(current_pid, wait_pid, options)
+            && !super::exit::has_tracees(current_pid, wait_pid)
         {
             break Err(KernelError::NoChild);
         }

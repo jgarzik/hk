@@ -1262,7 +1262,7 @@ impl TcpSock {
     /// inet_release: no linger time under PF_EXITING)
     fn linger_wait(&self) {
         let secs = match self.sk.linger() {
-            Some(s) if s != 0 && !crate::task::percpu::current_exiting() => s,
+            Some(s) if s != 0 && !crate::task::exit::current_exiting() => s,
             _ => return,
         };
         let ns = u64::from(secs) * 1_000_000_000;
