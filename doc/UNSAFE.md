@@ -42,6 +42,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | a task's saved user FP/SIMD state `ThreadStruct` and the per-CPU binding `PerCpu::fpsimd_last_state` (`arch/aarch64/fpsimd.rs`, Linux thread.uw.fpsimd_state, fpsimd_last_state.st; `with_current_state`, `thread_switch`, `dup_thread` unsafe: the running task's own state, the outgoing task current, a task not running) | cell accessed only by its task, flushed state checked; the binding followed only while the running task's registers are live, when it names that task's state (set by `bind_task_to_cpu`), else only compared |
 | `Pod` byte views | marker trait |
 | `IoMem` registers | checked volatile |
+| `IoRemap` (`hw/mmio.rs`, Linux pci_ioremap_bar / iounmap; Rust-for-Linux `io::mem::IoMem`) | owned register mapping, never copied out, unmapped on drop |
 | `DmaBox` (`hw/dma.rs`, Rust-for-Linux CoherentAllocation) | owned device memory, freed on drop |
 | page-table `PgTables` / `Pte` / `PteTable` / `Pmd` / `Dir`, `PgPrune` (`mm/pgtable.rs`) | typed handle borrowing the lock |
 | vmalloc-area range `VmArea` (`mm/vmalloc.rs`, Linux vm_struct) | ownership token |

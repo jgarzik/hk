@@ -136,10 +136,8 @@ SACK/DSACK, TLP, Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
-NIC removal: e1000 leaves the function's bus mastering and memory
-space on (no pci_disable_device) and its BAR mapped (no iounmap); an
-unregistered `NetDevice` lives on while queued skbs reference it
-(no netdev_wait_allrefs; it is down and driverless).
+NIC removal: an unregistered `NetDevice` lives on while queued skbs
+reference it (no netdev_wait_allrefs; it is down and driverless).
 A device MTU change leaves path MTU exceptions (`route::NhExceptions`)
 as they are (Linux NETDEV_CHANGEMTU fib_sync_mtu lowers them with it and
 raises those equal to the old MTU).
@@ -904,16 +902,11 @@ QEMU's xHCI hides all of them.
 
 ## Driver probe failure leaks
 
-**Location**: `hw/net/e1000.rs` (`e1000_probe`, `alloc_bufs`),
-`hw/net/virtio_net.rs` (`setup_queues`, `probe`)
+**Location**: `hw/net/virtio_net.rs` (`setup_queues`, `probe`)
 
-A probe that fails part-way does not undo what it set up (Linux
-devm_*, or the probe's goto unwind): e1000's descriptor rings and
-buffers (`DmaCoherent`, freed by hand only at remove) and its register
-mapping leak when a later allocation fails; virtio-net's virtqueues
-and buffer pools leak when the second queue or a pool fails. Owners
-freeing on drop (`DmaBox`) would unwind them; doc/res/hk-driver-api.md
-proposes the design.
+A probe that fails part-way does not undo what it set up (Linux the
+probe's goto unwind): virtio-net's virtqueues and buffer pools leak
+when the second queue or a pool fails.
 
 ## No DMA for 32-bit devices with RAM above 4GB
 

@@ -6,17 +6,20 @@
 //! (never a Rust reference: the device changes the memory and reads may
 //! have side effects), at an offset checked against the window and the
 //! access width. Making one is the only unsafe step: the caller vouches
-//! that the range is the device's registers, mapped for good.
+//! that the range is the device's registers, mapped as long as the
+//! window exists. An [`IoRemap`] owns its mapping and unmaps it when
+//! dropped (Linux pci_iounmap at a driver's remove or failed probe).
 
 use core::ptr::{NonNull, read_volatile, write_volatile};
 
-use crate::mm::ioremap::ioremap;
+use crate::mm::ioremap::{ioremap, iounmap};
 
 /// A mapped register window
 ///
 /// # Invariants
-/// `len` bytes at `base` are device memory, mapped for the kernel's life
-/// (hk never unmaps an ioremap).
+/// `len` bytes at `base` are device memory, mapped while this window or
+/// a copy of it exists (one from [`IoMem::ioremap`] for the kernel's
+/// life; the one inside an [`IoRemap`] is never copied out).
 #[derive(Clone, Copy)]
 pub struct IoMem {
     base: NonNull<u8>,
@@ -50,7 +53,7 @@ impl IoMem {
         // SAFETY: the caller's MMIO range (this fn's contract)
         let p = unsafe { ioremap(phys, len as u64) }.ok()?;
         // SAFETY: ioremap mapped `len` bytes of the caller's MMIO range,
-        // and hk never unmaps it
+        // and nothing unmaps it
         Some(unsafe { Self::new(NonNull::new(p)?, len) })
     }
 
@@ -152,4 +155,52 @@ access! {
     u16: read16, write16, try_read16, try_write16;
     u32: read32, write32, try_read32, try_write32;
     u64: read64, write64, try_read64, try_write64;
+}
+
+/// A register window that owns its ioremap and unmaps it when dropped
+/// (Linux pci_ioremap_bar / iounmap; Rust-for-Linux `io::mem::IoMem`,
+/// whose drop iounmaps)
+///
+/// # Invariants
+/// `io` is the whole mapping `ioremap` returned, owned by this value
+/// alone: it is never copied out, so no window into it outlives `self`.
+pub struct IoRemap {
+    io: IoMem,
+}
+
+impl IoRemap {
+    /// ioremap `len` bytes of device memory at physical `phys`
+    ///
+    /// # Safety
+    /// As [`IoMem::ioremap`].
+    pub unsafe fn new(phys: u64, len: usize) -> Option<Self> {
+        // SAFETY: the caller's MMIO range (this fn's contract)
+        let p = unsafe { ioremap(phys, len as u64) }.ok()?;
+        // SAFETY: ioremap mapped `len` bytes of the caller's MMIO range;
+        // `drop` unmaps it once no window into it is left
+        let io = unsafe { IoMem::new(NonNull::new(p)?, len) };
+        // INVARIANT: the whole mapping, kept private
+        Some(Self { io })
+    }
+
+    /// Volatile read of the 32-bit register at `off` (panics outside)
+    #[inline]
+    pub fn read32(&self, off: usize) -> u32 {
+        self.io.read32(off)
+    }
+
+    /// Volatile write of the 32-bit register at `off` (panics outside)
+    #[inline]
+    pub fn write32(&self, off: usize, v: u32) {
+        self.io.write32(off, v)
+    }
+}
+
+impl Drop for IoRemap {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `ioremap` returned for `len` bytes, owned
+        // by this value alone (type invariant): with it dropping, no
+        // window into it is left
+        unsafe { iounmap(self.io.base.as_ptr(), self.io.len as u64) };
+    }
 }

@@ -33,9 +33,6 @@ virtio-net's 418. Chip-specific logic is the remainder: the MAC filter, link
 status, the virtio feature bits.
 
 Bugs these patterns caused (found here, not fixed; they belong in BUGS.md):
-- `e1000_probe` leaks every earlier coherent block when a later
-  `dma_alloc_coherent` or `alloc_bufs` fails. `alloc_bufs` also grows with
-  infallible `Vec::with_capacity`/`push` (doc/STYLE.md).
 - virtio-net `setup_queues` leaks the RX virtqueue and pool when the TX side
   fails. `VirtioNetDriver::probe` leaks the queues and the NAPI
   registration when `try_arc` or `request_irq` fails.
