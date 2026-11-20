@@ -3251,3 +3251,20 @@ fn rto_delta_rounds_up() {
     assert!(p.a.schedule_loss_probe(100, false));
     assert_eq!(p.a.live.tmr.get(), Some((Tmr::LossProbe, 100 + rto)));
 }
+
+/// A simultaneous open delivers two packets each way (Linux: our SYN,
+/// still on the retransmit queue, acked in tcp_ack's
+/// tcp_clean_rtx_queue, TCPDelivered; then tcp_rcv_state_process
+/// SYN_RECV's SYN-ACK delivery, not in the MIB)
+#[test]
+fn simultaneous_open_delivered() {
+    use crate::net::mib::*;
+    let mut p = crossed_syns();
+    let m = crate::net::mib::NetMib::new().unwrap();
+    p.a.mib = Some(m.clone());
+    p.run();
+    assert_eq!(p.a.state, TcpState::Established);
+    assert_eq!(p.b.state, TcpState::Established);
+    assert_eq!((p.a.delivered, p.b.delivered), (2, 2));
+    assert_eq!(m.net.fold(LINUX_MIB_TCPDELIVERED), 1);
+}

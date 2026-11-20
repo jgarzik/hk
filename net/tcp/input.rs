@@ -332,6 +332,12 @@ impl TcpCb {
             // Linux tcp_rcv_state_process: tcp_ack(FLAG_SLOWPATH)
             self.net_stat_if(s.seq_len() == 0, LINUX_MIB_TCPPUREACKS);
             self.snd_una = s.ack;
+            if !self.passive {
+                // Simultaneous open: our SYN is on the retransmit queue,
+                // acked in tcp_ack (tcp_clean_rtx_queue, TCPDelivered)
+                self.count_delivered(1);
+                self.net_stat(LINUX_MIB_TCPDELIVERED);
+            }
             self.syn_unacked = false;
             // SYN-ACK delivery, which tcp_ack does not track
             self.count_delivered(1);
