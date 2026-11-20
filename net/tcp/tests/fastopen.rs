@@ -130,3 +130,23 @@ fn fin_wait1_ack_beyond_snd_max() {
     assert_eq!(w.len(), 1);
     assert!(w[0].flags == flags::ACK && w[0].seq == b.snd_max && w[0].ack == rcv);
 }
+
+/// The SYN's data does not shrink the SYN-ACK's window: Linux keeps
+/// rcv_wnd as a length, RCV.WUP moving with RCV.NXT past the data
+/// (tcp_fastopen_create_child)
+#[test]
+fn syn_data_keeps_synack_window() {
+    let wnd = |data: &[u8]| {
+        let mut a = TcpCb::new(cfg(), Default::default());
+        let mut out = Out::default();
+        a.connect(open(1000, 1460), 0, &mut out);
+        let syn = wire(&out).remove(0);
+        let mut s = seg_in(&syn);
+        s.data = data;
+        let mut b = TcpCb::new(cfg(), Default::default());
+        let mut out = Out::default();
+        b.fastopen_open(&s.hdr(), s.skb(), open(5000, 1460), 0, &mut out);
+        wire(&out)[0].wnd
+    };
+    assert_eq!(wnd(&[7; 100]), wnd(b""));
+}

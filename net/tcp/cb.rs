@@ -1488,6 +1488,8 @@ impl TcpCb {
         self.tfo = true;
         self.req_full = true;
         self.init_transfer();
+        // Linux keeps rcv_wnd, a length: the edge moves with RCV.NXT
+        let wnd = self.rcv_wnd_adv();
         let len = data.len();
         if len != 0 {
             data.dev = None;
@@ -1506,6 +1508,7 @@ impl TcpCb {
             out.wake |= wake::DATA;
         }
         self.rcv_wup = self.rcv_nxt;
+        self.rcv_adv = self.rcv_nxt.wrapping_add(wnd);
         self.synack_send(now, out);
     }
 
