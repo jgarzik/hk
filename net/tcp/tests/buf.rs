@@ -470,6 +470,31 @@ fn backlog_counts_in_space() {
     assert_eq!(p.b.window_now(), 0);
 }
 
+/// Without window scaling, free space at least half the buffer's but
+/// below the MSS estimate keeps the window offered: Linux v6.8
+/// __tcp_select_window's `window` is an int, so `window <= free_space -
+/// mss` compares signed and a negative difference never rounds the
+/// window down to 0
+#[test]
+fn small_buffer_keeps_window() {
+    use core::sync::atomic::Ordering;
+    let mut p = Pair::new(1460);
+    p.b.rcv_wscale = 0;
+    p.b.dack.rcv_mss = 1460;
+    // A buffer holding a window of 2000 bytes
+    p.b.rcvbuf = (2000 << 8) / u32::from(p.b.scaling_ratio);
+    let full = i64::from(p.b.full_space());
+    assert!(full > 1460 && full < 2 * 1460);
+    // Free space in [full / 2, mss)
+    let back = p.b.space_from_win(700) as usize;
+    p.b.live.backlog_len.store(back, Ordering::Relaxed);
+    let free = p.b.space();
+    assert!(free >= full / 2 && free < 1460);
+    p.b.rcv_wup = p.b.rcv_nxt;
+    p.b.rcv_adv = p.b.rcv_nxt.wrapping_add(500);
+    assert_eq!(p.b.window_now(), 500);
+}
+
 /// Send memory is skb truesize against all of SO_SNDBUF (Linux
 /// sk_wmem_queued, sk_stream_memory_free): charged as skbs are queued
 /// or split, released as they are acknowledged or merged, through

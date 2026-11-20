@@ -2284,14 +2284,15 @@ impl TcpCb {
         if self.rcv_wscale != 0 {
             return ((free + unit - 1) & !(unit - 1)) as u32;
         }
-        let window = self.rcv_wnd_adv();
-        // Linux compares the u32 window with the int free - mss
-        if window <= (free - mss) as i32 as u32 || i64::from(window) > free {
+        // Linux's window is an int: free - mss, negative while free is
+        // below the MSS estimate, compares signed
+        let window = i64::from(self.rcv_wnd_adv() as i32);
+        if window <= free - mss || window > free {
             (free - free % mss) as u32
-        } else if mss == full && free > i64::from(window) + (full >> 1) {
+        } else if mss == full && free > window + (full >> 1) {
             free as u32
         } else {
-            window
+            window as u32
         }
     }
 
