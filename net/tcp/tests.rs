@@ -3065,3 +3065,34 @@ fn orphan_retries_sysctl() {
     a.soft_err = Some(KernelError::HostUnreachable);
     assert_eq!((a.orphan_retries(true), a.orphan_retries(false)), (3, 0));
 }
+
+/// A loss probe with the congestion window full still sends one new
+/// segment (Linux tcp_write_xmit with push_one 2: cwnd_quota 1)
+#[test]
+fn loss_probe_ignores_full_cwnd() {
+    use crate::net::mib::*;
+    let (mut p, m) = sack_pair(1000);
+    let mss = p.a.live.mss.get();
+    p.a.cong.set_cwnd(2);
+    p.filter = drop_all;
+    let una = p.a.snd_nxt;
+    p.send_a(&pattern(4 * mss as usize));
+    p.run();
+    assert_eq!(p.a.packets_out, 2);
+    assert!(matches!(
+        p.a.live.tmr.get(),
+        Some((super::cb::Tmr::LossProbe, _))
+    ));
+    let n = p.log.len();
+    assert!(p.tick());
+    let sent: Vec<u32> = p.log[n..]
+        .iter()
+        .filter(|l| l.1 && !l.2.data.is_empty())
+        .map(|l| l.2.seq)
+        .collect();
+    assert_eq!(sent, [una + 2 * mss]);
+    assert_eq!(p.a.packets_out, 3);
+    assert!(!p.a.tlp_retrans);
+    assert_eq!(p.a.tlp_high_seq, Some(p.a.snd_max));
+    assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSPROBES), 1);
+}

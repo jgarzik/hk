@@ -57,8 +57,9 @@ pub(super) enum Push {
     More,
     /// Probe timer: one segment regardless (Linux tcp_write_wakeup)
     Force,
-    /// Tail loss probe: one new segment, Nagle off, no probe scheduled
-    /// for it (Linux tcp_write_xmit with push_one 2)
+    /// Tail loss probe: one new segment, Nagle off, even with the
+    /// congestion window full, no probe scheduled for it (Linux
+    /// tcp_write_xmit with push_one 2)
     Tlp,
     /// All the window allows, Nagle off (Linux TCP_NAGLE_OFF: F-RTO's
     /// new data)
@@ -269,10 +270,11 @@ impl TcpCb {
 
     /// Room for new data: the bytes the peer's window leaves from
     /// SND.NXT (Linux tcp_snd_wnd_test), none while the packets in
-    /// flight fill the congestion window (tcp_cwnd_test); and whether
+    /// flight fill the congestion window (tcp_cwnd_test) unless this is
+    /// a loss probe (push_one 2: cwnd_quota forced to 1); and whether
     /// cwnd was the limit
-    fn room(&self) -> (u32, bool) {
-        if self.in_flight() >= self.cong.snd_cwnd() {
+    fn room(&self, push: Push) -> (u32, bool) {
+        if self.in_flight() >= self.cong.snd_cwnd() && push != Push::Tlp {
             return (0, true);
         }
         let end = self.snd_una.wrapping_add(self.snd_wnd);
@@ -312,7 +314,7 @@ impl TcpCb {
             return None; // FIN already sent
         }
         let avail = self.write_seq.wrapping_sub(self.snd_nxt);
-        let (room, cwnd_bound) = self.room();
+        let (room, cwnd_bound) = self.room(push);
         let mss = self.cur_mss();
         let head = self.wq.front().map_or(0, |s| s.len() as u32);
         let n = head.min(mss).min(room);
