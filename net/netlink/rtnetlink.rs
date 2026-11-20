@@ -677,13 +677,22 @@ const IFLA_REJECT: [u16; 7] = [
 ];
 
 /// The parts of Linux ifla_policy the link requests rely on beyond the
-/// typed reads: rejected attributes, the alias length, the txqlen range
+/// typed reads: rejected attributes, the alias length, the GSO size
+/// minimum, the txqlen range
 fn ifla_validate(a: &Attrs<'_>) -> Result<(), KernelError> {
     if IFLA_REJECT.iter().any(|&t| a.has(t)) {
         return Err(KernelError::InvalidArgument);
     }
     // NLA_BINARY, len IFALIASZ - 1
     a.max(IFLA_IFALIAS, IFALIASZ - 1)?;
+    // NLA_POLICY_MIN(NLA_U32, MAX_TCP_HEADER + 1): a smaller GSO size
+    // underflows the socket's GSO limit
+    let min = crate::net::tcp::buf::MAX_TCP_HEADER + 1;
+    for t in [IFLA_GSO_MAX_SIZE, IFLA_GSO_IPV4_MAX_SIZE] {
+        if a.u32(t)?.is_some_and(|v| v < min) {
+            return Err(KernelError::Range);
+        }
+    }
     // NLA_POLICY_FULL_RANGE(NLA_U32, 0..INT_MAX)
     if a.u32(IFLA_TXQLEN)?.is_some_and(|q| q > i32::MAX as u32) {
         return Err(KernelError::Range);
@@ -990,7 +999,7 @@ fn do_setlink(
             (IFLA_GRO_IPV4_MAX_SIZE, gso::GRO_IPV4_MAX_SIZE_I),
         ] {
             if let Some(v) = a.u32(t)? {
-                dev.store_gso(i, v);
+                gso_set(dev, i, v);
             }
         }
     }
@@ -1039,6 +1048,20 @@ fn do_setlink(
         notify_link(net, dev, nl);
     }
     Ok(())
+}
+
+/// Set GSO/GRO limit `i`: a GSO or GRO size within the legacy limit
+/// is the IPv4 one too (Linux netif_set_gso_max_size,
+/// netif_set_gro_max_size)
+fn gso_set(dev: &NetDevice, i: usize, v: u32) {
+    use crate::net::device::gso;
+    dev.store_gso(i, v);
+    let v4 = match i {
+        gso::GSO_MAX_SIZE_I if v <= gso::GSO_LEGACY_MAX_SIZE => gso::GSO_IPV4_MAX_SIZE_I,
+        gso::GRO_MAX_SIZE_I if v <= gso::GRO_LEGACY_MAX_SIZE => gso::GRO_IPV4_MAX_SIZE_I,
+        _ => return,
+    };
+    dev.store_gso(v4, v);
 }
 
 /// Linux dev_set_alias: EINVAL at IFALIASZ bytes or more, an empty one

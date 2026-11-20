@@ -38,7 +38,7 @@ const INIT_CWND: u32 = super::cong::INIT_CWND;
 /// Linux MAX_TCP_HEADER (x86-64: L1_CACHE_ALIGN(128 + MAX_HEADER)),
 /// SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) and of struct
 /// sk_buff: tcp_sndbuf_expand's worst case per segment
-const MAX_TCP_HEADER: u32 = 320;
+pub const MAX_TCP_HEADER: u32 = 320;
 const SHINFO: u32 = 320;
 const SKB: u32 = 256;
 

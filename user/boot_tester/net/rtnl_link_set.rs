@@ -8,7 +8,10 @@
 //!   bytes fails ifla_policy (ERANGE);
 //!   IFLA_TXQLEN is kept (dev_change_tx_queue_len); IFLA_BROADCAST is
 //!   copied; GSO/GRO limits are kept up to the device's TSO limits and
-//!   GRO_MAX_SIZE, beyond them EINVAL ("too big ...", validate_linkmsg)
+//!   GRO_MAX_SIZE, beyond them EINVAL ("too big ...", validate_linkmsg);
+//!   a GSO/GRO size within 64 KiB is the IPv4 one too
+//!   (netif_set_gso_max_size); a GSO size of MAX_TCP_HEADER or less is
+//!   ERANGE (ifla_policy)
 
 use crate::harness::T;
 use crate::net::nl::*;
@@ -22,6 +25,8 @@ const IFLA_GROUP: u16 = 27;
 const IFLA_GSO_MAX_SEGS: u16 = 40;
 const IFLA_GSO_MAX_SIZE: u16 = 41;
 const IFLA_GRO_MAX_SIZE: u16 = 58;
+const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
+const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
 const EINVAL: i64 = -22;
 const ERANGE: i64 = -34;
 
@@ -155,6 +160,25 @@ fn settings(name: &'static [u8]) -> bool {
     );
     t.eq(b"gso size kept", get_u32(&mut nl, IFLA_GSO_MAX_SIZE), 32768);
     t.eq(
+        b"gso v4 follows",
+        get_u32(&mut nl, IFLA_GSO_IPV4_MAX_SIZE),
+        32768,
+    );
+    t.eq(
+        b"gso too small",
+        set(&mut nl, &|r| {
+            r.u32(IFLA_GSO_MAX_SIZE, 100);
+        }),
+        ERANGE,
+    );
+    t.eq(
+        b"gso v4 too small",
+        set(&mut nl, &|r| {
+            r.u32(IFLA_GSO_IPV4_MAX_SIZE, 100);
+        }),
+        ERANGE,
+    );
+    t.eq(
         b"gso segs",
         set(&mut nl, &|r| {
             r.u32(IFLA_GSO_MAX_SEGS, 100);
@@ -170,6 +194,11 @@ fn settings(name: &'static [u8]) -> bool {
         0,
     );
     t.eq(b"gro size kept", get_u32(&mut nl, IFLA_GRO_MAX_SIZE), 32768);
+    t.eq(
+        b"gro v4 follows",
+        get_u32(&mut nl, IFLA_GRO_IPV4_MAX_SIZE),
+        32768,
+    );
     t.eq(
         b"gso too big",
         set(&mut nl, &|r| {
