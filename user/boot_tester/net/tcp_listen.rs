@@ -430,6 +430,13 @@ fn test_fastopen_keys() {
     let r = sys_getsockopt(s, IPPROTO_TCP, TCP_FASTOPEN_KEY, g.as_mut_ptr(), &mut len);
     t.ok(b"get", r == 0 && len == 32 && g[..32] == k, i64::from(len));
     close(s);
+    // A socket without keys reads none, never its namespace's (Linux
+    // tcp_fastopen_get_cipher with the socket)
+    let s = tcp();
+    let mut len = g.len() as u32;
+    let r = sys_getsockopt(s, IPPROTO_TCP, TCP_FASTOPEN_KEY, g.as_mut_ptr(), &mut len);
+    t.ok(b"no keys", r == 0 && len == 0, i64::from(len));
+    close(s);
     let mut old = [0u8; 128];
     let n = read_file(KEY, &mut old);
     t.ok(b"read", n > 0, n);

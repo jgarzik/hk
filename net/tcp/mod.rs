@@ -3014,9 +3014,9 @@ impl TcpSock {
             TCP_FASTOPEN => g.cb.live.fastopen.get(),
             TCP_FASTOPEN_NO_COOKIE => u32::from(o.tfo_no_cookie),
             TCP_FASTOPEN_KEY => {
-                // Linux tcp_fastopen_get_cipher: the socket's keys, else
-                // its namespace's
-                let c = (*self.fastopen_ctx.lock()).or_else(|| self.sk.net.tcp.fastopen_ctx());
+                // Linux tcp_fastopen_get_cipher with the socket: its own
+                // keys only (the namespace's go to the 0600 sysctl alone)
+                let c = *self.fastopen_ctx.lock();
                 return Ok(OptOut::Bytes(c.map_or_else(Vec::new, |c| c.bytes())));
             }
             TCP_NOTSENT_LOWAT => o.notsent_lowat,
