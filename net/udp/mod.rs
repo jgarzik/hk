@@ -372,6 +372,10 @@ impl UdpSock {
             if data.len() > gso * UDP_MAX_SEGMENTS {
                 return Err(KernelError::InvalidArgument);
             }
+            // Linux udp_send_skb: segments need their checksums
+            if self.sk.flag(sf::NO_CHECK) {
+                return Err(KernelError::InvalidArgument);
+            }
         }
         let mib = &self.sk.net.mib;
         let r = if gso != 0 && data.len() > gso {

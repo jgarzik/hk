@@ -11,7 +11,7 @@
 //!   everything corked (do_append_data's udp_flush_pending_frames).
 //! - UDP_SEGMENT: a send with a segment size arrives as datagrams of
 //!   that size (software GSO on hk, segmented at the receiver on
-//!   Linux's lo); too many segments is EINVAL.
+//!   Linux's lo); too many segments, or SO_NO_CHECK, is EINVAL.
 //! - UDP_SOL_OPTS: UDP_ENCAP, UDP_NO_CHECK6_*, UDP_GRO round trips.
 
 use crate::harness::T;
@@ -24,6 +24,7 @@ const UDP_NO_CHECK6_TX: i32 = 101;
 const UDP_NO_CHECK6_RX: i32 = 102;
 const UDP_SEGMENT: i32 = 103;
 const UDP_GRO: i32 = 104;
+const SO_NO_CHECK: i32 = 11;
 
 pub fn run_tests() {
     crate::helpers::println(b"=== UDP cork Tests ===");
@@ -186,6 +187,12 @@ fn test_segment() {
     t.ok(b"no more", quiet(b), 0);
     t.eq(b"too many", setint(a, SOL_UDP, UDP_SEGMENT, 1), 0);
     t.eq(b"129 segments", send_to(a, &[0u8; 129], LO, pb, 0), EINVAL);
+    // Segments need checksums (udp_send_skb: sk_no_check_tx is EINVAL)
+    t.eq(b"segment", setint(a, SOL_UDP, UDP_SEGMENT, 100), 0);
+    t.eq(b"no check", setint(a, SOL_SOCKET, SO_NO_CHECK, 1), 0);
+    t.eq(b"no check send", send_to(a, &data, LO, pb, 0), EINVAL);
+    t.eq(b"check", setint(a, SOL_SOCKET, SO_NO_CHECK, 0), 0);
+    t.ok(b"nothing sent", quiet(b), 0);
     t.eq(b"negative", setint(a, SOL_UDP, UDP_SEGMENT, -1), EINVAL);
     t.eq(b"too big", setint(a, SOL_UDP, UDP_SEGMENT, 65536), EINVAL);
     close(a);
