@@ -190,7 +190,10 @@ fn bound_to(s: &PacketSock, dev: &NetDevice) -> Option<u16> {
 }
 
 /// `dev` went down (Linux packet_notifier NETDEV_DOWN, RTNL held): a
-/// socket receiving on it gets ENETDOWN
+/// socket receiving on it gets ENETDOWN, reported (sk_error_report:
+/// POLLERR, a blocked receive wakes). Linux also unhooks it until
+/// NETDEV_UP; here the tap matches each frame against the binding and
+/// a down device passes none, so the effect is the same.
 pub fn netdev_down(net: &crate::net::NetNamespace, dev: &NetDevice) {
     net.packet.for_each(|s| {
         if bound_to(s, dev).is_some_and(|n| n != 0) {

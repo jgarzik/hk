@@ -291,11 +291,10 @@ Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), the mmap rings
 PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
 (ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
 socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
-every socket). A bound socket is not told (ENETDOWN) when its device
-goes down later, only when it binds to a down device. Memberships only
-count promiscuity/allmulti users (the drivers have no promiscuous or
-multicast filtering; set_promisc is a no-op on e1000 and virtio-net,
-which has no control queue: QEMU then delivers all frames).
+every socket). Memberships only count promiscuity/allmulti users (the
+drivers have no promiscuous or multicast filtering; set_promisc is a
+no-op on e1000 and virtio-net, which has no control queue: QEMU then
+delivers all frames).
 PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
 lo (hk has no checksum offload states).
 

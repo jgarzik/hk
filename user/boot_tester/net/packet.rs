@@ -2,8 +2,10 @@
 //! naming, SOCK_RAW/SOCK_DGRAM receive over lo with packet types
 //! (OUTGOING then HOST), frame sends both ways, MSG_TRUNC, the bounded
 //! receive queue with PACKET_STATISTICS, classic BPF filters with
-//! PACKET_AUXDATA, memberships, /proc/net/packet, and a DHCP exchange
-//! on eth0 without an IP address (what busybox udhcpc does).
+//! PACKET_AUXDATA, memberships, /proc/net/packet, ENETDOWN when the
+//! bound device goes down (PACKET_NETDEV_DOWN, in a new network
+//! namespace), and a DHCP exchange on eth0 without an IP address (what
+//! busybox udhcpc does).
 
 use hk_syscall::{
     AF_INET, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, sys_bind, sys_exit, sys_fork, sys_getpeername,
@@ -11,8 +13,8 @@ use hk_syscall::{
     sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
 };
 
-use crate::harness::T;
-use crate::helpers::{println, skip};
+use crate::harness::{T, fail_num, pass};
+use crate::helpers::{host_mode, loopback_up, println, skip};
 use crate::net::nl::{Nl, addr as nl_addr, msleep, net_setup_eth0};
 use crate::net::sk::*;
 
@@ -41,6 +43,7 @@ const ARPHRD_ETHER: u16 = 1;
 const ENXIO: i64 = -6;
 const ENOENT: i64 = -2;
 const ENODEV: i64 = -19;
+const ENETDOWN: i64 = -100;
 
 pub fn run_tests() {
     println(b"=== AF_PACKET Tests ===");
@@ -57,6 +60,7 @@ pub fn run_tests() {
     test_filter(lo);
     test_opts(lo);
     test_proc();
+    test_netdev_down();
     match net_setup_eth0() {
         Ok(eth) => {
             test_eth_errors(eth as i32);
@@ -196,6 +200,98 @@ fn test_frame(out: &mut [u8], tag: u8, len: usize) -> &[u8] {
     out[12..14].copy_from_slice(&ETH_P_TEST.to_be_bytes());
     out[14] = tag;
     &out[..len]
+}
+
+/// lo up or down (SIOCSIFFLAGS)
+fn set_lo(up: bool) -> i64 {
+    const SIOCGIFFLAGS: u64 = 0x8913;
+    const SIOCSIFFLAGS: u64 = 0x8914;
+    let mut ifr = [0u8; 40];
+    ifr[..2].copy_from_slice(b"lo");
+    let fd = udp();
+    let mut r = sys_ioctl(fd, SIOCGIFFLAGS, ifr.as_mut_ptr() as u64);
+    if r == 0 {
+        let f = u16::from_ne_bytes([ifr[16], ifr[17]]);
+        let f = if up { f | 1 } else { f & !1 };
+        ifr[16..18].copy_from_slice(&f.to_ne_bytes());
+        r = sys_ioctl(fd, SIOCSIFFLAGS, ifr.as_mut_ptr() as u64);
+    }
+    close(fd);
+    r
+}
+
+/// A socket bound to a device that goes down gets ENETDOWN (Linux
+/// packet_notifier NETDEV_DOWN: sk_err, sk_error_report, the hook
+/// unregistered), in a new namespace whose lo can go down
+fn test_netdev_down() {
+    let pid = sys_fork();
+    if pid == 0 {
+        if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        loopback_up();
+        netdev_down(ifindex(b"lo"));
+        sys_exit(0);
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    let code = (st >> 8) & 0xff;
+    if st & 0x7f == 0 && code == 0 {
+        pass(b"PACKET_NETDEV_DOWN_NETNS");
+    } else if code == 2 && host_mode() {
+        skip(
+            b"PACKET_NETDEV_DOWN_NETNS",
+            b"unshare(CLONE_NEWNET) not permitted",
+        );
+    } else {
+        fail_num(b"PACKET_NETDEV_DOWN_NETNS:FAIL status=", st as i64);
+    }
+}
+
+/// POLLERR and ENETDOWN once (then EAGAIN) after lo goes down, none
+/// for a socket with no protocol; frames again once lo is up (the hook
+/// back: Linux NETDEV_UP); a blocked receive woken with ENETDOWN
+fn netdev_down(lo: i32) {
+    let mut t = T::new(b"PACKET_NETDEV_DOWN");
+    let fd = bound(SOCK_RAW, ETH_P_TEST, lo);
+    let idle = bound(SOCK_RAW, 0, lo);
+    t.eq(b"down", set_lo(false), 0);
+    let (_, rev) = poll1(fd, 1, 0);
+    t.ok(b"POLLERR", rev & hk_syscall::POLLERR != 0, rev as i64);
+    let mut buf = [0u8; 128];
+    t.eq(b"recv", recv(fd, &mut buf, MSG_DONTWAIT), ENETDOWN);
+    t.eq(b"recv again", recv(fd, &mut buf, MSG_DONTWAIT), EAGAIN);
+    t.eq(
+        b"no protocol",
+        getint(idle, SOL_SOCKET, SO_ERROR).1 as i64,
+        0,
+    );
+    t.eq(b"up", set_lo(true), 0);
+    let tx = psock(SOCK_RAW, 0);
+    let mut f = [0u8; 64];
+    let frame = test_frame(&mut f, 0x5a, 60);
+    t.eq(
+        b"send",
+        sendto_ll(tx, frame, &Sll::new(ETH_P_TEST, lo), 20),
+        60,
+    );
+    let ours = |f: &[u8], _: &Sll| f.len() == 60 && f[14] == 0x5a;
+    t.ok(b"rehooked", find(fd, &mut buf, 2000, &ours).is_some(), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        msleep(200);
+        sys_exit(if set_lo(false) == 0 { 0 } else { 1 });
+    }
+    let tv: [i64; 2] = [5, 0];
+    sys_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv.as_ptr() as *const u8, 16);
+    t.eq(b"blocked recv", recv(fd, &mut buf, 0), ENETDOWN);
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.eq(b"downer", st as i64, 0);
+    close(tx);
+    close(idle);
+    close(fd);
+    t.done();
 }
 
 /// Creation: EPERM without CAP_NET_RAW, ESOCKTNOSUPPORT for stream
