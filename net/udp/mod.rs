@@ -79,6 +79,8 @@ pub struct UdpSock {
     op: crate::sync::Mutex<()>,
     /// Connected (Linux TCP_ESTABLISHED state for datagram sockets)
     connected: AtomicBool,
+    /// SO_PEEK_OFF is set (Linux peeking_with_offset)
+    peeking_with_offset: AtomicBool,
     rxq: UdpRxq,
     /// Link on its port's hash slot (Linux sk_node)
     link: NullsLink,
@@ -102,6 +104,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
         inet: Inet::default(),
         op: crate::sync::Mutex::new(()),
         connected: AtomicBool::new(false),
+        peeking_with_offset: AtomicBool::new(false),
         rxq: UdpRxq::default(),
         link: NullsLink::new(),
         link2: NullsLink::new(),
@@ -240,6 +243,43 @@ impl UdpSock {
         let rt = route::output(&self.sk.net, a.daddr, a.saddr, self.sk.bound_dev_if())
             .map_err(|_| KernelError::NotConnected)?;
         Ok(rt.mtu as i32)
+    }
+
+    /// Copy datagram `skb` from offset `off` (Linux udp_recvmsg): data
+    /// (MSG_TRUNC when the buffer is shorter than the rest, or is not
+    /// past it and shorter than the datagram), source address, SOL_SOCKET
+    /// and IP control messages. Returns the length recvmsg reports (the
+    /// datagram's with MSG_TRUNC in `flags`).
+    fn deliver(
+        &self,
+        m: &mut RecvMsg<'_>,
+        skb: &SkBuff,
+        flags: i32,
+        off: usize,
+    ) -> Result<usize, KernelError> {
+        let crate::net::skb::SkbCb::Inet(cb) = skb.cb else {
+            return Err(KernelError::InvalidArgument);
+        };
+        let data = skb.data();
+        let ulen = data.len();
+        let off = off.min(ulen);
+        let mut copied = m.data.len();
+        if copied > ulen - off {
+            copied = ulen - off;
+        } else if copied < ulen {
+            m.flags |= crate::net::msg::MSG_TRUNC;
+        }
+        let n = m.data.put(0, &data[off..off + copied])?;
+        if m.want_name {
+            m.name = Some(af_inet::sin_bytes(skb.saddr.unwrap_or_default(), cb.sport));
+        }
+        dgram::sock_cmsgs(&self.sk, m, skb.tstamp, skb.dropcount);
+        self.inet.recv_cmsgs(&mut m.cmsg, &cb.info);
+        Ok(if flags & crate::net::msg::MSG_TRUNC != 0 {
+            ulen
+        } else {
+            n
+        })
     }
 
     /// Build and send one datagram: whether it went out, false if the
@@ -583,17 +623,38 @@ impl ProtoOps for UdpSock {
         let Some(d) = self.rxq.recv(&self.sk, flags, &mut off)? else {
             return Ok(0);
         };
-        let r = dgram::deliver(&self.sk, &self.inet, m, &d, flags);
-        if flags & MSG_PEEK == 0 {
+        let peeking = flags & MSG_PEEK != 0;
+        let r = self.deliver(m, &d, flags, off.max(0) as usize);
+        if !peeking {
             // Linux udp_recvmsg: a datagram is counted when it is read
             let f = if r.is_ok() {
                 UDP_MIB_INDATAGRAMS
             } else {
+                self.sk.drops.fetch_add(1, Ordering::Relaxed);
                 UDP_MIB_INERRORS
             };
             self.sk.net.mib.udp.inc(f);
         }
+        // Linux skb_consume_udp: the peek offset moves past what a peek
+        // returned, back by what a read consumed
+        if let Ok(n) = r
+            && self.peeking_with_offset.load(Ordering::Relaxed)
+        {
+            let n = n as i32;
+            self.sk.peek_offset_bwd(if peeking { -n } else { n });
+        }
         r
+    }
+
+    /// Linux sk_set_peek_off via udp_set_peek_off
+    fn set_peek_off(&self, val: i32) -> Option<Result<(), KernelError>> {
+        self.sk.set_peek_off(val);
+        self.peeking_with_offset.store(val >= 0, Ordering::Relaxed);
+        Some(Ok(()))
+    }
+
+    fn has_set_peek_off(&self) -> bool {
+        true
     }
 }
 

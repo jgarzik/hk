@@ -146,8 +146,9 @@ ACK counts TCPPureAcks, where Linux's fast path skips it), receive
 coalescing and collapse, RcvPruned (no tcp_can_ingest),
 Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
-UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
-SO_PEEK_OFF is EOPNOTSUPP.
+UDP_CORK/MSG_MORE are not implemented (each send is one datagram).
+TCP has no SO_PEEK_OFF (EOPNOTSUPP; Linux inet_stream_ops sets
+sk_set_peek_off and tcp_recvmsg peeks at the offset).
 A device MTU change leaves path MTU exceptions (`route::NhExceptions`)
 as they are (Linux NETDEV_CHANGEMTU fib_sync_mtu lowers them with it and
 raises those equal to the old MTU).
