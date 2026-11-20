@@ -117,8 +117,7 @@ fn set_packet(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
         }
         PACKET_VERSION => {
             let val = int_exact(v)?;
-            // TPACKET_V3 comes with its block descriptors
-            if !(ring::TPACKET_V1 as i32..=ring::TPACKET_V2 as i32).contains(&val) {
+            if !(ring::TPACKET_V1 as i32..=ring::TPACKET_V3 as i32).contains(&val) {
                 return Err(KernelError::InvalidArgument);
             }
             unless_ring(s, || s.tp_version.store(val as u32, Ordering::Release))

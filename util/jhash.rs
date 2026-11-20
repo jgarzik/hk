@@ -1,5 +1,5 @@
-//! Bob Jenkins' lookup3 hash, the one-word form (Linux
-//! include/linux/jhash.h jhash_1word)
+//! Bob Jenkins' lookup3 hash, the one- and three-word forms (Linux
+//! include/linux/jhash.h jhash_1word, jhash_3words)
 
 /// Linux JHASH_INITVAL
 const JHASH_INITVAL: u32 = 0xdead_beef;
@@ -38,6 +38,16 @@ pub fn jhash_1word(a: u32, initval: u32) -> u32 {
         0,
         0,
         initval.wrapping_add(JHASH_INITVAL).wrapping_add(1 << 2),
+    )
+}
+
+/// Linux jhash_3words
+pub fn jhash_3words(a: u32, b: u32, c: u32, initval: u32) -> u32 {
+    nwords(
+        a,
+        b,
+        c,
+        initval.wrapping_add(JHASH_INITVAL).wrapping_add(3 << 2),
     )
 }
 

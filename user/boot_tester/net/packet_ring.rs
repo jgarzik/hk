@@ -33,6 +33,8 @@ pub const PACKET_TX_HAS_OFF: i32 = 19;
 
 pub const TPACKET_V1: i32 = 0;
 pub const TPACKET_V2: i32 = 1;
+pub const TPACKET_V3: i32 = 2;
+pub const TP_STATUS_BLK_TMO: u32 = 1 << 5;
 
 pub const TP_STATUS_USER: u64 = 1;
 pub const TP_STATUS_COPY: u64 = 2;
@@ -59,6 +61,9 @@ pub fn run_tests() {
     test_tx(lo, TPACKET_V2, b"PACKET_RING_TX_V2");
     test_tx_rules(lo);
     test_rx_tx_map(lo);
+    test_v3_rx(lo);
+    test_v3_full(lo);
+    test_v3_tx(lo);
 }
 
 /// setsockopt(PACKET_RX_RING etc.) with a tpacket_req
@@ -725,5 +730,211 @@ fn test_rx_tx_map(lo: i32) {
         sys_munmap(base, 12288);
     }
     close(fd);
+    t.done();
+}
+
+/// struct tpacket_stats_v3: (len, packets, drops, freeze_q_cnt)
+fn stats3(fd: i32) -> (u32, u32, u32, u32) {
+    let mut st = [0u32; 3];
+    let mut len = 12u32;
+    sys_getsockopt(
+        fd,
+        SOL_PACKET,
+        PACKET_STATISTICS,
+        st.as_mut_ptr() as *mut u8,
+        &mut len,
+    );
+    (len, st[0], st[1], st[2])
+}
+
+/// A V3 receive socket on lo: (fd, base) of `nr` 4096-byte blocks
+fn v3_sock(lo: i32, nr: u32, tov: u32) -> (i32, u64) {
+    let rx = psock(SOCK_RAW, ETH_P_TEST);
+    pbind(rx, ETH_P_TEST, lo);
+    setint(rx, SOL_PACKET, PACKET_VERSION, TPACKET_V3);
+    ring_req(rx, PACKET_RX_RING, &[4096, nr, 2048, nr * 2, tov, 0, 0], 28);
+    let m = map(rx, 4096 * nr as u64, 0);
+    (rx, if m > 0 { m as u64 } else { 0 })
+}
+
+/// Wait up to `ms` for block `b` to be the user's
+fn wait_block(b: u64, ms: u64) -> bool {
+    let end = now_ms() + ms;
+    while now_ms() < end {
+        if rd32(b + 8) & 1 != 0 {
+            return true;
+        }
+        msleep(10);
+    }
+    false
+}
+
+/// TPACKET_V3 receive: packets packed in a block that the retire timer
+/// hands over (TP_STATUS_BLK_TMO), block descriptor and packet headers
+fn test_v3_rx(lo: i32) {
+    let mut t = T::new(b"PACKET_RING_V3_RX");
+    let fd = psock(SOCK_RAW, 0);
+    setint(fd, SOL_PACKET, PACKET_VERSION, TPACKET_V3);
+    t.eq(
+        b"req short",
+        ring_req(fd, PACKET_RX_RING, &[4096, 1, 2048, 2], 16),
+        EINVAL,
+    );
+    t.eq(
+        b"priv too big",
+        ring_req(fd, PACKET_RX_RING, &[4096, 1, 2048, 2, 0, 4000, 0], 28),
+        EINVAL,
+    );
+    close(fd);
+    let (rx, base) = v3_sock(lo, 4, 500);
+    t.ok(b"map", base != 0, 0);
+    if base == 0 {
+        close(rx);
+        t.done();
+        return;
+    }
+    let tx = psock(SOCK_RAW, 0);
+    let mut buf = [0u8; 128];
+    for i in 0..3u8 {
+        sendto_ll(
+            tx,
+            test_frame(&mut buf, 0x90 + i, 60 + i as usize),
+            &Sll::new(ETH_P_TEST, lo),
+            20,
+        );
+    }
+    t.ok(b"retired", wait_block(base, 3000), 0);
+    t.eq(b"pollin", poll1(rx, POLLIN, 0).1 as i64 & 1, 1);
+    let st = rd32(base + 8);
+    t.ok(b"BLK_TMO", st & TP_STATUS_BLK_TMO != 0, st as i64);
+    t.eq(b"version", rd32(base) as i64, TPACKET_V3 as i64);
+    t.eq(b"offset_to_priv", rd32(base + 4) as i64, 48);
+    t.eq(b"num_pkts", rd32(base + 12) as i64, 3);
+    t.eq(b"offset_to_first_pkt", rd32(base + 16) as i64, 48);
+    t.eq(
+        b"seq_num",
+        unsafe { core::ptr::read_volatile((base + 24) as *const u64) } as i64,
+        1,
+    );
+    let mut p = base + 48;
+    for i in 0..3u64 {
+        let len = 60 + i as u32;
+        t.eq(b"tp_len", rd32(p + 16) as i64, len as i64);
+        t.eq(b"tp_snaplen", rd32(p + 12) as i64, len as i64);
+        // TPACKET_ALIGN(68 + 16) = 96, the MAC header 14 before
+        t.eq(b"tp_mac", rd16(p + 24) as i64, 82);
+        t.eq(b"tp_net", rd16(p + 26) as i64, 96);
+        t.eq(b"tag", rd8(p + 82 + 14) as i64, 0x90 + i as i64);
+        let s = sll_at(p + 48);
+        t.eq(b"sll_ifindex", s.ifindex as i64, lo as i64);
+        t.eq(b"sll_protocol", s.protocol as i64, ETH_P_TEST as i64);
+        let next = rd32(p) as u64;
+        if i < 2 {
+            t.eq(b"next aligned", next as i64 % 8, 0);
+            t.ok(b"next", next >= 82 + len as u64, next as i64);
+        } else {
+            t.eq(b"last next", next as i64, 0);
+        }
+        p += next;
+    }
+    wr32(base + 8, 0);
+    let (len, packets, drops, freeze) = stats3(rx);
+    t.eq(b"stats v3 len", len as i64, 12);
+    t.eq(b"packets", packets as i64, 3);
+    t.eq(b"drops", drops as i64, 0);
+    t.eq(b"freeze", freeze as i64, 0);
+    sys_munmap(base, 4 * 4096);
+    close(tx);
+    close(rx);
+    t.done();
+}
+
+/// A packet that does not fit closes the block (no BLK_TMO); with the
+/// next block still the user's the queue freezes and drops
+/// (tp_freeze_q_cnt), and thaws once the block is given back
+fn test_v3_full(lo: i32) {
+    let mut t = T::new(b"PACKET_RING_V3_FULL");
+    let (rx, base) = v3_sock(lo, 2, 1000);
+    t.ok(b"map", base != 0, 0);
+    if base == 0 {
+        close(rx);
+        t.done();
+        return;
+    }
+    let tx = psock(SOCK_RAW, 0);
+    let to = Sll::new(ETH_P_TEST, lo);
+    let mut buf = [0u8; 1100];
+    // 82 + 1000 bytes take 1088: three per block
+    for i in 0..7u8 {
+        sendto_ll(tx, test_frame(&mut buf, i, 1000), &to, 20);
+    }
+    t.ok(b"block 0", wait_block(base, 2000), 0);
+    t.ok(b"block 1", wait_block(base + 4096, 2000), 0);
+    t.eq(b"closed, not timed out", rd32(base + 8) as i64, 1);
+    t.eq(b"block 1 status", rd32(base + 4096 + 8) as i64, 1);
+    t.eq(b"block 0 pkts", rd32(base + 12) as i64, 3);
+    t.eq(b"block 1 pkts", rd32(base + 4096 + 12) as i64, 3);
+    t.eq(b"block 1 first", rd8(base + 4096 + 48 + 82 + 14) as i64, 3);
+    let (_, packets, drops, freeze) = stats3(rx);
+    t.eq(b"packets", packets as i64, 7);
+    t.eq(b"drops", drops as i64, 1);
+    t.eq(b"freeze", freeze as i64, 1);
+    wr32(base + 8, 0);
+    sendto_ll(tx, test_frame(&mut buf, 0x55, 100), &to, 20);
+    t.ok(b"thawed", wait_block(base, 3000), 0);
+    t.eq(b"after thaw", rd8(base + 48 + 82 + 14) as i64, 0x55);
+    t.eq(
+        b"seq",
+        unsafe { core::ptr::read_volatile((base + 24) as *const u64) } as i64,
+        3,
+    );
+    sys_munmap(base, 2 * 4096);
+    close(tx);
+    close(rx);
+    t.done();
+}
+
+/// TPACKET_V3 transmit: no block options (EINVAL), frames with the V3
+/// header (status at 20, tp_len at 16, data at tp_hdrlen - 20 = 48)
+fn test_v3_tx(lo: i32) {
+    let mut t = T::new(b"PACKET_RING_V3_TX");
+    let rx = psock(SOCK_RAW, ETH_P_TEST);
+    pbind(rx, ETH_P_TEST, lo);
+    let tx = psock(SOCK_RAW, 0);
+    pbind(tx, ETH_P_TEST, lo);
+    setint(tx, SOL_PACKET, PACKET_VERSION, TPACKET_V3);
+    t.eq(
+        b"block options",
+        ring_req(tx, PACKET_TX_RING, &[4096, 1, 2048, 2, 10, 0, 0], 28),
+        EINVAL,
+    );
+    t.eq(
+        b"ring",
+        ring_req(tx, PACKET_TX_RING, &[4096, 1, 2048, 2, 0, 0, 0], 28),
+        0,
+    );
+    let m = map(tx, 4096, 0);
+    t.ok(b"map", m > 0, m);
+    if m > 0 {
+        let f = m as u64;
+        let mut b = [0u8; 128];
+        let fr = test_frame(&mut b, 0x99, 64);
+        for (i, x) in fr.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((f + 48 + i as u64) as *mut u8, *x) };
+        }
+        wr32(f, 0);
+        wr32(f + 16, 64);
+        wr32(f + 20, TP_STATUS_SEND_REQUEST);
+        t.eq(b"send", send(tx, &[], 0), 64);
+        t.eq(b"available", rd32(f + 20) as i64, 0);
+        t.eq(b"received", rx_tag(rx, 0x99), 64);
+        wr32(f + 2048, 8);
+        wr32(f + 2048 + 16, 64);
+        wr32(f + 2048 + 20, TP_STATUS_SEND_REQUEST);
+        t.eq(b"next_offset", send(tx, &[], 0), EINVAL);
+        sys_munmap(f, 4096);
+    }
+    close(tx);
+    close(rx);
     t.done();
 }

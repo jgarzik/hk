@@ -43,6 +43,7 @@ mod opts;
 mod rcv;
 mod ring;
 mod tx;
+mod v3;
 
 use crate::mm::page_alloc::Gfp;
 use crate::util::kalloc::try_arc;
@@ -175,6 +176,8 @@ pub struct PacketSock {
     rx: crate::sync::spin::Mutex<ring::RxRing>,
     /// The transmit ring (Linux po->tx_ring)
     tx: crate::sync::spin::Mutex<tx::TxRing>,
+    /// The V3 ring's retire timer (Linux prb_bdqc.retire_blk_timer)
+    retire: Arc<v3::Retire>,
     /// User mappings of the rings (Linux po->mapped)
     mapped: Arc<ring::Mapped>,
     /// PACKET_VERSION, the ring frame header length (Linux
@@ -220,6 +223,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         pg_vec_lock: crate::sync::Mutex::new(()),
         rx: crate::sync::spin::Mutex::new(ring::RxRing::default()),
         tx: crate::sync::spin::Mutex::new(tx::TxRing::default()),
+        retire: try_arc(v3::Retire::new())?,
         mapped: try_arc(ring::Mapped::default())?,
         tp_version: AtomicU32::new(ring::TPACKET_V1),
         tp_hdrlen: AtomicU32::new(0),
@@ -230,6 +234,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         link: crate::util::list::Link::new(),
         rcu: crate::sync::rcu::RcuHead::new(),
     })?;
+    s.retire.attach(&s);
     // Linux packet_create: hooked at once when a protocol is given
     if proto != 0 {
         let g = s.bind_lock.lock();

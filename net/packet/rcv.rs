@@ -28,6 +28,39 @@ pub const SOL_PACKET: i32 = 263;
 pub const PACKET_AUXDATA: i32 = 8;
 use super::ring::{TP_STATUS_CSUM_VALID, TP_STATUS_USER};
 
+/// A frame's flow hash (Linux skb_get_hash; with `symmetric` the two
+/// directions of a flow hash alike, __skb_get_hash_symmetric): IPv4
+/// addresses, protocol and, unless a fragment, TCP/UDP/SCTP ports;
+/// other frames by EtherType. Keyed by a boot-time random seed, as
+/// Linux's hashrnd (Linux uses siphash over flow_keys)
+pub(super) fn flow_hash(frame: &[u8], symmetric: bool) -> u32 {
+    static SEED: spin::Once<u32> = spin::Once::new();
+    let seed = *SEED.call_once(crate::random::get_random_u32);
+    let ty = eth_proto(frame);
+    let ip = frame.get(ETH_HLEN..).unwrap_or(&[]);
+    if ty != 0x0800 || ip.len() < 20 || ip[0] >> 4 != 4 {
+        return crate::util::jhash::jhash_1word(u32::from(ty), seed);
+    }
+    let mut src = u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]]);
+    let mut dst = u32::from_be_bytes([ip[16], ip[17], ip[18], ip[19]]);
+    let proto = ip[9];
+    let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0;
+    let ihl = usize::from(ip[0] & 0xf) * 4;
+    let (mut sp, mut dp) = match (proto, ip.get(ihl..ihl + 4)) {
+        (6 | 17 | 132, Some(p)) if !frag => (
+            u16::from_be_bytes([p[0], p[1]]),
+            u16::from_be_bytes([p[2], p[3]]),
+        ),
+        _ => (0, 0),
+    };
+    if symmetric && (dst < src || (dst == src && dp < sp)) {
+        core::mem::swap(&mut src, &mut dst);
+        core::mem::swap(&mut sp, &mut dp);
+    }
+    let ports = (u32::from(sp) << 16) | u32::from(dp);
+    crate::util::jhash::jhash_3words(src, dst, ports ^ u32::from(proto), seed)
+}
+
 /// Packet sockets in all namespaces (fast path: no socket, no work)
 static NSOCKS: AtomicUsize = AtomicUsize::new(0);
 

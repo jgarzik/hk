@@ -307,7 +307,7 @@ without it).
 
 **Location**: `net/packet/`
 
-Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), TPACKET_V3 (PACKET_VERSION 2 is EINVAL), PACKET_FANOUT,
+Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), PACKET_FANOUT,
 PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
 (ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
 socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
@@ -321,6 +321,11 @@ The TX ring copies each frame into an skb and makes it
 TP_STATUS_AVAILABLE once queued; Linux sends the ring pages themselves
 (zero copy) and frees the frame at the skb's completion
 (tpacket_ubuf_complete), a blocking send waiting for pending frames.
+The TPACKET_V3 retire timeout without tp_retire_blk_tov is always
+8 ms: hk keeps no ethtool link speed (Linux prb_calc_retire_blk_tmo
+derives it from the block size on links of 1 Gb/s and up, e.g. e1000,
+r8169). tp_rxhash (TP_FT_REQ_FILL_RXHASH) is a jhash of the flow, not
+Linux's siphash flow-dissector hash.
 Ring blocks are physically contiguous (`mm::shared::PgVec`): a
 tp_block_size past the buddy allocator's largest order is ENOMEM where
 Linux alloc_one_pg_vec_page falls back to vzalloc.

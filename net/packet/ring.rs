@@ -22,7 +22,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
 use crate::mm::PAGE_SIZE;
 use crate::mm::shared::{PgVec, SharedRegion};
@@ -93,7 +93,9 @@ pub struct Req {
     pub block_nr: u32,
     pub frame_size: u32,
     pub frame_nr: u32,
+    pub retire_blk_tov: u32,
     pub sizeof_priv: u32,
+    pub feature_req_word: u32,
 }
 
 impl Req {
@@ -108,7 +110,9 @@ impl Req {
             block_nr: w(1),
             frame_size: w(2),
             frame_nr: w(3),
+            retire_blk_tov: w(4),
             sizeof_priv: w(5),
+            feature_req_word: w(6),
         }
     }
 }
@@ -146,6 +150,9 @@ pub struct PgRing {
     pub frame_size: u32,
     /// Last frame index (tp_frame_nr - 1)
     pub frame_max: u32,
+    /// V3: packets being copied into the current block (Linux
+    /// blk_fill_in_prog_lock's readers)
+    pub fill: AtomicU32,
 }
 
 /// A frame of a ring: its block and offset in it
@@ -233,6 +240,8 @@ pub struct RxRing {
     pub head: u32,
     /// Frames claimed and being filled (Linux rx_owner_map)
     pub owner_map: Vec<u64>,
+    /// TPACKET_V3 block state (Linux prb_bdqc)
+    pub kbdq: Option<super::v3::Kbdq>,
 }
 
 impl RxRing {
@@ -318,6 +327,9 @@ impl PacketSock {
 
     /// Room in the ring (Linux __packet_rcv_has_room, tpacket_rcv part)
     pub(super) fn ring_room(&self) -> Room {
+        if self.version() == TPACKET_V3 {
+            return self.v3_room();
+        }
         let rx = self.rx.lock();
         let Some(ring) = rx.ring.clone() else {
             return Room::None;
@@ -338,6 +350,9 @@ impl PacketSock {
         let Some(ring) = &rx.ring else {
             return false;
         };
+        if let Some(k) = &rx.kbdq {
+            return self.v3_readable(ring, k);
+        }
         let prev = if rx.head != 0 {
             rx.head - 1
         } else {
@@ -346,7 +361,7 @@ impl PacketSock {
         ring.frame(prev).status(self.version()) != u64::from(TP_STATUS_KERNEL)
     }
 
-    /// Linux tpacket_rcv (TPACKET_V1/V2): copy a tapped frame into the
+    /// Linux tpacket_rcv: copy a tapped frame into the
     /// next free ring frame, or count a drop. `data` is what the socket
     /// sees (from the link header for SOCK_RAW, the network header for
     /// SOCK_DGRAM), `snaplen` its length after the filter.
@@ -357,6 +372,9 @@ impl PacketSock {
         }
         let version = self.version();
         let mut status = TP_STATUS_USER | super::rcv::csum_status(t);
+        if version == TPACKET_V3 {
+            return self.tpacket_rcv_v3(t, proto, data, snaplen, status);
+        }
         let hdrlen = self.tp_hdrlen.load(Ordering::Acquire) as usize;
         let reserve = self.tp_reserve.load(Ordering::Acquire) as usize;
         let (macoff, netoff) = if self.sk.stype == SOCK_DGRAM {
@@ -496,15 +514,21 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
         if exists {
             return Err(KernelError::Busy);
         }
-        if version == TPACKET_V3 {
-            return Err(KernelError::InvalidArgument);
-        }
         let hdrlen = tp_hdrlen(version);
         s.tp_hdrlen.store(hdrlen, Ordering::Release);
         let reserve = s.tp_reserve.load(Ordering::Acquire);
         let fpb = check_req(version, hdrlen, reserve, req)?;
+        // Block transmit is not supported (Linux)
+        if version == TPACKET_V3
+            && tx
+            && (req.retire_blk_tov != 0 || req.sizeof_priv != 0 || req.feature_req_word != 0)
+        {
+            return Err(KernelError::InvalidArgument);
+        }
         let pg = PgVec::new(req.block_nr as usize, req.block_size as usize)?;
-        if !tx {
+        if version == TPACKET_V3 && !tx {
+            new.kbdq = Some(super::v3::Kbdq::new(req));
+        } else if !tx {
             new.owner_map = crate::util::kmem::try_vec((req.frame_nr as usize).div_ceil(64), 0u64)?;
         }
         new.ring = Some(crate::util::kalloc::try_arc(PgRing {
@@ -512,6 +536,7 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
             frames_per_block: fpb,
             frame_size: req.frame_size,
             frame_max: req.frame_nr - 1,
+            fill: AtomicU32::new(0),
         })?);
     } else if req.frame_nr != 0 {
         return Err(KernelError::InvalidArgument);
@@ -546,6 +571,12 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
                 let mut rx = s.rx.lock();
                 let old = core::mem::replace(&mut *rx, new);
                 s.set_flag(pf::TPACKET, rx.ring.is_some());
+                // Linux init_prb_bdqc: the first block opened, the
+                // retire timer armed
+                let st = &mut *rx;
+                if let (Some(ring), Some(k)) = (&st.ring, st.kbdq.as_mut()) {
+                    super::v3::init(s, k, ring);
+                }
                 drop(rx);
                 s.rxq.clear();
                 Some(old)
@@ -566,8 +597,12 @@ pub fn set_ring(s: &PacketSock, req: &Req, closing: bool, tx: bool) -> Result<()
             s.register_hook(&g);
         }
     }
-    // The old ring goes after the unlock; pages still mapped stay
-    // until their mapping goes
+    // A V3 ring's retire timer stops once the ring is out (Linux
+    // prb_shutdown_retire_blk_timer); the old ring goes after the
+    // unlock, pages still mapped stay until their mapping goes
+    if old.as_ref().is_some_and(|o| o.kbdq.is_some()) {
+        super::v3::shutdown_timer(s);
+    }
     drop(old);
     r
 }
