@@ -92,12 +92,16 @@ Listed because real traffic reaches them: TCP has no delivery rate sampling (Lin
 tcp_rate.c; only the rate sample's prior_delivered, for RACK's
 reordering window), RACK checks every skb of the retransmit queue
 (Linux walks tsorted_sent_queue in send order and stops early), no
-F-RTO (tcp_frto, TCPSpuriousRTOs), no SACK compression
+SACK compression
 (Linux __tcp_ack_snd_check delays the ACKs for out-of-order data
 after TCP_FASTRETRANS_THRESH of them, tcp_comp_sack_delay_ns,
 TCPAckCompressed: hk ACKs each at once), no cwnd validation of an
 application-limited sender (tcp_cwnd_application_limited,
-snd_cwnd_used) and no tcp_slow_start_after_idle sysctl (always on), no CUBIC (only "reno"; Linux defaults to cubic), no
+snd_cwnd_used) and no tcp_slow_start_after_idle sysctl (always on), a
+timeout stamps `rtx_stamp` one RTO back (the head's send, for the
+retry and user timeouts) where Linux's retrans_stamp is the first
+retransmission, so the timestamp echo never undoes a timeout
+(tcp_packet_delayed; F-RTO still does), no CUBIC (only "reno"; Linux defaults to cubic), no
 receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
 tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
 SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf; no rcv_ssthresh,
@@ -138,7 +142,7 @@ receive memory past SO_RCVBUF (only the window and tcp_mem limit it).
 MIB counters (`net/mib.rs`) of mechanisms hk lacks stay 0: header
 prediction (TCPHPHits, TCPHPAcks; without the fast path every pure
 ACK counts TCPPureAcks, where Linux's fast path skips it), receive
-coalescing and collapse, F-RTO (TCPSpuriousRTOs), RcvPruned (no tcp_can_ingest),
+coalescing and collapse, RcvPruned (no tcp_can_ingest),
 Fast Open, syncookies, MD5/AO, forwarding and
 multicast receive; Ip InDiscards counts few of Linux's sites.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and

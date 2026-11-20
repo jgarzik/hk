@@ -314,6 +314,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         keepidle: secs(&s.tcp_keepalive_time),
         keepintvl: secs(&s.tcp_keepalive_intvl),
         keepcnt: u32::from(s.tcp_keepalive_probes.load(Ordering::Relaxed)),
+        frto: s.tcp_frto.load(Ordering::Relaxed),
     }
 }
 

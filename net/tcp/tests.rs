@@ -2808,3 +2808,78 @@ fn rack_reordering_timer_marks_loss() {
     assert_eq!(m.net.fold(LINUX_MIB_TCPSACKRECOVERY), 1);
     assert!(matches!(p.a.live.tmr.get(), Some((Tmr::Rtx, _))));
 }
+
+/// A pair without SACK (RACK needs a real RTT, which the simulated
+/// wire lacks), timestamps off (`ts` 0) or on, MIBs counted at a
+fn frto_pair(ts: u8) -> (Pair, alloc::sync::Arc<crate::net::mib::NetMib>) {
+    let c = Cfg {
+        ts,
+        sack: false,
+        ..cfg()
+    };
+    let mut p = Pair::with_cfgs(1000, 64 * 1024, c, c);
+    let m = crate::net::mib::NetMib::new().unwrap();
+    p.a.mib = Some(m.clone());
+    (p, m)
+}
+
+/// A spurious timeout: b's ACKs for a window are held past the RTO,
+/// then arrive after the resend of the head
+fn spurious_rto(p: &mut Pair) {
+    p.filter = |_, to_b, _, _| if to_b { Fate::Pass } else { Fate::Drop };
+    let n = p.log.len();
+    p.send_a(&pattern(20 * 988));
+    p.run();
+    let held: Vec<Seg> = p.log[n..]
+        .iter()
+        .filter(|(_, to_b, _)| !*to_b)
+        .map(|(_, _, s)| s.clone())
+        .collect();
+    assert!(!held.is_empty());
+    // The loss probe, then the RTO resends the head only (cwnd 1,
+    // CA_Loss)
+    p.filter = |_, to_b, _, _| if to_b { Fate::Drop } else { Fate::Pass };
+    for _ in 0..3 {
+        if p.a.ca_state == super::recovery::CaState::Loss {
+            break;
+        }
+        assert!(p.tick());
+    }
+    assert_eq!(p.a.ca_state, super::recovery::CaState::Loss);
+    assert_eq!(p.a.cong.snd_cwnd(), 1);
+    p.filter = pass;
+    for s in held {
+        let mut out = Out::default();
+        p.a.feed(&seg_in(&s), p.now, &mut out);
+        p.take(true, out);
+    }
+}
+
+/// F-RTO (RFC 5682): ACKs of never retransmitted data after a timeout
+/// show it spurious: undone, TCPSpuriousRTOs (Linux tcp_process_loss
+/// step 3.b, tcp_try_undo_loss)
+#[test]
+fn frto_undoes_spurious_timeout() {
+    use crate::net::mib::*;
+    let (mut p, m) = frto_pair(0);
+    spurious_rto(&mut p);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPSPURIOUSRTOS), 1);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSUNDO), 1);
+    assert_eq!(p.a.ca_state, super::recovery::CaState::Open);
+    assert!(p.a.cong.snd_cwnd() >= 10);
+    assert_eq!(p.a.cong.snd_ssthresh(), super::cong::INFINITE_SSTHRESH);
+    p.run();
+    assert_eq!(p.b.rcvq_len(), 20 * 988);
+}
+
+/// tcp_frto 0: the timeout stands
+#[test]
+fn frto_off_keeps_the_reduction() {
+    use crate::net::mib::*;
+    let (mut p, m) = frto_pair(0);
+    p.a.cfg.frto = 0;
+    spurious_rto(&mut p);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPSPURIOUSRTOS), 0);
+    assert_eq!(m.net.fold(LINUX_MIB_TCPLOSSUNDO), 0);
+    assert!(p.a.cong.snd_ssthresh() < super::cong::INFINITE_SSTHRESH);
+}

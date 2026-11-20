@@ -194,6 +194,8 @@ pub struct Cfg {
     pub keepidle: u64,
     pub keepintvl: u64,
     pub keepcnt: u32,
+    /// tcp_frto: F-RTO (RFC 5682) after a timeout when nonzero
+    pub frto: u8,
 }
 
 impl Default for Cfg {
@@ -216,6 +218,7 @@ impl Default for Cfg {
             keepidle: 7_200_000,
             keepintvl: 75_000,
             keepcnt: 9,
+            frto: 2,
         }
     }
 }
@@ -828,6 +831,8 @@ pub struct TcpCb {
     pub(super) undo_retrans: i32,
     pub(super) prior_ssthresh: u32,
     pub(super) prior_cwnd: u32,
+    /// F-RTO runs for the current timeout (Linux tp->frto)
+    pub(super) frto: bool,
     /// Proportional rate reduction (Linux prr_delivered, prr_out)
     pub(super) prr_delivered: u32,
     pub(super) prr_out: u32,
@@ -976,6 +981,7 @@ impl TcpCb {
             undo_retrans: -1,
             prior_ssthresh: 0,
             prior_cwnd: 0,
+            frto: false,
             prr_delivered: 0,
             prr_out: 0,
             rtx_hint: None,

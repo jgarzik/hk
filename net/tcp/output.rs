@@ -58,6 +58,9 @@ pub(super) enum Push {
     /// Tail loss probe: one new segment, Nagle off, no probe scheduled
     /// for it (Linux tcp_write_xmit with push_one 2)
     Tlp,
+    /// All the window allows, Nagle off (Linux TCP_NAGLE_OFF: F-RTO's
+    /// new data)
+    NagleOff,
 }
 
 impl Push {
@@ -277,7 +280,7 @@ impl TcpCb {
     /// Hold a partial segment (Linux tcp_nagle_check with Minshall's
     /// rule; cork and MSG_MORE hold all partial segments)
     fn nagle_hold(&self, push: Push) -> bool {
-        if push.one() {
+        if push.one() || push == Push::NagleOff {
             return false;
         }
         if self.opts.cork || push == Push::More {

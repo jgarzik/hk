@@ -63,6 +63,8 @@ pub struct NetSysctl {
     pub tcp_keepalive_time: AtomicI32,
     pub tcp_keepalive_intvl: AtomicI32,
     pub tcp_keepalive_probes: AtomicU8,
+    /// tcp_frto: F-RTO (RFC 5682) after a timeout when nonzero
+    pub tcp_frto: AtomicU8,
     /// Default congestion control (index into tcp::cong::ALGOS)
     pub tcp_ca: AtomicU8,
     pub somaxconn: AtomicI32,
@@ -106,6 +108,7 @@ impl Default for NetSysctl {
             tcp_keepalive_time: AtomicI32::new(7200),
             tcp_keepalive_intvl: AtomicI32::new(75),
             tcp_keepalive_probes: AtomicU8::new(9),
+            tcp_frto: AtomicU8::new(2),
             tcp_ca: AtomicU8::new(0),
             somaxconn: AtomicI32::new(4096),
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
@@ -538,6 +541,13 @@ pub static CTLS: &[NetCtl] = &[
         mode: 0o644,
         show: |n| get_u8(n, |s| &s.tcp_keepalive_probes),
         store: |n, v| set_u8(n, |s| &s.tcp_keepalive_probes, v),
+        text: None,
+    },
+    NetCtl {
+        path: "net/ipv4/tcp_frto",
+        mode: 0o644,
+        show: |n| get_u8(n, |s| &s.tcp_frto),
+        store: |n, v| set_u8(n, |s| &s.tcp_frto, v),
         text: None,
     },
     NetCtl {

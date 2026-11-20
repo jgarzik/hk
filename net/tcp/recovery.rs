@@ -68,6 +68,8 @@ pub(super) enum Rexmit {
     None,
     /// Lost skbs (tcp_xmit_retransmit_queue)
     Lost,
+    /// F-RTO: new data first
+    New,
 }
 
 /// RACK state (Linux tcp_sock.rack, RFC 8985)
@@ -360,8 +362,9 @@ impl TcpCb {
         self.rtx_hint = None;
     }
 
-    /// Linux tcp_enter_loss (no F-RTO): a retransmission timeout
+    /// Linux tcp_enter_loss: a retransmission timeout
     pub(super) fn enter_loss(&mut self) {
+        let new_recovery = self.ca_state < CaState::Recovery;
         self.timeout_mark_lost();
         if self.ca_state <= CaState::Disorder
             || !after(self.high_seq, self.snd_una)
@@ -383,6 +386,10 @@ impl TcpCb {
         self.set_ca_state(CaState::Loss);
         self.high_seq = self.snd_max;
         self.tlp_high_seq = None;
+        // F-RTO (RFC 5682 3.1 step 1): resend SND.UNA unless a recovery
+        // was underway, but for repeated timeouts of one SND.UNA (3.2)
+        // (hk has no MTU probing)
+        self.frto = self.cfg.frto != 0 && (new_recovery || self.live.retransmits.get() != 0);
     }
 
     /// Linux tcp_simple_retransmit (path MTU reduced): what no longer
@@ -522,18 +529,22 @@ impl TcpCb {
         false
     }
 
-    /// Linux tcp_try_undo_loss (no F-RTO)
-    fn try_undo_loss(&mut self) -> bool {
-        if !self.may_undo() {
+    /// Linux tcp_try_undo_loss: after a partial ACK, or F-RTO found the
+    /// timeout spurious (`frto_undo`)
+    fn try_undo_loss(&mut self, frto_undo: bool) -> bool {
+        if !(frto_undo || self.may_undo()) {
             return false;
         }
         self.undo_cwnd_reduction(true);
         self.net_stat(LINUX_MIB_TCPLOSSUNDO);
+        if frto_undo {
+            self.net_stat(LINUX_MIB_TCPSPURIOUSRTOS);
+        }
         self.live.retransmits.set(0);
         if self.non_sack_preventing_reopen() {
             return true;
         }
-        if self.is_sack() {
+        if frto_undo || self.is_sack() {
             self.set_ca_state(CaState::Open);
             self.is_sack_reneg = false;
         }
@@ -681,11 +692,36 @@ impl TcpCb {
 
     // --- the state machine --------------------------------------------------
 
-    /// Linux tcp_process_loss (no F-RTO): an ACK in CA_Loss
+    /// Linux tcp_process_loss: an ACK in CA_Loss ends it when the lost
+    /// data is recovered or found spurious (F-RTO, RFC 5682 3.1, or the
+    /// timestamp echo); else it retransmits more
     fn process_loss(&mut self, flg: u32, num_dupack: u32, rexmit: &mut Rexmit) {
         let recovered = !before(self.snd_una, self.high_seq);
-        if flg & flag::SND_UNA_ADVANCED != 0 && self.try_undo_loss() {
+        if flg & flag::SND_UNA_ADVANCED != 0 && self.try_undo_loss(false) {
             return;
+        }
+        if self.frto {
+            // Step 3.b: a timeout is spurious if not all data are lost,
+            // i.e. never retransmitted data are (s)acked
+            if flg & flag::ORIG_SACK_ACKED != 0 && self.try_undo_loss(true) {
+                return;
+            }
+            if after(self.snd_max, self.high_seq) {
+                // Step 3.a: the loss was real
+                if flg & flag::DATA_SACKED != 0 || num_dupack != 0 {
+                    self.frto = false;
+                }
+            } else if flg & flag::SND_UNA_ADVANCED != 0 && !recovered {
+                self.high_seq = self.snd_max;
+                // Step 2.b: send new data (once cwnd is updated in
+                // tcp_ack), else the conventional recovery
+                let wnd_end = self.snd_una.wrapping_add(self.snd_wnd);
+                if !self.wq.is_empty() && after(wnd_end, self.snd_max) {
+                    *rexmit = Rexmit::New;
+                    return;
+                }
+                self.frto = false;
+            }
         }
         if recovered {
             self.try_undo_recovery();
@@ -879,10 +915,18 @@ impl TcpCb {
         }
     }
 
-    /// Linux tcp_xmit_recovery
+    /// Linux tcp_xmit_recovery: with cwnd updated, F-RTO's new data or
+    /// the retransmissions loss recovery allows
     pub(super) fn xmit_recovery(&mut self, rexmit: Rexmit, out: &mut super::cb::Out) {
         if rexmit == Rexmit::None || self.state == TcpState::SynSent {
             return;
+        }
+        if rexmit == Rexmit::New {
+            self.xmit(self.clock, super::output::Push::NagleOff, out);
+            if after(self.snd_max, self.high_seq) {
+                return;
+            }
+            self.frto = false;
         }
         self.xmit_retransmit_queue(out);
     }
