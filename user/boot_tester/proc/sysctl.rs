@@ -28,6 +28,7 @@ pub fn run_tests() {
     test_netns_bind();
     test_netns_init_only();
     test_perm_call();
+    test_unregister_timeout();
 }
 
 /// Read a NUL-terminated path into `buf`; returns the length or -errno
@@ -154,6 +155,20 @@ fn test_validation() {
     t.eq(b"somaxconn", write_file(SOMAX, b"16"), 2);
     t.ok(b"somaxconn read", reads(SOMAX, b"16\n"), 0);
     write_file(SOMAX, b"4096");
+    t.done();
+}
+
+/// net.core.netdev_unregister_timeout_secs: 10 at boot, 1..3600 (Linux
+/// net_core_table, proc_dointvec_minmax)
+fn test_unregister_timeout() {
+    const P: &[u8] = b"/proc/sys/net/core/netdev_unregister_timeout_secs\0";
+    let mut t = T::new(b"SYSCTL_UNREGISTER_TIMEOUT");
+    t.ok(b"default", reads(P, b"10\n"), 0);
+    t.eq(b"zero", write_file(P, b"0"), EINVAL);
+    t.eq(b"too big", write_file(P, b"3601"), EINVAL);
+    t.eq(b"set", write_file(P, b"5"), 1);
+    t.ok(b"read", reads(P, b"5\n"), 0);
+    write_file(P, b"10");
     t.done();
 }
 

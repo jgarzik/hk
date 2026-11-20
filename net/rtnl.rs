@@ -157,9 +157,11 @@ const WAIT_REFS_MIN_MS: u64 = 1;
 const WAIT_REFS_MAX_MS: u64 = 250;
 /// NETDEV_UNREGISTER is sent again this often (Linux 1 * HZ)
 const REBROADCAST_MS: u64 = 1000;
-/// A device still referenced is reported this often (Linux
-/// netdev_unregister_timeout_secs' default)
-const UNREGISTER_TIMEOUT_MS: u64 = 10_000;
+/// A device still referenced is reported this often, in seconds
+/// (Linux netdev_unregister_timeout_secs: 10 at boot, 1..3600 through
+/// net.core.netdev_unregister_timeout_secs, read racily)
+pub static UNREGISTER_TIMEOUT_SECS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(10);
 
 /// Linux netdev_run_todo, with RTNL released: once the RCU callbacks
 /// queued meanwhile ran (routes and neighbours freed), each device is
@@ -198,7 +200,9 @@ fn netdev_wait_allrefs_any(list: &mut ArcList<TodoList>) -> Arc<NetDevice> {
         if let Some(dev) = take_free(list) {
             return dev;
         }
-        if now_ms().saturating_sub(warning) > UNREGISTER_TIMEOUT_MS {
+        let timeout =
+            u64::from(UNREGISTER_TIMEOUT_SECS.load(core::sync::atomic::Ordering::Relaxed)) * 1000;
+        if now_ms().saturating_sub(warning) > timeout {
             for_each_todo(list, |dev| {
                 crate::printkln!(
                     "unregister_netdevice: waiting for {} to become free. Usage count = {}",

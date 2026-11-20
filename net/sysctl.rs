@@ -558,6 +558,20 @@ pub static INIT_CTLS: &[NetCtl] = &[
         text: None,
     },
     NetCtl {
+        path: "net/core/netdev_unregister_timeout_secs",
+        mode: 0o644,
+        show: |_| {
+            let s = crate::net::rtnl::UNREGISTER_TIMEOUT_SECS.load(Ordering::Relaxed);
+            vec![i64::from(s)]
+        },
+        store: |_, v| {
+            range(v[0], 1, 3600)?;
+            crate::net::rtnl::UNREGISTER_TIMEOUT_SECS.store(v[0] as u32, Ordering::Relaxed);
+            Ok(())
+        },
+        text: None,
+    },
+    NetCtl {
         path: "net/core/mem_pcpu_rsv",
         mode: 0o644,
         show: |_| crate::net::tcp::mem::rsv_show(),
