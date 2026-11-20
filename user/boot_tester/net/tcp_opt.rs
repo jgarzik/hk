@@ -2,18 +2,20 @@
 //! window scaling and timestamps (checked through TCP_INFO), 4 MB
 //! through the slirp echo peer, IPPROTO_TCP option round-trips,
 //! TCP_MAXSEG on a connection, TCP_CORK/MSG_MORE delivery, keepalive
-//! against a dead peer (a blackhole route), /proc/net/tcp lines and the
-//! TCP sysctls.
+//! against a dead peer (a blackhole route), /proc/net/tcp lines, the
+//! TCP sysctls, and SACK (TCPI_OPT_SACK, tcp_sack / tcp_dsack per
+//! namespace).
 
 use hk_syscall::{
-    SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_listen, sys_setsockopt, sys_shutdown,
+    CLONE_NEWNET, SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_listen, sys_setsockopt,
+    sys_shutdown, sys_unshare,
 };
 
 use crate::harness::T;
 use crate::net::nl::{self, Nl, Req};
 use crate::net::sk::*;
 use crate::net::tcp_xfer::{accept, listener, recv_pat, send_pat, set_timeo, wait_child};
-use crate::proc::sysctl::read_file;
+use crate::proc::sysctl::{read_file, reads, write_file};
 
 const MB: usize = 1024 * 1024;
 /// slirp guestfwd echo service (tools/qemu-net.sh)
@@ -38,7 +40,11 @@ const ENOENT: i64 = -2;
 const ETIMEDOUT: i64 = -110;
 /// tcpi_options bits
 const TCPI_OPT_TIMESTAMPS: u8 = 1;
+const TCPI_OPT_SACK: u8 = 2;
 const TCPI_OPT_WSCALE: u8 = 4;
+const EINVAL: i64 = -22;
+const TCP_SACK: &[u8] = b"/proc/sys/net/ipv4/tcp_sack\0";
+const TCP_DSACK: &[u8] = b"/proc/sys/net/ipv4/tcp_dsack\0";
 
 pub fn run_tests() {
     crate::helpers::println(b"=== TCP Option Tests ===");
@@ -52,6 +58,70 @@ pub fn run_tests() {
     test_echo_4mb();
     test_keepalive_dead_peer();
     test_listen_opts();
+    test_sack();
+}
+
+/// Whether TCPI_OPT_SACK is set on each end of a new loopback
+/// connection (client, server); None if it could not be made
+fn lo_sack_bits() -> Option<(bool, bool)> {
+    let (l, p) = listener(1);
+    let c = tcp();
+    set_timeo(c, 10_000);
+    if connect(c, LO, p) != 0 {
+        close(c);
+        close(l);
+        return None;
+    }
+    let s = accept(l);
+    let bits = (
+        tcp_info(c).options & TCPI_OPT_SACK != 0,
+        tcp_info(s).options & TCPI_OPT_SACK != 0,
+    );
+    close(s);
+    close(c);
+    close(l);
+    Some(bits)
+}
+
+/// SACK is negotiated over lo by default (TCP_INFO TCPI_OPT_SACK);
+/// net.ipv4.tcp_sack and tcp_dsack are per namespace (1 in a new one),
+/// u8 values (Linux proc_dou8vec_minmax); tcp_sack=0 in a namespace
+/// leaves its connections without SACK and the initial namespace's on
+fn test_sack() {
+    let mut t = T::new(b"TCP_SACK");
+    t.ok(b"lo negotiates", lo_sack_bits() == Some((true, true)), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        crate::helpers::loopback_up();
+        if !reads(TCP_SACK, b"1\n") || !reads(TCP_DSACK, b"1\n") {
+            sys_exit(10);
+        }
+        if write_file(TCP_SACK, b"0") != 1 || !reads(TCP_SACK, b"0\n") {
+            sys_exit(11);
+        }
+        if lo_sack_bits() != Some((false, false)) {
+            sys_exit(12);
+        }
+        if write_file(TCP_SACK, b"256") != EINVAL || !reads(TCP_SACK, b"0\n") {
+            sys_exit(13);
+        }
+        if write_file(TCP_DSACK, b"0") != 1 || !reads(TCP_DSACK, b"0\n") {
+            sys_exit(14);
+        }
+        sys_exit(0);
+    }
+    let st = wait_child(pid);
+    if st == 2 << 8 && crate::helpers::host_mode() {
+        crate::helpers::skip(b"TCP_SACK", b"unshare(CLONE_NEWNET) not permitted");
+        return;
+    }
+    t.eq(b"netns child", st as i64, 0);
+    t.ok(b"init tcp_sack", reads(TCP_SACK, b"1\n"), 0);
+    t.ok(b"init tcp_dsack", reads(TCP_DSACK, b"1\n"), 0);
+    t.done();
 }
 
 /// The fields of struct tcp_info the tests read
